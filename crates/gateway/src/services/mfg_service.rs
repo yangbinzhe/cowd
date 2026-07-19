@@ -92,7 +92,6 @@ pub(crate) struct MfgService {
     review_reconciler: Arc<MfgReviewReconcilerLifecycle>,
     live_read_pools: Arc<Mutex<BTreeMap<PathBuf, Arc<MfgReadPool>>>>,
     live_key_lock: Arc<Mutex<()>>,
-    blocking_gate: Arc<tokio::sync::Semaphore>,
     live_hub_tx: tokio::sync::broadcast::Sender<u64>,
     live_hub_revision: Arc<AtomicU64>,
     live_view_cache:
@@ -192,23 +191,11 @@ impl MfgService {
             }),
             live_read_pools: Arc::new(Mutex::new(BTreeMap::new())),
             live_key_lock: Arc::new(Mutex::new(())),
-            // MFG route 中仍有同步 SQLite facade。统一把整条 route future
-            // 移到 blocking pool，并在入口限流，防止占满 Tokio async worker。
-            blocking_gate: Arc::new(tokio::sync::Semaphore::new(32)),
             live_hub_tx,
             live_hub_revision: Arc::new(AtomicU64::new(0)),
             live_view_cache: Arc::new((0..16).map(|_| Mutex::new(BTreeMap::new())).collect()),
             live_repository_reads: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    pub(crate) async fn acquire_blocking_permit(
-        &self,
-    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
-        Arc::clone(&self.blocking_gate)
-            .acquire_owned()
-            .await
-            .map_err(|_| "MFG blocking worker gate is closed".to_string())
     }
 
     /// Hub 只传播“durable log 已前进”的无载荷信号。订阅者收到信号后，
@@ -1443,26 +1430,6 @@ mod tests {
         for observer in &mut observers {
             assert_eq!(observer.recv().await.unwrap(), 1);
         }
-    }
-
-    #[tokio::test]
-    async fn mfg_blocking_workers_are_hard_bounded_at_thirty_two() {
-        let service = MfgService::new();
-        let mut permits = Vec::new();
-        for _ in 0..32 {
-            permits.push(service.acquire_blocking_permit().await.unwrap());
-        }
-        assert!(
-            Arc::clone(&service.blocking_gate)
-                .try_acquire_owned()
-                .is_err()
-        );
-        drop(permits.pop());
-        assert!(
-            Arc::clone(&service.blocking_gate)
-                .try_acquire_owned()
-                .is_ok()
-        );
     }
 
     #[test]

@@ -482,6 +482,7 @@ impl ExecutionGraphRunner {
             })
             .await?;
         let binding = resources.binding(&ticket);
+        let resource_kind = resources.resource.kind().clone();
         self.active.lock().await.insert(
             (ticket.graph_id.clone(), ticket.node_id.clone()),
             ActiveNode {
@@ -553,7 +554,14 @@ impl ExecutionGraphRunner {
             }
             ExecutionEffectState::Fresh => {}
         }
-        let outcome = executor.poll_or_await(&ticket).await?;
+        let resource_started = std::time::Instant::now();
+        let outcome = executor.poll_or_await(&ticket).await;
+        let _ = self.resource_manager.observe_runtime_pressure(
+            &resource_kind,
+            resource_started.elapsed(),
+            outcome.is_err(),
+        );
+        let outcome = outcome?;
         self.commit_service
             .commit_execution_effect(&ticket, &outcome)?;
         Ok((ticket.node_id.clone(), outcome))
@@ -577,7 +585,7 @@ impl ExecutionGraphRunner {
         };
         let resource = self
             .resource_manager
-            .acquire(resource_kind, None)
+            .acquire(resource_kind, Some(std::time::Duration::from_secs(30)))
             .await
             .map_err(|error| ExecutionRunnerError::Resource {
                 node_id: node.id.clone(),

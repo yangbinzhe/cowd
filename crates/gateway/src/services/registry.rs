@@ -60,6 +60,7 @@ impl GatewayServices {
             approval_repository,
             session_manager,
             config_home,
+            runtime::GatewayCapacityConfig::default(),
         )
     }
 
@@ -73,6 +74,7 @@ impl GatewayServices {
         approval_repository: FileApprovalRepository,
         session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
         config_home: impl AsRef<std::path::Path>,
+        capacity_config: runtime::GatewayCapacityConfig,
     ) -> Self {
         let command_host_runtime = Arc::clone(&runtime);
         let runtime_services = runtime.runtime_services();
@@ -80,6 +82,10 @@ impl GatewayServices {
         let session_kernel = runtime.session_kernel();
         let lifecycle_kernel = runtime.lifecycle_kernel();
         let task = TaskService::with_kernel_and_runtime(task_kernel, Arc::clone(&runtime_services));
+        let capacity = crate::gateway_capacity::GatewayCapacityController::new(
+            crate::gateway_capacity::GatewayCapacityConfig::resolve(&capacity_config),
+            Arc::clone(runtime_services.resource_manager()),
+        );
         Self {
             runtime: Some(runtime),
             session_manager: Some(session_manager),
@@ -94,6 +100,7 @@ impl GatewayServices {
             cross_plane: CrossPlaneService::new(Arc::clone(&runtime_services)),
             mission: MissionService::new()
                 .with_runtime_port(runtime::MissionRuntimePort::new(runtime_services)),
+            capacity,
             ..Self::baseline_with_config_home(config_home)
         }
     }
@@ -110,6 +117,9 @@ impl GatewayServices {
         let config_home = config_home.as_ref();
         let baseline_runtime =
             runtime::RuntimeServices::in_memory().expect("baseline runtime event projection");
+        let capacity = crate::gateway_capacity::GatewayCapacityController::defaults(Arc::clone(
+            baseline_runtime.resource_manager(),
+        ));
         let task = TaskService::new();
         Self {
             runtime: None,
@@ -138,6 +148,7 @@ impl GatewayServices {
             matrix: MatrixService::new(),
             mfg: MfgService::new(),
             mission: MissionService::new(),
+            capacity,
             owner: "0.9.380 GatewayServices",
             boundary_status: "0620_final_boundary",
         }

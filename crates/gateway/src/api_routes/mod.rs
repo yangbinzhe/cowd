@@ -976,7 +976,118 @@ pub fn api_router(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
-    public_routes.merge(protected_routes).with_state(state)
+    public_routes
+        .merge(protected_routes)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            capacity_middleware,
+        ))
+        .with_state(state)
+}
+
+async fn capacity_middleware(
+    AxumState(state): AxumState<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    use crate::gateway_capacity::HttpCapacityLane;
+
+    let path = request.uri().path();
+    let lane = if is_stream_capacity_path(path) {
+        HttpCapacityLane::Stream
+    } else if is_control_capacity_path(path) {
+        HttpCapacityLane::Control
+    } else {
+        HttpCapacityLane::Data
+    };
+    let lease = match state.services.capacity.admit_http(lane).await {
+        Ok(lease) => lease,
+        Err(overload) => {
+            let retry_after_seconds = overload.retry_after_ms.div_ceil(1_000).max(1);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (header::RETRY_AFTER, retry_after_seconds.to_string()),
+                    (
+                        header::HeaderName::from_static("x-cowd-capacity-lane"),
+                        format!("{:?}", overload.lane).to_ascii_lowercase(),
+                    ),
+                ],
+                Json(serde_json::json!({
+                    "error": "gateway_capacity_exhausted",
+                    "lane": format!("{:?}", overload.lane).to_ascii_lowercase(),
+                    "retry_after_ms": overload.retry_after_ms,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let response = next.run(request).await;
+    if lane == HttpCapacityLane::Stream {
+        hold_capacity_lease_for_body(response, lease)
+    } else {
+        drop(lease);
+        response
+    }
+}
+
+fn hold_capacity_lease_for_body(
+    response: Response,
+    lease: crate::gateway_capacity::GatewayCapacityLease,
+) -> Response {
+    use futures::StreamExt;
+
+    let (parts, body) = response.into_parts();
+    let stream = Box::pin(body.into_data_stream());
+    let guarded = futures::stream::unfold((stream, lease), |(mut stream, lease)| async move {
+        stream.next().await.map(|item| (item, (stream, lease)))
+    });
+    Response::from_parts(parts, Body::from_stream(guarded))
+}
+
+fn is_stream_capacity_path(path: &str) -> bool {
+    path.ends_with("/stream")
+        || path == "/api/apps/mfg/live"
+        || (path.starts_with("/api/runtime/executions/") && path.ends_with("/events"))
+}
+
+fn is_control_capacity_path(path: &str) -> bool {
+    path == "/health"
+        || path == "/healthz"
+        || path == "/readyz"
+        || path.contains("/cancel")
+        || path.ends_with("/status")
+        || path.starts_with("/api/approvals")
+        || path.starts_with("/api/runtime/config")
+}
+
+#[cfg(test)]
+mod capacity_middleware_tests {
+    use super::*;
+    use crate::gateway_capacity::HttpCapacityLane;
+
+    #[tokio::test]
+    async fn stream_body_owns_capacity_until_response_is_dropped() {
+        let services = GatewayServices::baseline();
+        let lease = services
+            .capacity
+            .admit_http(HttpCapacityLane::Stream)
+            .await
+            .unwrap();
+        let response = hold_capacity_lease_for_body(Response::new(Body::from("event")), lease);
+        assert_eq!(services.capacity.snapshot().stream.active, 1);
+        drop(response);
+        assert_eq!(services.capacity.snapshot().stream.active, 0);
+    }
+
+    #[test]
+    fn routes_are_partitioned_without_treating_long_stream_as_data() {
+        assert!(is_control_capacity_path("/healthz"));
+        assert!(is_control_capacity_path("/api/runtime/turns/t-1/cancel"));
+        assert!(is_stream_capacity_path("/api/sessions/s-1/stream"));
+        assert!(is_stream_capacity_path("/api/apps/mfg/live"));
+        assert!(!is_stream_capacity_path("/api/runtime/events"));
+    }
 }
 
 // ── Response types ─────────────────────────────────────────────

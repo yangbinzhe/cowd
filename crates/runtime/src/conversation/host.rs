@@ -118,6 +118,7 @@ where
 {
     pub fn new(config: StandardRuntimeHostConfig<T>) -> Result<Self, String> {
         let services = Arc::clone(&config.runtime_services);
+        let root_provider_owner = config.execution_parent.is_none();
         let approval_gate_slot = Arc::new(std::sync::RwLock::new(None));
         let active_model = config.model.clone();
         let model_context_window = config.model_context_window.unwrap_or_else(|| {
@@ -140,7 +141,7 @@ where
             &config.feature_config,
         )
         .with_model_context_window(model_context_window)
-        .with_explicit_team_escalation(config.execution_parent.is_none())
+        .with_explicit_team_escalation(root_provider_owner)
         .with_runtime_event_store(Arc::clone(services.event_store()))
         .with_skill_profiles(config.skill_profiles)
         .with_agent_skill_profile(config.agent_skill_profile)
@@ -151,6 +152,9 @@ where
             config.memory_team_id,
             config.memory_read_scopes,
         );
+        if root_provider_owner {
+            runtime = runtime.with_provider_admission(Arc::clone(services.resource_manager()));
+        }
         if let Some(memory_manager) = services.memory_manager() {
             runtime = runtime.with_memory_manager(memory_manager);
         }
@@ -1175,14 +1179,16 @@ where
                     // every parent, Team child, fallback and judge provider
                     // request. Its typed totals are therefore authoritative
                     // when installed; normal turns retain summary telemetry.
-                    input_tokens: evaluation_budget.as_ref().map_or(
-                        summary.model_telemetry.input_tokens,
-                        |budget| budget.input_consumed,
-                    ),
-                    output_tokens: evaluation_budget.as_ref().map_or(
-                        summary.model_telemetry.output_tokens,
-                        |budget| budget.output_consumed,
-                    ),
+                    input_tokens: evaluation_budget
+                        .as_ref()
+                        .map_or(summary.model_telemetry.input_tokens, |budget| {
+                            budget.input_consumed
+                        }),
+                    output_tokens: evaluation_budget
+                        .as_ref()
+                        .map_or(summary.model_telemetry.output_tokens, |budget| {
+                            budget.output_consumed
+                        }),
                     cached_tokens: evaluation_budget.as_ref().map_or_else(
                         || {
                             summary
@@ -1524,10 +1530,8 @@ where
         item.visibility = ContextVisibility::Private;
         item.evidence = vec![format!("strategy_decision:{}", strategy.decision_id)];
         if let Some(terminal_summary) = verified_team_terminal_summary(receipt) {
-            turn_state.lock().await.terminal_override = Some((
-                GoalCompletion::Satisfied,
-                terminal_summary,
-            ));
+            turn_state.lock().await.terminal_override =
+                Some((GoalCompletion::Satisfied, terminal_summary));
         }
         runtime.lock().await.push_next_model_context_item(item);
         return Ok(true);
@@ -1946,16 +1950,14 @@ where
     // Never await the turn-state mutex while retaining the ConversationRuntime
     // mutex; later graph executors acquire these owners in the opposite phase.
     drop(runtime);
-    turn_state.lock().await.terminal_override =
-        Some((GoalCompletion::Satisfied, terminal_summary));
+    turn_state.lock().await.terminal_override = Some((GoalCompletion::Satisfied, terminal_summary));
     Ok(true)
 }
 
 fn orchestration_result_has_committed_write(execution: &serde_json::Value) -> bool {
     match execution {
         serde_json::Value::Object(object) => {
-            object.get("ref_type").and_then(serde_json::Value::as_str)
-                == Some("runtime_change")
+            object.get("ref_type").and_then(serde_json::Value::as_str) == Some("runtime_change")
                 || object
                     .values()
                     .any(orchestration_result_has_committed_write)
@@ -4774,9 +4776,9 @@ where
             state
                 .focus_observed_resource_scopes
                 .extend(verified_focus_acceptance_scope_keys.iter().cloned());
-            if let Some(instruction) = upstream_verification_completion_instruction(
-                &verified_focus_acceptance_scope_keys,
-            ) {
+            if let Some(instruction) =
+                upstream_verification_completion_instruction(&verified_focus_acceptance_scope_keys)
+            {
                 // Runtime, rather than the provider, compiled and executed the
                 // reviewer's exact-path reads. Tell the following synthesis
                 // request what those retained receipts mean. Without this
@@ -7457,10 +7459,7 @@ fn runtime_tool_receipt_evidence(
         .collect()
 }
 
-fn tool_receipt_workspace_paths(
-    output: &str,
-    workspace_root: &std::path::Path,
-) -> Vec<String> {
+fn tool_receipt_workspace_paths(output: &str, workspace_root: &std::path::Path) -> Vec<String> {
     let Some(object_start) = output.find('{') else {
         return Vec::new();
     };
@@ -8769,12 +8768,12 @@ mod tests {
         )
         .await;
         let summary = result.expect("Host-selected Team must complete");
-        assert!(summary
-            .final_answer
-            .contains("# Terminal review/synthesis"));
-        assert!(summary
-            .final_answer
-            .contains("bounded host-selected Team role completed"));
+        assert!(summary.final_answer.contains("# Terminal review/synthesis"));
+        assert!(
+            summary
+                .final_answer
+                .contains("bounded host-selected Team role completed")
+        );
         let mut team_terminal_streamed = false;
         while let Ok(event) = visible_events.try_recv() {
             let event = match event {
@@ -9166,13 +9165,13 @@ mod tests {
         assert!(calls.iter().all(|call| call.name == "read_file"));
         assert_eq!(calls[0].id, "runtime-focus-verify-7-0");
         assert!(calls[0].input.contains("fixtures/a.txt"));
-        assert!(focus_verification_tool_calls(&["workspace_change:src/lib.rs".into()], 1)
-            .is_none());
-        assert!(focus_verification_tool_calls(
-            &["verify_after_write:../outside.txt".into()],
-            1
-        )
-        .is_none());
+        assert!(
+            focus_verification_tool_calls(&["workspace_change:src/lib.rs".into()], 1).is_none()
+        );
+        assert!(
+            focus_verification_tool_calls(&["verify_after_write:../outside.txt".into()], 1)
+                .is_none()
+        );
     }
 
     #[test]
@@ -9247,17 +9246,19 @@ mod tests {
             "verify_upstream_change:fixtures/target.txt".to_string(),
             "verify_after_write:fixtures/owned.txt".to_string(),
         ]);
-        let instruction = upstream_verification_completion_instruction(&verified)
-            .expect("reviewer instruction");
+        let instruction =
+            upstream_verification_completion_instruction(&verified).expect("reviewer instruction");
 
         assert!(instruction.contains("fixtures/target.txt"));
         assert!(!instruction.contains("fixtures/owned.txt"));
         assert!(instruction.contains("independent exact-path read"));
         assert!(instruction.contains("Tools are now disabled"));
-        assert!(upstream_verification_completion_instruction(&BTreeSet::from([
-            "verify_after_write:fixtures/owned.txt".to_string(),
-        ]))
-        .is_none());
+        assert!(
+            upstream_verification_completion_instruction(&BTreeSet::from([
+                "verify_after_write:fixtures/owned.txt".to_string(),
+            ]))
+            .is_none()
+        );
     }
 
     #[test]
@@ -9272,9 +9273,11 @@ mod tests {
         )
         .expect("bounded exact reads");
         assert_eq!(calls.len(), 2);
-        assert!(calls
-            .iter()
-            .all(|call| { call.name == "read_file" && call.depends_on.is_empty() }));
+        assert!(
+            calls
+                .iter()
+                .all(|call| { call.name == "read_file" && call.depends_on.is_empty() })
+        );
         assert_eq!(calls[0].id, "runtime-eval-exact-read-9-0");
         assert!(calls[0].input.contains("fixtures/protected.txt"));
         assert!(calls[1].input.contains("fixtures/target.txt"));
@@ -9304,28 +9307,16 @@ mod tests {
             &["fixtures/target.txt".into()],
         ));
         assert!(post_write_exact_read_recovery_allowed(
-            3,
-            "read:.",
-            true,
-            true,
+            3, "read:.", true, true,
         ));
         assert!(!post_write_exact_read_recovery_allowed(
-            2,
-            "read:.",
-            true,
-            true,
+            2, "read:.", true, true,
         ));
         assert!(!post_write_exact_read_recovery_allowed(
-            3,
-            "read:src",
-            true,
-            true,
+            3, "read:src", true, true,
         ));
         assert!(!post_write_exact_read_recovery_allowed(
-            3,
-            "read:.",
-            true,
-            false,
+            3, "read:.", true, false,
         ));
         assert_eq!(
             required_mutation_tool_allowlist(),

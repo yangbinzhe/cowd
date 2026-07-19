@@ -3895,12 +3895,33 @@ impl RuntimeControlSnapshot {
     }
 
     pub fn ingest_runtime_control_plane(&mut self, value: &serde_json::Value) {
-        self.runtime_readiness = value
+        let readiness = value
             .pointer("/readiness/score")
             .or_else(|| value.pointer("/diagnostics/readiness_score"))
             .and_then(serde_json::Value::as_u64)
-            .map(|score| format!("{score}%"))
-            .or_else(|| Some("unknown".to_string()));
+            .map_or_else(|| "unknown".to_string(), |score| format!("{score}%"));
+        self.runtime_readiness = value
+            .pointer("/components/capacity/data")
+            .map(|data| {
+                let active = data
+                    .get("active")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let capacity = data
+                    .get("capacity")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let queued = data
+                    .get("queued")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let p95 = data
+                    .pointer("/run/p95_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                format!("{readiness} · cap {active}/{capacity} q{queued} p95 {p95}ms")
+            })
+            .or(Some(readiness));
         self.runtime_components = value
             .pointer("/diagnostics/component_count")
             .and_then(serde_json::Value::as_u64);
@@ -6076,6 +6097,24 @@ pub(crate) mod tests {
         assert_eq!(
             snapshot.connector_degraded_reasons[0],
             "resource directory unavailable"
+        );
+    }
+
+    #[test]
+    fn runtime_control_plane_projects_capacity_without_breaking_readiness() {
+        let mut snapshot = RuntimeControlSnapshot::from_gateway_snapshot(&gateway_snapshot());
+        snapshot.ingest_runtime_control_plane(&serde_json::json!({
+            "readiness": {"score": 93},
+            "components": {"capacity": {"data": {
+                "active": 7,
+                "capacity": 32,
+                "queued": 2,
+                "run": {"p95_ms": 41}
+            }}}
+        }));
+        assert_eq!(
+            snapshot.runtime_readiness.as_deref(),
+            Some("93% · cap 7/32 q2 p95 41ms")
         );
     }
 

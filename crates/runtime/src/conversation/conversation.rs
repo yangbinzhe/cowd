@@ -1401,6 +1401,9 @@ pub struct ConversationRuntime<C, T> {
     /// Per-turn ReadOnly admission. The process-wide permit is acquired in
     /// addition to this one for every category.
     default_semaphore: Arc<Semaphore>,
+    /// 普通 Conversation 与 ExecutionGraph 共享的 Provider admission owner。
+    /// Graph-owned child host 已由外层 node lease 覆盖，因此不会重复申请。
+    provider_admission: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
     /// Maximum duration for a single tool execution. `None` means no timeout.
     tool_timeout: Option<Duration>,
     /// Only the root user turn may turn an explicit team requirement into a
@@ -1652,6 +1655,7 @@ where
             default_semaphore: Arc::new(Semaphore::new(
                 crate::execution_scheduler::DEFAULT_PARALLEL_READ_CONCURRENCY,
             )),
+            provider_admission: None,
             tool_timeout: Some(Duration::from_secs(120)),
             explicit_team_escalation: true,
             model_step_limit_override: AtomicUsize::new(0),
@@ -1664,6 +1668,15 @@ where
     #[must_use]
     pub fn with_tool_timeout(mut self, timeout: Duration) -> Self {
         self.tool_timeout = Some(timeout);
+        self
+    }
+
+    #[must_use]
+    pub fn with_provider_admission(
+        mut self,
+        manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
+    ) -> Self {
+        self.provider_admission = Some(manager);
         self
     }
 
@@ -1897,10 +1910,7 @@ where
     /// Restrict exactly one provider request to an existing subset of tools.
     /// Tool discovery, authorization and resource ceilings remain authoritative;
     /// unknown names are omitted rather than activated.
-    pub(crate) fn require_next_model_tools(
-        &self,
-        tool_ids: impl IntoIterator<Item = String>,
-    ) {
+    pub(crate) fn require_next_model_tools(&self, tool_ids: impl IntoIterator<Item = String>) {
         if let Ok(mut allowlist) = self.next_model_tool_allowlist.lock() {
             *allowlist = Some(tool_ids.into_iter().collect());
         }
@@ -3549,8 +3559,9 @@ where
                 bootstrap: Default::default(),
                 active,
                 deferred,
-                reason: "governed focus checkpoint restricts the next action to required mutation tools"
-                    .to_string(),
+                reason:
+                    "governed focus checkpoint restricts the next action to required mutation tools"
+                        .to_string(),
                 revision: exposure.revision.saturating_add(1),
                 fallback_full: false,
             }
@@ -3728,6 +3739,23 @@ where
             let idle_timeout = transport_policy.idle_timeout;
             let heartbeat_grace = transport_policy.heartbeat_grace;
             let cancellation = self.cancellation_token.clone();
+            let provider_started = Instant::now();
+            let provider_lease = if let Some(manager) = &self.provider_admission {
+                let acquire = manager.acquire(
+                    crate::execution_core::graph::ExecutionResourceKind::Provider,
+                    Some(Duration::from_secs(30)),
+                );
+                Some(tokio::select! {
+                    () = cancellation.cancelled() => {
+                        return Err(RuntimeError::new("turn cancelled while waiting for provider capacity"));
+                    }
+                    lease = acquire => lease.map_err(|error| RuntimeError::new(format!(
+                        "provider capacity admission failed: {error}"
+                    )))?,
+                })
+            } else {
+                None
+            };
             let mut stream = self.api_client.stream(request);
             let mut text = String::new();
             let mut effective_model = None;
@@ -3838,6 +3866,14 @@ where
                 }
             }
             drop(stream);
+            if let Some(manager) = &self.provider_admission {
+                let _ = manager.observe_runtime_pressure(
+                    &crate::execution_core::graph::ExecutionResourceKind::Provider,
+                    provider_started.elapsed(),
+                    failed.is_some(),
+                );
+            }
+            drop(provider_lease);
             if let Some(reservation) = evaluation_reservation.as_mut() {
                 reservation.reconcile(usage);
             }
@@ -6630,10 +6666,7 @@ where
         // body size made even a tiny exact `read_file` JSON lose its `content`
         // field to head-tail truncation. Keep bounded headroom for the receipt
         // envelope while preserving the existing per-tool hard ceiling.
-        let requested = raw_tokens
-            .saturating_add(96)
-            .min(per_tool_limit)
-            .max(1);
+        let requested = raw_tokens.saturating_add(96).min(per_tool_limit).max(1);
         let granted = self
             .turn_context_ledger
             .lock()
@@ -7335,8 +7368,7 @@ where
         let requires_guarded_pattern = understanding.requires_write
             || matches!(
                 understanding.risk,
-                harness_contract::core::TaskRisk::High
-                    | harness_contract::core::TaskRisk::Critical
+                harness_contract::core::TaskRisk::High | harness_contract::core::TaskRisk::Critical
             );
         let pattern = match candidate {
             harness_contract::strategy::ExecutionCandidateKind::Direct => {
@@ -8519,8 +8551,7 @@ mod tests {
         ModelStepIntent, ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
         apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
         build_cc_memory_config_with_budget, deterministic_checkpoint_id,
-        eval_override_selection,
-        enforce_explicit_team_requirement, image_user_message_from_path,
+        enforce_explicit_team_requirement, eval_override_selection, image_user_message_from_path,
         is_runtime_team_orchestration_call, memory_project_id_for_session,
         model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
         provider_transport_policy, rate_per_second, required_team_orchestration_call,
@@ -8539,7 +8570,7 @@ mod tests {
         COWD_IDENTITY_CONTRACT_VERSION, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
         RuntimeBudgetPlan, SystemPromptBuilder, resolve_context_budget_tokens,
     };
-    use futures::stream::Stream;
+    use futures::{StreamExt, stream::Stream};
     use harness_contract::agent::{
         AgentBindingSnapshot, AgentCapability, AgentDataLease, AgentDefinitionId,
         AgentDefinitionRevisionRef, AgentExecutorPolicy, AgentInstanceRef, AgentModelPolicy,
@@ -8554,6 +8585,7 @@ mod tests {
     use std::fs;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn small_exact_tool_result_retains_content_after_receipt_envelope() {
@@ -8606,7 +8638,10 @@ mod tests {
         )
         .expect("judge override")
         .expect("judge selection");
-        assert_eq!(judge, (ExecutionCandidateKind::Direct, ExecutionPattern::Execute));
+        assert_eq!(
+            judge,
+            (ExecutionCandidateKind::Direct, ExecutionPattern::Execute)
+        );
 
         let business = eval_override_selection(
             "direct",
@@ -8615,7 +8650,10 @@ mod tests {
         )
         .expect("business override")
         .expect("business selection");
-        assert_eq!(business, (ExecutionCandidateKind::Direct, ExecutionPattern::Execute));
+        assert_eq!(
+            business,
+            (ExecutionCandidateKind::Direct, ExecutionPattern::Execute)
+        );
 
         let parallel = eval_override_selection(
             "parallel_tools",
@@ -8626,7 +8664,10 @@ mod tests {
         .expect("parallel selection");
         assert_eq!(
             parallel,
-            (ExecutionCandidateKind::ParallelTools, ExecutionPattern::Execute)
+            (
+                ExecutionCandidateKind::ParallelTools,
+                ExecutionPattern::Execute
+            )
         );
     }
 
@@ -8954,6 +8995,76 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct CapacityRecordingApi {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    impl ApiClient for CapacityRecordingApi {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let active_now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active_now, Ordering::SeqCst);
+            let active = Arc::clone(&self.active);
+            Box::pin(
+                futures::stream::once(async move {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(AssistantEvent::TextDelta("capacity answer".to_string()))
+                })
+                .chain(futures::stream::iter([Ok(AssistantEvent::MessageStop)])),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_conversations_share_one_provider_admission_owner() {
+        use crate::execution_core::graph::{
+            ExecutionResourceKind, ExecutionResourceManager, ResourceQuota,
+        };
+
+        let manager = Arc::new(ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 1, 1).unwrap(),
+        )]));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let runtime = |turn: &str| {
+            let runtime = ConversationRuntime::new(
+                Session::new(),
+                CapacityRecordingApi {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                },
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                SystemPromptBuilder::new().build(),
+            )
+            .without_memory()
+            .with_model_context_window(128_000)
+            .with_provider_admission(Arc::clone(&manager));
+            runtime
+                .begin_turn_strategy(turn, "answer with current evidence")
+                .unwrap();
+            runtime
+        };
+        let mut first = runtime("provider-capacity-1");
+        let mut second = runtime("provider-capacity-2");
+        let (first, second) = tokio::join!(
+            first.execute_model_step("answer with current evidence", true),
+            second.execute_model_step("answer with current evidence", true),
+        );
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        let snapshot = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
+        assert_eq!(snapshot.active_leases, 0);
+        assert_eq!(snapshot.queued_waiters, 0);
+    }
+
     #[tokio::test]
     async fn runtime_owns_fallback_attempts_and_repacks_each_candidate() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -9025,14 +9136,18 @@ mod tests {
 
         let requests = requests.lock().expect("requests");
         assert_eq!(requests.len(), 2);
-        assert!(requests.iter().all(|request| {
-            request.reasoning_effort_override.as_deref() == Some("none")
-        }));
-        assert!(runtime
-            .next_model_reasoning_effort
-            .lock()
-            .expect("reasoning effort")
-            .is_none());
+        assert!(
+            requests
+                .iter()
+                .all(|request| { request.reasoning_effort_override.as_deref() == Some("none") })
+        );
+        assert!(
+            runtime
+                .next_model_reasoning_effort
+                .lock()
+                .expect("reasoning effort")
+                .is_none()
+        );
     }
 
     #[derive(Clone)]
@@ -10323,10 +10438,7 @@ mod tests {
         assert_eq!(projections.len(), 2);
         assert!(projections[0].active_ids.is_empty());
         assert_eq!(projections[0].deferred_ids.len(), 3);
-        assert_eq!(
-            projections[1].active_ids,
-            vec!["ToolSearch", "grep_search"]
-        );
+        assert_eq!(projections[1].active_ids, vec!["ToolSearch", "grep_search"]);
         assert!(
             projections[1]
                 .deferred_ids
@@ -10390,21 +10502,27 @@ mod tests {
             projections[0].active_ids,
             vec!["edit_file".to_string(), "write_file".to_string()]
         );
-        assert!(!projections[0]
-            .active_ids
-            .contains(&"unknown_mutator".to_string()));
-        assert!(projections[0]
-            .deferred_ids
-            .contains(&"read_file".to_string()));
-        assert!(projections[1]
-            .active_ids
-            .contains(&"ToolSearch".to_string()));
-        assert!(projections[1]
-            .active_ids
-            .contains(&"read_file".to_string()));
-        assert!(projections[1]
-            .active_ids
-            .contains(&"grep_search".to_string()));
+        assert!(
+            !projections[0]
+                .active_ids
+                .contains(&"unknown_mutator".to_string())
+        );
+        assert!(
+            projections[0]
+                .deferred_ids
+                .contains(&"read_file".to_string())
+        );
+        assert!(
+            projections[1]
+                .active_ids
+                .contains(&"ToolSearch".to_string())
+        );
+        assert!(projections[1].active_ids.contains(&"read_file".to_string()));
+        assert!(
+            projections[1]
+                .active_ids
+                .contains(&"grep_search".to_string())
+        );
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
     }
 

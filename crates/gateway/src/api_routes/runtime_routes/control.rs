@@ -349,6 +349,7 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         capability_count,
         "runtime control plane inspected"
     );
+    let capacity = state.services.capacity.snapshot();
 
     Json(serde_json::json!({
         "kind": "runtime_control_plane",
@@ -400,6 +401,7 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             "blocked": blocked_checks,
         },
         "components": {
+            "capacity": capacity,
             "session": {
                 "status": if durable_session_store { "available" } else { "degraded" },
                 "durable_store": durable_session_store,

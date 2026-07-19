@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::{
-    http::{header, HeaderValue, StatusCode, Uri},
+    http::{HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -27,8 +27,8 @@ use crate::gateway::ActiveSessions;
 use crate::runtime_service::RuntimeService;
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
-use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
+use memory::cognitive::CognitiveContextManager;
 use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
 use runtime::{McpServerManager, RuntimeConfig};
 use surface::SurfaceManifest;
@@ -908,6 +908,13 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }),
     ));
     let config_reload = runtime_service.config_reload();
+    let capacity_config = config
+        .runtime_config
+        .as_ref()
+        .and_then(|value| value.pointer("/gateway/capacity"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     let services = Arc::new(crate::services::GatewayServices::new_with_session_manager(
         Arc::clone(&runtime_service),
         task_kernel.clone(),
@@ -917,6 +924,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         approval_repository,
         Arc::clone(&session_manager),
         &approval_dir,
+        capacity_config,
     ));
     let _cleanup_handle =
         spawn_session_cleanup_task(Arc::clone(&session_manager), Duration::from_secs(300));

@@ -34,6 +34,7 @@ pub(crate) struct GatewayHealthSnapshot {
     pub(crate) static_webui: StaticWebUiSource,
     pub(crate) runtime: GatewayRuntimeSnapshot,
     pub(crate) storage: StorageGatewaySnapshot,
+    pub(crate) capacity: crate::gateway_capacity::GatewayCapacitySnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +99,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         static_webui,
         runtime,
         storage,
+        capacity: state.services.capacity.snapshot(),
     }
 }
 
@@ -171,6 +173,9 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
     {
         degraded.push("storage.parent_not_writable".to_string());
     }
+    if health.capacity.status == "overloaded" {
+        degraded.push("capacity.data_lane_overloaded".to_string());
+    }
 
     let ready = degraded.is_empty();
     let optional_missing = if health.static_webui.available {
@@ -190,6 +195,7 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
             "session-kernel".to_string(),
             "event-bus".to_string(),
             "storage-registry".to_string(),
+            "capacity-controller".to_string(),
         ],
         optional: vec!["static-webui".to_string()],
         optional_missing,

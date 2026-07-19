@@ -711,13 +711,16 @@ async fn mfg_capability_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let permit = match state.services.mfg.acquire_blocking_permit().await {
+    let permit = match state.services.capacity.admit_blocking().await {
         Ok(permit) => permit,
-        Err(message) => {
+        Err(overload) => {
             return mfg_error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 app_mfg_contract::MfgErrorCode::Internal,
-                message,
+                format!(
+                    "MFG blocking capacity exhausted; retry after {} ms",
+                    overload.retry_after_ms
+                ),
                 true,
             );
         }

@@ -513,8 +513,7 @@ impl Default for CircuitBreakerConfig {
 
 // ── Compression Config ─────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CompressionConfig {
     #[serde(default)]
     pub micro: MicroCompactConfig,
@@ -780,13 +779,25 @@ impl Default for ExtractionConfig {
 // ---- Gateway configuration ----
 
 /// Multi-platform gateway configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GatewayConfig {
     pub enabled: bool,
     pub webui_dir: Option<PathBuf>,
     pub platforms: Vec<PlatformConfig>,
     pub session_reset: SessionResetPolicy,
+    pub capacity: GatewayCapacityConfig,
+}
+
+/// Gateway 容量 override。`None` 使用基于逻辑 CPU 的受控默认值；所有值
+/// 只从统一配置树读取，不接受分散环境变量覆盖。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GatewayCapacityConfig {
+    pub runtime_workers: Option<usize>,
+    pub control_requests: Option<usize>,
+    pub data_requests: Option<usize>,
+    pub stream_connections: Option<usize>,
+    pub blocking_requests: Option<usize>,
+    pub queue_timeout_ms: Option<u64>,
 }
 
 /// Configuration for a single inbound platform adapter.
@@ -798,7 +809,6 @@ pub struct PlatformConfig {
     /// Platform-specific JSON blob (opaque to the runtime core).
     pub extra: BTreeMap<String, JsonValue>,
 }
-
 
 /// Configuration for gate auto-fix behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1376,7 +1386,9 @@ fn yaml_to_json(value: serde_yaml::Value) -> Option<JsonValue> {
             // Prefer integer representation; fall back to rounded float.
             if let Some(i) = n.as_i64() {
                 Some(JsonValue::Number(i))
-            } else { n.as_f64().map(|f| JsonValue::Number(f as i64)) }
+            } else {
+                n.as_f64().map(|f| JsonValue::Number(f as i64))
+            }
         }
         serde_yaml::Value::String(s) => Some(JsonValue::String(s)),
         serde_yaml::Value::Sequence(seq) => {
@@ -2294,11 +2306,49 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
     } else {
         Vec::new()
     };
+    let capacity = if let Some(value) = gw.get("capacity") {
+        let value = expect_object(value, "merged settings.gateway.capacity")?;
+        GatewayCapacityConfig {
+            runtime_workers: optional_usize(
+                value,
+                "runtime_workers",
+                "merged settings.gateway.capacity",
+            )?,
+            control_requests: optional_usize(
+                value,
+                "control_requests",
+                "merged settings.gateway.capacity",
+            )?,
+            data_requests: optional_usize(
+                value,
+                "data_requests",
+                "merged settings.gateway.capacity",
+            )?,
+            stream_connections: optional_usize(
+                value,
+                "stream_connections",
+                "merged settings.gateway.capacity",
+            )?,
+            blocking_requests: optional_usize(
+                value,
+                "blocking_requests",
+                "merged settings.gateway.capacity",
+            )?,
+            queue_timeout_ms: optional_u64(
+                value,
+                "queue_timeout_ms",
+                "merged settings.gateway.capacity",
+            )?,
+        }
+    } else {
+        GatewayCapacityConfig::default()
+    };
     Ok(GatewayConfig {
         enabled,
         webui_dir,
         platforms,
         session_reset,
+        capacity,
     })
 }
 
@@ -3127,12 +3177,12 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
+        COWD_SETTINGS_SCHEMA_NAME, ConfigLoader, ConfigSource, DomainProfile, McpServerConfig,
+        McpTransport, ProviderProtocol, ResolvedPermissionMode, RuntimeConfig,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
         deep_merge_objects, parse_optional_compression_config,
         parse_optional_context_budget_config, parse_optional_model_context_windows,
-        parse_permission_mode_label, redact_serde_json, ConfigLoader, ConfigSource, DomainProfile,
-        McpServerConfig, McpTransport, ProviderProtocol, ResolvedPermissionMode, RuntimeConfig,
-        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
-        COWD_SETTINGS_SCHEMA_NAME,
+        parse_permission_mode_label, redact_serde_json,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -3192,9 +3242,11 @@ mod tests {
         let error = ConfigLoader::new(&cwd, &home)
             .load()
             .expect_err("config should fail");
-        assert!(error
-            .to_string()
-            .contains("top-level config value must be an object"));
+        assert!(
+            error
+                .to_string()
+                .contains("top-level config value must be an object")
+        );
 
         if root.exists() {
             fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -3256,16 +3308,20 @@ mod tests {
                 .len(),
             3
         );
-        assert!(loaded
-            .get("hooks")
-            .and_then(JsonValue::as_object)
-            .expect("hooks object")
-            .contains_key("PreToolUse"));
-        assert!(loaded
-            .get("hooks")
-            .and_then(JsonValue::as_object)
-            .expect("hooks object")
-            .contains_key("PostToolUse"));
+        assert!(
+            loaded
+                .get("hooks")
+                .and_then(JsonValue::as_object)
+                .expect("hooks object")
+                .contains_key("PreToolUse")
+        );
+        assert!(
+            loaded
+                .get("hooks")
+                .and_then(JsonValue::as_object)
+                .expect("hooks object")
+                .contains_key("PostToolUse")
+        );
         assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
         assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
         assert_eq!(
@@ -3925,9 +3981,11 @@ approval:
             .expect_err("config should fail");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("mcpServers.broken: missing string field url"));
+        assert!(
+            error
+                .to_string()
+                .contains("mcpServers.broken: missing string field url")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -4499,9 +4557,11 @@ gateway:
 
         let invalid = JsonValue::parse(r#"{"model_context_windows":{"broken":1023}}"#)
             .expect("json should parse");
-        assert!(parse_optional_model_context_windows(&invalid)
-            .expect_err("sub-1024 context window must fail validation")
-            .to_string()
-            .contains("at least 1024"));
+        assert!(
+            parse_optional_model_context_windows(&invalid)
+                .expect_err("sub-1024 context window must fail validation")
+                .to_string()
+                .contains("at least 1024")
+        );
     }
 }

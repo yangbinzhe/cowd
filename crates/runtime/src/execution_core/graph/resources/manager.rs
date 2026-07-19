@@ -78,11 +78,23 @@ pub struct ExecutionResourceSnapshot {
     pub effective_limit: usize,
     pub active_leases: usize,
     pub queued_waiters: usize,
+    pub queue_wait: ResourceLatencySnapshot,
+    pub run: ResourceLatencySnapshot,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceLatencySnapshot {
+    pub samples: usize,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+    pub max_ms: u64,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ResourceAcquireError {
-    #[error("invalid quota: expected 0 < minimum <= target <= maximum, got {minimum}/{target}/{maximum}")]
+    #[error(
+        "invalid quota: expected 0 < minimum <= target <= maximum, got {minimum}/{target}/{maximum}"
+    )]
     InvalidQuota {
         minimum: usize,
         target: usize,
@@ -105,7 +117,11 @@ struct ResourceState {
     effective_limit: usize,
     active: HashMap<Uuid, Instant>,
     waiters: VecDeque<Uuid>,
+    queue_wait_ms: VecDeque<u64>,
+    run_ms: VecDeque<u64>,
 }
+
+const LATENCY_SAMPLE_CAPACITY: usize = 256;
 
 #[derive(Debug, Default)]
 struct ManagerState {
@@ -115,7 +131,15 @@ struct ManagerState {
 #[derive(Debug, Default)]
 struct Shared {
     state: Mutex<ManagerState>,
+    adaptive: Mutex<HashMap<ExecutionResourceKind, AdaptiveState>>,
     changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct AdaptiveState {
+    pressure_streak: u8,
+    healthy_streak: u8,
+    last_adjustment: Option<Instant>,
 }
 
 /// Instance-owned dynamic quota and backpressure manager.
@@ -136,6 +160,8 @@ impl ExecutionResourceManager {
                         effective_limit: quota.target,
                         active: HashMap::new(),
                         waiters: VecDeque::new(),
+                        queue_wait_ms: VecDeque::new(),
+                        run_ms: VecDeque::new(),
                     },
                 )
             })
@@ -143,6 +169,7 @@ impl ExecutionResourceManager {
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(ManagerState { resources }),
+                adaptive: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
             }),
         }
@@ -176,6 +203,69 @@ impl ExecutionResourceManager {
         };
         self.shared.changed.notify_waiters();
         Ok(snapshot)
+    }
+
+    /// Feed real queue/run/error observations into the existing quota owner.
+    /// Three consecutive pressure samples lower capacity; eight healthy samples
+    /// raise it. A five-second cooldown prevents request-by-request oscillation.
+    pub fn observe_runtime_pressure(
+        &self,
+        kind: &ExecutionResourceKind,
+        latency: Duration,
+        failed: bool,
+    ) -> Result<ExecutionResourceSnapshot, ResourceAcquireError> {
+        let snapshot = self.snapshot(kind)?;
+        let saturation = if snapshot.effective_limit == 0 {
+            1.0
+        } else {
+            (snapshot.active_leases + snapshot.queued_waiters) as f32
+                / snapshot.effective_limit as f32
+        }
+        .clamp(0.0, 1.0);
+        let latency_pressure = (latency.as_secs_f32() / 60.0).clamp(0.0, 1.0);
+        let pressured = failed || saturation >= 1.0 || latency_pressure >= 0.5;
+        let healthy = !failed && snapshot.queued_waiters == 0 && latency_pressure < 0.15;
+        let adjustment = {
+            let mut states = self
+                .shared
+                .adaptive
+                .lock()
+                .map_err(|_| ResourceAcquireError::Poisoned)?;
+            let state = states.entry(kind.clone()).or_default();
+            if pressured {
+                state.pressure_streak = state.pressure_streak.saturating_add(1);
+                state.healthy_streak = 0;
+            } else if healthy {
+                state.healthy_streak = state.healthy_streak.saturating_add(1);
+                state.pressure_streak = 0;
+            } else {
+                state.pressure_streak = 0;
+                state.healthy_streak = 0;
+            }
+            let cooldown_ready = state
+                .last_adjustment
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5));
+            let pressure = if cooldown_ready && state.pressure_streak >= 3 {
+                state.pressure_streak = 0;
+                Some(ResourcePressure {
+                    saturation,
+                    failure_rate: if failed { 1.0 } else { 0.0 },
+                    latency_pressure,
+                })
+            } else if cooldown_ready && state.healthy_streak >= 8 {
+                state.healthy_streak = 0;
+                Some(ResourcePressure::HEALTHY)
+            } else {
+                None
+            };
+            if pressure.is_some() {
+                state.last_adjustment = Some(Instant::now());
+            }
+            pressure
+        };
+        adjustment.map_or(Ok(snapshot), |pressure| {
+            self.observe_pressure(kind, pressure)
+        })
     }
 
     /// Replace quota bounds. Running leases are never cancelled when shrinking.
@@ -244,6 +334,7 @@ impl ExecutionResourceManager {
                 let is_front = state.waiters.front().copied() == Some(waiter_id);
                 if is_front && state.active.len() < state.effective_limit {
                     state.waiters.pop_front();
+                    observe_latency(&mut state.queue_wait_ms, duration_millis(started.elapsed()));
                     state.active.insert(waiter_id, Instant::now());
                     true
                 } else {
@@ -339,7 +430,9 @@ impl ExecutionResourceLease {
         }
         if let Ok(mut guard) = self.shared.state.lock() {
             if let Some(state) = guard.resources.get_mut(&self.kind) {
-                state.active.remove(&self.lease_id);
+                if let Some(started) = state.active.remove(&self.lease_id) {
+                    observe_latency(&mut state.run_ms, duration_millis(started.elapsed()));
+                }
             }
         }
         self.released = true;
@@ -383,6 +476,32 @@ fn snapshot_for(kind: ExecutionResourceKind, state: &ResourceState) -> Execution
         effective_limit: state.effective_limit,
         active_leases: state.active.len(),
         queued_waiters: state.waiters.len(),
+        queue_wait: latency_snapshot(&state.queue_wait_ms),
+        run: latency_snapshot(&state.run_ms),
+    }
+}
+
+fn observe_latency(values: &mut VecDeque<u64>, value: u64) {
+    if values.len() == LATENCY_SAMPLE_CAPACITY {
+        values.pop_front();
+    }
+    values.push_back(value);
+}
+
+fn latency_snapshot(values: &VecDeque<u64>) -> ResourceLatencySnapshot {
+    let mut sorted = values.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let percentile = |numerator: usize| {
+        sorted
+            .get((sorted.len().saturating_sub(1) * numerator) / 100)
+            .copied()
+            .unwrap_or_default()
+    };
+    ResourceLatencySnapshot {
+        samples: sorted.len(),
+        p50_ms: percentile(50),
+        p95_ms: percentile(95),
+        max_ms: sorted.last().copied().unwrap_or_default(),
     }
 }
 
@@ -399,6 +518,42 @@ mod tests {
             ExecutionResourceKind::Tool,
             ResourceQuota::new(1, limit, limit).unwrap(),
         )])
+    }
+
+    #[test]
+    fn runtime_pressure_uses_streak_and_cooldown_instead_of_oscillating() {
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 4, 4).unwrap(),
+        )]);
+        for _ in 0..2 {
+            let snapshot = manager
+                .observe_runtime_pressure(
+                    &ExecutionResourceKind::Provider,
+                    Duration::from_secs(60),
+                    true,
+                )
+                .unwrap();
+            assert_eq!(snapshot.effective_limit, 4);
+        }
+        let pressured = manager
+            .observe_runtime_pressure(
+                &ExecutionResourceKind::Provider,
+                Duration::from_secs(60),
+                true,
+            )
+            .unwrap();
+        assert!(pressured.effective_limit < 4);
+        for _ in 0..16 {
+            let stable = manager
+                .observe_runtime_pressure(
+                    &ExecutionResourceKind::Provider,
+                    Duration::from_millis(1),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(stable.effective_limit, pressured.effective_limit);
+        }
     }
 
     #[tokio::test]
@@ -487,5 +642,21 @@ mod tests {
                 .queued_waiters,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn snapshots_report_bounded_queue_and_run_latency() {
+        let manager = manager(1);
+        for _ in 0..(LATENCY_SAMPLE_CAPACITY + 20) {
+            drop(
+                manager
+                    .acquire(ExecutionResourceKind::Tool, None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let snapshot = manager.snapshot(&ExecutionResourceKind::Tool).unwrap();
+        assert_eq!(snapshot.queue_wait.samples, LATENCY_SAMPLE_CAPACITY);
+        assert_eq!(snapshot.run.samples, LATENCY_SAMPLE_CAPACITY);
     }
 }
