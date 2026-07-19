@@ -77,6 +77,7 @@ impl harness_eval::DefinitionEvolutionScenarioExecutor for GatewayEvolutionScena
 struct AuthBrokerProcess {
     child: Child,
     socket_path: PathBuf,
+    socket_identity: Option<(u64, u64)>,
 }
 
 impl AuthBrokerProcess {
@@ -116,7 +117,12 @@ impl AuthBrokerProcess {
         let client = auth_broker::BrokerClient::new(&socket_path);
         for _ in 0..40 {
             if client.trust_metadata().is_ok() {
-                return Ok(Self { child, socket_path });
+                let socket_identity = socket_file_identity(&socket_path);
+                return Ok(Self {
+                    child,
+                    socket_path,
+                    socket_identity,
+                });
             }
             if let Some(status) = child
                 .try_wait()
@@ -134,7 +140,27 @@ impl AuthBrokerProcess {
     fn shutdown(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = std::fs::remove_file(&self.socket_path);
+        remove_socket_if_owned(&self.socket_path, self.socket_identity);
+    }
+}
+
+#[cfg(unix)]
+fn socket_file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn socket_file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+fn remove_socket_if_owned(path: &Path, expected: Option<(u64, u64)>) {
+    if expected.is_some() && socket_file_identity(path) == expected {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1180,6 +1206,26 @@ mod tests {
         assert!(config.memory_config.is_none());
         assert!(config.surface_configs.is_empty());
         assert!(config.auth_token.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_cleanup_never_unlinks_a_new_socket_generation() {
+        use std::os::unix::net::UnixListener;
+
+        let root = temp_webui_dir("broker-socket-generation");
+        let socket = root.join("broker.sock");
+        let old_listener = UnixListener::bind(&socket).expect("old broker socket");
+        let old_identity = socket_file_identity(&socket);
+        drop(old_listener);
+        fs::remove_file(&socket).expect("replace old broker socket");
+        let new_listener = UnixListener::bind(&socket).expect("new broker socket");
+
+        remove_socket_if_owned(&socket, old_identity);
+
+        assert!(socket.exists(), "old broker cleanup removed the new socket");
+        drop(new_listener);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
