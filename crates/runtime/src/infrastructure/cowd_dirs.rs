@@ -66,6 +66,7 @@ pub const AGENTS_DIR: &str = "agents";
 pub const SKILLS_DIR: &str = "skills";
 pub const PLUGINS_DIR: &str = "plugins";
 pub const CREDENTIALS_DIR: &str = "credentials";
+pub const TOOLS_DIR: &str = "tools";
 pub const WORKER_STATE_FILE: &str = "worker-state.json";
 
 // ── Session paths ──
@@ -148,6 +149,39 @@ pub fn user_agents_dir() -> PathBuf {
 /// User-level skills: `~/.cowd/skills/`
 pub fn user_skills_dir() -> PathBuf {
     config_home_dir().join(SKILLS_DIR)
+}
+
+/// Cowd 自有的第三方工具安装根；与 Agent/Codex 的技能目录隔离。
+pub fn user_tools_dir() -> PathBuf {
+    config_home_dir().join(TOOLS_DIR)
+}
+
+/// Cowd 工具根中允许参与命令解析的目录。
+pub fn user_tool_bin_dirs() -> Vec<PathBuf> {
+    let root = user_tools_dir();
+    [root.join("bin"), root.join("node_modules").join(".bin")]
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
+/// 把已安装的 Cowd 自有工具前置到进程 PATH。
+///
+/// Gateway 子进程会继承该 PATH；hardened sandbox 仍使用独立的显式只读挂载，
+/// 不会因为这里的进程环境变化而暴露用户配置目录。
+pub fn prepend_user_tool_bins_to_path() -> std::io::Result<()> {
+    let tool_bins = user_tool_bin_dirs();
+    if tool_bins.is_empty() {
+        return Ok(());
+    }
+    let current = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let merged = tool_bins.into_iter().chain(current).collect::<Vec<_>>();
+    let value = std::env::join_paths(merged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    std::env::set_var("PATH", value);
+    Ok(())
 }
 
 /// User-level plugins: `~/.cowd/plugins/`

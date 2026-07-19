@@ -544,6 +544,52 @@ fn assemble_mcp_tool_state(
 fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         RuntimeToolDefinition {
+            name: "lark_cli_read".to_string(),
+            description: Some(
+                "Run an official Lark CLI read-only command with the active Cowd Feishu/Lark bot configuration. Pass argv entries after `lark-cli`; Cowd resolves a short-lived tenant token, verifies the CLI-declared risk, isolates credentials, applies timeout/output limits, and redacts secrets. Use this for interactive Lark/Feishu inspection and Base/Bitable reads selected by a lark-* Skill.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 96,
+                        "description": "Official lark-cli arguments excluding the executable name, for example [\"im\", \"+chat-list\", \"--as\", \"bot\"]."
+                    },
+                    "brand": { "type": "string", "enum": ["auto", "feishu", "lark"] },
+                    "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 180000 }
+                },
+                "required": ["args"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+        },
+        RuntimeToolDefinition {
+            name: "lark_cli_write".to_string(),
+            description: Some(
+                "Run an official Lark CLI mutating command with the active Cowd Feishu/Lark bot configuration. Cowd verifies the CLI-declared write risk and routes execution through the DangerFullAccess approval/effect fence; credentials remain gateway-owned and are never supplied by the model. Use only when a selected lark-* Skill requires a real create, update, delete, or send operation.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "args": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "maxItems": 96,
+                        "description": "Official lark-cli arguments excluding the executable name."
+                    },
+                    "brand": { "type": "string", "enum": ["auto", "feishu", "lark"] },
+                    "timeout_ms": { "type": "integer", "minimum": 1000, "maximum": 180000 }
+                },
+                "required": ["args"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::DangerFullAccess,
+        },
+        RuntimeToolDefinition {
             name: "runtime_config_view".to_string(),
             description: Some(
                 "Return a read-only, redacted view of the active model route, context window, permission mode, provider protocol, and runtime policy. Use only when configuration or provider behavior is relevant; secrets, headers, environment values, and configuration paths are never returned.".to_string(),
@@ -782,6 +828,21 @@ mod tests {
     #[test]
     fn runtime_capability_tool_is_always_registered_as_readonly() {
         let tools = runtime_capability_tool_definitions();
+
+        let lark_read = tools
+            .iter()
+            .find(|tool| tool.name == "lark_cli_read")
+            .expect("Lark read tool");
+        assert_eq!(lark_read.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(lark_read.input_schema["required"][0], "args");
+        let lark_write = tools
+            .iter()
+            .find(|tool| tool.name == "lark_cli_write")
+            .expect("Lark write tool");
+        assert_eq!(
+            lark_write.required_permission,
+            ToolPermissionMode::DangerFullAccess
+        );
 
         let capability_tool = tools
             .iter()

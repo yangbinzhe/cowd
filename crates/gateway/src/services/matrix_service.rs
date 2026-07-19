@@ -1076,6 +1076,17 @@ mod tests {
             .list_data_plane_watermarks(&config_home, 10)
             .expect("watermarks")
             .is_empty());
+        let restored = service
+            .connector_source_watermark(
+                &config_home,
+                &batch.adapter_id,
+                &batch.resource_ref,
+                batch.table.as_deref(),
+            )
+            .expect("restore connector watermark")
+            .expect("committed connector watermark");
+        assert_eq!(restored.revision, 1);
+        assert_eq!(restored.resource_ref, batch.resource_ref);
         let _ = std::fs::remove_dir_all(config_home);
     }
 }

@@ -1375,6 +1375,10 @@ pub struct ConversationRuntime<C, T> {
         std::sync::Mutex<Option<crate::execution_core::TurnStrategyDecisionState>>,
     /// Revisioned tool set visible to the next provider request.
     tool_exposure_state: std::sync::Mutex<Option<ToolExposureState>>,
+    /// Tools coupled to the PromptOnly Skill selected for the active turn.
+    /// Runtime folds these into the first provider exposure so Skill guidance
+    /// and its executable capability arrive atomically.
+    active_skill_tool_refs: std::sync::Mutex<BTreeSet<String>>,
     /// Provider visibility changes must be monotonically ordered. A governed
     /// text-only checkpoint temporarily withdraws every schema; the next
     /// normal model step must be able to restore the catalog rather than be
@@ -1634,6 +1638,7 @@ where
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
             active_turn_strategy: std::sync::Mutex::new(None),
             tool_exposure_state: std::sync::Mutex::new(None),
+            active_skill_tool_refs: std::sync::Mutex::new(BTreeSet::new()),
             tool_exposure_revision: AtomicU64::new(0),
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
@@ -1828,6 +1833,9 @@ where
     }
 
     async fn activate_skills_for_turn(&self, user_input: &str) -> Result<(), RuntimeError> {
+        if let Ok(mut tool_refs) = self.active_skill_tool_refs.lock() {
+            tool_refs.clear();
+        }
         if self.skill_profiles.is_empty() {
             return Ok(());
         }
@@ -1848,6 +1856,9 @@ where
                 .iter()
                 .find(|asset| asset.skill_id == invocation.skill_id)
             {
+                if let Ok(mut tool_refs) = self.active_skill_tool_refs.lock() {
+                    tool_refs.extend(asset.tool_refs.iter().cloned());
+                }
                 let mut item = ContextItem::new(
                     format!(
                         "runtime-skill:{}:{}",
@@ -3508,7 +3519,7 @@ where
             .iter()
             .map(|descriptor| descriptor.canonical_id.clone())
             .collect::<Vec<_>>();
-        let exposure = if first_step {
+        let mut exposure = if first_step {
             tool_exposure_for_catalog(
                 &discovery,
                 contract_permission_mode(self.permission_policy.active_mode()),
@@ -3526,6 +3537,32 @@ where
                     )
                 })
         };
+        let active_skill_tool_refs = self
+            .active_skill_tool_refs
+            .lock()
+            .map(|tool_refs| tool_refs.clone())
+            .unwrap_or_default();
+        if !active_skill_tool_refs.is_empty() {
+            let mut skill_discovery = discovery.clone();
+            skill_discovery.activation_candidates = active_skill_tool_refs.into_iter().collect();
+            let allowed_ids = exposure
+                .bootstrap
+                .iter()
+                .chain(exposure.active.iter())
+                .chain(exposure.deferred.iter())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let policy = ToolExposurePolicy {
+                allowed_ids,
+                maximum_permission: contract_permission_mode(self.permission_policy.active_mode()),
+                supports_dynamic_exposure: true,
+            };
+            let activation = ToolExposurePlanner.activate(&mut exposure, &skill_discovery, &policy);
+            tracing::info!(
+                activated = ?activation.activated_ids().collect::<Vec<_>>(),
+                "runtime Skill tool references applied to the current provider request"
+            );
+        }
         let one_shot_tool_overlay = one_shot_tool_allowlist.is_some();
         let mut exposure = if text_only_response || explicitly_forbids_tool_use {
             ToolExposureState {
@@ -10173,18 +10210,34 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct PromptRecordingApi(Arc<std::sync::Mutex<Vec<ApiRequest>>>);
+    struct PromptRecordingApi {
+        requests: Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+        projections: Arc<std::sync::Mutex<Vec<harness_contract::tool::ToolExposureProjection>>>,
+    }
 
     impl ApiClient for PromptRecordingApi {
         fn stream(
             &mut self,
             request: ApiRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
-            self.0.lock().expect("request recorder").push(request);
+            self.requests
+                .lock()
+                .expect("request recorder")
+                .push(request);
             Box::pin(futures::stream::iter(vec![
                 Ok(AssistantEvent::TextDelta("skill-aware result".to_string())),
                 Ok(AssistantEvent::MessageStop),
             ]))
+        }
+
+        fn configure_tool_exposure(
+            &mut self,
+            projection: harness_contract::tool::ToolExposureProjection,
+        ) {
+            self.projections
+                .lock()
+                .expect("projection recorder")
+                .push(projection);
         }
     }
 
@@ -10213,6 +10266,7 @@ mod tests {
             .await
             .unwrap();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
         let profile = SkillCapabilityProfile {
             skill_id: "release-evidence".to_string(),
             name: "Release Evidence".to_string(),
@@ -10234,8 +10288,11 @@ mod tests {
         };
         let mut runtime = ConversationRuntime::new(
             session,
-            PromptRecordingApi(Arc::clone(&requests)),
-            StaticToolExecutor::new(),
+            PromptRecordingApi {
+                requests: Arc::clone(&requests),
+                projections: Arc::clone(&projections),
+            },
+            StaticToolExecutor::new().register("lark_cli_read", |_| Ok("{}".to_string())),
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         )
@@ -10251,6 +10308,7 @@ mod tests {
             version: Some("1.0.0".to_string()),
             content: "Require release evidence before accepting completion.".to_string(),
             source_ref: "skill://release-evidence/SKILL.md".to_string(),
+            tool_refs: vec!["lark_cli_read".to_string()],
         }]);
         runtime.model = Some("test-model".to_string());
         runtime
@@ -10281,6 +10339,15 @@ mod tests {
         assert!(
             rendered_prompt(&requests[0].prompt)
                 .contains("Require release evidence before accepting completion.")
+        );
+        let projections = projections.lock().expect("projection recorder");
+        assert_eq!(projections.len(), 1);
+        assert!(
+            projections[0]
+                .active_ids
+                .iter()
+                .any(|tool| tool == "lark_cli_read"),
+            "the selected Skill tool must be visible in its first provider request"
         );
     }
 

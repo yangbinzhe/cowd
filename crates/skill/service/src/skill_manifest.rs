@@ -100,6 +100,22 @@ pub struct SkillPrerequisites {
     pub commands: Option<Vec<String>>,
 }
 
+/// Common Agent Skills metadata used by upstream skill packages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillPackageMetadata {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requires: Option<SkillPackageRequires>,
+}
+
+/// External runtime requirements declared as `metadata.requires`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillPackageRequires {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bins: Option<Vec<String>>,
+}
+
 /// Hermes-specific metadata
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillHermesMetadata {
@@ -177,6 +193,11 @@ pub struct SkillManifest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prerequisites: Option<SkillPrerequisites>,
+
+    /// Upstream Agent Skills compatible dependency declaration.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<SkillPackageMetadata>,
 
     /// Hermes-specific metadata
     #[serde(rename = "hermes")]
@@ -332,6 +353,7 @@ fn parse_enhanced_manifest(
         || obj.contains_key(serde_yaml::Value::String("conditions".into()))
         || obj.contains_key(serde_yaml::Value::String("config".into()))
         || obj.contains_key(serde_yaml::Value::String("prerequisites".into()))
+        || obj.contains_key(serde_yaml::Value::String("metadata".into()))
         || obj.contains_key(serde_yaml::Value::String("platforms".into()))
         || obj.contains_key(serde_yaml::Value::String("version".into()))
         || obj.contains_key(serde_yaml::Value::String("tags".into()))
@@ -454,6 +476,18 @@ fn parse_enhanced_manifest(
                 }),
         });
 
+    let metadata = obj
+        .get(serde_yaml::Value::String("metadata".into()))
+        .and_then(|value| value.as_mapping())
+        .map(|metadata| SkillPackageMetadata {
+            requires: metadata
+                .get(serde_yaml::Value::String("requires".into()))
+                .and_then(|value| value.as_mapping())
+                .map(|requires| SkillPackageRequires {
+                    bins: get_string_list_from_map(requires, "bins"),
+                }),
+        });
+
     Ok(Some(SkillManifest {
         name,
         description,
@@ -466,6 +500,7 @@ fn parse_enhanced_manifest(
         conditions,
         config,
         prerequisites,
+        metadata,
         hermes_metadata,
     }))
 }
@@ -622,13 +657,8 @@ pub fn check_prerequisites(
     env_vars: &HashMap<String, String>,
     available_commands: &[String],
 ) -> PrerequisitesCheck {
-    let prereqs = match &parsed.manifest {
-        Some(m) => m.prerequisites.as_ref(),
-        None => return PrerequisitesCheck::Met,
-    };
-
-    let prereqs = match prereqs {
-        Some(p) => p,
+    let manifest = match &parsed.manifest {
+        Some(manifest) => manifest,
         None => return PrerequisitesCheck::Met,
     };
 
@@ -636,7 +666,11 @@ pub fn check_prerequisites(
     let mut missing_commands = Vec::new();
 
     // Check env vars
-    if let Some(required) = &prereqs.env_vars {
+    if let Some(required) = manifest
+        .prerequisites
+        .as_ref()
+        .and_then(|prerequisites| prerequisites.env_vars.as_ref())
+    {
         for var in required {
             if !env_vars.contains_key(var) {
                 missing_env_vars.push(var.clone());
@@ -645,13 +679,28 @@ pub fn check_prerequisites(
     }
 
     // Check commands
-    if let Some(required) = &prereqs.commands {
-        for cmd in required {
-            if !available_commands.iter().any(|c| c == cmd) {
-                missing_commands.push(cmd.clone());
-            }
+    let commands = manifest
+        .prerequisites
+        .as_ref()
+        .and_then(|prerequisites| prerequisites.commands.as_ref())
+        .into_iter()
+        .flatten()
+        .chain(
+            manifest
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.requires.as_ref())
+                .and_then(|requires| requires.bins.as_ref())
+                .into_iter()
+                .flatten(),
+        );
+    for cmd in commands {
+        if !available_commands.iter().any(|available| available == cmd) {
+            missing_commands.push(cmd.clone());
         }
     }
+    missing_commands.sort();
+    missing_commands.dedup();
 
     if missing_env_vars.is_empty() && missing_commands.is_empty() {
         PrerequisitesCheck::Met
@@ -801,5 +850,33 @@ Body
         assert!(matches_platform(&parsed, "darwin"));
         assert!(matches_platform(&parsed, "linux"));
         assert!(!matches_platform(&parsed, "windows"));
+    }
+
+    #[test]
+    fn official_metadata_bins_are_checked_as_command_prerequisites() {
+        let content = r#"---
+name: lark-base
+description: Official Lark Base skill
+metadata:
+  requires:
+    bins: ["lark-cli"]
+  cliHelp: "lark-cli base --help"
+---
+
+Use lark-cli base commands.
+"#;
+        let parsed = parse_skill_content(content).unwrap();
+
+        assert_eq!(
+            check_prerequisites(&parsed, &HashMap::new(), &[]),
+            PrerequisitesCheck::Missing {
+                env_vars: Vec::new(),
+                commands: vec!["lark-cli".to_string()],
+            }
+        );
+        assert_eq!(
+            check_prerequisites(&parsed, &HashMap::new(), &["lark-cli".to_string()]),
+            PrerequisitesCheck::Met
+        );
     }
 }

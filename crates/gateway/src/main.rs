@@ -44,6 +44,8 @@ mod gateway_static;
 mod gateway_storage;
 #[path = "runtime/gateway_tool_executor.rs"]
 mod gateway_tool_executor;
+#[path = "runtime/lark_cli_tool.rs"]
+mod lark_cli_tool;
 #[path = "core/init.rs"]
 mod init;
 #[path = "core/logging.rs"]

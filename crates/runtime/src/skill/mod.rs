@@ -49,6 +49,10 @@ pub struct RuntimeSkillPromptAsset {
     pub version: Option<String>,
     pub content: String,
     pub source_ref: String,
+    /// Runtime-native tools that must be exposed in the same model step as
+    /// this PromptOnly Skill. Unknown or policy-ineligible tools fail closed.
+    #[serde(default)]
+    pub tool_refs: Vec<String>,
 }
 
 /// Runtime-owned snapshot of inspected Skill capabilities and bounded

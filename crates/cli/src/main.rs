@@ -10,6 +10,9 @@
 
 fn main() -> std::process::ExitCode {
     sandbox_launcher::register_cowd_process_host();
+    if let Err(error) = runtime::cowd_dirs::prepend_user_tool_bins_to_path() {
+        eprintln!("warning: failed to activate Cowd tool path: {error}");
+    }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if let Some(status) = cli::dispatch_internal_process(&args) {
         return status;

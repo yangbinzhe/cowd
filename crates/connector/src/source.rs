@@ -14,6 +14,23 @@ pub use surface::{
 const DEFAULT_BATCH_LIMIT: usize = 100;
 const MAX_BATCH_LIMIT: usize = 1_000;
 
+/// Return a stable, non-secret identity for an external source resource.
+/// Database credentials are transport inputs, not durable Matrix identity.
+#[must_use]
+pub fn canonical_source_resource_ref(resource_ref: &str) -> String {
+    let Some((scheme, tail)) = resource_ref.split_once("://") else {
+        return resource_ref.to_string();
+    };
+    let Some((userinfo, rest)) = tail.rsplit_once('@') else {
+        return resource_ref.to_string();
+    };
+    if userinfo.is_empty() {
+        resource_ref.to_string()
+    } else {
+        format!("{scheme}://***:***@{rest}")
+    }
+}
+
 fn bounded_limit(plan: &SourceReadPlan) -> usize {
     plan.limit
         .unwrap_or(DEFAULT_BATCH_LIMIT)
@@ -603,6 +620,24 @@ mod tests {
         assert!(ids.contains(&"mariadb".to_string()));
         assert!(ids.contains(&"feishu_bitable".to_string()));
         assert!(ids.contains(&"lark_bitable".to_string()));
+    }
+
+    #[test]
+    fn canonical_database_resource_ref_removes_credentials_but_keeps_identity() {
+        assert_eq!(
+            canonical_source_resource_ref(
+                "postgres://reader:secret@127.0.0.1:5432/orders?sslmode=disable"
+            ),
+            "postgres://***:***@127.0.0.1:5432/orders?sslmode=disable"
+        );
+        assert_eq!(
+            canonical_source_resource_ref("file:///tmp/orders.csv"),
+            "file:///tmp/orders.csv"
+        );
+        assert_eq!(
+            canonical_source_resource_ref("postgres://reader@127.0.0.1/orders"),
+            "postgres://***:***@127.0.0.1/orders"
+        );
     }
 
     #[test]

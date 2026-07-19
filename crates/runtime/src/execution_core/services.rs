@@ -3411,6 +3411,7 @@ mod tests {
                 version: Some("1.0.0".to_string()),
                 content: "Review evidence before returning.".to_string(),
                 source_ref: "skill://delegated-review/SKILL.md".to_string(),
+                tool_refs: Vec::new(),
             }],
         ));
 

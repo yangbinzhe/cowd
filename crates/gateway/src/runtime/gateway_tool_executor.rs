@@ -5,6 +5,9 @@ use serde::Deserialize;
 use tools::permissions::PermissionMode as ToolPermissionMode;
 use tools::{ToolHost, ToolHostSnapshot};
 
+use crate::lark_cli_tool::{
+    LarkCliToolMode, LarkCliToolRequest, execute_lark_cli_tool,
+};
 use crate::runtime_bootstrap::{GatewayToolRegistry, RuntimeMcpState};
 use crate::{AllowedToolSet, format_tool_result};
 
@@ -70,6 +73,8 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
             | "MCPTool"
             | "ListMcpResourcesTool"
             | "ReadMcpResourceTool"
+            | "lark_cli_read"
+            | "lark_cli_write"
     )
 }
 
@@ -225,6 +230,24 @@ impl GatewayToolExecutor {
         value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        if matches!(tool_name, "lark_cli_read" | "lark_cli_write") {
+            let input: LarkCliToolRequest = serde_json::from_value(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            let workspace_root = std::env::current_dir().map_err(|error| {
+                ToolError::new(format!("resolve workspace for Lark CLI tool: {error}"))
+            })?;
+            let config = ConfigLoader::default_for(&workspace_root)
+                .load()
+                .map_err(|error| {
+                    ToolError::new(format!("load active runtime configuration: {error}"))
+                })?;
+            let mode = if tool_name == "lark_cli_read" {
+                LarkCliToolMode::Read
+            } else {
+                LarkCliToolMode::Write
+            };
+            return execute_lark_cli_tool(config.gateway(), input, mode).map_err(ToolError::new);
+        }
         if tool_name == "runtime_config_view" {
             let input: RuntimeConfigViewRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;

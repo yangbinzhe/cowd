@@ -27,9 +27,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use source::{
-    builtin_source_adapter_manifests, read_local_source_batch, source_adapter_manifest,
-    SourceAdapterManifest, SourceBatchCursor, SourceConnectorState, SourceEventBatch,
-    SourceFieldSchema, SourceIncrementalRunRequest, SourceIncrementalRunResult,
+    builtin_source_adapter_manifests, canonical_source_resource_ref, read_local_source_batch,
+    source_adapter_manifest, SourceAdapterManifest, SourceBatchCursor, SourceConnectorState,
+    SourceEventBatch, SourceFieldSchema, SourceIncrementalRunRequest, SourceIncrementalRunResult,
     SourceIngestionReceipt, SourceReadPlan, SourceRecordBatch, SourceTableSchema, SourceWatermark,
 };
 

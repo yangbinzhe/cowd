@@ -86,6 +86,16 @@ fn prompt_asset_for_profile(
         return None;
     }
     let content = std::fs::read_to_string(&path).ok()?;
+    let (content, tool_refs) = if profile.skill_id.starts_with("lark-") {
+        (
+            format!(
+                "# Cowd Lark execution bridge\n\nThis Skill is already connected to the active Cowd Feishu/Lark bot configuration. For official CLI operations, call `lark_cli_read` for reads and `lark_cli_write` for mutations; pass only argv entries after `lark-cli`. Never use Bash to locate credentials, never ask the user to repeat configured app credentials, and never run CLI auth/config/profile/update commands. The gateway supplies a short-lived bot token, enforces the official CLI risk class, and applies Cowd approval policy. If an operation requires user identity rather than bot identity, explain that boundary instead of silently changing identity.\n\n{content}"
+            ),
+            vec!["lark_cli_read".to_string(), "lark_cli_write".to_string()],
+        )
+    } else {
+        (content, Vec::new())
+    };
     let content = content
         .chars()
         .take(MAX_PROMPT_ASSET_CHARS)
@@ -98,6 +108,7 @@ fn prompt_asset_for_profile(
         version: profile.version.clone(),
         content,
         source_ref: format!("skill://{}/{}", profile.skill_id, entrypoint.path),
+        tool_refs,
     })
 }
 
@@ -183,5 +194,46 @@ mod tests {
             .find(|asset| asset.skill_id == "release-review")
             .expect("workspace prompt-only skill must be represented in the runtime catalog");
         assert!(asset.content.contains("Require explicit evidence."));
+        assert!(asset.tool_refs.is_empty());
+    }
+
+    #[test]
+    fn live_cowd_lark_skills_are_discovered_and_selected_by_runtime() {
+        if std::env::var_os("COWD_LIVE_LARK_SKILL_TEST").is_none() {
+            return;
+        }
+        let assets = runtime_skill_assets_for_workspace(Path::new("."));
+        for (query, expected) in [
+            ("请使用 lark-base 查询多维表格", "lark-base"),
+            ("请使用 lark-im 搜索群聊消息", "lark-im"),
+        ] {
+            let decision = runtime::skill::SkillActivationEngine::activate(
+                runtime::skill::SkillActivationInput {
+                    session_id: "lark-live-skill-test".to_string(),
+                    turn_index: 0,
+                    query: query.to_string(),
+                    capability_refs: Vec::new(),
+                    available_profiles: assets.profiles.clone(),
+                    agent_profile: harness_contract::skill::AgentSkillProfile {
+                        adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
+                        ..Default::default()
+                    },
+                },
+            );
+            let selected = decision
+                .selected_invocation
+                .expect("Lark skill should be selected");
+            assert_eq!(selected.skill_id, expected);
+            let prompt = assets
+                .prompt_assets
+                .iter()
+                .find(|asset| asset.skill_id == expected)
+                .expect("selected Lark skill should have a prompt asset");
+            assert!(prompt.content.contains("lark-cli"));
+            assert_eq!(
+                prompt.tool_refs,
+                vec!["lark_cli_read".to_string(), "lark_cli_write".to_string()]
+            );
+        }
     }
 }

@@ -281,6 +281,10 @@ fn hardened_launch(
     let mut spec = SandboxLaunchSpec::workspace(&workspace);
     spec.working_directory = Some(workspace);
     spec.network_enabled = !sandbox_status.network_active;
+    let tool_root = crate::cowd_dirs::user_tools_dir();
+    if tool_root.is_dir() {
+        spec.tool_roots.push(tool_root);
+    }
     if sandbox_status.filesystem_mode == FilesystemIsolationMode::AllowList {
         spec.writable_roots = sandbox_status
             .allowed_mounts
@@ -353,6 +357,33 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[test]
+    fn live_cowd_owned_lark_cli_executes_inside_hardened_sandbox() {
+        if std::env::var_os("COWD_LIVE_LARK_SKILL_TEST").is_none() {
+            return;
+        }
+        let output = execute_bash(BashCommandInput {
+            command: String::from(
+                "set -eu; lark-cli --version; lark-cli --help >/dev/null; lark-cli base --help >/dev/null; lark-cli im --help >/dev/null; LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 lark-cli auth status --json > /tmp/lark-auth.json 2>&1 || true; grep -q not_configured /tmp/lark-auth.json; printf '\\nlark-sandbox-ok'",
+            ),
+            cwd: None,
+            timeout: Some(30_000),
+            description: Some("verify Cowd-owned Lark CLI inside hardened sandbox".to_string()),
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: Some(false),
+            namespace_restrictions: Some(true),
+            isolate_network: Some(true),
+            filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            allowed_mounts: None,
+        })
+        .expect("Cowd-owned Lark CLI should execute");
+
+        eprintln!("stdout={}\nstderr={}", output.stdout, output.stderr);
+        assert!(!output.interrupted);
+        assert!(output.stdout.contains("lark-cli version 1.0.72"));
+        assert!(output.stdout.contains("lark-sandbox-ok"));
     }
 }
 

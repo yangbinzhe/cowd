@@ -199,7 +199,10 @@ impl SurfaceHost {
         surface: SurfaceDescriptor,
         process: Arc<ManagedSurfaceProcess>,
     ) -> Result<(), SurfaceError> {
-        let Some(config) = self.config_for(&surface.id) else {
+        let config = self
+            .config_for(&surface.id)
+            .or_else(|| default_source_surface_config(&surface.capabilities));
+        let Some(config) = config else {
             return Ok(());
         };
         let frame = SurfaceFrame::Configure {
@@ -216,6 +219,15 @@ impl SurfaceHost {
             reason: format!("surface configure failed: {response:?}"),
         })
     }
+}
+
+fn default_source_surface_config(
+    capabilities: &[surface::SurfaceCapability],
+) -> Option<serde_json::Value> {
+    capabilities
+        .iter()
+        .any(|capability| capability.capability.starts_with("source."))
+        .then(|| serde_json::json!({}))
 }
 
 async fn start_managed_process(
@@ -513,8 +525,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::stage_managed_artifact;
+    use super::{default_source_surface_config, stage_managed_artifact};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn source_surface_without_explicit_config_receives_empty_config() {
+        let source = vec![surface::SurfaceCapability::new(
+            "postgres",
+            "source.incremental",
+        )];
+        let message = vec![surface::SurfaceCapability::new("lark", "message.send")];
+
+        assert_eq!(
+            default_source_surface_config(&source),
+            Some(serde_json::json!({}))
+        );
+        assert_eq!(default_source_surface_config(&message), None);
+    }
 
     #[test]
     fn managed_artifact_is_staged_inside_private_runtime_root() {

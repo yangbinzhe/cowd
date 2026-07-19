@@ -153,13 +153,14 @@ async fn connector_source_run_incremental_handler(
         }));
     };
     let resource_ref = request.resource_ref.clone().unwrap_or_default();
-    let canonical_watermark = if resource_ref.trim().is_empty() {
+    let canonical_resource_ref = connector::canonical_source_resource_ref(&resource_ref);
+    let canonical_watermark = if canonical_resource_ref.trim().is_empty() {
         None
     } else {
         match state.services.matrix.connector_source_watermark(
             &state.config_home,
             &adapter_id,
-            &resource_ref,
+            &canonical_resource_ref,
             request.table.as_deref(),
         ) {
             Ok(watermark) => watermark,

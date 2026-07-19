@@ -313,6 +313,9 @@ pub struct SandboxLaunchSpec {
     pub working_directory: Option<PathBuf>,
     pub readable_roots: Vec<PathBuf>,
     pub writable_roots: Vec<PathBuf>,
+    /// Cowd 自有工具根。它们只读挂载，并只把约定的 bin 目录加入沙箱 PATH。
+    /// 与普通 readable_roots 分开建模，避免任意可读目录影响命令解析。
+    pub tool_roots: Vec<PathBuf>,
     /// Explicit control-plane paths which must never become visible to the
     /// child. The constructor also derives config and broker paths from the
     /// environment when available.
@@ -335,6 +338,7 @@ impl SandboxLaunchSpec {
             working_directory: None,
             readable_roots: Vec::new(),
             writable_roots: Vec::new(),
+            tool_roots: Vec::new(),
             protected_roots: default_protected_roots(),
             network_enabled: true,
             environment: Vec::new(),
@@ -365,6 +369,20 @@ impl SandboxLaunchSpec {
         }
 
         let visible_roots = self.visible_roots(&workspace)?;
+        let tool_roots = self
+            .tool_roots
+            .iter()
+            .map(|root| {
+                let root = canonical(root)?;
+                if root.file_name().and_then(|name| name.to_str()) != Some("tools") {
+                    return Err(SandboxError::MissingPath(format!(
+                        "sandbox tool root `{}` must end with /tools",
+                        root.display()
+                    )));
+                }
+                Ok(root)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         for protected_root in self
             .protected_roots
             .iter()
@@ -372,6 +390,13 @@ impl SandboxLaunchSpec {
         {
             let protected_root = protected_root?;
             for visible_root in &visible_roots {
+                // 只允许显式 tool root 作为受保护 Cowd 配置根的只读子树。
+                // Bubblewrap 仅绑定该子树，兄弟目录（credentials/storage 等）仍不可见。
+                if tool_roots.iter().any(|tool_root| tool_root == visible_root)
+                    && visible_root == &protected_root.join("tools")
+                {
+                    continue;
+                }
                 if paths_overlap(&protected_root, visible_root) {
                     return Err(SandboxError::ProtectedRootExposed {
                         protected_root: protected_root.display().to_string(),
@@ -385,7 +410,12 @@ impl SandboxLaunchSpec {
 
     fn visible_roots(&self, workspace: &Path) -> Result<Vec<PathBuf>, SandboxError> {
         let mut roots = vec![workspace.to_path_buf()];
-        for root in self.readable_roots.iter().chain(&self.writable_roots) {
+        for root in self
+            .readable_roots
+            .iter()
+            .chain(&self.writable_roots)
+            .chain(&self.tool_roots)
+        {
             validate_root(root)?;
             roots.push(canonical(root)?);
         }
@@ -583,7 +613,7 @@ fn bwrap_args(
     }
 
     args.push("--clearenv".to_string());
-    append_environment(&mut args, &spec.environment)?;
+    append_environment(&mut args, &spec.environment, &spec.tool_roots)?;
     for root in SYSTEM_READ_ONLY_ROOTS {
         if Path::new(root).exists() {
             args.extend([
@@ -618,6 +648,7 @@ fn bwrap_args(
     let mut readable = spec
         .readable_roots
         .iter()
+        .chain(&spec.tool_roots)
         .map(|root| canonical(root))
         .collect::<Result<BTreeSet<_>, _>>()?;
     readable.remove(&workspace);
@@ -760,12 +791,28 @@ fn launcher_protocol_matches(path: &Path) -> bool {
 fn append_environment(
     args: &mut Vec<String>,
     environment: &[(String, String)],
+    tool_roots: &[PathBuf],
 ) -> Result<(), SandboxError> {
     validate_environment(environment)?;
+    let mut path_entries = Vec::new();
+    for root in tool_roots {
+        let root = canonical(root)?;
+        for candidate in [root.join("bin"), root.join("node_modules").join(".bin")] {
+            if candidate.is_dir() {
+                path_entries.push(candidate);
+            }
+        }
+    }
+    path_entries.push(PathBuf::from(SANDBOX_PATH));
+    let sandbox_path = path_entries
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
     for (key, value) in [
         ("HOME", "/home/cowd"),
         ("TMPDIR", "/tmp"),
-        ("PATH", SANDBOX_PATH),
+        ("PATH", sandbox_path.as_str()),
         ("COWD_SANDBOX", "rootless-kernel-hardened"),
     ] {
         args.extend(["--setenv".to_string(), key.to_string(), value.to_string()]);
@@ -1120,6 +1167,55 @@ mod tests {
             spec.validate(),
             Err(SandboxError::MalformedEnvironment(_))
         ));
+    }
+
+    #[test]
+    fn rejects_arbitrary_protected_subtree_as_tool_root() {
+        let root = ProbeFixture::new().expect("fixture");
+        let credentials = root.root.join("credentials");
+        fs::create_dir(&credentials).expect("credentials fixture");
+        let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+        spec.protect_root(&root.root);
+        spec.tool_roots.push(credentials);
+        assert!(matches!(spec.validate(), Err(SandboxError::MissingPath(_))));
+    }
+
+    #[test]
+    fn explicit_tools_subtree_does_not_expose_sibling_control_data() {
+        if !bwrap_available() {
+            return;
+        }
+        let root = ProbeFixture::new().expect("fixture");
+        let config_home = root.root.join("config-home");
+        let tools = config_home.join("tools");
+        let control = config_home.join("credentials").join("secret");
+        let bin = tools.join("bin");
+        fs::create_dir_all(&bin).expect("tool bin fixture");
+        fs::create_dir_all(control.parent().expect("control parent")).expect("control directory");
+        fs::write(&control, "must-not-be-visible").expect("control fixture");
+        let tool = bin.join("cowd-tool-fixture");
+        fs::write(&tool, "#!/bin/sh\nprintf tool-ok\n").expect("tool fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("tool mode");
+        }
+        let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
+        spec.protect_root(&config_home);
+        spec.tool_roots.push(tools);
+        let prepared = shell_command(
+            &format!(
+                "test ! -e {} && test \"$(cowd-tool-fixture)\" = tool-ok",
+                shell_quote(&control.display().to_string())
+            ),
+            &spec,
+        )
+        .expect("prepare tool-root sandbox");
+        let output = prepared
+            .into_command()
+            .output()
+            .expect("run tool-root sandbox");
+        assert!(output.status.success(), "{:?}", output);
     }
 
     #[test]
