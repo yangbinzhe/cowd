@@ -462,7 +462,10 @@ fn build_surface_runtime_configs(
         .iter()
         .filter(|p| p.enabled && p.platform_type != "api_server")
         .map(|p| {
-            let id = surface::normalize_surface_id(&p.platform_type);
+            // Lark 与 Feishu 共用同一个 open-platform artifact，运行配置
+            // 必须使用与清单相同的 canonical surface id，否则 sidecar
+            // 虽然可以被发现，却拿不到 app_id/app_secret。
+            let id = surface::message::normalize_message_connector(&p.platform_type);
             let mut config = p
                 .extra
                 .iter()
@@ -4757,6 +4760,34 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn lark_runtime_config_targets_shared_feishu_surface() {
+        let mut extra = BTreeMap::new();
+        extra.insert("app_id".to_string(), JsonValue::String("app-id".to_string()));
+        extra.insert(
+            "app_secret".to_string(),
+            JsonValue::String("app-secret".to_string()),
+        );
+        let gateway = runtime::GatewayConfig {
+            enabled: true,
+            platforms: vec![GatewayPlatformConfig {
+                platform_type: "lark".to_string(),
+                enabled: true,
+                extra,
+            }],
+            ..Default::default()
+        };
+
+        let configs = super::build_surface_runtime_configs(&gateway);
+        let config = configs
+            .get("feishu")
+            .expect("Lark config must target the shared Feishu surface");
+        assert!(!configs.contains_key("lark"));
+        assert_eq!(config["platform_type"], "lark");
+        assert_eq!(config["app_id"], "app-id");
+        assert_eq!(config["app_secret"], "app-secret");
+    }
 
     fn gateway_platform_with_auth_token(auth_token: &str) -> GatewayPlatformConfig {
         let mut extra = BTreeMap::new();

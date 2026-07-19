@@ -674,7 +674,9 @@ fn build_surface_runtime_configs(gw: &runtime::GatewayConfig) -> BTreeMap<String
         .iter()
         .filter(|platform| platform.enabled && platform.platform_type != "api_server")
         .map(|platform| {
-            let id = surface::normalize_surface_id(&platform.platform_type);
+            // 热加载必须与启动路径使用同一个 canonical surface id；
+            // Lark/Feishu 共享 `feishu` sidecar，不能把配置留在 `lark` key。
+            let id = surface::message::normalize_message_connector(&platform.platform_type);
             let mut config = platform
                 .extra
                 .iter()
@@ -940,5 +942,28 @@ mod tests {
         assert_eq!(first.read_status().status, "invalid");
         assert_eq!(second.read_status().status, "uninitialized");
         assert!(second.read_status().last_error.is_none());
+    }
+
+    #[test]
+    fn hot_reload_routes_lark_config_to_shared_feishu_surface() {
+        let mut extra = BTreeMap::new();
+        extra.insert(
+            "app_id".to_string(),
+            runtime::JsonValue::String("app-id".to_string()),
+        );
+        let gateway = runtime::GatewayConfig {
+            enabled: true,
+            platforms: vec![runtime::GatewayPlatformConfig {
+                platform_type: "lark".to_string(),
+                enabled: true,
+                extra,
+            }],
+            ..Default::default()
+        };
+
+        let configs = build_surface_runtime_configs(&gateway);
+        assert!(configs.contains_key("feishu"));
+        assert!(!configs.contains_key("lark"));
+        assert_eq!(configs["feishu"]["platform_type"], "lark");
     }
 }
