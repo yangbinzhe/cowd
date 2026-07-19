@@ -709,6 +709,7 @@ pub struct SurfaceDescriptor {
     pub routes: Vec<SurfaceRoute>,
     pub resources: Vec<SurfaceResource>,
     pub health: SurfaceHealthSpec,
+    pub default_enabled: bool,
     pub edge_domain: EdgeDomain,
     pub diagnostics: Vec<String>,
 }
@@ -742,6 +743,7 @@ impl SurfaceDescriptor {
             routes: manifest.routes.clone(),
             resources: manifest.resources.clone(),
             health: manifest.health.clone(),
+            default_enabled: manifest.default_enabled,
             edge_domain: manifest.edge_domain(),
             diagnostics: Vec::new(),
         }

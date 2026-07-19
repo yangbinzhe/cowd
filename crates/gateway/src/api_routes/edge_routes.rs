@@ -425,6 +425,7 @@ mod tests {
             routes: Vec::new(),
             resources: Vec::new(),
             health: surface::SurfaceHealthSpec::default(),
+            default_enabled: false,
             edge_domain: EdgeDomain::MessageConnector,
             diagnostics: Vec::new(),
         };
