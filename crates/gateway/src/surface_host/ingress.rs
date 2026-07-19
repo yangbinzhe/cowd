@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
 use sha2::{Digest, Sha256};
 use surface::{message::MessageActionKind, SurfaceActionRequest, SurfaceFrame, SurfaceSendRequest};
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 use crate::api_routes::AppState;
 use crate::runtime_service::IngressRuntimeOptions;
@@ -19,50 +19,110 @@ struct SurfaceTurnPolicy {
 
 pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
     let mut rx = state.services.surface.subscribe_events();
-    let session_locks = Arc::new(Mutex::new(HashMap::<String, Arc<Mutex<()>>>::new()));
+    let concurrency = Arc::new(Semaphore::new(32));
+    let claim_owner = format!("gateway-surface-ingress-{}", uuid::Uuid::new_v4());
     tokio::spawn(async move {
+        let mut dispatch_tick = tokio::time::interval(Duration::from_millis(100));
+        dispatch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut retry_tick = tokio::time::interval(Duration::from_secs(5));
         retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                _ = dispatch_tick.tick() => {
+                    dispatch_pending_ingress(&state, &claim_owner, &concurrency).await;
+                }
                 _ = retry_tick.tick() => {
                     retry_surface_trigger_events(&state).await;
                     reconcile_surface_terminal_deliveries(&state).await;
                 }
                 received = rx.recv() => {
-                    let frame = match received {
-                        Ok(frame) => frame,
+                    match received {
+                        Ok(_) => {
+                            // H2 client 已在 ACK 前持久化；broadcast 只负责低延迟唤醒。
+                            dispatch_pending_ingress(&state, &claim_owner, &concurrency).await;
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             tracing::warn!(skipped, "surface ingress dispatcher lagged");
-                            continue;
+                            // Lagged 后直接 repository scan，不依赖丢失的广播内容。
+                            dispatch_pending_ingress(&state, &claim_owner, &concurrency).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    };
-                    let SurfaceFrame::Event {
-                        surface,
-                        event,
-                        payload,
-                    } = frame
-                    else {
-                        continue;
-                    };
-                    let state = state.clone();
-                    enqueue_surface_trigger_event(state.clone(), &surface, &event, &payload);
-                    if event != "message.received" {
-                        continue;
                     }
-                    let session_locks = session_locks.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            handle_surface_message(state, session_locks, surface, payload).await
-                        {
-                            tracing::warn!(error = %error, "surface ingress message handling failed");
-                        }
-                    });
                 }
             }
         }
     });
+}
+
+async fn dispatch_pending_ingress(
+    state: &Arc<AppState>,
+    claim_owner: &str,
+    concurrency: &Arc<Semaphore>,
+) {
+    let available = concurrency.available_permits();
+    if available == 0 {
+        return;
+    }
+    let claims =
+        match state
+            .services
+            .surface
+            .claim_ingress_frames(claim_owner, available.min(32), 300_000)
+        {
+            Ok(claims) => claims,
+            Err(error) => {
+                tracing::error!(error = %error, "surface durable ingress claim failed");
+                return;
+            }
+        };
+    for claim in claims {
+        let Ok(permit) = concurrency.clone().try_acquire_owned() else {
+            break;
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            let record_key = claim.record_key;
+            let result = process_durable_ingress_frame(state.clone(), claim.frame).await;
+            match result {
+                Ok(()) => {
+                    if let Err(error) = state.services.surface.complete_ingress_frame(&record_key) {
+                        tracing::error!(%record_key, error = %error, "surface ingress completion persistence failed");
+                    }
+                }
+                Err(error) => {
+                    if let Err(persist_error) = state
+                        .services
+                        .surface
+                        .fail_ingress_frame(&record_key, &error)
+                    {
+                        tracing::error!(%record_key, error = %persist_error, work_error = %error, "surface ingress failure persistence failed");
+                    } else {
+                        tracing::warn!(%record_key, error = %error, "surface durable ingress work failed");
+                    }
+                }
+            }
+            drop(permit);
+        });
+    }
+}
+
+async fn process_durable_ingress_frame(
+    state: Arc<AppState>,
+    frame: SurfaceFrame,
+) -> Result<(), String> {
+    let SurfaceFrame::Event {
+        surface,
+        event,
+        payload,
+    } = frame
+    else {
+        return Err("durable surface ingress contains a non-event frame".to_string());
+    };
+    persist_and_dispatch_surface_trigger(state.clone(), &surface, &event, &payload).await?;
+    if event == "message.received" {
+        handle_surface_message(state, surface, payload).await?;
+    }
+    Ok(())
 }
 
 /// Terminal replies remain a Surface delivery concern.  The bridge recovers
@@ -293,41 +353,28 @@ async fn deliver_surface_terminal(
 /// Persist a Surface transport event before attempting Runtime delivery.  The
 /// persisted record is the recoverable transport handoff; it is intentionally
 /// not a second scheduler or source-matching implementation.
-fn enqueue_surface_trigger_event(
+async fn persist_and_dispatch_surface_trigger(
     state: Arc<AppState>,
     surface: &str,
     event_type: &str,
     payload: &serde_json::Value,
-) {
+) -> Result<(), String> {
     let event = normalize_surface_event(surface, event_type, payload);
-    match state
+    let receipt = state
         .services
         .surface
         .record_trigger_event_received(surface, event_type, &event, payload)
-    {
-        Ok(receipt) if !receipt.duplicate => {
-            let idempotency_key = receipt.record.idempotency_key;
-            tokio::spawn(async move {
-                dispatch_surface_trigger_event(state, idempotency_key).await;
-            });
-        }
-        Ok(receipt) => {
-            tracing::debug!(
-                surface,
-                event = event_type,
-                status = %receipt.record.status,
-                "surface trigger event ignored as durable duplicate"
-            );
-        }
-        Err(error) => {
-            tracing::warn!(
-                surface,
-                event = event_type,
-                error = %error,
-                "surface trigger event could not be persisted"
-            );
-        }
+        .map_err(|error| format!("surface trigger event could not be persisted: {error}"))?;
+    if receipt.duplicate {
+        tracing::debug!(
+            surface,
+            event = event_type,
+            status = %receipt.record.status,
+            "surface trigger event resumed from durable duplicate"
+        );
     }
+    dispatch_surface_trigger_event(state, receipt.record.idempotency_key).await;
+    Ok(())
 }
 
 async fn retry_surface_trigger_events(state: &Arc<AppState>) {
@@ -448,7 +495,6 @@ fn normalize_surface_event(
 
 async fn handle_surface_message(
     state: Arc<AppState>,
-    session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     surface: String,
     payload: serde_json::Value,
 ) -> Result<(), String> {
@@ -465,8 +511,6 @@ async fn handle_surface_message(
         })
         .ok_or_else(|| "surface message has no text content".to_string())?;
     let session_id = surface_session_id(&surface, &payload);
-    let session_lock = surface_session_lock(&session_locks, &session_id).await;
-    let session_guard = session_lock.lock().await;
     let user_id = payload_string(&payload, "user_id");
     let thread_id = payload_string(&payload, "thread_id");
     let metadata = payload
@@ -615,7 +659,6 @@ async fn handle_surface_message(
         }),
     )
     .await?;
-    drop(session_guard);
     Ok(())
 }
 
@@ -786,17 +829,6 @@ fn surface_failure_notice_text(error: &str) -> String {
     )
 }
 
-async fn surface_session_lock(
-    session_locks: &Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    session_id: &str,
-) -> Arc<Mutex<()>> {
-    let mut locks = session_locks.lock().await;
-    locks
-        .entry(session_id.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
 async fn append_surface_timeline_event(
     state: &AppState,
     session_id: &str,
@@ -914,7 +946,7 @@ async fn ensure_surface_runtime_session(
     Ok(())
 }
 
-fn surface_session_id(surface: &str, payload: &serde_json::Value) -> String {
+pub(super) fn surface_session_id(surface: &str, payload: &serde_json::Value) -> String {
     payload_string(payload, "session")
         .or_else(|| payload_string(payload, "session_id"))
         .filter(|value| !value.trim().is_empty())

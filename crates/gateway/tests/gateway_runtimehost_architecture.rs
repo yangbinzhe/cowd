@@ -2331,6 +2331,41 @@ fn source_connector_stream_uses_matrix_as_the_only_durable_watermark_owner() {
 }
 
 #[test]
+fn surface_ingress_is_durable_before_ack_and_uses_bounded_claim_workers() {
+    let message_store = read_repo("crates/gateway/src/surface_host/message_store.rs");
+    let ingress = read_repo("crates/gateway/src/surface_host/ingress.rs");
+    let edge_h2 = read_repo("crates/gateway/src/surface_host/edge_h2.rs");
+
+    for table in [
+        "surface_inbox",
+        "surface_outbox",
+        "surface_trigger_event",
+        "surface_delivery_event",
+        "surface_ingress_frame",
+    ] {
+        assert!(message_store.contains(table), "missing durable table {table}");
+    }
+    assert!(message_store.contains("legacy_jsonl_import_v1"));
+    assert!(message_store.contains("export_legacy_jsonl"));
+    assert!(!message_store.contains("Mutex<SurfaceMessageState>"));
+    assert!(!message_store.contains("OpenOptions::new"));
+
+    assert!(ingress.contains("Semaphore::new(32)"));
+    assert!(ingress.contains("claim_ingress_frames"));
+    assert!(ingress.contains("dispatch_pending_ingress"));
+    assert!(!ingress.contains("session_locks"));
+    assert!(!ingress.contains("HashMap::<String, Arc<Mutex<()>>"));
+    let persist = edge_h2
+        .find("persist_ingress_frame")
+        .expect("managed event must be persisted");
+    let ack = edge_h2[persist..]
+        .find("/_cowd/edge/v2/events/ack")
+        .map(|offset| persist + offset)
+        .expect("managed event ACK must remain wired");
+    assert!(persist < ack, "durable persist must happen before event ACK");
+}
+
+#[test]
 fn api_route_direct_dependencies_are_closed() {
     let allowlist = read_repo("crates/gateway/src/api_routes/service_boundary_policy.txt");
 

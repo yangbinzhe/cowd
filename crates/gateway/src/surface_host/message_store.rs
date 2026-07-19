@@ -1,19 +1,22 @@
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use harness_contract::managed_agent::ManagedAgentTriggerEvent;
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use surface::SurfaceFrame;
 use surface::{normalize_surface_id, SurfaceOperationResult, SurfaceSendRequest};
 
 const INBOX_FILE: &str = "surface_inbox.jsonl";
 const OUTBOX_FILE: &str = "surface_outbox.jsonl";
 const EVENT_FILE: &str = "surface_delivery_event.jsonl";
 const TRIGGER_EVENT_FILE: &str = "surface_trigger_event.jsonl";
+const DATABASE_FILE: &str = "surface_messages.sqlite3";
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -75,6 +78,10 @@ pub(crate) struct SurfaceOutboxRecord {
     pub attempts: u32,
     pub max_attempts: u32,
     pub next_retry_at_ms: Option<i64>,
+    #[serde(default)]
+    pub claim_owner: Option<String>,
+    #[serde(default)]
+    pub lease_until_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub sent_at_ms: Option<i64>,
@@ -148,6 +155,12 @@ pub(crate) struct SurfaceTriggerEventReceipt {
     pub duplicate: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SurfaceIngressClaim {
+    pub record_key: String,
+    pub frame: SurfaceFrame,
+}
+
 #[derive(Debug, Default)]
 struct SurfaceMessageState {
     inbox: BTreeMap<String, SurfaceInboxRecord>,
@@ -159,17 +172,45 @@ struct SurfaceMessageState {
 #[derive(Debug, Clone)]
 pub(crate) struct SurfaceMessageStore {
     root: PathBuf,
-    state: Arc<Mutex<SurfaceMessageState>>,
+    database: Arc<Mutex<Connection>>,
 }
 
 impl SurfaceMessageStore {
     pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let state = load_state(&root).unwrap_or_default();
-        Self {
-            root,
-            state: Arc::new(Mutex::new(state)),
+        if let Err(error) = fs::create_dir_all(&root) {
+            tracing::error!(path = %root.display(), error = %error, "surface durable store directory creation failed");
+            eprintln!("surface durable store directory creation failed: {error}");
+            std::process::abort();
         }
+        let connection = match Connection::open(root.join(DATABASE_FILE)) {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::error!(path = %root.display(), error = %error, "surface durable store open failed");
+                eprintln!("surface durable store open failed: {error}");
+                std::process::abort();
+            }
+        };
+        if let Err(error) = initialize_database(&connection) {
+            tracing::error!(path = %root.display(), error = %error, "surface durable store schema initialization failed");
+            eprintln!("surface durable store schema initialization failed: {error}");
+            std::process::abort();
+        }
+        let store = Self {
+            root,
+            database: Arc::new(Mutex::new(connection)),
+        };
+        if let Err(error) = store.import_legacy_jsonl_once() {
+            tracing::error!(path = %store.root.display(), error = %error, "surface JSONL import failed");
+            eprintln!("surface JSONL import failed: {error}");
+            std::process::abort();
+        }
+        if let Err(error) = store.reconcile_after_restart() {
+            tracing::error!(path = %store.root.display(), error = %error, "surface durable recovery failed");
+            eprintln!("surface durable recovery failed: {error}");
+            std::process::abort();
+        }
+        store
     }
 
     pub(crate) fn default_root(config_home: &Path) -> PathBuf {
@@ -180,6 +221,203 @@ impl SurfaceMessageStore {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Stop-time reverse export for operator rollback. Production mutations
+    /// never call this path and never dual-write JSONL.
+    #[allow(dead_code)]
+    pub(crate) fn export_legacy_jsonl(&self, target_root: &Path) -> Result<(), String> {
+        let state = self.lock_state()?;
+        fs::create_dir_all(target_root).map_err(|error| error.to_string())?;
+        write_jsonl_atomic(target_root.join(INBOX_FILE), state.inbox.values())?;
+        write_jsonl_atomic(target_root.join(OUTBOX_FILE), state.outbox.values())?;
+        write_jsonl_atomic(
+            target_root.join(TRIGGER_EVENT_FILE),
+            state.trigger_events.values(),
+        )?;
+        write_jsonl_atomic(target_root.join(EVENT_FILE), state.events.values())
+    }
+
+    pub(crate) fn persist_ingress_frame(&self, frame: &SurfaceFrame) -> Result<String, String> {
+        let SurfaceFrame::Event {
+            surface, payload, ..
+        } = frame
+        else {
+            return Err("only Surface event frames can enter the durable ingress".to_string());
+        };
+        let frame_json = serde_json::to_value(frame).map_err(|error| error.to_string())?;
+        let record_key = format!("surface-ingress:{}", hash_json(&frame_json));
+        let session_id = super::ingress::surface_session_id(surface, payload);
+        let now = now_ms();
+        let connection = self.lock_connection()?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO surface_ingress_frame(
+                   record_key, surface, session_id, status, attempts, max_attempts,
+                   next_retry_at_ms, created_at_ms, updated_at_ms, payload_json
+                 ) VALUES(?1, ?2, ?3, 'pending', 0, ?4, ?5, ?5, ?5, ?6)",
+                params![
+                    record_key,
+                    normalize_surface_id(surface),
+                    session_id,
+                    DEFAULT_MAX_ATTEMPTS,
+                    now,
+                    frame_json.to_string(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(record_key)
+    }
+
+    pub(crate) fn claim_ingress_frames(
+        &self,
+        claim_owner: &str,
+        limit: usize,
+        lease_ms: i64,
+    ) -> Result<Vec<SurfaceIngressClaim>, String> {
+        let now = now_ms();
+        let lease_until = now.saturating_add(lease_ms.max(1));
+        let mut connection = self.lock_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE surface_ingress_frame
+                 SET status='retry_scheduled', claim_owner=NULL, lease_until_ms=NULL,
+                     next_retry_at_ms=?1, updated_at_ms=?1,
+                     last_error='gateway worker lease expired before durable completion'
+                 WHERE status='claimed' AND lease_until_ms <= ?1",
+                params![now],
+            )
+            .map_err(|error| error.to_string())?;
+        let mut active_sessions = std::collections::BTreeSet::new();
+        {
+            let mut active = transaction
+                .prepare(
+                    "SELECT DISTINCT session_id FROM surface_ingress_frame
+                     WHERE status='claimed' AND lease_until_ms > ?1",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = active
+                .query_map(params![now], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            for row in rows {
+                active_sessions.insert(row.map_err(|error| error.to_string())?);
+            }
+        }
+        let candidates = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT record_key, session_id, payload_json
+                     FROM surface_ingress_frame
+                     WHERE status IN ('pending', 'retry_scheduled')
+                       AND attempts < max_attempts
+                       AND (next_retry_at_ms IS NULL OR next_retry_at_ms <= ?1)
+                     ORDER BY created_at_ms, record_key
+                     LIMIT ?2",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(
+                    params![now, limit.saturating_mul(8).max(limit) as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?
+        };
+        let mut claims = Vec::new();
+        for (record_key, session_id, payload_json) in candidates {
+            if claims.len() >= limit || !active_sessions.insert(session_id) {
+                continue;
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE surface_ingress_frame
+                     SET status='claimed', attempts=attempts+1, claim_owner=?2,
+                         lease_until_ms=?3, next_retry_at_ms=NULL, updated_at_ms=?1,
+                         last_error=NULL
+                     WHERE record_key=?4 AND status IN ('pending', 'retry_scheduled')",
+                    params![now, claim_owner, lease_until, record_key],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                continue;
+            }
+            claims.push(SurfaceIngressClaim {
+                record_key,
+                frame: serde_json::from_str(&payload_json).map_err(|error| error.to_string())?,
+            });
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(claims)
+    }
+
+    pub(crate) fn complete_ingress_frame(&self, record_key: &str) -> Result<(), String> {
+        let connection = self.lock_connection()?;
+        connection
+            .execute(
+                "UPDATE surface_ingress_frame
+                 SET status='completed', claim_owner=NULL, lease_until_ms=NULL,
+                     next_retry_at_ms=NULL, updated_at_ms=?1, last_error=NULL
+                 WHERE record_key=?2 AND status='claimed'",
+                params![now_ms(), record_key],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) fn fail_ingress_frame(&self, record_key: &str, error: &str) -> Result<(), String> {
+        let connection = self.lock_connection()?;
+        let (attempts, max_attempts) = connection
+            .query_row(
+                "SELECT attempts, max_attempts FROM surface_ingress_frame WHERE record_key=?1",
+                params![record_key],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .map_err(|db_error| db_error.to_string())?;
+        let terminal = attempts >= max_attempts;
+        connection
+            .execute(
+                "UPDATE surface_ingress_frame
+                 SET status=?1, claim_owner=NULL, lease_until_ms=NULL,
+                     next_retry_at_ms=?2, updated_at_ms=?3, last_error=?4
+                 WHERE record_key=?5",
+                params![
+                    if terminal {
+                        "dead_letter"
+                    } else {
+                        "retry_scheduled"
+                    },
+                    (!terminal).then(|| next_retry_at_ms(attempts)),
+                    now_ms(),
+                    error,
+                    record_key,
+                ],
+            )
+            .map_err(|db_error| db_error.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ingress_frame_count(&self) -> usize {
+        self.lock_connection()
+            .ok()
+            .and_then(|connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM surface_ingress_frame", [], |row| {
+                        row.get::<_, usize>(0)
+                    })
+                    .ok()
+            })
+            .unwrap_or(0)
     }
 
     pub(crate) fn record_inbox_received(
@@ -219,8 +457,21 @@ impl SurfaceMessageStore {
             correlation: None,
             last_error: None,
         };
-        state.inbox.insert(idempotency_key, record.clone());
-        self.append_record(INBOX_FILE, &record)?;
+        state.inbox.insert(idempotency_key.clone(), record.clone());
+        if !self.insert_record_if_absent(INBOX_FILE, &record)? {
+            let existing = self
+                .lock_state()?
+                .inbox
+                .get(&idempotency_key)
+                .cloned()
+                .ok_or_else(|| {
+                    "surface inbox idempotency race lost without durable row".to_string()
+                })?;
+            return Ok(SurfaceInboxReceipt {
+                record: existing,
+                duplicate: true,
+            });
+        }
         drop(state);
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
@@ -258,20 +509,18 @@ impl SurfaceMessageStore {
         idempotency_key: &str,
         correlation: SurfaceTurnCorrelation,
     ) -> Result<(), String> {
-        let mut state = self.lock_state()?;
-        let record = state
-            .inbox
-            .get_mut(idempotency_key)
-            .ok_or_else(|| format!("surface inbox `{idempotency_key}` not found"))?;
-        record.status = "processed".to_string();
-        record.updated_at_ms = now_ms();
-        record.runtime_session_id = Some(correlation.session_id.clone());
-        record.runtime_turn_id = Some(correlation.turn_id.clone());
-        record.correlation = Some(correlation);
-        record.last_error = None;
-        let record = record.clone();
-        self.append_record(INBOX_FILE, &record)?;
-        drop(state);
+        let (record, ()) = self.update_record_by_key(
+            INBOX_FILE,
+            idempotency_key,
+            |record: &mut SurfaceInboxRecord| {
+                record.status = "processed".to_string();
+                record.updated_at_ms = now_ms();
+                record.runtime_session_id = Some(correlation.session_id.clone());
+                record.runtime_turn_id = Some(correlation.turn_id.clone());
+                record.correlation = Some(correlation);
+                record.last_error = None;
+            },
+        )?;
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
             surface: record.surface.clone(),
@@ -293,24 +542,23 @@ impl SurfaceMessageStore {
         idempotency_key: &str,
         terminal_id: &str,
     ) -> Result<(), String> {
-        let mut state = self.lock_state()?;
-        let record = state
-            .inbox
-            .get_mut(idempotency_key)
-            .ok_or_else(|| format!("surface inbox `{idempotency_key}` not found"))?;
-        let correlation = record
-            .correlation
-            .as_mut()
-            .ok_or_else(|| format!("surface inbox `{idempotency_key}` has no turn correlation"))?;
-        if correlation.terminal_id.as_deref() != Some(terminal_id) {
-            correlation.terminal_id = Some(terminal_id.to_string());
-            correlation.terminal_delivery_revision =
-                correlation.terminal_delivery_revision.saturating_add(1);
-        }
-        record.updated_at_ms = now_ms();
-        let record = record.clone();
-        self.append_record(INBOX_FILE, &record)?;
-        drop(state);
+        let (record, updated) = self.update_record_by_key(
+            INBOX_FILE,
+            idempotency_key,
+            |record: &mut SurfaceInboxRecord| -> Result<(), String> {
+                let correlation = record.correlation.as_mut().ok_or_else(|| {
+                    format!("surface inbox `{idempotency_key}` has no turn correlation")
+                })?;
+                if correlation.terminal_id.as_deref() != Some(terminal_id) {
+                    correlation.terminal_id = Some(terminal_id.to_string());
+                    correlation.terminal_delivery_revision =
+                        correlation.terminal_delivery_revision.saturating_add(1);
+                }
+                record.updated_at_ms = now_ms();
+                Ok(())
+            },
+        )?;
+        updated?;
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
             surface: record.surface.clone(),
@@ -378,8 +626,23 @@ impl SurfaceMessageStore {
             accepted_at_ms: None,
             last_error: None,
         };
-        state.trigger_events.insert(idempotency_key, record.clone());
-        self.append_record(TRIGGER_EVENT_FILE, &record)?;
+        state
+            .trigger_events
+            .insert(idempotency_key.clone(), record.clone());
+        if !self.insert_record_if_absent(TRIGGER_EVENT_FILE, &record)? {
+            let existing = self
+                .lock_state()?
+                .trigger_events
+                .get(&idempotency_key)
+                .cloned()
+                .ok_or_else(|| {
+                    "surface trigger idempotency race lost without durable row".to_string()
+                })?;
+            return Ok(SurfaceTriggerEventReceipt {
+                record: existing,
+                duplicate: true,
+            });
+        }
         drop(state);
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
@@ -405,24 +668,26 @@ impl SurfaceMessageStore {
         &self,
         idempotency_key: &str,
     ) -> Result<Option<SurfaceTriggerEventRecord>, String> {
-        let current = self
-            .state
-            .lock()
-            .map_err(|_| "surface message store lock poisoned".to_string())?
-            .trigger_events
-            .get(idempotency_key)
-            .cloned()
-            .ok_or_else(|| format!("surface trigger event `{idempotency_key}` not found"))?;
-        if !matches!(current.status.as_str(), "received" | "retry_scheduled") {
+        let (record, claimed) = self.update_record_by_key(
+            TRIGGER_EVENT_FILE,
+            idempotency_key,
+            |record: &mut SurfaceTriggerEventRecord| {
+                if !matches!(record.status.as_str(), "received" | "retry_scheduled") {
+                    return false;
+                }
+                record.status = "dispatching".to_string();
+                record.attempts = record.attempts.saturating_add(1);
+                record.next_retry_at_ms = None;
+                record.last_error = None;
+                record.updated_at_ms = now_ms();
+                true
+            },
+        )?;
+        if !claimed {
             return Ok(None);
         }
-        self.update_trigger_event(idempotency_key, |record| {
-            record.status = "dispatching".to_string();
-            record.attempts = record.attempts.saturating_add(1);
-            record.next_retry_at_ms = None;
-            record.last_error = None;
-        })
-        .map(Some)
+        self.push_trigger_event_delivery_event(&record)?;
+        Ok(Some(record))
     }
 
     pub(crate) fn mark_trigger_event_accepted(
@@ -462,9 +727,7 @@ impl SurfaceMessageStore {
     ) -> Result<SurfaceTriggerEventRecord, String> {
         let surface = normalize_surface_id(surface);
         let current = self
-            .state
-            .lock()
-            .map_err(|_| "surface message store lock poisoned".to_string())?
+            .lock_state()?
             .trigger_events
             .get(idempotency_key)
             .cloned()
@@ -523,6 +786,8 @@ impl SurfaceMessageStore {
             attempts: 0,
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             next_retry_at_ms: None,
+            claim_owner: None,
+            lease_until_ms: None,
             created_at_ms: now,
             updated_at_ms: now,
             sent_at_ms: None,
@@ -530,8 +795,17 @@ impl SurfaceMessageStore {
             source_session_id,
             reply_to_message_id,
         };
-        state.outbox.insert(idempotency_key, record.clone());
-        self.append_record(OUTBOX_FILE, &record)?;
+        state.outbox.insert(idempotency_key.clone(), record.clone());
+        if !self.insert_record_if_absent(OUTBOX_FILE, &record)? {
+            return self
+                .lock_state()?
+                .outbox
+                .get(&idempotency_key)
+                .cloned()
+                .ok_or_else(|| {
+                    "surface outbox idempotency race lost without durable row".to_string()
+                });
+        }
         drop(state);
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
@@ -554,16 +828,38 @@ impl SurfaceMessageStore {
         &self,
         delivery_id: &str,
     ) -> Result<SurfaceOutboxRecord, String> {
-        let updated = self.update_outbox_by_delivery(delivery_id, |record| {
-            if is_terminal_outbox_status(&record.status) {
-                return;
-            }
-            record.status = "sending".to_string();
-            record.attempts = record.attempts.saturating_add(1);
-            record.updated_at_ms = now_ms();
-            record.next_retry_at_ms = None;
-            record.last_error = None;
-        })?;
+        let state = self.lock_state()?;
+        let key = state
+            .outbox
+            .iter()
+            .find_map(|(key, record)| (record.delivery_id == delivery_id).then(|| key.clone()))
+            .ok_or_else(|| format!("surface delivery `{delivery_id}` not found"))?;
+        let (updated, claimed) =
+            self.update_record_by_key(OUTBOX_FILE, &key, |record: &mut SurfaceOutboxRecord| {
+                if is_terminal_outbox_status(&record.status) {
+                    return 0_u8;
+                }
+                if !matches!(record.status.as_str(), "queued" | "retry_scheduled") {
+                    return 2_u8;
+                }
+                record.status = "sending".to_string();
+                record.attempts = record.attempts.saturating_add(1);
+                record.updated_at_ms = now_ms();
+                record.next_retry_at_ms = None;
+                record.claim_owner = Some(format!("surface-delivery:{delivery_id}"));
+                record.lease_until_ms = Some(now_ms().saturating_add(30_000));
+                record.last_error = None;
+                1_u8
+            })?;
+        if claimed == 2 {
+            return Err(format!(
+                "surface delivery `{delivery_id}` is already claimed or terminal ({})",
+                updated.status
+            ));
+        }
+        if claimed == 0 {
+            return Ok(updated);
+        }
         if let Some(reply_to) = updated.reply_to_message_id.as_deref() {
             let status = if outbox_is_failure_notice(&updated) {
                 "failure_notifying"
@@ -586,6 +882,8 @@ impl SurfaceMessageStore {
             record.updated_at_ms = now_ms();
             record.sent_at_ms = Some(record.updated_at_ms);
             record.next_retry_at_ms = None;
+            record.claim_owner = None;
+            record.lease_until_ms = None;
             record.last_error = None;
         })?;
         self.push_event(SurfaceDeliveryEvent {
@@ -619,6 +917,8 @@ impl SurfaceMessageStore {
         let updated = self.update_outbox_by_delivery(delivery_id, |record| {
             record.updated_at_ms = now_ms();
             record.last_error = Some(error.clone());
+            record.claim_owner = None;
+            record.lease_until_ms = None;
             if retryable && record.attempts < record.max_attempts {
                 record.status = "retry_scheduled".to_string();
                 record.next_retry_at_ms = Some(next_retry_at_ms(record.attempts));
@@ -672,6 +972,8 @@ impl SurfaceMessageStore {
             record.status = "dead_letter".to_string();
             record.updated_at_ms = now_ms();
             record.next_retry_at_ms = None;
+            record.claim_owner = None;
+            record.lease_until_ms = None;
             record.last_error = Some(reason.clone());
         })?;
         self.push_event(SurfaceDeliveryEvent {
@@ -721,6 +1023,8 @@ impl SurfaceMessageStore {
             record.attempts = 0;
             record.updated_at_ms = now_ms();
             record.next_retry_at_ms = None;
+            record.claim_owner = None;
+            record.lease_until_ms = None;
             record.last_error = None;
         })?;
         self.push_event(SurfaceDeliveryEvent {
@@ -766,7 +1070,7 @@ impl SurfaceMessageStore {
             }
         }
         for record in &archived {
-            self.append_record(OUTBOX_FILE, record)?;
+            self.upsert_record(OUTBOX_FILE, record)?;
         }
         drop(state);
         for record in &archived {
@@ -832,13 +1136,13 @@ impl SurfaceMessageStore {
         let remaining = state.events.values().cloned().collect::<Vec<_>>();
         drop(state);
         if !purged_event_ids.is_empty() {
-            self.rewrite_records(EVENT_FILE, &remaining)?;
+            self.replace_records_transaction(EVENT_FILE, &remaining)?;
         }
         Ok(purged_event_ids.len())
     }
 
     pub(crate) fn get_outbox_by_delivery(&self, delivery_id: &str) -> Option<SurfaceOutboxRecord> {
-        self.state.lock().ok().and_then(|state| {
+        self.lock_state().ok().and_then(|state| {
             state
                 .outbox
                 .values()
@@ -848,9 +1152,9 @@ impl SurfaceMessageStore {
     }
 
     pub(crate) fn due_retry_deliveries(&self) -> Vec<SurfaceOutboxRecord> {
+        let _ = self.recover_expired_outbox_claims();
         let now = now_ms();
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| {
                 state
                     .outbox
@@ -866,10 +1170,34 @@ impl SurfaceMessageStore {
             .unwrap_or_default()
     }
 
+    fn recover_expired_outbox_claims(&self) -> Result<(), String> {
+        let now = now_ms();
+        let expired = self
+            .lock_state()?
+            .outbox
+            .values()
+            .filter(|record| {
+                record.status == "sending"
+                    && record.lease_until_ms.is_some_and(|lease| lease <= now)
+            })
+            .map(|record| record.delivery_id.clone())
+            .collect::<Vec<_>>();
+        for delivery_id in expired {
+            self.update_outbox_by_delivery(&delivery_id, |record| {
+                record.status = "retry_scheduled".to_string();
+                record.next_retry_at_ms = Some(now);
+                record.claim_owner = None;
+                record.lease_until_ms = None;
+                record.updated_at_ms = now;
+                record.last_error = Some("surface outbound delivery claim expired".to_string());
+            })?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
         let now = now_ms();
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| {
                 state
                     .trigger_events
@@ -891,7 +1219,7 @@ impl SurfaceMessageStore {
         message_id: &str,
     ) -> Option<SurfaceInboxRecord> {
         let surface = normalize_surface_id(surface);
-        self.state.lock().ok().and_then(|state| {
+        self.lock_state().ok().and_then(|state| {
             state
                 .inbox
                 .values()
@@ -905,8 +1233,7 @@ impl SurfaceMessageStore {
 
     pub(crate) fn list_inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
         let surface = normalize_surface_id(surface);
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| {
                 state
                     .inbox
@@ -920,8 +1247,7 @@ impl SurfaceMessageStore {
 
     pub(crate) fn list_outbox(&self, surface: &str) -> Vec<SurfaceOutboxRecord> {
         let surface = normalize_surface_id(surface);
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| {
                 state
                     .outbox
@@ -934,23 +1260,20 @@ impl SurfaceMessageStore {
     }
 
     pub(crate) fn list_all_inbox(&self) -> Vec<SurfaceInboxRecord> {
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| state.inbox.values().cloned().collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn list_all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| state.outbox.values().cloned().collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn list_trigger_events(&self, surface: &str) -> Vec<SurfaceTriggerEventRecord> {
         let surface = normalize_surface_id(surface);
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| {
                 state
                     .trigger_events
@@ -964,8 +1287,7 @@ impl SurfaceMessageStore {
 
     pub(crate) fn list_delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
         let surface = normalize_surface_id(surface);
-        self.state
-            .lock()
+        self.lock_state()
             .map(|state| {
                 state
                     .events
@@ -1050,20 +1372,19 @@ impl SurfaceMessageStore {
         runtime_turn_id: Option<String>,
         error: Option<String>,
     ) -> Result<(), String> {
-        let mut state = self.lock_state()?;
-        let record = state
-            .inbox
-            .get_mut(idempotency_key)
-            .ok_or_else(|| format!("surface inbox `{idempotency_key}` not found"))?;
-        record.status = status.to_string();
-        record.updated_at_ms = now_ms();
-        if runtime_turn_id.is_some() {
-            record.runtime_turn_id = runtime_turn_id;
-        }
-        record.last_error = error;
-        let record = record.clone();
-        self.append_record(INBOX_FILE, &record)?;
-        drop(state);
+        let status_owned = status.to_string();
+        let (record, ()) = self.update_record_by_key(
+            INBOX_FILE,
+            idempotency_key,
+            |record: &mut SurfaceInboxRecord| {
+                record.status = status_owned;
+                record.updated_at_ms = now_ms();
+                if runtime_turn_id.is_some() {
+                    record.runtime_turn_id = runtime_turn_id;
+                }
+                record.last_error = error;
+            },
+        )?;
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
             surface: record.surface,
@@ -1084,16 +1405,22 @@ impl SurfaceMessageStore {
         idempotency_key: &str,
         update: impl FnOnce(&mut SurfaceTriggerEventRecord),
     ) -> Result<SurfaceTriggerEventRecord, String> {
-        let mut state = self.lock_state()?;
-        let record = state
-            .trigger_events
-            .get_mut(idempotency_key)
-            .ok_or_else(|| format!("surface trigger event `{idempotency_key}` not found"))?;
-        update(record);
-        record.updated_at_ms = now_ms();
-        let record = record.clone();
-        self.append_record(TRIGGER_EVENT_FILE, &record)?;
-        drop(state);
+        let (record, ()) = self.update_record_by_key(
+            TRIGGER_EVENT_FILE,
+            idempotency_key,
+            |record: &mut SurfaceTriggerEventRecord| {
+                update(record);
+                record.updated_at_ms = now_ms();
+            },
+        )?;
+        self.push_trigger_event_delivery_event(&record)?;
+        Ok(record)
+    }
+
+    fn push_trigger_event_delivery_event(
+        &self,
+        record: &SurfaceTriggerEventRecord,
+    ) -> Result<(), String> {
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
             surface: record.surface.clone(),
@@ -1112,7 +1439,7 @@ impl SurfaceMessageStore {
             }),
             created_at_ms: now_ms(),
         })?;
-        Ok(record)
+        Ok(())
     }
 
     fn mark_inbox_status_by_message_id(
@@ -1123,25 +1450,26 @@ impl SurfaceMessageStore {
         error: Option<String>,
     ) -> Result<Option<SurfaceInboxRecord>, String> {
         let surface = normalize_surface_id(surface);
-        let mut state = self.lock_state()?;
+        let state = self.lock_state()?;
         let Some(key) = state.inbox.iter().find_map(|(key, record)| {
             (record.surface == surface && record.message_id == message_id).then(|| key.clone())
         }) else {
             return Ok(None);
         };
-        let record = state
-            .inbox
-            .get_mut(&key)
-            .ok_or_else(|| format!("surface inbox `{surface}/{message_id}` not found"))?;
-        if record.status == status && record.last_error == error {
-            return Ok(Some(record.clone()));
+        let status_owned = status.to_string();
+        let (record, changed) =
+            self.update_record_by_key(INBOX_FILE, &key, |record: &mut SurfaceInboxRecord| {
+                if record.status == status_owned && record.last_error == error {
+                    return false;
+                }
+                record.status = status_owned;
+                record.updated_at_ms = now_ms();
+                record.last_error = error;
+                true
+            })?;
+        if !changed {
+            return Ok(Some(record));
         }
-        record.status = status.to_string();
-        record.updated_at_ms = now_ms();
-        record.last_error = error;
-        let record = record.clone();
-        self.append_record(INBOX_FILE, &record)?;
-        drop(state);
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
             surface: record.surface.clone(),
@@ -1163,61 +1491,418 @@ impl SurfaceMessageStore {
         delivery_id: &str,
         update: impl FnOnce(&mut SurfaceOutboxRecord),
     ) -> Result<SurfaceOutboxRecord, String> {
-        let mut state = self.lock_state()?;
+        let state = self.lock_state()?;
         let key = state
             .outbox
             .iter()
             .find_map(|(key, record)| (record.delivery_id == delivery_id).then(|| key.clone()))
             .ok_or_else(|| format!("surface delivery `{delivery_id}` not found"))?;
-        let record = state
-            .outbox
-            .get_mut(&key)
-            .ok_or_else(|| format!("surface delivery `{delivery_id}` not found"))?;
-        update(record);
-        let record = record.clone();
-        self.append_record(OUTBOX_FILE, &record)?;
-        Ok(record)
+        self.update_record_by_key(OUTBOX_FILE, &key, |record: &mut SurfaceOutboxRecord| {
+            update(record)
+        })
+        .map(|(record, ())| record)
     }
 
     fn push_event(&self, event: SurfaceDeliveryEvent) -> Result<(), String> {
-        let mut state = self.lock_state()?;
-        state.events.insert(event.event_id.clone(), event.clone());
-        self.append_record(EVENT_FILE, &event)
+        self.upsert_record(EVENT_FILE, &event)
     }
 
-    fn append_record<T: Serialize>(&self, file: &str, record: &T) -> Result<(), String> {
-        fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
-        let path = self.root.join(file);
-        let mut writer = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+    fn update_record_by_key<T, R>(
+        &self,
+        file: &str,
+        record_key: &str,
+        update: impl FnOnce(&mut T) -> R,
+    ) -> Result<(T, R), String>
+    where
+        T: for<'de> Deserialize<'de> + Serialize,
+    {
+        let table = table_for_file(file)?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection
+            .transaction()
             .map_err(|error| error.to_string())?;
-        serde_json::to_writer(&mut writer, record).map_err(|error| error.to_string())?;
-        writer.write_all(b"\n").map_err(|error| error.to_string())
+        let payload = transaction
+            .query_row(
+                &format!("SELECT payload_json FROM {table} WHERE record_key=?1"),
+                params![record_key],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let mut record = serde_json::from_str::<T>(&payload).map_err(|error| error.to_string())?;
+        let result = update(&mut record);
+        let value = serde_json::to_value(&record).map_err(|error| error.to_string())?;
+        upsert_json_record(&transaction, file, &value)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok((record, result))
     }
 
-    fn rewrite_records<T: Serialize>(&self, file: &str, records: &[T]) -> Result<(), String> {
-        fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
-        let path = self.root.join(file);
-        let mut writer = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(path)
+    fn upsert_record<T: Serialize>(&self, file: &str, record: &T) -> Result<(), String> {
+        let value = serde_json::to_value(record).map_err(|error| error.to_string())?;
+        let mut connection = self.lock_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        upsert_json_record(&transaction, file, &value)?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn insert_record_if_absent<T: Serialize>(
+        &self,
+        file: &str,
+        record: &T,
+    ) -> Result<bool, String> {
+        let value = serde_json::to_value(record).map_err(|error| error.to_string())?;
+        let table = table_for_file(file)?;
+        let (key, surface, status, next_retry_at_ms, updated_at_ms) = record_columns(file, &value)?;
+        let payload = value.to_string();
+        let connection = self.lock_connection()?;
+        connection
+            .execute(
+                &format!(
+                    "INSERT OR IGNORE INTO {table}(
+                       record_key, surface, status, next_retry_at_ms, updated_at_ms, payload_json
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)"
+                ),
+                params![
+                    key,
+                    surface,
+                    status,
+                    next_retry_at_ms,
+                    updated_at_ms,
+                    payload
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    fn replace_records_transaction<T: Serialize>(
+        &self,
+        file: &str,
+        records: &[T],
+    ) -> Result<(), String> {
+        let mut connection = self.lock_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute(&format!("DELETE FROM {}", table_for_file(file)?), [])
             .map_err(|error| error.to_string())?;
         for record in records {
-            serde_json::to_writer(&mut writer, record).map_err(|error| error.to_string())?;
-            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+            let value = serde_json::to_value(record).map_err(|error| error.to_string())?;
+            upsert_json_record(&transaction, file, &value)?;
         }
-        Ok(())
+        transaction.commit().map_err(|error| error.to_string())
     }
 
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, SurfaceMessageState>, String> {
-        self.state
+    fn lock_state(&self) -> Result<SurfaceMessageState, String> {
+        let connection = self.lock_connection()?;
+        load_database_state(&connection)
+    }
+
+    fn lock_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
+        self.database
             .lock()
             .map_err(|_| "surface message store lock poisoned".to_string())
     }
+
+    fn import_legacy_jsonl_once(&self) -> Result<(), String> {
+        let mut connection = self.lock_connection()?;
+        let imported = connection
+            .query_row(
+                "SELECT value FROM surface_store_meta WHERE key = 'legacy_jsonl_import_v1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if imported.is_some() {
+            return Ok(());
+        }
+        let state = load_legacy_state(&self.root)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        persist_state_transaction(&transaction, &state)?;
+        let evidence = legacy_import_evidence(&self.root, &state);
+        transaction
+            .execute(
+                "INSERT INTO surface_store_meta(key, value) VALUES('legacy_jsonl_import_v1', ?1)",
+                params![evidence.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+
+    fn reconcile_after_restart(&self) -> Result<(), String> {
+        {
+            let connection = self.lock_connection()?;
+            let now = now_ms();
+            connection
+                .execute(
+                    "UPDATE surface_ingress_frame
+                     SET status='retry_scheduled', claim_owner=NULL, lease_until_ms=NULL,
+                         next_retry_at_ms=?1, updated_at_ms=?1,
+                         last_error='gateway restarted before ingress claim completed'
+                     WHERE status='claimed'",
+                    params![now],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let mut state = self.lock_state()?;
+        normalize_terminal_outbox_state(&mut state);
+        normalize_trigger_event_state(&mut state);
+        reconcile_inbox_with_outbox(&mut state);
+        let mut connection = self.lock_connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        persist_state_transaction(&transaction, &state)?;
+        transaction.commit().map_err(|error| error.to_string())
+    }
+}
+
+fn initialize_database(connection: &Connection) -> Result<(), String> {
+    connection
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    connection
+        .pragma_update(None, "synchronous", "FULL")
+        .map_err(|error| error.to_string())?;
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .map_err(|error| error.to_string())?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|error| error.to_string())?;
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS surface_store_meta(
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS surface_inbox(
+                 record_key TEXT PRIMARY KEY,
+                 surface TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 next_retry_at_ms INTEGER,
+                 updated_at_ms INTEGER NOT NULL,
+                 payload_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS surface_outbox(
+                 record_key TEXT PRIMARY KEY,
+                 surface TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 next_retry_at_ms INTEGER,
+                 updated_at_ms INTEGER NOT NULL,
+                 payload_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS surface_trigger_event(
+                 record_key TEXT PRIMARY KEY,
+                 surface TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 next_retry_at_ms INTEGER,
+                 updated_at_ms INTEGER NOT NULL,
+                 payload_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS surface_delivery_event(
+                 record_key TEXT PRIMARY KEY,
+                 surface TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 next_retry_at_ms INTEGER,
+                 updated_at_ms INTEGER NOT NULL,
+                 payload_json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS surface_ingress_frame(
+                 record_key TEXT PRIMARY KEY,
+                 surface TEXT NOT NULL,
+                 session_id TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 max_attempts INTEGER NOT NULL DEFAULT 5,
+                 next_retry_at_ms INTEGER,
+                 claim_owner TEXT,
+                 lease_until_ms INTEGER,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 last_error TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_surface_inbox_surface_status
+                 ON surface_inbox(surface, status, updated_at_ms);
+             CREATE INDEX IF NOT EXISTS idx_surface_outbox_due
+                 ON surface_outbox(status, next_retry_at_ms, surface);
+             CREATE INDEX IF NOT EXISTS idx_surface_trigger_due
+                 ON surface_trigger_event(status, next_retry_at_ms, surface);
+             CREATE INDEX IF NOT EXISTS idx_surface_delivery_surface_created
+                 ON surface_delivery_event(surface, updated_at_ms);
+             CREATE INDEX IF NOT EXISTS idx_surface_ingress_claim
+                 ON surface_ingress_frame(status, next_retry_at_ms, lease_until_ms, session_id, created_at_ms);",
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn table_for_file(file: &str) -> Result<&'static str, String> {
+    match file {
+        INBOX_FILE => Ok("surface_inbox"),
+        OUTBOX_FILE => Ok("surface_outbox"),
+        TRIGGER_EVENT_FILE => Ok("surface_trigger_event"),
+        EVENT_FILE => Ok("surface_delivery_event"),
+        other => Err(format!("unknown surface durable record family `{other}`")),
+    }
+}
+
+fn record_columns(
+    file: &str,
+    value: &serde_json::Value,
+) -> Result<(String, String, String, Option<i64>, i64), String> {
+    let string = |field: &str| {
+        value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .ok_or_else(|| format!("surface durable record missing `{field}`"))
+    };
+    let key = match file {
+        INBOX_FILE | OUTBOX_FILE | TRIGGER_EVENT_FILE => string("idempotency_key")?,
+        EVENT_FILE => string("event_id")?,
+        other => return Err(format!("unknown surface durable record family `{other}`")),
+    };
+    let surface = string("surface")?;
+    let status = string("status")?;
+    let next_retry_at_ms = value
+        .get("next_retry_at_ms")
+        .and_then(serde_json::Value::as_i64);
+    let updated_at_ms = value
+        .get("updated_at_ms")
+        .or_else(|| value.get("created_at_ms"))
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(now_ms);
+    Ok((key, surface, status, next_retry_at_ms, updated_at_ms))
+}
+
+fn upsert_json_record(
+    transaction: &Transaction<'_>,
+    file: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let table = table_for_file(file)?;
+    let (key, surface, status, next_retry_at_ms, updated_at_ms) = record_columns(file, value)?;
+    let payload = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            &format!(
+                "INSERT INTO {table}(record_key, surface, status, next_retry_at_ms, updated_at_ms, payload_json)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(record_key) DO UPDATE SET
+                   surface=excluded.surface,
+                   status=excluded.status,
+                   next_retry_at_ms=excluded.next_retry_at_ms,
+                   updated_at_ms=excluded.updated_at_ms,
+                   payload_json=excluded.payload_json"
+            ),
+            params![key, surface, status, next_retry_at_ms, updated_at_ms, payload],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn load_database_records<T>(
+    connection: &Connection,
+    table: &str,
+) -> Result<BTreeMap<String, T>, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut statement = connection
+        .prepare(&format!("SELECT record_key, payload_json FROM {table}"))
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| error.to_string())?;
+    let mut records = BTreeMap::new();
+    for row in rows {
+        let (key, payload) = row.map_err(|error| error.to_string())?;
+        records.insert(
+            key,
+            serde_json::from_str::<T>(&payload).map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(records)
+}
+
+fn load_database_state(connection: &Connection) -> Result<SurfaceMessageState, String> {
+    Ok(SurfaceMessageState {
+        inbox: load_database_records(connection, "surface_inbox")?,
+        outbox: load_database_records(connection, "surface_outbox")?,
+        trigger_events: load_database_records(connection, "surface_trigger_event")?,
+        events: load_database_records(connection, "surface_delivery_event")?,
+    })
+}
+
+fn persist_state_transaction(
+    transaction: &Transaction<'_>,
+    state: &SurfaceMessageState,
+) -> Result<(), String> {
+    for table in [
+        "surface_inbox",
+        "surface_outbox",
+        "surface_trigger_event",
+        "surface_delivery_event",
+    ] {
+        transaction
+            .execute(&format!("DELETE FROM {table}"), [])
+            .map_err(|error| error.to_string())?;
+    }
+    for record in state.inbox.values() {
+        upsert_json_record(
+            transaction,
+            INBOX_FILE,
+            &serde_json::to_value(record).map_err(|error| error.to_string())?,
+        )?;
+    }
+    for record in state.outbox.values() {
+        upsert_json_record(
+            transaction,
+            OUTBOX_FILE,
+            &serde_json::to_value(record).map_err(|error| error.to_string())?,
+        )?;
+    }
+    for record in state.trigger_events.values() {
+        upsert_json_record(
+            transaction,
+            TRIGGER_EVENT_FILE,
+            &serde_json::to_value(record).map_err(|error| error.to_string())?,
+        )?;
+    }
+    for record in state.events.values() {
+        upsert_json_record(
+            transaction,
+            EVENT_FILE,
+            &serde_json::to_value(record).map_err(|error| error.to_string())?,
+        )?;
+    }
+    Ok(())
+}
+
+fn legacy_import_evidence(root: &Path, state: &SurfaceMessageState) -> serde_json::Value {
+    let mut hasher = Sha256::new();
+    for file in [INBOX_FILE, OUTBOX_FILE, TRIGGER_EVENT_FILE, EVENT_FILE] {
+        if let Ok(bytes) = fs::read(root.join(file)) {
+            hasher.update(file.as_bytes());
+            hasher.update(&bytes);
+        }
+    }
+    serde_json::json!({
+        "inbox": state.inbox.len(),
+        "outbox": state.outbox.len(),
+        "trigger_events": state.trigger_events.len(),
+        "delivery_events": state.events.len(),
+        "sha256": format!("{:x}", hasher.finalize()),
+        "imported_at_ms": now_ms(),
+    })
 }
 
 pub(crate) fn inbound_idempotency_key(surface: &str, message_id: &str) -> String {
@@ -1239,7 +1924,7 @@ fn outbound_idempotency_key(
     )
 }
 
-fn load_state(root: &Path) -> Result<SurfaceMessageState, String> {
+fn load_legacy_state(root: &Path) -> Result<SurfaceMessageState, String> {
     let mut state = SurfaceMessageState {
         inbox: read_latest(root.join(INBOX_FILE), |record: &SurfaceInboxRecord| {
             record.idempotency_key.clone()
@@ -1281,9 +1966,21 @@ fn normalize_trigger_event_state(state: &mut SurfaceMessageState) {
 }
 
 fn normalize_terminal_outbox_state(state: &mut SurfaceMessageState) {
+    let now = now_ms();
     for record in state.outbox.values_mut() {
+        if record.status == "sending" {
+            record.status = "retry_scheduled".to_string();
+            record.next_retry_at_ms = Some(now);
+            record.claim_owner = None;
+            record.lease_until_ms = None;
+            record.updated_at_ms = record.updated_at_ms.max(now);
+            record.last_error =
+                Some("gateway restarted before the outbound delivery claim completed".to_string());
+        }
         if is_terminal_outbox_status(&record.status) {
             record.next_retry_at_ms = None;
+            record.claim_owner = None;
+            record.lease_until_ms = None;
         }
         if record.status == "dead_letter" && record.attempts > record.max_attempts {
             record.attempts = record.max_attempts;
@@ -1398,6 +2095,20 @@ where
         records.insert(key_fn(&record), record);
     }
     Ok(records)
+}
+
+fn write_jsonl_atomic<'a, T: Serialize + 'a>(
+    path: PathBuf,
+    records: impl IntoIterator<Item = &'a T>,
+) -> Result<(), String> {
+    let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let mut writer = fs::File::create(&temporary).map_err(|error| error.to_string())?;
+    for record in records {
+        serde_json::to_writer(&mut writer, record).map_err(|error| error.to_string())?;
+        writer.write_all(b"\n").map_err(|error| error.to_string())?;
+    }
+    writer.sync_all().map_err(|error| error.to_string())?;
+    fs::rename(&temporary, &path).map_err(|error| error.to_string())
 }
 
 fn now_ms() -> i64 {
@@ -2021,6 +2732,278 @@ mod tests {
             .iter()
             .all(|event| event.delivery_id.as_deref() != Some(&queued.delivery_id)));
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_ingress_claims_one_frame_per_session_and_recovers_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-ingress-claim-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let frame = |session: &str, message: &str| SurfaceFrame::Event {
+            surface: "feishu".to_string(),
+            event: "message.received".to_string(),
+            payload: serde_json::json!({
+                "session_id": session,
+                "message_id": message,
+                "text": "fixture"
+            }),
+        };
+        let first_key = store
+            .persist_ingress_frame(&frame("session-a", "a-1"))
+            .unwrap();
+        store
+            .persist_ingress_frame(&frame("session-a", "a-2"))
+            .unwrap();
+        store
+            .persist_ingress_frame(&frame("session-b", "b-1"))
+            .unwrap();
+
+        let first_claim = store.claim_ingress_frames("worker-1", 8, 300_000).unwrap();
+        assert_eq!(first_claim.len(), 2);
+        assert_eq!(
+            first_claim
+                .iter()
+                .filter_map(|claim| match &claim.frame {
+                    SurfaceFrame::Event { payload, .. } => payload["session_id"].as_str(),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        store.complete_ingress_frame(&first_key).unwrap();
+
+        let reloaded = SurfaceMessageStore::new(&root);
+        let recovered = reloaded
+            .claim_ingress_frames("worker-2", 8, 300_000)
+            .unwrap();
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered
+                .iter()
+                .filter_map(|claim| match &claim.frame {
+                    SurfaceFrame::Event { payload, .. } => payload["session_id"].as_str(),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn production_mutations_write_sqlite_without_jsonl_dual_write() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-surface-sqlite-only-{}", uuid::Uuid::new_v4()));
+        let store = SurfaceMessageStore::new(&root);
+        store
+            .record_inbox_received(
+                "feishu",
+                "message-1",
+                &serde_json::json!({"text": "hello"}),
+                "session-1",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(root.join(DATABASE_FILE).exists());
+        assert!(!root.join(INBOX_FILE).exists());
+        assert!(!root.join(OUTBOX_FILE).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_jsonl_import_records_count_hash_and_supports_atomic_reverse_export() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-legacy-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let record = SurfaceInboxRecord {
+            id: "feishu:legacy-1".to_string(),
+            surface: "feishu".to_string(),
+            message_id: "legacy-1".to_string(),
+            idempotency_key: "feishu:legacy-1".to_string(),
+            thread_id: None,
+            sender_id: None,
+            payload_hash: "legacy-hash".to_string(),
+            payload_summary: "legacy".to_string(),
+            payload_json: serde_json::json!({"text": "legacy"}),
+            status: "received".to_string(),
+            received_at_ms: 1,
+            updated_at_ms: 1,
+            runtime_session_id: Some("legacy-session".to_string()),
+            runtime_turn_id: None,
+            correlation: None,
+            last_error: None,
+        };
+        std::fs::write(
+            root.join(INBOX_FILE),
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let store = SurfaceMessageStore::new(&root);
+        assert_eq!(store.list_inbox("feishu").len(), 1);
+        let evidence = store
+            .lock_connection()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM surface_store_meta WHERE key='legacy_jsonl_import_v1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        let evidence: serde_json::Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(evidence["inbox"], 1);
+        assert!(evidence["sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64));
+
+        let export = root.join("reverse-export");
+        store.export_legacy_jsonl(&export).unwrap();
+        assert_eq!(
+            read_latest::<SurfaceInboxRecord>(export.join(INBOX_FILE), |record| record
+                .idempotency_key
+                .clone())
+            .unwrap()
+            .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_outbox_idempotency_creates_one_durable_delivery_identity() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-surface-outbox-race-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(SurfaceMessageStore::new(&root));
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            workers.push(std::thread::spawn(move || {
+                store
+                    .queue_outbox(
+                        &SurfaceSendRequest {
+                            surface: "feishu".to_string(),
+                            recipient: "user-1".to_string(),
+                            thread: None,
+                            text: "one logical reply".to_string(),
+                            idempotency_key: Some("reply:stable-1".to_string()),
+                            metadata: serde_json::Value::Null,
+                        },
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                    .delivery_id
+            }));
+        }
+        let delivery_ids = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(delivery_ids.len(), 1);
+        assert_eq!(store.list_outbox("feishu").len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_ingress_burst_drains_in_bounded_claim_batches() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-ingress-burst-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = SurfaceMessageStore::new(&root);
+        let started = std::time::Instant::now();
+        for index in 0..320 {
+            store
+                .persist_ingress_frame(&SurfaceFrame::Event {
+                    surface: "feishu".to_string(),
+                    event: "message.received".to_string(),
+                    payload: serde_json::json!({
+                        "session_id": format!("session-{index}"),
+                        "message_id": format!("message-{index}"),
+                        "text": "fixture"
+                    }),
+                })
+                .unwrap();
+        }
+        let mut drained = 0usize;
+        loop {
+            let claims = store
+                .claim_ingress_frames("burst-worker", 32, 30_000)
+                .unwrap();
+            if claims.is_empty() {
+                break;
+            }
+            assert!(claims.len() <= 32);
+            for claim in claims {
+                store.complete_ingress_frame(&claim.record_key).unwrap();
+                drained += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "surface_ingress_burst records=320 elapsed_ms={}",
+            elapsed.as_micros() as f64 / 1_000.0
+        );
+        assert_eq!(drained, 320);
+        assert!(elapsed < std::time::Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn outbound_claim_is_exclusive_and_expired_lease_returns_to_retry_queue() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-outbox-lease-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(SurfaceMessageStore::new(&root));
+        let queued = store
+            .queue_outbox(
+                &SurfaceSendRequest {
+                    surface: "feishu".to_string(),
+                    recipient: "user-1".to_string(),
+                    thread: None,
+                    text: "lease fixture".to_string(),
+                    idempotency_key: Some("lease-fixture".to_string()),
+                    metadata: serde_json::Value::Null,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let delivery_id = queued.delivery_id.clone();
+            workers.push(std::thread::spawn(move || {
+                store.mark_delivery_sending(&delivery_id).is_ok()
+            }));
+        }
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|claimed| *claimed)
+                .count(),
+            1
+        );
+        store
+            .update_outbox_by_delivery(&queued.delivery_id, |record| {
+                record.lease_until_ms = Some(now_ms().saturating_sub(1));
+            })
+            .unwrap();
+        let retry = store.due_retry_deliveries();
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].status, "retry_scheduled");
         let _ = std::fs::remove_dir_all(root);
     }
 }

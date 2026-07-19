@@ -15,6 +15,8 @@ use surface::{
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
+use super::SurfaceMessageStore;
+
 const AUTH_HEADER: &str = "x-cowd-edge-token";
 const MAX_RESPONSE_BODY: usize = 2 * 1024 * 1024;
 const MAX_STREAM_LINE: usize = 512 * 1024;
@@ -170,10 +172,11 @@ impl EdgeH2Client {
         &self,
         events: Arc<Mutex<VecDeque<SurfaceFrame>>>,
         event_tx: broadcast::Sender<SurfaceFrame>,
+        messages: Arc<SurfaceMessageStore>,
     ) {
         let client = self.clone();
         tokio::spawn(async move {
-            if let Err(error) = client.consume_events(events, event_tx).await {
+            if let Err(error) = client.consume_events(events, event_tx, messages).await {
                 tracing::warn!(surface = %client.surface_id, error = %error, "managed edge event stream stopped");
             }
         });
@@ -183,6 +186,7 @@ impl EdgeH2Client {
         &self,
         events: Arc<Mutex<VecDeque<SurfaceFrame>>>,
         event_tx: broadcast::Sender<SurfaceFrame>,
+        messages: Arc<SurfaceMessageStore>,
     ) -> Result<(), SurfaceError> {
         let request = self.request(Method::GET, "/_cowd/edge/v2/events?after=0", Bytes::new())?;
         let response = self.send(request).await?;
@@ -218,6 +222,12 @@ impl EdgeH2Client {
                             surface: self.surface_id.to_string(),
                             reason: format!("managed edge event decode failed: {error}"),
                         }
+                    })?;
+                messages
+                    .persist_ingress_frame(&envelope.frame)
+                    .map_err(|reason| SurfaceError::Invocation {
+                        surface: self.surface_id.to_string(),
+                        reason: format!("managed edge event durable persist failed: {reason}"),
                     })?;
                 {
                     let mut snapshot = events.lock().await;
@@ -371,8 +381,9 @@ pub(super) fn bootstrap_request(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
     use http_body_util::StreamBody;
@@ -380,6 +391,7 @@ mod tests {
     use hyper::service::service_fn;
     use hyper::Response;
     use tokio::net::UnixListener;
+    use tokio::sync::Notify;
 
     type FixtureBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>;
 
@@ -589,5 +601,105 @@ mod tests {
         .await
         .expect("source H2 body remained active after downstream cancellation");
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_event_is_durable_before_gateway_sends_ack() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-h2-durable-event-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let socket = root.join("edge.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let store = Arc::new(SurfaceMessageStore::new(root.join("messages")));
+        let acked = Arc::new(Notify::new());
+        let persisted_before_ack = Arc::new(AtomicBool::new(false));
+        let server_store = store.clone();
+        let server_acked = acked.clone();
+        let server_persisted = persisted_before_ack.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |request: Request<Incoming>| {
+                let store = server_store.clone();
+                let acked = server_acked.clone();
+                let persisted = server_persisted.clone();
+                async move {
+                    let path = request.uri().path().to_string();
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    if path.ends_with("/handshake") {
+                        let bootstrap: EdgeBootstrapRequest =
+                            serde_json::from_slice(&bytes).unwrap();
+                        let response = EdgeBootstrapResponse {
+                            protocol: EDGE_PROTOCOL_V2.to_string(),
+                            surface_id: bootstrap.surface_id,
+                            driver_profile: bootstrap.driver_profile,
+                            capabilities: bootstrap.capabilities,
+                            max_in_flight: 256,
+                        };
+                        return Ok::<_, Infallible>(Response::new(
+                            Full::new(Bytes::from(serde_json::to_vec(&response).unwrap()))
+                                .boxed_unsync(),
+                        ));
+                    }
+                    if path.ends_with("/events") {
+                        let envelope = EdgeEventEnvelope {
+                            sequence: 1,
+                            frame: SurfaceFrame::Event {
+                                surface: "feishu".to_string(),
+                                event: "message.received".to_string(),
+                                payload: serde_json::json!({
+                                    "session_id": "session-1",
+                                    "message_id": "message-1",
+                                    "text": "hello"
+                                }),
+                            },
+                        };
+                        let mut line = serde_json::to_vec(&envelope).unwrap();
+                        line.push(b'\n');
+                        let frames = futures::stream::once(async move {
+                            Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from(line)))
+                        })
+                        .chain(futures::stream::pending());
+                        return Ok(Response::new(StreamBody::new(frames).boxed_unsync()));
+                    }
+                    if path.ends_with("/events/ack") {
+                        persisted.store(store.ingress_frame_count() == 1, Ordering::SeqCst);
+                        acked.notify_one();
+                        let ack: EdgeEventAck = serde_json::from_slice(&bytes).unwrap();
+                        return Ok(Response::new(
+                            Full::new(Bytes::from(serde_json::to_vec(&ack).unwrap()))
+                                .boxed_unsync(),
+                        ));
+                    }
+                    Ok(Response::new(Full::new(Bytes::new()).boxed_unsync()))
+                }
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let client = EdgeH2Client::connect(
+            &socket,
+            "fixture",
+            "fixture-token-at-least-thirty-two-bytes",
+        )
+        .await
+        .unwrap();
+        client
+            .bootstrap(&bootstrap_request(
+                "fixture",
+                "fixture",
+                vec!["message.receive".to_string()],
+            ))
+            .await
+            .unwrap();
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        client.spawn_event_stream(Arc::new(Mutex::new(VecDeque::new())), event_tx, store);
+
+        tokio::time::timeout(Duration::from_secs(1), acked.notified())
+            .await
+            .expect("gateway did not ACK managed event");
+        assert!(persisted_before_ack.load(Ordering::SeqCst));
+        server.abort();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

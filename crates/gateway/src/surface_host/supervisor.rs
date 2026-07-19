@@ -163,6 +163,7 @@ impl SurfaceHost {
             self.ledger.clone(),
             self.managed.clone(),
             self.event_tx.clone(),
+            self.messages.clone(),
         )
         .await
         {
@@ -223,6 +224,7 @@ async fn start_managed_process(
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
     managed: Arc<AsyncMutex<HashMap<String, Arc<ManagedSurfaceProcess>>>>,
     event_tx: broadcast::Sender<SurfaceFrame>,
+    messages: Arc<super::SurfaceMessageStore>,
 ) -> Result<ManagedSurfaceProcess, SurfaceError> {
     let surface_id = surface.id.clone();
     let (artifact, driver_profile) =
@@ -347,7 +349,7 @@ async fn start_managed_process(
         });
     }
     let events = Arc::new(AsyncMutex::new(VecDeque::new()));
-    client.spawn_event_stream(events.clone(), event_tx);
+    client.spawn_event_stream(events.clone(), event_tx, messages);
     let wait_runtime = runtime.clone();
     let wait_ledger = ledger.clone();
     let wait_managed = managed.clone();

@@ -19,7 +19,7 @@ mod types;
 
 pub(crate) use ingress::spawn_surface_ingress_dispatcher;
 pub(crate) use message_store::{
-    SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
+    SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim, SurfaceMessageSnapshot,
     SurfaceMessageStore, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
     SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };

@@ -12,9 +12,9 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::surface_host::{
     SurfaceDeliveryEvent, SurfaceDiscoveryReport, SurfaceHost, SurfaceHostHealth,
-    SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot, SurfaceOutboxRecord,
-    SurfaceResourceSummary, SurfaceRouteSummary, SurfaceStaticFile, SurfaceTriggerEventReceipt,
-    SurfaceTriggerEventRecord,
+    SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim, SurfaceMessageSnapshot,
+    SurfaceOutboxRecord, SurfaceResourceSummary, SurfaceRouteSummary, SurfaceStaticFile,
+    SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord,
 };
 use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 
@@ -230,6 +230,23 @@ impl SurfaceService {
 
     pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
         self.host.due_trigger_event_retries()
+    }
+
+    pub(crate) fn claim_ingress_frames(
+        &self,
+        claim_owner: &str,
+        limit: usize,
+        lease_ms: i64,
+    ) -> Result<Vec<SurfaceIngressClaim>, String> {
+        self.host.claim_ingress_frames(claim_owner, limit, lease_ms)
+    }
+
+    pub(crate) fn complete_ingress_frame(&self, record_key: &str) -> Result<(), String> {
+        self.host.complete_ingress_frame(record_key)
+    }
+
+    pub(crate) fn fail_ingress_frame(&self, record_key: &str, error: &str) -> Result<(), String> {
+        self.host.fail_ingress_frame(record_key, error)
     }
 
     pub(crate) fn inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {

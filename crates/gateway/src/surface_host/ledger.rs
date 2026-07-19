@@ -8,9 +8,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use super::{managed_actions, SurfaceHost};
 use super::{
-    SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceMessageSnapshot,
-    SurfaceOutboxRecord, SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord,
-    SurfaceTurnCorrelation,
+    SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
+    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
+    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 
@@ -150,6 +150,24 @@ impl SurfaceHost {
 
     pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
         self.messages.due_trigger_event_retries()
+    }
+
+    pub(crate) fn claim_ingress_frames(
+        &self,
+        claim_owner: &str,
+        limit: usize,
+        lease_ms: i64,
+    ) -> Result<Vec<SurfaceIngressClaim>, String> {
+        self.messages
+            .claim_ingress_frames(claim_owner, limit, lease_ms)
+    }
+
+    pub(crate) fn complete_ingress_frame(&self, record_key: &str) -> Result<(), String> {
+        self.messages.complete_ingress_frame(record_key)
+    }
+
+    pub(crate) fn fail_ingress_frame(&self, record_key: &str, error: &str) -> Result<(), String> {
+        self.messages.fail_ingress_frame(record_key, error)
     }
 
     pub(crate) fn inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
