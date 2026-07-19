@@ -4,6 +4,7 @@ use std::{
     io::{Read, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::atomic::Ordering,
 };
 
 use app_mfg::{MfgLiveDeltaRead, MfgLiveEpoch, MfgLiveProjectionEvent};
@@ -109,14 +110,46 @@ impl MfgService {
         limit: usize,
     ) -> Result<Option<MfgLiveEnvelopeV1>, MfgLiveServiceError> {
         let service = self.clone();
+        let cache_material = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            config_home.display(),
+            principal.principal_id,
+            principal.profile_revision,
+            principal.credential_epoch,
+            principal.expires_at_ms.unwrap_or_default(),
+            principal.scope_hash(),
+            principal.capability_hash(),
+            previous_view_epoch,
+            cursor,
+            limit,
+        );
+        let cache_key = format!("{:x}", Sha256::digest(cache_material.as_bytes()));
         tokio::task::spawn_blocking(move || {
-            service.live_delta_envelope(
+            let hub_revision = service.live_hub_revision.load(Ordering::Acquire);
+            let shard_index = usize::from(cache_key.as_bytes()[0]) % service.live_view_cache.len();
+            let mut shard = service.live_view_cache[shard_index]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((cached_revision, envelope)) = shard.get(&cache_key) {
+                if *cached_revision == hub_revision {
+                    return Ok(envelope.clone());
+                }
+            }
+            service
+                .live_repository_reads
+                .fetch_add(1, Ordering::Relaxed);
+            let envelope = service.live_delta_envelope(
                 config_home,
                 &principal,
                 &previous_view_epoch,
                 &cursor,
                 limit,
-            )
+            )?;
+            if shard.len() >= 256 {
+                shard.clear();
+            }
+            shard.insert(cache_key, (hub_revision, envelope.clone()));
+            Ok(envelope)
         })
         .await
         .map_err(|error| MfgLiveServiceError::CursorKeyIo(error.to_string()))?
@@ -1669,6 +1702,37 @@ mod tests {
                 .unwrap()
                 .rotation_reason,
             "cursor_key_recreated"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_hundred_identical_views_share_one_authorized_repository_delta_read() {
+        let config_home = tempfile::tempdir().unwrap();
+        let service = MfgService::new();
+        let observer = principal("operator", 1, &["gateway"]);
+        let MfgLiveEnvelopeV1::Snapshot(snapshot) = service
+            .live_snapshot_envelope(config_home.path(), &observer)
+            .unwrap()
+        else {
+            panic!("snapshot")
+        };
+        service.notify_live_mutation();
+        let before = service.live_repository_reads.load(Ordering::Relaxed);
+        let futures = (0..100).map(|_| {
+            service.live_delta_envelope_async(
+                config_home.path().to_path_buf(),
+                observer.clone(),
+                snapshot.view_epoch.clone(),
+                snapshot.cursor.clone(),
+                100,
+            )
+        });
+        for result in futures::future::join_all(futures).await {
+            assert!(result.unwrap().is_none());
+        }
+        assert_eq!(
+            service.live_repository_reads.load(Ordering::Relaxed) - before,
+            1
         );
     }
 

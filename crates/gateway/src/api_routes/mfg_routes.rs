@@ -711,6 +711,41 @@ async fn mfg_capability_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    let permit = match state.services.mfg.acquire_blocking_permit().await {
+        Ok(permit) => permit,
+        Err(message) => {
+            return mfg_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                app_mfg_contract::MfgErrorCode::Internal,
+                message,
+                true,
+            );
+        }
+    };
+    let runtime = tokio::runtime::Handle::current();
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        runtime.block_on(mfg_capability_middleware_blocking(state, request, next))
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => mfg_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            app_mfg_contract::MfgErrorCode::Internal,
+            format!("MFG blocking worker failed: {error}"),
+            true,
+        ),
+    }
+}
+
+/// 所有 MFG handler 的同步 repository I/O 都运行在有界 blocking worker
+/// 内；handler 自身仍可 await Runtime/connector I/O，不占用 Tokio async worker。
+async fn mfg_capability_middleware_blocking(
+    state: Arc<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     let method = request.method().as_str();
     let path = request
         .extensions()
@@ -1144,6 +1179,12 @@ async fn mfg_mutation_ledger_middleware(
     if !response.status().is_success() {
         return response;
     }
+    if durable {
+        // Domain mutation 已经提交：立即唤醒 live observer。Hub 不携带
+        // response/raw payload，observer 仍按各自 principal 从 durable log
+        // 读取并裁剪。
+        state.services.mfg.notify_live_mutation();
+    }
     let (mut response_parts, response_body) = response.into_parts();
     let response_bytes = match axum::body::to_bytes(response_body, MAX_MFG_MUTATION_BODY).await {
         Ok(bytes) => bytes,
@@ -1207,6 +1248,11 @@ async fn mfg_mutation_ledger_middleware(
             updated_at: now,
         }
     };
+    if durable {
+        // receipt 自身也是 durable live event；第二次无载荷唤醒确保第一轮
+        // delta 与 receipt 提交竞态时，订阅者仍能继续推进 cursor。
+        state.services.mfg.notify_live_mutation();
+    }
     attach_mfg_receipt(&mut response_json, &receipt);
     response_parts
         .headers

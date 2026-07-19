@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -90,8 +90,30 @@ pub(crate) struct MfgService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     review_reconciler: Arc<MfgReviewReconcilerLifecycle>,
-    live_stores: Arc<Mutex<BTreeMap<PathBuf, Arc<MfgStore>>>>,
+    live_read_pools: Arc<Mutex<BTreeMap<PathBuf, Arc<MfgReadPool>>>>,
     live_key_lock: Arc<Mutex<()>>,
+    blocking_gate: Arc<tokio::sync::Semaphore>,
+    live_hub_tx: tokio::sync::broadcast::Sender<u64>,
+    live_hub_revision: Arc<AtomicU64>,
+    live_view_cache:
+        Arc<Vec<Mutex<BTreeMap<String, (u64, Option<app_mfg_contract::MfgLiveEnvelopeV1>)>>>>,
+    live_repository_reads: Arc<AtomicU64>,
+}
+
+/// 有限的 live 查询连接池。每个 Store 拥有独立 SQLite 连接，避免一个
+/// observer 的较慢 snapshot/delta 查询阻塞其余 observer；SQLite WAL 仍是
+/// durable truth，pool 只负责连接所有权，不缓存业务数据。
+#[derive(Debug)]
+struct MfgReadPool {
+    stores: Vec<Arc<MfgStore>>,
+    next: AtomicUsize,
+}
+
+impl MfgReadPool {
+    fn next(&self) -> Arc<MfgStore> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.stores.len();
+        Arc::clone(&self.stores[index])
+    }
 }
 
 pub(crate) struct MfgReviewReconcilerLifecycle {
@@ -159,6 +181,7 @@ pub(crate) struct MfgIncidentContext {
 
 impl MfgService {
     pub(crate) fn new() -> Self {
+        let (live_hub_tx, _) = tokio::sync::broadcast::channel(1024);
         Self {
             label: "mfg",
             owner: "0.9.380 GatewayServices",
@@ -167,9 +190,37 @@ impl MfgService {
                 cancelled: AtomicBool::new(false),
                 handle: Mutex::new(None),
             }),
-            live_stores: Arc::new(Mutex::new(BTreeMap::new())),
+            live_read_pools: Arc::new(Mutex::new(BTreeMap::new())),
             live_key_lock: Arc::new(Mutex::new(())),
+            // MFG route 中仍有同步 SQLite facade。统一把整条 route future
+            // 移到 blocking pool，并在入口限流，防止占满 Tokio async worker。
+            blocking_gate: Arc::new(tokio::sync::Semaphore::new(32)),
+            live_hub_tx,
+            live_hub_revision: Arc::new(AtomicU64::new(0)),
+            live_view_cache: Arc::new((0..16).map(|_| Mutex::new(BTreeMap::new())).collect()),
+            live_repository_reads: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) async fn acquire_blocking_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        Arc::clone(&self.blocking_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| "MFG blocking worker gate is closed".to_string())
+    }
+
+    /// Hub 只传播“durable log 已前进”的无载荷信号。订阅者收到信号后，
+    /// 使用自己的 principal/cursor 从 repository 读取并裁剪，未经授权的
+    /// raw payload 因而不会进入共享 queue 或 cache。
+    pub(crate) fn subscribe_live_mutations(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.live_hub_tx.subscribe()
+    }
+
+    pub(crate) fn notify_live_mutation(&self) {
+        let revision = self.live_hub_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.live_hub_tx.send(revision);
     }
 
     pub(crate) fn begin_review_reconciler(&self) -> Option<Weak<MfgReviewReconcilerLifecycle>> {
@@ -256,14 +307,14 @@ impl MfgService {
         config_home: impl AsRef<Path>,
     ) -> Result<Arc<MfgStore>, MfgRepositoryError> {
         let config_home = config_home.as_ref().to_path_buf();
-        if let Some(store) = self
-            .live_stores
+        if let Some(pool) = self
+            .live_read_pools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&config_home)
             .cloned()
         {
-            return Ok(store);
+            return Ok(pool.next());
         }
         let registry = storage::StorageRegistry::default_for_config_home(&config_home);
         registry
@@ -273,15 +324,22 @@ impl MfgService {
         let handle = registry
             .sqlite_handle("mfg")
             .map_err(to_mfg_storage_error)?;
-        let store = Arc::new(MfgStore::open_storage_handle(handle)?);
-        let mut stores = self
-            .live_stores
+        let mut stores = Vec::with_capacity(4);
+        for _ in 0..4 {
+            stores.push(Arc::new(MfgStore::open_storage_handle(handle)?));
+        }
+        let pool = Arc::new(MfgReadPool {
+            stores,
+            next: AtomicUsize::new(0),
+        });
+        let mut pools = self
+            .live_read_pools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok(stores
+        Ok(pools
             .entry(config_home)
-            .or_insert_with(|| Arc::clone(&store))
-            .clone())
+            .or_insert_with(|| Arc::clone(&pool))
+            .next())
     }
 
     pub(crate) fn incident_context(
@@ -1373,5 +1431,52 @@ mod tests {
         service.shutdown_review_reconciler().await;
         assert!(lifecycle.upgrade().unwrap().is_cancelled());
         assert!(service.review_reconciler.handle.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn live_hub_fans_out_payload_free_revision_to_one_hundred_observers() {
+        let service = MfgService::new();
+        let mut observers = (0..100)
+            .map(|_| service.subscribe_live_mutations())
+            .collect::<Vec<_>>();
+        service.notify_live_mutation();
+        for observer in &mut observers {
+            assert_eq!(observer.recv().await.unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn mfg_blocking_workers_are_hard_bounded_at_thirty_two() {
+        let service = MfgService::new();
+        let mut permits = Vec::new();
+        for _ in 0..32 {
+            permits.push(service.acquire_blocking_permit().await.unwrap());
+        }
+        assert!(
+            Arc::clone(&service.blocking_gate)
+                .try_acquire_owned()
+                .is_err()
+        );
+        drop(permits.pop());
+        assert!(
+            Arc::clone(&service.blocking_gate)
+                .try_acquire_owned()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn live_reads_rotate_across_four_independent_sqlite_connections() {
+        let home = tempfile::tempdir().unwrap();
+        let service = MfgService::new();
+        let stores = (0..5)
+            .map(|_| service.open_live_store(home.path()).unwrap())
+            .collect::<Vec<_>>();
+        for left in 0..4 {
+            for right in (left + 1)..4 {
+                assert!(!Arc::ptr_eq(&stores[left], &stores[right]));
+            }
+        }
+        assert!(Arc::ptr_eq(&stores[0], &stores[4]));
     }
 }

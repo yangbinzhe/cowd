@@ -1,4 +1,4 @@
-use std::{convert::Infallible, time::Instant};
+use std::convert::Infallible;
 
 use axum::{
     extract::Extension,
@@ -1230,6 +1230,9 @@ pub(super) async fn mfg_live_projection_handler(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    // 先订阅再读取初始 cursor，避免 snapshot 与 Hub 注册之间的 mutation
+    // 丢失。Hub 只发送无载荷 revision signal。
+    let live_mutations = state.services.mfg.subscribe_live_mutations();
     let pending = if let Some(cursor) = supplied_cursor.as_deref() {
         state
             .services
@@ -1256,16 +1259,6 @@ pub(super) async fn mfg_live_projection_handler(
     let (cursor, view_epoch) = if let Some(seed) = pending.as_ref() {
         mfg_live_envelope_position(seed)
     } else {
-        state
-            .services
-            .mfg
-            .live_heartbeat_envelope_async(
-                state.config_home.clone(),
-                principal.clone(),
-                supplied_cursor.clone().unwrap_or_default(),
-            )
-            .await
-            .map_err(mfg_live_service_error)?;
         (
             supplied_cursor.clone().unwrap_or_default(),
             supplied_epoch.clone().unwrap_or_default(),
@@ -1280,6 +1273,7 @@ pub(super) async fn mfg_live_projection_handler(
         limit,
         pending,
         validate_authorization,
+        live_mutations,
         Arc::clone(&queue),
     ));
     let stream = futures::stream::unfold(
@@ -1334,11 +1328,16 @@ async fn run_mfg_live_observer_producer(
     limit: usize,
     mut pending: Option<app_mfg_contract::MfgLiveEnvelopeV1>,
     validate_authorization: bool,
+    mut live_mutations: tokio::sync::broadcast::Receiver<u64>,
     queue: Arc<MfgLiveObserverQueue>,
 ) {
     let _producer_guard = MfgLiveProducerGuard(Arc::clone(&queue));
-    let mut last_heartbeat = Instant::now();
-    let mut last_authorization_check = Instant::now();
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    let mut authorization = tokio::time::interval(std::time::Duration::from_secs(2));
+    authorization.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    authorization.tick().await;
     let mut last_telemetry = (usize::MAX, usize::MAX, usize::MAX);
     loop {
         let telemetry = (
@@ -1372,46 +1371,57 @@ async fn run_mfg_live_observer_producer(
             );
             return;
         }
-        if validate_authorization && last_authorization_check.elapsed().as_secs() >= 2 {
-            if let Some(error) = app
-                .services
-                .mfg
-                .live_authorization_error_async(app.config_home.clone(), principal.clone())
-                .await
-            {
-                queue.finish_with(MfgLiveQueuedItem::Error(error)).await;
-                return;
-            }
-            last_authorization_check = Instant::now();
-        }
         let envelope = if let Some(pending) = pending.take() {
             Some(pending)
         } else {
-            match app
-                .services
-                .mfg
-                .live_delta_envelope_async(
-                    app.config_home.clone(),
-                    principal.clone(),
-                    view_epoch.clone(),
-                    cursor.clone(),
-                    limit,
-                )
-                .await
-            {
-                Ok(Some(envelope)) => Some(envelope),
-                Ok(None) if last_heartbeat.elapsed().as_secs() >= 5 => {
+            #[derive(Clone, Copy)]
+            enum Wake {
+                Mutation,
+                Heartbeat,
+                Authorization,
+                Lagged,
+                Closed,
+            }
+            let wake = tokio::select! {
+                signal = live_mutations.recv() => match signal {
+                    Ok(_) => Wake::Mutation,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Wake::Lagged,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::Closed,
+                },
+                _ = heartbeat.tick() => Wake::Heartbeat,
+                _ = authorization.tick(), if validate_authorization => Wake::Authorization,
+            };
+            match wake {
+                Wake::Authorization => {
+                    if let Some(error) = app
+                        .services
+                        .mfg
+                        .live_authorization_error_async(app.config_home.clone(), principal.clone())
+                        .await
+                    {
+                        queue.finish_with(MfgLiveQueuedItem::Error(error)).await;
+                        return;
+                    }
+                    continue;
+                }
+                Wake::Lagged | Wake::Closed => {
+                    let reason = if matches!(wake, Wake::Lagged) {
+                        "live_hub_revision_gap"
+                    } else {
+                        "live_hub_restarted"
+                    };
                     match app
                         .services
                         .mfg
-                        .live_heartbeat_envelope_async(
+                        .live_resync_envelope_async(
                             app.config_home.clone(),
                             principal.clone(),
-                            cursor.clone(),
+                            view_epoch.clone(),
+                            reason.to_string(),
                         )
                         .await
                     {
-                        Ok(envelope) => Some(envelope),
+                        Ok(resync) => Some(resync),
                         Err(error) => {
                             queue
                                 .finish_with(MfgLiveQueuedItem::Error(
@@ -1422,19 +1432,50 @@ async fn run_mfg_live_observer_producer(
                         }
                     }
                 }
-                Ok(None) => None,
-                Err(error) => {
-                    queue
-                        .finish_with(MfgLiveQueuedItem::Error(mfg_live_service_contract_error(
-                            error,
-                        )))
-                        .await;
-                    return;
+                Wake::Heartbeat => Some(payload_free_heartbeat(&cursor, &view_epoch)),
+                Wake::Mutation => {
+                    // mutation 唤醒必须先重新验证 authority，再读取/裁剪；
+                    // 权限撤销后不会有旧 principal 的 payload 进入 queue。
+                    if validate_authorization {
+                        if let Some(error) = app
+                            .services
+                            .mfg
+                            .live_authorization_error_async(
+                                app.config_home.clone(),
+                                principal.clone(),
+                            )
+                            .await
+                        {
+                            queue.finish_with(MfgLiveQueuedItem::Error(error)).await;
+                            return;
+                        }
+                    }
+                    match app
+                        .services
+                        .mfg
+                        .live_delta_envelope_async(
+                            app.config_home.clone(),
+                            principal.clone(),
+                            view_epoch.clone(),
+                            cursor.clone(),
+                            limit,
+                        )
+                        .await
+                    {
+                        Ok(envelope) => envelope,
+                        Err(error) => {
+                            queue
+                                .finish_with(MfgLiveQueuedItem::Error(
+                                    mfg_live_service_contract_error(error),
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
                 }
             }
         };
         let Some(envelope) = envelope else {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             continue;
         };
         let terminal = matches!(envelope, app_mfg_contract::MfgLiveEnvelopeV1::Resync(_));
@@ -1485,8 +1526,15 @@ async fn run_mfg_live_observer_producer(
         }
         cursor = next_cursor;
         view_epoch = next_epoch;
-        last_heartbeat = Instant::now();
     }
+}
+
+fn payload_free_heartbeat(cursor: &str, view_epoch: &str) -> app_mfg_contract::MfgLiveEnvelopeV1 {
+    app_mfg_contract::MfgLiveEnvelopeV1::Heartbeat(app_mfg_contract::MfgLiveHeartbeatV1 {
+        view_epoch: view_epoch.to_string(),
+        cursor: cursor.to_string(),
+        generated_at: chrono::Utc::now(),
+    })
 }
 
 fn mfg_live_principal_context(

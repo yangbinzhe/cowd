@@ -1344,16 +1344,23 @@ pub(super) async fn reconcile_mfg_report_review_saga(
     report_id: Option<&str>,
     limit: usize,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let mut mutated = false;
     let reviews = state
         .services
         .mfg
         .list_report_delivery_reviews(&state.config_home, report_id, limit)
         .map_err(mfg_mutation_error)?;
     for review in reviews {
+        let original_revision = review.revision;
         let review = reconcile_review_approval_submission(state, review)?;
-        let _ = reconcile_prepared_review_decision(state, review)?;
+        let review = reconcile_prepared_review_decision(state, review)?;
+        mutated |= review.revision != original_revision;
     }
-    reconcile_mfg_report_review_effects(state, limit).await
+    mutated |= reconcile_mfg_report_review_effects(state, limit).await?;
+    if mutated {
+        state.services.mfg.notify_live_mutation();
+    }
+    Ok(())
 }
 
 fn reconcile_prepared_review_decision(
@@ -1403,12 +1410,13 @@ fn reconcile_prepared_review_decision(
 async fn reconcile_mfg_report_review_effects(
     state: &AppState,
     limit: usize,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
     let effects = state
         .services
         .mfg
         .claim_report_delivery_review_effects(&state.config_home, limit)
         .map_err(mfg_mutation_error)?;
+    let mutated = !effects.is_empty();
     for effect in effects {
         let review = match state
             .services
@@ -1484,7 +1492,7 @@ async fn reconcile_mfg_report_review_effects(
             }
         }
     }
-    Ok(())
+    Ok(mutated)
 }
 
 fn review_effect_delivery_request(
