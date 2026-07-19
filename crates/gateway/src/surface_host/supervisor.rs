@@ -236,7 +236,7 @@ async fn start_managed_process(
             })?;
     let manifest_path = PathBuf::from(&surface.source);
     let working_dir = manifest_path.parent().map(Path::to_path_buf);
-    let workspace_root = working_dir
+    let manifest_dir = working_dir
         .as_deref()
         .ok_or_else(|| SurfaceError::Invocation {
             surface: surface_id.clone(),
@@ -253,30 +253,47 @@ async fn start_managed_process(
             surface: surface_id.clone(),
             reason: format!("failed to create managed edge runtime directory: {error}"),
         })?;
+    let staged_command = stage_managed_artifact(&command_path, &runtime_dir).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("failed to stage managed edge artifact: {error}"),
+        }
+    })?;
     let socket_path = runtime_dir.join("edge.sock");
     let credential_path = runtime_dir.join("credential");
     let token = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-    std::fs::write(&credential_path, &token).map_err(|error| SurfaceError::Invocation {
-        surface: surface_id.clone(),
-        reason: format!("failed to write managed edge credential: {error}"),
+    std::fs::write(&credential_path, &token).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        SurfaceError::Invocation {
+            surface: surface_id.clone(),
+            reason: format!("failed to write managed edge credential: {error}"),
+        }
     })?;
     std::fs::set_permissions(&credential_path, std::fs::Permissions::from_mode(0o600)).map_err(
-        |error| SurfaceError::Invocation {
-            surface: surface_id.clone(),
-            reason: format!("failed to secure managed edge credential: {error}"),
+        |error| {
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            SurfaceError::Invocation {
+                surface: surface_id.clone(),
+                reason: format!("failed to secure managed edge credential: {error}"),
+            }
         },
     )?;
-    let mut sandbox = SandboxLaunchSpec::workspace(workspace_root);
-    sandbox.working_directory = Some(workspace_root.to_path_buf());
-    if let Some(parent) = command_path.parent() {
-        sandbox.readable_roots.push(parent.to_path_buf());
-    }
+    // 受信 artifact 先复制到本次 0700 runtime
+    // 目录，再以该目录作为最小 sandbox workspace。这样安装包中的
+    // `edge/` 二进制无需位于单个 connector 清单目录内，也不会为了
+    // 找到程序而把整个安装父目录暴露给 sidecar。
+    let mut sandbox = SandboxLaunchSpec::workspace(&runtime_dir);
+    sandbox.working_directory = Some(runtime_dir.clone());
+    sandbox.readable_roots.push(manifest_dir.to_path_buf());
     sandbox.writable_roots.push(runtime_dir.clone());
-    let prepared =
-        program_command(&command_path, &sandbox).map_err(|error| SurfaceError::Invocation {
+    let prepared = program_command(&staged_command, &sandbox).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        SurfaceError::Invocation {
             surface: surface_id.clone(),
             reason: format!("managed surface sandbox unavailable: {error}"),
-        })?;
+        }
+    })?;
     let mut child = TokioCommand::new(prepared.program)
         .args(prepared.args)
         .arg("--socket")
@@ -290,12 +307,15 @@ async fn start_managed_process(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|error| SurfaceError::Invocation {
-            surface: surface_id.clone(),
-            reason: format!(
-                "failed to launch managed `{}`: {error}",
-                command_path.display()
-            ),
+        .map_err(|error| {
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            SurfaceError::Invocation {
+                surface: surface_id.clone(),
+                reason: format!(
+                    "failed to launch managed `{}`: {error}",
+                    staged_command.display()
+                ),
+            }
         })?;
     let pid = child.id();
     let started_at = Utc::now();
@@ -436,6 +456,25 @@ fn resolve_managed_artifact(manifest: &Path, artifact: &str) -> Result<PathBuf, 
     ))
 }
 
+fn stage_managed_artifact(command: &Path, runtime_dir: &Path) -> std::io::Result<PathBuf> {
+    let file_name = command.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed artifact has no file name",
+        )
+    })?;
+    let metadata = std::fs::metadata(command)?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "managed artifact is not an executable regular file",
+        ));
+    }
+    let staged = runtime_dir.join(file_name);
+    std::fs::copy(command, &staged)?;
+    Ok(staged)
+}
+
 fn create_runtime_dir(surface: &str) -> std::io::Result<PathBuf> {
     let root = std::env::temp_dir().join("cowd-edge-runtime").join(format!(
         "{}-{}",
@@ -466,4 +505,29 @@ where
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stage_managed_artifact;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn managed_artifact_is_staged_inside_private_runtime_root() {
+        let root = tempfile::tempdir().expect("temporary bundle");
+        let bundle = root.path().join("bundle");
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir_all(&bundle).expect("bundle directory");
+        std::fs::create_dir_all(&runtime).expect("runtime directory");
+        let command = bundle.join("cowd-edge-fixture");
+        std::fs::write(&command, b"fixture").expect("fixture artifact");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))
+            .expect("executable fixture");
+
+        let staged = stage_managed_artifact(&command, &runtime).expect("stage artifact");
+
+        assert_eq!(staged, runtime.join("cowd-edge-fixture"));
+        assert!(staged.starts_with(&runtime));
+        assert_eq!(std::fs::read(staged).unwrap(), b"fixture");
+    }
 }
