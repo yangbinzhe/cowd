@@ -113,11 +113,10 @@ async fn list_message_connectors_handler(
     let connectors = platforms
         .into_iter()
         .map(|platform| {
+            let surface_id = platform_surface_id(&platform);
             let runtime = runtimes
                 .iter()
-                .find(|runtime| {
-                    runtime.surface == platform.platform_type || runtime.surface == platform.name
-                })
+                .find(|runtime| runtime.surface == surface_id)
                 .cloned();
             serde_json::json!({
                 "connector": platform.platform_type,
@@ -148,7 +147,10 @@ async fn get_message_connector_status_handler(
     let platforms = configured_platforms(config.as_ref());
     let platform = platforms
         .into_iter()
-        .find(|platform| platform.platform_type == connector || platform.name == connector);
+        .find(|platform| {
+            platform_surface_id(platform) == connector
+                || surface::message::normalize_message_connector(&platform.name) == connector
+        });
     let runtime = state.services.surface.runtime_snapshot(&connector);
     if platform.is_none() && runtime.is_none() {
         return Err(api_error(
@@ -162,6 +164,10 @@ async fn get_message_connector_status_handler(
         "configuration": platform,
         "runtime": runtime,
     })))
+}
+
+pub(super) fn platform_surface_id(platform: &PlatformReadiness) -> String {
+    surface::message::normalize_message_connector(&platform.platform_type)
 }
 
 async fn repair_message_connector_handler(
