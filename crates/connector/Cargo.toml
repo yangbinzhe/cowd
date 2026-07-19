@@ -12,6 +12,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 storage = { path = "../storage" }
+surface = { path = "../surface" }
 harness-contract = { path = "../harness-contract" }
 thiserror = "2"
 

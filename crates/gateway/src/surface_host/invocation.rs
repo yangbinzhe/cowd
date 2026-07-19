@@ -10,6 +10,7 @@ use surface::{
     SurfaceError, SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceOperationResult,
     SurfaceRoute, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus, SurfaceSendRequest,
 };
+use tokio::sync::mpsc;
 
 use super::{classify_surface_error, managed_actions, normalize_request_path, SurfaceHost};
 
@@ -180,6 +181,51 @@ impl SurfaceHost {
             payload: request.payload,
         };
         self.invoke(surface, frame).await
+    }
+
+    pub(crate) async fn action_stream(
+        &self,
+        request: SurfaceActionRequest,
+    ) -> Result<mpsc::Receiver<Result<SurfaceOperationResult, SurfaceError>>, SurfaceError> {
+        let Some(surface) = self.get(&request.surface) else {
+            return Err(SurfaceError::Unavailable(request.surface));
+        };
+        if !surface.is_executable() {
+            return Err(SurfaceError::Unavailable(surface.id));
+        }
+        let surface_id = normalize_surface_id(&request.surface);
+        let frame = SurfaceFrame::Action {
+            id: SurfaceFrame::new_id(),
+            surface: surface_id,
+            action: request.action,
+            payload: request.payload,
+        };
+        if surface.lifecycle != SurfaceLifecycle::Managed {
+            let result = self.invoke(surface, frame).await;
+            let (tx, rx) = mpsc::channel(1);
+            let _ = tx.send(result).await;
+            return Ok(rx);
+        }
+        let process = self.managed_process(surface.clone()).await?;
+        let mut frames = tokio::time::timeout(
+            Duration::from_secs(30),
+            process.client.invoke_stream(&frame),
+        )
+        .await
+        .map_err(|_| SurfaceError::Invocation {
+            surface: surface.id.clone(),
+            reason: "managed surface stream start timed out".to_string(),
+        })??;
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(frame) = frames.recv().await {
+                let result = frame.map(|frame| operation_result_from_frame(&surface.id, frame));
+                if tx.send(result).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
     }
 
     pub(crate) async fn callback(

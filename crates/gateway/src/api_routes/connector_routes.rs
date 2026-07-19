@@ -5,28 +5,28 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
     extract::{Path, Query, State as AxumState},
     response::IntoResponse,
     routing::get,
+    Json, Router,
 };
 use connector::{
+    builtin_service_connector_registry, builtin_source_adapter_manifests, default_capabilities,
     CapabilityManifest, ConnectorHealth, ConnectorRegistrySnapshot, ExternalResourceRef,
     ProviderAccount, ServiceConnector, ServiceToolRequest, ServiceToolResult, SourceConnectorState,
     SourceIncrementalRunRequest, SourceIncrementalRunResult, SourceReadPlan, SourceWatermark,
-    builtin_service_connector_registry, builtin_source_adapter_manifests, default_capabilities,
 };
-use memory::MemoryScope;
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
+use memory::MemoryScope;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::services::GatewayMemoryManager;
 
-use super::{AppState, message_connector_routes};
+use super::{message_connector_routes, AppState};
 
 mod mcp;
 mod resources;
@@ -61,10 +61,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/connectors/sources/:adapter_id/poll-events",
             axum::routing::post(connector_source_poll_events_handler),
-        )
-        .route(
-            "/api/connectors/sources/:adapter_id/commit-watermark",
-            axum::routing::post(connector_source_commit_watermark_handler),
         )
         .route(
             "/api/connectors/resources/revalidate",
@@ -127,11 +123,6 @@ struct ConnectorSourcePollEventsRequest {
     event_fixture_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ConnectorSourceCommitWatermarkRequest {
-    watermark: SourceWatermark,
-}
-
 async fn connector_source_state_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(adapter_id): Path<String>,
@@ -161,65 +152,68 @@ async fn connector_source_run_incremental_handler(
             "degraded_reason": "unsupported source adapter",
         }));
     };
-    let mut run = if manifest.requires_sidecar {
+    let resource_ref = request.resource_ref.clone().unwrap_or_default();
+    let canonical_watermark = if resource_ref.trim().is_empty() {
+        None
+    } else {
+        match state.services.matrix.connector_source_watermark(
+            &state.config_home,
+            &adapter_id,
+            &resource_ref,
+            request.table.as_deref(),
+        ) {
+            Ok(watermark) => watermark,
+            Err(error) => {
+                return Json(serde_json::json!({
+                    "kind": "connector.source.incremental_run",
+                    "adapter_id": adapter_id,
+                    "status": "degraded_matrix_watermark_read_failed",
+                    "degraded_reason": error.to_string(),
+                }));
+            }
+        }
+    };
+    let mut request = request;
+    request.watermark = canonical_watermark.or(request.watermark);
+    let sidecar_streamed = manifest.requires_sidecar;
+    let mut run = if sidecar_streamed {
         let request = SourceIncrementalRunRequest {
             adapter_id: adapter_id.clone(),
-            resource_ref: request.resource_ref.clone().unwrap_or_default(),
+            resource_ref,
             table: request.table.clone(),
             limit: request.limit,
             watermark: request.watermark.clone(),
+            expected_revision: request
+                .watermark
+                .as_ref()
+                .map(|watermark| watermark.revision),
             metadata: request.metadata.clone(),
         };
-        match state
-            .services
-            .surface
-            .source_incremental_run(&request)
-            .await
-        {
-            Ok(run) => run,
-            Err(error) => SourceIncrementalRunResult {
-                status: "degraded_sidecar_failed".to_string(),
-                batch: None,
-                watermark_before: request.watermark,
-                watermark_after: None,
-                degraded_reason: Some(error),
-                receipt: None,
-            },
-        }
+        consume_sidecar_source_stream(&state, request).await
     } else {
         run_local_source_incremental(&adapter_id, request)
     };
 
-    if let Some(batch) = run.batch.as_ref() {
-        match state.services.matrix.ingest_source_record_batch(
-            &state.config_home,
-            batch,
-            run.watermark_before.clone(),
-            run.watermark_after.clone(),
-        ) {
-            Ok(receipt) => {
-                if manifest.requires_sidecar {
-                    if let Some(watermark) = receipt.watermark_after.as_ref() {
-                        if let Err(error) = state
-                            .services
-                            .surface
-                            .commit_source_watermark(&adapter_id, watermark)
-                            .await
-                        {
-                            run.status = "degraded_watermark_commit_failed".to_string();
-                            run.degraded_reason = Some(error);
-                        }
+    if !sidecar_streamed {
+        if let Some(batch) = run.batch.as_ref() {
+            match state.services.matrix.ingest_source_record_batch(
+                &state.config_home,
+                batch,
+                run.watermark_before.clone(),
+                run.watermark_after.clone(),
+            ) {
+                Ok(receipt) => {
+                    run.watermark_after = receipt.watermark_after.clone();
+                    run.receipt = Some(receipt);
+                    if run.status == "ok" {
+                        run.status = "ingested".to_string();
                     }
                 }
-                run.receipt = Some(receipt);
-                if run.status == "ok" {
-                    run.status = "ingested".to_string();
+                Err(error) => {
+                    run.status = "degraded_matrix_ingest_failed".to_string();
+                    run.degraded_reason = Some(error.to_string());
+                    run.receipt = None;
                 }
-            }
-            Err(error) => {
-                run.status = "degraded_matrix_ingest_failed".to_string();
-                run.degraded_reason = Some(error.to_string());
-                run.receipt = None;
             }
         }
     }
@@ -239,6 +233,112 @@ async fn connector_source_run_incremental_handler(
         "receipt": run.receipt,
         "matrix_refs": matrix_refs,
     }))
+}
+
+async fn consume_sidecar_source_stream(
+    state: &Arc<AppState>,
+    request: SourceIncrementalRunRequest,
+) -> SourceIncrementalRunResult {
+    let watermark_before = request.watermark.clone();
+    let mut stream = match state
+        .services
+        .surface
+        .source_incremental_stream(&request)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            return SourceIncrementalRunResult {
+                status: "degraded_sidecar_failed".to_string(),
+                chunk_index: 0,
+                final_chunk: true,
+                batch: None,
+                watermark_before,
+                watermark_after: None,
+                degraded_reason: Some(error),
+                receipt: None,
+            };
+        }
+    };
+    let mut expected_chunk = 0usize;
+    let mut total_rows = 0usize;
+    let mut all_refs = Vec::new();
+    let mut final_result = None;
+    while let Some(chunk) = stream.recv().await {
+        let mut chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return source_stream_failure(watermark_before, error);
+            }
+        };
+        if chunk.chunk_index != expected_chunk {
+            return source_stream_failure(
+                watermark_before,
+                format!(
+                    "source stream chunk gap: expected {expected_chunk}, got {}",
+                    chunk.chunk_index
+                ),
+            );
+        }
+        expected_chunk = expected_chunk.saturating_add(1);
+        let Some(batch) = chunk.batch.take() else {
+            return source_stream_failure(
+                watermark_before,
+                format!("source stream chunk {} has no batch", chunk.chunk_index),
+            );
+        };
+        let receipt = match state.services.matrix.ingest_source_record_chunk(
+            &state.config_home,
+            &batch,
+            watermark_before.clone(),
+            chunk.watermark_after.clone(),
+            chunk.final_chunk,
+        ) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                // 返回后 stream 被丢弃，H2 数据流立即取消；候选水位不会提交。
+                return source_stream_failure(watermark_before, error.to_string());
+            }
+        };
+        total_rows = total_rows.saturating_add(receipt.row_count);
+        all_refs.extend(receipt.matrix_refs.iter().cloned());
+        if chunk.final_chunk {
+            let mut receipt = receipt;
+            receipt.row_count = total_rows;
+            receipt.matrix_refs = all_refs;
+            chunk.watermark_after = receipt.watermark_after.clone();
+            chunk.receipt = Some(receipt);
+            chunk.status = if chunk.status == "ok" {
+                "ingested".to_string()
+            } else {
+                chunk.status
+            };
+            final_result = Some(chunk);
+            break;
+        }
+    }
+    final_result.unwrap_or_else(|| {
+        source_stream_failure(
+            watermark_before,
+            "source stream ended before final chunk".to_string(),
+        )
+    })
+}
+
+fn source_stream_failure(
+    watermark_before: Option<SourceWatermark>,
+    error: String,
+) -> SourceIncrementalRunResult {
+    SourceIncrementalRunResult {
+        status: "degraded_source_stream_failed".to_string(),
+        chunk_index: 0,
+        final_chunk: true,
+        batch: None,
+        watermark_before,
+        watermark_after: None,
+        degraded_reason: Some(error),
+        receipt: None,
+    }
 }
 
 async fn connector_source_poll_events_handler(
@@ -439,32 +539,6 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-async fn connector_source_commit_watermark_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(adapter_id): Path<String>,
-    Json(request): Json<ConnectorSourceCommitWatermarkRequest>,
-) -> impl IntoResponse {
-    match state
-        .services
-        .surface
-        .commit_source_watermark(&adapter_id, &request.watermark)
-        .await
-    {
-        Ok(watermark) => Json(serde_json::json!({
-            "kind": "connector.source.watermark.commit",
-            "adapter_id": adapter_id,
-            "status": "ok",
-            "watermark": watermark,
-        })),
-        Err(error) => Json(serde_json::json!({
-            "kind": "connector.source.watermark.commit",
-            "adapter_id": adapter_id,
-            "status": "degraded_sidecar_failed",
-            "degraded_reason": error,
-        })),
-    }
-}
-
 async fn source_state_for_manifest(
     state: &AppState,
     manifest: &connector::SourceAdapterManifest,
@@ -541,10 +615,16 @@ fn run_local_source_incremental(
                 ),
                 high_watermark: None,
                 checksum: Some(batch.checksum.clone()),
+                revision: request
+                    .watermark
+                    .as_ref()
+                    .map_or(0, |watermark| watermark.revision),
                 updated_at_ms: chrono::Utc::now().timestamp_millis(),
             };
             SourceIncrementalRunResult {
                 status: "ok".to_string(),
+                chunk_index: 0,
+                final_chunk: true,
                 batch: Some(batch),
                 watermark_before: request.watermark,
                 watermark_after: Some(after),
@@ -554,6 +634,8 @@ fn run_local_source_incremental(
         }
         Err(error) => SourceIncrementalRunResult {
             status: "degraded_local_read_failed".to_string(),
+            chunk_index: 0,
+            final_chunk: true,
             batch: None,
             watermark_before: request.watermark,
             watermark_after: None,
@@ -762,11 +844,9 @@ mod tests {
             normalized.attributes.get("resource_ref"),
             Some(&"bitable://app/table".to_string())
         );
-        assert!(
-            normalized
-                .source_capabilities
-                .contains(&"connector.source.event.receive".to_string())
-        );
+        assert!(normalized
+            .source_capabilities
+            .contains(&"connector.source.event.receive".to_string()));
         assert!(normalized.payload_digest.starts_with("sha256:"));
     }
 }

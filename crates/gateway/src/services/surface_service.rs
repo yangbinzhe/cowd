@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use connector::{
     SourceConnectorState, SourceEventBatch, SourceIncrementalRunRequest,
-    SourceIncrementalRunResult, SourceReadPlan, SourceRecordBatch, SourceWatermark,
+    SourceIncrementalRunResult, SourceReadPlan, SourceRecordBatch,
 };
 use surface::{
     SurfaceActionRequest, SurfaceFrame, SurfaceOperationResult, SurfaceRegistrySnapshot,
     SurfaceRuntimeSnapshot, SurfaceSendRequest, SurfaceSupervisorEvent,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::surface_host::{
     SurfaceDeliveryEvent, SurfaceDiscoveryReport, SurfaceHost, SurfaceHostHealth,
@@ -380,22 +380,49 @@ impl SurfaceService {
         .map_err(|error| format!("source connector `{surface}` returned invalid state: {error}"))
     }
 
-    pub(crate) async fn source_incremental_run(
+    pub(crate) async fn source_incremental_stream(
         &self,
         request: &SourceIncrementalRunRequest,
-    ) -> Result<SourceIncrementalRunResult, String> {
+    ) -> Result<mpsc::Receiver<Result<SourceIncrementalRunResult, String>>, String> {
         let surface = source_connector_surface_id(&request.adapter_id);
-        let result = self
-            .action(SurfaceActionRequest {
+        let mut operations = self
+            .host
+            .action_stream(SurfaceActionRequest {
                 surface: surface.clone(),
                 action: "source.incremental.run".to_string(),
                 payload: serde_json::json!({ "request": request }),
             })
-            .await?;
-        let payload = self.source_action_payload(&surface, result)?;
-        serde_json::from_value::<SourceIncrementalRunResult>(payload).map_err(|error| {
-            format!("source connector `{surface}` returned invalid incremental result: {error}")
-        })
+            .await
+            .map_err(|error| error.to_string())?;
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            while let Some(operation) = operations.recv().await {
+                let decoded = operation
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| {
+                        if let Some(error) = result.error {
+                            return Err(format!(
+                                "source connector `{surface}` failed: {}",
+                                error.message
+                            ));
+                        }
+                        let payload = result.payload.ok_or_else(|| {
+                            format!("source connector `{surface}` returned no payload")
+                        })?;
+                        serde_json::from_value::<SourceIncrementalRunResult>(payload).map_err(
+                            |error| {
+                                format!(
+                                    "source connector `{surface}` returned invalid incremental chunk: {error}"
+                                )
+                            },
+                        )
+                    });
+                if tx.send(decoded).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(rx)
     }
 
     pub(crate) async fn source_event_poll(
@@ -414,31 +441,6 @@ impl SurfaceService {
         let payload = self.source_action_payload(&surface, result)?;
         serde_json::from_value::<SourceEventBatch>(payload).map_err(|error| {
             format!("source connector `{surface}` returned invalid event batch: {error}")
-        })
-    }
-
-    pub(crate) async fn commit_source_watermark(
-        &self,
-        adapter_id: &str,
-        watermark: &SourceWatermark,
-    ) -> Result<SourceWatermark, String> {
-        let surface = source_connector_surface_id(adapter_id);
-        let result = self
-            .action(SurfaceActionRequest {
-                surface: surface.clone(),
-                action: "source.watermark.commit".to_string(),
-                payload: serde_json::json!({ "watermark": watermark }),
-            })
-            .await?;
-        let payload = self.source_action_payload(&surface, result)?;
-        serde_json::from_value::<SourceWatermark>(
-            payload
-                .get("watermark")
-                .cloned()
-                .unwrap_or_else(|| payload.clone()),
-        )
-        .map_err(|error| {
-            format!("source connector `{surface}` returned invalid committed watermark: {error}")
         })
     }
 

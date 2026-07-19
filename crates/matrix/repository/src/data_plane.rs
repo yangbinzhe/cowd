@@ -78,6 +78,7 @@ impl MatrixDataPlane for MatrixSqliteDataPlane {
             partition_ref: partition_ref.clone(),
             idempotency_key,
             replay_policy: "replace_partition_by_idempotency_key".to_string(),
+            expected_revision: input.expected_revision,
             estimated_rows: input.estimated_rows.unwrap_or(0),
             affected_metric_ids: input.metric_ids,
             compute_jobs,
@@ -87,6 +88,16 @@ impl MatrixDataPlane for MatrixSqliteDataPlane {
                 partition_ref,
                 high_watermark,
                 last_batch_id: batch_id,
+                revision: input
+                    .expected_revision
+                    .unwrap_or_default()
+                    .saturating_add(1),
+                adapter_id: input.adapter_id,
+                strategy: input.strategy,
+                table: input.table,
+                cursor: input.cursor,
+                offset: input.offset,
+                checksum: input.raw_checksum,
                 updated_at: now,
             },
             planned_at: now,

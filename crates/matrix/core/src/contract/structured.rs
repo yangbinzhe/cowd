@@ -377,6 +377,12 @@ impl From<StructuredIngestPlanInput> for MatrixDataPlaneIngestPlanInput {
             high_watermark: input.high_watermark,
             estimated_rows: input.estimated_rows,
             raw_checksum: input.raw_checksum,
+            expected_revision: None,
+            adapter_id: None,
+            strategy: None,
+            table: None,
+            cursor: None,
+            offset: None,
             metric_ids: input.metric_ids,
         }
     }

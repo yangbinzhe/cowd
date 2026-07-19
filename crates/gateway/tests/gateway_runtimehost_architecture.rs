@@ -268,15 +268,12 @@ fn assert_root_rs_files(src: &str, allowed: &[&str]) {
 #[test]
 fn runtime_host_owns_gateway_runtime_implementation() {
     let root = repo_root();
-    assert!(
-        root.join("crates/gateway/src/runtime_host/mod.rs")
-            .is_file()
-    );
-    assert!(
-        !root
-            .join("crates/gateway/src/runtime_host/commands.rs")
-            .exists()
-    );
+    assert!(root
+        .join("crates/gateway/src/runtime_host/mod.rs")
+        .is_file());
+    assert!(!root
+        .join("crates/gateway/src/runtime_host/commands.rs")
+        .exists());
     let source = production_part(&read_repo("crates/gateway/src/runtime_host/mod.rs")).to_string();
     assert!(source.contains("pub struct RuntimeHostConfig"));
     assert!(source.contains("pub async fn run_gateway_runtime"));
@@ -2246,7 +2243,7 @@ fn knowledge_governance_projection_is_exposed_to_reality_and_webui() {
 }
 
 #[test]
-fn source_connector_realtime_watermark_is_wired_to_matrix_and_webui() {
+fn source_connector_stream_uses_matrix_as_the_only_durable_watermark_owner() {
     let connector_routes = read_repo("crates/gateway/src/api_routes/connector_routes.rs");
     let surface_service = read_repo("crates/gateway/src/services/surface_service.rs");
     let matrix_service = read_repo("crates/gateway/src/services/matrix_service.rs");
@@ -2267,13 +2264,16 @@ fn source_connector_realtime_watermark_is_wired_to_matrix_and_webui() {
         "/api/connectors/sources/:adapter_id/state",
         "/api/connectors/sources/:adapter_id/run-incremental",
         "/api/connectors/sources/:adapter_id/poll-events",
-        "/api/connectors/sources/:adapter_id/commit-watermark",
     ] {
         assert!(
             connector_routes.contains(route),
             "connector source route `{route}` must be exposed"
         );
     }
+    assert!(
+        !connector_routes.contains("/api/connectors/sources/:adapter_id/commit-watermark"),
+        "Gateway must not expose a second Edge watermark commit path"
+    );
     for dto in [
         "SourceWatermark",
         "SourceIncrementalRunRequest",
@@ -2288,9 +2288,8 @@ fn source_connector_realtime_watermark_is_wired_to_matrix_and_webui() {
         );
     }
     assert!(
-        surface_service.contains("source_incremental_run")
+        surface_service.contains("source_incremental_stream")
             && surface_service.contains("source_event_poll")
-            && surface_service.contains("commit_source_watermark")
             && surface_service.contains("\"source.incremental.run\""),
         "SurfaceService must expose typed source action helpers"
     );
@@ -2302,8 +2301,6 @@ fn source_connector_realtime_watermark_is_wired_to_matrix_and_webui() {
     );
     for action in [
         "\"source.state\"",
-        "\"source.watermark.get\"",
-        "\"source.watermark.commit\"",
         "\"source.incremental.run\"",
         "\"source.event.poll\"",
     ] {
@@ -2312,6 +2309,11 @@ fn source_connector_realtime_watermark_is_wired_to_matrix_and_webui() {
             "edge source sidecar missing action {action}"
         );
     }
+    assert!(
+        !edge_sidecar.contains("\"source.watermark.get\"")
+            && !edge_sidecar.contains("\"source.watermark.commit\""),
+        "Edge must not retain a competing watermark truth"
+    );
     assert!(
         edge_db.contains("updated_at_field")
             && edge_db.contains("cursor_field")

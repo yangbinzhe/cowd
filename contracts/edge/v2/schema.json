@@ -35,6 +35,40 @@
       "required": ["sequence"],
       "properties": { "sequence": { "type": "integer", "minimum": 0 } }
     },
+    "EdgeSourceStreamMeta": {
+      "required": ["chunk_index", "final_chunk"],
+      "properties": {
+        "chunk_index": { "type": "integer", "minimum": 0 },
+        "final_chunk": { "type": "boolean" }
+      }
+    },
+    "EdgeSourceRevision": {
+      "required": ["revision"],
+      "properties": {
+        "expected_revision": { "type": ["integer", "null"], "minimum": 0 },
+        "revision": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "SourceFieldSchema": { "type": "object", "required": ["name", "data_type", "nullable"] },
+    "SourceTableSchema": { "type": "object", "required": ["table_name", "fields", "primary_key"] },
+    "SourceBatchCursor": { "type": "object", "required": ["offset", "limit"] },
+    "SourceReadPlan": { "type": "object", "required": ["adapter_id", "resource_ref"] },
+    "SourceRecordBatch": { "type": "object", "required": ["adapter_id", "resource_ref", "schema", "rows", "cursor", "row_count", "checksum", "truncated"] },
+    "SourceWatermark": { "type": "object", "required": ["adapter_id", "resource_ref", "strategy", "revision", "updated_at_ms"] },
+    "SourceIncrementalRunRequest": {
+      "type": "object",
+      "required": ["adapter_id", "resource_ref"],
+      "properties": {
+        "adapter_id": { "type": "string" },
+        "resource_ref": { "type": "string" },
+        "expected_revision": { "type": ["integer", "null"], "minimum": 0 },
+        "watermark": { "oneOf": [{ "$ref": "#/definitions/SourceWatermark" }, { "type": "null" }] }
+      }
+    },
+    "SourceIncrementalRunResult": { "type": "object", "required": ["status", "chunk_index", "final_chunk"] },
+    "SourceEventBatch": { "type": "object", "required": ["adapter_id", "event_count"] },
+    "SourceIngestionReceipt": { "type": "object", "required": ["receipt_id", "adapter_id", "resource_ref", "row_count", "checksum", "created_at_ms"] },
+    "SourceConnectorState": { "type": "object", "required": ["adapter_id", "surface_id", "status"] },
     "ManagedRuntime": {
       "required": ["kind", "artifact", "driver_profile", "transport"],
       "properties": {

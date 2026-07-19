@@ -231,6 +231,17 @@ impl MatrixService {
         watermark_before: Option<SourceWatermark>,
         watermark_after: Option<SourceWatermark>,
     ) -> Result<SourceIngestionReceipt, GatewayMatrixRepositoryError> {
+        self.ingest_source_record_chunk(config_home, batch, watermark_before, watermark_after, true)
+    }
+
+    pub(crate) fn ingest_source_record_chunk(
+        &self,
+        config_home: impl AsRef<Path>,
+        batch: &SourceRecordBatch,
+        watermark_before: Option<SourceWatermark>,
+        watermark_after: Option<SourceWatermark>,
+        final_chunk: bool,
+    ) -> Result<SourceIngestionReceipt, GatewayMatrixRepositoryError> {
         let repository = self.sqlite_repository(&config_home)?;
         let source_pack_id = source_pack_id_for_batch(batch);
         let table = batch
@@ -305,27 +316,61 @@ impl MatrixService {
             snapshot.clone(),
             &batch.rows,
         )?;
-        let plan = repository.plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
-            source_ref: batch.resource_ref.clone(),
-            fact_type: format!("source.{}.row", batch.adapter_id),
-            partition_ref: batch.table.clone(),
-            high_watermark: watermark_after
-                .as_ref()
-                .and_then(|watermark| {
+        let mut matrix_refs = vec![
+            format!("matrix:source_pack:{source_pack_id}"),
+            format!("matrix:source_snapshot:{}", snapshot.snapshot_id),
+            format!("matrix:apply_report:{}", apply_report.fact_count),
+        ];
+        let committed_source_watermark = if final_chunk {
+            let plan = repository.plan_data_plane_ingest(MatrixDataPlaneIngestPlanInput {
+                source_ref: batch.resource_ref.clone(),
+                fact_type: format!("source.{}.row", batch.adapter_id),
+                partition_ref: batch.table.clone(),
+                high_watermark: watermark_after
+                    .as_ref()
+                    .and_then(|watermark| {
+                        watermark
+                            .high_watermark
+                            .clone()
+                            .or_else(|| watermark.cursor.clone())
+                    })
+                    .or_else(|| Some(batch.checksum.clone())),
+                estimated_rows: Some(batch.rows.len() as u64),
+                raw_checksum: watermark_after
+                    .as_ref()
+                    .and_then(|watermark| watermark.checksum.clone())
+                    .or_else(|| Some(batch.checksum.clone())),
+                expected_revision: watermark_before
+                    .as_ref()
+                    .map(|watermark| watermark.revision)
+                    .filter(|revision| *revision > 0),
+                adapter_id: Some(batch.adapter_id.clone()),
+                strategy: watermark_after
+                    .as_ref()
+                    .map(|watermark| watermark.strategy.clone()),
+                table: batch.table.clone(),
+                cursor: watermark_after.as_ref().and_then(|watermark| {
                     watermark
-                        .high_watermark
+                        .cursor
                         .clone()
-                        .or_else(|| watermark.cursor.clone())
-                })
-                .or_else(|| Some(batch.checksum.clone())),
-            estimated_rows: Some(batch.rows.len() as u64),
-            raw_checksum: Some(batch.checksum.clone()),
-            metric_ids: Vec::new(),
-        })?;
-        // A connector batch is an applied ingestion, unlike the public
-        // ingest-plan preview endpoint.  Advance its durable watermark only
-        // after source rows and their snapshot committed successfully.
-        repository.commit_data_plane_ingest(&plan)?;
+                        .or_else(|| watermark.high_watermark.clone())
+                }),
+                offset: watermark_after
+                    .as_ref()
+                    .and_then(|watermark| watermark.offset)
+                    .map(|offset| offset as u64),
+                metric_ids: Vec::new(),
+            })?;
+            // 只有最后一块完成记录事务后，才允许推进唯一耐久水位。
+            let committed_matrix_watermark = repository.commit_data_plane_ingest(&plan)?;
+            matrix_refs.push(format!("matrix:data_plane_batch:{}", plan.batch_id));
+            watermark_after.map(|mut watermark| {
+                watermark.revision = committed_matrix_watermark.revision;
+                watermark
+            })
+        } else {
+            None
+        };
         let receipt_id = stable_receipt_id(&[
             batch.adapter_id.as_str(),
             batch.resource_ref.as_str(),
@@ -339,13 +384,8 @@ impl MatrixService {
             row_count: batch.rows.len(),
             checksum: batch.checksum.clone(),
             watermark_before,
-            watermark_after,
-            matrix_refs: vec![
-                format!("matrix:source_pack:{source_pack_id}"),
-                format!("matrix:source_snapshot:{}", snapshot.snapshot_id),
-                format!("matrix:apply_report:{}", apply_report.fact_count),
-                format!("matrix:data_plane_batch:{}", plan.batch_id),
-            ],
+            watermark_after: committed_source_watermark,
+            matrix_refs,
             created_at_ms: Utc::now().timestamp_millis(),
         })
     }
@@ -786,6 +826,40 @@ impl MatrixService {
             .get_quality_gate(gate_id)
     }
 
+    pub(crate) fn connector_source_watermark(
+        &self,
+        config_home: impl AsRef<Path>,
+        adapter_id: &str,
+        resource_ref: &str,
+        table: Option<&str>,
+    ) -> Result<Option<SourceWatermark>, GatewayMatrixRepositoryError> {
+        let fact_type = format!("source.{adapter_id}.row");
+        let partition_ref = table.unwrap_or("default-partition");
+        Ok(self
+            .sqlite_repository(config_home)?
+            .get_data_plane_watermark(resource_ref, &fact_type, partition_ref)?
+            .map(|watermark| SourceWatermark {
+                adapter_id: watermark
+                    .adapter_id
+                    .unwrap_or_else(|| adapter_id.to_string()),
+                resource_ref: watermark.source_ref,
+                table: watermark.table.or_else(|| table.map(str::to_string)),
+                strategy: watermark.strategy.unwrap_or_else(|| {
+                    if watermark.offset.is_some() {
+                        "offset".to_string()
+                    } else {
+                        "cursor".to_string()
+                    }
+                }),
+                cursor: watermark.cursor,
+                offset: watermark.offset.map(|offset| offset as usize),
+                high_watermark: Some(watermark.high_watermark),
+                checksum: watermark.checksum,
+                revision: watermark.revision,
+                updated_at_ms: watermark.updated_at.timestamp_millis(),
+            }))
+    }
+
     pub(crate) fn list_data_plane_watermarks(
         &self,
         config_home: impl AsRef<Path>,
@@ -913,19 +987,15 @@ mod tests {
             .expect("bridge ingest");
 
         assert!(!attention.is_empty());
-        assert!(
-            !service
-                .list_source_packs(&config_home, 10)
-                .expect("source packs")
-                .is_empty()
-        );
-        assert!(
-            service
-                .list_facts(&config_home, 10)
-                .expect("facts")
-                .iter()
-                .any(|fact| fact.fact_type.starts_with("knowledge_"))
-        );
+        assert!(!service
+            .list_source_packs(&config_home, 10)
+            .expect("source packs")
+            .is_empty());
+        assert!(service
+            .list_facts(&config_home, 10)
+            .expect("facts")
+            .iter()
+            .any(|fact| fact.fact_type.starts_with("knowledge_")));
         let _ = std::fs::remove_dir_all(config_home);
     }
 
@@ -966,37 +1036,46 @@ mod tests {
             offset: Some(1),
             high_watermark: None,
             checksum: Some(batch.checksum.clone()),
+            revision: 0,
             updated_at_ms: Utc::now().timestamp_millis(),
         };
+        let staged = service
+            .ingest_source_record_chunk(&config_home, &batch, None, None, false)
+            .expect("source chunk stage");
+        assert!(staged.watermark_after.is_none());
+        assert!(service
+            .list_data_plane_watermarks(&config_home, 10)
+            .expect("staged watermarks")
+            .is_empty());
         let receipt = service
-            .ingest_source_record_batch(&config_home, &batch, None, Some(watermark_after))
-            .expect("source batch receipt");
+            .ingest_source_record_chunk(&config_home, &batch, None, Some(watermark_after), true)
+            .expect("source final chunk receipt");
 
         assert_eq!(receipt.row_count, 1);
-        assert!(
+        assert_eq!(
             receipt
-                .matrix_refs
-                .iter()
-                .any(|value| value.starts_with("matrix:source_pack:"))
+                .watermark_after
+                .as_ref()
+                .expect("committed source watermark")
+                .revision,
+            1
         );
-        assert!(
-            !service
-                .list_source_packs(&config_home, 10)
-                .expect("source packs")
-                .is_empty()
-        );
-        assert!(
-            !service
-                .list_source_snapshots(&config_home, None, 10)
-                .expect("snapshots")
-                .is_empty()
-        );
-        assert!(
-            !service
-                .list_data_plane_watermarks(&config_home, 10)
-                .expect("watermarks")
-                .is_empty()
-        );
+        assert!(receipt
+            .matrix_refs
+            .iter()
+            .any(|value| value.starts_with("matrix:source_pack:")));
+        assert!(!service
+            .list_source_packs(&config_home, 10)
+            .expect("source packs")
+            .is_empty());
+        assert!(!service
+            .list_source_snapshots(&config_home, None, 10)
+            .expect("snapshots")
+            .is_empty());
+        assert!(!service
+            .list_data_plane_watermarks(&config_home, 10)
+            .expect("watermarks")
+            .is_empty());
         let _ = std::fs::remove_dir_all(config_home);
     }
 }

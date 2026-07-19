@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::{SqliteConnectionFactory, StorageHandle};
@@ -13,18 +13,18 @@ use thiserror::Error;
 
 use crate::MatrixSqliteDataPlane;
 use matrix_core::{
-    MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixComputeJobInput,
-    MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlane,
-    MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput,
-    MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket, MatrixEvidenceSourceRef,
-    MatrixFact, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
-    MatrixMetricAttentionScore, MatrixMetricDefinition, MatrixMetricDependency,
-    MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState,
-    MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation, MatrixScenarioResult,
-    MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec, MatrixSeverity,
-    MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack, MatrixSourcePackValidation,
-    MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport, MatrixSourceSnapshotInput,
-    MatrixSourceSnapshotPlan, build_metric_compute_jobs,
+    build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
+    MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
+    MatrixDataPlane, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
+    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket,
+    MatrixEvidenceSourceRef, MatrixFact, MatrixImpactHop, MatrixImpactTrace,
+    MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
+    MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
+    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
+    MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioRunStatus, MatrixScenarioSpec,
+    MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourceKey, MatrixSourcePack,
+    MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
+    MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
 };
 
 #[derive(Debug, Error)]
@@ -232,12 +232,45 @@ impl MatrixSqliteRepository {
     pub fn commit_data_plane_ingest(
         &self,
         plan: &MatrixDataPlaneIngestPlan,
-    ) -> Result<(), MatrixSqliteRepositoryError> {
-        let connection = self
+    ) -> Result<MatrixDataPlaneWatermark, MatrixSqliteRepositoryError> {
+        let mut connection = self
             .connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        upsert_data_plane_watermark(&connection, &plan.watermark)
+        let transaction = connection.transaction()?;
+        let resource_id = data_plane_watermark_resource_id(&plan.watermark);
+        let exists = transaction
+            .query_row(
+                "SELECT 1 FROM matrix_data_plane_watermark
+                 WHERE source_ref = ?1 AND fact_type = ?2 AND partition_ref = ?3",
+                params![
+                    plan.watermark.source_ref,
+                    plan.watermark.fact_type,
+                    plan.watermark.partition_ref,
+                ],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        let (_, revision, _) = prepare_matrix_resource_revision(
+            &transaction,
+            "data_plane_watermark",
+            &resource_id,
+            exists,
+            plan.expected_revision,
+            true,
+        )?;
+        let mut watermark = plan.watermark.clone();
+        watermark.revision = revision;
+        upsert_data_plane_watermark(&transaction, &watermark)?;
+        persist_matrix_resource_revision(
+            &transaction,
+            "data_plane_watermark",
+            &resource_id,
+            revision,
+        )?;
+        transaction.commit()?;
+        Ok(watermark)
     }
 
     pub fn upsert_entity(
@@ -1662,6 +1695,41 @@ impl MatrixSqliteRepository {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         list_data_plane_watermarks(&connection, limit)
+    }
+
+    pub fn get_data_plane_watermark(
+        &self,
+        source_ref: &str,
+        fact_type: &str,
+        partition_ref: &str,
+    ) -> Result<Option<MatrixDataPlaneWatermark>, MatrixSqliteRepositoryError> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let json = connection
+            .query_row(
+                "SELECT watermark_json FROM matrix_data_plane_watermark
+                 WHERE source_ref = ?1 AND fact_type = ?2 AND partition_ref = ?3",
+                params![source_ref, fact_type, partition_ref],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let mut watermark = serde_json::from_str::<MatrixDataPlaneWatermark>(&json)?;
+        let resource_id = data_plane_watermark_resource_id(&watermark);
+        watermark.revision = connection
+            .query_row(
+                "SELECT revision FROM matrix_resource_revision
+                 WHERE resource_kind = 'data_plane_watermark' AND resource_id = ?1",
+                params![resource_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .map_or_else(|| watermark.revision.max(1), |revision| revision as u64);
+        Ok(Some(watermark))
     }
 }
 
@@ -3681,6 +3749,13 @@ fn upsert_data_plane_watermark(
     Ok(())
 }
 
+fn data_plane_watermark_resource_id(watermark: &MatrixDataPlaneWatermark) -> String {
+    format!(
+        "{}\0{}\0{}",
+        watermark.source_ref, watermark.fact_type, watermark.partition_ref
+    )
+}
+
 fn list_data_plane_watermarks(
     connection: &Connection,
     limit: usize,
@@ -3984,20 +4059,83 @@ mod tests {
                 high_watermark: None,
                 estimated_rows: None,
                 raw_checksum: None,
+                expected_revision: None,
+                adapter_id: None,
+                strategy: None,
+                table: None,
+                cursor: None,
+                offset: None,
                 metric_ids: Vec::new(),
             })
             .expect("ingest plan builds");
 
-        assert!(
-            plan.affected_metric_ids
-                .iter()
-                .any(|metric_id| metric_id == "manufacturing_event_count")
-        );
+        assert!(plan
+            .affected_metric_ids
+            .iter()
+            .any(|metric_id| metric_id == "manufacturing_event_count"));
         assert!(plan.compute_jobs.iter().any(|job| {
             job.metric_ids
                 .iter()
                 .any(|metric_id| metric_id == "manufacturing_event_count")
         }));
+    }
+
+    #[test]
+    fn data_plane_watermark_commit_uses_revision_cas() {
+        let repository = MatrixSqliteRepository::in_memory().expect("repository opens");
+        let input = |expected_revision| MatrixDataPlaneIngestPlanInput {
+            source_ref: "bitable://app/orders".to_string(),
+            fact_type: "source.feishu_bitable.row".to_string(),
+            partition_ref: Some("orders".to_string()),
+            high_watermark: Some("cursor-1".to_string()),
+            estimated_rows: Some(2),
+            raw_checksum: Some("sha256:rows".to_string()),
+            expected_revision,
+            adapter_id: Some("feishu_bitable".to_string()),
+            strategy: Some("cursor_field".to_string()),
+            table: Some("orders".to_string()),
+            cursor: Some("cursor-1".to_string()),
+            offset: Some(2),
+            metric_ids: Vec::new(),
+        };
+
+        let first = repository
+            .plan_data_plane_ingest(input(None))
+            .expect("first plan");
+        let committed = repository
+            .commit_data_plane_ingest(&first)
+            .expect("first commit");
+        assert_eq!(committed.revision, 1);
+
+        let stale = repository
+            .plan_data_plane_ingest(input(None))
+            .expect("stale plan");
+        assert!(matches!(
+            repository.commit_data_plane_ingest(&stale),
+            Err(MatrixSqliteRepositoryError::RevisionConflict {
+                expected: None,
+                actual: Some(1),
+                ..
+            })
+        ));
+
+        let second = repository
+            .plan_data_plane_ingest(input(Some(1)))
+            .expect("second plan");
+        let committed = repository
+            .commit_data_plane_ingest(&second)
+            .expect("second commit");
+        assert_eq!(committed.revision, 2);
+        let loaded = repository
+            .get_data_plane_watermark(
+                "bitable://app/orders",
+                "source.feishu_bitable.row",
+                "orders",
+            )
+            .expect("load")
+            .expect("watermark");
+        assert_eq!(loaded.revision, 2);
+        assert_eq!(loaded.cursor.as_deref(), Some("cursor-1"));
     }
 
     #[test]

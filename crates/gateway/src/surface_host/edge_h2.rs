@@ -13,10 +13,12 @@ use surface::{
     SurfaceFrame, EDGE_PROTOCOL_V2,
 };
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 const AUTH_HEADER: &str = "x-cowd-edge-token";
 const MAX_RESPONSE_BODY: usize = 2 * 1024 * 1024;
+const MAX_STREAM_LINE: usize = 512 * 1024;
+const STREAM_BUFFER: usize = 8;
 
 #[derive(Clone)]
 pub(super) struct EdgeH2Client {
@@ -87,6 +89,81 @@ impl EdgeH2Client {
     pub(super) async fn invoke(&self, frame: &SurfaceFrame) -> Result<SurfaceFrame, SurfaceError> {
         let (method, path) = frame_endpoint(frame);
         self.json_request(method, path, frame).await
+    }
+
+    pub(super) async fn invoke_stream(
+        &self,
+        frame: &SurfaceFrame,
+    ) -> Result<mpsc::Receiver<Result<SurfaceFrame, SurfaceError>>, SurfaceError> {
+        let (method, path) = frame_endpoint(frame);
+        let body = serde_json::to_vec(frame).map_err(|error| SurfaceError::Invocation {
+            surface: self.surface_id.to_string(),
+            reason: format!("managed edge request encode failed: {error}"),
+        })?;
+        let request = self.request(method, path, Bytes::from(body))?;
+        let response = self.send(request).await?;
+        if !response.status().is_success() {
+            return Err(self.response_error(response).await);
+        }
+        let surface = self.surface_id.clone();
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        tokio::spawn(async move {
+            let mut body = response.into_body();
+            let mut buffered = Vec::new();
+            while let Some(frame) = body.frame().await {
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(SurfaceError::Invocation {
+                                surface: surface.to_string(),
+                                reason: format!("managed edge stream read failed: {error}"),
+                            }))
+                            .await;
+                        return;
+                    }
+                };
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                buffered.extend_from_slice(&data);
+                if buffered.len() > MAX_STREAM_LINE {
+                    let _ = tx
+                        .send(Err(SurfaceError::Invocation {
+                            surface: surface.to_string(),
+                            reason: "managed edge stream exceeded line limit".to_string(),
+                        }))
+                        .await;
+                    return;
+                }
+                while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
+                    let line = buffered.drain(..=position).collect::<Vec<_>>();
+                    let line = &line[..line.len().saturating_sub(1)];
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let decoded = serde_json::from_slice::<SurfaceFrame>(line).map_err(|error| {
+                        SurfaceError::Invocation {
+                            surface: surface.to_string(),
+                            reason: format!("managed edge stream decode failed: {error}"),
+                        }
+                    });
+                    if tx.send(decoded).await.is_err() {
+                        // 下游取消时立即丢弃 Incoming，HTTP/2 会重置该流。
+                        return;
+                    }
+                }
+            }
+            if !buffered.is_empty() {
+                let _ = tx
+                    .send(Err(SurfaceError::Invocation {
+                        surface: surface.to_string(),
+                        reason: "managed edge stream ended with an incomplete frame".to_string(),
+                    }))
+                    .await;
+            }
+        });
+        Ok(rx)
     }
 
     pub(super) fn spawn_event_stream(
@@ -272,9 +349,6 @@ fn frame_endpoint(frame: &SurfaceFrame) -> (Method, &'static str) {
         SurfaceFrame::Action { action, .. } if action == "source.incremental.run" => {
             (Method::POST, "/_cowd/edge/v2/source/incremental")
         }
-        SurfaceFrame::Action { action, .. } if action == "source.watermark.commit" => {
-            (Method::POST, "/_cowd/edge/v2/source/watermark/commit")
-        }
         SurfaceFrame::Action { .. } => (Method::POST, "/_cowd/edge/v2/action"),
         _ => (Method::POST, "/_cowd/edge/v2/action"),
     }
@@ -301,16 +375,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
+    use http_body_util::StreamBody;
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper::Response;
     use tokio::net::UnixListener;
 
+    type FixtureBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>;
+
+    struct ActiveGuard(Arc<AtomicUsize>);
+
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     async fn fixture_response(
         request: Request<Incoming>,
         active: Arc<AtomicUsize>,
         max_active: Arc<AtomicUsize>,
-    ) -> Result<Response<Full<Bytes>>, Infallible> {
+    ) -> Result<Response<FixtureBody>, Infallible> {
         let path = request.uri().path().to_string();
         let bytes = request.into_body().collect().await.unwrap().to_bytes();
         if path.ends_with("/handshake") {
@@ -322,38 +407,63 @@ mod tests {
                 capabilities: bootstrap.capabilities,
                 max_in_flight: 256,
             };
-            return Ok(Response::new(Full::new(Bytes::from(
-                serde_json::to_vec(&response).unwrap(),
-            ))));
+            return Ok(Response::new(
+                Full::new(Bytes::from(serde_json::to_vec(&response).unwrap())).boxed_unsync(),
+            ));
         }
         let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
         max_active.fetch_max(active_now, Ordering::SeqCst);
-        struct ActiveGuard(Arc<AtomicUsize>);
-        impl Drop for ActiveGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        let _guard = ActiveGuard(active);
+        let guard = ActiveGuard(active);
         let frame: SurfaceFrame = serde_json::from_slice(&bytes).unwrap();
-        let (id, delay) = match frame {
-            SurfaceFrame::Action { id, payload, .. } => (
+        let (id, action, delay) = match frame {
+            SurfaceFrame::Action {
                 id,
+                action,
+                payload,
+                ..
+            } => (
+                id,
+                action,
                 payload
                     .get("delay_ms")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
             ),
-            _ => ("fixture".to_string(), 0),
+            _ => ("fixture".to_string(), String::new(), 0),
         };
+        if action == "source.incremental.run" {
+            let frames =
+                futures::stream::unfold((0usize, guard, id), |(index, guard, id)| async move {
+                    if index >= 100 {
+                        return None;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let frame = SurfaceFrame::Ok {
+                        id: id.clone(),
+                        payload: serde_json::json!({
+                            "status": "ok",
+                            "chunk_index": index,
+                            "final_chunk": index == 99
+                        }),
+                    };
+                    let mut bytes = serde_json::to_vec(&frame).unwrap();
+                    bytes.push(b'\n');
+                    Some((
+                        Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from(bytes))),
+                        (index + 1, guard, id),
+                    ))
+                });
+            return Ok(Response::new(StreamBody::new(frames).boxed_unsync()));
+        }
+        let _guard = guard;
         tokio::time::sleep(Duration::from_millis(delay)).await;
         let response = SurfaceFrame::Ok {
             id,
             payload: serde_json::json!({"ok": true}),
         };
-        Ok(Response::new(Full::new(Bytes::from(
-            serde_json::to_vec(&response).unwrap(),
-        ))))
+        Ok(Response::new(
+            Full::new(Bytes::from(serde_json::to_vec(&response).unwrap())).boxed_unsync(),
+        ))
     }
 
     async fn fixture() -> (
@@ -451,6 +561,33 @@ mod tests {
         })
         .await
         .expect("handler future remained active after H2 stream cancellation");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_stream_is_bounded_and_downstream_drop_cancels_h2_body() {
+        let (client, active, _, server) = fixture().await;
+        let frame = SurfaceFrame::Action {
+            id: "source-stream".to_string(),
+            surface: "fixture".to_string(),
+            action: "source.incremental.run".to_string(),
+            payload: serde_json::Value::Null,
+        };
+        let mut chunks = client.invoke_stream(&frame).await.unwrap();
+        assert!(matches!(
+            chunks.recv().await.unwrap().unwrap(),
+            SurfaceFrame::Ok { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        drop(chunks);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source H2 body remained active after downstream cancellation");
         server.abort();
     }
 }

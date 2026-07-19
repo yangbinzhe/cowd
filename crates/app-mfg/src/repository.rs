@@ -11784,6 +11784,12 @@ mod tests {
                 high_watermark: None,
                 estimated_rows: None,
                 raw_checksum: None,
+                expected_revision: None,
+                adapter_id: None,
+                strategy: None,
+                table: None,
+                cursor: None,
+                offset: None,
                 metric_ids: Vec::new(),
             })
             .expect("ingest plan builds");

@@ -28,6 +28,20 @@ pub struct MatrixDataPlaneWatermark {
     pub partition_ref: String,
     pub high_watermark: String,
     pub last_batch_id: String,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub adapter_id: Option<String>,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub checksum: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -44,6 +58,18 @@ pub struct MatrixDataPlaneIngestPlanInput {
     #[serde(default)]
     pub raw_checksum: Option<String>,
     #[serde(default)]
+    pub expected_revision: Option<u64>,
+    #[serde(default)]
+    pub adapter_id: Option<String>,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub table: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
     pub metric_ids: Vec<String>,
 }
 
@@ -55,6 +81,8 @@ pub struct MatrixDataPlaneIngestPlan {
     pub partition_ref: String,
     pub idempotency_key: String,
     pub replay_policy: String,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
     pub estimated_rows: u64,
     #[serde(default)]
     pub affected_metric_ids: Vec<String>,

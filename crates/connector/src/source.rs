@@ -5,9 +5,24 @@ use rusqlite::{types::ValueRef, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+pub use surface::{
+    SourceBatchCursor, SourceConnectorState, SourceEventBatch, SourceFieldSchema,
+    SourceIncrementalRunRequest, SourceIncrementalRunResult, SourceIngestionReceipt,
+    SourceReadPlan, SourceRecordBatch, SourceTableSchema, SourceWatermark,
+};
 
 const DEFAULT_BATCH_LIMIT: usize = 100;
 const MAX_BATCH_LIMIT: usize = 1_000;
+
+fn bounded_limit(plan: &SourceReadPlan) -> usize {
+    plan.limit
+        .unwrap_or(DEFAULT_BATCH_LIMIT)
+        .clamp(1, MAX_BATCH_LIMIT)
+}
+
+fn source_offset(plan: &SourceReadPlan) -> usize {
+    plan.offset.unwrap_or(0)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceAdapterManifest {
@@ -98,190 +113,6 @@ impl SourceAdapterManifest {
             notes: notes.iter().map(|value| (*value).to_string()).collect(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceFieldSchema {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceTableSchema {
-    pub table_name: String,
-    pub fields: Vec<SourceFieldSchema>,
-    pub primary_key: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct SourceBatchCursor {
-    pub offset: usize,
-    pub limit: usize,
-    #[serde(default)]
-    pub next_offset: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SourceReadPlan {
-    pub adapter_id: String,
-    pub resource_ref: String,
-    #[serde(default)]
-    pub table: Option<String>,
-    #[serde(default)]
-    pub fields: Vec<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-    #[serde(default)]
-    pub offset: Option<usize>,
-    #[serde(default)]
-    pub cursor: Option<String>,
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-impl SourceReadPlan {
-    #[must_use]
-    pub fn bounded_limit(&self) -> usize {
-        self.limit
-            .unwrap_or(DEFAULT_BATCH_LIMIT)
-            .clamp(1, MAX_BATCH_LIMIT)
-    }
-
-    #[must_use]
-    pub fn offset(&self) -> usize {
-        self.offset.unwrap_or(0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SourceRecordBatch {
-    pub adapter_id: String,
-    pub resource_ref: String,
-    #[serde(default)]
-    pub table: Option<String>,
-    pub schema: SourceTableSchema,
-    pub rows: Vec<Value>,
-    pub cursor: SourceBatchCursor,
-    pub row_count: usize,
-    pub checksum: String,
-    pub truncated: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceWatermark {
-    pub adapter_id: String,
-    pub resource_ref: String,
-    #[serde(default)]
-    pub table: Option<String>,
-    pub strategy: String,
-    #[serde(default)]
-    pub cursor: Option<String>,
-    #[serde(default)]
-    pub offset: Option<usize>,
-    #[serde(default)]
-    pub high_watermark: Option<String>,
-    #[serde(default)]
-    pub checksum: Option<String>,
-    pub updated_at_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SourceIncrementalRunRequest {
-    pub adapter_id: String,
-    pub resource_ref: String,
-    #[serde(default)]
-    pub table: Option<String>,
-    #[serde(default)]
-    pub limit: Option<usize>,
-    #[serde(default)]
-    pub watermark: Option<SourceWatermark>,
-    #[serde(default)]
-    pub metadata: Value,
-}
-
-impl SourceIncrementalRunRequest {
-    #[must_use]
-    pub fn read_plan(&self) -> SourceReadPlan {
-        SourceReadPlan {
-            adapter_id: self.adapter_id.clone(),
-            resource_ref: self.resource_ref.clone(),
-            table: self.table.clone(),
-            fields: Vec::new(),
-            limit: self.limit,
-            offset: self
-                .watermark
-                .as_ref()
-                .and_then(|watermark| watermark.offset),
-            cursor: self.watermark.as_ref().and_then(|watermark| {
-                watermark
-                    .cursor
-                    .clone()
-                    .or_else(|| watermark.high_watermark.clone())
-            }),
-            metadata: self.metadata.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SourceIncrementalRunResult {
-    pub status: String,
-    #[serde(default)]
-    pub batch: Option<SourceRecordBatch>,
-    #[serde(default)]
-    pub watermark_before: Option<SourceWatermark>,
-    #[serde(default)]
-    pub watermark_after: Option<SourceWatermark>,
-    #[serde(default)]
-    pub degraded_reason: Option<String>,
-    #[serde(default)]
-    pub receipt: Option<SourceIngestionReceipt>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SourceEventBatch {
-    pub adapter_id: String,
-    #[serde(default)]
-    pub resource_ref: Option<String>,
-    #[serde(default)]
-    pub events: Vec<Value>,
-    pub event_count: usize,
-    #[serde(default)]
-    pub watermark_after: Option<SourceWatermark>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceIngestionReceipt {
-    pub receipt_id: String,
-    pub adapter_id: String,
-    pub resource_ref: String,
-    pub row_count: usize,
-    pub checksum: String,
-    #[serde(default)]
-    pub watermark_before: Option<SourceWatermark>,
-    #[serde(default)]
-    pub watermark_after: Option<SourceWatermark>,
-    #[serde(default)]
-    pub matrix_refs: Vec<String>,
-    pub created_at_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceConnectorState {
-    pub adapter_id: String,
-    pub surface_id: String,
-    pub status: String,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    #[serde(default)]
-    pub last_run_at_ms: Option<i64>,
-    #[serde(default)]
-    pub last_error: Option<String>,
-    #[serde(default)]
-    pub degraded_reason: Option<String>,
-    #[serde(default)]
-    pub watermarks: Vec<SourceWatermark>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -427,8 +258,8 @@ fn read_csv_batch(plan: &SourceReadPlan) -> Result<SourceRecordBatch, SourceAdap
         .into_iter()
         .map(|value| value.trim().to_string())
         .collect::<Vec<_>>();
-    let limit = plan.bounded_limit();
-    let offset = plan.offset();
+    let limit = bounded_limit(plan);
+    let offset = source_offset(plan);
     let mut rows = Vec::new();
     let mut total = 0usize;
     for line in lines {
@@ -463,8 +294,8 @@ fn read_csv_batch(plan: &SourceReadPlan) -> Result<SourceRecordBatch, SourceAdap
 fn read_jsonl_batch(plan: &SourceReadPlan) -> Result<SourceRecordBatch, SourceAdapterError> {
     let path = local_path_from_ref(&plan.resource_ref)?;
     let content = fs::read_to_string(&path)?;
-    let limit = plan.bounded_limit();
-    let offset = plan.offset();
+    let limit = bounded_limit(plan);
+    let offset = source_offset(plan);
     let mut rows = Vec::new();
     let mut total = 0usize;
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
@@ -540,8 +371,8 @@ fn read_sqlite_batch(plan: &SourceReadPlan) -> Result<SourceRecordBatch, SourceA
     );
     let mut statement = connection.prepare(&sql)?;
     let mut rows_iter = statement.query(rusqlite::params![
-        plan.bounded_limit() as i64,
-        plan.offset() as i64
+        bounded_limit(plan) as i64,
+        source_offset(plan) as i64
     ])?;
     let mut rows = Vec::new();
     while let Some(row) = rows_iter.next()? {
@@ -572,8 +403,8 @@ fn batch_from_rows(
     rows: Vec<Value>,
     total: usize,
 ) -> SourceRecordBatch {
-    let offset = plan.offset();
-    let limit = plan.bounded_limit();
+    let offset = source_offset(plan);
+    let limit = bounded_limit(plan);
     let next_offset = if offset + rows.len() < total {
         Some(offset + rows.len())
     } else {
@@ -799,10 +630,13 @@ mod tests {
             offset: None,
             high_watermark: Some("2026-07-07T00:00:00Z".to_string()),
             checksum: Some("sha256:test".to_string()),
+            revision: 7,
             updated_at_ms: 1_783_440_000_000,
         };
         let result = SourceIncrementalRunResult {
             status: "ingested".to_string(),
+            chunk_index: 0,
+            final_chunk: true,
             batch: None,
             watermark_before: Some(watermark.clone()),
             watermark_after: Some(watermark.clone()),
