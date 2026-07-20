@@ -5844,40 +5844,100 @@ pub(crate) mod tests {
             .as_ref()
             .expect("Gateway test state has runtime services")
             .runtime_services();
-        // Seed the generic Matrix core directly.  The following MFG requests
-        // must read this same durable Reality domain through the external APP,
-        // not through the still-unmigrated MFG source-pack mutation route.
-        let source_pack: matrix_core::MatrixSourcePack =
-            serde_json::from_value(serde_json::json!({
-                "source_pack_id": "gateway-external-source-pack",
-                "source_name": "gateway_external_fixture",
-                "owner": "operations",
-                "access_mode": "connector",
-                "refresh_mode": "incremental",
-                "entity_mappings": [{
-                    "source_entity": "plant",
-                    "matrix_entity_type": "factory",
-                    "source_key_field": "plant_id"
-                }],
-                "fact_mappings": [{
-                    "source_table": "quality_events",
-                    "fact_type": "manufacturing_quality_event",
-                    "metric_key": "quality_deviation_rate",
-                    "entity_ref_fields": ["plant_id"],
-                    "measure_fields": ["deviation"],
-                    "dedup_key": "plant_id:event_id",
-                    "delta_signature": "deviation"
-                }],
-                "reconciliation_rules": ["dedup_key_unique"],
-                "quality_rules": ["deviation_non_negative"]
-            }))
-            .expect("Matrix source-pack fixture");
-        state
-            .services
-            .matrix
-            .upsert_source_pack(&config_home, source_pack)
-            .expect("seed generic Matrix source pack");
+        // Keep the source fixture as HTTP data rather than seeding Matrix
+        // directly. The authenticated product path below must prove external
+        // MFG owns the source-pack CAS, durable receipt and resulting Reality
+        // reads through the same config-home Matrix domain.
+        let source_pack = serde_json::json!({
+            "source_pack_id": "gateway-external-source-pack",
+            "source_name": "gateway_external_fixture",
+            "owner": "operations",
+            "access_mode": "connector",
+            "refresh_mode": "incremental",
+            "entity_mappings": [{
+                "source_entity": "plant",
+                "matrix_entity_type": "factory",
+                "source_key_field": "plant_id"
+            }],
+            "fact_mappings": [{
+                "source_table": "quality_events",
+                "fact_type": "manufacturing_quality_event",
+                "metric_key": "quality_deviation_rate",
+                "entity_ref_fields": ["plant_id"],
+                "measure_fields": ["deviation"],
+                "dedup_key": "plant_id:event_id",
+                "delta_signature": "deviation"
+            }],
+            "reconciliation_rules": ["dedup_key_unique"],
+            "quality_rules": ["deviation_non_negative"]
+        });
         let app = api_router(state);
+
+        // This is a real Gateway -> verified APP request, not an adapter
+        // fixture. It proves the migrated write opens canonical Matrix, emits
+        // a durable MFG receipt, and leaves the source available to the
+        // external validate/delta read routes below.
+        let external_source_pack = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/source-packs/upsert")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-source-pack")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "gateway-external-source-pack",
+                            "session_id": "gateway-external-source-session",
+                            "source_pack": source_pack,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_source_pack.status();
+        let body = to_bytes(external_source_pack.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_source_pack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_source_pack["kind"], "mfg.reality.source_pack");
+        assert_eq!(external_source_pack["created"], true);
+        assert_eq!(external_source_pack["revision"], 1);
+        assert!(external_source_pack["receipt"]["receipt_id"].is_string());
+
+        let external_source_pack_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/source-packs/upsert")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-source-pack")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "gateway-external-source-pack",
+                            "session_id": "gateway-external-source-session",
+                            "source_pack": source_pack,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_source_pack_replay.status();
+        let body = to_bytes(external_source_pack_replay.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_source_pack_replay: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_source_pack_replay["revision"], 1);
+        assert_eq!(external_source_pack_replay["receipt"]["status"], "replayed");
 
         let bearer_snapshot = app
             .clone()

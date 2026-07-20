@@ -18,7 +18,7 @@ use axum::{
 use matrix_core::{
     MatrixComputeJobInput, MatrixConnectorRunInput, MatrixEntity, MatrixEntityInput, MatrixFact,
     MatrixFactInput, MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation,
-    MatrixRelationInput, MatrixSourcePack,
+    MatrixRelationInput,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -139,8 +139,6 @@ pub(super) fn register_mfg_openapi_schemas(
     );
     registry.register_type::<MfgRealityComputeJobPlanRequest>("MfgRealityComputeJobPlanRequest");
     registry.register_type::<MfgRealityEvidenceBuildRequest>("MfgRealityEvidenceBuildRequest");
-    registry
-        .register_type::<MfgRealitySourcePackUpsertRequest>("MfgRealitySourcePackUpsertRequest");
     registry.register_type::<MfgRealitySourcePackIngestFileRequest>(
         "MfgRealitySourcePackIngestFileRequest",
     );
@@ -221,10 +219,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/production/governance",
             get(mfg_production_governance_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/source-packs/upsert",
-            post(mfg_reality_source_pack_upsert_handler),
         )
         .route(
             "/api/apps/mfg/reality/source-packs/:id/ingest-file",
@@ -2038,17 +2032,6 @@ struct MfgRealityEvidenceBuildRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealitySourcePackUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    expected_revision: Option<u64>,
-    source_pack: MatrixSourcePack,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealitySourcePackIngestFileRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -2150,31 +2133,6 @@ async fn mfg_production_governance_handler(
             "cross_plane_audit_route": "/api/cross-plane/audit",
             "production_runbook": "docs/operator/mfg-production-runbook.md",
         }
-    })))
-}
-
-async fn mfg_reality_source_pack_upsert_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealitySourcePackUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let outcome = state
-        .services
-        .matrix
-        .upsert_source_pack_checked(
-            &state.config_home,
-            request.source_pack,
-            request.expected_revision,
-        )
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.source_pack",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "source_pack": outcome.resource,
-        "created": outcome.created,
-        "previous_revision": outcome.previous_revision,
-        "revision": outcome.revision,
-        "boundary": mfg_reality_boundary(),
     })))
 }
 
