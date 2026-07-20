@@ -170,7 +170,9 @@ pub enum AppRegistryError {
 #[cfg(test)]
 mod tests {
     use axum::{routing::get, Router};
-    use cowd_app_sdk::{AppActionDescriptor, AppProfileDescriptor, SDK_API_VERSION};
+    use cowd_app_sdk::{
+        AppActionDescriptor, AppProfileDescriptor, AppProfileVariant, SDK_API_VERSION,
+    };
 
     use super::*;
 
@@ -200,9 +202,12 @@ mod tests {
                     requires_confirmation: false,
                 }],
                 profile: Some(AppProfileDescriptor {
-                    id: "fixture".to_string(),
-                    revision: 1,
+                    catalog_revision: 1,
                     capability_digest: "fixture".to_string(),
+                    profiles: vec![AppProfileVariant {
+                        id: "operator".to_string(),
+                        capabilities: vec!["fixture.read".to_string()],
+                    }],
                 }),
             }
         }

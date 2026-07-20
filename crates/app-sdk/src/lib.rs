@@ -78,6 +78,27 @@ impl AppDescriptor {
                 return Err(AppContractError::InvalidDescriptor(self.id.clone()));
             }
         }
+        if let Some(profile_catalogue) = &self.profile {
+            if profile_catalogue.capability_digest.trim().is_empty()
+                || profile_catalogue.profiles.iter().any(|profile| {
+                    profile.id.trim().is_empty()
+                        || profile
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability.trim().is_empty())
+                })
+            {
+                return Err(AppContractError::InvalidDescriptor(self.id.clone()));
+            }
+            for (index, profile) in profile_catalogue.profiles.iter().enumerate() {
+                if profile_catalogue.profiles[..index]
+                    .iter()
+                    .any(|previous| previous.id == profile.id)
+                {
+                    return Err(AppContractError::InvalidDescriptor(self.id.clone()));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -118,9 +139,22 @@ pub struct AppActionDescriptor {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppProfileDescriptor {
-    pub id: String,
-    pub revision: u64,
+    /// Build-time catalog revision supplied by the APP. This is distinct from
+    /// a credential profile revision and cannot be chosen by a request.
+    pub catalog_revision: u64,
     pub capability_digest: String,
+    #[serde(default)]
+    pub profiles: Vec<AppProfileVariant>,
+}
+
+/// A named application profile exposed through the stable APP ABI. Hosts can
+/// aggregate these descriptors without importing APP-specific enums or
+/// capability helper functions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppProfileVariant {
+    pub id: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
