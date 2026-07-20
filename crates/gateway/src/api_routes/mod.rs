@@ -5871,7 +5871,92 @@ pub(crate) mod tests {
             "reconciliation_rules": ["dedup_key_unique"],
             "quality_rules": ["deviation_non_negative"]
         });
+        state
+            .services
+            .task
+            .start_goal_idempotent(
+                "gateway-external-assignment-task",
+                "External APP assignment task fixture".to_string(),
+                false,
+            )
+            .expect("seed runtime task for external assignment");
+        let assignment_surface = state.services.surface.clone();
         let app = api_router(state);
+
+        // Assignment is an external APP mutation. This product request proves
+        // that its task lookup and Surface outbox delivery both transit only
+        // the generic Gateway host ports; Gateway has no mounted MFG handler.
+        let external_assignment = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/assignments")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-assignment")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "assignment": {
+                                "task_ref": "task://gateway-external-assignment-task",
+                                "assignee_ref": "principal:local-human",
+                                "notification_targets": [{
+                                    "surface": "fixture-surface",
+                                    "recipient": "local-human"
+                                }]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_assignment.status();
+        let body = to_bytes(external_assignment.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_assignment: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_assignment["kind"], "mfg.assignment");
+        assert_eq!(
+            external_assignment["assignment"]["task_ref"],
+            "task://gateway-external-assignment-task"
+        );
+        let assignment_id = external_assignment["assignment"]["assignment_id"]
+            .as_str()
+            .expect("external assignment id");
+        let assignment_started = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/apps/mfg/assignments/{assignment_id}/command"))
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-assignment-start")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command": "start",
+                            "expected_revision": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = assignment_started.status();
+        let body = to_bytes(assignment_started.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let assignment_started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(assignment_started["assignment"]["status"], "in_progress");
+        assert!(assignment_surface.all_outbox().iter().any(|entry| {
+            entry.idempotency_key == "gateway-external-assignment-start:surface:0"
+                && entry.surface == "fixture-surface"
+        }));
 
         let external_governance = app
             .clone()

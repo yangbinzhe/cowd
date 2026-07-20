@@ -29,6 +29,7 @@ use serde::Deserialize;
 
 use matrix_core::MatrixEvidencePacket;
 use memory::store::session::SessionRecord;
+use surface::SurfaceSendRequest;
 
 use crate::api_routes::{connector_routes::connector_snapshot, AppState};
 
@@ -61,6 +62,21 @@ pub(crate) const WORK_CONTEXT_APPEND_SESSION_EVENT_INTENT_V1: &str =
 /// domain; the application never receives the Context service or its types.
 pub(crate) const WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_INTENT_V1: &str =
     "cowd.work_context.structured_evidence_item.v1";
+/// Closed task lookup used by an APP to bind its own domain assignment to an
+/// already-existing Cowd task without obtaining task service access.
+pub(crate) const WORK_CONTEXT_TASK_EXISTS_INTENT_V1: &str = "cowd.work_context.task_exists.v1";
+/// Closed task-terminal observation. Gateway verifies and records Runtime
+/// completion evidence; an APP can consume only the resulting durable fact.
+pub(crate) const WORK_CONTEXT_RECORD_TASK_TERMINAL_OBSERVATION_INTENT_V1: &str =
+    "cowd.work_context.record_task_terminal_observation.v1";
+/// Closed task-terminal probe. The APP can learn only whether a referenced
+/// Runtime task is terminal; it never receives a task service or graph.
+pub(crate) const WORK_CONTEXT_INSPECT_TASK_TERMINAL_INTENT_V1: &str =
+    "cowd.work_context.inspect_task_terminal.v1";
+/// Closed surface dispatch batch. APPs supply no transport credential and the
+/// host owns the durable outbox/idempotency identity for every delivery.
+pub(crate) const CONNECTOR_SURFACE_DISPATCH_BATCH_INTENT_V1: &str =
+    "cowd.connector.surface_dispatch_batch.v1";
 /// Closed, read-only host snapshot for an APP's own production-governance
 /// projection. The response is product status only, not a configuration API.
 pub(crate) const PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1: &str =
@@ -469,11 +485,129 @@ fn current_time_ms() -> u64 {
 impl ConnectorPort for GatewayAppHostBinding {
     async fn dispatch(
         &self,
-        _context: &InvocationContext,
+        context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
-        Err(Self::unsupported("connector", &intent.kind))
+        let state = self.state()?;
+        let _principal = self.verified_principal(context)?;
+        match intent.kind.as_str() {
+            CONNECTOR_SURFACE_DISPATCH_BATCH_INTENT_V1 => {
+                let request: ConnectorSurfaceDispatchBatchIntentV1 =
+                    serde_json::from_value(intent.payload).map_err(|error| {
+                        AppHostError::Denied(format!(
+                            "surface dispatch batch intent must contain only bounded delivery entries: {error}"
+                        ))
+                    })?;
+                if request.deliveries.is_empty() || request.deliveries.len() > 32 {
+                    return Err(AppHostError::Denied(
+                        "surface dispatch batch must contain between 1 and 32 deliveries"
+                            .to_string(),
+                    ));
+                }
+                let mut notification_refs = Vec::with_capacity(request.deliveries.len());
+                for delivery in request.deliveries {
+                    validate_surface_delivery(&delivery)?;
+                    let delivery_key = delivery.idempotency_key.clone();
+                    let send = state.services.surface.send(SurfaceSendRequest {
+                        surface: delivery.surface,
+                        recipient: delivery.recipient,
+                        thread: delivery.thread,
+                        text: delivery.text,
+                        idempotency_key: Some(delivery_key.clone()),
+                        metadata: delivery.metadata,
+                    });
+                    let result = send.await;
+                    if let Some(outbox) = state
+                        .services
+                        .surface
+                        .all_outbox()
+                        .into_iter()
+                        .find(|entry| entry.idempotency_key == delivery_key)
+                    {
+                        notification_refs.push(format!(
+                            "surface://{}/delivery/{}",
+                            outbox.surface, outbox.delivery_id
+                        ));
+                    } else if let Err(error) = result {
+                        return Err(AppHostError::Failed(format!(
+                            "surface delivery failed before durable outbox acceptance: {error}"
+                        )));
+                    } else {
+                        return Err(AppHostError::Failed(
+                            "surface delivery completed without a durable outbox record"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Ok(HostReceipt {
+                    id: format!("connector:surface-batch:{}", context.request_id),
+                    status: "completed".to_string(),
+                    replayed: false,
+                    payload: serde_json::json!({
+                        "kind": "cowd.connector.surface_dispatch_batch.receipt.v1",
+                        "notification_refs": notification_refs,
+                    }),
+                })
+            }
+            _ => Err(Self::unsupported("connector", &intent.kind)),
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectorSurfaceDispatchBatchIntentV1 {
+    deliveries: Vec<ConnectorSurfaceDeliveryV1>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectorSurfaceDeliveryV1 {
+    surface: String,
+    recipient: String,
+    #[serde(default)]
+    thread: Option<String>,
+    text: String,
+    idempotency_key: String,
+    metadata: serde_json::Value,
+}
+
+fn validate_surface_delivery(delivery: &ConnectorSurfaceDeliveryV1) -> Result<(), AppHostError> {
+    let valid_label = |value: &str, limit: usize| {
+        !value.trim().is_empty()
+            && value.len() <= limit
+            && value
+                .chars()
+                .all(|character| !character.is_control() && character != '\n' && character != '\r')
+    };
+    let metadata_size = serde_json::to_vec(&delivery.metadata)
+        .map_err(|error| {
+            AppHostError::Denied(format!("surface delivery metadata is invalid: {error}"))
+        })?
+        .len();
+    if !valid_label(&delivery.surface, 96)
+        || !valid_label(&delivery.recipient, 512)
+        || !valid_label(&delivery.idempotency_key, 256)
+        || delivery.text.trim().is_empty()
+        || delivery.text.len() > 16 * 1024
+        || !delivery.metadata.is_object()
+        || metadata_size > 8 * 1024
+    {
+        return Err(AppHostError::Denied(
+            "surface delivery contains an invalid bounded target, text, idempotency key or metadata"
+                .to_string(),
+        ));
+    }
+    if delivery
+        .thread
+        .as_deref()
+        .is_some_and(|value| !valid_label(value, 512))
+    {
+        return Err(AppHostError::Denied(
+            "surface delivery thread is invalid".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -616,6 +750,124 @@ impl WorkContextPort for GatewayAppHostBinding {
                     }),
                 })
             }
+            WORK_CONTEXT_TASK_EXISTS_INTENT_V1 => {
+                let request: WorkContextTaskExistsIntentV1 = serde_json::from_value(intent.payload)
+                    .map_err(|error| {
+                        AppHostError::Denied(format!(
+                            "task_exists intent must contain exactly one task_ref: {error}"
+                        ))
+                    })?;
+                let task_id = canonical_task_id(&request.task_ref)?;
+                let exists = state
+                    .services
+                    .task
+                    .list_records()
+                    .map_err(AppHostError::Unavailable)?
+                    .into_iter()
+                    .any(|task| task.id == task_id);
+                Ok(HostReceipt {
+                    id: format!("work-context:task-exists:{}", context.request_id),
+                    status: "completed".to_string(),
+                    replayed: false,
+                    payload: serde_json::json!({
+                        "kind": "cowd.work_context.task_exists.receipt.v1",
+                        "task_id": task_id,
+                        "exists": exists,
+                    }),
+                })
+            }
+            WORK_CONTEXT_RECORD_TASK_TERMINAL_OBSERVATION_INTENT_V1 => {
+                let request: WorkContextRecordTaskTerminalObservationIntentV1 =
+                    serde_json::from_value(intent.payload).map_err(|error| {
+                        AppHostError::Denied(format!(
+                            "record_task_terminal_observation intent must contain the closed task observation envelope: {error}"
+                        ))
+                    })?;
+                let task_id = canonical_task_id(&request.task_ref)?;
+                if request.correlation_id.trim().is_empty()
+                    || request.correlation_id.len() > 256
+                    || request.correlation_id.chars().any(char::is_control)
+                {
+                    return Err(AppHostError::Denied(
+                        "task terminal observation correlation_id is invalid".to_string(),
+                    ));
+                }
+                let terminal =
+                    observe_task_terminal(&state, &task_id, request.workflow_node_id.as_deref())
+                        .await?;
+                let Some(terminal) = terminal else {
+                    return Ok(HostReceipt {
+                        id: format!("work-context:task-terminal:{}", context.request_id),
+                        status: "not_ready".to_string(),
+                        replayed: false,
+                        payload: serde_json::json!({
+                            "kind": "cowd.work_context.task_terminal_observation.receipt.v1",
+                            "task_id": task_id,
+                            "terminal": serde_json::Value::Null,
+                        }),
+                    });
+                };
+                let observation = state
+                    .services
+                    .task
+                    .record_assignment_terminal_observation(
+                        &terminal.task_id,
+                        &terminal.terminal_status,
+                        &terminal.source_receipt_ref,
+                        &request.correlation_id,
+                    )
+                    .map_err(AppHostError::Unavailable)?;
+                Ok(HostReceipt {
+                    id: format!("work-context:task-terminal:{}", context.request_id),
+                    status: "completed".to_string(),
+                    replayed: false,
+                    payload: serde_json::json!({
+                        "kind": "cowd.work_context.task_terminal_observation.receipt.v1",
+                        "task_id": terminal.task_id,
+                        "completion_evidence": {
+                            "correlation_id": request.correlation_id,
+                            "owner_kind": "runtime_assignment_terminal_observation",
+                            "task_ref": request.task_ref,
+                            "workflow_node_id": terminal.workflow_node_id,
+                            "terminal_status": terminal.terminal_status,
+                            "receipt_ref": format!(
+                                "runtime-event://{}?cursor={}&transaction={}",
+                                observation.event_id, observation.commit_cursor, observation.transaction_id
+                            ),
+                        },
+                    }),
+                })
+            }
+            WORK_CONTEXT_INSPECT_TASK_TERMINAL_INTENT_V1 => {
+                let request: WorkContextInspectTaskTerminalIntentV1 =
+                    serde_json::from_value(intent.payload).map_err(|error| {
+                        AppHostError::Denied(format!(
+                            "inspect_task_terminal intent must contain the closed task reference: {error}"
+                        ))
+                    })?;
+                let task_id = canonical_task_id(&request.task_ref)?;
+                let terminal =
+                    observe_task_terminal(&state, &task_id, request.workflow_node_id.as_deref())
+                        .await?;
+                Ok(HostReceipt {
+                    id: format!("work-context:task-terminal-inspect:{}", context.request_id),
+                    status: if terminal.is_some() {
+                        "completed".to_string()
+                    } else {
+                        "not_ready".to_string()
+                    },
+                    replayed: false,
+                    payload: serde_json::json!({
+                        "kind": "cowd.work_context.inspect_task_terminal.receipt.v1",
+                        "task_id": task_id,
+                        "terminal": terminal.as_ref().map(|terminal| serde_json::json!({
+                            "workflow_node_id": terminal.workflow_node_id,
+                            "terminal_status": terminal.terminal_status,
+                            "source_receipt_ref": terminal.source_receipt_ref,
+                        })),
+                    }),
+                })
+            }
             _ => Err(Self::unsupported("work_context", &intent.kind)),
         }
     }
@@ -670,6 +922,138 @@ struct WorkContextAppendSessionEventIntentV1 {
 #[serde(deny_unknown_fields)]
 struct WorkContextStructuredEvidenceItemIntentV1 {
     packet: MatrixEvidencePacket,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkContextTaskExistsIntentV1 {
+    task_ref: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkContextRecordTaskTerminalObservationIntentV1 {
+    task_ref: String,
+    #[serde(default)]
+    workflow_node_id: Option<String>,
+    correlation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkContextInspectTaskTerminalIntentV1 {
+    task_ref: String,
+    #[serde(default)]
+    workflow_node_id: Option<String>,
+}
+
+struct WorkContextTaskTerminal {
+    task_id: String,
+    workflow_node_id: Option<String>,
+    terminal_status: String,
+    source_receipt_ref: String,
+}
+
+fn canonical_task_id(task_ref: &str) -> Result<String, AppHostError> {
+    let task_id = task_ref
+        .trim()
+        .strip_prefix("task://")
+        .or_else(|| task_ref.trim().strip_prefix("task:"))
+        .unwrap_or(task_ref.trim());
+    if task_id.is_empty() || task_id.len() > 256 || task_id.chars().any(char::is_control) {
+        return Err(AppHostError::Denied(
+            "work-context task_ref is invalid".to_string(),
+        ));
+    }
+    Ok(task_id.to_string())
+}
+
+async fn observe_task_terminal(
+    state: &AppState,
+    task_id: &str,
+    workflow_node_id: Option<&str>,
+) -> Result<Option<WorkContextTaskTerminal>, AppHostError> {
+    let task = state
+        .services
+        .task
+        .list_records()
+        .map_err(AppHostError::Unavailable)?
+        .into_iter()
+        .find(|task| task.id == task_id);
+    let Some(task) = task else {
+        return Ok(None);
+    };
+    if let Some(node_id) = workflow_node_id {
+        let projection = state
+            .services
+            .task
+            .execution_graph(&task.id)
+            .await
+            .map_err(AppHostError::Unavailable)?;
+        let Some(projection) = projection else {
+            return Ok(None);
+        };
+        let node = projection.nodes.iter().find(|node| node.node_id == node_id);
+        let Some(node) = node else {
+            return Ok(None);
+        };
+        if !node.status.is_terminal() {
+            return Ok(None);
+        }
+        return Ok(Some(WorkContextTaskTerminal {
+            task_id: task.id,
+            workflow_node_id: Some(node_id.to_string()),
+            terminal_status: format!("{:?}", node.status).to_ascii_lowercase(),
+            source_receipt_ref: node.result_ref.clone().unwrap_or_else(|| {
+                format!(
+                    "execution://{}/nodes/{}?revision={}",
+                    projection.graph_id, node_id, projection.revision
+                )
+            }),
+        }));
+    }
+    let receipt = state
+        .services
+        .task
+        .latest_terminal_runtime_receipt(&task.id)
+        .map_err(AppHostError::Unavailable)?;
+    if let Some(receipt) = receipt {
+        let terminal_status = receipt
+            .payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AppHostError::Failed(
+                    "canonical Runtime terminal receipt omitted its terminal status".to_string(),
+                )
+            })?;
+        return Ok(Some(WorkContextTaskTerminal {
+            task_id: task.id,
+            workflow_node_id: None,
+            terminal_status: terminal_status.to_string(),
+            source_receipt_ref: format!(
+                "runtime-event://{}?cursor={}&transaction={}",
+                receipt.event_id, receipt.commit_cursor, receipt.transaction_id
+            ),
+        }));
+    }
+    if matches!(
+        task.status,
+        crate::task_kernel::TaskStatus::Completed
+            | crate::task_kernel::TaskStatus::Blocked
+            | crate::task_kernel::TaskStatus::Cancelled
+            | crate::task_kernel::TaskStatus::Failed
+    ) {
+        let task_id = task.id;
+        let terminal_status = task.status.as_str().to_string();
+        return Ok(Some(WorkContextTaskTerminal {
+            task_id: task_id.clone(),
+            workflow_node_id: None,
+            terminal_status: terminal_status.clone(),
+            source_receipt_ref: format!("task://{task_id}?status={terminal_status}"),
+        }));
+    }
+    Ok(None)
 }
 
 fn validate_work_context_session_event(

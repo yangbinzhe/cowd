@@ -116,9 +116,6 @@ pub(super) fn register_mfg_openapi_schemas(
         .register_type::<MfgAlertSubscriptionUpsertRequest>("MfgAlertSubscriptionUpsertRequest");
     registry.register_type::<MfgAlertCommandRequest>("MfgAlertCommandRequest");
     registry.register_type::<MfgForecastQuery>("MfgForecastQuery");
-    registry.register_type::<MfgAssignmentListQuery>("MfgAssignmentListQuery");
-    registry.register_type::<MfgAssignmentUpsertRequest>("MfgAssignmentUpsertRequest");
-    registry.register_type::<MfgAssignmentCommandRequest>("MfgAssignmentCommandRequest");
     registry.register_type::<MfgLiveQuery>("MfgLiveQuery");
 }
 
@@ -226,14 +223,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/focus/alerts/:id/command",
             post(mfg_alert_command_handler),
-        )
-        .route(
-            "/api/apps/mfg/assignments",
-            post(mfg_assignment_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/assignments/:id/command",
-            post(mfg_assignment_command_handler),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state,
