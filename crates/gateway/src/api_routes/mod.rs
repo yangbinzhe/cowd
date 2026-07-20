@@ -5745,6 +5745,27 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(external_incidents["kind"], "mfg.incident.list");
 
+        let external_reality_metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/reality/metrics")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(external_reality_metrics.status(), StatusCode::OK);
+        let external_reality_metrics: serde_json::Value = serde_json::from_slice(
+            &to_bytes(external_reality_metrics.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(external_reality_metrics["kind"], "mfg.reality.metrics");
+        assert_eq!(external_reality_metrics["boundary"]["engine"], "matrix");
+
         let login = app
             .clone()
             .oneshot(

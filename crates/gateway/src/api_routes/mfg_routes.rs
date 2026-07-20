@@ -354,10 +354,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_reality_source_pack_upsert_handler),
         )
         .route(
-            "/api/apps/mfg/reality/source-packs/:id",
-            get(mfg_reality_source_pack_get_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/source-packs/:id/validate",
             post(mfg_reality_source_pack_validate_handler),
         )
@@ -378,14 +374,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_reality_source_pack_connector_run_execute_handler),
         )
         .route(
-            "/api/apps/mfg/reality/connector-runs/:id",
-            get(mfg_reality_connector_run_get_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/metrics",
-            get(mfg_reality_metrics_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/metrics/attention-plan",
             post(mfg_reality_metric_attention_plan_handler),
         )
@@ -396,14 +384,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/reality/metrics/recompute",
             post(mfg_reality_metric_recompute_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/metrics/:id",
-            get(mfg_reality_metric_detail_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/metrics/:id/lineage",
-            get(mfg_reality_metric_lineage_handler),
         )
         .route(
             "/api/apps/mfg/reality/metric-dependencies/upsert",
@@ -418,16 +398,8 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_reality_compute_job_plan_handler),
         )
         .route(
-            "/api/apps/mfg/reality/compute/jobs/:id",
-            get(mfg_reality_compute_job_get_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/compute/jobs/:id/run",
             post(mfg_reality_compute_job_run_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/entities",
-            get(mfg_reality_entities_handler),
         )
         .route(
             "/api/apps/mfg/reality/entities/upsert",
@@ -446,18 +418,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_reality_entity_conflict_decision_handler),
         )
         .route(
-            "/api/apps/mfg/reality/entities/:id",
-            get(mfg_reality_entity_get_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/entities/:id/relations",
-            get(mfg_reality_entity_relations_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/entities/:id/impact-path",
-            get(mfg_reality_entity_impact_path_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/relations/upsert",
             post(mfg_reality_relation_upsert_handler),
         )
@@ -466,20 +426,8 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_reality_fact_ingest_handler),
         )
         .route(
-            "/api/apps/mfg/reality/changes",
-            get(mfg_reality_changes_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/attention/hot",
-            get(mfg_reality_attention_hot_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/evidence/build",
             post(mfg_reality_evidence_build_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/evidence/:id",
-            get(mfg_reality_evidence_get_handler),
         )
         .route(
             "/api/apps/mfg/reality/evidence/:id/quality-gate",
@@ -488,10 +436,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/reality/evidence/:id/context",
             get(mfg_reality_evidence_context_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/quality-gates/:id",
-            get(mfg_reality_quality_gate_get_handler),
         )
         .route(
             "/api/apps/mfg/decision-trace",
