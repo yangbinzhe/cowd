@@ -134,14 +134,8 @@ pub(super) fn register_mfg_openapi_schemas(
     registry.register_type::<MfgRealityMetricDependencyUpsertRequest>(
         "MfgRealityMetricDependencyUpsertRequest",
     );
-    registry.register_type::<MfgRealityMetricAttentionPlanRequest>(
-        "MfgRealityMetricAttentionPlanRequest",
-    );
     registry.register_type::<MfgRealityMetricSnapshotMaterializeRequest>(
         "MfgRealityMetricSnapshotMaterializeRequest",
-    );
-    registry.register_type::<MfgRealityAffectedByFactTypeRequest>(
-        "MfgRealityAffectedByFactTypeRequest",
     );
     registry.register_type::<MfgRealityComputeJobPlanRequest>("MfgRealityComputeJobPlanRequest");
     registry.register_type::<MfgRealityEvidenceBuildRequest>("MfgRealityEvidenceBuildRequest");
@@ -245,10 +239,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_reality_source_pack_connector_run_execute_handler),
         )
         .route(
-            "/api/apps/mfg/reality/metrics/attention-plan",
-            post(mfg_reality_metric_attention_plan_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/metrics/snapshots/materialize",
             post(mfg_reality_metric_snapshot_materialize_handler),
         )
@@ -259,10 +249,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/reality/metric-dependencies/upsert",
             post(mfg_reality_metric_dependency_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/metric-dependencies/affected-by-fact-type",
-            post(mfg_reality_metric_affected_by_fact_type_handler),
         )
         .route(
             "/api/apps/mfg/reality/compute/jobs/plan",
@@ -2024,21 +2010,6 @@ struct MfgRealityMetricDependencyUpsertRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityMetricAttentionPlanRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    trigger_fact_type: String,
-    #[serde(default)]
-    entity_scope: Option<String>,
-    #[serde(default)]
-    period: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityMetricSnapshotMaterializeRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -2047,15 +2018,6 @@ struct MfgRealityMetricSnapshotMaterializeRequest {
     metric_ids: Vec<String>,
     #[serde(default)]
     scope_ref: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityAffectedByFactTypeRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    fact_type: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2430,30 +2392,6 @@ async fn mfg_reality_metric_lineage_handler(
     })))
 }
 
-async fn mfg_reality_metric_attention_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityMetricAttentionPlanRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let plan = state
-        .services
-        .matrix
-        .plan_metric_attention(
-            &state.config_home,
-            &request.trigger_fact_type,
-            request.entity_scope,
-            request.period,
-            request.limit.unwrap_or(12),
-        )
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.metric_attention.plan",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "plan": plan,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
 async fn mfg_reality_metric_snapshot_materialize_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<MfgRealityMetricSnapshotMaterializeRequest>,
@@ -2499,25 +2437,6 @@ async fn mfg_reality_metric_dependency_upsert_handler(
         "created": outcome.created,
         "previous_revision": outcome.previous_revision,
         "revision": outcome.revision,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_metric_affected_by_fact_type_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityAffectedByFactTypeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let metric_ids = state
-        .services
-        .matrix
-        .metrics_affected_by_fact_type(&state.config_home, &request.fact_type)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.metric_dependency.affected_by_fact_type",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "fact_type": request.fact_type,
-        "metric_ids": metric_ids,
         "boundary": mfg_reality_boundary(),
     })))
 }
