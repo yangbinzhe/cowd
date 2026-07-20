@@ -51,8 +51,8 @@ dependencies = [
  "auth-broker",
  "cowd-app-host",
  "cowd-app-mfg-adapter",
- "cowd-app-mfg-contract",
- "cowd-app-mfg-core",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945)",
+ "cowd-app-mfg-core 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945)",
  "cowd-app-mfg-tui",
 ]
 
@@ -89,7 +89,7 @@ name = "auth-broker"
 version = "0.9.561"
 dependencies = [
  "base64",
- "cowd-app-mfg-contract",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b)",
  "harness-contract",
  "ring",
  "rustix 1.1.4",
@@ -287,7 +287,7 @@ name = "cli"
 version = "0.9.561"
 dependencies = [
  "auth-broker",
- "cowd-app-mfg-contract",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b)",
  "gateway",
  "runtime",
  "sandbox-launcher",
@@ -346,14 +346,14 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-adapter"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b#f4853d046e6c7932b78e58e7753de3f6b92e3b4b"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945#e0d15eca7b19a87b35b6d2fdb000d8ec5b374945"
 dependencies = [
  "axum",
  "base64",
  "chrono",
  "cowd-app-host",
- "cowd-app-mfg-contract",
- "cowd-app-mfg-core",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945)",
+ "cowd-app-mfg-core 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945)",
  "cowd-app-mfg-tui",
  "cowd-app-sdk",
  "futures",
@@ -363,6 +363,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cowd-app-mfg-contract"
+version = "0.9.562-dev"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945#e0d15eca7b19a87b35b6d2fdb000d8ec5b374945"
+dependencies = [
+ "chrono",
+ "matrix-core",
+ "schemars",
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -382,10 +395,29 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-core"
 version = "0.9.562-dev"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945#e0d15eca7b19a87b35b6d2fdb000d8ec5b374945"
+dependencies = [
+ "chrono",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945)",
+ "matrix-core",
+ "matrix-repository",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "cowd-app-mfg-core"
+version = "0.9.562-dev"
 source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b#f4853d046e6c7932b78e58e7753de3f6b92e3b4b"
 dependencies = [
  "chrono",
- "cowd-app-mfg-contract",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b)",
  "matrix-core",
  "matrix-repository",
  "rusqlite",
@@ -401,9 +433,9 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-tui"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b#f4853d046e6c7932b78e58e7753de3f6b92e3b4b"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945#e0d15eca7b19a87b35b6d2fdb000d8ec5b374945"
 dependencies = [
- "cowd-app-mfg-contract",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=e0d15eca7b19a87b35b6d2fdb000d8ec5b374945)",
  "serde",
 ]
 
@@ -841,8 +873,8 @@ dependencies = [
  "chrono",
  "connector",
  "cowd-app-host",
- "cowd-app-mfg-contract",
- "cowd-app-mfg-core",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b)",
+ "cowd-app-mfg-core 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b)",
  "cowd-app-sdk",
  "fact-kernel",
  "futures",
@@ -3235,7 +3267,7 @@ name = "tui"
 version = "0.9.561"
 dependencies = [
  "chrono",
- "cowd-app-mfg-contract",
+ "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b)",
  "crossterm",
  "futures",
  "harness-contract",
