@@ -209,10 +209,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(mfg_production_governance_handler),
         )
         .route(
-            "/api/apps/mfg/reality/compute/jobs/:id/run",
-            post(mfg_reality_compute_job_run_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/entities/upsert",
             post(mfg_reality_entity_upsert_handler),
         )
@@ -2180,22 +2176,6 @@ async fn mfg_reality_compute_job_get_handler(
         .get_compute_job(&state.config_home, &id)
         .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
         .ok_or_else(|| mfg_api_error(StatusCode::NOT_FOUND, "MFG Reality compute job not found"))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.compute.job",
-        "job": job,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_compute_job_run_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let job = state
-        .services
-        .matrix
-        .run_compute_job(&state.config_home, &id)
-        .map_err(matrix_error)?;
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.compute.job",
         "job": job,

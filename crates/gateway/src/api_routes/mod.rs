@@ -6358,6 +6358,59 @@ pub(crate) mod tests {
             assert_eq!(replay["receipt"]["status"], "replayed", "{path}");
         }
 
+        // Compute-job execution is deliberately a host effect rather than a
+        // direct external Matrix facade: this real request proves Gateway
+        // validates the APP's bound principal then performs the canonical
+        // transition, while the APP keeps the idempotent response contract.
+        let external_compute_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/compute/jobs/gateway-external-compute-plan/run")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("idempotency-key", "gateway-external-compute-run")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_compute_run.status();
+        let body = to_bytes(external_compute_run.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_compute_run: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_compute_run["kind"], "mfg.reality.compute.job");
+        assert_eq!(
+            external_compute_run["job"]["job_id"],
+            "gateway-external-compute-plan"
+        );
+        assert_eq!(external_compute_run["job"]["status"], "completed");
+        assert_eq!(external_compute_run["job"]["attempts"], 1);
+        assert!(external_compute_run["receipt"]["receipt_id"].is_string());
+
+        let external_compute_run_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/compute/jobs/gateway-external-compute-plan/run")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("idempotency-key", "gateway-external-compute-run")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_compute_run_replay.status();
+        let body = to_bytes(external_compute_run_replay.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_compute_run_replay: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_compute_run_replay["receipt"]["status"], "replayed");
+
         let external_recompute = app
             .clone()
             .oneshot(

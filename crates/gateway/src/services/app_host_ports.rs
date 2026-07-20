@@ -44,6 +44,10 @@ pub(crate) const APPROVAL_DECIDE_INTENT_V1: &str = "cowd.approval.decide.v1";
 /// Closed generic Matrix operation used by an APP that owns the user-facing
 /// projection but not the Reality Core storage authority.
 pub(crate) const REALITY_RECOMPUTE_METRICS_INTENT_V1: &str = "cowd.reality.recompute_metrics.v1";
+/// Closed Matrix compute-job transition. The APP may select only an existing
+/// job identifier; Gateway keeps the state transition and metric recompute
+/// authority behind the verified request-principal binding.
+pub(crate) const REALITY_RUN_COMPUTE_JOB_INTENT_V1: &str = "cowd.reality.run_compute_job.v1";
 
 const APP_REQUEST_PRINCIPAL_TTL: Duration = Duration::from_secs(300);
 const APP_REQUEST_PRINCIPAL_LIMIT: usize = 4096;
@@ -493,9 +497,48 @@ impl RealityPort for GatewayAppHostBinding {
                     }),
                 })
             }
+            REALITY_RUN_COMPUTE_JOB_INTENT_V1 => {
+                let request: RealityRunComputeJobIntentV1 = serde_json::from_value(intent.payload)
+                    .map_err(|error| {
+                        AppHostError::Denied(format!(
+                            "run_compute_job intent must contain only a non-empty job_id: {error}"
+                        ))
+                    })?;
+                if request.job_id.trim().is_empty() {
+                    return Err(AppHostError::Denied(
+                        "run_compute_job intent job_id must not be empty".to_string(),
+                    ));
+                }
+                let matrix = state.services.matrix.clone();
+                let config_home = state.config_home.clone();
+                let job_id = request.job_id;
+                let job = tokio::task::spawn_blocking(move || {
+                    matrix.run_compute_job(&config_home, &job_id)
+                })
+                .await
+                .map_err(|error| {
+                    AppHostError::Unavailable(format!("Reality compute-job worker failed: {error}"))
+                })?
+                .map_err(|error| AppHostError::Failed(error.to_string()))?;
+                Ok(HostReceipt {
+                    id: format!("reality:compute-job:run:{}", context.request_id),
+                    status: "completed".to_string(),
+                    replayed: false,
+                    payload: serde_json::json!({
+                        "kind": "cowd.reality.run_compute_job.receipt.v1",
+                        "job": job,
+                    }),
+                })
+            }
             _ => Err(Self::unsupported("reality", &intent.kind)),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RealityRunComputeJobIntentV1 {
+    job_id: String,
 }
 
 #[async_trait]

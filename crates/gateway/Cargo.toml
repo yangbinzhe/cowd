@@ -15,7 +15,7 @@ harness-contract = { path = "../harness-contract" }
 app-bundle-mfg = { path = "../app-bundle-mfg" }
 cowd-app-host = { path = "../app-host" }
 cowd-app-sdk = { path = "../app-sdk" }
-app-mfg-contract = { package = "cowd-app-mfg-contract", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "4794625ae7196e6348f180c4bbb4e7f79d2c4cf1" }
+app-mfg-contract = { package = "cowd-app-mfg-contract", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "b5afaa3e7ec26958fd7b0dfab0a13d8ae6b5c3de" }
 auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }
 fact-kernel = { path = "../fact-kernel" }
@@ -30,7 +30,7 @@ memory = { path = "../memory" }
 chrono = { version = "0.4", features = ["serde"] }
 connector = { path = "../connector" }
 skill = { path = "../skill/service" }
-app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "4794625ae7196e6348f180c4bbb4e7f79d2c4cf1" }
+app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "b5afaa3e7ec26958fd7b0dfab0a13d8ae6b5c3de" }
 futures = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http2"] }
