@@ -39,11 +39,9 @@ pub enum GatewayApiError {
 
 impl GatewayApiClient {
     fn authorize(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let requested_capabilities = tui_requested_capabilities().join(",");
         request = request
             .header("x-cowd-surface-id", TUI_SURFACE_ID)
-            .header("x-cowd-observer-id", &self.observer_id)
-            .header("x-cowd-requested-capabilities", requested_capabilities);
+            .header("x-cowd-observer-id", &self.observer_id);
         if let Some(token) = self
             .auth_token
             .as_deref()
@@ -2311,36 +2309,6 @@ pub(crate) fn mfg_tui_route_path(
     Ok(path)
 }
 
-fn tui_requested_capabilities() -> Vec<String> {
-    let mut capabilities = app_mfg_contract::core_profile_capabilities(
-        app_mfg_contract::MfgCoreProfileId::CoreManager,
-    )
-    .iter()
-    .map(|capability| (*capability).to_string())
-    .collect::<Vec<_>>();
-    for route in app_mfg_contract::mfg_tui_read_route_contracts() {
-        match route.capability {
-            app_mfg_contract::MfgCapabilityRequirement::One { capability } => {
-                capabilities.push(capability.as_str().to_string());
-            }
-            app_mfg_contract::MfgCapabilityRequirement::All {
-                capabilities: required,
-            } => capabilities.extend(
-                required
-                    .into_iter()
-                    .map(|capability| capability.as_str().to_string()),
-            ),
-            app_mfg_contract::MfgCapabilityRequirement::PerAction => {}
-        }
-    }
-    for action in app_mfg_contract::mfg_tui_action_contracts() {
-        capabilities.extend(action.required_capabilities);
-    }
-    capabilities.sort();
-    capabilities.dedup();
-    capabilities
-}
-
 fn append_query(mut path: String, query: &[(&str, String)]) -> String {
     let values = query
         .iter()
@@ -3274,20 +3242,11 @@ mod tests {
             .next()
             .expect("source has a production section");
         assert!(source.contains("x-cowd-surface-id"));
-        assert!(source.contains("x-cowd-requested-capabilities"));
         assert_eq!(production_source.matches(".bearer_auth(").count(), 1);
-        let capabilities = tui_requested_capabilities();
-        assert!(capabilities.windows(2).all(|pair| pair[0] < pair[1]));
-        for required in app_mfg_contract::core_profile_capabilities(
-            app_mfg_contract::MfgCoreProfileId::CoreManager,
-        ) {
-            assert!(capabilities.iter().any(|granted| granted == required));
-        }
-        for action in app_mfg_contract::mfg_tui_action_contracts() {
-            for required in action.required_capabilities {
-                assert!(capabilities.iter().any(|granted| granted == &required));
-            }
-        }
+        assert!(
+            !production_source.contains("x-cowd-requested-capabilities"),
+            "TUI must not reconstruct an APP capability union; the broker derives it from the active APP catalogue"
+        );
     }
 
     #[test]

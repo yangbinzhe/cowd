@@ -15,8 +15,8 @@ use super::capability_contract::{
 use super::route_manifest::gateway_route_manifest;
 use super::{
     authenticated_human_principal_for_surface, cookie_value, issue_web_session,
-    surface_capability_inventory, validate_surface_capability_request, web_session_principal,
-    AppState, ErrorResponse, WEB_SESSION_COOKIE,
+    validate_surface_capability_request, web_session_principal, AppState, ErrorResponse,
+    WEB_SESSION_COOKIE,
 };
 
 pub(super) fn router() -> Router<Arc<AppState>> {
@@ -134,9 +134,11 @@ async fn login_handler(
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or("legacy_gateway");
-            let allowed = surface_capability_inventory(surface_id);
             let requested_capabilities = if body.requested_capabilities.is_empty() {
-                allowed
+                // Empty means "all capabilities declared by this surface".
+                // The isolated broker resolves that from its compile-time APP
+                // catalogue; Gateway does not reconstruct APP policy.
+                Vec::new()
             } else {
                 let mut requested =
                     validate_surface_capability_request(surface_id, body.requested_capabilities)
@@ -217,7 +219,7 @@ async fn verify_handler(
                 &state.config_home,
                 auth_token,
                 "legacy_gateway",
-                surface_capability_inventory("legacy_gateway"),
+                Vec::new(),
             )
             .map_err(|error| {
                 (

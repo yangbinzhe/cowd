@@ -43,7 +43,7 @@ fn auth_profile_entry(args: &[String]) -> std::process::ExitCode {
             auth_profile_set(rest)
         }
         _ => Err(
-            "usage: cowd auth profile show | cowd auth profile set --core <profile> --mfg <profile> --expected-epoch <n> --expected-revision <n> --confirm <digest>"
+            "usage: cowd auth profile show | cowd auth profile set --core-profile <id> --apps <app=profile[,app=profile]> --expected-epoch <n> --expected-revision <n> --confirm <digest>"
                 .to_string(),
         ),
     };
@@ -76,15 +76,15 @@ fn auth_profile_set(args: &[String]) -> Result<(), String> {
     let flags = parse_exact_flags(
         args,
         &[
-            "--core",
-            "--mfg",
+            "--core-profile",
+            "--apps",
             "--expected-epoch",
             "--expected-revision",
             "--confirm",
         ],
     )?;
-    let core = flags["--core"].clone();
-    let mfg = flags["--mfg"].clone();
+    let core = flags["--core-profile"].clone();
+    let app_profiles = parse_app_profiles(&flags["--apps"])?;
     let expected_epoch = flags["--expected-epoch"]
         .parse::<u64>()
         .map_err(|_| "--expected-epoch must be an integer".to_string())?;
@@ -92,8 +92,6 @@ fn auth_profile_set(args: &[String]) -> Result<(), String> {
         .parse::<u64>()
         .map_err(|_| "--expected-revision must be an integer".to_string())?;
     let supplied_confirmation = flags["--confirm"].clone();
-    let core_profile_id = parse_core_profile(&core)?;
-    let mfg_profile_id = parse_mfg_profile(&mfg)?;
     let credential = read_credential_stdin()?;
     let client = auth_profile_client();
     let current = client
@@ -105,25 +103,14 @@ fn auth_profile_set(args: &[String]) -> Result<(), String> {
             current.credential_epoch, current.profile_revision
         ));
     }
-    let mut target = app_mfg_contract::core_profile_capabilities(core_profile_id)
-        .iter()
-        .map(|capability| (*capability).to_string())
-        .chain(
-            app_mfg_contract::mfg_profile_capabilities(mfg_profile_id)
-                .iter()
-                .map(|capability| capability.as_str().to_string()),
-        )
-        .collect::<Vec<_>>();
-    target.sort();
-    target.dedup();
-    let expected_confirmation = auth_broker::entitlement_confirmation_digest(
-        expected_epoch,
-        expected_revision,
-        core_profile_id,
-        mfg_profile_id,
-        &target,
-    );
-    let added = target
+    // The broker is the single authority for an APP profile's actual
+    // capability union. Preview and mutation therefore share one catalogue
+    // and one conflict token; CLI never reconstructs product capabilities.
+    let (preview, expected_confirmation) = client
+        .preview_human_entitlements(&credential, core.clone(), app_profiles.clone())
+        .map_err(|error| error.to_string())?;
+    let added = preview
+        .ceiling
         .iter()
         .filter(|capability| !current.ceiling.contains(*capability))
         .cloned()
@@ -131,13 +118,14 @@ fn auth_profile_set(args: &[String]) -> Result<(), String> {
     let removed = current
         .ceiling
         .iter()
-        .filter(|capability| !target.contains(*capability))
+        .filter(|capability| !preview.ceiling.contains(*capability))
         .cloned()
         .collect::<Vec<_>>();
     eprintln!(
-        "profile diff: core={core} mfg={mfg} add={} remove={} confirmation={expected_confirmation}",
+        "profile preview: core={core} apps={} add={} remove={} confirmation={expected_confirmation}",
+        flags["--apps"],
         added.join(","),
-        removed.join(",")
+        removed.join(","),
     );
     if supplied_confirmation != expected_confirmation {
         return Err(
@@ -149,8 +137,8 @@ fn auth_profile_set(args: &[String]) -> Result<(), String> {
             &credential,
             expected_epoch,
             expected_revision,
-            core_profile_id,
-            mfg_profile_id,
+            core,
+            app_profiles,
             supplied_confirmation,
         )
         .map_err(|error| error.to_string())?;
@@ -220,23 +208,25 @@ fn parse_exact_flags(
     Ok(parsed)
 }
 
-fn parse_core_profile(value: &str) -> Result<app_mfg_contract::MfgCoreProfileId, String> {
-    match value {
-        "core_legacy_0_9_530" => Ok(app_mfg_contract::MfgCoreProfileId::CoreLegacy09530),
-        "core_manager" => Ok(app_mfg_contract::MfgCoreProfileId::CoreManager),
-        _ => Err(format!("unknown core profile {value}")),
+fn parse_app_profiles(value: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut profiles = std::collections::BTreeMap::new();
+    for entry in value.split(',') {
+        let (app_id, profile_id) = entry
+            .split_once('=')
+            .ok_or_else(|| "--apps entries must use app=profile".to_string())?;
+        if app_id.trim().is_empty()
+            || profile_id.trim().is_empty()
+            || profiles
+                .insert(app_id.trim().to_string(), profile_id.trim().to_string())
+                .is_some()
+        {
+            return Err("--apps must contain unique non-empty app=profile entries".to_string());
+        }
     }
-}
-
-fn parse_mfg_profile(value: &str) -> Result<app_mfg_contract::MfgProfileId, String> {
-    match value {
-        "mfg_viewer" => Ok(app_mfg_contract::MfgProfileId::MfgViewer),
-        "mfg_legacy_0_9_529" => Ok(app_mfg_contract::MfgProfileId::MfgLegacy09529),
-        "mfg_operator" => Ok(app_mfg_contract::MfgProfileId::MfgOperator),
-        "mfg_reviewer" => Ok(app_mfg_contract::MfgProfileId::MfgReviewer),
-        "mfg_manager" => Ok(app_mfg_contract::MfgProfileId::MfgManager),
-        _ => Err(format!("unknown MFG profile {value}")),
+    if profiles.is_empty() {
+        return Err("--apps must contain at least one app=profile entry".to_string());
     }
+    Ok(profiles)
 }
 
 #[cfg(feature = "tui-surface")]
@@ -295,28 +285,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auth_profile_flags_accept_only_closed_profile_catalogs() {
-        assert_eq!(
-            parse_core_profile("core_manager").unwrap(),
-            app_mfg_contract::MfgCoreProfileId::CoreManager
-        );
-        assert_eq!(
-            parse_mfg_profile("mfg_reviewer").unwrap(),
-            app_mfg_contract::MfgProfileId::MfgReviewer
-        );
-        assert!(parse_core_profile("arbitrary").is_err());
-        assert!(parse_mfg_profile("mfg_arbitrary").is_err());
+    fn auth_profile_flags_accept_generic_app_profile_selections() {
         let args = vec![
-            "--core".to_string(),
+            "--core-profile".to_string(),
             "core_manager".to_string(),
-            "--mfg".to_string(),
-            "mfg_manager".to_string(),
+            "--apps".to_string(),
+            "mfg=mfg_manager,developer=developer".to_string(),
         ];
         assert!(parse_exact_flags(
             &args,
             &[
-                "--core",
-                "--mfg",
+                "--core-profile",
+                "--apps",
                 "--expected-epoch",
                 "--expected-revision",
                 "--confirm"
@@ -324,10 +304,10 @@ mod tests {
         )
         .is_err());
         let complete = vec![
-            "--core".to_string(),
+            "--core-profile".to_string(),
             "core_manager".to_string(),
-            "--mfg".to_string(),
-            "mfg_manager".to_string(),
+            "--apps".to_string(),
+            "mfg=mfg_manager,developer=developer".to_string(),
             "--expected-epoch".to_string(),
             "1".to_string(),
             "--expected-revision".to_string(),
@@ -339,36 +319,32 @@ mod tests {
             parse_exact_flags(
                 &complete,
                 &[
-                    "--core",
-                    "--mfg",
+                    "--core-profile",
+                    "--apps",
                     "--expected-epoch",
                     "--expected-revision",
                     "--confirm"
                 ]
             )
-            .unwrap()["--mfg"],
-            "mfg_manager"
+            .unwrap()["--apps"],
+            "mfg=mfg_manager,developer=developer"
         );
-        let mut duplicate = complete.clone();
-        duplicate.extend(["--mfg".to_string(), "mfg_viewer".to_string()]);
-        assert!(parse_exact_flags(
-            &duplicate,
-            &[
-                "--core",
-                "--mfg",
-                "--expected-epoch",
-                "--expected-revision",
-                "--confirm"
-            ]
-        )
-        .is_err());
+        assert_eq!(
+            parse_app_profiles("mfg=mfg_manager,developer=developer").unwrap(),
+            std::collections::BTreeMap::from([
+                ("developer".to_string(), "developer".to_string()),
+                ("mfg".to_string(), "mfg_manager".to_string()),
+            ])
+        );
+        assert!(parse_app_profiles("mfg=mfg_viewer,mfg=mfg_manager").is_err());
+        assert!(parse_app_profiles("missing-separator").is_err());
         let mut unknown = complete;
-        unknown.extend(["--capability".to_string(), "mfg.read".to_string()]);
+        unknown.extend(["--capability".to_string(), "app.read".to_string()]);
         assert!(parse_exact_flags(
             &unknown,
             &[
-                "--core",
-                "--mfg",
+                "--core-profile",
+                "--apps",
                 "--expected-epoch",
                 "--expected-revision",
                 "--confirm"

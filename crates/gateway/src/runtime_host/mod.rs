@@ -81,11 +81,18 @@ struct AuthBrokerProcess {
 }
 
 impl AuthBrokerProcess {
-    fn start(config_home: &Path, credential: &str) -> Result<Self, String> {
+    fn start(
+        config_home: &Path,
+        credential: &str,
+        catalog: &auth_broker::AuthorizationCatalog,
+    ) -> Result<Self, String> {
         let root = config_home.join("auth-broker");
         std::fs::create_dir_all(&root)
             .map_err(|error| format!("failed to create auth broker root: {error}"))?;
         let socket_path = auth_broker::BrokerClient::default_socket(&root);
+        let catalog_path = auth_broker::catalog_file(&root);
+        auth_broker::write_catalog(&catalog_path, catalog)
+            .map_err(|error| format!("failed to write auth broker profile catalogue: {error}"))?;
         if socket_path.exists() {
             std::fs::remove_file(&socket_path)
                 .map_err(|error| format!("failed to remove stale auth broker socket: {error}"))?;
@@ -97,6 +104,8 @@ impl AuthBrokerProcess {
             .arg(&root)
             .arg("--socket")
             .arg(&socket_path)
+            .arg("--catalog")
+            .arg(&catalog_path)
             .arg("--credential-stdin")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -696,10 +705,21 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
+    // Build the immutable product APP catalogue before the isolated broker is
+    // started. The broker sees only these generic descriptors, never MFG
+    // types or a Gateway service handle.
+    let app_registry = crate::services::broker_backed_app_registry(&approval_dir);
+    let auth_catalog = auth_broker::AuthorizationCatalog::from_app_descriptors(
+        app_registry
+            .apps()
+            .into_iter()
+            .map(|registered| registered.descriptor),
+    )
+    .map_err(|error| format!("failed to compose auth profile catalogue: {error}"))?;
     let mut auth_broker = config
         .auth_token
         .as_deref()
-        .map(|credential| AuthBrokerProcess::start(&approval_dir, credential))
+        .map(|credential| AuthBrokerProcess::start(&approval_dir, credential, &auth_catalog))
         .transpose()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let config_load =
@@ -953,7 +973,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             &approval_dir,
             capacity_config,
         )
-        .with_app_registry(crate::services::broker_backed_app_registry(&approval_dir)),
+        .with_app_registry(app_registry),
     );
     let _cleanup_handle =
         spawn_session_cleanup_task(Arc::clone(&session_manager), Duration::from_secs(300));

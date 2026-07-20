@@ -89,7 +89,7 @@ name = "auth-broker"
 version = "0.9.561"
 dependencies = [
  "base64",
- "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b)",
+ "cowd-app-sdk",
  "harness-contract",
  "ring",
  "rustix 1.1.4",
@@ -287,7 +287,6 @@ name = "cli"
 version = "0.9.561"
 dependencies = [
  "auth-broker",
- "cowd-app-mfg-contract 0.9.562-dev (git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b)",
  "gateway",
  "runtime",
  "sandbox-launcher",

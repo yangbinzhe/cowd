@@ -5,6 +5,7 @@
 //! principal kind, capabilities, or assurance encoded in a signed result.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -12,11 +13,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use app_mfg_contract::{
-    core_profile_capabilities, mfg_profile_capabilities, MfgCoreProfileId,
-    MfgEntitlementProjectionV2, MfgProfileId,
-};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use cowd_app_sdk::AppDescriptor;
 use harness_contract::security::{
     DecisionLeaseClaims, PrincipalAssurance, PrincipalClaims, PrincipalKind, SignedDecisionLease,
     SignedPrincipalEnvelope,
@@ -30,14 +28,14 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 const KEY_FILE: &str = "authority.pk8";
-const LEGACY_CREDENTIAL_FILE: &str = "human-credential.sha256";
 const CREDENTIAL_STATE_FILE: &str = "credential-state.json";
 const ENTITLEMENT_AUDIT_FILE: &str = "entitlement-audit.jsonl";
-const CREDENTIAL_STATE_VERSION: u32 = 2;
+const CREDENTIAL_STATE_VERSION: u32 = 3;
+const CATALOG_FILE: &str = "profile-catalog.json";
 const KEY_ID: &str = "cowd-local-ed25519-v1";
 const SOCKET_FILE: &str = "broker.sock";
 
-const HUMAN_CAPABILITIES: &[&str] = &[
+const CORE_HUMAN_CAPABILITIES: &[&str] = &[
     "approval.respond",
     "definition.manage",
     "definition.default.set",
@@ -45,22 +43,248 @@ const HUMAN_CAPABILITIES: &[&str] = &[
     "evolution.release.manage",
     "runtime.maintenance.manage",
     "runtime.outbox.retry",
-    "mfg.read",
-    "mfg.incident.operate",
-    "mfg.playbook.manage",
-    "mfg.alert.respond",
-    "mfg.alert.manage",
-    "mfg.assignment.manage",
-    "mfg.assignment.lifecycle",
-    "mfg.execution.operate",
-    "mfg.execution.feedback",
-    "mfg.report.generate",
-    "mfg.report.deliver",
-    "mfg.report.review",
-    "mfg.skill.run",
-    "mfg.cockpit.manage",
-    "mfg.data.manage",
 ];
+
+/// Stable, product-neutral authorization catalogue. Product composition builds
+/// this from the APP descriptors linked into the current Cowd binary; the
+/// broker therefore never imports an APP contract or knows an APP's enum.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuthorizationCatalog {
+    pub schema_version: u32,
+    pub core_profiles: Vec<AuthorizationProfile>,
+    pub apps: Vec<AuthorizationAppProfileCatalog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuthorizationProfile {
+    pub id: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AuthorizationAppProfileCatalog {
+    pub app_id: String,
+    pub default_profile_id: String,
+    pub profiles: Vec<AuthorizationProfile>,
+    #[serde(default)]
+    pub surface_capabilities: BTreeMap<String, Vec<String>>,
+}
+
+/// Product-neutral projection returned to CLI, WebUI and TUI. APP selections
+/// are key/value identifiers instead of product-specific Rust enums.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HumanEntitlementProjection {
+    pub core_profile_id: String,
+    #[serde(default)]
+    pub app_profiles: BTreeMap<String, String>,
+    pub profile_revision: u64,
+    pub credential_epoch: u64,
+    pub ceiling: Vec<String>,
+    pub granted: Vec<String>,
+    pub denied: Vec<String>,
+}
+
+impl AuthorizationCatalog {
+    /// Compose the generic catalogue from already validated APP descriptors.
+    pub fn from_app_descriptors(
+        descriptors: impl IntoIterator<Item = AppDescriptor>,
+    ) -> Result<Self, AuthBrokerError> {
+        let mut apps = descriptors
+            .into_iter()
+            .filter_map(|descriptor| {
+                descriptor
+                    .profile
+                    .map(|profile| AuthorizationAppProfileCatalog {
+                        app_id: descriptor.id.as_str().to_string(),
+                        default_profile_id: profile.default_profile_id,
+                        profiles: profile
+                            .profiles
+                            .into_iter()
+                            .map(|profile| AuthorizationProfile {
+                                id: profile.id,
+                                capabilities: profile.capabilities,
+                            })
+                            .collect(),
+                        surface_capabilities: profile.surface_capabilities,
+                    })
+            })
+            .collect::<Vec<_>>();
+        apps.sort_by(|left, right| left.app_id.cmp(&right.app_id));
+        let catalog = Self {
+            schema_version: 1,
+            core_profiles: vec![
+                AuthorizationProfile {
+                    id: "core_operator".to_string(),
+                    capabilities: vec!["approval.respond".to_string()],
+                },
+                AuthorizationProfile {
+                    id: "core_manager".to_string(),
+                    capabilities: CORE_HUMAN_CAPABILITIES
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect(),
+                },
+            ],
+            apps,
+        };
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    #[must_use]
+    pub fn default_selection(&self) -> (String, BTreeMap<String, String>) {
+        let apps = self
+            .apps
+            .iter()
+            .map(|app| (app.app_id.clone(), app.default_profile_id.clone()))
+            .collect();
+        ("core_operator".to_string(), apps)
+    }
+
+    pub fn capabilities_for(
+        &self,
+        core_profile_id: &str,
+        app_profiles: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>, AuthBrokerError> {
+        let core = self
+            .core_profiles
+            .iter()
+            .find(|profile| profile.id == core_profile_id)
+            .ok_or_else(|| {
+                AuthBrokerError::InvalidCredentialState(format!(
+                    "unknown core profile {core_profile_id}"
+                ))
+            })?;
+        if self.apps.len() != app_profiles.len()
+            || self
+                .apps
+                .iter()
+                .any(|app| !app_profiles.contains_key(&app.app_id))
+        {
+            return Err(AuthBrokerError::InvalidCredentialState(
+                "app profile selection does not match the active APP catalogue".to_string(),
+            ));
+        }
+        let mut capabilities = core.capabilities.clone();
+        for app in &self.apps {
+            let profile_id = app_profiles
+                .get(&app.app_id)
+                .expect("validated app selection");
+            let profile = app
+                .profiles
+                .iter()
+                .find(|profile| profile.id == *profile_id)
+                .ok_or_else(|| {
+                    AuthBrokerError::InvalidCredentialState(format!(
+                        "unknown profile {profile_id} for app {}",
+                        app.app_id
+                    ))
+                })?;
+            capabilities.extend(profile.capabilities.clone());
+        }
+        capabilities.sort();
+        capabilities.dedup();
+        Ok(capabilities)
+    }
+
+    pub fn surface_capabilities(&self, surface_id: &str) -> Vec<String> {
+        let normalized_surface = if surface_id == "legacy_gateway" {
+            "backend"
+        } else {
+            surface_id
+        };
+        let mut capabilities = CORE_HUMAN_CAPABILITIES
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect::<Vec<_>>();
+        for app in &self.apps {
+            capabilities.extend(
+                app.surface_capabilities
+                    .get(normalized_surface)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
+        capabilities.sort();
+        capabilities.dedup();
+        capabilities
+    }
+
+    pub fn digest(&self) -> Result<String, AuthBrokerError> {
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| AuthBrokerError::Serialization(error.to_string()))?;
+        let value = digest::digest(&digest::SHA256, &encoded);
+        Ok(format!("sha256:{}", hex(value.as_ref())))
+    }
+
+    pub fn validate(&self) -> Result<(), AuthBrokerError> {
+        if self.schema_version != 1 || self.core_profiles.is_empty() {
+            return Err(AuthBrokerError::InvalidCredentialState(
+                "authorization catalogue schema is invalid".to_string(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for profile in &self.core_profiles {
+            validate_catalog_profile("core", profile, &mut ids)?;
+        }
+        if !ids.contains("core_operator") || !ids.contains("core_manager") {
+            return Err(AuthBrokerError::InvalidCredentialState(
+                "authorization catalogue lacks required core profiles".to_string(),
+            ));
+        }
+        let mut app_ids = BTreeSet::new();
+        for app in &self.apps {
+            if app.app_id.trim().is_empty() || !app_ids.insert(app.app_id.clone()) {
+                return Err(AuthBrokerError::InvalidCredentialState(
+                    "authorization catalogue has duplicate or empty APP ids".to_string(),
+                ));
+            }
+            let mut profile_ids = BTreeSet::new();
+            for profile in &app.profiles {
+                validate_catalog_profile(&app.app_id, profile, &mut profile_ids)?;
+            }
+            if !profile_ids.contains(&app.default_profile_id) {
+                return Err(AuthBrokerError::InvalidCredentialState(format!(
+                    "APP {} has no valid default profile",
+                    app.app_id
+                )));
+            }
+            for capabilities in app.surface_capabilities.values() {
+                if capabilities
+                    .iter()
+                    .any(|capability| capability.trim().is_empty())
+                {
+                    return Err(AuthBrokerError::InvalidCredentialState(format!(
+                        "APP {} has an invalid surface capability",
+                        app.app_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_catalog_profile(
+    owner: &str,
+    profile: &AuthorizationProfile,
+    ids: &mut BTreeSet<String>,
+) -> Result<(), AuthBrokerError> {
+    if profile.id.trim().is_empty()
+        || !ids.insert(profile.id.clone())
+        || profile
+            .capabilities
+            .iter()
+            .any(|capability| capability.trim().is_empty())
+    {
+        return Err(AuthBrokerError::InvalidCredentialState(format!(
+            "{owner} profile catalogue is invalid"
+        )));
+    }
+    Ok(())
+}
 
 /// 运行 Cowd 单文件架构中的认证子进程角色。
 ///
@@ -70,16 +294,18 @@ const HUMAN_CAPABILITIES: &[&str] = &[
 pub fn internal_process_entry(args: &[String]) -> ExitCode {
     let mut root = None;
     let mut socket = None;
+    let mut catalog = None;
     let mut credential_stdin = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--root" => root = args.next().map(PathBuf::from),
             "--socket" => socket = args.next().map(PathBuf::from),
+            "--catalog" => catalog = args.next().map(PathBuf::from),
             "--credential-stdin" => credential_stdin = true,
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: cowd __cowd_internal auth-broker --root <dir> --socket <path> --credential-stdin"
+                    "usage: cowd __cowd_internal auth-broker --root <dir> --socket <path> --catalog <path> --credential-stdin"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -89,8 +315,8 @@ pub fn internal_process_entry(args: &[String]) -> ExitCode {
             }
         }
     }
-    let (Some(root), Some(socket)) = (root, socket) else {
-        eprintln!("--root and --socket are required");
+    let (Some(root), Some(socket), Some(catalog)) = (root, socket, catalog) else {
+        eprintln!("--root, --socket and --catalog are required");
         return ExitCode::from(64);
     };
     if !credential_stdin {
@@ -102,7 +328,14 @@ pub fn internal_process_entry(args: &[String]) -> ExitCode {
         eprintln!("a non-empty enrollment credential is required on stdin");
         return ExitCode::from(64);
     }
-    match serve_local(root, credential.trim(), socket) {
+    let catalog = match read_catalog(&catalog) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            eprintln!("auth broker catalogue failed: {error}");
+            return ExitCode::from(64);
+        }
+    };
+    match serve_local(root, credential.trim(), socket, catalog) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("auth broker failed: {error}");
@@ -168,7 +401,7 @@ const fn default_profile_revision() -> u64 {
 pub struct HumanAuthenticationResult {
     pub public_key_base64: String,
     pub envelope: SignedPrincipalEnvelope,
-    pub entitlement: MfgEntitlementProjectionV2,
+    pub entitlement: HumanEntitlementProjection,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -194,12 +427,19 @@ pub enum BrokerRequest {
     GetHumanEntitlements {
         credential: String,
     },
+    PreviewHumanEntitlements {
+        credential: String,
+        core_profile_id: String,
+        #[serde(default)]
+        app_profiles: BTreeMap<String, String>,
+    },
     SetHumanEntitlements {
         credential: String,
         expected_credential_epoch: u64,
         expected_profile_revision: u64,
-        core_profile_id: MfgCoreProfileId,
-        mfg_profile_id: MfgProfileId,
+        core_profile_id: String,
+        #[serde(default)]
+        app_profiles: BTreeMap<String, String>,
         confirmation_digest: String,
     },
     RotateCredential {
@@ -222,7 +462,7 @@ pub enum BrokerResponse {
     Principal {
         public_key_base64: String,
         envelope: SignedPrincipalEnvelope,
-        entitlement: MfgEntitlementProjectionV2,
+        entitlement: HumanEntitlementProjection,
     },
     DecisionLease {
         public_key_base64: String,
@@ -232,7 +472,11 @@ pub enum BrokerResponse {
         lifecycle: CredentialLifecycleMetadata,
     },
     HumanEntitlements {
-        entitlement: MfgEntitlementProjectionV2,
+        entitlement: HumanEntitlementProjection,
+    },
+    HumanEntitlementPreview {
+        entitlement: HumanEntitlementProjection,
+        confirmation_digest: String,
     },
     TrustMetadata {
         key_id: String,
@@ -312,7 +556,7 @@ impl BrokerClient {
     pub fn human_entitlements(
         &self,
         credential: &str,
-    ) -> Result<MfgEntitlementProjectionV2, AuthBrokerError> {
+    ) -> Result<HumanEntitlementProjection, AuthBrokerError> {
         match self.request(BrokerRequest::GetHumanEntitlements {
             credential: credential.to_string(),
         })? {
@@ -324,25 +568,46 @@ impl BrokerClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn set_human_entitlements(
         &self,
         credential: &str,
         expected_credential_epoch: u64,
         expected_profile_revision: u64,
-        core_profile_id: MfgCoreProfileId,
-        mfg_profile_id: MfgProfileId,
+        core_profile_id: impl Into<String>,
+        app_profiles: BTreeMap<String, String>,
         confirmation_digest: String,
-    ) -> Result<MfgEntitlementProjectionV2, AuthBrokerError> {
+    ) -> Result<HumanEntitlementProjection, AuthBrokerError> {
         match self.request(BrokerRequest::SetHumanEntitlements {
             credential: credential.to_string(),
             expected_credential_epoch,
             expected_profile_revision,
-            core_profile_id,
-            mfg_profile_id,
+            core_profile_id: core_profile_id.into(),
+            app_profiles,
             confirmation_digest,
         })? {
             BrokerResponse::HumanEntitlements { entitlement } => Ok(entitlement),
+            BrokerResponse::Error { message, .. } => Err(AuthBrokerError::Protocol(message)),
+            _ => Err(AuthBrokerError::Protocol(
+                "broker returned an unexpected response".to_string(),
+            )),
+        }
+    }
+
+    pub fn preview_human_entitlements(
+        &self,
+        credential: &str,
+        core_profile_id: impl Into<String>,
+        app_profiles: BTreeMap<String, String>,
+    ) -> Result<(HumanEntitlementProjection, String), AuthBrokerError> {
+        match self.request(BrokerRequest::PreviewHumanEntitlements {
+            credential: credential.to_string(),
+            core_profile_id: core_profile_id.into(),
+            app_profiles,
+        })? {
+            BrokerResponse::HumanEntitlementPreview {
+                entitlement,
+                confirmation_digest,
+            } => Ok((entitlement, confirmation_digest)),
             BrokerResponse::Error { message, .. } => Err(AuthBrokerError::Protocol(message)),
             _ => Err(AuthBrokerError::Protocol(
                 "broker returned an unexpected response".to_string(),
@@ -496,8 +761,10 @@ struct PersistedCredentialState {
     status: CredentialLifecycleStatus,
     enrolled_at_ms: u64,
     updated_at_ms: u64,
-    core_profile_id: MfgCoreProfileId,
-    mfg_profile_id: MfgProfileId,
+    catalog_digest: String,
+    core_profile_id: String,
+    #[serde(default)]
+    app_profiles: BTreeMap<String, String>,
     profile_revision: u64,
     entitled_capabilities: Vec<String>,
     entitlement_updated_at_ms: u64,
@@ -506,21 +773,12 @@ struct PersistedCredentialState {
     last_audit_ref: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedCredentialStateV1 {
-    version: u32,
-    credential_digest: String,
-    credential_epoch: u64,
-    status: CredentialLifecycleStatus,
-    enrolled_at_ms: u64,
-    updated_at_ms: u64,
-}
-
 impl PersistedCredentialState {
-    fn enroll(credential: &str) -> Result<Self, AuthBrokerError> {
+    fn enroll(credential: &str, catalog: &AuthorizationCatalog) -> Result<Self, AuthBrokerError> {
         validate_credential_input(credential)?;
         let now = now_ms();
+        let (core_profile_id, app_profiles) = catalog.default_selection();
+        let entitled_capabilities = catalog.capabilities_for(&core_profile_id, &app_profiles)?;
         Ok(Self {
             version: CREDENTIAL_STATE_VERSION,
             credential_digest: hex(&credential_digest(credential)),
@@ -528,65 +786,13 @@ impl PersistedCredentialState {
             status: CredentialLifecycleStatus::Active,
             enrolled_at_ms: now,
             updated_at_ms: now,
-            core_profile_id: MfgCoreProfileId::CoreLegacy09530,
-            mfg_profile_id: MfgProfileId::MfgViewer,
+            catalog_digest: catalog.digest()?,
+            core_profile_id,
+            app_profiles,
             profile_revision: 1,
-            entitled_capabilities: entitlement_union(
-                MfgCoreProfileId::CoreLegacy09530,
-                MfgProfileId::MfgViewer,
-            ),
+            entitled_capabilities,
             entitlement_updated_at_ms: now,
             entitlement_updated_by: "initial_enrollment".to_string(),
-            last_audit_ref: None,
-        })
-    }
-
-    fn from_legacy_digest(credential_digest: [u8; digest::SHA256_OUTPUT_LEN]) -> Self {
-        let now = now_ms();
-        Self {
-            version: CREDENTIAL_STATE_VERSION,
-            credential_digest: hex(&credential_digest),
-            credential_epoch: 1,
-            status: CredentialLifecycleStatus::Active,
-            enrolled_at_ms: now,
-            updated_at_ms: now,
-            core_profile_id: MfgCoreProfileId::CoreLegacy09530,
-            mfg_profile_id: MfgProfileId::MfgLegacy09529,
-            profile_revision: 1,
-            entitled_capabilities: entitlement_union(
-                MfgCoreProfileId::CoreLegacy09530,
-                MfgProfileId::MfgLegacy09529,
-            ),
-            entitlement_updated_at_ms: now,
-            entitlement_updated_by: "legacy_digest_migration".to_string(),
-            last_audit_ref: None,
-        }
-    }
-
-    fn from_v1(state: PersistedCredentialStateV1) -> Result<Self, AuthBrokerError> {
-        if state.version != 1 {
-            return Err(AuthBrokerError::InvalidCredentialState(format!(
-                "expected v1 credential state, found {}",
-                state.version
-            )));
-        }
-        let migrated_at = now_ms().max(state.updated_at_ms);
-        Ok(Self {
-            version: CREDENTIAL_STATE_VERSION,
-            credential_digest: state.credential_digest,
-            credential_epoch: state.credential_epoch,
-            status: state.status,
-            enrolled_at_ms: state.enrolled_at_ms,
-            updated_at_ms: migrated_at,
-            core_profile_id: MfgCoreProfileId::CoreLegacy09530,
-            mfg_profile_id: MfgProfileId::MfgLegacy09529,
-            profile_revision: 1,
-            entitled_capabilities: entitlement_union(
-                MfgCoreProfileId::CoreLegacy09530,
-                MfgProfileId::MfgLegacy09529,
-            ),
-            entitlement_updated_at_ms: migrated_at,
-            entitlement_updated_by: "credential_state_v1_migration".to_string(),
             last_audit_ref: None,
         })
     }
@@ -605,7 +811,7 @@ impl PersistedCredentialState {
         }
     }
 
-    fn validate(&self) -> Result<(), AuthBrokerError> {
+    fn validate(&self, catalog: &AuthorizationCatalog) -> Result<(), AuthBrokerError> {
         if self.version != CREDENTIAL_STATE_VERSION {
             return Err(AuthBrokerError::InvalidCredentialState(format!(
                 "unsupported credential state version {}",
@@ -630,7 +836,12 @@ impl PersistedCredentialState {
                 "entitlement metadata is invalid".to_string(),
             ));
         }
-        let expected = entitlement_union(self.core_profile_id, self.mfg_profile_id);
+        if self.catalog_digest != catalog.digest()? {
+            return Err(AuthBrokerError::InvalidCredentialState(
+                "credential state catalogue digest does not match the running product".to_string(),
+            ));
+        }
+        let expected = catalog.capabilities_for(&self.core_profile_id, &self.app_profiles)?;
         if self.entitled_capabilities != expected {
             return Err(AuthBrokerError::InvalidCredentialState(
                 "entitled capabilities do not match the selected profiles".to_string(),
@@ -652,8 +863,10 @@ impl PersistedCredentialState {
     fn entitlement_projection(
         &self,
         requested: &[String],
-    ) -> Result<MfgEntitlementProjectionV2, AuthBrokerError> {
-        let requested = validated_human_capabilities(requested.to_vec())?;
+        catalog: &AuthorizationCatalog,
+    ) -> Result<HumanEntitlementProjection, AuthBrokerError> {
+        let requested =
+            validated_surface_capabilities(catalog, "legacy_gateway", requested.to_vec())?;
         let granted = requested
             .iter()
             .filter(|capability| self.entitled_capabilities.contains(*capability))
@@ -663,15 +876,63 @@ impl PersistedCredentialState {
             .into_iter()
             .filter(|capability| !granted.contains(capability))
             .collect::<Vec<_>>();
-        Ok(MfgEntitlementProjectionV2 {
-            core_profile_id: self.core_profile_id,
-            mfg_profile_id: self.mfg_profile_id,
+        Ok(HumanEntitlementProjection {
+            core_profile_id: self.core_profile_id.clone(),
+            app_profiles: self.app_profiles.clone(),
             profile_revision: self.profile_revision,
             credential_epoch: self.credential_epoch,
             ceiling: self.entitled_capabilities.clone(),
             granted,
             denied,
         })
+    }
+
+    /// A new product build may add an APP or change its profile capabilities.
+    /// Reconcile only with the compile-time catalogue, then invalidate every
+    /// previously issued envelope by advancing both revisions atomically.
+    fn reconcile_catalog(
+        &mut self,
+        catalog: &AuthorizationCatalog,
+    ) -> Result<bool, AuthBrokerError> {
+        let catalog_digest = catalog.digest()?;
+        if self.catalog_digest == catalog_digest {
+            return Ok(false);
+        }
+        if !catalog
+            .core_profiles
+            .iter()
+            .any(|profile| profile.id == self.core_profile_id)
+        {
+            return Err(AuthBrokerError::InvalidCredentialState(
+                "selected core profile is unavailable in the running product".to_string(),
+            ));
+        }
+        self.app_profiles
+            .retain(|app_id, _| catalog.apps.iter().any(|app| &app.app_id == app_id));
+        for app in &catalog.apps {
+            let profile_valid = self
+                .app_profiles
+                .get(&app.app_id)
+                .is_some_and(|profile_id| {
+                    app.profiles.iter().any(|profile| profile.id == *profile_id)
+                });
+            if !profile_valid {
+                self.app_profiles
+                    .insert(app.app_id.clone(), app.default_profile_id.clone());
+            }
+        }
+        self.catalog_digest = catalog_digest;
+        self.entitled_capabilities =
+            catalog.capabilities_for(&self.core_profile_id, &self.app_profiles)?;
+        self.profile_revision = self.profile_revision.checked_add(1).ok_or_else(|| {
+            AuthBrokerError::InvalidCredentialState(
+                "profile revision cannot be advanced further".to_string(),
+            )
+        })?;
+        self.entitlement_updated_at_ms = now_ms().max(self.updated_at_ms);
+        self.entitlement_updated_by = "compiled_app_catalogue_reconciliation".to_string();
+        self.advance_epoch()?;
+        Ok(true)
     }
 }
 
@@ -680,41 +941,43 @@ struct LocalAuthority {
     credential_state: PersistedCredentialState,
     credential_state_path: PathBuf,
     entitlement_audit_path: PathBuf,
+    catalog: AuthorizationCatalog,
 }
 
 impl LocalAuthority {
     pub fn open_or_initialize(
         root: impl AsRef<Path>,
         human_credential: &str,
+        catalog: AuthorizationCatalog,
     ) -> Result<Self, AuthBrokerError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(storage_error)?;
         validate_credential_input(human_credential)?;
+        catalog.validate()?;
         let credential_state_path = root.join(CREDENTIAL_STATE_FILE);
         let entitlement_audit_path = root.join(ENTITLEMENT_AUDIT_FILE);
-        let legacy_credential_path = root.join(LEGACY_CREDENTIAL_FILE);
-        let credential_state = if credential_state_path.exists() {
-            read_credential_state(&credential_state_path)?
-        } else if legacy_credential_path.exists() {
-            let digest = decode_digest(
-                &fs::read_to_string(&legacy_credential_path).map_err(storage_error)?,
-            )?;
-            let state = PersistedCredentialState::from_legacy_digest(digest);
-            persist_credential_state(&credential_state_path, &state)?;
-            fs::remove_file(&legacy_credential_path).map_err(storage_error)?;
-            state
+        if root.join("human-credential.sha256").exists() {
+            return Err(AuthBrokerError::InvalidCredentialState(
+                "legacy credential state is unsupported; remove it and enroll again".to_string(),
+            ));
+        }
+        let mut credential_state = if credential_state_path.exists() {
+            read_credential_state(&credential_state_path, &catalog)?
         } else {
             // Enrollment is intentionally only possible while no lifecycle
             // state exists.  Subsequent broker starts recover this state and
             // must present the registered credential.
-            let state = PersistedCredentialState::enroll(human_credential)?;
-            persist_credential_state(&credential_state_path, &state)?;
+            let state = PersistedCredentialState::enroll(human_credential, &catalog)?;
+            persist_credential_state(&credential_state_path, &state, &catalog)?;
             state
         };
         let expected = credential_state.digest()?;
         let supplied = credential_digest(human_credential);
         if !bool::from(expected.ct_eq(&supplied)) {
             return Err(AuthBrokerError::InvalidCredential);
+        }
+        if credential_state.reconcile_catalog(&catalog)? {
+            persist_credential_state(&credential_state_path, &credential_state, &catalog)?;
         }
         let key_path = root.join(KEY_FILE);
         let key_material = if key_path.exists() {
@@ -732,6 +995,7 @@ impl LocalAuthority {
             credential_state,
             credential_state_path,
             entitlement_audit_path,
+            catalog,
         })
     }
 
@@ -740,33 +1004,22 @@ impl LocalAuthority {
         BASE64.encode(self.key_pair.public_key().as_ref())
     }
 
-    pub fn issue_human_principal(
-        &self,
-        human_credential: &str,
-        requested_capabilities: Vec<String>,
-        ttl_ms: Option<u64>,
-    ) -> Result<(SignedPrincipalEnvelope, MfgEntitlementProjectionV2), AuthBrokerError> {
-        self.issue_human_principal_for_surface(
-            human_credential,
-            "legacy_gateway",
-            requested_capabilities,
-            ttl_ms,
-        )
-    }
-
     pub fn issue_human_principal_for_surface(
         &self,
         human_credential: &str,
         surface_id: &str,
         requested_capabilities: Vec<String>,
         ttl_ms: Option<u64>,
-    ) -> Result<(SignedPrincipalEnvelope, MfgEntitlementProjectionV2), AuthBrokerError> {
+    ) -> Result<(SignedPrincipalEnvelope, HumanEntitlementProjection), AuthBrokerError> {
         self.verify_active_credential(human_credential)?;
-        let requested_capabilities =
-            validated_surface_capabilities(surface_id, requested_capabilities)?;
+        let requested_capabilities = if requested_capabilities.is_empty() {
+            self.catalog.surface_capabilities(surface_id)
+        } else {
+            validated_surface_capabilities(&self.catalog, surface_id, requested_capabilities)?
+        };
         let entitlement = self
             .credential_state
-            .entitlement_projection(&requested_capabilities)?;
+            .entitlement_projection(&requested_capabilities, &self.catalog)?;
         let now = now_ms();
         let claims = PrincipalClaims {
             principal_id: "local-human".to_string(),
@@ -865,34 +1118,35 @@ impl LocalAuthority {
     fn human_entitlements(
         &self,
         credential: &str,
-    ) -> Result<MfgEntitlementProjectionV2, AuthBrokerError> {
+    ) -> Result<HumanEntitlementProjection, AuthBrokerError> {
         self.verify_active_credential(credential)?;
         self.credential_state
-            .entitlement_projection(&self.credential_state.entitled_capabilities)
+            .entitlement_projection(&self.credential_state.entitled_capabilities, &self.catalog)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn set_human_entitlements(
         &mut self,
         credential: &str,
         expected_credential_epoch: u64,
         expected_profile_revision: u64,
-        core_profile_id: MfgCoreProfileId,
-        mfg_profile_id: MfgProfileId,
+        core_profile_id: String,
+        app_profiles: BTreeMap<String, String>,
         confirmation_digest: &str,
-    ) -> Result<MfgEntitlementProjectionV2, AuthBrokerError> {
+    ) -> Result<HumanEntitlementProjection, AuthBrokerError> {
         self.verify_active_credential(credential)?;
         if self.credential_state.credential_epoch != expected_credential_epoch
             || self.credential_state.profile_revision != expected_profile_revision
         {
             return Err(AuthBrokerError::EntitlementConflict);
         }
-        let next_capabilities = entitlement_union(core_profile_id, mfg_profile_id);
+        let next_capabilities = self
+            .catalog
+            .capabilities_for(&core_profile_id, &app_profiles)?;
         let expected_confirmation = entitlement_confirmation_digest(
             expected_credential_epoch,
             expected_profile_revision,
-            core_profile_id,
-            mfg_profile_id,
+            &core_profile_id,
+            &app_profiles,
             &next_capabilities,
         );
         if !bool::from(
@@ -903,13 +1157,13 @@ impl LocalAuthority {
             return Err(AuthBrokerError::InvalidEntitlementConfirmation);
         }
 
-        let previous_core = self.credential_state.core_profile_id;
-        let previous_mfg = self.credential_state.mfg_profile_id;
+        let previous_core = self.credential_state.core_profile_id.clone();
+        let previous_app_profiles = self.credential_state.app_profiles.clone();
         let previous_capabilities = self.credential_state.entitled_capabilities.clone();
         let updated_at_ms = now_ms().max(self.credential_state.updated_at_ms);
         let mut next_state = self.credential_state.clone();
-        next_state.core_profile_id = core_profile_id;
-        next_state.mfg_profile_id = mfg_profile_id;
+        next_state.core_profile_id = core_profile_id.clone();
+        next_state.app_profiles = app_profiles.clone();
         next_state.profile_revision =
             next_state.profile_revision.checked_add(1).ok_or_else(|| {
                 AuthBrokerError::InvalidCredentialState(
@@ -931,18 +1185,47 @@ impl LocalAuthority {
             "status": "authorized",
             "updated_at_ms": updated_at_ms,
             "previous_core_profile_id": previous_core,
-            "previous_mfg_profile_id": previous_mfg,
+            "previous_app_profiles": previous_app_profiles,
             "previous_capabilities": previous_capabilities,
             "core_profile_id": core_profile_id,
-            "mfg_profile_id": mfg_profile_id,
+            "app_profiles": app_profiles,
             "entitled_capabilities": next_state.entitled_capabilities,
             "credential_epoch": next_state.credential_epoch,
             "profile_revision": next_state.profile_revision,
             "updated_by": next_state.entitlement_updated_by,
         }))?;
-        persist_credential_state(&self.credential_state_path, &next_state)?;
+        persist_credential_state(&self.credential_state_path, &next_state, &self.catalog)?;
         self.credential_state = next_state;
         self.human_entitlements(credential)
+    }
+
+    fn preview_human_entitlements(
+        &self,
+        credential: &str,
+        core_profile_id: String,
+        app_profiles: BTreeMap<String, String>,
+    ) -> Result<(HumanEntitlementProjection, String), AuthBrokerError> {
+        self.verify_active_credential(credential)?;
+        let ceiling = self
+            .catalog
+            .capabilities_for(&core_profile_id, &app_profiles)?;
+        let projection = HumanEntitlementProjection {
+            core_profile_id: core_profile_id.clone(),
+            app_profiles: app_profiles.clone(),
+            profile_revision: self.credential_state.profile_revision,
+            credential_epoch: self.credential_state.credential_epoch,
+            ceiling: ceiling.clone(),
+            granted: ceiling,
+            denied: Vec::new(),
+        };
+        let confirmation_digest = entitlement_confirmation_digest(
+            projection.credential_epoch,
+            projection.profile_revision,
+            &core_profile_id,
+            &app_profiles,
+            &projection.ceiling,
+        );
+        Ok((projection, confirmation_digest))
     }
 
     fn rotate_credential(
@@ -987,7 +1270,11 @@ impl LocalAuthority {
     }
 
     fn persist_credential_state(&self) -> Result<(), AuthBrokerError> {
-        persist_credential_state(&self.credential_state_path, &self.credential_state)
+        persist_credential_state(
+            &self.credential_state_path,
+            &self.credential_state,
+            &self.catalog,
+        )
     }
 
     fn append_entitlement_audit(&self, event: serde_json::Value) -> Result<(), AuthBrokerError> {
@@ -1035,13 +1322,50 @@ impl LocalAuthority {
 /// signer back into the Gateway production API surface.
 #[cfg(feature = "test-support")]
 pub mod test_support {
-    use std::path::Path;
+    use std::{collections::BTreeMap, path::Path};
 
     use harness_contract::security::{SignedDecisionLease, SignedPrincipalEnvelope};
 
     use super::{
-        entitlement_union, AuthBrokerError, LocalAuthority, MfgCoreProfileId, MfgProfileId,
+        AuthBrokerError, AuthorizationAppProfileCatalog, AuthorizationCatalog,
+        AuthorizationProfile, LocalAuthority,
     };
+
+    /// Test-only permissive catalogue. It is not linked into production: the
+    /// real broker receives its catalogue from the product APP registry.
+    #[must_use]
+    pub fn catalog_for_capabilities(capabilities: Vec<String>) -> AuthorizationCatalog {
+        let mut capabilities = capabilities;
+        capabilities.sort();
+        capabilities.dedup();
+        AuthorizationCatalog {
+            schema_version: 1,
+            core_profiles: vec![
+                AuthorizationProfile {
+                    id: "core_operator".to_string(),
+                    capabilities: vec!["approval.respond".to_string()],
+                },
+                AuthorizationProfile {
+                    id: "core_manager".to_string(),
+                    capabilities: capabilities.clone(),
+                },
+            ],
+            apps: vec![AuthorizationAppProfileCatalog {
+                app_id: "fixture".to_string(),
+                default_profile_id: "fixture_manager".to_string(),
+                profiles: vec![AuthorizationProfile {
+                    id: "fixture_manager".to_string(),
+                    capabilities: capabilities.clone(),
+                }],
+                surface_capabilities: BTreeMap::from([
+                    ("backend".to_string(), capabilities.clone()),
+                    ("webui".to_string(), capabilities.clone()),
+                    ("tui".to_string(), capabilities.clone()),
+                    ("cli".to_string(), capabilities.clone()),
+                ]),
+            }],
+        }
+    }
 
     pub fn issue_human_principal(
         root: impl AsRef<Path>,
@@ -1049,12 +1373,16 @@ pub mod test_support {
         capabilities: Vec<String>,
         ttl_ms: Option<u64>,
     ) -> Result<(SignedPrincipalEnvelope, String), AuthBrokerError> {
-        let mut authority = LocalAuthority::open_or_initialize(root, credential)?;
-        authority.credential_state.core_profile_id = MfgCoreProfileId::CoreManager;
-        authority.credential_state.mfg_profile_id = MfgProfileId::MfgManager;
-        authority.credential_state.entitled_capabilities =
-            entitlement_union(MfgCoreProfileId::CoreManager, MfgProfileId::MfgManager);
-        let (envelope, _) = authority.issue_human_principal(credential, capabilities, ttl_ms)?;
+        let catalog = catalog_for_capabilities(capabilities.clone());
+        let mut authority = LocalAuthority::open_or_initialize(root, credential, catalog)?;
+        authority.credential_state.core_profile_id = "core_manager".to_string();
+        authority.credential_state.entitled_capabilities = capabilities;
+        let (envelope, _) = authority.issue_human_principal_for_surface(
+            credential,
+            "legacy_gateway",
+            authority.credential_state.entitled_capabilities.clone(),
+            ttl_ms,
+        )?;
         Ok((envelope, authority.public_key_base64()))
     }
 
@@ -1068,7 +1396,11 @@ pub mod test_support {
         evidence_digest: impl Into<String>,
         expires_at_ms: u64,
     ) -> Result<(SignedDecisionLease, String), AuthBrokerError> {
-        let authority = LocalAuthority::open_or_initialize(root, credential)?;
+        let authority = LocalAuthority::open_or_initialize(
+            root,
+            credential,
+            catalog_for_capabilities(Vec::new()),
+        )?;
         let lease = authority.issue_decision_lease(
             credential,
             review_id,
@@ -1089,10 +1421,11 @@ pub fn serve_local(
     root: impl AsRef<Path>,
     human_credential: &str,
     socket_path: impl AsRef<Path>,
+    catalog: AuthorizationCatalog,
 ) -> Result<(), AuthBrokerError> {
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
-    let mut authority = LocalAuthority::open_or_initialize(root, human_credential)?;
+    let mut authority = LocalAuthority::open_or_initialize(root, human_credential, catalog)?;
     let socket_path = socket_path.as_ref();
     if socket_path.exists() {
         fs::remove_file(socket_path).map_err(storage_error)?;
@@ -1121,11 +1454,12 @@ pub fn serve_local_until(
     root: impl AsRef<Path>,
     human_credential: &str,
     socket_path: impl AsRef<Path>,
+    catalog: AuthorizationCatalog,
     should_shutdown: impl Fn() -> bool,
 ) -> Result<(), AuthBrokerError> {
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 
-    let mut authority = LocalAuthority::open_or_initialize(root, human_credential)?;
+    let mut authority = LocalAuthority::open_or_initialize(root, human_credential, catalog)?;
     let socket_path = socket_path.as_ref();
     if socket_path.exists() {
         fs::remove_file(socket_path).map_err(storage_error)?;
@@ -1155,6 +1489,7 @@ pub fn serve_local(
     _root: impl AsRef<Path>,
     _human_credential: &str,
     _socket_path: impl AsRef<Path>,
+    _catalog: AuthorizationCatalog,
 ) -> Result<(), AuthBrokerError> {
     Err(AuthBrokerError::Protocol(
         "local auth broker requires Unix domain sockets".to_string(),
@@ -1166,6 +1501,7 @@ pub fn serve_local_until(
     _root: impl AsRef<Path>,
     _human_credential: &str,
     _socket_path: impl AsRef<Path>,
+    _catalog: AuthorizationCatalog,
     _should_shutdown: impl Fn() -> bool,
 ) -> Result<(), AuthBrokerError> {
     Err(AuthBrokerError::Protocol(
@@ -1244,19 +1580,35 @@ fn handle_client(
                 },
             }
         }
+        Ok(BrokerRequest::PreviewHumanEntitlements {
+            credential,
+            core_profile_id,
+            app_profiles,
+        }) => {
+            match authority.preview_human_entitlements(&credential, core_profile_id, app_profiles) {
+                Ok((entitlement, confirmation_digest)) => BrokerResponse::HumanEntitlementPreview {
+                    entitlement,
+                    confirmation_digest,
+                },
+                Err(error) => BrokerResponse::Error {
+                    code: "entitlement_preview_denied".to_string(),
+                    message: error.to_string(),
+                },
+            }
+        }
         Ok(BrokerRequest::SetHumanEntitlements {
             credential,
             expected_credential_epoch,
             expected_profile_revision,
             core_profile_id,
-            mfg_profile_id,
+            app_profiles,
             confirmation_digest,
         }) => match authority.set_human_entitlements(
             &credential,
             expected_credential_epoch,
             expected_profile_revision,
             core_profile_id,
-            mfg_profile_id,
+            app_profiles,
             &confirmation_digest,
         ) {
             Ok(entitlement) => BrokerResponse::HumanEntitlements { entitlement },
@@ -1313,10 +1665,25 @@ fn handle_client(
         .map_err(storage_error)
 }
 
-fn validated_human_capabilities(capabilities: Vec<String>) -> Result<Vec<String>, AuthBrokerError> {
+fn validated_human_capabilities(
+    catalog: &AuthorizationCatalog,
+    capabilities: Vec<String>,
+) -> Result<Vec<String>, AuthBrokerError> {
+    let known = catalog
+        .core_profiles
+        .iter()
+        .flat_map(|profile| profile.capabilities.iter())
+        .chain(
+            catalog
+                .apps
+                .iter()
+                .flat_map(|app| app.profiles.iter())
+                .flat_map(|profile| profile.capabilities.iter()),
+        )
+        .collect::<BTreeSet<_>>();
     let mut approved = Vec::new();
     for capability in capabilities {
-        if !HUMAN_CAPABILITIES.contains(&capability.as_str()) {
+        if !known.contains(&capability) {
             return Err(AuthBrokerError::CapabilityDenied(capability));
         }
         if !approved.contains(&capability) {
@@ -1327,13 +1694,14 @@ fn validated_human_capabilities(capabilities: Vec<String>) -> Result<Vec<String>
 }
 
 fn validated_surface_capabilities(
+    catalog: &AuthorizationCatalog,
     surface_id: &str,
     capabilities: Vec<String>,
 ) -> Result<Vec<String>, AuthBrokerError> {
-    let capabilities = validated_human_capabilities(capabilities)?;
-    let allowed_mfg = app_mfg_contract::active_mfg_capabilities_for_surface(surface_id);
+    let capabilities = validated_human_capabilities(catalog, capabilities)?;
+    let allowed = catalog.surface_capabilities(surface_id);
     for capability in &capabilities {
-        if capability.starts_with("mfg.") && !allowed_mfg.contains(capability) {
+        if !allowed.contains(capability) {
             return Err(AuthBrokerError::CapabilityDenied(format!(
                 "{capability} is not exposed by surface {surface_id}"
             )));
@@ -1392,7 +1760,10 @@ fn write_private_bytes(path: &Path, content: &[u8]) -> Result<(), AuthBrokerErro
     Ok(())
 }
 
-fn read_credential_state(path: &Path) -> Result<PersistedCredentialState, AuthBrokerError> {
+fn read_credential_state(
+    path: &Path,
+    catalog: &AuthorizationCatalog,
+) -> Result<PersistedCredentialState, AuthBrokerError> {
     let bytes = fs::read(path).map_err(storage_error)?;
     let document = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map_err(|error| AuthBrokerError::InvalidCredentialState(error.to_string()))?;
@@ -1405,14 +1776,7 @@ fn read_credential_state(path: &Path) -> Result<PersistedCredentialState, AuthBr
             )
         })?;
     let state = match version {
-        1 => {
-            let legacy = serde_json::from_value::<PersistedCredentialStateV1>(document)
-                .map_err(|error| AuthBrokerError::InvalidCredentialState(error.to_string()))?;
-            let migrated = PersistedCredentialState::from_v1(legacy)?;
-            persist_credential_state(path, &migrated)?;
-            migrated
-        }
-        2 => serde_json::from_value::<PersistedCredentialState>(document)
+        3 => serde_json::from_value::<PersistedCredentialState>(document)
             .map_err(|error| AuthBrokerError::InvalidCredentialState(error.to_string()))?,
         other => {
             return Err(AuthBrokerError::InvalidCredentialState(format!(
@@ -1420,18 +1784,51 @@ fn read_credential_state(path: &Path) -> Result<PersistedCredentialState, AuthBr
             )));
         }
     };
-    state.validate()?;
+    // Catalogue reconciliation runs after the enrollment credential has been
+    // verified. The version and cryptographic shape must still be valid here.
+    if state.version != CREDENTIAL_STATE_VERSION || state.credential_epoch == 0 {
+        return Err(AuthBrokerError::InvalidCredentialState(
+            "credential state shape is invalid".to_string(),
+        ));
+    }
+    if state.catalog_digest == catalog.digest()? {
+        state.validate(catalog)?;
+    }
     Ok(state)
 }
 
 fn persist_credential_state(
     path: &Path,
     state: &PersistedCredentialState,
+    catalog: &AuthorizationCatalog,
 ) -> Result<(), AuthBrokerError> {
-    state.validate()?;
+    state.validate(catalog)?;
     let encoded = serde_json::to_vec_pretty(state)
         .map_err(|error| AuthBrokerError::Serialization(error.to_string()))?;
     write_private_bytes(path, &encoded)
+}
+
+/// Persist the non-secret catalogue next to the broker authority. The file is
+/// passed to the isolated child by path so neither the credential nor a
+/// product-specific type needs to cross its process boundary.
+pub fn write_catalog(path: &Path, catalog: &AuthorizationCatalog) -> Result<(), AuthBrokerError> {
+    catalog.validate()?;
+    let encoded = serde_json::to_vec_pretty(catalog)
+        .map_err(|error| AuthBrokerError::Serialization(error.to_string()))?;
+    write_private_bytes(path, &encoded)
+}
+
+fn read_catalog(path: &Path) -> Result<AuthorizationCatalog, AuthBrokerError> {
+    let bytes = fs::read(path).map_err(storage_error)?;
+    let catalog = serde_json::from_slice::<AuthorizationCatalog>(&bytes)
+        .map_err(|error| AuthBrokerError::InvalidCredentialState(error.to_string()))?;
+    catalog.validate()?;
+    Ok(catalog)
+}
+
+#[must_use]
+pub fn catalog_file(root: impl AsRef<Path>) -> PathBuf {
+    root.as_ref().join(CATALOG_FILE)
 }
 
 fn decode_digest(value: &str) -> Result<[u8; digest::SHA256_OUTPUT_LEN], AuthBrokerError> {
@@ -1453,37 +1850,19 @@ fn hex(value: &[u8]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn entitlement_union(
-    core_profile_id: MfgCoreProfileId,
-    mfg_profile_id: MfgProfileId,
-) -> Vec<String> {
-    let mut capabilities = core_profile_capabilities(core_profile_id)
-        .iter()
-        .map(|capability| (*capability).to_string())
-        .chain(
-            mfg_profile_capabilities(mfg_profile_id)
-                .iter()
-                .map(|capability| capability.as_str().to_string()),
-        )
-        .collect::<Vec<_>>();
-    capabilities.sort();
-    capabilities.dedup();
-    capabilities
-}
-
 #[must_use]
 pub fn entitlement_confirmation_digest(
     credential_epoch: u64,
     profile_revision: u64,
-    core_profile_id: MfgCoreProfileId,
-    mfg_profile_id: MfgProfileId,
+    core_profile_id: &str,
+    app_profiles: &BTreeMap<String, String>,
     capabilities: &[String],
 ) -> String {
     let document = serde_json::json!({
         "credential_epoch": credential_epoch,
         "profile_revision": profile_revision,
         "core_profile_id": core_profile_id,
-        "mfg_profile_id": mfg_profile_id,
+        "app_profiles": app_profiles,
         "capabilities": capabilities,
     });
     let encoded = serde_json::to_vec(&document).unwrap_or_default();
@@ -1495,7 +1874,7 @@ fn storage_error(error: std::io::Error) -> AuthBrokerError {
     AuthBrokerError::Storage(error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
@@ -1843,5 +2222,121 @@ mod tests {
         ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
             .verify(&payload, &signature)
             .is_ok()
+    }
+}
+
+#[cfg(test)]
+mod generic_catalog_tests {
+    use super::*;
+
+    fn fixture_catalog() -> AuthorizationCatalog {
+        AuthorizationCatalog {
+            schema_version: 1,
+            core_profiles: vec![
+                AuthorizationProfile {
+                    id: "core_operator".to_string(),
+                    capabilities: vec!["approval.respond".to_string()],
+                },
+                AuthorizationProfile {
+                    id: "core_manager".to_string(),
+                    capabilities: vec![
+                        "approval.respond".to_string(),
+                        "definition.manage".to_string(),
+                    ],
+                },
+            ],
+            apps: vec![AuthorizationAppProfileCatalog {
+                app_id: "workbench".to_string(),
+                default_profile_id: "viewer".to_string(),
+                profiles: vec![
+                    AuthorizationProfile {
+                        id: "viewer".to_string(),
+                        capabilities: vec!["workbench.read".to_string()],
+                    },
+                    AuthorizationProfile {
+                        id: "manager".to_string(),
+                        capabilities: vec![
+                            "workbench.read".to_string(),
+                            "workbench.manage".to_string(),
+                        ],
+                    },
+                ],
+                surface_capabilities: BTreeMap::from([
+                    (
+                        "backend".to_string(),
+                        vec!["workbench.read".to_string(), "workbench.manage".to_string()],
+                    ),
+                    ("tui".to_string(), vec!["workbench.read".to_string()]),
+                ]),
+            }],
+        }
+    }
+
+    #[test]
+    fn generic_catalog_rejects_surface_capability_outside_its_declared_surface() {
+        let catalog = fixture_catalog();
+        catalog.validate().expect("catalogue is valid");
+        assert!(validated_surface_capabilities(
+            &catalog,
+            "tui",
+            vec!["workbench.manage".to_string()],
+        )
+        .is_err());
+        assert!(validated_surface_capabilities(
+            &catalog,
+            "backend",
+            vec!["workbench.manage".to_string()],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn profile_preview_and_update_are_catalog_bound_and_epoch_invalidating() {
+        let root = std::env::temp_dir().join(format!("cowd-auth-generic-{}", uuid::Uuid::new_v4()));
+        let catalog = fixture_catalog();
+        let mut authority =
+            LocalAuthority::open_or_initialize(&root, "credential", catalog).expect("authority");
+        let initial = authority.human_entitlements("credential").expect("initial");
+        assert_eq!(initial.core_profile_id, "core_operator");
+        assert_eq!(initial.app_profiles["workbench"], "viewer");
+        let target_profiles = BTreeMap::from([("workbench".to_string(), "manager".to_string())]);
+        let (preview, confirmation) = authority
+            .preview_human_entitlements(
+                "credential",
+                "core_manager".to_string(),
+                target_profiles.clone(),
+            )
+            .expect("preview");
+        assert!(preview.ceiling.contains(&"workbench.manage".to_string()));
+        let updated = authority
+            .set_human_entitlements(
+                "credential",
+                initial.credential_epoch,
+                initial.profile_revision,
+                "core_manager".to_string(),
+                target_profiles,
+                &confirmation,
+            )
+            .expect("update");
+        assert!(updated.credential_epoch > initial.credential_epoch);
+        assert_eq!(updated.app_profiles["workbench"], "manager");
+        assert!(root.join(ENTITLEMENT_AUDIT_FILE).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn historical_credential_state_is_rejected_without_migration() {
+        let root = std::env::temp_dir().join(format!("cowd-auth-generic-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            root.join(CREDENTIAL_STATE_FILE),
+            r#"{\"version\":2,\"credential_digest\":\"abc\"}"#,
+        )
+        .expect("state");
+        assert!(matches!(
+            LocalAuthority::open_or_initialize(&root, "credential", fixture_catalog()),
+            Err(AuthBrokerError::InvalidCredentialState(_))
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 }

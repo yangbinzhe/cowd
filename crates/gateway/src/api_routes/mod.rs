@@ -380,13 +380,8 @@ pub(super) fn authenticated_human_principal(
     config_home: &std::path::Path,
     token: &str,
 ) -> Result<runtime::VerifiedPrincipal, String> {
-    authenticated_human_principal_for_surface(
-        config_home,
-        token,
-        "legacy_gateway",
-        human_capabilities(),
-    )
-    .map(|(principal, _)| principal)
+    authenticated_human_principal_for_surface(config_home, token, "legacy_gateway", Vec::new())
+        .map(|(principal, _)| principal)
 }
 
 pub(super) fn authenticated_human_principal_for_surface(
@@ -397,7 +392,7 @@ pub(super) fn authenticated_human_principal_for_surface(
 ) -> Result<
     (
         runtime::VerifiedPrincipal,
-        app_mfg_contract::MfgEntitlementProjectionV2,
+        auth_broker::HumanEntitlementProjection,
     ),
     String,
 > {
@@ -435,6 +430,11 @@ pub(super) fn authenticated_human_principal_for_surface(
 
     #[cfg(any(test, feature = "test-support"))]
     {
+        let requested_capabilities = if requested_capabilities.is_empty() {
+            test_human_capabilities()
+        } else {
+            requested_capabilities
+        };
         let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
             config_home.join("auth-broker"),
             token,
@@ -448,12 +448,15 @@ pub(super) fn authenticated_human_principal_for_surface(
             .map_err(|error| error.to_string())?;
         Ok((
             principal,
-            app_mfg_contract::MfgEntitlementProjectionV2 {
-                core_profile_id: app_mfg_contract::MfgCoreProfileId::CoreManager,
-                mfg_profile_id: app_mfg_contract::MfgProfileId::MfgManager,
+            auth_broker::HumanEntitlementProjection {
+                core_profile_id: "core_manager".to_string(),
+                app_profiles: std::collections::BTreeMap::from([(
+                    "fixture".to_string(),
+                    "fixture_manager".to_string(),
+                )]),
                 profile_revision: 1,
                 credential_epoch: 1,
-                ceiling: human_capabilities(),
+                ceiling: test_human_capabilities(),
                 granted: requested_capabilities,
                 denied: Vec::new(),
             },
@@ -470,7 +473,7 @@ pub(super) fn issue_web_session(
     credential: &str,
     surface_id: &str,
     requested_capabilities: Vec<String>,
-) -> Result<(String, app_mfg_contract::MfgEntitlementProjectionV2), String> {
+) -> Result<(String, auth_broker::HumanEntitlementProjection), String> {
     let requested_capabilities =
         validate_surface_capability_request(surface_id, requested_capabilities)?;
     #[cfg(not(any(test, feature = "test-support")))]
@@ -502,6 +505,11 @@ pub(super) fn issue_web_session(
 
     #[cfg(any(test, feature = "test-support"))]
     {
+        let requested_capabilities = if requested_capabilities.is_empty() {
+            test_human_capabilities()
+        } else {
+            requested_capabilities
+        };
         let (envelope, public_key) = auth_broker::test_support::issue_human_principal(
             config_home.join("auth-broker"),
             credential,
@@ -513,12 +521,15 @@ pub(super) fn issue_web_session(
         encode_web_session(&envelope).map(|session| {
             (
                 session,
-                app_mfg_contract::MfgEntitlementProjectionV2 {
-                    core_profile_id: app_mfg_contract::MfgCoreProfileId::CoreManager,
-                    mfg_profile_id: app_mfg_contract::MfgProfileId::MfgManager,
+                auth_broker::HumanEntitlementProjection {
+                    core_profile_id: "core_manager".to_string(),
+                    app_profiles: std::collections::BTreeMap::from([(
+                        "fixture".to_string(),
+                        "fixture_manager".to_string(),
+                    )]),
                     profile_revision: 1,
                     credential_epoch: 1,
-                    ceiling: human_capabilities(),
+                    ceiling: test_human_capabilities(),
                     granted: requested_capabilities,
                     denied: Vec::new(),
                 },
@@ -568,7 +579,7 @@ pub(super) fn web_session_principal(
         let (_, public_key) = auth_broker::test_support::issue_human_principal(
             config_home.join("auth-broker"),
             test_credential.ok_or_else(|| "test_browser_session_credential_missing".to_string())?,
-            human_capabilities(),
+            test_human_capabilities(),
             Some(5 * 60 * 1_000),
         )
         .map_err(|error| error.to_string())?;
@@ -657,7 +668,8 @@ pub(super) fn issue_human_decision_lease(
     }
 }
 
-fn human_capabilities() -> Vec<String> {
+#[cfg(any(test, feature = "test-support"))]
+fn test_human_capabilities() -> Vec<String> {
     let mut capabilities = vec![
         "approval.respond".to_string(),
         "definition.manage".to_string(),
@@ -678,19 +690,6 @@ fn human_capabilities() -> Vec<String> {
     capabilities
 }
 
-fn surface_capability_inventory(surface_id: &str) -> Vec<String> {
-    let mut inventory = human_capabilities()
-        .into_iter()
-        .filter(|capability| !capability.starts_with("mfg."))
-        .collect::<Vec<_>>();
-    inventory.extend(app_mfg_contract::active_mfg_capabilities_for_surface(
-        surface_id,
-    ));
-    inventory.sort();
-    inventory.dedup();
-    inventory
-}
-
 fn requested_capabilities_for_headers(
     headers: &axum::http::HeaderMap,
 ) -> Result<(String, Vec<String>), String> {
@@ -706,7 +705,6 @@ fn requested_capabilities_for_headers(
         .unwrap_or("legacy_gateway")
         .trim()
         .to_string();
-    let allowed = surface_capability_inventory(&surface_id);
     let requested = headers
         .get("x-cowd-requested-capabilities")
         .map(|value| {
@@ -723,8 +721,7 @@ fn requested_capabilities_for_headers(
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })
-        .filter(|requested| !requested.is_empty())
-        .unwrap_or_else(|| allowed.clone());
+        .unwrap_or_default();
     let mut requested = validate_surface_capability_request(&surface_id, requested)?;
     requested.sort();
     requested.dedup();
@@ -735,18 +732,18 @@ pub(super) fn validate_surface_capability_request(
     surface_id: &str,
     requested: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    let allowed = surface_capability_inventory(surface_id);
-    let unknown = requested
-        .iter()
-        .filter(|capability| !allowed.contains(capability))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unknown.is_empty() {
+    if surface_id.trim().is_empty()
+        || requested
+            .iter()
+            .any(|capability| capability.trim().is_empty())
+    {
         return Err(format!(
-            "surface {surface_id} requested capabilities outside its inventory: {}",
-            unknown.join(",")
+            "surface {surface_id} has an invalid requested capability declaration"
         ));
     }
+    let mut requested = requested;
+    requested.sort();
+    requested.dedup();
     Ok(requested)
 }
 
@@ -764,7 +761,7 @@ fn test_human_principal() -> runtime::VerifiedPrincipal {
                     std::process::id()
                 )),
                 "test-only-credential",
-                human_capabilities(),
+                test_human_capabilities(),
                 None,
             )
             .expect("test principal envelope");
@@ -1347,16 +1344,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn surface_capability_requests_reject_unknown_values_instead_of_dropping_them() {
-        let webui_inventory = surface_capability_inventory("webui");
-        assert!(webui_inventory.contains(&"mfg.read".to_string()));
-        assert!(validate_surface_capability_request("webui", vec!["mfg.read".to_string()]).is_ok());
-        let error = validate_surface_capability_request(
-            "webui",
-            vec!["mfg.read".to_string(), "mfg.not_real".to_string()],
-        )
-        .expect_err("unknown capability must fail closed");
-        assert!(error.contains("mfg.not_real"));
+    fn surface_capability_requests_preserve_intent_for_broker_catalog_validation() {
+        assert_eq!(
+            validate_surface_capability_request(
+                "webui",
+                vec!["app.read".to_string(), "app.read".to_string()],
+            )
+            .expect("well-formed request"),
+            vec!["app.read".to_string()]
+        );
+        assert!(validate_surface_capability_request("", vec!["app.read".to_string()]).is_err());
+        assert!(validate_surface_capability_request("webui", vec![" ".to_string()]).is_err());
     }
 
     #[async_trait::async_trait]
@@ -5678,6 +5676,7 @@ pub(crate) mod tests {
                 broker_root,
                 "mfg-live-auth-token",
                 broker_socket_for_worker,
+                auth_broker::test_support::catalog_for_capabilities(test_human_capabilities()),
                 || broker_shutdown_for_worker.load(std::sync::atomic::Ordering::Acquire),
             )
             .expect("test auth broker");

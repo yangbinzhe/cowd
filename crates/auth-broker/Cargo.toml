@@ -13,7 +13,7 @@ path = "src/lib.rs"
 test-support = []
 
 [dependencies]
-app-mfg-contract = { package = "cowd-app-mfg-contract", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "f4853d046e6c7932b78e58e7753de3f6b92e3b4b" }
+cowd-app-sdk = { path = "../app-sdk" }
 base64 = "0.22"
 harness-contract = { path = "../harness-contract" }
 ring = "0.17"

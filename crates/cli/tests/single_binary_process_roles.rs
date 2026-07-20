@@ -124,6 +124,14 @@ fn cowd_runs_the_auth_broker_as_an_internal_child_role() {
     let fixture = temp_root("auth");
     let authority_root = fixture.join("authority");
     let socket = fixture.join("broker.sock");
+    fs::create_dir_all(&authority_root).expect("create authority root");
+    let catalog_path = auth_broker::catalog_file(&authority_root);
+    auth_broker::write_catalog(
+        &catalog_path,
+        &auth_broker::AuthorizationCatalog::from_app_descriptors(Vec::new())
+            .expect("generic core catalogue"),
+    )
+    .expect("write catalogue");
     let mut child = Command::new(cowd_binary())
         .args([
             INTERNAL_DISPATCH,
@@ -132,6 +140,8 @@ fn cowd_runs_the_auth_broker_as_an_internal_child_role() {
             authority_root.to_str().expect("utf-8 authority root"),
             "--socket",
             socket.to_str().expect("utf-8 socket"),
+            "--catalog",
+            catalog_path.to_str().expect("utf-8 catalogue"),
             "--credential-stdin",
         ])
         .stdin(Stdio::piped())
@@ -173,6 +183,14 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
     let install_dir = fixture.join("install");
     let authority_root = fixture.join("authority");
     let socket = fixture.join("broker.sock");
+    fs::create_dir_all(&authority_root).expect("create authority root");
+    let catalog_path = auth_broker::catalog_file(&authority_root);
+    auth_broker::write_catalog(
+        &catalog_path,
+        &auth_broker::AuthorizationCatalog::from_app_descriptors(Vec::new())
+            .expect("generic core catalogue"),
+    )
+    .expect("write catalogue");
     fs::create_dir_all(&install_dir).expect("create install directory");
     let installed = install_dir.join("cowd");
     fs::copy(cowd_binary(), &installed).expect("seed installed Cowd");
@@ -191,6 +209,8 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
             authority_root.to_str().expect("utf-8 authority root"),
             "--socket",
             socket.to_str().expect("utf-8 socket"),
+            "--catalog",
+            catalog_path.to_str().expect("utf-8 catalogue"),
             "--credential-stdin",
         ])
         .stdin(Stdio::piped())
