@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
 use harness_contract::{
@@ -66,7 +66,7 @@ pub(crate) use mission_service::{
     UpdateMissionScheduleHttpRequest, UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
-pub(crate) use receipt::{ServiceEnvelope, service_envelope};
+pub(crate) use receipt::{service_envelope, ServiceEnvelope};
 pub(crate) use runtime_event_service::RuntimeEventService;
 pub(crate) use session_service::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,
@@ -545,6 +545,9 @@ impl AgentService {
 
 #[derive(Clone)]
 pub(crate) struct GatewayServices {
+    /// Product-composed APP catalogue. The core host only consumes its generic
+    /// descriptors and routers; it never imports an APP implementation.
+    pub(crate) app_registry: Arc<cowd_app_host::AppRegistry>,
     pub(crate) runtime: Option<Arc<RuntimeService>>,
     pub(crate) session_manager: Option<Arc<crate::unified_session_manager::UnifiedSessionManager>>,
     pub(crate) runtime_events: RuntimeEventService,
@@ -852,16 +855,12 @@ mod tests {
             "reports"
         );
         let evolution_contracts = services.evolution.contracts();
-        assert!(
-            evolution_contracts
-                .iter()
-                .any(|contract| contract.operation == "signals")
-        );
-        assert!(
-            evolution_contracts
-                .iter()
-                .any(|contract| contract.operation == "proposals")
-        );
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "signals"));
+        assert!(evolution_contracts
+            .iter()
+            .any(|contract| contract.operation == "proposals"));
         assert!(evolution_contracts.iter().all(|contract| {
             !contract.operation.contains("candidate")
                 && !contract.operation.contains("sandbox")
@@ -878,36 +877,28 @@ mod tests {
             "risk_gate_event"
         );
         assert_eq!(services.growth.event_log_contract().operation, "event_log");
-        assert!(
-            services
-                .workspace
-                .contracts()
-                .iter()
-                .any(|contract| contract.operation == "overview")
-        );
+        assert!(services
+            .workspace
+            .contracts()
+            .iter()
+            .any(|contract| contract.operation == "overview"));
         let skill_contracts = services.skill.contracts();
-        assert!(
-            skill_contracts
-                .iter()
-                .any(|contract| contract.operation == "catalog")
-        );
-        assert!(
-            skill_contracts
-                .iter()
-                .any(|contract| contract.operation == "projection")
-        );
+        assert!(skill_contracts
+            .iter()
+            .any(|contract| contract.operation == "catalog"));
+        assert!(skill_contracts
+            .iter()
+            .any(|contract| contract.operation == "projection"));
         assert_eq!(
             services.agent.task_projection().operation,
             "task_projection"
         );
         assert_eq!(services.matrix.health().operation, "health");
-        assert!(
-            services
-                .mfg
-                .contracts()
-                .iter()
-                .any(|contract| contract.operation == "incident")
-        );
+        assert!(services
+            .mfg
+            .contracts()
+            .iter()
+            .any(|contract| contract.operation == "incident"));
         assert_eq!(
             services.mission.projection_contract().operation,
             "projection"
@@ -970,30 +961,22 @@ mod tests {
 
         assert!(receipt.durable, "{receipt:#?}");
         assert!(receipt.errors.is_empty(), "{receipt:#?}");
-        assert!(
-            receipt
-                .promotions
-                .iter()
-                .any(|item| item.target == "fact.memory" && item.status == "promote")
-        );
-        assert!(
-            receipt
-                .promotions
-                .iter()
-                .any(|item| item.target == "fact.matrix" && item.status == "promote")
-        );
-        assert!(
-            receipt
-                .promotions
-                .iter()
-                .any(|item| item.target == "matrix.fact" && item.status == "promoted")
-        );
-        assert!(
-            receipt
-                .promotions
-                .iter()
-                .any(|item| item.target == "memory.entry" && item.status == "held")
-        );
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "fact.memory" && item.status == "promote"));
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "fact.matrix" && item.status == "promote"));
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "matrix.fact" && item.status == "promoted"));
+        assert!(receipt
+            .promotions
+            .iter()
+            .any(|item| item.target == "memory.entry" && item.status == "held"));
         assert_eq!(
             services
                 .growth
@@ -1002,20 +985,16 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            !services
-                .growth
-                .durable_promotion_log(&config_home)
-                .expect("durable promotions")
-                .is_empty()
-        );
-        assert!(
-            !services
-                .matrix
-                .list_facts(&config_home, 10)
-                .expect("matrix facts")
-                .is_empty()
-        );
+        assert!(!services
+            .growth
+            .durable_promotion_log(&config_home)
+            .expect("durable promotions")
+            .is_empty());
+        assert!(!services
+            .matrix
+            .list_facts(&config_home, 10)
+            .expect("matrix facts")
+            .is_empty());
 
         let _ = std::fs::remove_dir_all(config_home);
     }

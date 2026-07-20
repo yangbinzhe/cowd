@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 harness-contract = { path = "../harness-contract" }
+cowd-app-host = { path = "../app-host" }
+cowd-app-sdk = { path = "../app-sdk" }
 app-mfg-contract = { path = "../app-mfg-contract" }
 auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }

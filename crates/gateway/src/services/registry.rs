@@ -87,6 +87,7 @@ impl GatewayServices {
             Arc::clone(runtime_services.resource_manager()),
         );
         Self {
+            app_registry: Arc::new(cowd_app_host::AppRegistry::default()),
             runtime: Some(runtime),
             session_manager: Some(session_manager),
             runtime_events,
@@ -122,6 +123,7 @@ impl GatewayServices {
         ));
         let task = TaskService::new();
         Self {
+            app_registry: Arc::new(cowd_app_host::AppRegistry::default()),
             runtime: None,
             session_manager: None,
             runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
@@ -152,6 +154,15 @@ impl GatewayServices {
             owner: "0.9.380 GatewayServices",
             boundary_status: "0620_final_boundary",
         }
+    }
+
+    /// Product assembly injects a completely validated, immutable registry
+    /// before Gateway starts serving requests. The method deliberately takes
+    /// ownership so a running Gateway cannot hot-load source or mutate routes.
+    #[must_use]
+    pub(crate) fn with_app_registry(mut self, app_registry: cowd_app_host::AppRegistry) -> Self {
+        self.app_registry = Arc::new(app_registry);
+        self
     }
 
     /// Gateway only projects the Runtime-owned capability snapshot. Baseline

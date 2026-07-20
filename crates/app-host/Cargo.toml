@@ -1,0 +1,15 @@
+[package]
+name = "cowd-app-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum = "0.7"
+cowd-app-sdk = { path = "../app-sdk" }
+serde.workspace = true
+thiserror = "2"
+
+[lints]
+workspace = true

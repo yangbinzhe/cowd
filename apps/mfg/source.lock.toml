@@ -1,0 +1,21 @@
+# Canonical, build-time source selection for the first-party MFG APP.
+# It is deliberately not runtime configuration: changing this file requires a
+# product rebuild and review of the generated Cargo/WebUI inputs.
+schema = 1
+app_id = "mfg"
+sdk_api = 1
+
+[rust]
+git = "https://gitee.com/eyeout/cowd-app-mfg"
+rev = "5e22dcd03c7c459665d988093512d7accfb7d35c"
+packages = [
+    "cowd-app-mfg-contract",
+    "cowd-app-mfg-core",
+    "cowd-app-mfg-adapter",
+    "cowd-app-mfg-tui",
+]
+
+[webui]
+git = "https://gitee.com/eyeout/cowd-app-mfg"
+rev = "5e22dcd03c7c459665d988093512d7accfb7d35c"
+package = "@cowd/app-mfg-webui"

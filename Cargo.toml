@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/app-sdk",
+    "crates/app-host",
     "crates/harness-contract",
     "crates/app-mfg-contract",
     "crates/app-mfg",
@@ -25,9 +27,12 @@ members = [
     "crates/surface",
     "crates/tools",
     "crates/tui",
+    "crates/xtask",
 ]
 resolver = "2"
 default-members = [
+    "crates/app-sdk",
+    "crates/app-host",
     "crates/harness-contract",
     "crates/app-mfg-contract",
     "crates/app-mfg",
@@ -52,6 +57,7 @@ default-members = [
     "crates/storage",
     "crates/surface",
     "crates/tools",
+    "crates/xtask",
 ]
 
 [workspace.package]
