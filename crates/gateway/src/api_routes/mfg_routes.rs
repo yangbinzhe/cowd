@@ -494,28 +494,10 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             get(mfg_reality_quality_gate_get_handler),
         )
         .route(
-            "/api/apps/mfg/skill-runs/:id",
-            get(mfg_skill_run_get_handler),
-        )
-        .route(
-            "/api/apps/mfg/command-center",
-            get(mfg_command_center_handler),
-        )
-        .route(
-            "/api/apps/mfg/command-center/live",
-            get(mfg_command_center_live_handler),
-        )
-        .route(
             "/api/apps/mfg/decision-trace",
             get(mfg_decision_trace_handler),
         )
-        .route("/api/apps/mfg/incidents", get(mfg_incidents_list_handler))
         .route("/api/apps/mfg/incidents", post(mfg_incident_create_handler))
-        .route("/api/apps/mfg/incidents/:id", get(mfg_incident_get_handler))
-        .route(
-            "/api/apps/mfg/incidents/:id/room",
-            get(mfg_incident_room_handler),
-        )
         .route(
             "/api/apps/mfg/incidents/:id/analyze",
             post(mfg_incident_analyze_handler),
@@ -537,27 +519,12 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_incident_skill_run_handler),
         )
         .route(
-            "/api/apps/mfg/incidents/:id/skills",
-            get(mfg_incident_skill_runs_handler),
-        )
-        .route("/api/apps/mfg/cases/:id", get(mfg_memory_case_get_handler))
-        .route(
-            "/api/apps/mfg/cases/search",
-            get(mfg_memory_case_search_handler),
-        )
-        .route(
             "/api/apps/mfg/playbooks/upsert",
             post(mfg_playbook_upsert_handler),
         )
-        .route("/api/apps/mfg/playbooks/:id", get(mfg_playbook_get_handler))
-        .route("/api/apps/mfg/analyses/:id", get(mfg_analysis_get_handler))
         .route(
             "/api/apps/mfg/analyses/:analysis_id/actions/:action_id/execute",
             post(mfg_action_execute_handler),
-        )
-        .route(
-            "/api/apps/mfg/executions/:id",
-            get(mfg_execution_get_handler),
         )
         .route(
             "/api/apps/mfg/executions/:id/cross-plane/execute",

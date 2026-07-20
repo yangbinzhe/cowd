@@ -5721,6 +5721,30 @@ pub(crate) mod tests {
         assert!(bearer_snapshot["cursor"].as_str().is_some());
         assert!(bearer_snapshot["view_epoch"].as_str().is_some());
 
+        // This request is owned by the external MFG adapter rather than the
+        // Gateway MFG router. It proves the product assembly forwards the
+        // verified request context and the APP opens the same config-home
+        // storage domain without a Gateway service proxy.
+        let external_incidents = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/incidents?limit=1")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(external_incidents.status(), StatusCode::OK);
+        let external_incidents: serde_json::Value = serde_json::from_slice(
+            &to_bytes(external_incidents.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(external_incidents["kind"], "mfg.incident.list");
+
         let login = app
             .clone()
             .oneshot(
