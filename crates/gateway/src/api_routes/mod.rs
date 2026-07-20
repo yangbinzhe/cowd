@@ -6065,6 +6065,51 @@ pub(crate) mod tests {
             assert_eq!(response["boundary"]["engine"], "matrix", "{path}");
         }
 
+        let external_recompute = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/metrics/recompute")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("idempotency-key", "gateway-external-metric-recompute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_recompute.status();
+        let body = to_bytes(external_recompute.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_recompute: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_recompute["kind"], "mfg.reality.metrics.recompute");
+        assert_eq!(external_recompute["boundary"]["engine"], "matrix");
+        assert!(external_recompute["result"].is_object());
+        assert!(external_recompute["receipt"]["receipt_id"].is_string());
+
+        let external_recompute_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/metrics/recompute")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("idempotency-key", "gateway-external-metric-recompute")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_recompute_replay.status();
+        let body = to_bytes(external_recompute_replay.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_recompute_replay: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_recompute_replay["receipt"]["status"], "replayed");
+
         // Cockpit reads are owned by the external APP as well. This crosses
         // the full authenticated Gateway path, checks the profile visibility
         // context reaches the APP, and proves GET no longer resolves to the

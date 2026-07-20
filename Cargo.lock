@@ -347,7 +347,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-adapter"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4423852c74b87851488aa4b1d89f486c188ea09e#4423852c74b87851488aa4b1d89f486c188ea09e"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=7596d6c9481485b913d551e950f766a117b307f6#7596d6c9481485b913d551e950f766a117b307f6"
 dependencies = [
  "async-trait",
  "axum",
@@ -372,7 +372,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-contract"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4423852c74b87851488aa4b1d89f486c188ea09e#4423852c74b87851488aa4b1d89f486c188ea09e"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=7596d6c9481485b913d551e950f766a117b307f6#7596d6c9481485b913d551e950f766a117b307f6"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-core"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4423852c74b87851488aa4b1d89f486c188ea09e#4423852c74b87851488aa4b1d89f486c188ea09e"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=7596d6c9481485b913d551e950f766a117b307f6#7596d6c9481485b913d551e950f766a117b307f6"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-tui"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4423852c74b87851488aa4b1d89f486c188ea09e#4423852c74b87851488aa4b1d89f486c188ea09e"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=7596d6c9481485b913d551e950f766a117b307f6#7596d6c9481485b913d551e950f766a117b307f6"
 dependencies = [
  "cowd-app-mfg-contract",
  "serde",

@@ -243,10 +243,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_reality_metric_snapshot_materialize_handler),
         )
         .route(
-            "/api/apps/mfg/reality/metrics/recompute",
-            post(mfg_reality_metric_recompute_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/metric-dependencies/upsert",
             post(mfg_reality_metric_dependency_upsert_handler),
         )
@@ -2488,21 +2484,6 @@ async fn mfg_reality_compute_job_run_handler(
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.compute.job",
         "job": job,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_metric_recompute_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let result = state
-        .services
-        .matrix
-        .recompute_metrics(&state.config_home)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.metrics.recompute",
-        "result": result,
         "boundary": mfg_reality_boundary(),
     })))
 }

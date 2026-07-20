@@ -41,6 +41,9 @@ pub(crate) const APPROVAL_SUBMIT_INTENT_V1: &str = "cowd.approval.submit.v1";
 /// original verified principal before issuing and consuming the lease; an APP
 /// cannot select an actor by putting one in this payload.
 pub(crate) const APPROVAL_DECIDE_INTENT_V1: &str = "cowd.approval.decide.v1";
+/// Closed generic Matrix operation used by an APP that owns the user-facing
+/// projection but not the Reality Core storage authority.
+pub(crate) const REALITY_RECOMPUTE_METRICS_INTENT_V1: &str = "cowd.reality.recompute_metrics.v1";
 
 const APP_REQUEST_PRINCIPAL_TTL: Duration = Duration::from_secs(300);
 const APP_REQUEST_PRINCIPAL_LIMIT: usize = 4096;
@@ -452,10 +455,46 @@ impl ConnectorPort for GatewayAppHostBinding {
 impl RealityPort for GatewayAppHostBinding {
     async fn query(
         &self,
-        _context: &InvocationContext,
+        context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
-        Err(Self::unsupported("reality", &intent.kind))
+        let state = self.state()?;
+        let _principal = self.verified_principal(context)?;
+        match intent.kind.as_str() {
+            REALITY_RECOMPUTE_METRICS_INTENT_V1 => {
+                if !intent.payload.is_null()
+                    && intent
+                        .payload
+                        .as_object()
+                        .is_none_or(|value| !value.is_empty())
+                {
+                    return Err(AppHostError::Denied(
+                        "recompute_metrics intent must not contain an application payload".into(),
+                    ));
+                }
+                let matrix = state.services.matrix.clone();
+                let config_home = state.config_home.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || matrix.recompute_metrics(&config_home))
+                        .await
+                        .map_err(|error| {
+                            AppHostError::Unavailable(format!(
+                                "Reality recompute worker failed: {error}"
+                            ))
+                        })?
+                        .map_err(|error| AppHostError::Failed(error.to_string()))?;
+                Ok(HostReceipt {
+                    id: format!("reality:metrics:recompute:{}", context.request_id),
+                    status: "completed".to_string(),
+                    replayed: false,
+                    payload: serde_json::json!({
+                        "kind": "cowd.reality.recompute_metrics.receipt.v1",
+                        "result": result,
+                    }),
+                })
+            }
+            _ => Err(Self::unsupported("reality", &intent.kind)),
+        }
     }
 }
 
