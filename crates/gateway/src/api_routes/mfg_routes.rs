@@ -110,11 +110,6 @@ pub(super) fn register_mfg_openapi_schemas(
     registry.register_type::<MfgSkillPlanRequest>("MfgSkillPlanRequest");
     registry.register_type::<MfgSkillRunRequest>("MfgSkillRunRequest");
     registry.register_type::<MatrixDecisionTraceQuery>("MatrixDecisionTraceQuery");
-    registry.register_type::<MfgAlertListQuery>("MfgAlertListQuery");
-    registry.register_type::<MfgAlertRuleUpsertRequest>("MfgAlertRuleUpsertRequest");
-    registry
-        .register_type::<MfgAlertSubscriptionUpsertRequest>("MfgAlertSubscriptionUpsertRequest");
-    registry.register_type::<MfgAlertCommandRequest>("MfgAlertCommandRequest");
     registry.register_type::<MfgForecastQuery>("MfgForecastQuery");
     registry.register_type::<MfgLiveQuery>("MfgLiveQuery");
 }
@@ -211,18 +206,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/executions/:id/feedback",
             post(mfg_execution_feedback_handler),
-        )
-        .route(
-            "/api/apps/mfg/focus/alert-rules",
-            post(mfg_alert_rule_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/focus/alert-subscriptions",
-            post(mfg_alert_subscription_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/focus/alerts/:id/command",
-            post(mfg_alert_command_handler),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state,

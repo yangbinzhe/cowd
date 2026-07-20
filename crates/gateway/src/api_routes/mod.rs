@@ -5958,6 +5958,46 @@ pub(crate) mod tests {
                 && entry.surface == "fixture-surface"
         }));
 
+        let external_alert_rule = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/focus/alert-rules")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-alert-rule")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "rule": {
+                                "owner_ref": "ignored-by-verified-principal",
+                                "name": "Gateway external alert rule",
+                                "metric_refs": ["quality_deviation_rate"],
+                                "condition": {
+                                    "field": "confidence",
+                                    "operator": "gte",
+                                    "threshold": 0.9
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_alert_rule.status();
+        let body = to_bytes(external_alert_rule.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_alert_rule: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_alert_rule["kind"], "mfg.alert_rule");
+        assert_eq!(
+            external_alert_rule["rule"]["owner_ref"],
+            "principal:local-human"
+        );
+
         let external_governance = app
             .clone()
             .oneshot(
