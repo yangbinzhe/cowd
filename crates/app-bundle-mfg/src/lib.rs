@@ -127,6 +127,13 @@ pub fn register_mfg_embedded_trusted(
     )
 }
 
+/// Forward MFG-owned OpenAPI schemas through product composition. Gateway can
+/// aggregate APP documentation without recreating request DTOs that belong to
+/// the external MFG adapter.
+pub fn register_mfg_openapi_schemas(registry: &mut app_mfg_contract::MfgOpenApiSchemaRegistry) {
+    cowd_app_mfg_adapter::register_mfg_openapi_schemas(registry);
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

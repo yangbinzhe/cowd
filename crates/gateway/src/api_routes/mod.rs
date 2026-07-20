@@ -5903,6 +5903,70 @@ pub(crate) mod tests {
             }
         }
 
+        // This is a product-level mutation proof, not an adapter-only unit
+        // test: authenticated Gateway composition must route Cockpit authoring
+        // to the external APP, bind the broker principal as owner, and expose
+        // the newly generated report through the same external store.
+        let authored = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/cockpit/profiles/upsert")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-authoring")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "profile": {
+                                "owner_ref": "untrusted-client-owner",
+                                "display_name": "Gateway assembled external Cockpit"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authored.status(), StatusCode::OK);
+        let authored: serde_json::Value =
+            serde_json::from_slice(&to_bytes(authored.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            authored["profile"]["owner_ref"],
+            serde_json::Value::String("principal:local-human".to_string())
+        );
+        let authored_profile_id = authored["profile"]["profile_id"]
+            .as_str()
+            .expect("external profile id")
+            .to_string();
+
+        let generated_report = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/cockpit/profiles/{authored_profile_id}/reports/generate"
+                    ))
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-authoring-report")
+                    .body(Body::from(serde_json::json!({"report": {}}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generated_report.status(), StatusCode::OK);
+        let generated_report: serde_json::Value = serde_json::from_slice(
+            &to_bytes(generated_report.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(generated_report["kind"], "mfg.cockpit.report");
+
         let login = app
             .clone()
             .oneshot(

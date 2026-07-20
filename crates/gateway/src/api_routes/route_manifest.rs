@@ -63,31 +63,28 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
             });
         }
     }
+    // APP routers are composed at startup and are therefore not visible to
+    // the literal-route build scanner. Complete the public inventory from the
+    // static APP contract, preserving any Gateway-owned route entry already
+    // found above. The resulting metadata explicitly records that these are
+    // APP-owned handlers rather than synthetic Gateway handlers.
+    for contract in app_mfg_contract::mfg_route_contracts()
+        .into_iter()
+        .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
+    {
+        if entries.iter().any(|entry: &GatewayRouteManifestEntry| {
+            entry.method == contract.method && entry.path == contract.path
+        }) {
+            continue;
+        }
+        entries.insert(app_mfg_manifest_entry(contract));
+    }
     entries.into_iter().collect()
 }
 
 fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
     let mfg = app_mfg_contract::route::mfg_route_contract_by_method_path(route.method, route.path)
-        .map(|contract| GatewayMfgSemanticMetadata {
-            route_id: contract.route_id.as_str().to_string(),
-            request_schema: contract.request_schema,
-            response_schema: contract.response_schema,
-            class: format!("{:?}", contract.class).to_ascii_lowercase(),
-            capability: match contract.capability {
-                app_mfg_contract::MfgCapabilityRequirement::One { capability } => {
-                    capability.as_str().to_string()
-                }
-                app_mfg_contract::MfgCapabilityRequirement::All { capabilities } => capabilities
-                    .into_iter()
-                    .map(app_mfg_contract::MfgCapabilityId::as_str)
-                    .collect::<Vec<_>>()
-                    .join("+"),
-                app_mfg_contract::MfgCapabilityRequirement::PerAction => "per_action".to_string(),
-            },
-            risk: format!("{:?}", contract.risk).to_ascii_lowercase(),
-            confirmation: format!("{:?}", contract.confirmation).to_ascii_lowercase(),
-            emits_live_event: contract.emits_live_event,
-        });
+        .map(mfg_semantic_metadata);
     GatewayRouteManifestEntry {
         method: route.method,
         path: route.path.to_string(),
@@ -98,6 +95,58 @@ fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
         source: route.source.to_string(),
         handler: route.handler.to_string(),
         mfg,
+    }
+}
+
+fn app_mfg_manifest_entry(
+    contract: app_mfg_contract::MfgRouteContract,
+) -> GatewayRouteManifestEntry {
+    GatewayRouteManifestEntry {
+        method: mfg_static_method(&contract.method),
+        path: contract.path.to_string(),
+        group: "app".to_string(),
+        owner: "app:mfg",
+        criticality: route_criticality(&contract.path),
+        stability: "stable",
+        source: "app_registry:mfg".to_string(),
+        handler: contract.route_id.as_str().to_string(),
+        mfg: Some(mfg_semantic_metadata(contract)),
+    }
+}
+
+fn mfg_static_method(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "PATCH" => "PATCH",
+        "DELETE" => "DELETE",
+        other => panic!("MFG contract has unsupported HTTP method: {other}"),
+    }
+}
+
+fn mfg_semantic_metadata(
+    contract: app_mfg_contract::MfgRouteContract,
+) -> GatewayMfgSemanticMetadata {
+    GatewayMfgSemanticMetadata {
+        route_id: contract.route_id.as_str().to_string(),
+        request_schema: contract.request_schema,
+        response_schema: contract.response_schema,
+        class: format!("{:?}", contract.class).to_ascii_lowercase(),
+        capability: match contract.capability {
+            app_mfg_contract::MfgCapabilityRequirement::One { capability } => {
+                capability.as_str().to_string()
+            }
+            app_mfg_contract::MfgCapabilityRequirement::All { capabilities } => capabilities
+                .into_iter()
+                .map(app_mfg_contract::MfgCapabilityId::as_str)
+                .collect::<Vec<_>>()
+                .join("+"),
+            app_mfg_contract::MfgCapabilityRequirement::PerAction => "per_action".to_string(),
+        },
+        risk: format!("{:?}", contract.risk).to_ascii_lowercase(),
+        confirmation: format!("{:?}", contract.confirmation).to_ascii_lowercase(),
+        emits_live_event: contract.emits_live_event,
     }
 }
 
@@ -215,5 +264,12 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(contract.len(), 104);
         assert_eq!(manifest, contract);
+        let external_contract = gateway_route_manifest()
+            .into_iter()
+            .find(|entry| entry.method == "GET" && entry.path == "/api/apps/mfg/contract")
+            .expect("external MFG contract route is inventoried");
+        assert_eq!(external_contract.owner, "app:mfg");
+        assert_eq!(external_contract.source, "app_registry:mfg");
+        assert_eq!(external_contract.handler, "mfg.contract.get");
     }
 }

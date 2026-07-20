@@ -4,9 +4,8 @@ use app_mfg::{
     mfg_widget_catalog, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand,
     MfgAlertCommandInput, MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription,
     MfgAlertSubscriptionInput, MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput,
-    MfgAssignmentInput, MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitReportDeliveryState,
-    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook,
-    MfgRepositoryError,
+    MfgAssignmentInput, MfgCockpitProfile, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
+    MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook, MfgRepositoryError,
 };
 use axum::{
     body::Body,
@@ -14,7 +13,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
     Extension, Json, Router,
 };
 use matrix_core::{
@@ -197,17 +196,10 @@ fn default_mfg_bridge_mode() -> String {
 pub(super) fn register_mfg_openapi_schemas(
     registry: &mut app_mfg_contract::MfgOpenApiSchemaRegistry,
 ) {
+    app_bundle_mfg::register_mfg_openapi_schemas(registry);
     registry.register_type::<MfgCrossPlaneBridgeIntent>("MfgCrossPlaneBridgeIntent");
     registry.register_type::<MfgCockpitReportDeliveryIntent>("MfgCockpitReportDeliveryIntent");
     registry.register_type::<MfgActionExecutionIntent>("MfgActionExecutionIntent");
-    registry.register_type::<MfgCockpitProfileUpsertRequest>("MfgCockpitProfileUpsertRequest");
-    registry.register_type::<MfgCockpitProfileListQuery>("MfgCockpitProfileListQuery");
-    registry.register_type::<MfgCockpitProfileDeleteQuery>("MfgCockpitProfileDeleteQuery");
-    registry.register_type::<MfgCockpitProjectionQuery>("MfgCockpitProjectionQuery");
-    registry.register_type::<MfgCockpitProfileCloneRequest>("MfgCockpitProfileCloneRequest");
-    registry.register_type::<MfgCockpitProfileShareRequest>("MfgCockpitProfileShareRequest");
-    registry.register_type::<MfgCockpitReportGenerateRequest>("MfgCockpitReportGenerateRequest");
-    registry.register_type::<MfgCockpitReportListQuery>("MfgCockpitReportListQuery");
     registry
         .register_type::<MfgCockpitReportScheduleRunRequest>("MfgCockpitReportScheduleRunRequest");
     registry.register_type::<MfgIncidentCreateRequest>("MfgIncidentCreateRequest");
@@ -470,26 +462,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/executions/:id/feedback",
             post(mfg_execution_feedback_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/profiles/upsert",
-            post(mfg_cockpit_profile_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/profiles/:id",
-            delete(mfg_cockpit_profile_delete_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/profiles/:id/clone",
-            post(mfg_cockpit_profile_clone_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/profiles/:id/share",
-            post(mfg_cockpit_profile_share_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/profiles/:id/reports/generate",
-            post(mfg_cockpit_report_generate_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/reports/schedules/run",
@@ -2007,68 +1979,6 @@ async fn mfg_contract_handler(
     })
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgCockpitProfileUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-    profile: MfgCockpitProfileInput,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgCockpitProfileListQuery {
-    #[serde(default)]
-    cadence: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgCockpitProfileDeleteQuery {
-    expected_revision: u64,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-struct MfgCockpitProjectionQuery {
-    #[serde(default)]
-    entity: Option<String>,
-    #[serde(default)]
-    metric: Option<String>,
-    #[serde(default)]
-    severity: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    from: Option<String>,
-    #[serde(default)]
-    to: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct MfgCockpitProfileCloneRequest {
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct MfgCockpitProfileShareRequest {
-    expected_revision: u64,
-    sharing_policy: app_mfg::MfgDashboardSharingPolicy,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-}
-
 pub(super) fn mfg_idempotency_key(
     headers: &HeaderMap,
     legacy_value: Option<String>,
@@ -2104,24 +2014,6 @@ pub(super) fn stable_mfg_resource_id(prefix: &str, idempotency_key: &str) -> Str
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("{prefix}:{idempotency_key}").as_bytes());
     format!("{prefix}-{digest:x}")[..prefix.len() + 1 + 20].to_string()
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgCockpitReportGenerateRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    report: MfgCockpitReportRequest,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgCockpitReportListQuery {
-    #[serde(default)]
-    profile_id: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
