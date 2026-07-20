@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use app_mfg::{
-    mfg_widget_catalog, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand,
-    MfgAlertCommandInput, MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription,
-    MfgAlertSubscriptionInput, MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput,
-    MfgAssignmentInput, MfgCockpitProfile, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
-    MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook, MfgRepositoryError,
+    MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
+    MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription, MfgAlertSubscriptionInput,
+    MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput, MfgAssignmentInput,
+    MfgIncident, MfgPlaybook, MfgRepositoryError,
 };
 use axum::{
     body::Body,
@@ -26,8 +25,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::services::{
-    GatewayMatrixRepositoryError as MatrixStoreError, MfgCockpitReportDeliveryOutcome,
-    MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
+    GatewayMatrixRepositoryError as MatrixStoreError, MfgCrossPlaneBridgeRequest,
 };
 
 use super::matrix_outcomes::{
@@ -36,50 +34,11 @@ use super::matrix_outcomes::{
 use super::mfg_outcomes::{
     append_mfg_execution_outcome, mfg_action_execution_outcome, mfg_skill_run_execution_outcome,
 };
-mod cockpit;
 mod incidents;
 mod operations;
 use super::{principal_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
-use cockpit::*;
 use incidents::*;
 use operations::*;
-
-pub(super) fn start_review_reconciler(state: &Arc<AppState>) {
-    if state.services.runtime.is_none() {
-        return;
-    }
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let Some(lifecycle) = state.services.mfg.begin_review_reconciler() else {
-        return;
-    };
-    let state_weak = Arc::downgrade(state);
-    let handle = runtime.spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            let Some(lifecycle_owner) = lifecycle.upgrade() else {
-                break;
-            };
-            if lifecycle_owner.is_cancelled() {
-                break;
-            }
-            let Some(state) = state_weak.upgrade() else {
-                break;
-            };
-            if let Err((status, error)) = reconcile_mfg_report_review_saga(&state, None, 32).await {
-                tracing::warn!(
-                    status = %status,
-                    error = ?error.0,
-                    "MFG report review reconciler iteration failed"
-                );
-            }
-        }
-    });
-    state.services.mfg.install_review_reconciler(handle);
-}
 
 /// Public MFG bridge intent. Gateway authentication owns the effective actor;
 /// an actor field in an HTTP body is rejected by this closed schema.
@@ -120,34 +79,6 @@ impl MfgCrossPlaneBridgeIntent {
     }
 }
 
-/// Public MFG delivery intent. It cannot deserialize service-owned actor data.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(super) struct MfgCockpitReportDeliveryIntent {
-    #[serde(default = "default_mfg_bridge_mode")]
-    mode: String,
-    #[serde(default)]
-    expected_revision: Option<u64>,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-    #[serde(default)]
-    actor_identity_ref: Option<String>,
-    #[serde(default)]
-    source_channel: Option<String>,
-    #[serde(default)]
-    requested_capability: Option<String>,
-    #[serde(default)]
-    provider_account: Option<String>,
-    #[serde(default)]
-    target_ref: Option<String>,
-    #[serde(default)]
-    resource_ref: Option<String>,
-    #[serde(default)]
-    channel: Option<String>,
-    #[serde(default)]
-    template_id: Option<String>,
-}
-
 /// Public action execution intent. The authenticated gateway principal is the
 /// only source of the effective operator id.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -171,24 +102,6 @@ impl MfgActionExecutionIntent {
     }
 }
 
-impl MfgCockpitReportDeliveryIntent {
-    pub(super) fn into_request(self, actor_principal: String) -> MfgCockpitReportDeliveryRequest {
-        MfgCockpitReportDeliveryRequest {
-            mode: self.mode,
-            idempotency_key: self.idempotency_key,
-            actor_principal,
-            actor_identity_ref: self.actor_identity_ref,
-            source_channel: self.source_channel,
-            requested_capability: self.requested_capability,
-            provider_account: self.provider_account,
-            target_ref: self.target_ref,
-            resource_ref: self.resource_ref,
-            channel: self.channel,
-            template_id: self.template_id,
-        }
-    }
-}
-
 fn default_mfg_bridge_mode() -> String {
     "dry_run".to_string()
 }
@@ -198,10 +111,7 @@ pub(super) fn register_mfg_openapi_schemas(
 ) {
     app_bundle_mfg::register_mfg_openapi_schemas(registry);
     registry.register_type::<MfgCrossPlaneBridgeIntent>("MfgCrossPlaneBridgeIntent");
-    registry.register_type::<MfgCockpitReportDeliveryIntent>("MfgCockpitReportDeliveryIntent");
     registry.register_type::<MfgActionExecutionIntent>("MfgActionExecutionIntent");
-    registry
-        .register_type::<MfgCockpitReportScheduleRunRequest>("MfgCockpitReportScheduleRunRequest");
     registry.register_type::<MfgIncidentCreateRequest>("MfgIncidentCreateRequest");
     registry.register_type::<MfgExecutionFeedbackRequest>("MfgExecutionFeedbackRequest");
     registry.register_type::<MfgCaseSearchQuery>("MfgCaseSearchQuery");
@@ -209,10 +119,6 @@ pub(super) fn register_mfg_openapi_schemas(
     registry.register_type::<MfgPlaybookRecommendRequest>("MfgPlaybookRecommendRequest");
     registry.register_type::<MfgSkillPlanRequest>("MfgSkillPlanRequest");
     registry.register_type::<MfgSkillRunRequest>("MfgSkillRunRequest");
-    registry.register_type::<MfgCockpitReportDeliveryRetryRequest>(
-        "MfgCockpitReportDeliveryRetryRequest",
-    );
-    registry.register_type::<MfgReportReviewListQuery>("MfgReportReviewListQuery");
     registry.register_type::<MatrixDecisionTraceQuery>("MatrixDecisionTraceQuery");
     registry.register_type::<MfgRealityFactIngestRequest>("MfgRealityFactIngestRequest");
     registry.register_type::<MfgRealityEntityUpsertRequest>("MfgRealityEntityUpsertRequest");
@@ -302,7 +208,7 @@ pub(super) fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteI
         R::ReportGenerate => "MfgCockpitReportGenerateRequest",
         R::ReportScheduleRun => "MfgCockpitReportScheduleRunRequest",
         R::ReportList => "MfgCockpitReportListQuery",
-        R::ReportDeliver => "MfgCockpitReportDeliveryIntent",
+        R::ReportDeliver => "MfgCockpitReportDeliveryRequest",
         R::ReportDeliveryRetry => "MfgCockpitReportDeliveryRetryRequest",
         R::ReportReviewRequest => "MfgReportDeliveryReviewCreateRequest",
         R::ReportReviewList => "MfgReportReviewListQuery",
@@ -462,26 +368,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/executions/:id/feedback",
             post(mfg_execution_feedback_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/reports/schedules/run",
-            post(mfg_cockpit_report_schedule_run_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/reports/:id/reviews",
-            post(mfg_cockpit_report_review_request_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/report-reviews",
-            get(mfg_cockpit_report_review_list_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/report-reviews/:id",
-            get(mfg_cockpit_report_review_get_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/report-reviews/:id/decision",
-            post(mfg_cockpit_report_review_decision_handler),
         )
         .route(
             "/api/apps/mfg/focus/alert-rules",
@@ -2005,38 +1891,6 @@ pub(super) fn stable_mfg_resource_id(prefix: &str, idempotency_key: &str) -> Str
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct MfgCockpitReportScheduleRunRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    cadence: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    report_id_prefix: Option<String>,
-    #[serde(default)]
-    delivery_ref: Option<String>,
-    #[serde(default)]
-    deliver: bool,
-    #[serde(default = "default_matrix_bridge_mode")]
-    mode: String,
-    #[serde(default)]
-    actor_identity_ref: Option<String>,
-    #[serde(default)]
-    source_channel: Option<String>,
-    #[serde(default)]
-    requested_capability: Option<String>,
-    #[serde(default)]
-    provider_account: Option<String>,
-    #[serde(default)]
-    channel: Option<String>,
-    #[serde(default)]
-    template_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgIncidentCreateRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -2106,41 +1960,6 @@ struct MfgSkillRunRequest {
     session_id: Option<String>,
     #[serde(default)]
     expected_revision: Option<u64>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct MfgCockpitReportDeliveryRetryRequest {
-    #[serde(default)]
-    mode: String,
-    #[serde(default)]
-    expected_revision: Option<u64>,
-    #[serde(default)]
-    idempotency_key: Option<String>,
-    #[serde(default)]
-    actor_identity_ref: Option<String>,
-    #[serde(default)]
-    source_channel: Option<String>,
-    #[serde(default)]
-    requested_capability: Option<String>,
-    #[serde(default)]
-    provider_account: Option<String>,
-    #[serde(default)]
-    target_ref: Option<String>,
-    #[serde(default)]
-    resource_ref: Option<String>,
-    #[serde(default)]
-    channel: Option<String>,
-    #[serde(default)]
-    template_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-struct MfgReportReviewListQuery {
-    #[serde(default)]
-    report_id: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -3502,9 +3321,7 @@ mod tests {
     use super::{
         mfg_api_error, mfg_contract_handler, mfg_idempotency_key, normalize_mfg_action_mode,
         parse_mfg_query_pairs, resolve_mfg_action_id, resolve_mfg_resource_ref,
-        MfgActionExecutionIntent, MfgCockpitReportDeliveryIntent,
-        MfgCockpitReportDeliveryRetryRequest, MfgCrossPlaneBridgeIntent,
-        MfgExecutionFeedbackRequest,
+        MfgActionExecutionIntent, MfgCrossPlaneBridgeIntent, MfgExecutionFeedbackRequest,
     };
     use axum::{
         extract::Extension,
@@ -3561,9 +3378,6 @@ mod tests {
         let bridge = serde_json::from_str::<MfgCrossPlaneBridgeIntent>(
             r#"{"actor_principal":"user:forged","mode":"dry_run"}"#,
         );
-        let delivery = serde_json::from_str::<MfgCockpitReportDeliveryIntent>(
-            r#"{"actor_principal":"user:forged","mode":"dry_run"}"#,
-        );
         let action = serde_json::from_str::<MfgActionExecutionIntent>(
             r#"{"operator_id":"user:forged","mode":"commit"}"#,
         );
@@ -3572,7 +3386,6 @@ mod tests {
         );
 
         assert!(bridge.is_err());
-        assert!(delivery.is_err());
         assert!(action.is_err());
         assert!(feedback.is_err());
     }
@@ -3862,15 +3675,5 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn public_report_retry_rejects_legacy_force_bypass() {
-        assert!(
-            serde_json::from_value::<MfgCockpitReportDeliveryRetryRequest>(
-                serde_json::json!({"mode": "commit", "force": true})
-            )
-            .is_err()
-        );
     }
 }

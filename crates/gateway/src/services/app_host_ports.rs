@@ -4,15 +4,26 @@
 //! product-side adapter that owns Gateway state, policy and dispatch details;
 //! no application can import or downcast it.
 
-use std::sync::{Arc, RwLock, Weak};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, RwLock, Weak},
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use cowd_app_sdk::{
     AppHostError, AppHostPorts, ApprovalPort, ConnectorPort, CowdAppContext, CrossPlanePort,
     HostIntent, HostReceipt, InvocationContext, RealityPort, RuntimePort, WorkContextPort,
 };
-use harness_contract::policy::{CrossPlaneRisk, DataClassification};
-use runtime::{CrossPlaneAction, CrossPlaneDispatchTarget, IdentityTrust, PolicyDecisionKind};
+use harness_contract::{
+    core::TaskRisk,
+    policy::{CrossPlaneRisk, DataClassification},
+};
+use runtime::{
+    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, CrossPlaneAction,
+    CrossPlaneDispatchTarget, IdentityTrust, PolicyDecisionKind, SubmitGlobalApprovalRequest,
+    VerifiedPrincipal,
+};
 use serde::Deserialize;
 
 use crate::api_routes::{connector_routes::connector_snapshot, AppState};
@@ -23,6 +34,24 @@ use super::GatewayCrossPlaneExecutor;
 /// dispatch.  The payload deliberately uses only transport data, never an
 /// application-domain DTO or a Gateway service type.
 pub(crate) const CROSS_PLANE_DISPATCH_INTENT_V1: &str = "cowd.cross_plane.dispatch.v1";
+/// Closed approval-submit intent used by a compile-time linked APP that owns
+/// a typed business review while Cowd owns the durable approval record.
+pub(crate) const APPROVAL_SUBMIT_INTENT_V1: &str = "cowd.approval.submit.v1";
+/// Closed approval-decision intent.  The Gateway resolves the request's
+/// original verified principal before issuing and consuming the lease; an APP
+/// cannot select an actor by putting one in this payload.
+pub(crate) const APPROVAL_DECIDE_INTENT_V1: &str = "cowd.approval.decide.v1";
+
+const APP_REQUEST_PRINCIPAL_TTL: Duration = Duration::from_secs(300);
+const APP_REQUEST_PRINCIPAL_LIMIT: usize = 4096;
+
+#[derive(Clone)]
+struct BoundAppPrincipal {
+    principal: VerifiedPrincipal,
+    workspace_id: String,
+    surface: String,
+    bound_at: Instant,
+}
 
 /// One binding is created during product composition and attached once the
 /// fully assembled [`AppState`] exists.  It solves startup ordering without
@@ -31,6 +60,7 @@ pub(crate) const CROSS_PLANE_DISPATCH_INTENT_V1: &str = "cowd.cross_plane.dispat
 #[derive(Clone, Default)]
 pub(crate) struct GatewayAppHostBinding {
     state: Arc<RwLock<Weak<AppState>>>,
+    request_principals: Arc<RwLock<BTreeMap<String, BoundAppPrincipal>>>,
 }
 
 impl GatewayAppHostBinding {
@@ -55,6 +85,43 @@ impl GatewayAppHostBinding {
         *slot = Arc::downgrade(state);
     }
 
+    /// Bind verified request identity immediately after Gateway authentication
+    /// and before handing the stable request context to an APP.  Effect ports
+    /// resolve this opaque binding instead of trusting an APP-supplied actor.
+    pub(crate) fn bind_request_principal(
+        &self,
+        principal: &VerifiedPrincipal,
+        context: &InvocationContext,
+    ) {
+        let now = Instant::now();
+        let mut principals = self
+            .request_principals
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        principals
+            .retain(|_, bound| now.duration_since(bound.bound_at) <= APP_REQUEST_PRINCIPAL_TTL);
+        if principals.len() >= APP_REQUEST_PRINCIPAL_LIMIT {
+            let overflow = principals.len() + 1 - APP_REQUEST_PRINCIPAL_LIMIT;
+            let stale = principals
+                .iter()
+                .take(overflow)
+                .map(|(request_id, _)| request_id.clone())
+                .collect::<Vec<_>>();
+            for request_id in stale {
+                principals.remove(&request_id);
+            }
+        }
+        principals.insert(
+            context.request_id.clone(),
+            BoundAppPrincipal {
+                principal: principal.clone(),
+                workspace_id: context.workspace_id.clone(),
+                surface: context.surface.clone(),
+                bound_at: now,
+            },
+        );
+    }
+
     fn state(&self) -> Result<Arc<AppState>, AppHostError> {
         self.state
             .read()
@@ -63,6 +130,33 @@ impl GatewayAppHostBinding {
             .ok_or_else(|| {
                 AppHostError::Unavailable("Gateway application host is not active".into())
             })
+    }
+
+    fn verified_principal(
+        &self,
+        context: &InvocationContext,
+    ) -> Result<VerifiedPrincipal, AppHostError> {
+        let now = Instant::now();
+        let mut principals = self
+            .request_principals
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        principals
+            .retain(|_, bound| now.duration_since(bound.bound_at) <= APP_REQUEST_PRINCIPAL_TTL);
+        let bound = principals.get(&context.request_id).ok_or_else(|| {
+            AppHostError::Denied(
+                "application effect request is not bound to a verified Gateway request".into(),
+            )
+        })?;
+        if bound.workspace_id != context.workspace_id
+            || bound.surface != context.surface
+            || bound.principal.claims().principal_id != context.principal_id
+        {
+            return Err(AppHostError::Denied(
+                "application effect invocation does not match its verified Gateway request".into(),
+            ));
+        }
+        Ok(bound.principal.clone())
     }
 
     fn unsupported(port: &str, kind: &str) -> AppHostError {
@@ -113,11 +207,234 @@ impl RuntimePort for GatewayAppHostBinding {
 impl ApprovalPort for GatewayAppHostBinding {
     async fn request(
         &self,
-        _context: &InvocationContext,
+        context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
-        Err(Self::unsupported("approval", &intent.kind))
+        let state = self.state()?;
+        let principal = self.verified_principal(context)?;
+        match intent.kind.as_str() {
+            APPROVAL_SUBMIT_INTENT_V1 => {
+                let request = ApplicationApprovalSubmitIntentV1::parse(intent)?;
+                let runtime = state
+                    .services
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| {
+                        AppHostError::Unavailable(
+                            "Gateway runtime approval service is not configured".into(),
+                        )
+                    })?
+                    .runtime_services();
+                let replayed = runtime.approval_queue().get(&request.approval_id).is_some();
+                let approval = runtime
+                    .approval_queue()
+                    .submit_scoped(
+                        request.approval_id.clone(),
+                        SubmitGlobalApprovalRequest {
+                            source: ApprovalSource {
+                                kind: ApprovalSourceKind::Mfg,
+                                session_id: None,
+                                agent_id: None,
+                                team_id: None,
+                                mission_id: None,
+                                resource_ref: Some(request.resource_ref),
+                                review_ref: Some(request.review_ref),
+                            },
+                            action: request.action,
+                            summary: request.summary,
+                            risk: request.risk,
+                            evidence_refs: request.evidence_refs,
+                            timeout_policy: request.timeout_policy,
+                        },
+                    )
+                    .map_err(AppHostError::Failed)?;
+                Ok(HostReceipt {
+                    id: approval.approval_id.clone(),
+                    status: approval.status.as_str().to_string(),
+                    replayed,
+                    payload: serde_json::json!({
+                        "kind": "cowd.approval.submit.receipt.v1",
+                        "approval": approval,
+                    }),
+                })
+            }
+            APPROVAL_DECIDE_INTENT_V1 => {
+                let request = ApplicationApprovalDecisionIntentV1::parse(intent)?;
+                if !principal.is_human_interactive()
+                    || !principal.has_capability("approval.respond")
+                    || !principal.has_capability("mfg.report.review")
+                {
+                    return Err(AppHostError::Denied(
+                        "application approval decisions require a human-interactive mfg.report.review principal with approval.respond"
+                            .into(),
+                    ));
+                }
+                let credential = state
+                    .auth_token
+                    .as_deref()
+                    .unwrap_or("test-only-credential");
+                let (lease, public_key) = crate::api_routes::issue_human_decision_lease(
+                    &state.config_home,
+                    credential,
+                    request.review_ref.clone(),
+                    request.action.clone(),
+                    request.scope.clone(),
+                    request.evidence_digest.clone(),
+                    current_time_ms().saturating_add(60_000),
+                )
+                .map_err(|_| {
+                    AppHostError::Unavailable("decision authority is unavailable".into())
+                })?;
+                let verified = runtime::PrincipalVerifier::from_base64(&lease.key_id, &public_key)
+                    .map_err(|_| AppHostError::Denied("decision lease verification failed".into()))?
+                    .requiring_credential_epoch(principal.credential_epoch())
+                    .verify_decision_lease(
+                        &lease,
+                        &principal,
+                        &runtime::DecisionLeaseExpectation::new(
+                            request.review_ref.clone(),
+                            request.action.clone(),
+                            request.scope.clone(),
+                            request.evidence_digest.clone(),
+                        ),
+                    )
+                    .map_err(|error| {
+                        AppHostError::Denied(format!("decision lease verification failed: {error}"))
+                    })?;
+                let runtime = state
+                    .services
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| {
+                        AppHostError::Unavailable(
+                            "Gateway runtime approval service is not configured".into(),
+                        )
+                    })?
+                    .runtime_services();
+                runtime
+                    .consume_verified_decision_lease(verified)
+                    .map_err(|error| {
+                        if error.contains("already been consumed") {
+                            AppHostError::Denied("decision lease was already consumed".into())
+                        } else {
+                            AppHostError::Unavailable(
+                                "runtime decision lease store is unavailable".into(),
+                            )
+                        }
+                    })?;
+                let actor = format!("principal:{}", principal.claims().principal_id);
+                let receipt = runtime
+                    .approval_queue()
+                    .record_mfg_decision_fact(
+                        &request.approval_id,
+                        &request.review_ref,
+                        &actor,
+                        request.approved,
+                        &request.decision,
+                        &request.reason,
+                        &lease.claims.lease_id,
+                    )
+                    .map_err(AppHostError::Denied)?;
+                Ok(HostReceipt {
+                    id: receipt.approval_id.clone(),
+                    status: receipt.status.as_str().to_string(),
+                    replayed: receipt.message.starts_with("approval already "),
+                    payload: serde_json::json!({
+                        "kind": "cowd.approval.decision.receipt.v1",
+                        "approval": receipt,
+                        "decision_lease_ref": lease.claims.lease_id,
+                    }),
+                })
+            }
+            _ => Err(Self::unsupported("approval", &intent.kind)),
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationApprovalSubmitIntentV1 {
+    approval_id: String,
+    resource_ref: String,
+    review_ref: String,
+    action: String,
+    summary: String,
+    risk: TaskRisk,
+    evidence_refs: Vec<String>,
+    timeout_policy: ApprovalTimeoutPolicy,
+}
+
+impl ApplicationApprovalSubmitIntentV1 {
+    fn parse(intent: HostIntent) -> Result<Self, AppHostError> {
+        if intent.kind != APPROVAL_SUBMIT_INTENT_V1 {
+            return Err(AppHostError::Denied(format!(
+                "approval intent kind {} is not allowed",
+                intent.kind
+            )));
+        }
+        let request = serde_json::from_value::<Self>(intent.payload).map_err(|error| {
+            AppHostError::Denied(format!("invalid approval submit intent: {error}"))
+        })?;
+        for (field, value) in [
+            ("approval_id", request.approval_id.trim()),
+            ("resource_ref", request.resource_ref.trim()),
+            ("review_ref", request.review_ref.trim()),
+            ("action", request.action.trim()),
+            ("summary", request.summary.trim()),
+        ] {
+            if value.is_empty() {
+                return Err(AppHostError::Denied(format!("{field} must not be empty")));
+            }
+        }
+        Ok(request)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplicationApprovalDecisionIntentV1 {
+    approval_id: String,
+    review_ref: String,
+    action: String,
+    scope: String,
+    evidence_digest: String,
+    approved: bool,
+    decision: String,
+    reason: String,
+}
+
+impl ApplicationApprovalDecisionIntentV1 {
+    fn parse(intent: HostIntent) -> Result<Self, AppHostError> {
+        if intent.kind != APPROVAL_DECIDE_INTENT_V1 {
+            return Err(AppHostError::Denied(format!(
+                "approval intent kind {} is not allowed",
+                intent.kind
+            )));
+        }
+        let request = serde_json::from_value::<Self>(intent.payload).map_err(|error| {
+            AppHostError::Denied(format!("invalid approval decision intent: {error}"))
+        })?;
+        for (field, value) in [
+            ("approval_id", request.approval_id.trim()),
+            ("review_ref", request.review_ref.trim()),
+            ("action", request.action.trim()),
+            ("scope", request.scope.trim()),
+            ("evidence_digest", request.evidence_digest.trim()),
+            ("decision", request.decision.trim()),
+        ] {
+            if value.is_empty() {
+                return Err(AppHostError::Denied(format!("{field} must not be empty")));
+            }
+        }
+        Ok(request)
+    }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -259,6 +576,10 @@ impl CrossPlanePort for GatewayAppHostBinding {
         context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
+        // An embedded APP must not be able to manufacture another principal's
+        // invocation context.  Resolve the context back to the request that
+        // Gateway authenticated before accepting a CrossPlane action.
+        let _principal = self.verified_principal(context)?;
         let request = CrossPlaneDispatchIntentV1::parse(intent)?;
         let mode = request.mode.trim().to_string();
         let (idempotency_key, requested_action, platform, operation) = request.action(context);

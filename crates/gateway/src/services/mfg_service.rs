@@ -30,10 +30,7 @@ use matrix_core::{
     MatrixMetricDefinition, MatrixOntologyPack, MatrixQualityGateDecision, MatrixSourcePack,
 };
 use runtime::{CrossPlaneAction, CrossPlaneExecutionReceipt, IdentityTrust};
-use serde::Serialize;
-
 mod cross_plane;
-mod delivery;
 mod live;
 
 pub(crate) use live::{MfgLivePrincipalContext, MfgLiveServiceError};
@@ -51,34 +48,6 @@ pub(crate) struct MfgCrossPlaneBridgeRequest {
     pub(crate) provider_account: Option<String>,
     pub(crate) target_ref: Option<String>,
     pub(crate) resource_ref: Option<String>,
-}
-
-/// Internal delivery request. It is intentionally not deserializable from an
-/// HTTP payload because the actor is a Gateway-owned security boundary.
-#[derive(Debug)]
-pub(crate) struct MfgCockpitReportDeliveryRequest {
-    pub(crate) mode: String,
-    pub(crate) idempotency_key: Option<String>,
-    pub(crate) actor_principal: String,
-    pub(crate) actor_identity_ref: Option<String>,
-    pub(crate) source_channel: Option<String>,
-    pub(crate) requested_capability: Option<String>,
-    pub(crate) provider_account: Option<String>,
-    pub(crate) target_ref: Option<String>,
-    pub(crate) resource_ref: Option<String>,
-    pub(crate) channel: Option<String>,
-    pub(crate) template_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct MfgCockpitReportDeliveryOutcome {
-    pub(crate) mode: String,
-    pub(crate) status: String,
-    pub(crate) dispatch_status: String,
-    pub(crate) report: MfgCockpitReportSnapshot,
-    pub(crate) delivery_payload: app_mfg::MfgCockpitReportDeliveryPayload,
-    pub(crate) cross_plane_execution_receipt: CrossPlaneExecutionReceipt,
-    pub(crate) idempotent_replay: bool,
 }
 
 fn default_mfg_bridge_mode() -> String {

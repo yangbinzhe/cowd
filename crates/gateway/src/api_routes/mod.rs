@@ -287,6 +287,9 @@ async fn auth_middleware(
         ));
     };
     let app_request_context = generic_app_request_context(&state, &claims, request.headers());
+    state
+        .services
+        .bind_app_request_principal(&claims, &app_request_context.invocation);
     request
         .extensions_mut()
         .insert(AuthenticatedPrincipal(claims));
@@ -430,6 +433,38 @@ pub(super) fn authenticated_human_principal_for_surface(
 
     #[cfg(any(test, feature = "test-support"))]
     {
+        // Product integration tests may start a real local broker.  Use it
+        // whenever its socket exists so request principals and one-time
+        // decision leases share the same credential epoch.  The direct helper
+        // below remains only for isolated route tests that intentionally do
+        // not assemble a broker process.
+        let socket = auth_broker::BrokerClient::default_socket(config_home.join("auth-broker"));
+        if socket.exists() {
+            let client = auth_broker::BrokerClient::new(socket);
+            let result = client
+                .authenticate_human_for_surface(
+                    token,
+                    surface_id,
+                    requested_capabilities.clone(),
+                    Some(5 * 60 * 1_000),
+                )
+                .map_err(|error| error.to_string())?;
+            let lifecycle = client
+                .credential_lifecycle()
+                .map_err(|error| error.to_string())?;
+            if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+                return Err("local human credential is revoked".to_string());
+            }
+            let principal = runtime::PrincipalVerifier::from_base64(
+                &result.envelope.key_id,
+                &result.public_key_base64,
+            )
+            .map_err(|error| error.to_string())?
+            .requiring_credential_epoch(lifecycle.credential_epoch)
+            .verify(&result.envelope)
+            .map_err(|error| error.to_string())?;
+            return Ok((principal, result.entitlement));
+        }
         let requested_capabilities = if requested_capabilities.is_empty() {
             test_human_capabilities()
         } else {
@@ -655,6 +690,19 @@ pub(super) fn issue_human_decision_lease(
 
     #[cfg(any(test, feature = "test-support"))]
     {
+        let socket = auth_broker::BrokerClient::default_socket(config_home.join("auth-broker"));
+        if socket.exists() {
+            return auth_broker::BrokerClient::new(socket)
+                .issue_decision_lease(
+                    credential,
+                    review_id,
+                    action,
+                    scope,
+                    evidence_digest,
+                    expires_at_ms,
+                )
+                .map_err(|error| error.to_string());
+        }
         auth_broker::test_support::issue_decision_lease(
             config_home.join("auth-broker"),
             credential,
@@ -981,10 +1029,9 @@ pub mod test_support {
 
 pub fn api_router(state: Arc<AppState>) -> Router {
     // APP routers are immutable, while their generic host ports are attached
-    // only after the complete Gateway state exists. Bind before any route or
-    // background reconciler can receive traffic.
+    // only after the complete Gateway state exists. Bind before any route can
+    // receive traffic.
     state.services.bind_app_host_ports(&state);
-    mfg_routes::start_review_reconciler(&state);
     let public_routes = public_routes::router();
 
     let protected_routes = Router::new()
@@ -5754,6 +5801,49 @@ pub(crate) mod tests {
                 },
             )
             .expect("seed cockpit report for external APP route");
+        // Seed an external dead-letter report before product composition.
+        // The following HTTP sequence proves the new external review owner
+        // calls the real Gateway approval/decision host, rather than an
+        // adapter fixture or legacy Gateway MFG handler.
+        let review_report = {
+            let store = app_mfg::MfgStore::open_config_home(&config_home)
+                .expect("open external MFG store for review fixture");
+            let report = store
+                .generate_cockpit_report_idempotent(
+                    &cockpit_profile.profile_id,
+                    "gateway-external-review-report",
+                    app_mfg::MfgCockpitReportRequest {
+                        delivery_ref: Some("channel://feishu/user/local-human".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .expect("seed external review report");
+            for attempt in 1..=3 {
+                store
+                    .attach_cockpit_report_delivery(
+                        &report.report_id,
+                        app_mfg::MfgCockpitReportDeliveryReceipt::new(
+                            report.report_id.clone(),
+                            format!("gateway-review-failure-{attempt}"),
+                            "blocked",
+                            "runtime_unavailable",
+                            None,
+                        ),
+                    )
+                    .expect("seed external review delivery failure");
+            }
+            store
+                .get_cockpit_report(&report.report_id)
+                .expect("load seeded external review report")
+                .expect("seeded external review report exists")
+        };
+        assert!(app_mfg::MfgCockpitReportDeliveryState::from_report(&review_report).dead_lettered);
+        let review_runtime = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("Gateway test state has runtime services")
+            .runtime_services();
         let app = api_router(state);
 
         let bearer_snapshot = app
@@ -6026,6 +6116,105 @@ pub(crate) mod tests {
         assert_eq!(
             delivery_preview["cross_plane_execution_receipt"]["action"]["actor_principal"],
             "principal:local-human"
+        );
+
+        // Product proof for the new typed review boundary: authenticated
+        // external MFG persists review state, calls the concrete Gateway
+        // approval port, and has the host issue+consume its decision lease.
+        // Reject is intentionally terminal and local, so this assertion does
+        // not depend on a live Feishu connector; cross-plane product wiring
+        // is already exercised immediately above.
+        let review_requested = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/cockpit/reports/{}/reviews",
+                        review_report.report_id
+                    ))
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-review-request")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_report_revision": review_report.revision,
+                            "reason": "real Gateway approval-host proof",
+                            "evidence_refs": ["evidence://gateway-review-proof"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let review_requested_status = review_requested.status();
+        let review_requested: serde_json::Value = serde_json::from_slice(
+            &to_bytes(review_requested.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            review_requested_status,
+            StatusCode::OK,
+            "{review_requested}"
+        );
+        assert_eq!(review_requested["review"]["status"], "pending_approval");
+        let review_id = review_requested["review"]["review_id"]
+            .as_str()
+            .expect("external review id")
+            .to_string();
+        let review_revision = review_requested["review"]["revision"]
+            .as_u64()
+            .expect("external review revision");
+        let review_decided = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/cockpit/report-reviews/{review_id}/decision"
+                    ))
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-review-decision")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "decision": "reject",
+                            "expected_revision": review_revision,
+                            "reason": "real Gateway lease should record typed rejection",
+                            "evidence_refs": ["evidence://gateway-review-proof"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let review_decided_status = review_decided.status();
+        let review_decided: serde_json::Value = serde_json::from_slice(
+            &to_bytes(review_decided.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(review_decided_status, StatusCode::OK, "{review_decided}");
+        assert_eq!(review_decided["review"]["status"], "rejected");
+        assert!(review_decided["decision_lease_ref"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        let approval_id = review_decided["approval_id"]
+            .as_str()
+            .expect("external review approval id");
+        let approval = review_runtime
+            .approval_queue()
+            .get(approval_id)
+            .expect("Gateway approval queue received external review fact");
+        assert_eq!(approval.status, runtime::GlobalApprovalStatus::Denied);
+        assert_eq!(
+            approval.source.review_ref.as_deref(),
+            Some(review_id.as_str())
         );
 
         let login = app

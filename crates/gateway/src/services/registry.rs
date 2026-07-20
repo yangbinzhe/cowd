@@ -188,6 +188,17 @@ impl GatewayServices {
         self.app_host_binding.bind(state);
     }
 
+    /// Associate an APP request correlation id with the Gateway-verified
+    /// principal before an external APP can submit a host effect.
+    pub(crate) fn bind_app_request_principal(
+        &self,
+        principal: &runtime::VerifiedPrincipal,
+        context: &cowd_app_sdk::InvocationContext,
+    ) {
+        self.app_host_binding
+            .bind_request_principal(principal, context);
+    }
+
     /// Gateway only projects the Runtime-owned capability snapshot. Baseline
     /// services used by static command/tests intentionally expose core-only
     /// capabilities and never perform environment discovery.
