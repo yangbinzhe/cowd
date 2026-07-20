@@ -11,10 +11,10 @@ publish.workspace = true
 # Product composition owns the host's credential lifecycle authority.
 auth-broker = { path = "../auth-broker" }
 cowd-app-host = { path = "../app-host" }
-cowd-app-mfg-contract = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "e0d15eca7b19a87b35b6d2fdb000d8ec5b374945" }
-cowd-app-mfg-core = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "e0d15eca7b19a87b35b6d2fdb000d8ec5b374945" }
-cowd-app-mfg-adapter = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "e0d15eca7b19a87b35b6d2fdb000d8ec5b374945" }
-cowd-app-mfg-tui = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "e0d15eca7b19a87b35b6d2fdb000d8ec5b374945" }
+cowd-app-mfg-contract = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "834b50a9115f6ab8ee6540a0d77832566aeb49f3" }
+cowd-app-mfg-core = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "834b50a9115f6ab8ee6540a0d77832566aeb49f3" }
+cowd-app-mfg-adapter = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "834b50a9115f6ab8ee6540a0d77832566aeb49f3" }
+cowd-app-mfg-tui = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "834b50a9115f6ab8ee6540a0d77832566aeb49f3" }
 
 [lints]
 workspace = true
