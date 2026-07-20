@@ -333,8 +333,6 @@ pub(super) fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteI
 
 pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/apps/mfg/contract", get(mfg_contract_handler))
-        .route("/api/apps/mfg/app", get(mfg_app_handler))
         .route(
             "/api/apps/mfg/production/governance",
             get(mfg_production_governance_handler),
@@ -695,11 +693,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/apps/mfg/assignments/:id/command",
             post(mfg_assignment_command_handler),
         )
-        .route(
-            "/api/apps/mfg/live/snapshot",
-            get(mfg_live_snapshot_handler),
-        )
-        .route("/api/apps/mfg/live", get(mfg_live_projection_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             state,
             mfg_capability_middleware,

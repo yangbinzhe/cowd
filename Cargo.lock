@@ -48,6 +48,7 @@ dependencies = [
 name = "app-bundle-mfg"
 version = "0.9.561"
 dependencies = [
+ "auth-broker",
  "cowd-app-host",
  "cowd-app-mfg-adapter",
  "cowd-app-mfg-contract",
@@ -375,7 +376,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-adapter"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8f6eb455e71ec30994cb671b8fc0db814c7151dd#8f6eb455e71ec30994cb671b8fc0db814c7151dd"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b#f4853d046e6c7932b78e58e7753de3f6b92e3b4b"
 dependencies = [
  "axum",
  "base64",
@@ -398,7 +399,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-contract"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8f6eb455e71ec30994cb671b8fc0db814c7151dd#8f6eb455e71ec30994cb671b8fc0db814c7151dd"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b#f4853d046e6c7932b78e58e7753de3f6b92e3b4b"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -411,7 +412,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-core"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8f6eb455e71ec30994cb671b8fc0db814c7151dd#8f6eb455e71ec30994cb671b8fc0db814c7151dd"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b#f4853d046e6c7932b78e58e7753de3f6b92e3b4b"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
@@ -430,7 +431,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-tui"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8f6eb455e71ec30994cb671b8fc0db814c7151dd#8f6eb455e71ec30994cb671b8fc0db814c7151dd"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=f4853d046e6c7932b78e58e7753de3f6b92e3b4b#f4853d046e6c7932b78e58e7753de3f6b92e3b4b"
 dependencies = [
  "cowd-app-mfg-contract",
  "serde",
@@ -860,6 +861,7 @@ dependencies = [
 name = "gateway"
 version = "0.9.561"
 dependencies = [
+ "app-bundle-mfg",
  "app-mfg",
  "app-mfg-contract",
  "approval",

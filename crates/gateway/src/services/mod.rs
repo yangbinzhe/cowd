@@ -56,7 +56,7 @@ pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
 pub(crate) use mfg_service::{
     MfgCockpitReportDeliveryOutcome, MfgCockpitReportDeliveryRequest, MfgCrossPlaneBridgeRequest,
-    MfgLivePrincipalContext, MfgLiveServiceError, MfgReviewReconcilerLifecycle, MfgService,
+    MfgLivePrincipalContext, MfgLiveServiceError, MfgService,
 };
 pub(crate) use mfg_skill_executor::{GatewayMfgSkillExecutor, MfgSkillExecutionPayload};
 pub(crate) use mission_service::{
@@ -67,6 +67,7 @@ pub(crate) use mission_service::{
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
+pub(crate) use registry::broker_backed_app_registry;
 pub(crate) use runtime_event_service::RuntimeEventService;
 pub(crate) use session_service::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,

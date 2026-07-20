@@ -76,6 +76,7 @@ impl GatewayServices {
         config_home: impl AsRef<std::path::Path>,
         capacity_config: runtime::GatewayCapacityConfig,
     ) -> Self {
+        let config_home = config_home.as_ref().to_path_buf();
         let command_host_runtime = Arc::clone(&runtime);
         let runtime_services = runtime.runtime_services();
         let runtime_events = RuntimeEventService::from_runtime_services(runtime_services.as_ref());
@@ -87,7 +88,7 @@ impl GatewayServices {
             Arc::clone(runtime_services.resource_manager()),
         );
         Self {
-            app_registry: Arc::new(cowd_app_host::AppRegistry::default()),
+            app_registry: Arc::new(embedded_app_registry(&config_home)),
             runtime: Some(runtime),
             session_manager: Some(session_manager),
             runtime_events,
@@ -102,7 +103,7 @@ impl GatewayServices {
             mission: MissionService::new()
                 .with_runtime_port(runtime::MissionRuntimePort::new(runtime_services)),
             capacity,
-            ..Self::baseline_with_config_home(config_home)
+            ..Self::baseline_with_config_home(&config_home)
         }
     }
 
@@ -123,7 +124,7 @@ impl GatewayServices {
         ));
         let task = TaskService::new();
         Self {
-            app_registry: Arc::new(cowd_app_host::AppRegistry::default()),
+            app_registry: Arc::new(embedded_app_registry(config_home)),
             runtime: None,
             session_manager: None,
             runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
@@ -380,4 +381,25 @@ impl GatewayServices {
         .into_iter()
         .all(|(service, operation)| has(service, operation))
     }
+}
+
+/// Build the deterministic first-party application registry for local/test
+/// Gateway instances. Production startup replaces this with the same static
+/// registry using broker-backed live credential revalidation before accepting
+/// traffic.  The APP source itself remains external; this helper owns only
+/// product assembly policy.
+fn embedded_app_registry(config_home: &std::path::Path) -> cowd_app_host::AppRegistry {
+    let mut registry = cowd_app_host::AppRegistry::default();
+    app_bundle_mfg::register_mfg_embedded_trusted(&mut registry, config_home.to_path_buf())
+        .expect("static MFG product contribution must have a valid descriptor");
+    registry
+}
+
+pub(crate) fn broker_backed_app_registry(
+    config_home: impl AsRef<std::path::Path>,
+) -> cowd_app_host::AppRegistry {
+    let mut registry = cowd_app_host::AppRegistry::default();
+    app_bundle_mfg::register_mfg_with_broker(&mut registry, config_home.as_ref().to_path_buf())
+        .expect("static MFG product contribution must have a valid descriptor");
+    registry
 }

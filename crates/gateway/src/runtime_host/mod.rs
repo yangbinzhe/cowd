@@ -941,17 +941,20 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
-    let services = Arc::new(crate::services::GatewayServices::new_with_session_manager(
-        Arc::clone(&runtime_service),
-        task_kernel.clone(),
-        surface_host.clone(),
-        cognitive.clone(),
-        approval_gate.clone(),
-        approval_repository,
-        Arc::clone(&session_manager),
-        &approval_dir,
-        capacity_config,
-    ));
+    let services = Arc::new(
+        crate::services::GatewayServices::new_with_session_manager(
+            Arc::clone(&runtime_service),
+            task_kernel.clone(),
+            surface_host.clone(),
+            cognitive.clone(),
+            approval_gate.clone(),
+            approval_repository,
+            Arc::clone(&session_manager),
+            &approval_dir,
+            capacity_config,
+        )
+        .with_app_registry(crate::services::broker_backed_app_registry(&approval_dir)),
+    );
     let _cleanup_handle =
         spawn_session_cleanup_task(Arc::clone(&session_manager), Duration::from_secs(300));
     tokio::spawn(async move {
