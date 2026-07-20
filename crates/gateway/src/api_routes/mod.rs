@@ -6125,6 +6125,143 @@ pub(crate) mod tests {
             assert_eq!(response["boundary"]["engine"], "matrix", "{path}");
         }
 
+        // The remaining source-pack write family uses the same authenticated
+        // product path. These requests prove MFG owns the fact batch and the
+        // historical plan/run record behavior, including durable replay;
+        // Gateway provides only registry/auth composition and Matrix's shared
+        // storage location.
+        let external_ingest_request = serde_json::json!({
+            "request_id": "gateway-external-source-ingest",
+            "facts": [{
+                "fact_id": "gateway-external-source-fact",
+                "snapshot_id": "gateway-external-source-snapshot",
+                "fact_type": "manufacturing_quality_event",
+                "entity_refs": ["factory:gateway"],
+                "metric_key": "quality_deviation_rate",
+                "measures": {"deviation": 1},
+                "source_ref": "source-pack://gateway-external-source-pack",
+                "confidence": 0.9,
+                "raw_hash": "sha256:gateway-external-source"
+            }]
+        });
+        let external_ingest = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/source-packs/gateway-external-source-pack/ingest-file")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-source-ingest")
+                    .body(Body::from(external_ingest_request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_ingest.status();
+        let body = to_bytes(external_ingest.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_ingest: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            external_ingest["kind"],
+            "mfg.reality.source_pack.ingest_file"
+        );
+        assert_eq!(external_ingest["ingested"], 1);
+        assert!(external_ingest["receipt"]["receipt_id"].is_string());
+
+        let external_ingest_replay = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/source-packs/gateway-external-source-pack/ingest-file")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-source-ingest")
+                    .body(Body::from(external_ingest_request.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_ingest_replay.status();
+        let body = to_bytes(external_ingest_replay.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_ingest_replay: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_ingest_replay["receipt"]["status"], "replayed");
+
+        for (path, key, run_id, expected_kind, expected_mode) in [
+            (
+                "/api/apps/mfg/reality/source-packs/gateway-external-source-pack/connector-runs/plan",
+                "gateway-external-source-plan",
+                "gateway-external-source-plan-run",
+                "mfg.reality.connector_run.plan",
+                "plan",
+            ),
+            (
+                "/api/apps/mfg/reality/source-packs/gateway-external-source-pack/connector-runs/run",
+                "gateway-external-source-run",
+                "gateway-external-source-run-run",
+                "mfg.reality.connector_run",
+                "run",
+            ),
+        ] {
+            let request = serde_json::json!({
+                "request_id": format!("gateway-external-source-{expected_mode}"),
+                "run": {
+                    "run_id": run_id,
+                    "resource_ref": "connector://gateway-external-source-pack",
+                    "expected_rows": 1,
+                    "checksum": "sha256:gateway-external-source"
+                }
+            });
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("authorization", "Bearer mfg-live-auth-token")
+                        .header("content-type", "application/json")
+                        .header("idempotency-key", key)
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{path}: {}", String::from_utf8_lossy(&body));
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["kind"], expected_kind, "{path}");
+            assert_eq!(response["run"]["run_id"], run_id, "{path}");
+            assert_eq!(response["run"]["mode"], expected_mode, "{path}");
+            assert!(response["receipt"]["receipt_id"].is_string(), "{path}");
+
+            let replay = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("authorization", "Bearer mfg-live-auth-token")
+                        .header("content-type", "application/json")
+                        .header("idempotency-key", key)
+                        .body(Body::from(request.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = replay.status();
+            let body = to_bytes(replay.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{path}: {}", String::from_utf8_lossy(&body));
+            let replay: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(replay["receipt"]["status"], "replayed", "{path}");
+        }
+
         let external_recompute = app
             .clone()
             .oneshot(

@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-app-mfg-contract = { package = "cowd-app-mfg-contract", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "11ffa7884cf4d609081669599abec52632fe23c6" }
+app-mfg-contract = { package = "cowd-app-mfg-contract", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "01cc6737aea19b09c998f26483175248f42cfd7a" }
 harness-contract = { path = "../harness-contract" }
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = { version = "0.28", features = ["event-stream"] }

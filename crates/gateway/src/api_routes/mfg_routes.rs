@@ -16,9 +16,8 @@ use axum::{
     Extension, Json, Router,
 };
 use matrix_core::{
-    MatrixComputeJobInput, MatrixConnectorRunInput, MatrixEntity, MatrixEntityInput, MatrixFact,
-    MatrixFactInput, MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation,
-    MatrixRelationInput,
+    MatrixComputeJobInput, MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput,
+    MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -139,10 +138,6 @@ pub(super) fn register_mfg_openapi_schemas(
     );
     registry.register_type::<MfgRealityComputeJobPlanRequest>("MfgRealityComputeJobPlanRequest");
     registry.register_type::<MfgRealityEvidenceBuildRequest>("MfgRealityEvidenceBuildRequest");
-    registry.register_type::<MfgRealitySourcePackIngestFileRequest>(
-        "MfgRealitySourcePackIngestFileRequest",
-    );
-    registry.register_type::<MfgRealityConnectorRunRequest>("MfgRealityConnectorRunRequest");
     registry.register_type::<MfgAlertListQuery>("MfgAlertListQuery");
     registry.register_type::<MfgAlertRuleUpsertRequest>("MfgAlertRuleUpsertRequest");
     registry
@@ -219,18 +214,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/production/governance",
             get(mfg_production_governance_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/source-packs/:id/ingest-file",
-            post(mfg_reality_source_pack_ingest_file_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/source-packs/:id/connector-runs/plan",
-            post(mfg_reality_source_pack_connector_run_plan_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/source-packs/:id/connector-runs/run",
-            post(mfg_reality_source_pack_connector_run_execute_handler),
         )
         .route(
             "/api/apps/mfg/reality/metrics/snapshots/materialize",
@@ -2031,26 +2014,6 @@ struct MfgRealityEvidenceBuildRequest {
     problem_statement: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealitySourcePackIngestFileRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    facts: Vec<MatrixFactInput>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityConnectorRunRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    run: Option<MatrixConnectorRunInput>,
-}
-
 fn default_matrix_bridge_mode() -> String {
     "dry_run".to_string()
 }
@@ -2159,95 +2122,6 @@ async fn mfg_reality_source_pack_get_handler(
         "kind": "mfg.reality.source_pack",
         "source_pack": source_pack,
         "revision": revision,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_source_pack_ingest_file_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<MfgRealitySourcePackIngestFileRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .matrix
-        .validate_source_pack(&state.config_home, &id)
-        .map_err(matrix_error)?;
-    let mut attention = Vec::new();
-    for input in request.facts {
-        let fact = MatrixFact::from_input(input);
-        let item = state
-            .services
-            .matrix
-            .ingest_fact(&state.config_home, &fact)
-            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        attention.push(item);
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.source_pack.ingest_file",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "source_pack_id": id,
-        "ingested": attention.len(),
-        "attention": attention,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_source_pack_connector_run_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<MfgRealityConnectorRunRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let mut input = request.run.unwrap_or(MatrixConnectorRunInput {
-        run_id: None,
-        mode: Some("plan".to_string()),
-        resource_ref: None,
-        partition_ref: None,
-        credential_ref: None,
-        expected_rows: None,
-        checksum: None,
-    });
-    input.mode = Some("plan".to_string());
-    let run = state
-        .services
-        .matrix
-        .plan_connector_run(&state.config_home, &id, input)
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.connector_run.plan",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "run": run,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_source_pack_connector_run_execute_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Json(request): Json<MfgRealityConnectorRunRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let mut input = request.run.unwrap_or(MatrixConnectorRunInput {
-        run_id: None,
-        mode: Some("run".to_string()),
-        resource_ref: None,
-        partition_ref: None,
-        credential_ref: None,
-        expected_rows: None,
-        checksum: None,
-    });
-    input.mode = Some("run".to_string());
-    let run = state
-        .services
-        .matrix
-        .plan_connector_run(&state.config_home, &id, input)
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.connector_run",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "run": run,
         "boundary": mfg_reality_boundary(),
     })))
 }
