@@ -57,36 +57,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "app-mfg"
-version = "0.9.561"
-dependencies = [
- "app-mfg-contract",
- "chrono",
- "matrix-core",
- "matrix-repository",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "sha2",
- "storage",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "app-mfg-contract"
-version = "0.9.561"
-dependencies = [
- "chrono",
- "matrix-core",
- "schemars",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
 name = "approval"
 version = "0.9.561"
 dependencies = [
@@ -118,8 +88,8 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "auth-broker"
 version = "0.9.561"
 dependencies = [
- "app-mfg-contract",
  "base64",
+ "cowd-app-mfg-contract",
  "harness-contract",
  "ring",
  "rustix 1.1.4",
@@ -316,8 +286,8 @@ dependencies = [
 name = "cli"
 version = "0.9.561"
 dependencies = [
- "app-mfg-contract",
  "auth-broker",
+ "cowd-app-mfg-contract",
  "gateway",
  "runtime",
  "sandbox-launcher",
@@ -862,8 +832,6 @@ name = "gateway"
 version = "0.9.561"
 dependencies = [
  "app-bundle-mfg",
- "app-mfg",
- "app-mfg-contract",
  "approval",
  "async-trait",
  "auth-broker",
@@ -873,6 +841,8 @@ dependencies = [
  "chrono",
  "connector",
  "cowd-app-host",
+ "cowd-app-mfg-contract",
+ "cowd-app-mfg-core",
  "cowd-app-sdk",
  "fact-kernel",
  "futures",
@@ -3264,8 +3234,8 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tui"
 version = "0.9.561"
 dependencies = [
- "app-mfg-contract",
  "chrono",
+ "cowd-app-mfg-contract",
  "crossterm",
  "futures",
  "harness-contract",
