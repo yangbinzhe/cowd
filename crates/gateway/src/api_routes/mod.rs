@@ -6262,6 +6262,102 @@ pub(crate) mod tests {
             assert_eq!(replay["receipt"]["status"], "replayed", "{path}");
         }
 
+        // Metric materialization, dependency CAS and compute-job planning are
+        // Matrix-owned durable writes too. Execute each through the full
+        // broker/Gateway/APP path and require canonical replay before moving
+        // to the separate high-risk compute execution route.
+        for (path, key, payload, expected_kind) in [
+            (
+                "/api/apps/mfg/reality/metrics/snapshots/materialize",
+                "gateway-external-metric-snapshot",
+                serde_json::json!({
+                    "request_id": "gateway-external-metric-snapshot",
+                    "metric_ids": ["gateway_external_metric"],
+                    "scope_ref": "factory:gateway"
+                }),
+                "mfg.reality.metric_snapshot",
+            ),
+            (
+                "/api/apps/mfg/reality/metric-dependencies/upsert",
+                "gateway-external-metric-dependency",
+                serde_json::json!({
+                    "request_id": "gateway-external-metric-dependency",
+                    "dependency": {
+                        "dependency_id": "gateway-external-metric-dependency",
+                        "upstream_metric_id": "gateway_upstream",
+                        "downstream_metric_id": "gateway_downstream",
+                        "dependency_type": "derived_from",
+                        "required_fact_types": ["manufacturing_quality_event"]
+                    }
+                }),
+                "mfg.reality.metric_dependency",
+            ),
+            (
+                "/api/apps/mfg/reality/compute/jobs/plan",
+                "gateway-external-compute-plan",
+                serde_json::json!({
+                    "request_id": "gateway-external-compute-plan",
+                    "job": {
+                        "job_id": "gateway-external-compute-plan",
+                        "trigger_fact_type": "manufacturing_quality_event",
+                        "metric_ids": ["gateway_external_metric"]
+                    }
+                }),
+                "mfg.reality.compute.plan",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("authorization", "Bearer mfg-live-auth-token")
+                        .header("content-type", "application/json")
+                        .header("idempotency-key", key)
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["kind"], expected_kind, "{path}");
+            assert!(response["receipt"]["receipt_id"].is_string(), "{path}");
+
+            let replay = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("authorization", "Bearer mfg-live-auth-token")
+                        .header("content-type", "application/json")
+                        .header("idempotency-key", key)
+                        .body(Body::from(payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = replay.status();
+            let body = to_bytes(replay.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let replay: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(replay["receipt"]["status"], "replayed", "{path}");
+        }
+
         let external_recompute = app
             .clone()
             .oneshot(

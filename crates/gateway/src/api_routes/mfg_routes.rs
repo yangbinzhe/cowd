@@ -16,8 +16,8 @@ use axum::{
     Extension, Json, Router,
 };
 use matrix_core::{
-    MatrixComputeJobInput, MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput,
-    MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput,
+    MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixRelation,
+    MatrixRelationInput,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -130,13 +130,6 @@ pub(super) fn register_mfg_openapi_schemas(
         "MfgRealityEntityConflictDecisionRequest",
     );
     registry.register_type::<MfgRealityRelationUpsertRequest>("MfgRealityRelationUpsertRequest");
-    registry.register_type::<MfgRealityMetricDependencyUpsertRequest>(
-        "MfgRealityMetricDependencyUpsertRequest",
-    );
-    registry.register_type::<MfgRealityMetricSnapshotMaterializeRequest>(
-        "MfgRealityMetricSnapshotMaterializeRequest",
-    );
-    registry.register_type::<MfgRealityComputeJobPlanRequest>("MfgRealityComputeJobPlanRequest");
     registry.register_type::<MfgRealityEvidenceBuildRequest>("MfgRealityEvidenceBuildRequest");
     registry.register_type::<MfgAlertListQuery>("MfgAlertListQuery");
     registry.register_type::<MfgAlertRuleUpsertRequest>("MfgAlertRuleUpsertRequest");
@@ -214,18 +207,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/production/governance",
             get(mfg_production_governance_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/metrics/snapshots/materialize",
-            post(mfg_reality_metric_snapshot_materialize_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/metric-dependencies/upsert",
-            post(mfg_reality_metric_dependency_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/compute/jobs/plan",
-            post(mfg_reality_compute_job_plan_handler),
         )
         .route(
             "/api/apps/mfg/reality/compute/jobs/:id/run",
@@ -1972,37 +1953,6 @@ struct MfgRealityRelationUpsertRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityMetricDependencyUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    expected_revision: Option<u64>,
-    dependency: MatrixMetricDependencyInput,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityMetricSnapshotMaterializeRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    metric_ids: Vec<String>,
-    #[serde(default)]
-    scope_ref: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityComputeJobPlanRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    job: MatrixComputeJobInput,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityEvidenceBuildRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -2216,73 +2166,6 @@ async fn mfg_reality_metric_lineage_handler(
         "schema_version": "matrix.metric_lineage.v1",
         "lineage": lineage,
         "dependency_revisions": dependency_revisions,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_metric_snapshot_materialize_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityMetricSnapshotMaterializeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if request.metric_ids.is_empty() {
-        return Err(mfg_api_error(
-            StatusCode::BAD_REQUEST,
-            "at least one metric_id is required",
-        ));
-    }
-    let snapshot = state
-        .services
-        .matrix
-        .materialize_metric_snapshot(&state.config_home, request.metric_ids, request.scope_ref)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.metric_snapshot",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "snapshot": snapshot,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_metric_dependency_upsert_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityMetricDependencyUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let outcome = state
-        .services
-        .matrix
-        .upsert_metric_dependency_checked(
-            &state.config_home,
-            &MatrixMetricDependency::from_input(request.dependency),
-            request.expected_revision,
-        )
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.metric_dependency",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "dependency": outcome.resource,
-        "created": outcome.created,
-        "previous_revision": outcome.previous_revision,
-        "revision": outcome.revision,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_compute_job_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityComputeJobPlanRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let plan = state
-        .services
-        .matrix
-        .plan_compute_job_for_fact_type(&state.config_home, request.job)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.compute.plan",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "plan": plan,
         "boundary": mfg_reality_boundary(),
     })))
 }
