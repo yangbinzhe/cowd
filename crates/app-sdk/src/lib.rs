@@ -279,6 +279,18 @@ pub trait WorkContextPort: Send + Sync {
     ) -> Result<HostReceipt, AppHostError>;
 }
 
+/// Read-only product/runtime facts that an APP may use to present its own
+/// governance posture. The host returns only a closed snapshot; it never
+/// exposes configuration, a service handle, a token or an arbitrary probe.
+#[async_trait]
+pub trait PlatformPort: Send + Sync {
+    async fn query(
+        &self,
+        context: &InvocationContext,
+        intent: HostIntent,
+    ) -> Result<HostReceipt, AppHostError>;
+}
+
 /// The only service bundle visible to an APP. Concrete Cowd services are
 /// intentionally hidden behind explicit ports so an APP cannot downcast into
 /// Gateway state or obtain secrets.
@@ -289,6 +301,7 @@ pub trait AppHostPorts: Send + Sync {
     fn connector(&self) -> &dyn ConnectorPort;
     fn reality(&self) -> &dyn RealityPort;
     fn work_context(&self) -> &dyn WorkContextPort;
+    fn platform(&self) -> &dyn PlatformPort;
 }
 
 #[derive(Clone)]

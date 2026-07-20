@@ -117,6 +117,13 @@ impl MfgHostEffectPort for CowdSdkMfgHostEffects {
                     .execute(&invocation, intent)
                     .await
             }
+            MfgHostEffect::Platform => {
+                self.context
+                    .ports()
+                    .platform()
+                    .query(&invocation, intent)
+                    .await
+            }
         }
         .map_err(Self::error)?;
         Ok(Self::receipt(receipt))

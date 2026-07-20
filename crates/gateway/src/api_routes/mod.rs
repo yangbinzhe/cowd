@@ -5873,6 +5873,26 @@ pub(crate) mod tests {
         });
         let app = api_router(state);
 
+        let external_governance = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps/mfg/production/governance")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_governance.status();
+        let body = to_bytes(external_governance.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_governance: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_governance["kind"], "mfg.production_governance");
+        assert!(external_governance["bundle"]["runbook_present"].as_bool() == Some(true));
+
         // Product-level proof of the V562-24 boundary: authenticated Gateway
         // routing reaches the external MFG fact/evidence owner, while the APP
         // can only append its outcome and request a ContextItem through the

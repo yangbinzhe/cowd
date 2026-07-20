@@ -12,11 +12,11 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::post,
     Extension, Json, Router,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::mfg_outcomes::{
     append_mfg_execution_outcome, mfg_action_execution_outcome, mfg_skill_run_execution_outcome,
@@ -178,10 +178,6 @@ pub(super) fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteI
 
 pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
-        .route(
-            "/api/apps/mfg/production/governance",
-            get(mfg_production_governance_handler),
-        )
         .route("/api/apps/mfg/incidents", post(mfg_incident_create_handler))
         .route(
             "/api/apps/mfg/incidents/:id/analyze",
@@ -1824,87 +1820,6 @@ fn default_matrix_bridge_mode() -> String {
     "dry_run".to_string()
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct MfgProductionGovernanceBundle {
-    auth_token_configured: bool,
-    approval_gate_configured: bool,
-    session_store_ready: bool,
-    surface_runtime_ready: bool,
-    audit_export_surface: bool,
-    cross_plane_audit_surface: bool,
-    runbook_present: bool,
-    health_capability_present: bool,
-}
-
-async fn mfg_production_governance_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let bundle = MfgProductionGovernanceBundle {
-        auth_token_configured: state.auth_token.is_some(),
-        approval_gate_configured: state.services.approval.is_configured(),
-        session_store_ready: state.services.session.has_unified_store(),
-        surface_runtime_ready: state.services.surface.is_runtime_available(),
-        audit_export_surface: true,
-        cross_plane_audit_surface: true,
-        runbook_present: state
-            .workspace_root
-            .join("docs/operator/mfg-production-runbook.md")
-            .is_file(),
-        health_capability_present: mfg_application_capabilities()
-            .contains(&"production_governance_bundle"),
-    };
-
-    let checks = [
-        bundle.auth_token_configured,
-        bundle.approval_gate_configured,
-        bundle.session_store_ready,
-        bundle.surface_runtime_ready,
-        bundle.audit_export_surface,
-        bundle.cross_plane_audit_surface,
-        bundle.runbook_present,
-        bundle.health_capability_present,
-    ];
-    let score = checks.iter().filter(|ok| **ok).count();
-    let status = if score == checks.len() {
-        "ready"
-    } else {
-        "attention"
-    };
-    let mut reasons = Vec::new();
-    if !bundle.auth_token_configured {
-        reasons.push("auth_token_not_configured");
-    }
-    if !bundle.approval_gate_configured {
-        reasons.push("approval_gate_missing");
-    }
-    if !bundle.session_store_ready {
-        reasons.push("session_store_unavailable");
-    }
-    if !bundle.surface_runtime_ready {
-        reasons.push("surface_runtime_unavailable");
-    }
-    if !bundle.runbook_present {
-        reasons.push("production_runbook_missing");
-    }
-
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.production_governance",
-        "status": status,
-        "bundle": bundle,
-        "readiness": {
-            "score": score,
-            "total": checks.len(),
-            "ready": score == checks.len(),
-            "reasons": reasons,
-        },
-        "evidence": {
-            "audit_export_route": "/api/audit/export",
-            "cross_plane_audit_route": "/api/cross-plane/audit",
-            "production_runbook": "docs/operator/mfg-production-runbook.md",
-        }
-    })))
-}
-
 async fn mfg_reality_source_pack_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -2233,75 +2148,6 @@ fn mfg_reality_boundary() -> serde_json::Value {
         "engine": "matrix",
         "ownership": "MFG consumes Reality Core projections; Reality Core owns Matrix management.",
     })
-}
-
-fn mfg_application_capabilities() -> Vec<&'static str> {
-    vec![
-        "data_plane_adapter",
-        "data_plane_ingest_plan",
-        "data_plane_watermark",
-        "data_plane_replay_policy",
-        "connector_runtime",
-        "connector_run_receipt",
-        "connector_quality_report",
-        "server_manufacturing_ontology",
-        "entity_match_candidate",
-        "entity_conflict_decision",
-        "entity_survivorship_rule",
-        "metric_attention_plan",
-        "metric_snapshot_materialize",
-        "metric_attention_scoring",
-        "incremental_metric_focus",
-        "cockpit_report_snapshot",
-        "scheduled_report_foundation",
-        "cockpit_report_delivery_bridge",
-        "cockpit_report_payload_templates",
-        "cockpit_report_schedule_runner",
-        "cockpit_report_delivery_retry_state",
-        "cockpit_report_webui_visibility",
-        "production_operation_package",
-        "production_governance_bundle",
-        "memory_case_promotion",
-        "playbook_recommendation",
-        "mfg_skill_pack",
-        "incident_skill_agent_graph",
-        "command_center_projection",
-        "incident_room_projection",
-        "source_onboarding_pack",
-        "source_pack_delta_plan",
-        "production_pilot_gate",
-        "personal_cockpit_projection",
-        "cockpit_profile_thresholds",
-        "evidence_quality_gate",
-        "insight_quality_gate",
-        "cross_plane_action_bridge",
-        "incremental_compute_job",
-        "scoped_metric_recompute",
-        "metric_dependency_graph",
-        "metric_lineage",
-        "fact_type_metric_impact",
-        "server_manufacturing_domain_pack",
-        "server_manufacturing_seed",
-        "entity_relation_network",
-        "entity_source_key_resolution",
-        "entity_impact_trace",
-        "fact_ingest",
-        "metric_recompute",
-        "metric_state",
-        "change_event",
-        "attention_hot",
-        "evidence_packet_build",
-        "evidence_packet_get",
-        "evidence_context_item",
-        "incident_agent_graph",
-        "incident_operational_analysis",
-        "action_execution_feedback",
-        "skill_execution_record",
-        "skill_execution_query",
-        "incident_queue",
-        "command_center_live",
-        "incident_list",
-    ]
 }
 
 async fn mfg_incidents_list_handler(

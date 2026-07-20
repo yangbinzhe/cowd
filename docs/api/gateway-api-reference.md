@@ -607,7 +607,7 @@ Edge 包发现、健康、热加载、surface/connector/resource 投影。
 | `POST` | `/api/apps/mfg/ontology/server-manufacturing/seed` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_server_manufacturing_ontology_seed_handler` | `mfg_routes.rs` | P2 |
 | `GET` | `/api/apps/mfg/playbooks/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_playbook_get_handler` | `mfg_routes.rs` | P2 |
 | `POST` | `/api/apps/mfg/playbooks/upsert` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_playbook_upsert_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/production/governance` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_production_governance_handler` | `mfg_routes.rs` | P2 |
+| `GET` | `/api/apps/mfg/production/governance` | MFG 外置应用查询接口 | - | 无 | - | `mfg_production_governance_handler` | `cowd-app-mfg/app-mfg-adapter` | P2 |
 | `GET` | `/api/apps/mfg/reality/attention/hot` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_reality_attention_hot_handler` | `mfg_routes.rs` | P1 |
 | `GET` | `/api/apps/mfg/reality/changes` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_reality_changes_handler` | `mfg_routes.rs` | P1 |
 | `GET` | `/api/apps/mfg/reality/compute/jobs/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_compute_job_get_handler` | `mfg_routes.rs` | P1 |

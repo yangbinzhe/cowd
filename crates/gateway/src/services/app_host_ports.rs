@@ -13,7 +13,8 @@ use std::{
 use async_trait::async_trait;
 use cowd_app_sdk::{
     AppHostError, AppHostPorts, ApprovalPort, ConnectorPort, CowdAppContext, CrossPlanePort,
-    HostIntent, HostReceipt, InvocationContext, RealityPort, RuntimePort, WorkContextPort,
+    HostIntent, HostReceipt, InvocationContext, PlatformPort, RealityPort, RuntimePort,
+    WorkContextPort,
 };
 use harness_contract::{
     core::TaskRisk,
@@ -60,6 +61,10 @@ pub(crate) const WORK_CONTEXT_APPEND_SESSION_EVENT_INTENT_V1: &str =
 /// domain; the application never receives the Context service or its types.
 pub(crate) const WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_INTENT_V1: &str =
     "cowd.work_context.structured_evidence_item.v1";
+/// Closed, read-only host snapshot for an APP's own production-governance
+/// projection. The response is product status only, not a configuration API.
+pub(crate) const PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1: &str =
+    "cowd.platform.governance_snapshot.v1";
 
 const APP_REQUEST_PRINCIPAL_TTL: Duration = Duration::from_secs(300);
 const APP_REQUEST_PRINCIPAL_LIMIT: usize = 4096;
@@ -207,6 +212,10 @@ impl AppHostPorts for GatewayAppHostBinding {
     }
 
     fn work_context(&self) -> &dyn WorkContextPort {
+        self
+    }
+
+    fn platform(&self) -> &dyn PlatformPort {
         self
     }
 }
@@ -608,6 +617,40 @@ impl WorkContextPort for GatewayAppHostBinding {
                 })
             }
             _ => Err(Self::unsupported("work_context", &intent.kind)),
+        }
+    }
+}
+
+#[async_trait]
+impl PlatformPort for GatewayAppHostBinding {
+    async fn query(
+        &self,
+        context: &InvocationContext,
+        intent: HostIntent,
+    ) -> Result<HostReceipt, AppHostError> {
+        let state = self.state()?;
+        let _principal = self.verified_principal(context)?;
+        match intent.kind.as_str() {
+            PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1 if intent.payload.is_null() => Ok(HostReceipt {
+                id: format!("platform:governance:{}", context.request_id),
+                status: "completed".to_string(),
+                replayed: false,
+                payload: serde_json::json!({
+                    "kind": "cowd.platform.governance_snapshot.receipt.v1",
+                    "snapshot": {
+                        "auth_token_configured": state.auth_token.is_some(),
+                        "approval_gate_configured": state.services.approval.is_configured(),
+                        "session_store_ready": state.services.session.has_unified_store(),
+                        "surface_runtime_ready": state.services.surface.is_runtime_available(),
+                        "audit_export_surface": true,
+                        "cross_plane_audit_surface": true,
+                    },
+                }),
+            }),
+            PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1 => Err(AppHostError::Denied(
+                "platform governance snapshot intent must have a null payload".to_string(),
+            )),
+            _ => Err(Self::unsupported("platform", &intent.kind)),
         }
     }
 }
