@@ -45,6 +45,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-bundle-mfg"
+version = "0.9.561"
+dependencies = [
+ "cowd-app-host",
+ "cowd-app-mfg-adapter",
+ "cowd-app-mfg-contract",
+ "cowd-app-mfg-core",
+ "cowd-app-mfg-tui",
+]
+
+[[package]]
 name = "app-mfg"
 version = "0.9.561"
 dependencies = [
@@ -359,6 +370,70 @@ dependencies = [
  "cowd-app-sdk",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "cowd-app-mfg-adapter"
+version = "0.9.562-dev"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8f6eb455e71ec30994cb671b8fc0db814c7151dd#8f6eb455e71ec30994cb671b8fc0db814c7151dd"
+dependencies = [
+ "axum",
+ "base64",
+ "chrono",
+ "cowd-app-host",
+ "cowd-app-mfg-contract",
+ "cowd-app-mfg-core",
+ "cowd-app-mfg-tui",
+ "cowd-app-sdk",
+ "futures",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cowd-app-mfg-contract"
+version = "0.9.562-dev"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8f6eb455e71ec30994cb671b8fc0db814c7151dd#8f6eb455e71ec30994cb671b8fc0db814c7151dd"
+dependencies = [
+ "chrono",
+ "matrix-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "cowd-app-mfg-core"
+version = "0.9.562-dev"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8f6eb455e71ec30994cb671b8fc0db814c7151dd#8f6eb455e71ec30994cb671b8fc0db814c7151dd"
+dependencies = [
+ "chrono",
+ "cowd-app-mfg-contract",
+ "matrix-core",
+ "matrix-repository",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "cowd-app-mfg-tui"
+version = "0.9.562-dev"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8f6eb455e71ec30994cb671b8fc0db814c7151dd#8f6eb455e71ec30994cb671b8fc0db814c7151dd"
+dependencies = [
+ "cowd-app-mfg-contract",
+ "serde",
 ]
 
 [[package]]

@@ -9,10 +9,10 @@ publish.workspace = true
 
 [dependencies]
 cowd-app-host = { path = "../app-host" }
-cowd-app-mfg-contract = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "5e22dcd03c7c459665d988093512d7accfb7d35c" }
-cowd-app-mfg-core = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "5e22dcd03c7c459665d988093512d7accfb7d35c" }
-cowd-app-mfg-adapter = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "5e22dcd03c7c459665d988093512d7accfb7d35c" }
-cowd-app-mfg-tui = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "5e22dcd03c7c459665d988093512d7accfb7d35c" }
+cowd-app-mfg-contract = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "8f6eb455e71ec30994cb671b8fc0db814c7151dd" }
+cowd-app-mfg-core = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "8f6eb455e71ec30994cb671b8fc0db814c7151dd" }
+cowd-app-mfg-adapter = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "8f6eb455e71ec30994cb671b8fc0db814c7151dd" }
+cowd-app-mfg-tui = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "8f6eb455e71ec30994cb671b8fc0db814c7151dd" }
 
 [lints]
 workspace = true

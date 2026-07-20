@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/app-bundle-mfg",
     "crates/app-sdk",
     "crates/app-host",
     "crates/harness-contract",
@@ -31,6 +32,7 @@ members = [
 ]
 resolver = "2"
 default-members = [
+    "crates/app-bundle-mfg",
     "crates/app-sdk",
     "crates/app-host",
     "crates/harness-contract",
@@ -99,3 +101,13 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "allow", priority = -2 }
 unwrap_used = { level = "warn", priority = -1 }
 expect_used = { level = "warn", priority = -1 }
+
+# External APP crates resolve Cowd foundation packages from a Git revision.
+# Product composition patches them back to this workspace so the final binary
+# has exactly one SDK/foundation type identity, never a Git/path duplicate.
+[patch."https://gitee.com/eyeout/cowd"]
+cowd-app-sdk = { path = "crates/app-sdk" }
+cowd-app-host = { path = "crates/app-host" }
+matrix-core = { path = "crates/matrix/core" }
+matrix-repository = { path = "crates/matrix/repository" }
+storage = { path = "crates/storage" }

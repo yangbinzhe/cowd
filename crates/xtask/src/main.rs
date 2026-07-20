@@ -34,14 +34,26 @@ fn main() -> ExitCode {
 
 fn run(arguments: Vec<String>) -> Result<(), String> {
     match arguments.as_slice() {
+        [command, action, flag] if command == "apps" && action == "sync" && flag == "--locked" => {
+            sync_locked(&workspace_root()?)
+        }
         [command, action, flag]
-            if command == "apps"
-                && matches!(action.as_str(), "sync" | "verify")
-                && flag == "--locked" =>
+            if command == "apps" && action == "verify" && flag == "--locked" =>
         {
             verify_locked(&workspace_root()?)
         }
-        _ => Err("usage: cargo xtask apps <sync|verify> --locked".to_string()),
+        [command, action, app_id, revision_flag, revision]
+            if command == "apps"
+                && action == "update"
+                && app_id == "mfg"
+                && revision_flag == "--rev" =>
+        {
+            update_mfg_revision(&workspace_root()?, revision)
+        }
+        _ => Err(
+            "usage: cargo xtask apps <sync|verify> --locked | cargo xtask apps update mfg --rev <40-char-sha>"
+                .to_string(),
+        ),
     }
 }
 
@@ -73,6 +85,51 @@ fn verify_locked(root: &Path) -> Result<(), String> {
         lock.app_id, lock.rust_rev
     );
     Ok(())
+}
+
+/// Re-render only deterministic build inputs. It never clones, fetches,
+/// installs packages or rewrites a resolver lock.
+fn sync_locked(root: &Path) -> Result<(), String> {
+    let lock = parse_lock(&root.join("apps/mfg/source.lock.toml"))?;
+    validate_lock(&lock)?;
+    write_generated(
+        &root.join("crates/app-bundle-mfg/Cargo.toml"),
+        &render_bundle_manifest(&lock),
+    )?;
+    write_generated(
+        &root.join("surfaces/webui/apps.generated.ts"),
+        &render_webui_catalogue(&lock),
+    )?;
+    println!(
+        "APP source inputs synchronized: {} @ {}",
+        lock.app_id, lock.rust_rev
+    );
+    Ok(())
+}
+
+/// The only mutation command for the selected MFG source revision. Both
+/// Rust and WebUI revisions advance together before generated inputs change.
+fn update_mfg_revision(root: &Path, revision: &str) -> Result<(), String> {
+    if revision.len() != 40 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("--rev must be a full 40-character Git SHA".to_string());
+    }
+    let path = root.join("apps/mfg/source.lock.toml");
+    let current =
+        fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let lock = parse_lock(&path)?;
+    validate_lock(&lock)?;
+    let old = format!("rev = \"{}\"", lock.rust_rev);
+    let replacement = format!("rev = \"{revision}\"");
+    let occurrence_count = current.matches(&old).count();
+    if occurrence_count != 2 {
+        return Err(format!(
+            "{} must contain the locked MFG revision exactly twice, found {occurrence_count}",
+            path.display()
+        ));
+    }
+    fs::write(&path, current.replace(&old, &replacement))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    sync_locked(root)
 }
 
 fn parse_lock(path: &Path) -> Result<AppSourceLock, String> {
@@ -170,6 +227,14 @@ fn check_generated(path: &Path, expected: &str) -> Result<(), String> {
     }
 }
 
+fn write_generated(path: &Path, expected: &str) -> Result<(), String> {
+    let current = fs::read_to_string(path).ok();
+    if current.as_deref() != Some(expected) {
+        fs::write(path, expected).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn render_bundle_manifest(lock: &AppSourceLock) -> String {
     let dependencies = lock
         .rust_packages
@@ -229,5 +294,15 @@ mod tests {
         let mut lock = lock();
         lock.rust_rev = "short".to_string();
         assert!(validate_lock(&lock).is_err());
+    }
+
+    #[test]
+    fn revision_rendering_keeps_rust_and_webui_on_one_sha() {
+        let old = "0123456789abcdef0123456789abcdef01234567";
+        let new = "89abcdef0123456789abcdef0123456789abcdef";
+        let source = format!("[rust]\nrev = \"{old}\"\n[webui]\nrev = \"{old}\"\n");
+        let updated = source.replace(&format!("rev = \"{old}\""), &format!("rev = \"{new}\""));
+        assert_eq!(updated.matches(new).count(), 2);
+        assert!(!updated.contains(old));
     }
 }
