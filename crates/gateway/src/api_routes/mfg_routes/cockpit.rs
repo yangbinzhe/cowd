@@ -146,40 +146,6 @@ fn cockpit_mutation_error(error: MfgRepositoryError) -> MfgCockpitApiError {
     }
 }
 
-pub(super) async fn mfg_cockpit_profile_list_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Query(query): Query<MfgCockpitProfileListQuery>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let profiles = state
-        .services
-        .mfg
-        .list_cockpit_profiles(
-            &state.config_home,
-            query.cadence.as_deref(),
-            query.limit.unwrap_or(100).clamp(1, 500),
-        )
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .into_iter()
-        .filter(|profile| cockpit_profile_visible_to(profile, &principal))
-        .map(|profile| cockpit_profile_cropped_for(profile, &principal))
-        .collect::<Vec<_>>();
-    Ok(Json(
-        serde_json::json!({ "kind": "mfg.cockpit.profile_list", "items": profiles }),
-    ))
-}
-
-pub(super) async fn mfg_cockpit_widget_catalog_handler(
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "kind": "mfg.cockpit.widget_catalog",
-        "items": mfg_widget_catalog().into_iter().filter(|definition| cockpit_widget_allowed(definition, &principal)).collect::<Vec<_>>(),
-        "global_filter_schema": mfg_cockpit_global_filter_schema(),
-        "filter_merge_policy": mfg_cockpit_filter_merge_policy(),
-    }))
-}
-
 pub(super) async fn mfg_cockpit_profile_upsert_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
@@ -262,31 +228,6 @@ pub(super) async fn mfg_cockpit_profile_upsert_handler(
             "session_id": request.session_id,
             "profile": profile,
             "business_receipt": receipt,
-        }),
-        revision,
-    ))
-}
-
-pub(super) async fn mfg_cockpit_profile_get_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-) -> Result<impl IntoResponse, MfgCockpitApiError> {
-    let profile = state
-        .services
-        .mfg
-        .get_cockpit_profile(&state.config_home, &id)
-        .map_err(cockpit_internal_error)?
-        .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
-    if !cockpit_profile_visible_to(&profile, &principal) {
-        return Err(cockpit_scope_not_found("cockpit_profile", &id));
-    }
-    let revision = profile.revision;
-    let profile = cockpit_profile_cropped_for(profile, &principal);
-    Ok(cockpit_profile_response(
-        serde_json::json!({
-            "kind": "mfg.cockpit.profile",
-            "profile": profile,
         }),
         revision,
     ))
@@ -484,47 +425,6 @@ fn cockpit_profile_response(
     (headers, Json(value))
 }
 
-fn cockpit_projection_filters(
-    profile: &MfgCockpitProfile,
-    query: MfgCockpitProjectionQuery,
-) -> serde_json::Value {
-    let mut filters = profile
-        .global_filters
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    for (key, value) in [
-        ("entity_refs", query.entity),
-        ("metric_ids", query.metric),
-        ("severities", query.severity),
-        ("statuses", query.status),
-    ] {
-        if let Some(value) = value {
-            let values = value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            if values.is_empty() {
-                filters.remove(key);
-            } else {
-                filters.insert(key.to_string(), serde_json::json!(values));
-            }
-        }
-    }
-    for (key, value) in [("from", query.from), ("to", query.to)] {
-        if let Some(value) = value {
-            if value.trim().is_empty() {
-                filters.remove(key);
-            } else {
-                filters.insert(key.to_string(), serde_json::json!(value.trim()));
-            }
-        }
-    }
-    serde_json::Value::Object(filters)
-}
-
 fn cockpit_profile_scope_visible_to(
     profile: &MfgCockpitProfile,
     principal: &AuthenticatedPrincipal,
@@ -653,106 +553,6 @@ fn cockpit_report_mutable_by(
     }))
 }
 
-pub(super) async fn mfg_cockpit_projection_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Query(query): Query<MfgCockpitProjectionQuery>,
-) -> Result<impl IntoResponse, MfgCockpitApiError> {
-    let profile = state
-        .services
-        .mfg
-        .get_cockpit_profile(&state.config_home, &id)
-        .map_err(cockpit_internal_error)?
-        .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
-    if !cockpit_profile_visible_to(&profile, &principal) {
-        return Err(cockpit_scope_not_found("cockpit_profile", &id));
-    }
-    let filters = cockpit_projection_filters(&profile, query);
-    let mut projection = state
-        .services
-        .mfg
-        .cockpit_projection_with_filters(&state.config_home, &id, filters)
-        .map_err(|error| match error {
-            MfgRepositoryError::NotFound(message) => cockpit_not_found("cockpit_profile", &message),
-            other => cockpit_internal_error(other),
-        })?;
-    let original_widget_count = projection.widgets.len();
-    projection.profile = cockpit_profile_cropped_for(projection.profile, &principal);
-    let visible_instances = projection
-        .profile
-        .widget_instances
-        .iter()
-        .map(|instance| instance.instance_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    projection
-        .widgets
-        .retain(|widget| visible_instances.contains(widget.instance_id.as_str()));
-    if projection.widgets.len() != original_widget_count {
-        projection.summary = format!(
-            "{} permission_cropped={}",
-            projection.summary,
-            original_widget_count.saturating_sub(projection.widgets.len())
-        );
-    }
-    let revision = projection.profile.revision;
-    Ok(cockpit_profile_response(
-        serde_json::json!({
-            "kind": "mfg.cockpit.projection", "projection": projection,
-        }),
-        revision,
-    ))
-}
-
-pub(super) async fn mfg_cockpit_widget_projection_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath((id, instance_id)): AxumPath<(String, String)>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Query(query): Query<MfgCockpitProjectionQuery>,
-) -> Result<impl IntoResponse, MfgCockpitApiError> {
-    let profile = state
-        .services
-        .mfg
-        .get_cockpit_profile(&state.config_home, &id)
-        .map_err(cockpit_internal_error)?
-        .ok_or_else(|| cockpit_not_found("cockpit_profile", &id))?;
-    if !cockpit_profile_visible_to(&profile, &principal) {
-        return Err(cockpit_scope_not_found("cockpit_profile", &id));
-    }
-    let instance = profile
-        .widget_instances
-        .iter()
-        .find(|instance| instance.instance_id == instance_id)
-        .ok_or_else(|| cockpit_not_found("cockpit_widget", &instance_id))?;
-    let definition = mfg_widget_catalog()
-        .into_iter()
-        .find(|definition| definition.definition_id == instance.definition_id)
-        .ok_or_else(|| cockpit_not_found("cockpit_widget_definition", &instance.definition_id))?;
-    if !cockpit_widget_allowed(&definition, &principal) {
-        return Err(cockpit_capability_denied(
-            "cockpit_widget",
-            &instance_id,
-            &definition.required_capability,
-        ));
-    }
-    let filters = cockpit_projection_filters(&profile, query);
-    let projection = state
-        .services
-        .mfg
-        .cockpit_widget_projection_with_filters(&state.config_home, &id, &instance_id, filters)
-        .map_err(|error| match error {
-            MfgRepositoryError::NotFound(_) => cockpit_not_found("cockpit_widget", &instance_id),
-            other => cockpit_internal_error(other),
-        })?;
-    let revision = projection.profile_revision;
-    Ok(cockpit_profile_response(
-        serde_json::json!({
-            "kind": "mfg.cockpit.widget_projection", "projection": projection,
-        }),
-        revision,
-    ))
-}
-
 pub(super) async fn mfg_cockpit_report_generate_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -797,56 +597,6 @@ pub(super) async fn mfg_cockpit_report_generate_handler(
         "kind": "mfg.cockpit.report",
         "request_id": request.request_id,
         "session_id": request.session_id,
-        "report": report,
-    })))
-}
-
-pub(super) async fn mfg_cockpit_report_list_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Query(query): Query<MfgCockpitReportListQuery>,
-) -> Result<impl IntoResponse, MfgCockpitApiError> {
-    let reports = state
-        .services
-        .mfg
-        .list_cockpit_reports(
-            &state.config_home,
-            query.profile_id.as_deref(),
-            query.limit.unwrap_or(100).clamp(1, 500),
-        )
-        .map_err(cockpit_internal_error)?;
-    let items = reports
-        .into_iter()
-        .filter_map(
-            |report| match cockpit_report_accessible_to(&state, &report, &principal) {
-                Ok(true) => Some(Ok(report)),
-                Ok(false) => None,
-                Err(error) => Some(Err(cockpit_internal_error(error))),
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.cockpit.report_list",
-        "items": items,
-    })))
-}
-
-pub(super) async fn mfg_cockpit_report_get_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-) -> Result<impl IntoResponse, MfgCockpitApiError> {
-    let report = state
-        .services
-        .mfg
-        .get_cockpit_report(&state.config_home, &id)
-        .map_err(cockpit_internal_error)?
-        .ok_or_else(|| cockpit_not_found("cockpit_report", &id))?;
-    if !cockpit_report_accessible_to(&state, &report, &principal).map_err(cockpit_internal_error)? {
-        return Err(cockpit_scope_not_found("cockpit_report", &id));
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.cockpit.report",
         "report": report,
     })))
 }

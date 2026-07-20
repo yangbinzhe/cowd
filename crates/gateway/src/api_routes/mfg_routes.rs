@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use app_mfg::{
-    mfg_cockpit_filter_merge_policy, mfg_cockpit_global_filter_schema, mfg_widget_catalog,
-    MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
-    MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription, MfgAlertSubscriptionInput,
-    MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput, MfgAssignmentInput,
-    MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitReportDeliveryState,
+    mfg_widget_catalog, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand,
+    MfgAlertCommandInput, MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription,
+    MfgAlertSubscriptionInput, MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput,
+    MfgAssignmentInput, MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitReportDeliveryState,
     MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook,
     MfgRepositoryError,
 };
@@ -15,7 +14,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Extension, Json, Router,
 };
 use matrix_core::{
@@ -479,16 +478,12 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_execution_feedback_handler),
         )
         .route(
-            "/api/apps/mfg/cockpit/profiles",
-            get(mfg_cockpit_profile_list_handler),
-        )
-        .route(
             "/api/apps/mfg/cockpit/profiles/upsert",
             post(mfg_cockpit_profile_upsert_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/profiles/:id",
-            get(mfg_cockpit_profile_get_handler).delete(mfg_cockpit_profile_delete_handler),
+            delete(mfg_cockpit_profile_delete_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/profiles/:id/clone",
@@ -499,32 +494,12 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_cockpit_profile_share_handler),
         )
         .route(
-            "/api/apps/mfg/cockpit/widget-catalog",
-            get(mfg_cockpit_widget_catalog_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/profiles/:id/projection",
-            get(mfg_cockpit_projection_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/profiles/:id/widgets/:instance_id/projection",
-            get(mfg_cockpit_widget_projection_handler),
-        )
-        .route(
             "/api/apps/mfg/cockpit/profiles/:id/reports/generate",
             post(mfg_cockpit_report_generate_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/reports/schedules/run",
             post(mfg_cockpit_report_schedule_run_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/reports",
-            get(mfg_cockpit_report_list_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/reports/:id",
-            get(mfg_cockpit_report_get_handler),
         )
         .route(
             "/api/apps/mfg/cockpit/reports/:id/deliver",

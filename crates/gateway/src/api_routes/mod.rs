@@ -5689,7 +5689,63 @@ pub(crate) mod tests {
         }
         assert!(broker_socket.exists(), "test auth broker did not start");
         let mut state = test_state_with_workspace(workspace.clone(), config_home.clone());
-        Arc::get_mut(&mut state).unwrap().auth_token = Some("mfg-live-auth-token".to_string());
+        let state_mut = Arc::get_mut(&mut state).expect("exclusive test state");
+        state_mut.auth_token = Some("mfg-live-auth-token".to_string());
+        // `test_state_with_workspace` intentionally gives most route tests an
+        // isolated service home. This product-assembly test instead requires
+        // the APP registry and Gateway request state to share one config home,
+        // otherwise the external APP quite correctly opens a different MFG
+        // SQLite domain from the seeded Gateway data.
+        let mut app_registry = cowd_app_host::AppRegistry::default();
+        app_bundle_mfg::register_mfg_embedded_trusted(&mut app_registry, config_home.clone())
+            .expect("test MFG APP registry");
+        state_mut.services = Arc::new(
+            (*state_mut.services)
+                .clone()
+                .with_app_registry(app_registry),
+        );
+        let cockpit_profile = state
+            .services
+            .mfg
+            .upsert_cockpit_profile(
+                &config_home,
+                &app_mfg::MfgCockpitProfile::from_input(app_mfg::MfgCockpitProfileInput {
+                    profile_id: Some("gateway-external-cockpit".to_string()),
+                    owner_ref: "principal:local-human".to_string(),
+                    display_name: Some("Gateway external Cockpit".to_string()),
+                    focus_refs: Vec::new(),
+                    focus_metric_ids: Vec::new(),
+                    thresholds: serde_json::Value::Null,
+                    template_id: None,
+                    cadence: None,
+                    expected_revision: None,
+                    scope: None,
+                    layout: None,
+                    global_filters: serde_json::Value::Null,
+                    widget_instances: Vec::new(),
+                    sharing_policy: Some(app_mfg::MfgDashboardSharingPolicy {
+                        visibility: "private".to_string(),
+                        viewer_refs: Vec::new(),
+                        editor_refs: Vec::new(),
+                    }),
+                }),
+                None,
+            )
+            .expect("seed cockpit profile for external APP route");
+        let cockpit_report = state
+            .services
+            .mfg
+            .generate_cockpit_report(
+                &config_home,
+                &cockpit_profile.profile_id,
+                app_mfg::MfgCockpitReportRequest {
+                    report_id: Some("gateway-external-cockpit-report".to_string()),
+                    cadence: None,
+                    delivery_ref: None,
+                    note: None,
+                },
+            )
+            .expect("seed cockpit report for external APP route");
         let app = api_router(state);
 
         let bearer_snapshot = app
@@ -5765,6 +5821,80 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(external_reality_metrics["kind"], "mfg.reality.metrics");
         assert_eq!(external_reality_metrics["boundary"]["engine"], "matrix");
+
+        // Cockpit reads are owned by the external APP as well. This crosses
+        // the full authenticated Gateway path, checks the profile visibility
+        // context reaches the APP, and proves GET no longer resolves to the
+        // residual Gateway mutation router.
+        for (path, expected_kind) in [
+            (
+                "/api/apps/mfg/cockpit/profiles".to_string(),
+                "mfg.cockpit.profile_list",
+            ),
+            (
+                format!(
+                    "/api/apps/mfg/cockpit/profiles/{}",
+                    cockpit_profile.profile_id
+                ),
+                "mfg.cockpit.profile",
+            ),
+            (
+                "/api/apps/mfg/cockpit/widget-catalog".to_string(),
+                "mfg.cockpit.widget_catalog",
+            ),
+            (
+                format!(
+                    "/api/apps/mfg/cockpit/profiles/{}/projection",
+                    cockpit_profile.profile_id
+                ),
+                "mfg.cockpit.projection",
+            ),
+            (
+                format!(
+                    "/api/apps/mfg/cockpit/profiles/{}/widgets/default-attention/projection",
+                    cockpit_profile.profile_id
+                ),
+                "mfg.cockpit.widget_projection",
+            ),
+            (
+                "/api/apps/mfg/cockpit/reports".to_string(),
+                "mfg.cockpit.report_list",
+            ),
+            (
+                format!("/api/apps/mfg/cockpit/reports/{}", cockpit_report.report_id),
+                "mfg.cockpit.report",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&path)
+                        .header("authorization", "Bearer mfg-live-auth-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let etag = response.headers().get(header::ETAG).cloned();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["kind"], expected_kind, "{path}");
+            if path.ends_with(&cockpit_profile.profile_id) {
+                assert_eq!(
+                    etag,
+                    Some(axum::http::HeaderValue::from_static("\"1\"")),
+                    "{path}: {response}"
+                );
+            }
+        }
 
         let login = app
             .clone()
