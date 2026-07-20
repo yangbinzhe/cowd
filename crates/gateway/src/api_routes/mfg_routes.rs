@@ -15,10 +15,7 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use matrix_core::{
-    MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixRelation,
-    MatrixRelationInput,
-};
+use matrix_core::{MatrixFact, MatrixFactInput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -119,17 +116,6 @@ pub(super) fn register_mfg_openapi_schemas(
     registry.register_type::<MfgSkillRunRequest>("MfgSkillRunRequest");
     registry.register_type::<MatrixDecisionTraceQuery>("MatrixDecisionTraceQuery");
     registry.register_type::<MfgRealityFactIngestRequest>("MfgRealityFactIngestRequest");
-    registry.register_type::<MfgRealityEntityUpsertRequest>("MfgRealityEntityUpsertRequest");
-    registry.register_type::<MfgRealityEntityResolveSourceKeyRequest>(
-        "MfgRealityEntityResolveSourceKeyRequest",
-    );
-    registry.register_type::<MfgRealityEntityMatchCandidateRequest>(
-        "MfgRealityEntityMatchCandidateRequest",
-    );
-    registry.register_type::<MfgRealityEntityConflictDecisionRequest>(
-        "MfgRealityEntityConflictDecisionRequest",
-    );
-    registry.register_type::<MfgRealityRelationUpsertRequest>("MfgRealityRelationUpsertRequest");
     registry.register_type::<MfgRealityEvidenceBuildRequest>("MfgRealityEvidenceBuildRequest");
     registry.register_type::<MfgAlertListQuery>("MfgAlertListQuery");
     registry.register_type::<MfgAlertRuleUpsertRequest>("MfgAlertRuleUpsertRequest");
@@ -157,11 +143,6 @@ pub(super) fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteI
         R::RealityMetricDependencyUpsert => "MfgRealityMetricDependencyUpsertRequest",
         R::RealityMetricDependencyAffectedPlan => "MfgRealityAffectedByFactTypeRequest",
         R::RealityComputeJobPlan => "MfgRealityComputeJobPlanRequest",
-        R::RealityEntityUpsert => "MfgRealityEntityUpsertRequest",
-        R::RealityEntityResolveSourceKey => "MfgRealityEntityResolveSourceKeyRequest",
-        R::RealityEntityMatchCandidate => "MfgRealityEntityMatchCandidateRequest",
-        R::RealityEntityConflictDecision => "MfgRealityEntityConflictDecisionRequest",
-        R::RealityRelationUpsert => "MfgRealityRelationUpsertRequest",
         R::RealityFactIngest => "MfgRealityFactIngestRequest",
         R::RealityEvidenceBuild => "MfgRealityEvidenceBuildRequest",
         R::DecisionTraceGet => "MatrixDecisionTraceQuery",
@@ -207,26 +188,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/production/governance",
             get(mfg_production_governance_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/entities/upsert",
-            post(mfg_reality_entity_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/entities/resolve-source-key",
-            post(mfg_reality_entity_resolve_source_key_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/entities/match-candidate",
-            post(mfg_reality_entity_match_candidate_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/entities/conflict-decision",
-            post(mfg_reality_entity_conflict_decision_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/relations/upsert",
-            post(mfg_reality_relation_upsert_handler),
         )
         .route(
             "/api/apps/mfg/reality/facts/ingest",
@@ -1893,62 +1854,6 @@ struct MfgRealityFactIngestRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityEntityUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    expected_revision: Option<u64>,
-    entity: MatrixEntityInput,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityEntityResolveSourceKeyRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    source_system: String,
-    source_key: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityEntityMatchCandidateRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    left_entity_id: String,
-    right_entity_id: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityEntityConflictDecisionRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    candidate_id: String,
-    survivor_entity_id: String,
-    retired_entity_id: String,
-    survivorship_rule: String,
-    #[serde(default)]
-    notes: Option<String>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityRelationUpsertRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    expected_revision: Option<u64>,
-    relation: MatrixRelationInput,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityEvidenceBuildRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -2233,114 +2138,6 @@ async fn mfg_reality_entity_get_handler(
     })))
 }
 
-async fn mfg_reality_entity_upsert_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityEntityUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let outcome = state
-        .services
-        .matrix
-        .upsert_entity_checked(
-            &state.config_home,
-            &MatrixEntity::from_input(request.entity),
-            request.expected_revision,
-        )
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.entity",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "entity": outcome.resource,
-        "created": outcome.created,
-        "previous_revision": outcome.previous_revision,
-        "revision": outcome.revision,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_entity_resolve_source_key_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityEntityResolveSourceKeyRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let entity = state
-        .services
-        .matrix
-        .resolve_entity_by_source_key(
-            &state.config_home,
-            &request.source_system,
-            &request.source_key,
-        )
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| {
-            mfg_api_error(
-                StatusCode::NOT_FOUND,
-                "MFG Reality entity source key not found",
-            )
-        })?;
-    let revision = state
-        .services
-        .matrix
-        .resource_revision(&state.config_home, "entity", &entity.entity_id)
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.entity.resolution",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "source_system": request.source_system,
-        "source_key": request.source_key,
-        "entity": entity,
-        "revision": revision,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_entity_match_candidate_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityEntityMatchCandidateRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let candidate = state
-        .services
-        .matrix
-        .propose_entity_match(
-            &state.config_home,
-            &request.left_entity_id,
-            &request.right_entity_id,
-        )
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.entity.match_candidate",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "candidate": candidate,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_entity_conflict_decision_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityEntityConflictDecisionRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let decision = state
-        .services
-        .matrix
-        .decide_entity_conflict(
-            &state.config_home,
-            &request.candidate_id,
-            &request.survivor_entity_id,
-            &request.retired_entity_id,
-            &request.survivorship_rule,
-            request.notes,
-        )
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.entity.conflict_decision",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "decision": decision,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
 async fn mfg_reality_entity_relations_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -2384,31 +2181,6 @@ async fn mfg_reality_entity_impact_path_handler(
         "kind": "mfg.reality.entity.impact_path",
         "schema_version": "matrix.entity_impact.v1",
         "trace": trace,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_relation_upsert_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityRelationUpsertRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let outcome = state
-        .services
-        .matrix
-        .upsert_relation_checked(
-            &state.config_home,
-            &MatrixRelation::from_input(request.relation),
-            request.expected_revision,
-        )
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.relation",
-        "request_id": request.request_id,
-        "session_id": request.session_id,
-        "relation": outcome.resource,
-        "created": outcome.created,
-        "previous_revision": outcome.previous_revision,
-        "revision": outcome.revision,
         "boundary": mfg_reality_boundary(),
     })))
 }

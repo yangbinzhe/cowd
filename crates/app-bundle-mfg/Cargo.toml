@@ -13,10 +13,10 @@ async-trait = "0.1"
 auth-broker = { path = "../auth-broker" }
 cowd-app-host = { path = "../app-host" }
 cowd-app-sdk = { path = "../app-sdk" }
-cowd-app-mfg-contract = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "b5afaa3e7ec26958fd7b0dfab0a13d8ae6b5c3de" }
-cowd-app-mfg-core = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "b5afaa3e7ec26958fd7b0dfab0a13d8ae6b5c3de" }
-cowd-app-mfg-adapter = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "b5afaa3e7ec26958fd7b0dfab0a13d8ae6b5c3de" }
-cowd-app-mfg-tui = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "b5afaa3e7ec26958fd7b0dfab0a13d8ae6b5c3de" }
+cowd-app-mfg-contract = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "6c414e7ad2772ba38cf86c4d921674f71a7b6c85" }
+cowd-app-mfg-core = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "6c414e7ad2772ba38cf86c4d921674f71a7b6c85" }
+cowd-app-mfg-adapter = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "6c414e7ad2772ba38cf86c4d921674f71a7b6c85" }
+cowd-app-mfg-tui = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "6c414e7ad2772ba38cf86c4d921674f71a7b6c85" }
 
 [lints]
 workspace = true
