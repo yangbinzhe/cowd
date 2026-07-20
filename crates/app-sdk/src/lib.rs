@@ -268,7 +268,11 @@ pub trait RealityPort: Send + Sync {
 
 #[async_trait]
 pub trait WorkContextPort: Send + Sync {
-    async fn read(
+    /// Invoke one closed work-context effect.  Work context includes both
+    /// read projections and append-only session records, so `execute` is
+    /// intentionally broader and less misleading than the former `read`
+    /// spelling.
+    async fn execute(
         &self,
         context: &InvocationContext,
         intent: HostIntent,

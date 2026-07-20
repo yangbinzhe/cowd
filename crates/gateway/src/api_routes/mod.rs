@@ -5873,6 +5873,133 @@ pub(crate) mod tests {
         });
         let app = api_router(state);
 
+        // Product-level proof of the V562-24 boundary: authenticated Gateway
+        // routing reaches the external MFG fact/evidence owner, while the APP
+        // can only append its outcome and request a ContextItem through the
+        // newly concrete, request-principal-bound WorkContext port.
+        let external_fact = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/facts/ingest")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-fact")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "gateway-external-fact",
+                            "session_id": "gateway-external-fact-session",
+                            "facts": [{
+                                "fact_id": "gateway-external-fact",
+                                "snapshot_id": "gateway-external-fact-snapshot",
+                                "fact_type": "manufacturing_quality_event",
+                                "entity_refs": ["factory:gateway"],
+                                "metric_key": "quality_deviation_rate",
+                                "dimensions": {"line": "gateway"},
+                                "measures": {"deviation": 1},
+                                "source_ref": "source-pack://gateway-external-source-pack",
+                                "confidence": 0.9
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_fact.status();
+        let body = to_bytes(external_fact.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_fact: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_fact["kind"], "mfg.reality.fact.ingest");
+        assert!(external_fact["receipt"]["receipt_id"].is_string());
+        let attention_id = external_fact["attention"][0]["attention_id"]
+            .as_str()
+            .expect("external fact attention id")
+            .to_string();
+
+        let external_evidence = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/evidence/build")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-evidence")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "gateway-external-evidence",
+                            "session_id": "gateway-external-fact-session",
+                            "attention_id": attention_id,
+                            "problem_statement": "Gateway product evidence projection"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_evidence.status();
+        let body = to_bytes(external_evidence.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_evidence: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let packet_id = external_evidence["packet"]["packet_id"]
+            .as_str()
+            .expect("external evidence packet id")
+            .to_string();
+        assert!(external_evidence["receipt"]["receipt_id"].is_string());
+
+        let external_quality_gate = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/reality/evidence/{packet_id}/quality-gate"
+                    ))
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("idempotency-key", "gateway-external-evidence-quality")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(external_quality_gate.status(), StatusCode::OK);
+
+        let external_context = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/apps/mfg/reality/evidence/{packet_id}/context"
+                    ))
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_context.status();
+        let body = to_bytes(external_context.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_context: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            external_context["kind"],
+            "mfg.reality.evidence.context_item"
+        );
+        assert_eq!(
+            external_context["context_item"]["id"],
+            format!("structured-evidence:{packet_id}")
+        );
+
         // This is a real Gateway -> verified APP request, not an adapter
         // fixture. It proves the migrated write opens canonical Matrix, emits
         // a durable MFG receipt, and leaves the source available to the

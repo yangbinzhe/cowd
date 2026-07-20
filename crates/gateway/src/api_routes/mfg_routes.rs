@@ -15,19 +15,14 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use matrix_core::{MatrixFact, MatrixFactInput};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::services::{
-    GatewayMatrixRepositoryError as MatrixStoreError, MfgCrossPlaneBridgeRequest,
-};
-
-use super::matrix_outcomes::{
-    append_matrix_execution_outcome, matrix_evidence_packet_outcome, matrix_fact_outcome,
-};
 use super::mfg_outcomes::{
     append_mfg_execution_outcome, mfg_action_execution_outcome, mfg_skill_run_execution_outcome,
+};
+use crate::services::{
+    GatewayMatrixRepositoryError as MatrixStoreError, MfgCrossPlaneBridgeRequest,
 };
 mod incidents;
 mod operations;
@@ -115,8 +110,6 @@ pub(super) fn register_mfg_openapi_schemas(
     registry.register_type::<MfgSkillPlanRequest>("MfgSkillPlanRequest");
     registry.register_type::<MfgSkillRunRequest>("MfgSkillRunRequest");
     registry.register_type::<MatrixDecisionTraceQuery>("MatrixDecisionTraceQuery");
-    registry.register_type::<MfgRealityFactIngestRequest>("MfgRealityFactIngestRequest");
-    registry.register_type::<MfgRealityEvidenceBuildRequest>("MfgRealityEvidenceBuildRequest");
     registry.register_type::<MfgAlertListQuery>("MfgAlertListQuery");
     registry.register_type::<MfgAlertRuleUpsertRequest>("MfgAlertRuleUpsertRequest");
     registry
@@ -188,22 +181,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/production/governance",
             get(mfg_production_governance_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/facts/ingest",
-            post(mfg_reality_fact_ingest_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/evidence/build",
-            post(mfg_reality_evidence_build_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/evidence/:id/quality-gate",
-            post(mfg_reality_evidence_quality_gate_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/evidence/:id/context",
-            get(mfg_reality_evidence_context_handler),
         )
         .route("/api/apps/mfg/incidents", post(mfg_incident_create_handler))
         .route(
@@ -1843,28 +1820,6 @@ struct MatrixDecisionTraceQuery {
     report_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityFactIngestRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    facts: Vec<MatrixFactInput>,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityEvidenceBuildRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    attention_id: Option<String>,
-    #[serde(default)]
-    problem_statement: Option<String>,
-}
-
 fn default_matrix_bridge_mode() -> String {
     "dry_run".to_string()
 }
@@ -2185,43 +2140,6 @@ async fn mfg_reality_entity_impact_path_handler(
     })))
 }
 
-async fn mfg_reality_fact_ingest_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityFactIngestRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    if request.facts.is_empty() {
-        return Err(mfg_api_error(
-            StatusCode::BAD_REQUEST,
-            "at least one MFG Reality fact is required",
-        ));
-    }
-    let session_id = request.session_id.clone();
-    let mut facts = Vec::with_capacity(request.facts.len());
-    let mut attention = Vec::with_capacity(request.facts.len());
-    for input in request.facts {
-        let fact = MatrixFact::from_input(input);
-        let item = state
-            .services
-            .matrix
-            .ingest_fact(&state.config_home, &fact)
-            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        append_matrix_execution_outcome(&state, session_id.as_deref(), matrix_fact_outcome(&fact))
-            .await
-            .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-        facts.push(fact);
-        attention.push(item);
-    }
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.fact.ingest",
-        "request_id": request.request_id,
-        "session_id": session_id,
-        "ingested": facts.len(),
-        "facts": facts,
-        "attention": attention,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
 async fn mfg_reality_changes_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -2252,36 +2170,6 @@ async fn mfg_reality_attention_hot_handler(
     })))
 }
 
-async fn mfg_reality_evidence_build_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityEvidenceBuildRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let session_id = request.session_id.clone();
-    let packet = state
-        .services
-        .matrix
-        .build_evidence_packet(
-            &state.config_home,
-            request.attention_id.as_deref(),
-            request.problem_statement.as_deref(),
-        )
-        .map_err(matrix_error)?;
-    append_matrix_execution_outcome(
-        &state,
-        session_id.as_deref(),
-        matrix_evidence_packet_outcome(&packet),
-    )
-    .await
-    .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.evidence.packet",
-        "request_id": request.request_id,
-        "session_id": session_id,
-        "packet": packet,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
 async fn mfg_reality_evidence_get_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -2300,26 +2188,6 @@ async fn mfg_reality_evidence_get_handler(
     Ok(Json(serde_json::json!({
         "kind": "mfg.reality.evidence.packet",
         "packet": packet,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_evidence_quality_gate_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let idempotency_key = mfg_idempotency_key(&headers, None)
-        .map_err(|error| mfg_api_error(StatusCode::BAD_REQUEST, error.message))?;
-    let gate_id = stable_mfg_resource_id("quality-gate", &idempotency_key);
-    let gate = state
-        .services
-        .matrix
-        .evaluate_evidence_quality_with_gate_id(&state.config_home, &id, &gate_id)
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.quality_gate",
-        "gate": gate,
         "boundary": mfg_reality_boundary(),
     })))
 }
@@ -2343,28 +2211,10 @@ async fn mfg_reality_quality_gate_get_handler(
     })))
 }
 
-async fn mfg_reality_evidence_context_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let packet = state
-        .services
-        .matrix
-        .get_evidence_packet(&state.config_home, &id)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        .ok_or_else(|| {
-            mfg_api_error(
-                StatusCode::NOT_FOUND,
-                "MFG Reality evidence packet not found",
-            )
-        })?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.evidence.context_item",
-        "context_item": state.services.context.structured_evidence_item(&packet),
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
+// Legacy unmounted Reality read helpers remain until the final legacy-carrier
+// deletion phase. The active route surface for their paths is already the
+// external APP; this mapper keeps their historical error shape compilable in
+// the interim without re-registering any MFG route in Gateway.
 fn matrix_error(error: MatrixStoreError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
         MatrixStoreError::NotFound(message) => mfg_api_error(StatusCode::NOT_FOUND, message),

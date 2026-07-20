@@ -114,7 +114,7 @@ impl MfgHostEffectPort for CowdSdkMfgHostEffects {
                 self.context
                     .ports()
                     .work_context()
-                    .read(&invocation, intent)
+                    .execute(&invocation, intent)
                     .await
             }
         }
