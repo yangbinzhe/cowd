@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
     extract::{Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 
 use crate::task_kernel::TaskStatus;
 
-use super::{AppState, ErrorResponse, api_error};
+use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()

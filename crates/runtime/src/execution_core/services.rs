@@ -23,14 +23,14 @@ use thiserror::Error;
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 use super::goal::GoalStore;
 use super::graph::{
-    ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
-    ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError,
-    ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ResourceQuota,
-    ScopeLockError, ScopeLockManager, WorktreeLeaseError, WorktreeLeaseManager,
     executors::{
         AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
         SynthesizeNodeExecutor, VerifyNodeExecutor,
     },
+    ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
+    ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError,
+    ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ResourceQuota,
+    ScopeLockError, ScopeLockManager, WorktreeLeaseError, WorktreeLeaseManager,
 };
 use super::protocols::ProtocolResultReducer;
 use crate::agent::binding::request_for_intent;
@@ -3642,26 +3642,22 @@ mod tests {
             left.executor_registry().available_kinds(),
             right.executor_registry().available_kinds()
         );
-        assert!(
-            left.executor_registry()
-                .available_kinds()
-                .contains("inline_model")
-        );
-        assert!(
-            left.executor_registry()
-                .available_kinds()
-                .contains("tool_batch")
-        );
-        assert!(
-            left.executor_registry()
-                .available_kinds()
-                .contains("session_dispatch")
-        );
-        assert!(
-            left.executor_registry()
-                .available_kinds()
-                .contains("cross_plane_connector")
-        );
+        assert!(left
+            .executor_registry()
+            .available_kinds()
+            .contains("inline_model"));
+        assert!(left
+            .executor_registry()
+            .available_kinds()
+            .contains("tool_batch"));
+        assert!(left
+            .executor_registry()
+            .available_kinds()
+            .contains("session_dispatch"));
+        assert!(left
+            .executor_registry()
+            .available_kinds()
+            .contains("cross_plane_connector"));
         assert!(!Arc::ptr_eq(
             left.cross_plane_connector_executor(),
             right.cross_plane_connector_executor()
@@ -3762,13 +3758,11 @@ mod tests {
         services
             .refresh_definition_catalog()
             .expect("catalog refresh");
-        assert!(
-            services
-                .agent_runtime()
-                .catalog()
-                .get(definition_id.as_str())
-                .is_none()
-        );
+        assert!(services
+            .agent_runtime()
+            .catalog()
+            .get(definition_id.as_str())
+            .is_none());
     }
 
     #[test]
@@ -3887,18 +3881,14 @@ mod tests {
             .agents()
             .read_revision(&revision_ref)
             .expect("candidate revision");
-        assert!(
-            revision
-                .agent_markdown
-                .contains("repeated evidence validation failure")
-        );
+        assert!(revision
+            .agent_markdown
+            .contains("repeated evidence validation failure"));
         assert!(services.evolution_release_reviews().unwrap().is_empty());
-        assert!(
-            services
-                .consider_agent_evolution(&trigger)
-                .expect("idempotent planner")
-                .is_none()
-        );
+        assert!(services
+            .consider_agent_evolution(&trigger)
+            .expect("idempotent planner")
+            .is_none());
     }
 
     #[test]
@@ -4149,13 +4139,11 @@ mod tests {
         services
             .refresh_definition_catalog()
             .expect("catalog refresh");
-        assert!(
-            services
-                .agent_runtime()
-                .catalog()
-                .get("workspace/external/reviewer")
-                .is_none()
-        );
+        assert!(services
+            .agent_runtime()
+            .catalog()
+            .get("workspace/external/reviewer")
+            .is_none());
     }
 
     #[test]
@@ -4269,12 +4257,10 @@ mod tests {
             .clone()
             .expect("stable graph id");
         let graph = services.graph_state_store().load(&graph_id).unwrap();
-        assert!(
-            graph
-                .node_statuses
-                .values()
-                .all(|status| *status == ExecutionNodeStatus::WaitingExternal)
-        );
+        assert!(graph
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::WaitingExternal));
 
         let target_outbox = store
             .claim_session_runtime_outbox(
@@ -4398,11 +4384,9 @@ mod tests {
             services.workspace_root(),
             "0.9.472",
         );
-        assert!(
-            importer
-                .import_receipt_file(temp.path().join("missing-receipt.json"))
-                .is_err()
-        );
+        assert!(importer
+            .import_receipt_file(temp.path().join("missing-receipt.json"))
+            .is_err());
 
         let graph = harness_contract::execution_graph::ExecutionGraph::new("blocked");
         let graph_id = graph.id.clone();
@@ -4813,12 +4797,10 @@ mod tests {
             .graph_state_store()
             .load(&projection.graph_id)
             .expect("canonical graph");
-        assert!(
-            graph
-                .node_statuses
-                .values()
-                .all(|status| *status == ExecutionNodeStatus::Completed)
-        );
+        assert!(graph
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::Completed));
         let team_bindings = graph
             .nodes
             .iter()
@@ -4841,11 +4823,9 @@ mod tests {
         assert!(team_bindings.iter().all(|binding| {
             binding.data_lease.team_id.as_deref() == Some("team-runtime-integration")
         }));
-        assert!(
-            services.team_runtime().projection_json()["teams"]
-                .as_array()
-                .is_some_and(|teams| teams.len() == 1)
-        );
+        assert!(services.team_runtime().projection_json()["teams"]
+            .as_array()
+            .is_some_and(|teams| teams.len() == 1));
     }
 
     #[tokio::test]

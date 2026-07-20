@@ -23,15 +23,13 @@ pub struct RecallSourceResult {
     pub degraded_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct RecallReport {
     pub selected: Vec<RecallCandidate>,
     pub omitted: Vec<RecallOmission>,
     pub sources: Vec<RecallSourceResult>,
     pub truncated: bool,
 }
-
 
 impl RecallReport {
     pub fn from_selected_omitted(

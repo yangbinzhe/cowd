@@ -297,11 +297,9 @@ mod tests {
         assert!(GATEWAY_CLIENT.contains("subscribe_mfg_live"));
         assert!(MFG_STATE.contains("apply_live_envelope"));
         assert_eq!(panel, p0_expected);
-        assert!(
-            routes
-                .iter()
-                .all(|route| crate::runtime_control_store::mfg_route_section(*route).is_some())
-        );
+        assert!(routes
+            .iter()
+            .all(|route| crate::runtime_control_store::mfg_route_section(*route).is_some()));
         assert!(GATEWAY_CLIENT.contains("mfg_tui_read"));
         assert!(GATEWAY_CLIENT.contains("mfg_tui_route_path"));
         assert!(MFG_STATE.contains("MfgOperationsState"));

@@ -9,8 +9,7 @@ use tokio::sync::RwLock;
 // ── Eviction Policy ───────────────────────────────────────────────────────
 
 /// Policy used when the active session count exceeds the configured maximum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EvictionPolicy {
     /// Evict the least-recently-used session.
     #[default]
@@ -30,7 +29,6 @@ impl Display for EvictionPolicy {
         }
     }
 }
-
 
 // ── Session Status ─────────────────────────────────────────────────────────
 

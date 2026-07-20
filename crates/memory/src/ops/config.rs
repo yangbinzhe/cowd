@@ -396,8 +396,7 @@ impl Default for LlmSummarizerConfig {
 // ── Memory-specific types ────────────────────────────────────────────────
 
 /// Top-level memory system configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MemoryConfig {
     pub store: StoreConfig,
     pub compression: CompressionConfig,
@@ -487,7 +486,6 @@ impl Default for TuningConfig {
         }
     }
 }
-
 
 /// Storage backend configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]

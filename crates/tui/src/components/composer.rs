@@ -3,15 +3,15 @@ pub mod model;
 
 use std::{cell::RefCell, ops::Range, rc::Rc};
 
+use crate::components::context_suggestions::ContextSuggestions;
+use crate::components::prompt::Prompt;
+use crate::components::RenderContext;
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use crate::components::context_suggestions::ContextSuggestions;
-use crate::components::prompt::Prompt;
-use crate::components::RenderContext;
 
 use self::model::ComposerModel;
 
@@ -153,23 +153,27 @@ fn compact_queue_preview(value: &str) -> String {
     }
 }
 
-fn composer_line(row: &layout::ComposerVisualRow, selection: Option<Range<usize>>) -> Line<'static> {
+fn composer_line(
+    row: &layout::ComposerVisualRow,
+    selection: Option<Range<usize>>,
+) -> Line<'static> {
     let Some(selection) = selection else {
         return Line::styled(row.text.clone(), Style::default());
     };
-    let spans = unicode_segmentation::UnicodeSegmentation::grapheme_indices(row.text.as_str(), true)
-        .map(|(offset, grapheme)| {
-            let start = row.start_byte.saturating_add(offset);
-            let end = start.saturating_add(grapheme.len());
-            let selected = start < selection.end && selection.start < end;
-            let style = if selected {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else {
-                Style::default()
-            };
-            Span::styled(grapheme.to_string(), style)
-        })
-        .collect::<Vec<_>>();
+    let spans =
+        unicode_segmentation::UnicodeSegmentation::grapheme_indices(row.text.as_str(), true)
+            .map(|(offset, grapheme)| {
+                let start = row.start_byte.saturating_add(offset);
+                let end = start.saturating_add(grapheme.len());
+                let selected = start < selection.end && selection.start < end;
+                let style = if selected {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                Span::styled(grapheme.to_string(), style)
+            })
+            .collect::<Vec<_>>();
     Line::from(spans)
 }
 
@@ -212,7 +216,9 @@ mod tests {
     #[test]
     fn selection_is_split_on_grapheme_boundaries_for_rendering() {
         let input = ComposerModel::new("a🙂e\u{301}");
-        let row = layout::ComposerLayout::from_model(&input, 20).rows.remove(0);
+        let row = layout::ComposerLayout::from_model(&input, 20)
+            .rows
+            .remove(0);
         let line = composer_line(&row, Some(1.."a🙂".len()));
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[1].content, "🙂");

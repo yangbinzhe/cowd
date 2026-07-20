@@ -101,7 +101,6 @@ struct SessionLifecycleEntry {
     updated_at_ms: u64,
 }
 
-
 #[derive(Debug, Default)]
 pub struct SessionLifecycleKernel {
     sessions: RwLock<HashMap<String, SessionLifecycleEntry>>,

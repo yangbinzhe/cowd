@@ -32,21 +32,21 @@ pub use analysis::{
     MfgAttributionCandidate, MfgImpactPath, MfgOperationalAnalysis, MfgRecommendedAction,
 };
 pub use app::{
-    MfgApplicationDescriptor, MfgApplicationDomain, MfgApplicationSurface,
-    MfgApplicationSurfaceKind, manufacturing_app_descriptor,
+    manufacturing_app_descriptor, MfgApplicationDescriptor, MfgApplicationDomain,
+    MfgApplicationSurface, MfgApplicationSurfaceKind,
 };
 pub use cockpit::{
-    MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitProjection,
-    MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
-    MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
-    MfgCockpitReportSnapshot, MfgCockpitWidget, MfgCockpitWidgetProjection, MfgDashboardLayout,
-    MfgDashboardScope, MfgDashboardSharingPolicy, MfgWidgetDefinition, MfgWidgetInstance,
-    MfgWidgetPlacement, default_mfg_widget_instances, mfg_cockpit_filter_merge_policy,
-    mfg_cockpit_global_filter_schema, mfg_widget_catalog,
+    default_mfg_widget_instances, mfg_cockpit_filter_merge_policy,
+    mfg_cockpit_global_filter_schema, mfg_widget_catalog, MfgCockpitProfile,
+    MfgCockpitProfileInput, MfgCockpitProjection, MfgCockpitReportDeliveryPayload,
+    MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
+    MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
+    MfgCockpitWidget, MfgCockpitWidgetProjection, MfgDashboardLayout, MfgDashboardScope,
+    MfgDashboardSharingPolicy, MfgWidgetDefinition, MfgWidgetInstance, MfgWidgetPlacement,
 };
 pub use domain::{
-    MfgDomainPack, MfgDomainScenario, MfgDomainSeedPlan, MfgDomainSeedResult,
-    server_manufacturing_domain_pack, server_manufacturing_seed_plan,
+    server_manufacturing_domain_pack, server_manufacturing_seed_plan, MfgDomainPack,
+    MfgDomainScenario, MfgDomainSeedPlan, MfgDomainSeedResult,
 };
 pub use execution::{
     MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgCrossPlaneBridgeReceipt,
@@ -62,9 +62,10 @@ pub use operations::{
     MfgSurfaceNotificationTarget,
 };
 pub use skill::{
-    MfgSkillExecutionContext, MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgSkillTelemetry,
-    MfgSkillToolCall, MfgSkillToolResult, plan_server_manufacturing_skills,
-    run_server_manufacturing_skill, server_manufacturing_skill_pack, skill_agent_node_id,
+    plan_server_manufacturing_skills, run_server_manufacturing_skill,
+    server_manufacturing_skill_pack, skill_agent_node_id, MfgSkillExecutionContext,
+    MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgSkillTelemetry, MfgSkillToolCall,
+    MfgSkillToolResult,
 };
 pub use store::MfgStore;
 pub use workflow::{

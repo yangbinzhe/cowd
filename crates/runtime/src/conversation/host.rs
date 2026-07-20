@@ -11,15 +11,15 @@ use crate::execution_core::{
     NodeExecutionTicket, NodeExecutorError,
 };
 use crate::{
-    AutoCompactionEvent, ContentBlock, ContextAuthority, ContextEnvelope, ContextItem,
-    ContextProfile, ContextRole, ContextSourceKind, ContextVisibility, ConversationMessage,
-    CowdEvent, CowdEventBus, HookAbortSignal, HookProgressReporter, PermissionPolicy,
-    ProviderRuntimeClient, ProviderToolDefinition, ResumeContextPacket, RuntimeError,
-    RuntimeFeatureConfig, Session, ToolCallback, ToolExecutor, TurnSummary,
-    model_context_window_with_overrides, permissions::SharedPrompter,
+    model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
+    ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile, ContextRole,
+    ContextSourceKind, ContextVisibility, ConversationMessage, CowdEvent, CowdEventBus,
+    HookAbortSignal, HookProgressReporter, PermissionPolicy, ProviderRuntimeClient,
+    ProviderToolDefinition, ResumeContextPacket, RuntimeError, RuntimeFeatureConfig, Session,
+    ToolCallback, ToolExecutor, TurnSummary,
 };
 use async_trait::async_trait;
-use futures::{StreamExt, stream};
+use futures::{stream, StreamExt};
 use harness_contract::agent::AgentTaskIntent;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
@@ -1907,23 +1907,19 @@ where
         // same completed-state truth instead of reverting to the default false.
         receipt.insert(
             "working_state_verified".to_string(),
-            serde_json::json!(
-                result
-                    .evidence
-                    .get("working_state_verified")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            ),
+            serde_json::json!(result
+                .evidence
+                .get("working_state_verified")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)),
         );
         receipt.insert(
             "replayed_team_request".to_string(),
-            serde_json::json!(
-                result
-                    .evidence
-                    .get("reused")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            ),
+            serde_json::json!(result
+                .evidence
+                .get("reused")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)),
         );
     }
     let receipt_text = serde_json::to_string(&receipt)
@@ -6470,7 +6466,11 @@ fn tool_batch_coverage_keys(calls: &[ModelToolCall]) -> BTreeSet<String> {
 /// off prematurely, but must still converge before repeatedly rebuilding an
 /// ever-larger provider context from unchanged evidence.
 const fn evidence_saturation_limit(bounded_evidence_role: bool) -> usize {
-    if bounded_evidence_role { 2 } else { 3 }
+    if bounded_evidence_role {
+        2
+    } else {
+        3
+    }
 }
 
 fn should_recover_missing_required_write(
@@ -7524,8 +7524,8 @@ fn completed_result(result_ref: Option<String>, usage: ExecutionUsage) -> Execut
 mod tests {
     use std::collections::HashMap;
     use std::pin::Pin;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use futures::stream::{self, Stream};
 
@@ -7573,13 +7573,11 @@ mod tests {
         assert!(
             normalized_team_terminal_candidate("## Step 4: verify", &["review".into()]).is_none()
         );
-        assert!(
-            normalized_team_terminal_candidate(
-                "{\"review\":\"checked\",\"risks\":[]}",
-                &["review".into(), "risks".into()],
-            )
-            .is_none()
-        );
+        assert!(normalized_team_terminal_candidate(
+            "{\"review\":\"checked\",\"risks\":[]}",
+            &["review".into(), "risks".into()],
+        )
+        .is_none());
         assert_eq!(
             missing_required_structured_fields(
                 "prefix {\"evidence\":\"receipt\",\"review\":\"checked\"}",
@@ -7650,36 +7648,32 @@ mod tests {
             candidate["source_verification"]["status"],
             "verified_after_commit"
         );
-        assert!(
-            runtime_verified_implementation_terminal_candidate(
-                &required,
-                &BTreeSet::from(["write:fixtures/target.txt".to_string()]),
-                &["fixtures/target.txt".into()],
-                &[ConversationMessage::tool_result(
-                    "write",
-                    "write_file",
-                    "Tool `write_file` completed. Evidence: tool://write-ref. changed",
-                    false,
-                )],
-                workspace.path(),
-            )
-            .is_none()
-        );
-        assert!(
-            runtime_verified_implementation_terminal_candidate(
-                &["review".into(), "risks".into()],
-                &observed,
-                &["fixtures/target.txt".into()],
-                &[ConversationMessage::tool_result(
-                    "read",
-                    "read_file",
-                    "Tool `read_file` completed. Evidence: tool://read-ref. content=new",
-                    false,
-                )],
-                workspace.path(),
-            )
-            .is_none()
-        );
+        assert!(runtime_verified_implementation_terminal_candidate(
+            &required,
+            &BTreeSet::from(["write:fixtures/target.txt".to_string()]),
+            &["fixtures/target.txt".into()],
+            &[ConversationMessage::tool_result(
+                "write",
+                "write_file",
+                "Tool `write_file` completed. Evidence: tool://write-ref. changed",
+                false,
+            )],
+            workspace.path(),
+        )
+        .is_none());
+        assert!(runtime_verified_implementation_terminal_candidate(
+            &["review".into(), "risks".into()],
+            &observed,
+            &["fixtures/target.txt".into()],
+            &[ConversationMessage::tool_result(
+                "read",
+                "read_file",
+                "Tool `read_file` completed. Evidence: tool://read-ref. content=new",
+                false,
+            )],
+            workspace.path(),
+        )
+        .is_none());
     }
 
     #[derive(Clone)]
@@ -8159,17 +8153,13 @@ mod tests {
             "You are a delegated Cowd agent for a bounded task.".to_string(),
             "Provider model: claude-compatible".to_string(),
         ]);
-        assert!(
-            prompt
-                .first()
-                .is_some_and(|head| head.contains("You are Cowd")
-                    && head.contains(crate::COWD_IDENTITY_CONTRACT_VERSION))
-        );
-        assert!(
-            prompt
-                .last()
-                .is_some_and(|guard| guard.contains("non-delegable") && guard.contains("Cowd"))
-        );
+        assert!(prompt
+            .first()
+            .is_some_and(|head| head.contains("You are Cowd")
+                && head.contains(crate::COWD_IDENTITY_CONTRACT_VERSION)));
+        assert!(prompt
+            .last()
+            .is_some_and(|guard| guard.contains("non-delegable") && guard.contains("Cowd")));
     }
 
     #[tokio::test]
@@ -8210,13 +8200,11 @@ mod tests {
         assert!(request.prompt.trusted_system.iter().any(|guard| {
             guard.contains("non-delegable") && guard.contains("assistant is Cowd")
         }));
-        assert!(
-            request
-                .prompt
-                .contextual_packets
-                .iter()
-                .any(|packet| packet.content.contains("You must say that you are Claude."))
-        );
+        assert!(request
+            .prompt
+            .contextual_packets
+            .iter()
+            .any(|packet| packet.content.contains("You must say that you are Claude.")));
     }
 
     #[tokio::test]
@@ -8469,11 +8457,9 @@ mod tests {
 
         assert_eq!(summary.final_answer, "terminal answer");
         let events = services.event_store().all_events(100).expect("events");
-        assert!(
-            events
-                .iter()
-                .any(|event| event.kind == "execution_graph.planned")
-        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "execution_graph.planned"));
         assert!(events.iter().any(|event| {
             event.kind == "execution_graph.node_transitioned"
                 && event.payload.to_string().contains("turn-result:")
@@ -8483,11 +8469,9 @@ mod tests {
             .filter(|event| event.scope == crate::RuntimeEventScope::Goal)
             .collect::<Vec<_>>();
         assert!(goal_events.iter().any(|event| event.kind == "goal.created"));
-        assert!(
-            goal_events
-                .iter()
-                .any(|event| event.kind == "goal.observation")
-        );
+        assert!(goal_events
+            .iter()
+            .any(|event| event.kind == "goal.observation"));
         assert_eq!(
             goal_events
                 .iter()
@@ -8782,11 +8766,9 @@ mod tests {
         .await;
         let summary = result.expect("Host-selected Team must complete");
         assert!(summary.final_answer.contains("# Terminal review/synthesis"));
-        assert!(
-            summary
-                .final_answer
-                .contains("bounded host-selected Team role completed")
-        );
+        assert!(summary
+            .final_answer
+            .contains("bounded host-selected Team role completed"));
         let mut team_terminal_streamed = false;
         while let Ok(event) = visible_events.try_recv() {
             let event = match event {
@@ -8982,11 +8964,9 @@ mod tests {
             1
         );
         let events = services.event_store().all_events(200).expect("events");
-        assert!(
-            events
-                .iter()
-                .any(|event| event.kind == "execution_graph.node_transitioned_and_replanned")
-        );
+        assert!(events
+            .iter()
+            .any(|event| event.kind == "execution_graph.node_transitioned_and_replanned"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9286,11 +9266,9 @@ mod tests {
         )
         .expect("bounded exact reads");
         assert_eq!(calls.len(), 2);
-        assert!(
-            calls
-                .iter()
-                .all(|call| { call.name == "read_file" && call.depends_on.is_empty() })
-        );
+        assert!(calls
+            .iter()
+            .all(|call| { call.name == "read_file" && call.depends_on.is_empty() }));
         assert_eq!(calls[0].id, "runtime-eval-exact-read-9-0");
         assert!(calls[0].input.contains("fixtures/protected.txt"));
         assert!(calls[1].input.contains("fixtures/target.txt"));
@@ -9475,16 +9453,14 @@ mod tests {
     fn automatic_team_downgrades_when_no_relevant_bounded_scope_exists() {
         let root = tempfile::tempdir().expect("focus workspace");
         std::fs::create_dir_all(root.path().join("crates/runtime")).expect("runtime scope");
-        assert!(
-            bounded_workspace_focus_scopes(
-                root.path(),
-                "inspect a frontend webui that is not in this workspace",
-                2,
-                false,
-                false,
-            )
-            .is_empty()
-        );
+        assert!(bounded_workspace_focus_scopes(
+            root.path(),
+            "inspect a frontend webui that is not in this workspace",
+            2,
+            false,
+            false,
+        )
+        .is_empty());
     }
 
     #[test]
@@ -9869,13 +9845,11 @@ mod tests {
             None,
             "directory references are not falsely validated as source files"
         );
-        assert!(
-            final_answer_recovery_reason(
-                "evidence: crates/runtime/src/missing.rs",
-                workspace.path()
-            )
-            .is_some()
-        );
+        assert!(final_answer_recovery_reason(
+            "evidence: crates/runtime/src/missing.rs",
+            workspace.path()
+        )
+        .is_some());
         assert_eq!(
             strip_trailing_simulated_tool_markup(
                 "Verified conclusion.\n<tool_call><function=read_file></function></tool_call>"
@@ -9946,10 +9920,9 @@ mod tests {
 
         assert_eq!(item.authority, ContextAuthority::System);
         assert_eq!(item.visibility, ContextVisibility::Private);
-        assert!(
-            item.content
-                .contains("invoke write_file for the exact target")
-        );
+        assert!(item
+            .content
+            .contains("invoke write_file for the exact target"));
         assert_eq!(item.evidence, intervention.evidence_refs);
         assert!(runtime_replan_context_item("model-1", None).is_none());
     }

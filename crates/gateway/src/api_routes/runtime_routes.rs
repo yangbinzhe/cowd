@@ -1,18 +1,18 @@
 use std::{sync::Arc, time::Instant};
 
 use axum::{
-    Json, Router,
     extract::{Extension, Path, Query, State as AxumState},
-    http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Response, Sse, sse::Event},
+    http::{header, HeaderMap, StatusCode},
+    response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::convert::Infallible;
 
 mod control;
-use super::{AppState, AuthenticatedPrincipal, ErrorResponse, connector_routes};
+use super::{connector_routes, AppState, AuthenticatedPrincipal, ErrorResponse};
 pub(super) use control::{
     agent_value_summary, execution_graph_summary, get_runtime_control_plane, health_summary,
     session_lease_projection, value_loop_summary,

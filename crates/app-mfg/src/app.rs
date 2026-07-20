@@ -146,16 +146,12 @@ mod tests {
 
         assert_eq!(descriptor.app_id, "mfg.manufacturing");
         assert_eq!(descriptor.layer, "application");
-        assert!(
-            descriptor
-                .cowd_capabilities
-                .contains(&"cowd.structured_data.core".to_string())
-        );
-        assert!(
-            !descriptor
-                .cowd_capabilities
-                .contains(&"cowd.matrix.runtime".to_string())
-        );
+        assert!(descriptor
+            .cowd_capabilities
+            .contains(&"cowd.structured_data.core".to_string()));
+        assert!(!descriptor
+            .cowd_capabilities
+            .contains(&"cowd.matrix.runtime".to_string()));
         assert!(!descriptor.source_contracts.is_empty());
     }
 
@@ -165,16 +161,12 @@ mod tests {
 
         assert_eq!(descriptor.domains.len(), 1);
         assert_eq!(descriptor.domains[0].domain_id, "server_manufacturing");
-        assert!(
-            descriptor.domains[0]
-                .metric_ids
-                .contains(&"material_shortage_risk".to_string())
-        );
-        assert!(
-            descriptor
-                .skill_ids
-                .contains(&"mfg:supply-risk-analyst".to_string())
-        );
+        assert!(descriptor.domains[0]
+            .metric_ids
+            .contains(&"material_shortage_risk".to_string()));
+        assert!(descriptor
+            .skill_ids
+            .contains(&"mfg:supply-risk-analyst".to_string()));
     }
 
     #[test]

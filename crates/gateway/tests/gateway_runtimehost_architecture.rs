@@ -2343,7 +2343,10 @@ fn surface_ingress_is_durable_before_ack_and_uses_bounded_claim_workers() {
         "surface_delivery_event",
         "surface_ingress_frame",
     ] {
-        assert!(message_store.contains(table), "missing durable table {table}");
+        assert!(
+            message_store.contains(table),
+            "missing durable table {table}"
+        );
     }
     assert!(message_store.contains("legacy_jsonl_import_v1"));
     assert!(message_store.contains("export_legacy_jsonl"));
@@ -2362,7 +2365,10 @@ fn surface_ingress_is_durable_before_ack_and_uses_bounded_claim_workers() {
         .find("/_cowd/edge/v2/events/ack")
         .map(|offset| persist + offset)
         .expect("managed event ACK must remain wired");
-    assert!(persist < ack, "durable persist must happen before event ACK");
+    assert!(
+        persist < ack,
+        "durable persist must happen before event ACK"
+    );
 }
 
 #[test]

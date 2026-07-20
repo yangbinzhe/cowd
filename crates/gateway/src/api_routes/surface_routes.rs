@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
     body::Bytes,
     extract::{Path, State as AxumState},
-    http::{Method, StatusCode, header},
+    http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 use surface::{SurfaceActionRequest, SurfaceSendRequest};
 
-use super::{AppState, ErrorResponse, api_error};
+use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()

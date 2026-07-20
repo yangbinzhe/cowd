@@ -1,16 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use axum::{
-    Json, Router,
     extract::{Extension, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use runtime::ApprovalConfig;
 use serde::Deserialize;
 
-use super::{AppState, AuthenticatedPrincipal, ErrorResponse, api_error};
+use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()

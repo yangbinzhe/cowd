@@ -1,11 +1,11 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use axum::{
-    Json, Router,
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use matrix_core::structured::{
     StructuredEvidence as CowdStructuredEvidence, StructuredFact as CowdStructuredFact,
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::services::GatewayMatrixRepositoryError;
 
 use super::route_manifest::gateway_route_manifest;
-use super::{AppState, ErrorResponse, api_error};
+use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()

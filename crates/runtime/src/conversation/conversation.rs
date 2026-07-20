@@ -77,7 +77,7 @@ use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::budget_policy::{RuntimeBudgetInputs, RuntimeBudgetPlan, clamp_context_budget_ratio_bp};
+use crate::budget_policy::{clamp_context_budget_ratio_bp, RuntimeBudgetInputs, RuntimeBudgetPlan};
 
 static STRATEGY_EXPERIENCE_IO_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 static EVALUATION_PROVIDER_TOKEN_LEASE: OnceLock<
@@ -142,8 +142,8 @@ pub(crate) fn install_evaluation_provider_token_lease(
     Ok(())
 }
 
-pub(crate) fn evaluation_provider_token_lease_snapshot()
--> Option<EvaluationProviderTokenLeaseSnapshot> {
+pub(crate) fn evaluation_provider_token_lease_snapshot(
+) -> Option<EvaluationProviderTokenLeaseSnapshot> {
     EVALUATION_PROVIDER_TOKEN_LEASE
         .get()
         .and_then(|lease| lease.lock().ok())
@@ -273,9 +273,8 @@ impl Drop for EvaluationProviderTokenReservation {
         }
     }
 }
-use crate::PromptAssembly;
 use crate::compact::{
-    CompactionConfig, apply_compaction_summary, estimate_session_tokens, plan_session_compaction,
+    apply_compaction_summary, estimate_session_tokens, plan_session_compaction, CompactionConfig,
 };
 use crate::config::{RuntimeFeatureConfig, SessionCompactConfig as RuntimeSessionCompactConfig};
 use crate::context_runtime::{
@@ -297,14 +296,15 @@ use crate::runtime_control::RuntimeControlPolicy;
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
 use crate::skill::{
-    RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
     memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
+    RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
 };
 use crate::tool_execution_plan::{ToolExecutionPlan, ToolExecutionPolicyValidationReport};
 use crate::tool_invocation::{
-    DEFAULT_OUTPUT_REF_MIN_LINES, ToolFailureKind, ToolInvocationRecord, now_ms,
+    now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
 use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
+use crate::PromptAssembly;
 use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
 use model_protocol::usage::TokenUsage;
 
@@ -7061,8 +7061,7 @@ where
                 .and_then(|bytes| {
                     serde_json::from_slice::<serde_json::Value>(&bytes)
                         .map_err(|error| error.to_string())
-                })
-            {
+                }) {
                 Ok(report) => {
                     let positive = store.import_paired_evaluation_report(&report);
                     let negative = store.import_negative_benefit_report(&report);
@@ -8601,15 +8600,15 @@ impl ToolExecutor for StaticToolExecutor {
 mod tests {
 
     use super::{
-        ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime,
-        ModelStepIntent, ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
         apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
         build_cc_memory_config_with_budget, deterministic_checkpoint_id,
         enforce_explicit_team_requirement, eval_override_selection, image_user_message_from_path,
         is_runtime_team_orchestration_call, memory_project_id_for_session,
         model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
         provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        tool_batch_pattern, turn_strategy_event_kind_allowed, vision_user_message,
+        tool_batch_pattern, turn_strategy_event_kind_allowed, vision_user_message, ApiClient,
+        ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime, ModelStepIntent,
+        ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -8621,10 +8620,10 @@ mod tests {
     use crate::runtime_event_store::{RuntimeEventScope, RuntimeEventStore};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::{
-        COWD_IDENTITY_CONTRACT_VERSION, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
-        RuntimeBudgetPlan, SystemPromptBuilder, resolve_context_budget_tokens,
+        resolve_context_budget_tokens, PromptAssembly, RealityRecallPort, RuntimeBudgetInputs,
+        RuntimeBudgetPlan, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
     };
-    use futures::{StreamExt, stream::Stream};
+    use futures::{stream::Stream, StreamExt};
     use harness_contract::agent::{
         AgentBindingSnapshot, AgentCapability, AgentDataLease, AgentDefinitionId,
         AgentDefinitionRevisionRef, AgentExecutorPolicy, AgentInstanceRef, AgentModelPolicy,
@@ -8767,12 +8766,10 @@ mod tests {
             harness_contract::strategy::ExecutionCandidateKind::Team
         );
         assert!(team.net_benefit_score < 0);
-        assert!(
-            decision
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("negative estimated lift"))
-        );
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("negative estimated lift")));
 
         let mut unmarked = harness_contract::strategy::StrategyInput::from_prompt(
             "must start a Team for runtime gateway frontend",
@@ -9190,18 +9187,14 @@ mod tests {
 
         let requests = requests.lock().expect("requests");
         assert_eq!(requests.len(), 2);
-        assert!(
-            requests
-                .iter()
-                .all(|request| { request.reasoning_effort_override.as_deref() == Some("none") })
-        );
-        assert!(
-            runtime
-                .next_model_reasoning_effort
-                .lock()
-                .expect("reasoning effort")
-                .is_none()
-        );
+        assert!(requests
+            .iter()
+            .all(|request| { request.reasoning_effort_override.as_deref() == Some("none") }));
+        assert!(runtime
+            .next_model_reasoning_effort
+            .lock()
+            .expect("reasoning effort")
+            .is_none());
     }
 
     #[derive(Clone)]
@@ -9655,12 +9648,10 @@ mod tests {
                 > selected.revision
         );
         assert_eq!(downgraded.payload["selected_candidate"], "direct");
-        assert!(
-            downgraded.payload["reason"]
-                .as_str()
-                .expect("visible reason")
-                .contains("overlap 9100 bp")
-        );
+        assert!(downgraded.payload["reason"]
+            .as_str()
+            .expect("visible reason")
+            .contains("overlap 9100 bp"));
     }
 
     #[test]
@@ -9783,12 +9774,10 @@ mod tests {
             Some(selected.revision.saturating_add(1))
         );
         assert_eq!(early_stop.status.as_deref(), Some("early_stopped"));
-        assert!(
-            early_stop.payload["reason"]
-                .as_str()
-                .expect("visible early-stop reason")
-                .contains("low novelty")
-        );
+        assert!(early_stop.payload["reason"]
+            .as_str()
+            .expect("visible early-stop reason")
+            .contains("low novelty"));
     }
 
     #[test]
@@ -10050,12 +10039,10 @@ mod tests {
             .await;
         assert!(!critical_validation.allowed);
         assert!(!critical_validation.checkpoint_created);
-        assert!(
-            critical_validation
-                .findings
-                .iter()
-                .any(|finding| finding == "critical_mutation_missing_approval_runtime")
-        );
+        assert!(critical_validation
+            .findings
+            .iter()
+            .any(|finding| finding == "critical_mutation_missing_approval_runtime"));
         assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
     }
@@ -10336,10 +10323,8 @@ mod tests {
         }));
         let requests = requests.lock().expect("request recorder");
         assert_eq!(requests.len(), 1);
-        assert!(
-            rendered_prompt(&requests[0].prompt)
-                .contains("Require release evidence before accepting completion.")
-        );
+        assert!(rendered_prompt(&requests[0].prompt)
+            .contains("Require release evidence before accepting completion."));
         let projections = projections.lock().expect("projection recorder");
         assert_eq!(projections.len(), 1);
         assert!(
@@ -10523,11 +10508,9 @@ mod tests {
         assert!(projections[0].active_ids.is_empty());
         assert_eq!(projections[0].deferred_ids.len(), 3);
         assert_eq!(projections[1].active_ids, vec!["ToolSearch", "grep_search"]);
-        assert!(
-            projections[1]
-                .deferred_ids
-                .contains(&"custom_reader".to_string())
-        );
+        assert!(projections[1]
+            .deferred_ids
+            .contains(&"custom_reader".to_string()));
     }
 
     struct MutationExposureToolExecutor;
@@ -10586,27 +10569,19 @@ mod tests {
             projections[0].active_ids,
             vec!["edit_file".to_string(), "write_file".to_string()]
         );
-        assert!(
-            !projections[0]
-                .active_ids
-                .contains(&"unknown_mutator".to_string())
-        );
-        assert!(
-            projections[0]
-                .deferred_ids
-                .contains(&"read_file".to_string())
-        );
-        assert!(
-            projections[1]
-                .active_ids
-                .contains(&"ToolSearch".to_string())
-        );
+        assert!(!projections[0]
+            .active_ids
+            .contains(&"unknown_mutator".to_string()));
+        assert!(projections[0]
+            .deferred_ids
+            .contains(&"read_file".to_string()));
+        assert!(projections[1]
+            .active_ids
+            .contains(&"ToolSearch".to_string()));
         assert!(projections[1].active_ids.contains(&"read_file".to_string()));
-        assert!(
-            projections[1]
-                .active_ids
-                .contains(&"grep_search".to_string())
-        );
+        assert!(projections[1]
+            .active_ids
+            .contains(&"grep_search".to_string()));
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
     }
 
@@ -10738,11 +10713,9 @@ mod tests {
         assert_eq!(projections[0].catalog_revision, 0);
         assert_eq!(projections[0].active_ids, vec!["ToolSearch"]);
         assert_eq!(projections[0].deferred_ids, vec!["custom_reader"]);
-        assert!(
-            projections[1]
-                .active_ids
-                .contains(&"custom_reader".to_string())
-        );
+        assert!(projections[1]
+            .active_ids
+            .contains(&"custom_reader".to_string()));
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
     }
 
@@ -10945,11 +10918,9 @@ mod tests {
             .remember_context_turn_report(report)
             .await
             .expect_err("a foreign-key persistence failure must fail the terminal report path");
-        assert!(
-            error
-                .to_string()
-                .contains("context governance persistence failed")
-        );
+        assert!(error
+            .to_string()
+            .contains("context governance persistence failed"));
         assert_eq!(runtime.last_context_turn_report(), None);
     }
 
@@ -11014,11 +10985,9 @@ mod tests {
             )
             .await
             .expect_err("missing session carrier must reject canonical compaction persistence");
-        assert!(
-            error
-                .to_string()
-                .contains("atomic compaction persistence failed")
-        );
+        assert!(error
+            .to_string()
+            .contains("atomic compaction persistence failed"));
     }
 
     #[test]
@@ -11136,24 +11105,20 @@ mod tests {
 
         assert_eq!(prompt.trusted_system[0], "stable system");
         assert!(prompt.trusted_system[1].contains("profile:MainTurn"));
-        assert!(
-            prompt
-                .trusted_system
-                .iter()
-                .any(|segment| segment.contains("context_governance_report_id:"))
-        );
+        assert!(prompt
+            .trusted_system
+            .iter()
+            .any(|segment| segment.contains("context_governance_report_id:")));
         assert_eq!(envelope.intent, "remember this");
         assert_eq!(envelope.assembled.stable_head, vec!["stable system"]);
         assert_eq!(
             envelope.diagnostics.degraded_sources,
             vec![ContextSourceKind::Memory]
         );
-        assert!(
-            envelope
-                .selected
-                .iter()
-                .all(|item| item.source != ContextSourceKind::Memory)
-        );
+        assert!(envelope
+            .selected
+            .iter()
+            .all(|item| item.source != ContextSourceKind::Memory));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -11183,12 +11148,10 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(
-            prompt
-                .contextual_packets
-                .iter()
-                .any(|packet| packet.content.contains("continue v0.8.13 context work"))
-        );
+        assert!(prompt
+            .contextual_packets
+            .iter()
+            .any(|packet| packet.content.contains("continue v0.8.13 context work")));
         let handoff = envelope
             .selected
             .iter()
@@ -11223,18 +11186,14 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(
-            prompt
-                .contextual_packets
-                .iter()
-                .any(|packet| packet.content.contains("cargo test passed"))
-        );
-        assert!(
-            envelope
-                .selected
-                .iter()
-                .any(|item| item.source == ContextSourceKind::ToolTrace)
-        );
+        assert!(prompt
+            .contextual_packets
+            .iter()
+            .any(|packet| packet.content.contains("cargo test passed")));
+        assert!(envelope
+            .selected
+            .iter()
+            .any(|item| item.source == ContextSourceKind::ToolTrace));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -11345,11 +11304,9 @@ mod tests {
             .list_layer_full_entries(memory::types::MemoryLayer::L1)
             .await
             .unwrap();
-        assert!(
-            loaded_l1
-                .iter()
-                .any(|entry| entry.title == "User preference: 不要使用工具或编排")
-        );
+        assert!(loaded_l1
+            .iter()
+            .any(|entry| entry.title == "User preference: 不要使用工具或编排"));
         let memory_turn = memory::MemoryTurnContext::new("test-session", "primary")
             .with_project_id(Some(project_id));
         let prepared = mgr
@@ -11390,12 +11347,10 @@ mod tests {
             .last_context_envelope()
             .expect("context envelope should be recorded");
 
-        assert!(
-            envelope
-                .omitted
-                .iter()
-                .any(|omission| omission.reason.contains("suppressed_for_current_turn"))
-        );
+        assert!(envelope
+            .omitted
+            .iter()
+            .any(|omission| omission.reason.contains("suppressed_for_current_turn")));
         assert!(!prompt.contains("<title>User preference: 不要使用工具或编排</title>"));
         assert!(!prompt.contains("<knowledge_compliance>"));
     }
@@ -11452,12 +11407,10 @@ mod tests {
         // runtime governance context. Attachment/resource guidance may add more
         // bounded sections, so this must remain a semantic budget assertion.
         assert_eq!(prompt.trusted_system[0], "system prompt");
-        assert!(
-            prompt
-                .trusted_system
-                .iter()
-                .any(|segment| segment.contains("profile:MainTurn"))
-        );
+        assert!(prompt
+            .trusted_system
+            .iter()
+            .any(|segment| segment.contains("profile:MainTurn")));
         assert!(!rendered_prompt(&prompt).contains("<memory_context>"));
         let total_prompt_chars = prompt.estimated_chars();
         assert!(
@@ -11584,12 +11537,10 @@ mod tests {
         let rendered = rendered_prompt(&prompt);
         assert!(rendered.contains("east allocation requires expedited approval"));
         let envelope = runtime.last_context_envelope().expect("context envelope");
-        assert!(
-            envelope
-                .selected
-                .iter()
-                .any(|item| item.source == ContextSourceKind::Fact)
-        );
+        assert!(envelope
+            .selected
+            .iter()
+            .any(|item| item.source == ContextSourceKind::Fact));
         let report = runtime
             .last_reality_recall_report()
             .expect("reality recall report");

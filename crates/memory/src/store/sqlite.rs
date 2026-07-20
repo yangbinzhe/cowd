@@ -1307,7 +1307,8 @@ impl SqliteStore {
 
         let limit_param: Box<dyn rusqlite::ToSql> = Box::new(limit as i64);
         let all_params: Vec<&dyn rusqlite::ToSql> = param_refs
-            .iter().copied()
+            .iter()
+            .copied()
             .chain(std::iter::once(limit_param.as_ref()))
             .collect();
 
@@ -1334,7 +1335,8 @@ impl SqliteStore {
             let snippet_sql = r"SELECT snippet(memories_fts, 2, '<mark>', '</mark>', '...', 32)
                   FROM memories_fts
                   WHERE memories_fts MATCH ?1
-                  LIMIT ?2".to_string();
+                  LIMIT ?2"
+                .to_string();
             let mut stmt = conn.prepare(&snippet_sql).map_err(sql_err)?;
             let snippet_rows = stmt
                 .query_map(params![query, limit as i64], |row| {

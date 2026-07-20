@@ -708,8 +708,7 @@ impl Component for RuntimeActivityPanel {
                 KeyCode::Home => self.scroll.top(),
                 KeyCode::End => self.scroll.bottom(),
                 KeyCode::Char('[') if !self.strategy_backlink_targets.is_empty() => {
-                    self.strategy_backlink_index =
-                        self.strategy_backlink_index.saturating_sub(1);
+                    self.strategy_backlink_index = self.strategy_backlink_index.saturating_sub(1);
                 }
                 KeyCode::Char(']') if !self.strategy_backlink_targets.is_empty() => {
                     self.strategy_backlink_index = (self.strategy_backlink_index + 1)
@@ -893,7 +892,10 @@ fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
                 .split('&')
                 .find_map(|item| item.strip_prefix("agent_id="))
         }) {
-            let agent = projection.agents.iter().find(|agent| agent.id == agent_id)?;
+            let agent = projection
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id)?;
             return Some(format!(
                 "execution {} agent {} status {}",
                 projection.execution_id,
@@ -1158,7 +1160,10 @@ mod tests {
             let mut panel = RuntimeActivityPanel::new();
             panel.sync_from_app(&app);
 
-            assert!(panel.strategy_backlink_targets.is_empty(), "unsafe target {secret}");
+            assert!(
+                panel.strategy_backlink_targets.is_empty(),
+                "unsafe target {secret}"
+            );
             assert_eq!(panel.handle_event(&activate), EventResult::NotConsumed);
             assert!(panel.focused_backlink_target.is_none());
             assert!(!render_panel(&mut panel, 96, 27).contains(&secret));

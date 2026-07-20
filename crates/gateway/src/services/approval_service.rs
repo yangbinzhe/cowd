@@ -3,7 +3,7 @@ use std::sync::Arc;
 use approval::{ApprovalRepository, FileApprovalRepository};
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::policy::RiskGateReceipt;
-use runtime::{ApprovalConfig, approval_gate::SmartApprovalGate};
+use runtime::{approval_gate::SmartApprovalGate, ApprovalConfig};
 
 use super::ServiceEnvelope;
 
@@ -460,16 +460,12 @@ mod tests {
             .event_reader()
             .list_scope(runtime::RuntimeEventScope::Approval, 20)
             .unwrap();
-        assert!(
-            approval_events
-                .iter()
-                .any(|event| event.kind == "approval.submitted")
-        );
-        assert!(
-            approval_events
-                .iter()
-                .any(|event| event.kind == "approval.decided")
-        );
+        assert!(approval_events
+            .iter()
+            .any(|event| event.kind == "approval.submitted"));
+        assert!(approval_events
+            .iter()
+            .any(|event| event.kind == "approval.decided"));
         assert_eq!(
             services
                 .approval_queue()

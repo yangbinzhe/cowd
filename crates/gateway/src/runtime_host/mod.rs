@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::{
-    http::{HeaderValue, StatusCode, Uri, header},
+    http::{header, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -27,8 +27,8 @@ use crate::gateway::ActiveSessions;
 use crate::runtime_service::RuntimeService;
 use crate::session_kernel::SessionKernel;
 use crate::session_lifecycle_kernel::SessionLifecycleKernel;
-use memory::MemoryConfig;
 use memory::cognitive::CognitiveContextManager;
+use memory::MemoryConfig;
 use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
 use runtime::{McpServerManager, RuntimeConfig};
 use surface::SurfaceManifest;

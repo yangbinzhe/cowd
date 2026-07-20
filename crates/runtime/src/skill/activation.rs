@@ -15,7 +15,6 @@ pub enum RuntimeSkillCandidateSource {
     CapabilityRefFallback,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSkillCandidate {
     pub name: String,

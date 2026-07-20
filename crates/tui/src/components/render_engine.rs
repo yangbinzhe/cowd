@@ -17,7 +17,6 @@ pub struct TuiState {
     pub theme: SkinConfig,
 }
 
-
 /// Flatten the `LayoutTree` into area+component pairs and render each.
 ///
 /// Recursively walks every [`LayoutNode`], computing a [`Rect`] for each

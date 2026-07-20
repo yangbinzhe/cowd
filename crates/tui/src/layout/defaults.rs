@@ -8,9 +8,8 @@ use crate::components::chat_view::ChatView;
 #[cfg(test)]
 use ratatui::layout::Rect;
 
-use super::LayoutTree;
 use super::types::{LayoutNode, PanelDef, Split, SplitDirection, TabDef, TabGroup};
-use crate::components::Component;
+use super::LayoutTree;
 use crate::components::agent_team_panel::AgentTeamPanel;
 use crate::components::approval_cockpit_panel::ApprovalCockpitPanel;
 use crate::components::diff_viewer::DiffViewer;
@@ -25,6 +24,7 @@ use crate::components::session_sidebar::SessionSidebar;
 use crate::components::surface_panel::SurfacePanel;
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::ToolOpsPanel;
+use crate::components::Component;
 #[cfg(test)]
 use crate::components::{EventResult, RenderContext};
 use crate::workbench::panel_registry;

@@ -7,15 +7,15 @@
 
 use harness_contract::core::ExecutionPattern;
 use harness_contract::execution_graph::{
-    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
-    ExecutionNodeStatus, apply_node_transition, validate_execution_graph,
+    apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionEdgeKind,
+    ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
 };
 use harness_contract::strategy::{
-    ExecutionCandidateKind, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
-    decide_strategy, understand,
+    decide_strategy, understand, ExecutionCandidateKind, StrategyExperienceRecord,
+    StrategyExperienceStore, StrategyInput,
 };
-use runtime::RuntimeAiKernel;
 use runtime::eval_gate::{ScenarioCheck, ScenarioCheckKind, ScenarioSpec, ScenarioSuite};
+use runtime::RuntimeAiKernel;
 
 fn node(id: &str, kind: ExecutionNodeKind) -> ExecutionNodeSpec {
     let mut node = ExecutionNodeSpec::new(kind, "scenario-executor", format!("payload:{id}"));
@@ -235,12 +235,10 @@ fn agent_parallel_research_scenario_keeps_independent_nodes_ready_for_merge() {
         graph.node_statuses["merge-review"],
         ExecutionNodeStatus::Planned
     );
-    assert!(
-        graph
-            .edges
-            .iter()
-            .all(|edge| graph.node_statuses[&edge.from] == ExecutionNodeStatus::Completed)
-    );
+    assert!(graph
+        .edges
+        .iter()
+        .all(|edge| graph.node_statuses[&edge.from] == ExecutionNodeStatus::Completed));
 }
 
 #[test]
@@ -299,10 +297,8 @@ fn agent_untrusted_low_lift_cannot_change_multi_agent_path() {
         adapted.pattern,
         harness_contract::core::ExecutionPattern::Collaborate
     );
-    assert!(
-        !adapted
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("low multi-agent lift"))
-    );
+    assert!(!adapted
+        .reasons
+        .iter()
+        .any(|reason| reason.contains("low multi-agent lift")));
 }

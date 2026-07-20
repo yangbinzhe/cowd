@@ -3177,12 +3177,12 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        COWD_SETTINGS_SCHEMA_NAME, ConfigLoader, ConfigSource, DomainProfile, McpServerConfig,
-        McpTransport, ProviderProtocol, ResolvedPermissionMode, RuntimeConfig,
-        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
         deep_merge_objects, parse_optional_compression_config,
         parse_optional_context_budget_config, parse_optional_model_context_windows,
-        parse_permission_mode_label, redact_serde_json,
+        parse_permission_mode_label, redact_serde_json, ConfigLoader, ConfigSource, DomainProfile,
+        McpServerConfig, McpTransport, ProviderProtocol, ResolvedPermissionMode, RuntimeConfig,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
+        COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -3242,11 +3242,9 @@ mod tests {
         let error = ConfigLoader::new(&cwd, &home)
             .load()
             .expect_err("config should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("top-level config value must be an object")
-        );
+        assert!(error
+            .to_string()
+            .contains("top-level config value must be an object"));
 
         if root.exists() {
             fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -3308,20 +3306,16 @@ mod tests {
                 .len(),
             3
         );
-        assert!(
-            loaded
-                .get("hooks")
-                .and_then(JsonValue::as_object)
-                .expect("hooks object")
-                .contains_key("PreToolUse")
-        );
-        assert!(
-            loaded
-                .get("hooks")
-                .and_then(JsonValue::as_object)
-                .expect("hooks object")
-                .contains_key("PostToolUse")
-        );
+        assert!(loaded
+            .get("hooks")
+            .and_then(JsonValue::as_object)
+            .expect("hooks object")
+            .contains_key("PreToolUse"));
+        assert!(loaded
+            .get("hooks")
+            .and_then(JsonValue::as_object)
+            .expect("hooks object")
+            .contains_key("PostToolUse"));
         assert_eq!(loaded.hooks().pre_tool_use(), &["base".to_string()]);
         assert_eq!(loaded.hooks().post_tool_use(), &["project".to_string()]);
         assert_eq!(
@@ -3981,11 +3975,9 @@ approval:
             .expect_err("config should fail");
 
         // then
-        assert!(
-            error
-                .to_string()
-                .contains("mcpServers.broken: missing string field url")
-        );
+        assert!(error
+            .to_string()
+            .contains("mcpServers.broken: missing string field url"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -4557,11 +4549,9 @@ gateway:
 
         let invalid = JsonValue::parse(r#"{"model_context_windows":{"broken":1023}}"#)
             .expect("json should parse");
-        assert!(
-            parse_optional_model_context_windows(&invalid)
-                .expect_err("sub-1024 context window must fail validation")
-                .to_string()
-                .contains("at least 1024")
-        );
+        assert!(parse_optional_model_context_windows(&invalid)
+            .expect_err("sub-1024 context window must fail validation")
+            .to_string()
+            .contains("at least 1024"));
     }
 }

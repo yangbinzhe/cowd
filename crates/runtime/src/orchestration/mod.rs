@@ -10,13 +10,13 @@ pub mod request;
 pub mod result;
 pub mod validator;
 
+use crate::execution_core::{graph::ExecutionRunReport, RuntimeExecutionDecision};
 use crate::RuntimeServices;
-use crate::execution_core::{RuntimeExecutionDecision, graph::ExecutionRunReport};
 use harness_contract::agent::{AgentTaskIntent, AgentTaskPacket};
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphProjection, ExecutionNodeKind, ExecutionNodeStatus,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
@@ -1076,14 +1076,12 @@ mod tests {
 
         assert_eq!(result.status, "compiled", "{result:?}");
         assert_eq!(result.evidence["accepted"], false);
-        assert!(
-            !services
-                .event_store()
-                .all_events(100)
-                .expect("runtime events")
-                .iter()
-                .any(|event| event.kind == "execution_graph.planned")
-        );
+        assert!(!services
+            .event_store()
+            .all_events(100)
+            .expect("runtime events")
+            .iter()
+            .any(|event| event.kind == "execution_graph.planned"));
     }
 
     #[tokio::test]
@@ -1182,30 +1180,24 @@ mod tests {
         assert_eq!(result.status, "completed", "{result:?}");
         assert!(result.execution.get("protocol").is_none());
         assert_eq!(result.execution["type"], "execution_graph_run");
-        assert!(
-            result.execution["terminal_result_ref"]
-                .as_str()
-                .is_some_and(|value| value.starts_with("assistant_json:"))
-        );
+        assert!(result.execution["terminal_result_ref"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("assistant_json:")));
         assert_eq!(result.evidence["accepted"], true);
-        assert!(
-            services
-                .event_store()
-                .all_events(200)
-                .expect("runtime events")
-                .iter()
-                .any(|event| event.kind == "agent.terminal")
-        );
-        assert!(
-            objectives
-                .lock()
-                .expect("objectives")
-                .iter()
-                .any(|objective| {
-                    objective.contains("## Canonical upstream results")
-                        && objective.contains("### Upstream proposer")
-                })
-        );
+        assert!(services
+            .event_store()
+            .all_events(200)
+            .expect("runtime events")
+            .iter()
+            .any(|event| event.kind == "agent.terminal"));
+        assert!(objectives
+            .lock()
+            .expect("objectives")
+            .iter()
+            .any(|objective| {
+                objective.contains("## Canonical upstream results")
+                    && objective.contains("### Upstream proposer")
+            }));
     }
 
     #[tokio::test]
@@ -1303,8 +1295,7 @@ mod tests {
                 objectives: Arc::clone(&objectives),
             }));
         let objective = "全面审视 crates/runtime、crates/gateway、surfaces/webui 三个独立责任域的策略事件接线、权限边界和用户可见状态，分别给出证据后综合。";
-        let mut decision =
-            crate::execution_core::build_runtime_execution_decision(objective, None);
+        let mut decision = crate::execution_core::build_runtime_execution_decision(objective, None);
         assert_eq!(
             decision.strategy.selected_candidate,
             harness_contract::strategy::ExecutionCandidateKind::Team
@@ -1327,9 +1318,8 @@ mod tests {
         automatic.selection_mode = Some(harness_contract::team::TeamSelectionMode::Automatic);
         automatic.strategy_binding = Some(binding.clone());
         automatic.constraints.max_parallel_agents = Some(3);
-        automatic.constraints.risk = Some(
-            format!("{:?}", decision.strategy.understanding.risk).to_ascii_lowercase(),
-        );
+        automatic.constraints.risk =
+            Some(format!("{:?}", decision.strategy.understanding.risk).to_ascii_lowercase());
         let scopes = [
             "read:crates/runtime",
             "read:crates/gateway",
@@ -1497,20 +1487,14 @@ mod tests {
         let decision = validator::validate_request(&critical, &execution, None, None);
 
         assert_eq!(decision.status, "needs_approval");
-        assert!(
-            decision
-                .policy_gates
-                .contains(&harness_contract::core::ExecutionPolicyGate::Risk)
-        );
-        assert!(
-            decision
-                .policy_gates
-                .contains(&harness_contract::core::ExecutionPolicyGate::Approval)
-        );
-        assert!(
-            decision
-                .validation_findings
-                .contains(&"risk_requires_approval".to_string())
-        );
+        assert!(decision
+            .policy_gates
+            .contains(&harness_contract::core::ExecutionPolicyGate::Risk));
+        assert!(decision
+            .policy_gates
+            .contains(&harness_contract::core::ExecutionPolicyGate::Approval));
+        assert!(decision
+            .validation_findings
+            .contains(&"risk_requires_approval".to_string()));
     }
 }

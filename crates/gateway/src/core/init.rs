@@ -255,7 +255,8 @@ instructions.
 
 Project-level CLAUDE.md (in the project root) inherits from this file and can
 override any settings here.
-"#.to_string()
+"#
+    .to_string()
 }
 
 pub(crate) fn render_init_cowd_md(cwd: &Path) -> String {

@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::Duration;
 
 use harness_contract::execution_graph::{
-    ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
-    ExecutionNodeResult, ExecutionNodeStatus, validate_execution_graph,
+    validate_execution_graph, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand,
+    ExecutionGraphValidationError, ExecutionNodeResult, ExecutionNodeStatus,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, futures::OwnedNotified};
+use tokio::sync::{futures::OwnedNotified, Mutex, Notify, OwnedMutexGuard};
 use tokio::task::JoinSet;
 
 use super::commit_service::{ExecutionCommitError, ExecutionCommitService, ExecutionEffectState};

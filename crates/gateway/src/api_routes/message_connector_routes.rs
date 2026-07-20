@@ -2,18 +2,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
     extract::{Path, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 use serde::Serialize;
+use surface::message::{message_connector_required_fields, MessageConnectorContract};
 use surface::SurfaceActionRequest;
-use surface::message::{MessageConnectorContract, message_connector_required_fields};
 
-use super::{AppState, ErrorResponse, api_error};
+use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -145,12 +145,10 @@ async fn get_message_connector_status_handler(
     let connector = surface::message::normalize_message_connector(&name);
     let config = state.runtime_config_json_snapshot();
     let platforms = configured_platforms(config.as_ref());
-    let platform = platforms
-        .into_iter()
-        .find(|platform| {
-            platform_surface_id(platform) == connector
-                || surface::message::normalize_message_connector(&platform.name) == connector
-        });
+    let platform = platforms.into_iter().find(|platform| {
+        platform_surface_id(platform) == connector
+            || surface::message::normalize_message_connector(&platform.name) == connector
+    });
     let runtime = state.services.surface.runtime_snapshot(&connector);
     if platform.is_none() && runtime.is_none() {
         return Err(api_error(

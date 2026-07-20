@@ -346,14 +346,16 @@ impl IntegrityChecker {
 
         // 2. Protected layer modification by non-system source
         for entry in &entries {
-            if entry.source != WriteSource::System && entry.source != WriteSource::User
-                && (entry.layer == "L0" || entry.layer == "L1") {
-                    anomalies.push(Anomaly::ProtectedLayerModified {
-                        layer: entry.layer.clone(),
-                        source: entry.source,
-                        entry_id: entry.entry_id.clone(),
-                    });
-                }
+            if entry.source != WriteSource::System
+                && entry.source != WriteSource::User
+                && (entry.layer == "L0" || entry.layer == "L1")
+            {
+                anomalies.push(Anomaly::ProtectedLayerModified {
+                    layer: entry.layer.clone(),
+                    source: entry.source,
+                    entry_id: entry.entry_id.clone(),
+                });
+            }
         }
 
         // 3. Relation oscillation is detected at a higher level (TemporalGraph)

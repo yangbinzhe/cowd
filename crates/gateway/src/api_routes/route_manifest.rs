@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 
 use super::route_registry::{
-    GeneratedRouteMetadata, execution_projection_route_metadata, generated_route_metadata,
+    execution_projection_route_metadata, generated_route_metadata, GeneratedRouteMetadata,
 };
 
 /// Public, deterministic route inventory. Its source is the build-generated
@@ -176,11 +176,9 @@ mod tests {
         assert!(has("POST", "/api/surfaces/:id/trigger-events/retry"));
         assert!(has("GET", "/api/cowd/release-gate"));
         assert!(has("POST", "/api/resources"));
-        assert!(
-            manifest.iter().any(|entry| {
-                entry.path == "/api/approval/pending" && entry.criticality == "p1"
-            })
-        );
+        assert!(manifest
+            .iter()
+            .any(|entry| { entry.path == "/api/approval/pending" && entry.criticality == "p1" }));
     }
 
     #[test]

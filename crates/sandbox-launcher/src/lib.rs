@@ -711,16 +711,13 @@ fn append_network_resolver_bind(
     let parent = resolver.parent().ok_or_else(|| {
         SandboxError::MissingPath("resolver target has no parent directory".to_string())
     })?;
-    let relative = parent.strip_prefix("/run").map_err(|_| {
-        SandboxError::MissingPath("resolver target is not below /run".to_string())
-    })?;
+    let relative = parent
+        .strip_prefix("/run")
+        .map_err(|_| SandboxError::MissingPath("resolver target is not below /run".to_string()))?;
     let mut target_parent = PathBuf::from("/run");
     for component in relative.components() {
         target_parent.push(component.as_os_str());
-        args.extend([
-            "--dir".to_string(),
-            target_parent.display().to_string(),
-        ]);
+        args.extend(["--dir".to_string(), target_parent.display().to_string()]);
     }
     args.extend([
         "--ro-bind".to_string(),
@@ -1320,7 +1317,10 @@ mod tests {
             &SandboxLaunchSpec::workspace(&root.workspace),
         )
         .expect("prepare resolver sandbox");
-        let output = prepared.into_command().output().expect("run resolver sandbox");
+        let output = prepared
+            .into_command()
+            .output()
+            .expect("run resolver sandbox");
         assert!(output.status.success(), "{:?}", output);
     }
 

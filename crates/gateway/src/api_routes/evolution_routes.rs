@@ -4,11 +4,11 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
     extract::{Extension, Path as AxumPath, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 
 use crate::services::{
@@ -18,7 +18,7 @@ use crate::services::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    AppState, AuthenticatedPrincipal, ErrorResponse, api_error, issue_human_decision_lease,
+    api_error, issue_human_decision_lease, AppState, AuthenticatedPrincipal, ErrorResponse,
 };
 
 fn require_evolution_release_principal(

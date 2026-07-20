@@ -1,28 +1,28 @@
 use std::sync::Arc;
 
 use app_mfg::{
+    mfg_cockpit_filter_merge_policy, mfg_cockpit_global_filter_schema, mfg_widget_catalog,
     MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
     MfgAlertRule, MfgAlertRuleInput, MfgAlertSubscription, MfgAlertSubscriptionInput,
     MfgAssignment, MfgAssignmentCommand, MfgAssignmentCommandInput, MfgAssignmentInput,
     MfgCockpitProfile, MfgCockpitProfileInput, MfgCockpitReportDeliveryState,
     MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgIncident, MfgPlaybook,
-    MfgRepositoryError, mfg_cockpit_filter_merge_policy, mfg_cockpit_global_filter_schema,
-    mfg_widget_catalog,
+    MfgRepositoryError,
 };
 use axum::{
-    Extension, Json, Router,
     body::Body,
     extract::{MatchedPath, Path as AxumPath, Query, State as AxumState},
     http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{get, post},
+    Extension, Json, Router,
 };
 use matrix_core::{
-    MATRIX_SCHEMA_VERSION, MatrixComputeJobInput, MatrixConnectorRunInput,
-    MatrixDataPlaneIngestPlanInput, MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput,
-    MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput,
-    MatrixSourcePack,
+    MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlanInput, MatrixEntity,
+    MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDependency,
+    MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourcePack,
+    MATRIX_SCHEMA_VERSION,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,7 @@ mod cockpit;
 mod decision;
 mod incidents;
 mod operations;
-use super::{AppState, AuthenticatedPrincipal, ErrorResponse, principal_actor_id};
+use super::{principal_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
 use cockpit::*;
 use decision::*;
 use incidents::*;
@@ -3777,11 +3777,11 @@ async fn mfg_execution_feedback_handler(
 #[cfg(test)]
 mod tests {
     use super::{
+        mfg_api_error, mfg_contract_handler, mfg_idempotency_key, normalize_mfg_action_mode,
+        parse_mfg_query_pairs, resolve_mfg_action_id, resolve_mfg_resource_ref,
         MfgActionExecutionIntent, MfgCockpitReportDeliveryIntent,
         MfgCockpitReportDeliveryRetryRequest, MfgCrossPlaneBridgeIntent,
-        MfgExecutionFeedbackRequest, mfg_api_error, mfg_contract_handler, mfg_idempotency_key,
-        normalize_mfg_action_mode, parse_mfg_query_pairs, resolve_mfg_action_id,
-        resolve_mfg_resource_ref,
+        MfgExecutionFeedbackRequest,
     };
     use axum::{
         extract::Extension,

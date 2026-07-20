@@ -17,10 +17,10 @@ use std::{
 
 use reqwest::{
     blocking::Client,
-    header::{AUTHORIZATION, HeaderMap, HeaderValue},
+    header::{HeaderMap, HeaderValue, AUTHORIZATION},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub const AUTO_STRATEGY_SEED: u64 = 20_260_716;
@@ -561,14 +561,12 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
     );
     if diagnostic_task_id.is_some() {
         let gate = &report["gate"];
-        let all_samples_completed = report["samples"]
-            .as_array()
-            .is_some_and(|samples| {
-                !samples.is_empty()
-                    && samples
-                        .iter()
-                        .all(|sample| sample["status"].as_str() == Some("completed"))
-            });
+        let all_samples_completed = report["samples"].as_array().is_some_and(|samples| {
+            !samples.is_empty()
+                && samples
+                    .iter()
+                    .all(|sample| sample["status"].as_str() == Some("completed"))
+        });
         let diagnostic_passed = all_samples_completed
             && report["completeness_bp"].as_u64() == Some(10_000)
             && gate["per_task_pair_gate"] == true
@@ -1807,7 +1805,11 @@ fn apply_blind_judge(
 /// ran and no token/cost was consumed. Failed polling or a partial projection
 /// remains unobserved and therefore fail-closed.
 fn zero_provider_usage_proven(sample: &Sample, consumed: u64) -> bool {
-    let Some(nodes) = sample.projection.pointer("/graph/nodes").and_then(Value::as_array) else {
+    let Some(nodes) = sample
+        .projection
+        .pointer("/graph/nodes")
+        .and_then(Value::as_array)
+    else {
         return false;
     };
     consumed == 0
@@ -2169,21 +2171,19 @@ fn evaluate_samples(
                 && mutation_samples.into_iter().all(|sample| {
                     sample.workspace_mutation_verified
                         && sample.workspace_changed_paths
-                            == vec![
-                                task.mutation_fixture
-                                    .as_ref()
-                                    .expect("filtered mutation fixture")
-                                    .target_path
-                                    .clone(),
-                            ]
+                            == vec![task
+                                .mutation_fixture
+                                .as_ref()
+                                .expect("filtered mutation fixture")
+                                .target_path
+                                .clone()]
                         && sample.write_attempt_paths
-                            == vec![
-                                task.mutation_fixture
-                                    .as_ref()
-                                    .expect("filtered mutation fixture")
-                                    .target_path
-                                    .clone(),
-                            ]
+                            == vec![task
+                                .mutation_fixture
+                                .as_ref()
+                                .expect("filtered mutation fixture")
+                                .target_path
+                                .clone()]
                         && sample.workspace_mutation_error.is_none()
                 })
         });
@@ -2260,12 +2260,8 @@ fn evaluate_samples(
     } else {
         Vec::new()
     };
-    let negative_benefit_observations = build_negative_benefit_observations(
-        corpus,
-        &task_comparisons,
-        &samples,
-        &provenance,
-    );
+    let negative_benefit_observations =
+        build_negative_benefit_observations(corpus, &task_comparisons, &samples, &provenance);
     json!({
         "kind": "harness_eval.auto_strategy_paired.v1",
         "status": if gate_passed {
@@ -2321,8 +2317,8 @@ fn build_negative_benefit_observations(
     provenance: &Value,
 ) -> Vec<harness_contract::strategy::NegativeBenefitObservation> {
     use harness_contract::strategy::{
-        ExecutionCandidateKind, NegativeBenefitObservation, StrategyInput,
-        StrategyWorkloadFingerprint, understand,
+        understand, ExecutionCandidateKind, NegativeBenefitObservation, StrategyInput,
+        StrategyWorkloadFingerprint,
     };
 
     let Some(provider) = provenance["provider"]
@@ -2405,7 +2401,7 @@ fn build_strategy_calibration_records(
     use harness_contract::{
         core::ExecutionPattern,
         strategy::{
-            PairedStrategyCalibrationEvidence, StrategyExperienceRecord, StrategyInput, understand,
+            understand, PairedStrategyCalibrationEvidence, StrategyExperienceRecord, StrategyInput,
         },
     };
 
@@ -3226,7 +3222,8 @@ mod tests {
             "private copy",
         )
         .expect("Runtime private file");
-        let after_runtime_state = snapshot_workspace_tree(root.path()).expect("after Runtime state");
+        let after_runtime_state =
+            snapshot_workspace_tree(root.path()).expect("after Runtime state");
         assert_eq!(before, after_runtime_state);
 
         fs::create_dir_all(root.path().join("nested/.cowd")).expect("nested business directory");

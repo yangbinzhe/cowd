@@ -3,10 +3,10 @@ use std::convert::Infallible;
 use axum::{
     extract::Extension,
     http::HeaderMap,
-    response::{Response, Sse, sse::Event},
+    response::{sse::Event, Response, Sse},
 };
 
-use crate::api_routes::{AuthenticatedPrincipal, principal_actor_id};
+use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
 use surface::SurfaceSendRequest;
 
 use super::*;

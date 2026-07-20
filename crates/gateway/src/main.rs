@@ -44,10 +44,10 @@ mod gateway_static;
 mod gateway_storage;
 #[path = "runtime/gateway_tool_executor.rs"]
 mod gateway_tool_executor;
-#[path = "runtime/lark_cli_tool.rs"]
-mod lark_cli_tool;
 #[path = "core/init.rs"]
 mod init;
+#[path = "runtime/lark_cli_tool.rs"]
+mod lark_cli_tool;
 #[path = "core/logging.rs"]
 mod logging;
 #[path = "infrastructure/matrix_sqlite_repository.rs"]
@@ -117,28 +117,29 @@ use model_protocol::usage::TokenUsage;
 use provider as provider_crate;
 #[cfg(test)]
 use provider_crate::{
-    AuthSource, ImageSource, InputContentBlock, InputMessage, MessageResponse, OutputContentBlock,
-    ProviderClient as ApiProviderClient, ToolResultContentBlock, resolve_startup_auth_source,
+    resolve_startup_auth_source, AuthSource, ImageSource, InputContentBlock, InputMessage,
+    MessageResponse, OutputContentBlock, ProviderClient as ApiProviderClient,
+    ToolResultContentBlock,
 };
 
 #[cfg(test)]
 use crate::command::slash::resume_supported_slash_commands;
 use crate::command::slash::{
-    SkillSlashDispatch, SlashCommand, classify_skills_slash_command,
-    render_slash_command_help_filtered, slash_command_specs,
+    classify_skills_slash_command, render_slash_command_help_filtered, slash_command_specs,
+    SkillSlashDispatch, SlashCommand,
 };
-use compat_manifest::{UpstreamPaths, extract_manifest};
+use compat_manifest::{extract_manifest, UpstreamPaths};
 use runtime::ContextProfile;
 #[cfg(test)]
 use runtime::PromptCacheEvent;
+use runtime::{
+    check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
+    resolve_sandbox_status, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
+    PermissionMode, PermissionPolicy, ResolvedPermissionMode, ResumeContextPacket,
+    ResumeContextSource, Session, UsageTracker,
+};
 #[cfg(test)]
 use runtime::{AssistantEvent, RuntimeError};
-use runtime::{
-    ConfigLoader, ContentBlock, ConversationMessage, MessageRole, PermissionMode, PermissionPolicy,
-    ResolvedPermissionMode, ResumeContextPacket, ResumeContextSource, Session, UsageTracker,
-    check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
-    resolve_sandbox_status,
-};
 use runtime_bootstrap::GatewayToolRegistry;
 use runtime_entry::GatewayRuntimeEntry;
 use serde_json::json;
@@ -161,10 +162,10 @@ pub(crate) use entry::env_entry::{
 };
 #[cfg(test)]
 pub(crate) use entry::gateway_projection_entry::{
+    parse_gateway_approval_slash_command, parse_gateway_context_slash_command,
+    parse_gateway_cross_plane_slash_command, parse_gateway_task_slash_command,
     GatewayApprovalSlashCommand, GatewayContextSlashCommand, GatewayCrossPlaneSlashCommand,
-    GatewayTaskSlashCommand, parse_gateway_approval_slash_command,
-    parse_gateway_context_slash_command, parse_gateway_cross_plane_slash_command,
-    parse_gateway_task_slash_command,
+    GatewayTaskSlashCommand,
 };
 use entry::init_entry::{init_claude_md, init_json_value, run_init};
 #[cfg(test)]
@@ -184,9 +185,9 @@ pub(crate) use entry::session_archive_entry::{
 };
 #[cfg(test)]
 pub(crate) use entry::session_store_entry::{
-    SessionHandle, create_managed_session_handle, discover_local_session_import_candidates,
+    create_managed_session_handle, discover_local_session_import_candidates,
     hydrate_session_from_unified_store, import_local_session_file, jsonl_sessions_dir,
-    resolve_session_reference,
+    resolve_session_reference, SessionHandle,
 };
 pub(crate) use entry::session_store_entry::{
     get_unified_store, list_managed_sessions, load_session_reference, new_cli_session,
@@ -204,18 +205,18 @@ pub(crate) use entry::status_entry::parse_git_status_branch;
 #[cfg(test)]
 pub(crate) use entry::status_entry::parse_git_status_metadata_for;
 pub(crate) use entry::status_entry::{
-    GitWorkspaceSummary, StatusContext, StatusUsage, format_sandbox_report, format_status_report,
-    parse_git_status_metadata, parse_git_workspace_summary, print_sandbox_status_snapshot,
-    print_status_snapshot, sandbox_json_value, status_context, status_context_for_session,
-    status_json_value,
+    format_sandbox_report, format_status_report, parse_git_status_metadata,
+    parse_git_workspace_summary, print_sandbox_status_snapshot, print_status_snapshot,
+    sandbox_json_value, status_context, status_context_for_session, status_json_value,
+    GitWorkspaceSummary, StatusContext, StatusUsage,
 };
-#[cfg(test)]
-pub(crate) use entry::workspace_entry::{SetupItem, SetupSnapshot, render_diff_report};
 use entry::workspace_entry::{
     print_setup, render_config_json, render_config_report, render_diff_json_for,
     render_diff_report_for, render_memory_json, render_memory_report, render_setup_json,
     render_setup_report,
 };
+#[cfg(test)]
+pub(crate) use entry::workspace_entry::{render_diff_report, SetupItem, SetupSnapshot};
 #[cfg(test)]
 use gateway_tool_executor::GatewayToolExecutor;
 
@@ -1482,10 +1483,7 @@ fn is_static_skill_cli_action(args: Option<&str>) -> bool {
     let parts = args.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
         ["list" | "help" | "-h" | "--help" | "doctor"] => true,
-        [
-            "view" | "show" | "validate" | "install" | "remove" | "import",
-            _,
-        ] => true,
+        ["view" | "show" | "validate" | "install" | "remove" | "import", _] => true,
         _ => false,
     }
 }
@@ -2539,7 +2537,11 @@ fn detect_broad_cwd() -> Option<PathBuf> {
         .or_else(|| env::var_os("USERPROFILE"))
         .is_some_and(|h| Path::new(&h) == cwd);
     let is_root = cwd.parent().is_none();
-    if is_home || is_root { Some(cwd) } else { None }
+    if is_home || is_root {
+        Some(cwd)
+    } else {
+        None
+    }
 }
 
 /// Enforce the broad-CWD policy: when running from home or root, either
@@ -4702,23 +4704,19 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 mod tests {
     #![allow(unused_imports)]
     use super::{
-        CliAction, CliOutputFormat, DEFAULT_MODEL, GatewayAction, GatewayApprovalSlashCommand,
-        GatewayContextSlashCommand, GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand,
-        GatewayToolExecutor, GitWorkspaceSummary, LATEST_SESSION_REFERENCE, LocalHelpTopic,
-        SHARED_RT, STUB_COMMANDS, SessionHandle, SessionPromptHistoryEntry, SlashCommand,
-        StatusUsage, build_system_prompt_for_mode, cli_turn_context_profile,
-        collect_session_prompt_history, create_managed_session_handle,
-        discover_local_session_import_candidates, ensure_yolo_task, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_connected_line, format_cost_report, format_history_timestamp, format_issue_report,
-        format_model_report, format_model_switch_report, format_permissions_report,
-        format_permissions_switch_report, format_pr_report, format_resume_report,
-        format_startup_banner, format_startup_banner_with_task, format_status_report,
-        format_tool_call_start, format_tool_result, format_ultraplan_report,
-        format_unknown_slash_command_message, format_user_visible_api_error,
-        gateway_auth_token_from_platform, get_unified_store, handoff_resume_context_packet,
-        hydrate_session_from_unified_store, import_local_session_file, jsonl_sessions_dir,
-        merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
+        build_system_prompt_for_mode, cli_turn_context_profile, collect_session_prompt_history,
+        create_managed_session_handle, discover_local_session_import_candidates, ensure_yolo_task,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_connected_line, format_cost_report,
+        format_history_timestamp, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_startup_banner,
+        format_startup_banner_with_task, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command_message,
+        format_user_visible_api_error, gateway_auth_token_from_platform, get_unified_store,
+        handoff_resume_context_packet, hydrate_session_from_unified_store,
+        import_local_session_file, jsonl_sessions_dir, merge_prompt_with_stdin,
+        normalize_permission_mode, parse_args, parse_export_args,
         parse_gateway_approval_slash_command, parse_gateway_args,
         parse_gateway_context_slash_command, parse_gateway_cross_plane_slash_command,
         parse_gateway_task_slash_command, parse_git_status_branch, parse_git_status_metadata_for,
@@ -4733,7 +4731,12 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
         suggestions::format_unknown_slash_command, summarize_tool_payload_for_markdown,
         sync_cli_session_to_unified_store, try_resolve_bare_skill_prompt, validate_no_args,
-        workspace_context_item, write_mcp_server_fixture,
+        workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
+        GatewayAction, GatewayApprovalSlashCommand, GatewayContextSlashCommand,
+        GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand, GatewayToolExecutor,
+        GitWorkspaceSummary, LocalHelpTopic, SessionHandle, SessionPromptHistoryEntry,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT,
+        STUB_COMMANDS,
     };
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
@@ -4741,7 +4744,7 @@ mod tests {
     use crate::task_kernel::{
         TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
     };
-    use model_protocol::oauth::{OAuthConfig, OAuthTokenSet, save_oauth_credentials};
+    use model_protocol::oauth::{save_oauth_credentials, OAuthConfig, OAuthTokenSet};
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
     use model_protocol::usage::TokenUsage;
     use plugins::{
@@ -4766,7 +4769,10 @@ mod tests {
     #[test]
     fn lark_runtime_config_targets_shared_feishu_surface() {
         let mut extra = BTreeMap::new();
-        extra.insert("app_id".to_string(), JsonValue::String("app-id".to_string()));
+        extra.insert(
+            "app_id".to_string(),
+            JsonValue::String("app-id".to_string()),
+        );
         extra.insert(
             "app_secret".to_string(),
             JsonValue::String("app-secret".to_string()),
@@ -5719,11 +5725,9 @@ mod tests {
             build_system_prompt_for_mode(true).expect("system prompt should build")
         });
 
-        assert!(
-            prompt
-                .iter()
-                .any(|section| section.contains("YOLO continuous execution mode is active"))
-        );
+        assert!(prompt
+            .iter()
+            .any(|section| section.contains("YOLO continuous execution mode is active")));
     }
 
     #[test]
@@ -6703,18 +6707,14 @@ mod tests {
 
         assert_eq!(packet.session_id, "session-resume-packet");
         assert_eq!(packet.source, runtime::ResumeContextSource::SessionDb);
-        assert!(
-            packet
-                .active_task
-                .as_deref()
-                .is_some_and(|task| task.contains("context timeline is persisted"))
-        );
-        assert!(
-            packet
-                .recent_decisions
-                .iter()
-                .any(|decision| decision.contains("compaction#2"))
-        );
+        assert!(packet
+            .active_task
+            .as_deref()
+            .is_some_and(|task| task.contains("context timeline is persisted")));
+        assert!(packet
+            .recent_decisions
+            .iter()
+            .any(|decision| decision.contains("compaction#2")));
     }
 
     #[test]
@@ -6754,24 +6754,18 @@ mod tests {
 
         assert_eq!(packet.session_id, "handoff-session");
         assert_eq!(packet.source, runtime::ResumeContextSource::Handoff);
-        assert!(
-            packet
-                .active_task
-                .as_deref()
-                .is_some_and(|task| task.contains("timeline complete"))
-        );
-        assert!(
-            packet
-                .recent_decisions
-                .iter()
-                .any(|decision| decision.contains("Use typed packets"))
-        );
-        assert!(
-            packet
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("fallback to latest"))
-        );
+        assert!(packet
+            .active_task
+            .as_deref()
+            .is_some_and(|task| task.contains("timeline complete")));
+        assert!(packet
+            .recent_decisions
+            .iter()
+            .any(|decision| decision.contains("Use typed packets")));
+        assert!(packet
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("fallback to latest")));
     }
 
     #[test]
@@ -7139,22 +7133,16 @@ mod tests {
         assert!(preflight.contains("Result           ready"));
         assert!(preflight.contains("Branch           feature/ux"));
         assert!(preflight.contains("Workspace        dirty · 2 files · 1 staged, 1 unstaged"));
-        assert!(
-            preflight.contains(
-                "Action           create a git commit from the current workspace changes"
-            )
-        );
+        assert!(preflight
+            .contains("Action           create a git commit from the current workspace changes"));
     }
 
     #[test]
     fn commit_skipped_report_points_to_next_steps() {
         let report = format_commit_skipped_report();
         assert!(report.contains("Reason           no workspace changes"));
-        assert!(
-            report.contains(
-                "Action           create a git commit from the current workspace changes"
-            )
-        );
+        assert!(report
+            .contains("Action           create a git commit from the current workspace changes"));
         assert!(report.contains("/status to inspect context"));
         assert!(report.contains("/diff to inspect repo changes"));
     }
@@ -7427,13 +7415,11 @@ UU conflicted.rs",
                 .expect("switch should update session path"),
             session_db_path()
         );
-        assert!(
-            outcome
-                .message
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Session switched")
-        );
+        assert!(outcome
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Session switched"));
 
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(config_home);
@@ -7667,11 +7653,9 @@ UU conflicted.rs",
             .expect("legacy session should save");
 
         let candidates = discover_local_session_import_candidates();
-        assert!(
-            candidates
-                .iter()
-                .any(|candidate| candidate.path == legacy_path)
-        );
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.path == legacy_path));
         assert!(
             resolve_session_reference("legacy").is_err(),
             "legacy files must not resolve until explicitly imported"
@@ -7681,12 +7665,10 @@ UU conflicted.rs",
         let (imported_id, _messages) =
             import_local_session_file(&store, &legacy_path).expect("legacy import should succeed");
         assert!(!imported_id.is_empty());
-        assert!(
-            SHARED_RT
-                .block_on(store.get_session(&imported_id))
-                .expect("session lookup should succeed")
-                .is_some()
-        );
+        assert!(SHARED_RT
+            .block_on(store.get_session(&imported_id))
+            .expect("session lookup should succeed")
+            .is_some());
 
         std::env::set_current_dir(&restore_dir).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
@@ -8412,11 +8394,9 @@ UU conflicted.rs",
             executor.execute_authorized(&authorization, tool_name, input)
         };
 
-        assert!(
-            executor
-                .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
-                .is_err()
-        );
+        assert!(executor
+            .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
+            .is_err());
 
         let tool_output = authorize_and_execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
             .expect("discovered mcp tool should execute");
@@ -8774,7 +8754,7 @@ fn write_mcp_server_fixture(script_path: &Path) {
 #[cfg(test)]
 mod sandbox_report_tests {
     #![allow(unused_imports)]
-    use super::{HookAbortMonitor, format_sandbox_report};
+    use super::{format_sandbox_report, HookAbortMonitor};
     use runtime::HookAbortSignal;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -8831,7 +8811,7 @@ mod sandbox_report_tests {
 #[cfg(test)]
 mod dump_manifests_tests {
     #![allow(unused_imports)]
-    use super::{CliOutputFormat, dump_manifests_at_path};
+    use super::{dump_manifests_at_path, CliOutputFormat};
     use std::fs;
 
     #[test]

@@ -669,10 +669,9 @@ mod tests {
             .map(|handle| handle.join().expect("checkpoint thread"))
             .collect::<BTreeSet<_>>();
         assert_eq!(ids.len(), 8);
-        assert!(
-            ids.iter()
-                .all(|id| checkpoints_root(&root).join(id).is_dir())
-        );
+        assert!(ids
+            .iter()
+            .all(|id| checkpoints_root(&root).join(id).is_dir()));
         fs::remove_dir_all(root).expect("cleanup");
     }
 

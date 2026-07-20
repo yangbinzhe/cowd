@@ -302,12 +302,11 @@ mod tests {
             })
             .expect("capacity");
         }
-        assert!(
-            tx.try_send(CowdEvent::TextDelta {
+        assert!(tx
+            .try_send(CowdEvent::TextDelta {
                 text: "overflow".into(),
             })
-            .is_err()
-        );
+            .is_err());
     }
 
     #[tokio::test]

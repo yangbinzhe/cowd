@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -13,16 +13,16 @@ use storage::{SqliteConnectionFactory, StorageHandle};
 use thiserror::Error;
 
 use crate::{
-    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand,
-    MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment,
-    MfgAssignmentCommand, MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile,
-    MfgCockpitProjection, MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest,
-    MfgCockpitReportSnapshot, MfgCockpitWidget, MfgCockpitWidgetProjection, MfgCommandReceipt,
-    MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection, MfgForecastSignal,
-    MfgIncident, MfgLiveDeltaRead, MfgLiveEpoch, MfgLiveProjectionEvent, MfgLiveSnapshotRead,
-    MfgMemoryCase, MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun, MfgWidgetDefinition,
-    MfgWidgetInstance, MfgWorkflowGraph, MfgWorkflowGraphError, mfg_ontology_pack, mfg_seed_plan,
-    mfg_widget_catalog,
+    mfg_ontology_pack, mfg_seed_plan, mfg_widget_catalog, MfgActionExecution,
+    MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommand, MfgAlertCommandInput,
+    MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment, MfgAssignmentCommand,
+    MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
+    MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
+    MfgCockpitWidget, MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt,
+    MfgDomainSeedResult, MfgForecastProjection, MfgForecastSignal, MfgIncident, MfgLiveDeltaRead,
+    MfgLiveEpoch, MfgLiveProjectionEvent, MfgLiveSnapshotRead, MfgMemoryCase,
+    MfgOperationalAnalysis, MfgPlaybook, MfgSkillRun, MfgWidgetDefinition, MfgWidgetInstance,
+    MfgWorkflowGraph, MfgWorkflowGraphError,
 };
 
 use app_mfg_contract::{
@@ -31,15 +31,15 @@ use app_mfg_contract::{
     MfgReportDeliveryReviewStatus,
 };
 use matrix_core::{
-    MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob, MatrixComputeJobInput,
-    MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput, MatrixDataPlane,
-    MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan, MatrixDataPlaneIngestPlanInput,
-    MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket, MatrixEvidenceSourceRef,
-    MatrixFact, MatrixImpactHop, MatrixImpactTrace, MatrixMetricAttentionPlan,
-    MatrixMetricAttentionScore, MatrixMetricDefinition, MatrixMetricDependency,
-    MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem, MatrixMetricState,
-    MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation, MatrixSeverity,
-    MatrixSourceDeltaPlan, MatrixSourcePack, MatrixSourcePackValidation, build_metric_compute_jobs,
+    build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
+    MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
+    MatrixDataPlane, MatrixDataPlaneHealth, MatrixDataPlaneIngestPlan,
+    MatrixDataPlaneIngestPlanInput, MatrixDataPlaneWatermark, MatrixEntity, MatrixEvidencePacket,
+    MatrixEvidenceSourceRef, MatrixFact, MatrixImpactHop, MatrixImpactTrace,
+    MatrixMetricAttentionPlan, MatrixMetricAttentionScore, MatrixMetricDefinition,
+    MatrixMetricDependency, MatrixMetricLineage, MatrixMetricSnapshot, MatrixMetricSnapshotItem,
+    MatrixMetricState, MatrixOntologyPack, MatrixQualityGateDecision, MatrixRelation,
+    MatrixSeverity, MatrixSourceDeltaPlan, MatrixSourcePack, MatrixSourcePackValidation,
 };
 use matrix_repository::MatrixSqliteDataPlane;
 
@@ -10041,10 +10041,10 @@ fn attention_from_change(
 mod tests {
     use super::*;
     use crate::{
-        MfgAlertRuleInput, MfgAlertSubscriptionInput, MfgAssignmentInput, MfgCockpitProfileInput,
-        MfgCockpitReportDeliveryPayload, MfgCockpitReportDeliveryPayloadRequest,
-        MfgCockpitReportDeliveryReceipt, MfgCockpitReportDeliveryState, MfgCockpitReportRequest,
-        MfgDashboardScope, default_mfg_widget_instances,
+        default_mfg_widget_instances, MfgAlertRuleInput, MfgAlertSubscriptionInput,
+        MfgAssignmentInput, MfgCockpitProfileInput, MfgCockpitReportDeliveryPayload,
+        MfgCockpitReportDeliveryPayloadRequest, MfgCockpitReportDeliveryReceipt,
+        MfgCockpitReportDeliveryState, MfgCockpitReportRequest, MfgDashboardScope,
     };
     use matrix_core::{
         MatrixComputeJobInput, MatrixDataPlaneIngestPlanInput, MatrixEntityInput, MatrixFactInput,
@@ -10382,20 +10382,15 @@ mod tests {
                 "snapshot field {marker} is not wired to its durable table"
             );
         }
-        assert!(
-            !state["data_compute"]["facts"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            state["receipts"]["mutations"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|item| {
-                    item["response"]["_live_snapshot_sentinel"].as_str()
-                        == Some("receipts.mutations")
-                }))
-        );
+        assert!(!state["data_compute"]["facts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(state["receipts"]["mutations"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| {
+                item["response"]["_live_snapshot_sentinel"].as_str() == Some("receipts.mutations")
+            })));
         let delta = repository
             .live_delta_read(event_cursor.saturating_sub(1), 100)
             .unwrap();
@@ -10511,20 +10506,18 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(
-            repository
-                .record_mutation_receipt(
-                    "live-atomicity-key",
-                    "principal:operator",
-                    "mfg.incident.create",
-                    "mfg:incident:live-atomicity",
-                    None,
-                    Some(1),
-                    "sha256:live-atomicity",
-                    &serde_json::json!({"revision": 1}),
-                )
-                .is_err()
-        );
+        assert!(repository
+            .record_mutation_receipt(
+                "live-atomicity-key",
+                "principal:operator",
+                "mfg.incident.create",
+                "mfg:incident:live-atomicity",
+                None,
+                Some(1),
+                "sha256:live-atomicity",
+                &serde_json::json!({"revision": 1}),
+            )
+            .is_err());
 
         let connection = repository.connection.lock().unwrap();
         let status = connection
@@ -10934,12 +10927,10 @@ mod tests {
             expected_revision: None,
         });
         repository.upsert_alert_rule(&rule, None).unwrap();
-        assert!(
-            repository
-                .list_alert_occurrences(None, 10)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(repository
+            .list_alert_occurrences(None, 10)
+            .unwrap()
+            .is_empty());
 
         let now = Utc::now();
         let matching = MatrixAttentionItem {
@@ -11393,12 +11384,10 @@ mod tests {
             .expect("impact path builds");
         assert_eq!(trace.root_entity_id, component.entity_id);
         assert_eq!(trace.hops.len(), 2);
-        assert!(
-            trace
-                .entities
-                .iter()
-                .any(|entity| entity.entity_id == order.entity_id)
-        );
+        assert!(trace
+            .entities
+            .iter()
+            .any(|entity| entity.entity_id == order.entity_id));
         assert_eq!(store.health().unwrap().relation_count, 2);
     }
 
@@ -11432,20 +11421,16 @@ mod tests {
         let trace = store
             .impact_trace("entity-component-gpu-h100", 3)
             .expect("impact trace builds");
-        assert!(
-            trace
-                .entities
-                .iter()
-                .any(|entity| entity.entity_id == "entity-order-co-2026-0001")
-        );
+        assert!(trace
+            .entities
+            .iter()
+            .any(|entity| entity.entity_id == "entity-order-co-2026-0001"));
 
         let recompute = store.recompute_metrics().expect("metrics recompute");
-        assert!(
-            recompute
-                .metric_states
-                .iter()
-                .any(|state| state.metric_id == "material_shortage_risk")
-        );
+        assert!(recompute
+            .metric_states
+            .iter()
+            .any(|state| state.metric_id == "material_shortage_risk"));
         assert!(!recompute.attention.is_empty());
     }
 
@@ -11458,32 +11443,24 @@ mod tests {
         let lineage = store
             .metric_lineage("supplier_commit_variance", 6)
             .expect("lineage builds");
-        assert!(
-            lineage
-                .downstream_dependencies
-                .iter()
-                .any(|dependency| dependency.downstream_metric_id == "material_shortage_risk")
-        );
-        assert!(
-            lineage
-                .impacted_metric_ids
-                .iter()
-                .any(|metric_id| metric_id == "order_delivery_risk")
-        );
+        assert!(lineage
+            .downstream_dependencies
+            .iter()
+            .any(|dependency| dependency.downstream_metric_id == "material_shortage_risk"));
+        assert!(lineage
+            .impacted_metric_ids
+            .iter()
+            .any(|metric_id| metric_id == "order_delivery_risk"));
 
         let affected = store
             .metrics_affected_by_fact_type("supply.commit_variance")
             .expect("affected metrics resolve");
-        assert!(
-            affected
-                .iter()
-                .any(|metric_id| metric_id == "supplier_commit_variance")
-        );
-        assert!(
-            affected
-                .iter()
-                .any(|metric_id| metric_id == "order_delivery_risk")
-        );
+        assert!(affected
+            .iter()
+            .any(|metric_id| metric_id == "supplier_commit_variance"));
+        assert!(affected
+            .iter()
+            .any(|metric_id| metric_id == "order_delivery_risk"));
         assert_eq!(store.health().unwrap().metric_dependency_count, 5);
     }
 
@@ -11505,16 +11482,14 @@ mod tests {
             .expect("job plans");
 
         assert_eq!(plan.job.status, "planned");
-        assert!(
-            plan.affected_metric_ids
-                .iter()
-                .any(|metric_id| metric_id == "supplier_commit_variance")
-        );
-        assert!(
-            plan.affected_metric_ids
-                .iter()
-                .any(|metric_id| metric_id == "order_delivery_risk")
-        );
+        assert!(plan
+            .affected_metric_ids
+            .iter()
+            .any(|metric_id| metric_id == "supplier_commit_variance"));
+        assert!(plan
+            .affected_metric_ids
+            .iter()
+            .any(|metric_id| metric_id == "order_delivery_risk"));
         assert_eq!(store.health().unwrap().compute_job_count, 1);
 
         let job = store.run_compute_job(&plan.job.job_id).expect("job runs");
@@ -11528,12 +11503,10 @@ mod tests {
                 .len()
                 == 1
         );
-        assert!(
-            store
-                .metric_states("work_center_load")
-                .expect("states load")
-                .is_empty()
-        );
+        assert!(store
+            .metric_states("work_center_load")
+            .expect("states load")
+            .is_empty());
     }
 
     #[test]
@@ -11694,11 +11667,10 @@ mod tests {
                     priority: None,
                 })
                 .expect("compute plan builds");
-            assert!(
-                plan.affected_metric_ids
-                    .iter()
-                    .any(|metric_id| metric_id == expected.trigger_metric)
-            );
+            assert!(plan
+                .affected_metric_ids
+                .iter()
+                .any(|metric_id| metric_id == expected.trigger_metric));
         }
     }
 
@@ -11794,11 +11766,10 @@ mod tests {
             })
             .expect("ingest plan builds");
 
-        assert!(
-            plan.affected_metric_ids
-                .iter()
-                .any(|metric_id| metric_id == "manufacturing_event_count")
-        );
+        assert!(plan
+            .affected_metric_ids
+            .iter()
+            .any(|metric_id| metric_id == "manufacturing_event_count"));
         assert!(plan.compute_jobs.iter().any(|job| {
             job.metric_ids
                 .iter()
@@ -11947,12 +11918,10 @@ mod tests {
             .evaluate_evidence_quality(&packet.packet_id)
             .expect("quality gate evaluates");
         assert_eq!(review_gate.decision, "review");
-        assert!(
-            review_gate
-                .required_actions
-                .iter()
-                .any(|action| action == "run_incident_analysis")
-        );
+        assert!(review_gate
+            .required_actions
+            .iter()
+            .any(|action| action == "run_incident_analysis"));
         assert_eq!(
             store
                 .get_quality_gate(&review_gate.gate_id)
@@ -12119,16 +12088,12 @@ mod tests {
         assert_eq!(payload.template_id, "ops.alert.compact");
         assert_eq!(payload.requested_capability, "channel.feishu.send_text");
         assert!(payload.resource_ref.starts_with("text://"));
-        assert!(
-            payload
-                .constraints
-                .contains(&"payload_kind:text".to_string())
-        );
-        assert!(
-            payload
-                .constraints
-                .contains(&"target_ref_present".to_string())
-        );
+        assert!(payload
+            .constraints
+            .contains(&"payload_kind:text".to_string()));
+        assert!(payload
+            .constraints
+            .contains(&"target_ref_present".to_string()));
 
         let delivered = store
             .attach_cockpit_report_delivery(
@@ -12164,20 +12129,18 @@ mod tests {
             .expect("report delivery deduplicates");
         assert_eq!(delivered.delivery_receipts.len(), 1);
         assert_eq!(delivered.revision, delivered_revision);
-        assert!(
-            store
-                .attach_cockpit_report_delivery(
-                    &report.report_id,
-                    MfgCockpitReportDeliveryReceipt::new(
-                        report.report_id.clone(),
-                        "cpx-report-test",
-                        "dispatched",
-                        "sent",
-                        Some("cpa-report-test".to_string()),
-                    ),
-                )
-                .is_err()
-        );
+        assert!(store
+            .attach_cockpit_report_delivery(
+                &report.report_id,
+                MfgCockpitReportDeliveryReceipt::new(
+                    report.report_id.clone(),
+                    "cpx-report-test",
+                    "dispatched",
+                    "sent",
+                    Some("cpa-report-test".to_string()),
+                ),
+            )
+            .is_err());
         let unchanged = store
             .get_cockpit_report(&report.report_id)
             .unwrap()
@@ -12212,11 +12175,9 @@ mod tests {
         );
         assert!(!delivery_state.retryable);
         assert_eq!(delivery_state.recommended_mode, "manual_review");
-        assert!(
-            delivery_state
-                .reasons
-                .contains(&"delivery:retry_attempts_exhausted:3".to_string())
-        );
+        assert!(delivery_state
+            .reasons
+            .contains(&"delivery:retry_attempts_exhausted:3".to_string()));
     }
 
     #[test]
@@ -12258,11 +12219,9 @@ mod tests {
             .expect("single widget projects");
         assert_eq!(projection.profile_revision, saved.revision);
         assert_eq!(projection.widget.instance_id, "default-attention");
-        assert!(
-            store
-                .cockpit_widget_projection(&saved.profile_id, "default-quality")
-                .is_ok()
-        );
+        assert!(store
+            .cockpit_widget_projection(&saved.profile_id, "default-quality")
+            .is_ok());
         assert!(matches!(
             store.cockpit_widget_projection(&saved.profile_id, "missing"),
             Err(MfgRepositoryError::NotFound(_))
@@ -12485,12 +12444,10 @@ mod tests {
             terminal.status,
             MfgReportDeliveryReviewStatus::EffectAppliedReroute
         );
-        assert!(
-            reopened
-                .claim_report_delivery_review_effects(10)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reopened
+            .claim_report_delivery_review_effects(10)
+            .unwrap()
+            .is_empty());
         drop(reopened);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
@@ -13061,20 +13018,18 @@ mod tests {
             .expect("bridge receipt deduplicates");
         assert_eq!(execution.cross_plane_receipts.len(), 1);
         assert_eq!(execution.updated_at, bridge_updated_at);
-        assert!(
-            store
-                .attach_cross_plane_receipt(
-                    &execution.execution_id,
-                    MfgCrossPlaneBridgeReceipt::new(
-                        execution.execution_id.clone(),
-                        "cpx-matrix-test",
-                        "dispatched",
-                        "sent",
-                        Some("cpa-matrix-test".to_string()),
-                    ),
-                )
-                .is_err()
-        );
+        assert!(store
+            .attach_cross_plane_receipt(
+                &execution.execution_id,
+                MfgCrossPlaneBridgeReceipt::new(
+                    execution.execution_id.clone(),
+                    "cpx-matrix-test",
+                    "dispatched",
+                    "sent",
+                    Some("cpa-matrix-test".to_string()),
+                ),
+            )
+            .is_err());
         let unchanged = store
             .get_execution(&execution.execution_id)
             .unwrap()
@@ -13093,18 +13048,16 @@ mod tests {
             .record_execution_feedback(&execution.execution_id, feedback)
             .expect("identical feedback replays");
         assert_eq!(replayed.updated_at, feedback_updated_at);
-        assert!(
-            store
-                .record_execution_feedback(
-                    &execution.execution_id,
-                    MfgActionFeedback::new(
-                        "needs_followup",
-                        "attempt to replace immutable outcome",
-                        Some(40.0),
-                    ),
-                )
-                .is_err()
-        );
+        assert!(store
+            .record_execution_feedback(
+                &execution.execution_id,
+                MfgActionFeedback::new(
+                    "needs_followup",
+                    "attempt to replace immutable outcome",
+                    Some(40.0),
+                ),
+            )
+            .is_err());
         let unchanged = store
             .get_execution(&execution.execution_id)
             .unwrap()

@@ -90,7 +90,6 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-
 /// Task result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
@@ -215,7 +214,6 @@ pub enum WaveStatus {
     Cancelled,
 }
 
-
 /// Wave execution result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaveResult {
@@ -244,7 +242,6 @@ pub enum ErrorPolicy {
     /// Abort the entire plan on first failure.
     Abort,
 }
-
 
 /// Wave execution configuration.
 #[derive(Debug, Clone)]

@@ -7,23 +7,23 @@ use std::time::Duration;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use futures::StreamExt;
 use harness_contract::projection::{ExecutionCommandKind, ExecutionCommandRequest};
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
 use crate::app::{PendingResource, SystemNoticeKind};
 use crate::context_tokens::ContextWorkspaceEntry;
 use crate::events::CowdEventSender;
-use crate::gateway_client::{GatewayApiClient, default_auth_token};
+use crate::gateway_client::{default_auth_token, GatewayApiClient};
 use crate::runtime_control_store::{
     MfgBacklink, MfgBacklinkKind, MfgItemSummary, MfgOperationsSnapshot, MfgOperationsState,
     MfgPaginationState,
 };
 use crate::state::{ProcessedKey, TuiState};
-use crate::{CowdEvent, FileEntry, config_migration, cowd_event_channel, error_recovery};
+use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
 
 static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -3614,12 +3614,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![MfgBacklinkKind::Evidence, MfgBacklinkKind::Runtime]
         );
-        assert!(
-            !summaries[0]
-                .backlinks
-                .iter()
-                .any(|backlink| backlink.kind == MfgBacklinkKind::Surface)
-        );
+        assert!(!summaries[0]
+            .backlinks
+            .iter()
+            .any(|backlink| backlink.kind == MfgBacklinkKind::Surface));
     }
 
     #[test]
@@ -3705,12 +3703,10 @@ mod tests {
             "assignment",
         )
         .expect("assignment summary");
-        assert!(
-            !assignment
-                .backlinks
-                .iter()
-                .any(|backlink| backlink.target.contains("chat-1"))
-        );
+        assert!(!assignment
+            .backlinks
+            .iter()
+            .any(|backlink| backlink.target.contains("chat-1")));
         assert!(assignment.backlinks.iter().any(|backlink| {
             backlink.kind == MfgBacklinkKind::Surface
                 && backlink.target == "surface://feishu/delivery/surface-delivery-42"
@@ -3730,12 +3726,10 @@ mod tests {
             "report",
         )
         .expect("report summary");
-        assert!(
-            !report
-                .backlinks
-                .iter()
-                .any(|backlink| backlink.target == "surface://email/report-1")
-        );
+        assert!(!report
+            .backlinks
+            .iter()
+            .any(|backlink| backlink.target == "surface://email/report-1"));
         assert!(report.backlinks.iter().any(|backlink| {
             backlink.kind == MfgBacklinkKind::Surface
                 && backlink.target == "receipt://cross-plane/cross-plane-1"
@@ -3778,12 +3772,10 @@ mod tests {
             backlink.kind == MfgBacklinkKind::Approval && backlink.target == "approval://approval-1"
         }));
         assert_eq!(summary.evidence_refs, vec!["evidence-1".to_string()]);
-        assert!(
-            !summary
-                .backlinks
-                .iter()
-                .any(|backlink| backlink.kind == MfgBacklinkKind::Evidence)
-        );
+        assert!(!summary
+            .backlinks
+            .iter()
+            .any(|backlink| backlink.kind == MfgBacklinkKind::Evidence));
     }
 
     #[test]
@@ -3906,11 +3898,9 @@ mod tests {
         let files = parse_workspace_files_projection(&projection).unwrap();
 
         assert!(files.iter().any(|entry| entry.name == ".env"));
-        assert!(
-            files
-                .iter()
-                .any(|entry| entry.name == "src" && entry.is_dir)
-        );
+        assert!(files
+            .iter()
+            .any(|entry| entry.name == "src" && entry.is_dir));
     }
 
     #[test]

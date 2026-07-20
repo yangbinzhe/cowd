@@ -67,8 +67,7 @@ pub struct Triple {
 /// Entity facts for seeding the knowledge graph.
 ///
 /// Similar to MemPalace's fact_checker.py ENTITY_FACTS structure.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EntityFacts {
     /// Full name of the entity.
     pub full_name: Option<String>,
@@ -85,7 +84,6 @@ pub struct EntityFacts {
     /// Custom relationships (predicate -> object).
     pub relationships: Vec<(String, String)>,
 }
-
 
 // ─── Query Options ────────────────────────────────────────────────────────────
 

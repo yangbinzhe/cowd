@@ -3,22 +3,22 @@ use std::{
     path::Path,
     path::PathBuf,
     sync::{
-        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, Weak,
     },
 };
 
 use super::ServiceEnvelope;
 use app_mfg::{
-    MfgActionExecution, MfgActionExecutionRequest, MfgActionFeedback, MfgAlertCommandInput,
-    MfgAlertOccurrence, MfgAlertRule, MfgAlertSubscription, MfgAssignment,
-    MfgAssignmentCommandInput, MfgCasePromotion, MfgCockpitProfile, MfgCockpitProjection,
-    MfgCockpitReportDeliveryReceipt, MfgCockpitReportRequest, MfgCockpitReportSnapshot,
-    MfgCockpitWidgetProjection, MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult,
-    MfgForecastProjection, MfgHealth, MfgIncident, MfgMemoryCase, MfgMetricRecomputeResult,
-    MfgOperationalAnalysis, MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan,
-    MfgSkillRun, MfgStore, plan_server_manufacturing_skills, run_server_manufacturing_skill,
-    server_manufacturing_skill_pack,
+    plan_server_manufacturing_skills, run_server_manufacturing_skill,
+    server_manufacturing_skill_pack, MfgActionExecution, MfgActionExecutionRequest,
+    MfgActionFeedback, MfgAlertCommandInput, MfgAlertOccurrence, MfgAlertRule,
+    MfgAlertSubscription, MfgAssignment, MfgAssignmentCommandInput, MfgCasePromotion,
+    MfgCockpitProfile, MfgCockpitProjection, MfgCockpitReportDeliveryReceipt,
+    MfgCockpitReportRequest, MfgCockpitReportSnapshot, MfgCockpitWidgetProjection,
+    MfgCommandReceipt, MfgCrossPlaneBridgeReceipt, MfgDomainSeedResult, MfgForecastProjection,
+    MfgHealth, MfgIncident, MfgMemoryCase, MfgMetricRecomputeResult, MfgOperationalAnalysis,
+    MfgPlaybook, MfgRepositoryError, MfgSkillManifest, MfgSkillPlan, MfgSkillRun, MfgStore,
 };
 use app_mfg_contract::{
     MfgReportDeliveryReview, MfgReportDeliveryReviewDecision, MfgReportDeliveryReviewEffect,

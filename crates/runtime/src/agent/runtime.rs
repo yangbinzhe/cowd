@@ -1899,12 +1899,10 @@ mod tests {
             .expect("validation failure is a terminal Agent result");
 
         assert_eq!(returned.status, AgentTerminalStatus::Failed);
-        assert!(
-            returned
-                .failure
-                .as_deref()
-                .is_some_and(|failure| failure.contains("Runtime rejected Agent terminal result"))
-        );
+        assert!(returned
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.contains("Runtime rejected Agent terminal result")));
         assert_eq!(returned.input_tokens, 3);
         assert_eq!(returned.output_tokens, 2);
         assert_eq!(
@@ -1914,12 +1912,10 @@ mod tests {
                 .status,
             AgentStatus::Failed
         );
-        assert!(
-            runtime
-                .events(&packet.agent_id)
-                .iter()
-                .any(|event| event.status == AgentStatus::Failed)
-        );
+        assert!(runtime
+            .events(&packet.agent_id)
+            .iter()
+            .any(|event| event.status == AgentStatus::Failed));
     }
 
     #[test]

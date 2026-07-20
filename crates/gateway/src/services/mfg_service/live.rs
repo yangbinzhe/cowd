@@ -12,7 +12,7 @@ use app_mfg_contract::{
     MfgContractVersion, MfgLiveDeltaV1, MfgLiveEnvelopeV1, MfgLiveEventV1, MfgLiveHeartbeatV1,
     MfgLiveResyncV1, MfgLiveSnapshotStateV1, MfgLiveSnapshotV1,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1428,18 +1428,16 @@ mod tests {
                 &serde_json::json!({"revision": 1}),
             )
             .unwrap();
-        assert!(
-            service
-                .live_delta_envelope(
-                    config_home.path(),
-                    &observer,
-                    &snapshot.view_epoch,
-                    &snapshot.cursor,
-                    100,
-                )
-                .unwrap()
-                .is_none()
-        );
+        assert!(service
+            .live_delta_envelope(
+                config_home.path(),
+                &observer,
+                &snapshot.view_epoch,
+                &snapshot.cursor,
+                100,
+            )
+            .unwrap()
+            .is_none());
         let MfgLiveEnvelopeV1::Heartbeat(heartbeat) = service
             .live_heartbeat_envelope(config_home.path(), &observer, &snapshot.cursor)
             .unwrap()

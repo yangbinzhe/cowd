@@ -2318,11 +2318,9 @@ mod tests {
                 .expect("normalize internal absolute path");
         let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
         assert_eq!(normalized["path"], "fixtures/target.txt");
-        assert!(
-            normalized["content"]
-                .as_str()
-                .is_some_and(|content| content.contains(&root.path().display().to_string()))
-        );
+        assert!(normalized["content"]
+            .as_str()
+            .is_some_and(|content| content.contains(&root.path().display().to_string())));
     }
 
     #[test]
@@ -2446,17 +2444,18 @@ mod tests {
             .describe_tool_effect("read_file", &absolute_value)
             .expect("normalized effect descriptor");
         let authorization = crate::ToolPolicy
-            .authorize(&descriptor, "absolute-agent-read", PermissionMode::ReadOnly, 30)
+            .authorize(
+                &descriptor,
+                "absolute-agent-read",
+                PermissionMode::ReadOnly,
+                30,
+            )
             .expect("normalized read authorization")
             .authorization;
 
         assert_eq!(
             executor
-                .execute_authorized(
-                    &authorization,
-                    "read_file",
-                    &absolute_value.to_string(),
-                )
+                .execute_authorized(&authorization, "read_file", &absolute_value.to_string(),)
                 .expect("same normalized descriptor must remain current"),
             "authorized:read_file"
         );

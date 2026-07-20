@@ -356,7 +356,11 @@ fn rejected(command: MissionCommand, reason: impl Into<String>) -> MissionComman
 }
 
 fn non_empty_actor(actor: &str) -> String {
-    if !actor.trim().is_empty() { actor.to_string() } else { "mission_command".to_string() }
+    if !actor.trim().is_empty() {
+        actor.to_string()
+    } else {
+        "mission_command".to_string()
+    }
 }
 
 #[cfg(test)]

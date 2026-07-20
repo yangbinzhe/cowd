@@ -4,11 +4,11 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
     extract::{Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, patch},
+    Json, Router,
 };
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
@@ -19,7 +19,7 @@ use memory::{
 };
 use serde::Deserialize;
 
-use super::{AppState, ErrorResponse, api_error};
+use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()

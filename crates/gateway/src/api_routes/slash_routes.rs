@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use crate::command::slash::CommandSurface;
 use axum::{
-    Json, Router,
     extract::{Path as AxumPath, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use serde::Deserialize;
 
-use super::{AppState, ErrorResponse, api_error};
+use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()

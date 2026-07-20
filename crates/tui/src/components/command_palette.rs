@@ -13,11 +13,11 @@
 #![allow(dead_code)]
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::Frame;
 
 use crate::components::base::{Component, EventResult, RenderContext};
 use crate::keybind::Action;
@@ -116,7 +116,11 @@ fn fuzzy_match_score(query: &str, text: &str) -> usize {
         }
     }
 
-    if matched == q.len() { matched * 25 } else { 0 }
+    if matched == q.len() {
+        matched * 25
+    } else {
+        0
+    }
 }
 
 /// Compute the combined score for a command entry against a query.
@@ -730,7 +734,11 @@ impl CommandPalette {
                 .enumerate()
                 .filter_map(|(i, entry)| {
                     let score = score_entry(query, entry);
-                    if score > 0 { Some((i, score)) } else { None }
+                    if score > 0 {
+                        Some((i, score))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
 
@@ -1214,7 +1222,7 @@ mod tests {
     use super::*;
     use crate::components::RenderContext;
     use crate::skin::SkinConfig;
-    use crate::test_utils::{MockTerminal, gateway_command_projection_fixture};
+    use crate::test_utils::{gateway_command_projection_fixture, MockTerminal};
     use crossterm::event::KeyModifiers;
 
     // ── Helpers ───────────────────────────────────────────────────
@@ -1393,16 +1401,14 @@ mod tests {
         p.sync_runtime_actions(&snapshot);
 
         assert!(p.command_count() > before);
-        assert!(
-            p.all_commands
-                .iter()
-                .any(|entry| { entry.dynamic && entry.name == "Inspect Runtime" })
-        );
-        assert!(
-            p.all_commands
-                .iter()
-                .any(|entry| { entry.dynamic && entry.action == Action::Execute("/tasks".into()) })
-        );
+        assert!(p
+            .all_commands
+            .iter()
+            .any(|entry| { entry.dynamic && entry.name == "Inspect Runtime" }));
+        assert!(p
+            .all_commands
+            .iter()
+            .any(|entry| { entry.dynamic && entry.action == Action::Execute("/tasks".into()) }));
         assert!(p.all_commands.iter().any(|entry| {
             entry.dynamic && entry.action == Action::Execute("/approvals".into())
         }));
@@ -1459,12 +1465,10 @@ mod tests {
                     Action::Execute(command) if command == "/mfg review review-1"
                 )
         }));
-        assert!(
-            !palette
-                .all_commands
-                .iter()
-                .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. }))
-        );
+        assert!(!palette
+            .all_commands
+            .iter()
+            .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. })));
 
         let malformed = RuntimeControlSnapshot {
             gateway_running: true,
@@ -1477,18 +1481,14 @@ mod tests {
             ..RuntimeControlSnapshot::default()
         };
         palette.sync_runtime_actions(&malformed);
-        assert!(
-            palette
-                .all_commands
-                .iter()
-                .any(|entry| entry.name == "Inspect Invalid MFG Approval")
-        );
-        assert!(
-            !palette
-                .all_commands
-                .iter()
-                .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. }))
-        );
+        assert!(palette
+            .all_commands
+            .iter()
+            .any(|entry| entry.name == "Inspect Invalid MFG Approval"));
+        assert!(!palette
+            .all_commands
+            .iter()
+            .any(|entry| matches!(&entry.action, Action::RespondGatewayApproval { .. })));
     }
 
     #[test]
@@ -1521,27 +1521,21 @@ mod tests {
         });
         state.granted_capabilities = vec!["mfg.read".to_string(), "mfg.alert.respond".to_string()];
         palette.sync_mfg_actions(&state);
-        assert!(
-            palette
-                .all_commands
-                .iter()
-                .any(|entry| entry.name == "mfg.alert.resolve")
-        );
-        assert!(
-            !palette
-                .all_commands
-                .iter()
-                .any(|entry| entry.name == "mfg.assignment.complete")
-        );
+        assert!(palette
+            .all_commands
+            .iter()
+            .any(|entry| entry.name == "mfg.alert.resolve"));
+        assert!(!palette
+            .all_commands
+            .iter()
+            .any(|entry| entry.name == "mfg.assignment.complete"));
 
         state.granted_capabilities = vec!["mfg.read".to_string()];
         palette.sync_mfg_actions(&state);
-        assert!(
-            !palette
-                .all_commands
-                .iter()
-                .any(|entry| entry.name == "mfg.alert.resolve")
-        );
+        assert!(!palette
+            .all_commands
+            .iter()
+            .any(|entry| entry.name == "mfg.alert.resolve"));
     }
 
     #[test]
@@ -1673,11 +1667,10 @@ mod tests {
 
         assert_eq!(first_dynamic, 1);
         assert!(second_dynamic >= 3);
-        assert!(
-            !p.all_commands
-                .iter()
-                .any(|entry| entry.dynamic && entry.name == "Start Gateway")
-        );
+        assert!(!p
+            .all_commands
+            .iter()
+            .any(|entry| entry.dynamic && entry.name == "Start Gateway"));
     }
 
     // ── Search scoring ────────────────────────────────────────────

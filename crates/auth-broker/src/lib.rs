@@ -13,10 +13,10 @@ use std::{
 };
 
 use app_mfg_contract::{
-    MfgCoreProfileId, MfgEntitlementProjectionV2, MfgProfileId, core_profile_capabilities,
-    mfg_profile_capabilities,
+    core_profile_capabilities, mfg_profile_capabilities, MfgCoreProfileId,
+    MfgEntitlementProjectionV2, MfgProfileId,
 };
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use harness_contract::security::{
     DecisionLeaseClaims, PrincipalAssurance, PrincipalClaims, PrincipalKind, SignedDecisionLease,
     SignedPrincipalEnvelope,
@@ -1040,7 +1040,7 @@ pub mod test_support {
     use harness_contract::security::{SignedDecisionLease, SignedPrincipalEnvelope};
 
     use super::{
-        AuthBrokerError, LocalAuthority, MfgCoreProfileId, MfgProfileId, entitlement_union,
+        entitlement_union, AuthBrokerError, LocalAuthority, MfgCoreProfileId, MfgProfileId,
     };
 
     pub fn issue_human_principal(
@@ -1505,11 +1505,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cowd-auth-broker-{}", uuid::Uuid::new_v4()));
         let authority = LocalAuthority::open_or_initialize(&root, "credential").expect("authority");
         let public_key = authority.public_key_base64();
-        assert!(
-            authority
-                .issue_human_principal("forged", vec!["approval.respond".to_string()], None)
-                .is_err()
-        );
+        assert!(authority
+            .issue_human_principal("forged", vec!["approval.respond".to_string()], None)
+            .is_err());
         let reopened = LocalAuthority::open_or_initialize(&root, "credential").expect("reopen");
         assert_eq!(public_key, reopened.public_key_base64());
         let _ = fs::remove_dir_all(root);
@@ -1528,16 +1526,14 @@ mod tests {
             ),
             Err(AuthBrokerError::CapabilityDenied(_))
         ));
-        assert!(
-            authority
-                .issue_human_principal_for_surface(
-                    "credential",
-                    "tui",
-                    vec!["mfg.read".to_string()],
-                    None,
-                )
-                .is_ok()
-        );
+        assert!(authority
+            .issue_human_principal_for_surface(
+                "credential",
+                "tui",
+                vec!["mfg.read".to_string()],
+                None,
+            )
+            .is_ok());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1648,18 +1644,14 @@ mod tests {
             authority.credential_state.mfg_profile_id,
             MfgProfileId::MfgLegacy09529
         );
-        assert!(
-            !authority
-                .credential_state
-                .entitled_capabilities
-                .contains(&"definition.default.set".to_string())
-        );
-        assert!(
-            !authority
-                .credential_state
-                .entitled_capabilities
-                .contains(&"mfg.report.review".to_string())
-        );
+        assert!(!authority
+            .credential_state
+            .entitled_capabilities
+            .contains(&"definition.default.set".to_string()));
+        assert!(!authority
+            .credential_state
+            .entitled_capabilities
+            .contains(&"mfg.report.review".to_string()));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1718,11 +1710,9 @@ mod tests {
             verified,
             "broker response must carry a verifiable signature"
         );
-        assert!(
-            client
-                .authenticate_human("credential", vec!["not.allowed".to_string()], None)
-                .is_err()
-        );
+        assert!(client
+            .authenticate_human("credential", vec!["not.allowed".to_string()], None)
+            .is_err());
         let (lease, lease_public_key) = client
             .issue_decision_lease(
                 "credential",
@@ -1784,23 +1774,19 @@ mod tests {
             .expect("rotate credential");
         assert_eq!(rotated.status, CredentialLifecycleStatus::Active);
         assert_eq!(rotated.credential_epoch, 2);
-        assert!(
-            client
-                .authenticate_human("credential-v1", vec!["approval.respond".to_string()], None)
-                .is_err()
-        );
-        assert!(
-            client
-                .issue_decision_lease(
-                    "credential-v1",
-                    "proposal:p-1",
-                    "publish",
-                    "definition.agent:workspace/cowd/reviewer",
-                    "sha256:evidence-v1",
-                    now_ms().saturating_add(1_000),
-                )
-                .is_err()
-        );
+        assert!(client
+            .authenticate_human("credential-v1", vec!["approval.respond".to_string()], None)
+            .is_err());
+        assert!(client
+            .issue_decision_lease(
+                "credential-v1",
+                "proposal:p-1",
+                "publish",
+                "definition.agent:workspace/cowd/reviewer",
+                "sha256:evidence-v1",
+                now_ms().saturating_add(1_000),
+            )
+            .is_err());
         let (rotated_envelope, _) = client
             .authenticate_human("credential-v2", vec!["approval.respond".to_string()], None)
             .expect("rotated credential signs a new envelope");
@@ -1811,23 +1797,19 @@ mod tests {
             .expect("revoke credential");
         assert_eq!(revoked.status, CredentialLifecycleStatus::Revoked);
         assert_eq!(revoked.credential_epoch, 3);
-        assert!(
-            client
-                .authenticate_human("credential-v2", vec!["approval.respond".to_string()], None)
-                .is_err()
-        );
-        assert!(
-            client
-                .issue_decision_lease(
-                    "credential-v2",
-                    "proposal:p-1",
-                    "publish",
-                    "definition.agent:workspace/cowd/reviewer",
-                    "sha256:evidence-v2",
-                    now_ms().saturating_add(1_000),
-                )
-                .is_err()
-        );
+        assert!(client
+            .authenticate_human("credential-v2", vec!["approval.respond".to_string()], None)
+            .is_err());
+        assert!(client
+            .issue_decision_lease(
+                "credential-v2",
+                "proposal:p-1",
+                "publish",
+                "definition.agent:workspace/cowd/reviewer",
+                "sha256:evidence-v2",
+                now_ms().saturating_add(1_000),
+            )
+            .is_err());
 
         let recovered = client
             .recover_credential("credential-v2", "credential-v3")

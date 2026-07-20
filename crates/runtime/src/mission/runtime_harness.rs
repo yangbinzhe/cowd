@@ -127,8 +127,7 @@ impl RuntimeAiKernel {
         let session_id = session_id.into();
         let user_input = user_input.into();
         let strategy = &execution_decision.strategy;
-        let collaboration_decision =
-            CollaborationTemplateMatcher.decide(&user_input, strategy);
+        let collaboration_decision = CollaborationTemplateMatcher.decide(&user_input, strategy);
         let behavior_policy = decide_behavior_policy(&user_input, strategy);
         let context_epoch =
             build_context_epoch(&session_id, &user_input, profile, system_prompt, strategy);

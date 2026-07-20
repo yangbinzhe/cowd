@@ -435,16 +435,14 @@ mod tests {
         assert_eq!(summary["degraded_events"], 1);
         assert_eq!(summary["missing_required_count"], 4);
         assert!(summary["score"].as_u64().unwrap() < 50);
-        assert!(
-            summary["next_actions"]
-                .as_array()
+        assert!(summary["next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action
+                .as_str()
                 .unwrap()
-                .iter()
-                .any(|action| action
-                    .as_str()
-                    .unwrap()
-                    .contains("complete missing required runtime stages"))
-        );
+                .contains("complete missing required runtime stages")));
     }
 
     #[test]
@@ -504,20 +502,16 @@ mod tests {
             "prefer_single_agent_or_review_only"
         );
         assert_eq!(summary["policy_passed"], false);
-        assert!(
-            summary["reasons"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|reason| reason.as_str().unwrap().contains("below policy threshold"))
-        );
-        assert!(
-            summary["reasons"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|reason| reason.as_str().unwrap() == "no_synthesis_lift")
-        );
+        assert!(summary["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap().contains("below policy threshold")));
+        assert!(summary["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason.as_str().unwrap() == "no_synthesis_lift"));
     }
 
     #[test]

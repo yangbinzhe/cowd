@@ -4,10 +4,10 @@ use std::{
 };
 
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 
 use super::{
-    route_manifest::{GatewayRouteManifestEntry, gateway_route_manifest},
+    route_manifest::{gateway_route_manifest, GatewayRouteManifestEntry},
     route_registry::stable_route_metadata,
 };
 
@@ -1595,13 +1595,13 @@ mod tests {
             "#/components/schemas/ExecutionProjection"
         );
         assert_eq!(
-            document["components"]["schemas"]["ExecutionProjection"]["properties"]["child_executions"]
-                ["items"]["$ref"],
+            document["components"]["schemas"]["ExecutionProjection"]["properties"]
+                ["child_executions"]["items"]["$ref"],
             "#/components/schemas/ChildExecutionProjection"
         );
         assert_eq!(
-            document["components"]["schemas"]["ExecutionProjection"]["properties"]["strategy"]["oneOf"]
-                [0]["$ref"],
+            document["components"]["schemas"]["ExecutionProjection"]["properties"]["strategy"]
+                ["oneOf"][0]["$ref"],
             "#/components/schemas/StrategyDecisionProjection"
         );
         assert_eq!(
@@ -1609,18 +1609,18 @@ mod tests {
             serde_json::json!(["id", "kind", "revision", "evidence_refs"])
         );
         assert_eq!(
-            document["components"]["schemas"]["StrategyDecisionProjection"]["properties"]["schema_version"]
-                ["const"],
+            document["components"]["schemas"]["StrategyDecisionProjection"]["properties"]
+                ["schema_version"]["const"],
             1
         );
         assert_eq!(
-            document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]["parent_execution"]
-                ["oneOf"][0]["$ref"],
+            document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]
+                ["parent_execution"]["oneOf"][0]["$ref"],
             "#/components/schemas/ExecutionParentBinding"
         );
         assert_eq!(
-            document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]["edges"]["items"]
-                ["$ref"],
+            document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]["edges"]
+                ["items"]["$ref"],
             "#/components/schemas/ExecutionEdgeProjection"
         );
 
@@ -1631,7 +1631,8 @@ mod tests {
             "#/components/schemas/ProjectionDelta"
         );
         assert_eq!(
-            events["responses"]["200"]["content"]["text/event-stream"]["x-cowd-event-schema"]["$ref"],
+            events["responses"]["200"]["content"]["text/event-stream"]["x-cowd-event-schema"]
+                ["$ref"],
             "#/components/schemas/ProjectionDelta"
         );
 
@@ -1667,10 +1668,10 @@ mod tests {
             let method = route.method.to_ascii_lowercase();
             let operation = &document["paths"][&path][&method];
             assert!(operation.is_object(), "missing {} {}", route.method, path);
-            let response_ref =
-                operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
-                    .as_str()
-                    .expect("MFG response must use a named schema");
+            let response_ref = operation["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"]
+                .as_str()
+                .expect("MFG response must use a named schema");
             assert_eq!(
                 response_ref,
                 format!("#/components/schemas/{}", route.response_schema)

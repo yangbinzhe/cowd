@@ -953,10 +953,7 @@ impl ConversationMessage {
             blocks_count: self.blocks.len(),
             tool_use_id,
             tool_name,
-            token_usage_json: self
-                .usage
-                .as_ref()
-                .map(|u| usage_to_json(*u).render()),
+            token_usage_json: self.usage.as_ref().map(|u| usage_to_json(*u).render()),
             created_at_ms: crate::session::current_time_millis(),
         }
     }

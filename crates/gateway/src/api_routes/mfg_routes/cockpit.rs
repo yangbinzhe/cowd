@@ -1,8 +1,8 @@
 use axum::extract::Extension;
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{header, HeaderMap, HeaderValue};
 use sha2::{Digest, Sha256};
 
-use crate::api_routes::{AuthenticatedPrincipal, principal_actor_id};
+use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
 
 use super::*;
 
@@ -1478,7 +1478,7 @@ async fn reconcile_mfg_report_review_effects(
                     .map_err(mfg_mutation_error)?;
             }
             Err(error) => {
-                let message = format!("{}:{:?}", error.0, error.1.0);
+                let message = format!("{}:{:?}", error.0, error.1 .0);
                 state
                     .services
                     .mfg
@@ -1987,11 +1987,9 @@ mod tests {
                 .len(),
             shared.widget_instances.len()
         );
-        assert!(
-            cockpit_profile_cropped_for(shared.clone(), &denied)
-                .widget_instances
-                .is_empty()
-        );
+        assert!(cockpit_profile_cropped_for(shared.clone(), &denied)
+            .widget_instances
+            .is_empty());
         assert!(cockpit_profile_report_allowed(&shared, &allowed));
         assert!(!cockpit_profile_report_allowed(&shared, &denied));
     }

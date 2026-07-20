@@ -2,8 +2,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use harness_contract::execution_graph::{
-    ExecutionEdge, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeSpec,
-    ExecutionNodeStatus, ExecutionTransitionError, apply_node_transition, validate_execution_graph,
+    apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionGraph,
+    ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
+    ExecutionTransitionError,
 };
 use serde_json::json;
 use thiserror::Error;
@@ -24,7 +25,9 @@ pub enum ExecutionCommitError {
     Transition(#[from] ExecutionTransitionError),
     #[error("execution graph commit serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
-    #[error("execution graph `{graph_id}` revision mismatch: expected {expected}, actual {actual}")]
+    #[error(
+        "execution graph `{graph_id}` revision mismatch: expected {expected}, actual {actual}"
+    )]
     StaleRevision {
         graph_id: String,
         expected: u64,

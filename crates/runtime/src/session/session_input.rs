@@ -417,9 +417,9 @@ impl SessionInputStream {
             .records
             .iter()
             .filter(|record| {
-                selected_turn_id.as_ref().is_none_or(|turn_id| {
-                    record.active_turn_id.as_ref() == Some(turn_id)
-                })
+                selected_turn_id
+                    .as_ref()
+                    .is_none_or(|turn_id| record.active_turn_id.as_ref() == Some(turn_id))
             })
             .map(SessionInputRecord::to_inbox_item)
             .collect();

@@ -43,15 +43,13 @@ pub enum AgentRole {
     General,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum SubAgentToolMode {
     #[default]
     FullToolSet,
     ReadOnly,
     Custom(Vec<String>),
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubAgentConfig {

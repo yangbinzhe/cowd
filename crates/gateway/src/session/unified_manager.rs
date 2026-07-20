@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use futures::{StreamExt, stream};
+use futures::{stream, StreamExt};
 use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
 use runtime::session_lifecycle::SessionLifecycleManager;
 use tokio::sync::Mutex;
@@ -780,13 +780,11 @@ mod tests {
         }
         assert_eq!(created, 1);
         assert_eq!(active.list(), vec!["session-concurrent".to_string()]);
-        assert!(
-            store
-                .get_session("session-concurrent")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get_session("session-concurrent")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -849,12 +847,10 @@ mod tests {
             "{error}"
         );
         assert!(active.get("session-legacy-ownerless").is_none());
-        assert!(
-            lifecycle
-                .check_session("session-legacy-ownerless")
-                .await
-                .is_none()
-        );
+        assert!(lifecycle
+            .check_session("session-legacy-ownerless")
+            .await
+            .is_none());
 
         let mut privileged =
             EnsureSessionRequest::new("session-legacy-ownerless", None, SessionSource::Tui);
@@ -906,13 +902,11 @@ mod tests {
 
         assert!(error.contains("sessions limit"), "{error}");
         assert!(active.get("session-activation-failure").is_none());
-        assert!(
-            store
-                .get_session("session-activation-failure")
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(store
+            .get_session("session-activation-failure")
+            .await
+            .unwrap()
+            .is_none());
         let records = store
             .claim_session_mission_outbox(
                 manager.runtime().runtime_services().workspace_key(),
@@ -997,13 +991,11 @@ mod tests {
             .unwrap();
         assert!(manager.unload_runtime("session-recover").await);
         assert!(active.get("session-recover").is_none());
-        assert!(
-            store
-                .get_session("session-recover")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get_session("session-recover")
+            .await
+            .unwrap()
+            .is_some());
 
         let outcome = manager
             .ensure_session(EnsureSessionRequest::new(
@@ -1078,17 +1070,15 @@ mod tests {
             lifecycle.check_session("session-durable").await,
             Some(runtime::session_lifecycle::SessionStatus::Active)
         );
-        assert!(
-            manager
-                .ensure_session(EnsureSessionRequest::new(
-                    "session-over-limit",
-                    None,
-                    SessionSource::WebUi,
-                ))
-                .await
-                .unwrap_err()
-                .contains("active session limit")
-        );
+        assert!(manager
+            .ensure_session(EnsureSessionRequest::new(
+                "session-over-limit",
+                None,
+                SessionSource::WebUi,
+            ))
+            .await
+            .unwrap_err()
+            .contains("active session limit"));
     }
 
     #[tokio::test]
@@ -1133,13 +1123,11 @@ mod tests {
 
         assert_eq!(manager.run_resource_cleanup().await, 1);
         assert!(active.get("session-idle-cleanup").is_none());
-        assert!(
-            store
-                .get_session("session-idle-cleanup")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get_session("session-idle-cleanup")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

@@ -305,15 +305,14 @@ async fn start_managed_process(
         "--credential-file".to_string(),
         credential_path.display().to_string(),
     ];
-    let prepared = program_command_with_args(&staged_command, &program_args, &sandbox).map_err(
-        |error| {
+    let prepared =
+        program_command_with_args(&staged_command, &program_args, &sandbox).map_err(|error| {
             let _ = std::fs::remove_dir_all(&runtime_dir);
             SurfaceError::Invocation {
                 surface: surface_id.clone(),
                 reason: format!("managed surface sandbox unavailable: {error}"),
             }
-        },
-    )?;
+        })?;
     let mut child = TokioCommand::new(prepared.program)
         .args(prepared.args)
         .env_clear()

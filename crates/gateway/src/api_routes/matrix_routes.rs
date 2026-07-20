@@ -1,18 +1,18 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
     extract::{Path as AxumPath, Query as AxumQuery, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use connector::SourceReadPlan;
 use matrix_core::{
-    MATRIX_SCHEMA_VERSION, MatrixComputeJobInput, MatrixConnectorRunInput,
-    MatrixDataPlaneIngestPlanInput, MatrixEntity, MatrixEntityInput, MatrixFact, MatrixFactInput,
-    MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput,
-    MatrixSourceKind, MatrixSourcePack, MatrixSourceSnapshotInput,
+    MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlanInput, MatrixEntity,
+    MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDependency,
+    MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourceKind,
+    MatrixSourcePack, MatrixSourceSnapshotInput, MATRIX_SCHEMA_VERSION,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -23,7 +23,7 @@ use super::matrix_outcomes::{
     append_matrix_execution_outcome, matrix_evidence_packet_outcome, matrix_fact_outcome,
     matrix_ingest_plan_outcome,
 };
-use super::{AppState, ErrorResponse, api_error};
+use super::{api_error, AppState, ErrorResponse};
 
 mod entities;
 mod evidence;

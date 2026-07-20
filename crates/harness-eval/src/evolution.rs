@@ -380,7 +380,11 @@ fn observation_value(
 }
 
 fn mean_or_zero(values: &[f64]) -> f64 {
-    if !values.is_empty() { values.iter().sum::<f64>() / values.len() as f64 } else { 0.0 }
+    if !values.is_empty() {
+        values.iter().sum::<f64>() / values.len() as f64
+    } else {
+        0.0
+    }
 }
 
 /// Exact one-sided paired sign-test p-value for the null hypothesis that a

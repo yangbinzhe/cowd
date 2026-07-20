@@ -51,7 +51,9 @@ impl ComposerLayout {
         let mut line_start = 0usize;
 
         for (logical_line, line_with_break) in text.split_inclusive('\n').enumerate() {
-            let line = line_with_break.strip_suffix('\n').unwrap_or(line_with_break);
+            let line = line_with_break
+                .strip_suffix('\n')
+                .unwrap_or(line_with_break);
             let display_line = line.strip_suffix('\r').unwrap_or(line);
             let first_row = rows.len();
             append_wrapped_rows(
@@ -336,7 +338,9 @@ mod tests {
         let layout = ComposerLayout::from_text(&text, 0, 2);
         for row in 0..layout.rows.len() {
             for column in 0..=2 {
-                let byte = layout.byte_offset_for_visual(row, column).expect("row exists");
+                let byte = layout
+                    .byte_offset_for_visual(row, column)
+                    .expect("row exists");
                 assert!(text.is_char_boundary(byte));
                 assert!(UnicodeSegmentation::grapheme_indices(text.as_str(), true)
                     .map(|(index, _)| index)

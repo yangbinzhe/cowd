@@ -71,8 +71,7 @@ pub enum MemorySource {
 }
 
 /// Visibility level for multi-agent memory sharing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AgentVisibility {
     /// Visible only to the source agent.
     #[default]
@@ -82,7 +81,6 @@ pub enum AgentVisibility {
     /// Visible to agents within the specified team.
     TeamScoped(String),
 }
-
 
 // --- Memory entry ---
 

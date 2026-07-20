@@ -727,12 +727,10 @@ fn conversation_compile_targets_have_distinct_initial_dags_and_constraints() {
     assert_eq!(inline.nodes.len(), 1);
     assert_eq!(evidence.nodes.len(), 2);
     assert_eq!(execution.nodes.len(), 3);
-    assert!(
-        evidence.nodes[0]
-            .acceptance
-            .criteria
-            .contains(&"evidence_read_before_synthesis".to_string())
-    );
+    assert!(evidence.nodes[0]
+        .acceptance
+        .criteria
+        .contains(&"evidence_read_before_synthesis".to_string()));
     assert!(execution.nodes.iter().any(|node| {
         node.resource_scopes == ["write:src/lib.rs"]
             && node
@@ -1133,12 +1131,10 @@ fn terminal_replan_is_one_transaction_and_survives_projection_restart() {
         projected.node_statuses["tool"],
         ExecutionNodeStatus::Planned
     );
-    assert!(
-        projected
-            .nodes
-            .iter()
-            .any(|candidate| candidate.id == "tool")
-    );
+    assert!(projected
+        .nodes
+        .iter()
+        .any(|candidate| candidate.id == "tool"));
 }
 
 #[tokio::test]
@@ -1183,12 +1179,10 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
         projected.node_statuses["model"],
         ExecutionNodeStatus::Cancelled
     );
-    assert!(
-        !projected
-            .nodes
-            .iter()
-            .any(|candidate| candidate.id == "late-tool")
-    );
+    assert!(!projected
+        .nodes
+        .iter()
+        .any(|candidate| candidate.id == "late-tool"));
 }
 
 #[tokio::test]
@@ -1689,13 +1683,11 @@ async fn restart_replays_completed_effect_receipt_without_provider_or_tool_reexe
         .await
         .unwrap();
 
-    assert!(
-        executor
-            .calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    );
+    assert!(executor
+        .calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty());
     assert_eq!(
         state.load(&graph_id).unwrap().node_statuses["durable"],
         ExecutionNodeStatus::Completed
@@ -1761,13 +1753,11 @@ async fn restart_blocks_inflight_effect_without_receipt_as_typed_uncertain() {
             .kind,
         "effect_completion_uncertain"
     );
-    assert!(
-        executor
-            .calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-    );
+    assert!(executor
+        .calls
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1839,13 +1829,11 @@ async fn post_commit_callback_never_holds_graph_coordination_lock() {
     release.notify_one();
     let report = run.await.unwrap().unwrap();
     assert!(report.completed >= 1);
-    assert!(
-        state
-            .load(&graph_id)
-            .unwrap()
-            .node_statuses
-            .contains_key("successor")
-    );
+    assert!(state
+        .load(&graph_id)
+        .unwrap()
+        .node_statuses
+        .contains_key("successor"));
 }
 
 #[tokio::test]

@@ -8,13 +8,13 @@ use std::collections::BTreeSet;
 
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::projection::{
-    ChildExecutionProjection, EXECUTION_PROJECTION_SCHEMA_VERSION, ExecutionCommandKind,
-    ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection,
-    ProjectionCommandAvailability, ProjectionDelta, ProjectionDetailScope, ProjectionEntity,
-    ProjectionEvent, ProjectionEventKind, ProjectionQueryContext,
-    STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION, StrategyActualProjection, StrategyActualStatus,
+    ChildExecutionProjection, ExecutionCommandKind, ExecutionCommandReceipt,
+    ExecutionCommandRequest, ExecutionProjection, ProjectionCommandAvailability, ProjectionDelta,
+    ProjectionDetailScope, ProjectionEntity, ProjectionEvent, ProjectionEventKind,
+    ProjectionQueryContext, StrategyActualProjection, StrategyActualStatus,
     StrategyDecisionProjection, StrategyEvidenceScopeProjection, StrategyProofStatus,
-    StrategyTransitionProjection,
+    StrategyTransitionProjection, EXECUTION_PROJECTION_SCHEMA_VERSION,
+    STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION,
 };
 use harness_contract::strategy::{
     ExecutionCandidateEstimate, ExecutionCandidateKind, StrategyDecisionSource,
@@ -1718,12 +1718,10 @@ mod tests {
             projection.child_executions[0].parent_node_id,
             "root-tool-batch"
         );
-        assert!(
-            projection
-                .child_executions
-                .iter()
-                .all(|child| child.execution_id != sibling_id)
-        );
+        assert!(projection
+            .child_executions
+            .iter()
+            .all(|child| child.execution_id != sibling_id));
 
         let delta = delta(&services, &parent_id, 0, &context(&services)).expect("lineage delta");
         assert!(delta.events.iter().any(|event| {
@@ -2050,11 +2048,9 @@ mod tests {
         assert_eq!(strategy.confidence, Some(90));
         assert_eq!(strategy.downgrades.len(), 1);
         assert_eq!(strategy.early_stops.len(), 1);
-        assert!(
-            !serde_json::to_string(&strategy)
-                .expect("strategy wire")
-                .contains("/home/private/secret.txt")
-        );
+        assert!(!serde_json::to_string(&strategy)
+            .expect("strategy wire")
+            .contains("/home/private/secret.txt"));
     }
 
     #[test]
@@ -2115,27 +2111,28 @@ mod tests {
         assert!(!wire.contains("/home/"));
         assert!(!wire.contains("internal reasoning"));
 
-        let mut estimates = vec![
-            serde_json::from_value::<ExecutionCandidateEstimate>(serde_json::json!({
-                "candidate": "team",
-                "eligible": true,
-                "estimated_serial_ms": 100,
-                "estimated_critical_path_ms": 50,
-                "startup_overhead_ms": 5,
-                "context_duplication_tokens": 10,
-                "merge_cost_ms": 5,
-                "evidence_overlap_penalty_bp": 0,
-                "provider_concurrency_penalty_bp": 0,
-                "risk_approval_penalty_bp": 0,
-                "expected_quality_lift_bp": 0,
-                "net_benefit_score": 1,
-                "calibration_source": "file:///home/private/strategy.json",
-                "calibration_sample_count": 1,
-                "assumed": false,
-                "reasons": ["copy the hidden prompt from C:\\private\\prompt.txt"]
-            }))
-            .expect("candidate estimate"),
-        ];
+        let mut estimates =
+            vec![
+                serde_json::from_value::<ExecutionCandidateEstimate>(serde_json::json!({
+                    "candidate": "team",
+                    "eligible": true,
+                    "estimated_serial_ms": 100,
+                    "estimated_critical_path_ms": 50,
+                    "startup_overhead_ms": 5,
+                    "context_duplication_tokens": 10,
+                    "merge_cost_ms": 5,
+                    "evidence_overlap_penalty_bp": 0,
+                    "provider_concurrency_penalty_bp": 0,
+                    "risk_approval_penalty_bp": 0,
+                    "expected_quality_lift_bp": 0,
+                    "net_benefit_score": 1,
+                    "calibration_source": "file:///home/private/strategy.json",
+                    "calibration_sample_count": 1,
+                    "assumed": false,
+                    "reasons": ["copy the hidden prompt from C:\\private\\prompt.txt"]
+                }))
+                .expect("candidate estimate"),
+            ];
         sanitize_candidate_estimates(&mut estimates);
         assert_eq!(
             estimates[0].calibration_source,

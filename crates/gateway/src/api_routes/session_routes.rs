@@ -4,16 +4,16 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
     extract::{Extension, Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json, Router,
 };
 use memory::store::session::{SessionEvent, SessionRecord};
 use serde::{Deserialize, Serialize};
 
-use super::{AppState, AuthenticatedPrincipal, ErrorResponse, surface_actor_id};
+use super::{surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
 use crate::services::{
     SessionMessageCounts, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
@@ -2593,12 +2593,10 @@ mod tests {
             projection["turns"][0]["event_sequences"],
             serde_json::json!([0, 1, 2, 3])
         );
-        assert!(
-            projection["turns"][0]["evidence_refs"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!("ctx-report-1"))
-        );
+        assert!(projection["turns"][0]["evidence_refs"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("ctx-report-1")));
     }
 
     #[test]

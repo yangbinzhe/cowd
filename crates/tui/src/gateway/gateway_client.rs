@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
 
-use crate::{CowdEvent, events::CowdEventSender};
+use crate::{events::CowdEventSender, CowdEvent};
 
 const GATEWAY_READY_RETRY_ATTEMPTS: usize = 20;
 const GATEWAY_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -3591,11 +3591,9 @@ mod tests {
             "evolution_evaluation_policy_review_decision",
         ];
         assert_eq!(evolution_methods.len(), 22);
-        assert!(
-            evolution_methods
-                .iter()
-                .all(|method| method.starts_with("evolution_"))
-        );
+        assert!(evolution_methods
+            .iter()
+            .all(|method| method.starts_with("evolution_")));
     }
 
     #[test]
@@ -3607,11 +3605,9 @@ mod tests {
             "reset_managed_agent_health",
         ];
         assert_eq!(managed_agent_methods.len(), 4);
-        assert!(
-            managed_agent_methods
-                .iter()
-                .all(|method| method.contains("managed_agent"))
-        );
+        assert!(managed_agent_methods
+            .iter()
+            .all(|method| method.contains("managed_agent")));
     }
 
     #[tokio::test]

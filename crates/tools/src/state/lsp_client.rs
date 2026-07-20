@@ -589,13 +589,8 @@ fn file_uri(path: &str) -> String {
 
 fn write_lsp_message(writer: &mut dyn Write, payload: &serde_json::Value) -> Result<(), String> {
     let body = payload.to_string();
-    write!(
-        writer,
-        "Content-Length: {}\r\n\r\n{}",
-        body.len(),
-        body
-    )
-    .map_err(|error| error.to_string())
+    write!(writer, "Content-Length: {}\r\n\r\n{}", body.len(), body)
+        .map_err(|error| error.to_string())
 }
 
 fn read_lsp_message(reader: &mut BufReader<impl Read>) -> Result<serde_json::Value, String> {

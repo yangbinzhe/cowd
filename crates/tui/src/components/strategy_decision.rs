@@ -536,10 +536,8 @@ mod tests {
         assert!(rendered.contains("Downgrade: r2"));
         assert!(rendered.contains("Early stop: r3"));
         assert!(rendered.contains("Team backlink: runtime-execution://execution-547"));
-        assert!(
-            rendered
-                .contains("Agent backlink: runtime-execution://execution-547?agent_id=agent-547")
-        );
+        assert!(rendered
+            .contains("Agent backlink: runtime-execution://execution-547?agent_id=agent-547"));
         assert!(strategy_matches_target(
             &strategy,
             "runtime-execution://execution-547"

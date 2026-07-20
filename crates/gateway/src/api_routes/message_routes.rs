@@ -7,16 +7,16 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
     extract::{Extension, Path, Query, State as AxumState},
     http::{HeaderMap, StatusCode},
     response::{
-        IntoResponse,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse,
     },
     routing::{get, post},
+    Json, Router,
 };
-use futures::{StreamExt, stream::Stream};
+use futures::{stream::Stream, StreamExt};
 use harness_contract::turn::{
     InputRoutingDecision, InputSourceKind, SessionInputEnvelope, SessionInputId, TurnId,
 };
@@ -29,8 +29,8 @@ use crate::event_bus::SessionEventBus;
 use crate::task_kernel::TaskRecord;
 
 use super::{
+    session_routes::{authorize_session_access, SessionAccess},
     AppState, AuthenticatedPrincipal, ErrorResponse,
-    session_routes::{SessionAccess, authorize_session_access},
 };
 
 pub(super) fn router() -> Router<Arc<AppState>> {

@@ -1,7 +1,7 @@
 use axum::extract::Extension;
 use sha2::{Digest, Sha256};
 
-use crate::api_routes::{AuthenticatedPrincipal, principal_actor_id};
+use crate::api_routes::{principal_actor_id, AuthenticatedPrincipal};
 
 use super::*;
 

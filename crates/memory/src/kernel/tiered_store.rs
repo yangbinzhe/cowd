@@ -64,14 +64,12 @@ pub enum StorageTier {
 // ---------------------------------------------------------------------------
 
 /// Supported compression algorithms for the cold tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum CompressionAlgo {
     /// lz4 fast compression via `lz4_flex`.
     #[default]
     Lz4,
 }
-
 
 // ---------------------------------------------------------------------------
 // TieredSessionStoreConfig

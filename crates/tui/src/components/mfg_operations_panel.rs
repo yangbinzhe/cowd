@@ -767,7 +767,7 @@ mod tests {
     use super::*;
     use crate::runtime_control_store::{MfgBacklink, MfgItemSummary};
     use crate::skin::SkinConfig;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{backend::TestBackend, Terminal};
 
     fn render(width: u16, height: u16, state: &MfgOperationsState) -> String {
         render_with_strategy(width, height, state, None)
@@ -1002,11 +1002,9 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(visible, expected);
         let state = MfgOperationsState::default();
-        assert!(
-            MFG_PANEL_READ_ROUTE_IDS
-                .iter()
-                .all(|route| state.route_projection_status(*route).is_some())
-        );
+        assert!(MFG_PANEL_READ_ROUTE_IDS
+            .iter()
+            .all(|route| state.route_projection_status(*route).is_some()));
         assert_eq!(
             MFG_PANEL_READ_ROUTE_IDS
                 .iter()

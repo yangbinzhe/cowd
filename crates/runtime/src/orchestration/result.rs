@@ -1,6 +1,6 @@
 use harness_contract::core::{ExecutionPattern, ExecutionPolicyGate};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationApprovalRequirement {
@@ -169,11 +169,9 @@ mod tests {
         assert_eq!(receipt["execution"]["type"], "execution_graph_run");
         assert!(receipt["execution"].get("projection").is_none());
         assert!(receipt["execution"].get("terminal_result_ref").is_none());
-        assert!(
-            receipt["terminal_summary"]
-                .as_str()
-                .is_some_and(|value| value.contains("terminal synthesis truncated"))
-        );
+        assert!(receipt["terminal_summary"]
+            .as_str()
+            .is_some_and(|value| value.contains("terminal synthesis truncated")));
         assert!(serde_json::to_string(&receipt).unwrap().len() < 20_000);
     }
 }

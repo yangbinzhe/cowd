@@ -46,7 +46,6 @@ pub enum AgentTaskQualityStatus {
     Failed,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentTaskOutcome {
     pub result_summary: String,

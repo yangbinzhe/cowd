@@ -866,8 +866,7 @@ pub struct ConnectorBulkhead {
     providers: Mutex<HashMap<String, ConnectorProviderBulkheadState>>,
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct ConnectorProviderBulkheadState {
     in_flight: usize,
     consecutive_failures: u32,
@@ -922,9 +921,7 @@ impl ConnectorBulkhead {
             .providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = providers
-            .entry(provider.clone())
-            .or_default();
+        let state = providers.entry(provider.clone()).or_default();
         if state.cooldown_until.is_some_and(|until| until > now) {
             return Err(ConnectorBulkheadRejection::CoolingDown { provider });
         }
@@ -947,9 +944,7 @@ impl ConnectorBulkhead {
             .providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = providers
-            .entry(provider.to_string())
-            .or_default();
+        let state = providers.entry(provider.to_string()).or_default();
         state.consecutive_failures = 0;
         state.cooldown_until = None;
     }
@@ -959,9 +954,7 @@ impl ConnectorBulkhead {
             .providers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let state = providers
-            .entry(provider.to_string())
-            .or_default();
+        let state = providers.entry(provider.to_string()).or_default();
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         if state.consecutive_failures >= self.failure_threshold {
             state.cooldown_until = Some(Instant::now() + self.cooldown);
@@ -994,7 +987,6 @@ impl Default for ConnectorBulkhead {
         Self::default_service_gate()
     }
 }
-
 
 impl Drop for ConnectorBulkheadGuard<'_> {
     fn drop(&mut self) {

@@ -83,7 +83,8 @@ impl ComposerModel {
 
     #[must_use]
     pub fn has_selection(&self) -> bool {
-        self.selection_range().is_some_and(|range| !range.is_empty())
+        self.selection_range()
+            .is_some_and(|range| !range.is_empty())
     }
 
     pub fn clear_selection(&mut self) {
@@ -198,7 +199,8 @@ impl ComposerModel {
         {
             start = grapheme_boundary_before(&self.text, start);
         }
-        while start > 0 && grapheme_before(&self.text, start).is_some_and(|g| !g.trim().is_empty()) {
+        while start > 0 && grapheme_before(&self.text, start).is_some_and(|g| !g.trim().is_empty())
+        {
             start = grapheme_boundary_before(&self.text, start);
         }
         self.text.replace_range(start..self.cursor, "");

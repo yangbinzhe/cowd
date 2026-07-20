@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 
-use crate::CowdEvent;
 use crate::accessibility::AccessibilityMode;
 use crate::animation::{AnimationEngine, AnimationKind};
 use crate::app::{App, SystemNoticeKind};
@@ -61,18 +60,19 @@ use crate::components::toast::{ToastManager, ToastVariant};
 use crate::components::todo_panel::TodoPanel;
 use crate::components::tool_ops_panel::{ToolOpsMode, ToolOpsPanel};
 use crate::components::{Component, RenderContext};
-use crate::context_tokens::{ContextWorkspaceEntry, validate_context_tokens_against_entries};
+use crate::context_tokens::{validate_context_tokens_against_entries, ContextWorkspaceEntry};
 use crate::error_recovery::{self, RenderResult};
 use crate::event::dispatcher::EventDispatcher;
 use crate::event::{ComponentId as EventComponentId, EventBus};
 use crate::keybind::types::Action;
 use crate::keybind::which_key::WhichKey;
-use crate::keybind::{KeybindEngine, default_bindings};
+use crate::keybind::{default_bindings, KeybindEngine};
 use crate::layout::{LayoutState, LayoutTree};
 use crate::profiler::{FrameTimer, RenderProfiler};
 use crate::runtime_control_store::{MfgBacklinkKind, MfgIntentStatus, MfgViewFocus};
 use crate::theme::ThemeEngine;
 use crate::workbench::panel_registry;
+use crate::CowdEvent;
 
 /// Result of processing a key event through the TUI input pipeline.
 #[derive(Debug, Clone)]
@@ -5437,22 +5437,18 @@ mod tests {
         state.app.available_models = vec!["tui-reload-model".to_string(), "tui-fast".to_string()];
 
         assert!(state.reload_runtime_provider_projection());
-        assert!(
-            state
-                .app
-                .notification
-                .as_deref()
-                .unwrap_or_default()
-                .contains("Provider projection refreshed")
-        );
-        assert!(
-            !state
-                .app
-                .notification
-                .as_deref()
-                .unwrap_or_default()
-                .contains("tui-secret-key")
-        );
+        assert!(state
+            .app
+            .notification
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Provider projection refreshed"));
+        assert!(!state
+            .app
+            .notification
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tui-secret-key"));
     }
 
     #[test]

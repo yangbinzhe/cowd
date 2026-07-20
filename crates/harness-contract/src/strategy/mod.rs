@@ -342,7 +342,9 @@ impl NegativeBenefitObservation {
             || self.team_duration_ms == 0
             || self.expires_at_ms <= self.observed_at_ms
         {
-            return Err("negative Team observation has incomplete provenance or bounds".to_string());
+            return Err(
+                "negative Team observation has incomplete provenance or bounds".to_string(),
+            );
         }
         let quality_delta =
             i32::from(self.team_quality_score_bp) - i32::from(self.baseline_quality_score_bp);
@@ -648,10 +650,8 @@ impl StrategyExperienceStore {
         observation.validate()?;
         self.negative_benefit_observations.retain(|existing| {
             existing.report_sha256 != observation.report_sha256
-                || existing.workload_fingerprint_sha256
-                    != observation.workload_fingerprint_sha256
-                || existing.provider_profile_fingerprint
-                    != observation.provider_profile_fingerprint
+                || existing.workload_fingerprint_sha256 != observation.workload_fingerprint_sha256
+                || existing.provider_profile_fingerprint != observation.provider_profile_fingerprint
         });
         self.negative_benefit_observations.push(observation);
         Ok(())
@@ -1660,15 +1660,18 @@ impl StrategyRouter {
             StrategyWorkloadFingerprint::from_input(input, &understanding).digest();
         let negative_team_veto = (!understanding.requests_multi_agent)
             .then(|| {
-                input.negative_benefit_observations.iter().find(|observation| {
-                    observation.workload_fingerprint_sha256 == workload_fingerprint
-                        && !input
-                            .resource_snapshot
-                            .provider_profile_fingerprint
-                            .is_empty()
-                        && observation.provider_profile_fingerprint
-                            == input.resource_snapshot.provider_profile_fingerprint
-                })
+                input
+                    .negative_benefit_observations
+                    .iter()
+                    .find(|observation| {
+                        observation.workload_fingerprint_sha256 == workload_fingerprint
+                            && !input
+                                .resource_snapshot
+                                .provider_profile_fingerprint
+                                .is_empty()
+                            && observation.provider_profile_fingerprint
+                                == input.resource_snapshot.provider_profile_fingerprint
+                    })
             })
             .flatten();
         if let Some(observation) = negative_team_veto {
@@ -2808,18 +2811,14 @@ mod tests {
     }
 
     fn assert_contract_legal(decision: &StrategyDecision) {
-        assert!(
-            decision
-                .modifiers
-                .iter()
-                .all(|modifier| decision.pattern.supports_modifier(*modifier))
-        );
-        assert!(
-            decision
-                .gates
-                .iter()
-                .all(|gate| decision.pattern.supports_gate(*gate))
-        );
+        assert!(decision
+            .modifiers
+            .iter()
+            .all(|modifier| decision.pattern.supports_modifier(*modifier)));
+        assert!(decision
+            .gates
+            .iter()
+            .all(|gate| decision.pattern.supports_gate(*gate)));
     }
 
     fn paired_calibration(
@@ -2911,16 +2910,12 @@ mod tests {
         assert_eq!(decision.understanding.complexity, TaskComplexity::Strategic);
         assert!(decision.uses_modifier(ExecutionModifier::WithVerifier));
         assert_eq!(decision.policy_version, "strategy-decision-v5");
-        assert!(
-            decision
-                .required_capabilities
-                .contains(&KernelCapability::ExecutionGraph)
-        );
-        assert!(
-            decision
-                .required_capabilities
-                .contains(&KernelCapability::VerificationLedger)
-        );
+        assert!(decision
+            .required_capabilities
+            .contains(&KernelCapability::ExecutionGraph));
+        assert!(decision
+            .required_capabilities
+            .contains(&KernelCapability::VerificationLedger));
     }
 
     #[test]
@@ -3193,17 +3188,13 @@ mod tests {
             });
         }
 
-        assert!(
-            store
-                .cost_summary_for_candidate(&understanding, ExecutionCandidateKind::Team)
-                .is_none()
-        );
+        assert!(store
+            .cost_summary_for_candidate(&understanding, ExecutionCandidateKind::Team)
+            .is_none());
         let enriched = store.enrich_input(input);
-        assert!(
-            !enriched
-                .candidate_costs
-                .contains_key(&ExecutionCandidateKind::Team)
-        );
+        assert!(!enriched
+            .candidate_costs
+            .contains_key(&ExecutionCandidateKind::Team));
     }
 
     #[test]
@@ -3232,11 +3223,9 @@ mod tests {
             paired_calibration: None,
         });
 
-        assert!(
-            store
-                .cost_summary_for_candidate(&understanding, ExecutionCandidateKind::Direct)
-                .is_none()
-        );
+        assert!(store
+            .cost_summary_for_candidate(&understanding, ExecutionCandidateKind::Direct)
+            .is_none());
     }
 
     #[test]
@@ -3274,12 +3263,10 @@ mod tests {
         assert_eq!(decision.pattern, ExecutionPattern::Direct);
         assert_eq!(decision.source, StrategyDecisionSource::Deterministic);
         assert!(!decision.uses_modifier(ExecutionModifier::Background));
-        assert!(
-            decision
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("rejected by contract policy"))
-        );
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("rejected by contract policy")));
         assert_contract_legal(&decision);
     }
 
@@ -3406,12 +3393,10 @@ mod tests {
         );
 
         assert_eq!(decision.pattern, ExecutionPattern::Execute);
-        assert!(
-            decision
-                .reasons
-                .iter()
-                .any(|reason| reason.contains("low multi-agent lift"))
-        );
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("low multi-agent lift")));
     }
 
     #[test]
@@ -3643,11 +3628,9 @@ mod tests {
 
         let mut rejected = report;
         rejected["gate"]["claim_allowed"] = serde_json::Value::Bool(false);
-        assert!(
-            StrategyExperienceStore::new()
-                .import_paired_evaluation_report(&rejected)
-                .is_err()
-        );
+        assert!(StrategyExperienceStore::new()
+            .import_paired_evaluation_report(&rejected)
+            .is_err());
     }
 
     #[test]
@@ -3710,7 +3693,10 @@ mod tests {
         };
         let vetoed = decide_strategy(&enriched(1_500));
         assert_ne!(vetoed.selected_candidate, ExecutionCandidateKind::Team);
-        assert!(vetoed.reasons.iter().any(|reason| reason.contains("vetoed")));
+        assert!(vetoed
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("vetoed")));
 
         let expired = decide_strategy(&enriched(2_000));
         assert_eq!(expired.selected_candidate, ExecutionCandidateKind::Team);
@@ -3722,9 +3708,8 @@ mod tests {
             ExecutionCandidateKind::Team
         );
 
-        let explicit = StrategyInput::from_prompt(
-            "必须启动 Team 分别审查 runtime gateway frontend 并综合",
-        );
+        let explicit =
+            StrategyInput::from_prompt("必须启动 Team 分别审查 runtime gateway frontend 并综合");
         assert_eq!(
             decide_strategy(&store.enrich_input_at(explicit, 1_500)).selected_candidate,
             ExecutionCandidateKind::Team
@@ -3747,9 +3732,8 @@ mod tests {
 
     #[test]
     fn failed_positive_claim_can_import_only_a_negative_veto() {
-        let input = StrategyInput::from_prompt(
-            "全面审查 runtime gateway frontend 三个独立责任域并综合",
-        );
+        let input =
+            StrategyInput::from_prompt("全面审查 runtime gateway frontend 三个独立责任域并综合");
         let fingerprint =
             StrategyWorkloadFingerprint::from_input(&input, &understand(&input)).digest();
         let report = serde_json::json!({

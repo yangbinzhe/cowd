@@ -14,8 +14,8 @@ use harness_contract::growth::{
     GrowthSignalKind, LearningRecord,
 };
 use harness_contract::strategy::{
-    ExecutionCandidateKind, StrategyExperienceRecord, StrategyExperienceStore, StrategyInput,
-    decide_strategy, understand,
+    decide_strategy, understand, ExecutionCandidateKind, StrategyExperienceRecord,
+    StrategyExperienceStore, StrategyInput,
 };
 use matrix_core::{MatrixEvidencePacket, MatrixQualityGateDecision};
 use runtime::eval_gate::{
@@ -389,12 +389,10 @@ fn matrix_quality_failure_becomes_growth_signal() {
         )],
     });
 
-    assert!(
-        event
-            .signals
-            .iter()
-            .any(|item| item.kind == GrowthSignalKind::MatrixQualityGate)
-    );
+    assert!(event
+        .signals
+        .iter()
+        .any(|item| item.kind == GrowthSignalKind::MatrixQualityGate));
     let observation = ScenarioObservation {
         scenario_id: "matrix_quality_failure".to_string(),
         strategy_pattern: event.strategy_pattern,
@@ -434,19 +432,15 @@ fn underspecified_complex_trace_exposes_improvement_signal() {
         bench_passed: true,
     });
 
-    assert!(
-        record
-            .signals
-            .iter()
-            .any(|signal| signal.kind == GrowthSignalKind::StrategyFit
-                && signal.severity == GrowthSeverity::Improve)
-    );
-    assert!(
-        record
-            .next_strategy_hints
-            .iter()
-            .any(|hint| hint.contains("execute"))
-    );
+    assert!(record
+        .signals
+        .iter()
+        .any(|signal| signal.kind == GrowthSignalKind::StrategyFit
+            && signal.severity == GrowthSeverity::Improve));
+    assert!(record
+        .next_strategy_hints
+        .iter()
+        .any(|hint| hint.contains("execute")));
 }
 
 #[derive(Clone)]

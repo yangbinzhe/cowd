@@ -1,7 +1,7 @@
 use harness_eval::{
-    AutoStrategyPairedOptions, HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions,
-    PairedPerformanceOptions, default_report_root, run_auto_strategy_paired, run_eval,
-    run_paired_performance, terminal_gate_report_with_report, write_auto_strategy_report,
+    default_report_root, run_auto_strategy_paired, run_eval, run_paired_performance,
+    terminal_gate_report_with_report, write_auto_strategy_report, AutoStrategyPairedOptions,
+    HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions, PairedPerformanceOptions,
 };
 use std::{path::PathBuf, time::Duration};
 

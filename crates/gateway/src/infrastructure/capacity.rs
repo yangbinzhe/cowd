@@ -1,8 +1,8 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -346,12 +346,10 @@ mod tests {
             data.push(controller.admit_http(HttpCapacityLane::Data).await.unwrap());
         }
         assert!(controller.admit_http(HttpCapacityLane::Data).await.is_err());
-        assert!(
-            controller
-                .admit_http(HttpCapacityLane::Control)
-                .await
-                .is_ok()
-        );
+        assert!(controller
+            .admit_http(HttpCapacityLane::Control)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -368,19 +366,15 @@ mod tests {
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-        assert!(
-            controller
-                .admit_http(HttpCapacityLane::Stream)
-                .await
-                .is_err()
-        );
+        assert!(controller
+            .admit_http(HttpCapacityLane::Stream)
+            .await
+            .is_err());
         drop(permits);
-        assert!(
-            controller
-                .admit_http(HttpCapacityLane::Stream)
-                .await
-                .is_ok()
-        );
+        assert!(controller
+            .admit_http(HttpCapacityLane::Stream)
+            .await
+            .is_ok());
     }
 
     #[test]

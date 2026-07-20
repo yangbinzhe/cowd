@@ -603,14 +603,12 @@ mod tests {
         assert!(validate_args(&["api".to_string(), "GET".to_string()]).is_ok());
         assert!(validate_args(&["base".to_string(), "--".to_string()]).is_err());
         assert!(validate_args(&["im".to_string(), "--as=user".to_string()]).is_err());
-        assert!(
-            validate_args(&[
-                "im".to_string(),
-                "+chat-list".to_string(),
-                "--app-secret=forbidden".to_string()
-            ])
-            .is_err()
-        );
+        assert!(validate_args(&[
+            "im".to_string(),
+            "+chat-list".to_string(),
+            "--app-secret=forbidden".to_string()
+        ])
+        .is_err());
     }
 
     #[test]
@@ -644,11 +642,9 @@ mod tests {
             "short-token"
         );
         assert!(!environment.contains_key("LARKSUITE_CLI_APP_SECRET"));
-        assert!(
-            !environment
-                .values()
-                .any(|value| value == "permanent-secret")
-        );
+        assert!(!environment
+            .values()
+            .any(|value| value == "permanent-secret"));
     }
 
     #[test]

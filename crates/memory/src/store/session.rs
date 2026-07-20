@@ -3930,7 +3930,8 @@ mod tests {
                     session_id: session_id.to_string(),
                     sequence,
                     role: "user".to_string(),
-                    content_json: r#"[{"type":"text","text":"tenant ranked search phrase"}]"#.to_string(),
+                    content_json: r#"[{"type":"text","text":"tenant ranked search phrase"}]"#
+                        .to_string(),
                     blocks_count: 1,
                     tool_use_id: None,
                     tool_name: None,
@@ -3941,11 +3942,7 @@ mod tests {
         }
 
         let results = store
-            .search_messages_in_sessions(
-                "tenant",
-                &["authorized".to_string()],
-                1,
-            )
+            .search_messages_in_sessions("tenant", &["authorized".to_string()], 1)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_id, "authorized");

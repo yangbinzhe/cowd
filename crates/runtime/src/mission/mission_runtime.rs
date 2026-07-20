@@ -100,8 +100,7 @@ pub struct StartMissionSessionRequest {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct MissionRuntimeState {
     active_session_id: Option<String>,
     sessions: BTreeMap<String, MissionSessionSnapshot>,
@@ -117,7 +116,6 @@ struct MissionStateEvent {
     event: MissionEvent,
     state: MissionRuntimeState,
 }
-
 
 #[derive(Debug)]
 pub struct MissionRuntime {

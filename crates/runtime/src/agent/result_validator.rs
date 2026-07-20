@@ -98,8 +98,8 @@ pub fn validate_agent_return(
             // and acceptance vector are derived from Runtime tool receipts;
             // together with a real tool call they prove reacquisition even
             // when ref identity is unchanged.
-            let fresh_runtime_tool_observed = returned.tool_calls > 0
-                && !returned.runtime_observed_resource_scopes.is_empty();
+            let fresh_runtime_tool_observed =
+                returned.tool_calls > 0 && !returned.runtime_observed_resource_scopes.is_empty();
             let produced = returned.evidence_refs.iter().any(|evidence| {
                 is_materialized_durable_evidence(evidence)
                     && (fresh_runtime_tool_observed

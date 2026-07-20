@@ -151,11 +151,8 @@ impl NodeExecutor for VerifyNodeExecutor {
                             )
                         })
                         .collect::<BTreeSet<_>>();
-                    let produced_evidence = produced_team_evidence(
-                        result,
-                        &packet.evidence_refs,
-                        &upstream_evidence,
-                    );
+                    let produced_evidence =
+                        produced_team_evidence(result, &packet.evidence_refs, &upstream_evidence);
                     let completed_acceptance = packet.acceptance.iter().all(|criterion| {
                         result.evidence_refs.iter().any(|reference| {
                             reference.evidence_ref.0.ref_type == "runtime_acceptance"
@@ -366,8 +363,8 @@ fn produced_team_evidence(
     // Runtime-derived tool/scoped usage into the committed node result, so a
     // fresh scoped tool observation proves reacquisition without weakening
     // the durable evidence requirement.
-    let fresh_runtime_tool_observed = result.usage.tool_calls > 0
-        && !result.usage.runtime_observed_resource_scopes.is_empty();
+    let fresh_runtime_tool_observed =
+        result.usage.tool_calls > 0 && !result.usage.runtime_observed_resource_scopes.is_empty();
     result.evidence_refs.iter().any(|reference| {
         crate::agent_result_validator::is_materialized_durable_evidence(reference)
             && (fresh_runtime_tool_observed

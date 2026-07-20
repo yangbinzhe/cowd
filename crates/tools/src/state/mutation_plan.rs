@@ -170,9 +170,9 @@ pub fn apply_mutations(
         let previous_hash = stable_hash(&original);
         if let Some(expected) = input.expected_hashes.get(&path) {
             if expected != &previous_hash {
-                return Err(io::Error::other(
-                    format!("file `{path}` changed before apply: expected {expected}, got {previous_hash}"),
-                ));
+                return Err(io::Error::other(format!(
+                    "file `{path}` changed before apply: expected {expected}, got {previous_hash}"
+                )));
             }
         }
         let mut updated = original.clone();
