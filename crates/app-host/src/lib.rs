@@ -204,10 +204,15 @@ mod tests {
                 profile: Some(AppProfileDescriptor {
                     catalog_revision: 1,
                     capability_digest: "fixture".to_string(),
+                    default_profile_id: "operator".to_string(),
                     profiles: vec![AppProfileVariant {
                         id: "operator".to_string(),
                         capabilities: vec!["fixture.read".to_string()],
                     }],
+                    surface_capabilities: std::collections::BTreeMap::from([(
+                        "tui".to_string(),
+                        vec!["fixture.read".to_string()],
+                    )]),
                 }),
             }
         }

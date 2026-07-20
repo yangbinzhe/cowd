@@ -4,7 +4,7 @@
 //! An application can depend on it without gaining access to Gateway, Runtime,
 //! authentication credentials, or another application's implementation.
 
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -80,6 +80,7 @@ impl AppDescriptor {
         }
         if let Some(profile_catalogue) = &self.profile {
             if profile_catalogue.capability_digest.trim().is_empty()
+                || profile_catalogue.default_profile_id.trim().is_empty()
                 || profile_catalogue.profiles.iter().any(|profile| {
                     profile.id.trim().is_empty()
                         || profile
@@ -97,6 +98,21 @@ impl AppDescriptor {
                 {
                     return Err(AppContractError::InvalidDescriptor(self.id.clone()));
                 }
+            }
+            if !profile_catalogue
+                .profiles
+                .iter()
+                .any(|profile| profile.id == profile_catalogue.default_profile_id)
+                || profile_catalogue
+                    .surface_capabilities
+                    .values()
+                    .any(|capabilities| {
+                        capabilities
+                            .iter()
+                            .any(|capability| capability.trim().is_empty())
+                    })
+            {
+                return Err(AppContractError::InvalidDescriptor(self.id.clone()));
             }
         }
         Ok(())
@@ -143,8 +159,11 @@ pub struct AppProfileDescriptor {
     /// a credential profile revision and cannot be chosen by a request.
     pub catalog_revision: u64,
     pub capability_digest: String,
+    pub default_profile_id: String,
     #[serde(default)]
     pub profiles: Vec<AppProfileVariant>,
+    #[serde(default)]
+    pub surface_capabilities: BTreeMap<String, Vec<String>>,
 }
 
 /// A named application profile exposed through the stable APP ABI. Hosts can
