@@ -5954,6 +5954,49 @@ pub(crate) mod tests {
             assert_eq!(response["boundary"]["engine"], "matrix", "{path}");
         }
 
+        let external_ingest_plan = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/reality/data-plane/ingest-plan")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "gateway-external-ingest-plan",
+                            "session_id": "gateway-external-ingest-session",
+                            "ingest": {
+                                "source_ref": "source-pack://gateway-external",
+                                "fact_type": "manufacturing.gateway_preview",
+                                "partition_ref": "line:gateway",
+                                "high_watermark": "2026-07-20T00:00:00Z",
+                                "estimated_rows": 1,
+                                "raw_checksum": "sha256:gateway-external",
+                                "metric_ids": ["gateway_external_metric"]
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_ingest_plan.status();
+        let body = to_bytes(external_ingest_plan.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_ingest_plan: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            external_ingest_plan["kind"],
+            "mfg.reality.data_plane.ingest_plan"
+        );
+        assert_eq!(
+            external_ingest_plan["session_id"],
+            "gateway-external-ingest-session"
+        );
+
         // Cockpit reads are owned by the external APP as well. This crosses
         // the full authenticated Gateway path, checks the profile visibility
         // context reaches the APP, and proves GET no longer resolves to the

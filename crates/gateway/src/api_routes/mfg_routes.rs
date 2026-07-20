@@ -16,9 +16,9 @@ use axum::{
     Extension, Json, Router,
 };
 use matrix_core::{
-    MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlanInput, MatrixEntity,
-    MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDependency,
-    MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourcePack,
+    MatrixComputeJobInput, MatrixConnectorRunInput, MatrixEntity, MatrixEntityInput, MatrixFact,
+    MatrixFactInput, MatrixMetricDependency, MatrixMetricDependencyInput, MatrixRelation,
+    MatrixRelationInput, MatrixSourcePack,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -144,9 +144,6 @@ pub(super) fn register_mfg_openapi_schemas(
         "MfgRealityAffectedByFactTypeRequest",
     );
     registry.register_type::<MfgRealityComputeJobPlanRequest>("MfgRealityComputeJobPlanRequest");
-    registry.register_type::<MfgRealityDataPlaneIngestPlanRequest>(
-        "MfgRealityDataPlaneIngestPlanRequest",
-    );
     registry.register_type::<MfgRealityEvidenceBuildRequest>("MfgRealityEvidenceBuildRequest");
     registry
         .register_type::<MfgRealitySourcePackUpsertRequest>("MfgRealitySourcePackUpsertRequest");
@@ -230,10 +227,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/production/governance",
             get(mfg_production_governance_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/data-plane/ingest-plan",
-            post(mfg_reality_data_plane_ingest_plan_handler),
         )
         .route(
             "/api/apps/mfg/reality/source-packs/upsert",
@@ -2083,15 +2076,6 @@ struct MfgRealityComputeJobPlanRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-struct MfgRealityDataPlaneIngestPlanRequest {
-    #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    ingest: MatrixDataPlaneIngestPlanInput,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 struct MfgRealityEvidenceBuildRequest {
     #[serde(default)]
     request_id: Option<String>,
@@ -2216,25 +2200,6 @@ async fn mfg_production_governance_handler(
             "cross_plane_audit_route": "/api/cross-plane/audit",
             "production_runbook": "docs/operator/mfg-production-runbook.md",
         }
-    })))
-}
-
-async fn mfg_reality_data_plane_ingest_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<MfgRealityDataPlaneIngestPlanRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let session_id = request.session_id.clone();
-    let plan = state
-        .services
-        .matrix
-        .plan_data_plane_ingest(&state.config_home, request.ingest)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.data_plane.ingest_plan",
-        "request_id": request.request_id,
-        "session_id": session_id,
-        "plan": plan,
-        "boundary": mfg_reality_boundary(),
     })))
 }
 
