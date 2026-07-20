@@ -612,31 +612,19 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route(
             "/api/apps/mfg/focus/alert-rules",
-            get(mfg_alert_rule_list_handler).post(mfg_alert_rule_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/focus/alerts",
-            get(mfg_alert_occurrence_list_handler),
+            post(mfg_alert_rule_upsert_handler),
         )
         .route(
             "/api/apps/mfg/focus/alert-subscriptions",
-            get(mfg_alert_subscription_list_handler).post(mfg_alert_subscription_upsert_handler),
+            post(mfg_alert_subscription_upsert_handler),
         )
         .route(
             "/api/apps/mfg/focus/alerts/:id/command",
             post(mfg_alert_command_handler),
         )
         .route(
-            "/api/apps/mfg/focus/forecasts",
-            get(mfg_forecast_list_handler),
-        )
-        .route(
             "/api/apps/mfg/assignments",
-            get(mfg_assignment_list_handler).post(mfg_assignment_upsert_handler),
-        )
-        .route(
-            "/api/apps/mfg/assignments/:id",
-            get(mfg_assignment_get_handler),
+            post(mfg_assignment_upsert_handler),
         )
         .route(
             "/api/apps/mfg/assignments/:id/command",
