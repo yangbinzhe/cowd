@@ -980,6 +980,10 @@ pub mod test_support {
 // ── Router ─────────────────────────────────────────────────────
 
 pub fn api_router(state: Arc<AppState>) -> Router {
+    // APP routers are immutable, while their generic host ports are attached
+    // only after the complete Gateway state exists. Bind before any route or
+    // background reconciler can receive traffic.
+    state.services.bind_app_host_ports(&state);
     mfg_routes::start_review_reconciler(&state);
     let public_routes = public_routes::router();
 
@@ -5697,8 +5701,12 @@ pub(crate) mod tests {
         // otherwise the external APP quite correctly opens a different MFG
         // SQLite domain from the seeded Gateway data.
         let mut app_registry = cowd_app_host::AppRegistry::default();
-        app_bundle_mfg::register_mfg_embedded_trusted(&mut app_registry, config_home.clone())
-            .expect("test MFG APP registry");
+        app_bundle_mfg::register_mfg_embedded_trusted(
+            &mut app_registry,
+            config_home.clone(),
+            state_mut.services.app_host_context(),
+        )
+        .expect("test MFG APP registry");
         state_mut.services = Arc::new(
             (*state_mut.services)
                 .clone()
@@ -5966,6 +5974,59 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(generated_report["kind"], "mfg.cockpit.report");
+        let generated_report_id = generated_report["report"]["report_id"]
+            .as_str()
+            .expect("external generated report id")
+            .to_string();
+        let generated_report_revision = generated_report["report"]["revision"]
+            .as_u64()
+            .expect("external generated report revision");
+
+        // The effect route is external too: this exercises external MFG
+        // payload construction -> product ABI bridge -> concrete Gateway
+        // cross-plane policy, without handing a Gateway service to the APP.
+        let delivery_preview = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/cockpit/reports/{generated_report_id}/deliver"
+                    ))
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-delivery-preview")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "mode": "dry_run",
+                            "expected_revision": generated_report_revision,
+                            "channel": "feishu",
+                            "target_ref": "channel://feishu/user/local-human",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let delivery_preview_status = delivery_preview.status();
+        let delivery_preview: serde_json::Value = serde_json::from_slice(
+            &to_bytes(delivery_preview.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            delivery_preview_status,
+            StatusCode::OK,
+            "{delivery_preview}"
+        );
+        assert_eq!(delivery_preview["kind"], "mfg.cockpit.report_delivery");
+        assert_eq!(delivery_preview["mode"], "dry_run");
+        assert_eq!(
+            delivery_preview["cross_plane_execution_receipt"]["action"]["actor_principal"],
+            "principal:local-human"
+        );
 
         let login = app
             .clone()

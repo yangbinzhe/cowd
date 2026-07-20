@@ -6,11 +6,122 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use async_trait::async_trait;
 use cowd_app_host::{AppRegistry, AppRegistryError};
 use cowd_app_mfg_adapter::{
-    contribution_with_live_host, MfgLiveAuthorization, MfgLiveAuthorizationFailure, MfgLiveHost,
-    MfgLivePrincipalContext,
+    contribution_with_live_host,
+    effects::{
+        MfgHostEffect, MfgHostEffectError, MfgHostEffectPort, MfgHostIntent, MfgHostInvocation,
+        MfgHostReceipt,
+    },
+    MfgLiveAuthorization, MfgLiveAuthorizationFailure, MfgLiveHost, MfgLivePrincipalContext,
 };
+use cowd_app_sdk::{AppDescriptor, AppHostError, CowdAppContext, HostIntent, InvocationContext};
+
+/// Product-side bridge from MFG's repository-stable effect ABI to Cowd's
+/// stable SDK. The external APP never receives this type or a Gateway service.
+#[derive(Clone)]
+struct CowdSdkMfgHostEffects {
+    context: CowdAppContext,
+}
+
+impl CowdSdkMfgHostEffects {
+    fn new(context: CowdAppContext) -> Self {
+        Self { context }
+    }
+
+    fn invocation(invocation: MfgHostInvocation) -> InvocationContext {
+        InvocationContext {
+            principal_id: invocation.principal_id,
+            workspace_id: invocation.workspace_id,
+            surface: invocation.surface,
+            request_id: invocation.request_id,
+        }
+    }
+
+    fn intent(intent: MfgHostIntent) -> HostIntent {
+        HostIntent {
+            kind: intent.kind,
+            payload: intent.payload,
+        }
+    }
+
+    fn receipt(receipt: cowd_app_sdk::HostReceipt) -> MfgHostReceipt {
+        MfgHostReceipt {
+            id: receipt.id,
+            status: receipt.status,
+            replayed: receipt.replayed,
+            payload: receipt.payload,
+        }
+    }
+
+    fn error(error: AppHostError) -> MfgHostEffectError {
+        match error {
+            AppHostError::Unavailable(message) => MfgHostEffectError::Unavailable(message),
+            AppHostError::Denied(message) => MfgHostEffectError::Denied(message),
+            AppHostError::Failed(message) => MfgHostEffectError::Failed(message),
+        }
+    }
+}
+
+#[async_trait]
+impl MfgHostEffectPort for CowdSdkMfgHostEffects {
+    async fn submit(
+        &self,
+        effect: MfgHostEffect,
+        invocation: MfgHostInvocation,
+        intent: MfgHostIntent,
+    ) -> Result<MfgHostReceipt, MfgHostEffectError> {
+        let invocation = Self::invocation(invocation);
+        let intent = Self::intent(intent);
+        let receipt = match effect {
+            MfgHostEffect::Runtime => {
+                self.context
+                    .ports()
+                    .runtime()
+                    .execute(&invocation, intent)
+                    .await
+            }
+            MfgHostEffect::Approval => {
+                self.context
+                    .ports()
+                    .approval()
+                    .request(&invocation, intent)
+                    .await
+            }
+            MfgHostEffect::CrossPlane => {
+                self.context
+                    .ports()
+                    .cross_plane()
+                    .submit(&invocation, intent)
+                    .await
+            }
+            MfgHostEffect::Connector => {
+                self.context
+                    .ports()
+                    .connector()
+                    .dispatch(&invocation, intent)
+                    .await
+            }
+            MfgHostEffect::Reality => {
+                self.context
+                    .ports()
+                    .reality()
+                    .query(&invocation, intent)
+                    .await
+            }
+            MfgHostEffect::WorkContext => {
+                self.context
+                    .ports()
+                    .work_context()
+                    .read(&invocation, intent)
+                    .await
+            }
+        }
+        .map_err(Self::error)?;
+        Ok(Self::receipt(receipt))
+    }
+}
 
 /// Product-owned credential lifecycle adapter for MFG live projections.
 ///
@@ -94,10 +205,12 @@ pub fn register_mfg(
     registry: &mut AppRegistry,
     config_home: PathBuf,
     authorization: Arc<dyn MfgLiveAuthorization>,
+    host_context: CowdAppContext,
 ) -> Result<(), AppRegistryError> {
     registry.register(contribution_with_live_host(MfgLiveHost::new(
         config_home,
         authorization,
+        Arc::new(CowdSdkMfgHostEffects::new(host_context)),
     )))
 }
 
@@ -105,11 +218,13 @@ pub fn register_mfg(
 pub fn register_mfg_with_broker(
     registry: &mut AppRegistry,
     config_home: PathBuf,
+    host_context: CowdAppContext,
 ) -> Result<(), AppRegistryError> {
     register_mfg(
         registry,
         config_home,
         Arc::new(BrokerCredentialLifecycleAuthorization::required()),
+        host_context,
     )
 }
 
@@ -119,12 +234,22 @@ pub fn register_mfg_with_broker(
 pub fn register_mfg_embedded_trusted(
     registry: &mut AppRegistry,
     config_home: PathBuf,
+    host_context: CowdAppContext,
 ) -> Result<(), AppRegistryError> {
     register_mfg(
         registry,
         config_home,
         Arc::new(BrokerCredentialLifecycleAuthorization::embedded_trusted()),
+        host_context,
     )
+}
+
+/// Return the generic MFG descriptor for product code that needs to compose
+/// authentication before its HTTP host is fully assembled.  This exposes no
+/// MFG domain type or handler to Gateway.
+#[must_use]
+pub fn mfg_app_descriptor() -> AppDescriptor {
+    cowd_app_mfg_adapter::mfg_descriptor()
 }
 
 /// Forward MFG-owned OpenAPI schemas through product composition. Gateway can
@@ -136,38 +261,13 @@ pub fn register_mfg_openapi_schemas(registry: &mut app_mfg_contract::MfgOpenApiS
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use cowd_app_mfg_adapter::{MfgLiveAuthorizationFailure, MfgLivePrincipalContext};
-
     use super::*;
 
-    struct FixtureAuthorization;
-
-    impl MfgLiveAuthorization for FixtureAuthorization {
-        fn verify(
-            &self,
-            _config_home: &std::path::Path,
-            _principal: &MfgLivePrincipalContext,
-        ) -> Result<(), MfgLiveAuthorizationFailure> {
-            Ok(())
-        }
-    }
-
     #[test]
-    fn bundle_is_the_real_external_mfg_factory_consumer() {
-        let mut registry = AppRegistry::default();
-        register_mfg(
-            &mut registry,
-            std::env::temp_dir(),
-            Arc::new(FixtureAuthorization),
-        )
-        .expect("MFG contribution registers");
-        let apps = registry.apps();
-        assert_eq!(apps.len(), 1);
-        assert_eq!(apps[0].descriptor.id.as_str(), "mfg");
-        assert_eq!(apps[0].descriptor.routes.len(), 104);
-        assert!(apps[0].http_registered);
-        assert!(apps[0].tui_registered);
+    fn bundle_exposes_the_real_external_mfg_descriptor_before_host_assembly() {
+        let descriptor = mfg_app_descriptor();
+        assert_eq!(descriptor.id.as_str(), "mfg");
+        assert_eq!(descriptor.routes.len(), 104);
+        assert_eq!(descriptor.sdk_api, cowd_app_sdk::SDK_API_VERSION);
     }
 }

@@ -48,12 +48,14 @@ dependencies = [
 name = "app-bundle-mfg"
 version = "0.9.561"
 dependencies = [
+ "async-trait",
  "auth-broker",
  "cowd-app-host",
  "cowd-app-mfg-adapter",
  "cowd-app-mfg-contract",
  "cowd-app-mfg-core",
  "cowd-app-mfg-tui",
+ "cowd-app-sdk",
 ]
 
 [[package]]
@@ -345,8 +347,9 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-adapter"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8d9baca2237c2e87b67a7328a6806fc14474e3bf#8d9baca2237c2e87b67a7328a6806fc14474e3bf"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=a7a876b0d420cf9cf1661f3ec48d291e0ba44da4#a7a876b0d420cf9cf1661f3ec48d291e0ba44da4"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "chrono",
@@ -369,7 +372,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-contract"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8d9baca2237c2e87b67a7328a6806fc14474e3bf#8d9baca2237c2e87b67a7328a6806fc14474e3bf"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=a7a876b0d420cf9cf1661f3ec48d291e0ba44da4#a7a876b0d420cf9cf1661f3ec48d291e0ba44da4"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -382,7 +385,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-core"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8d9baca2237c2e87b67a7328a6806fc14474e3bf#8d9baca2237c2e87b67a7328a6806fc14474e3bf"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=a7a876b0d420cf9cf1661f3ec48d291e0ba44da4#a7a876b0d420cf9cf1661f3ec48d291e0ba44da4"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
@@ -401,7 +404,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-tui"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=8d9baca2237c2e87b67a7328a6806fc14474e3bf#8d9baca2237c2e87b67a7328a6806fc14474e3bf"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=a7a876b0d420cf9cf1661f3ec48d291e0ba44da4#a7a876b0d420cf9cf1661f3ec48d291e0ba44da4"
 dependencies = [
  "cowd-app-mfg-contract",
  "serde",

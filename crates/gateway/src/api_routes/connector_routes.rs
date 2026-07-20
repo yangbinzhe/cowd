@@ -649,7 +649,7 @@ fn run_local_source_incremental(
 const MAX_CONNECTOR_RESOURCE_PAGE: usize = 200;
 const DEFAULT_CONNECTOR_RESOURCE_PAGE: usize = 100;
 
-pub(super) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
+pub(crate) fn connector_snapshot(state: &AppState) -> ConnectorRegistrySnapshot {
     let config = state.runtime_config_json_snapshot();
     let platforms = message_connector_routes::configured_platforms(config.as_ref());
     let mut accounts = platforms

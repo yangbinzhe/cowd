@@ -77,6 +77,7 @@ impl GatewayServices {
         capacity_config: runtime::GatewayCapacityConfig,
     ) -> Self {
         let config_home = config_home.as_ref().to_path_buf();
+        let app_host_binding = GatewayAppHostBinding::new();
         let command_host_runtime = Arc::clone(&runtime);
         let runtime_services = runtime.runtime_services();
         let runtime_events = RuntimeEventService::from_runtime_services(runtime_services.as_ref());
@@ -88,7 +89,11 @@ impl GatewayServices {
             Arc::clone(runtime_services.resource_manager()),
         );
         Self {
-            app_registry: Arc::new(embedded_app_registry(&config_home)),
+            app_registry: Arc::new(embedded_app_registry(
+                &config_home,
+                app_host_binding.context(),
+            )),
+            app_host_binding,
             runtime: Some(runtime),
             session_manager: Some(session_manager),
             runtime_events,
@@ -117,6 +122,7 @@ impl GatewayServices {
     )]
     pub(crate) fn baseline_with_config_home(config_home: impl AsRef<std::path::Path>) -> Self {
         let config_home = config_home.as_ref();
+        let app_host_binding = GatewayAppHostBinding::new();
         let baseline_runtime =
             runtime::RuntimeServices::in_memory().expect("baseline runtime event projection");
         let capacity = crate::gateway_capacity::GatewayCapacityController::defaults(Arc::clone(
@@ -124,7 +130,11 @@ impl GatewayServices {
         ));
         let task = TaskService::new();
         Self {
-            app_registry: Arc::new(embedded_app_registry(config_home)),
+            app_registry: Arc::new(embedded_app_registry(
+                config_home,
+                app_host_binding.context(),
+            )),
+            app_host_binding,
             runtime: None,
             session_manager: None,
             runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
@@ -164,6 +174,18 @@ impl GatewayServices {
     pub(crate) fn with_app_registry(mut self, app_registry: cowd_app_host::AppRegistry) -> Self {
         self.app_registry = Arc::new(app_registry);
         self
+    }
+
+    #[must_use]
+    pub(crate) fn app_host_context(&self) -> cowd_app_sdk::CowdAppContext {
+        self.app_host_binding.context()
+    }
+
+    /// Complete the composition root after an immutable APP registry and the
+    /// concrete application state both exist. APP handlers still see only the
+    /// stable SDK ports supplied by this binding.
+    pub(crate) fn bind_app_host_ports(&self, state: &Arc<crate::api_routes::AppState>) {
+        self.app_host_binding.bind(state);
     }
 
     /// Gateway only projects the Runtime-owned capability snapshot. Baseline
@@ -388,18 +410,30 @@ impl GatewayServices {
 /// registry using broker-backed live credential revalidation before accepting
 /// traffic.  The APP source itself remains external; this helper owns only
 /// product assembly policy.
-fn embedded_app_registry(config_home: &std::path::Path) -> cowd_app_host::AppRegistry {
+fn embedded_app_registry(
+    config_home: &std::path::Path,
+    host_context: cowd_app_sdk::CowdAppContext,
+) -> cowd_app_host::AppRegistry {
     let mut registry = cowd_app_host::AppRegistry::default();
-    app_bundle_mfg::register_mfg_embedded_trusted(&mut registry, config_home.to_path_buf())
-        .expect("static MFG product contribution must have a valid descriptor");
+    app_bundle_mfg::register_mfg_embedded_trusted(
+        &mut registry,
+        config_home.to_path_buf(),
+        host_context,
+    )
+    .expect("static MFG product contribution must have a valid descriptor");
     registry
 }
 
 pub(crate) fn broker_backed_app_registry(
     config_home: impl AsRef<std::path::Path>,
+    host_context: cowd_app_sdk::CowdAppContext,
 ) -> cowd_app_host::AppRegistry {
     let mut registry = cowd_app_host::AppRegistry::default();
-    app_bundle_mfg::register_mfg_with_broker(&mut registry, config_home.as_ref().to_path_buf())
-        .expect("static MFG product contribution must have a valid descriptor");
+    app_bundle_mfg::register_mfg_with_broker(
+        &mut registry,
+        config_home.as_ref().to_path_buf(),
+        host_context,
+    )
+    .expect("static MFG product contribution must have a valid descriptor");
     registry
 }

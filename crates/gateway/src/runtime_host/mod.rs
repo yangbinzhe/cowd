@@ -705,16 +705,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
-    // Build the immutable product APP catalogue before the isolated broker is
-    // started. The broker sees only these generic descriptors, never MFG
-    // types or a Gateway service handle.
-    let app_registry = crate::services::broker_backed_app_registry(&approval_dir);
-    let auth_catalog = auth_broker::AuthorizationCatalog::from_app_descriptors(
-        app_registry
-            .apps()
-            .into_iter()
-            .map(|registered| registered.descriptor),
-    )
+    // Authentication starts before the concrete HTTP host exists. It receives
+    // only generic APP descriptors; the immutable router contribution is
+    // assembled later with the stable host-effect binding.
+    let auth_catalog = auth_broker::AuthorizationCatalog::from_app_descriptors([
+        app_bundle_mfg::mfg_app_descriptor(),
+    ])
     .map_err(|error| format!("failed to compose auth profile catalogue: {error}"))?;
     let mut auth_broker = config
         .auth_token
@@ -961,20 +957,20 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
-    let services = Arc::new(
-        crate::services::GatewayServices::new_with_session_manager(
-            Arc::clone(&runtime_service),
-            task_kernel.clone(),
-            surface_host.clone(),
-            cognitive.clone(),
-            approval_gate.clone(),
-            approval_repository,
-            Arc::clone(&session_manager),
-            &approval_dir,
-            capacity_config,
-        )
-        .with_app_registry(app_registry),
+    let services = crate::services::GatewayServices::new_with_session_manager(
+        Arc::clone(&runtime_service),
+        task_kernel.clone(),
+        surface_host.clone(),
+        cognitive.clone(),
+        approval_gate.clone(),
+        approval_repository,
+        Arc::clone(&session_manager),
+        &approval_dir,
+        capacity_config,
     );
+    let app_registry =
+        crate::services::broker_backed_app_registry(&approval_dir, services.app_host_context());
+    let services = Arc::new(services.with_app_registry(app_registry));
     let _cleanup_handle =
         spawn_session_cleanup_task(Arc::clone(&session_manager), Duration::from_secs(300));
     tokio::spawn(async move {

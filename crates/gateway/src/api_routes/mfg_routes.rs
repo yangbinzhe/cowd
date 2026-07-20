@@ -468,18 +468,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_cockpit_report_schedule_run_handler),
         )
         .route(
-            "/api/apps/mfg/cockpit/reports/:id/deliver",
-            post(mfg_cockpit_report_deliver_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/reports/:id/delivery-state",
-            get(mfg_cockpit_report_delivery_state_handler),
-        )
-        .route(
-            "/api/apps/mfg/cockpit/reports/:id/delivery/retry",
-            post(mfg_cockpit_report_delivery_retry_handler),
-        )
-        .route(
             "/api/apps/mfg/cockpit/reports/:id/reviews",
             post(mfg_cockpit_report_review_request_handler),
         )

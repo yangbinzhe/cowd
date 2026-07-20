@@ -14,6 +14,7 @@ use crate::runtime_service::RuntimeService;
 use memory::CognitiveContextManager;
 
 mod agent_service;
+mod app_host_ports;
 mod approval_service;
 mod connector_service;
 mod context;
@@ -42,6 +43,7 @@ mod system_service;
 mod task_service;
 mod workspace_service;
 
+pub(crate) use app_host_ports::GatewayAppHostBinding;
 pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_executor::{GatewayConnectorServiceExecutor, GatewayCrossPlaneExecutor};
@@ -549,6 +551,10 @@ pub(crate) struct GatewayServices {
     /// Product-composed APP catalogue. The core host only consumes its generic
     /// descriptors and routers; it never imports an APP implementation.
     pub(crate) app_registry: Arc<cowd_app_host::AppRegistry>,
+    /// Generic APP-to-host effect binding. This is deliberately separate from
+    /// the immutable registry so product startup can compose descriptors
+    /// before the final `AppState` exists.
+    pub(crate) app_host_binding: GatewayAppHostBinding,
     pub(crate) runtime: Option<Arc<RuntimeService>>,
     pub(crate) session_manager: Option<Arc<crate::unified_session_manager::UnifiedSessionManager>>,
     pub(crate) runtime_events: RuntimeEventService,
