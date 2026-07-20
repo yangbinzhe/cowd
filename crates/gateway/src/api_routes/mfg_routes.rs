@@ -19,7 +19,6 @@ use matrix_core::{
     MatrixComputeJobInput, MatrixConnectorRunInput, MatrixDataPlaneIngestPlanInput, MatrixEntity,
     MatrixEntityInput, MatrixFact, MatrixFactInput, MatrixMetricDependency,
     MatrixMetricDependencyInput, MatrixRelation, MatrixRelationInput, MatrixSourcePack,
-    MATRIX_SCHEMA_VERSION,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -231,14 +230,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/production/governance",
             get(mfg_production_governance_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/health",
-            get(mfg_reality_health_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/data-plane/health",
-            get(mfg_reality_data_plane_health_handler),
         )
         .route(
             "/api/apps/mfg/reality/data-plane/ingest-plan",
@@ -2225,63 +2216,6 @@ async fn mfg_production_governance_handler(
             "cross_plane_audit_route": "/api/cross-plane/audit",
             "production_runbook": "docs/operator/mfg-production-runbook.md",
         }
-    })))
-}
-
-async fn mfg_reality_health_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let health = state
-        .services
-        .matrix
-        .repository_health(&state.config_home)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let store_path = state
-        .services
-        .matrix
-        .store_path(&state.config_home)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.health",
-        "status": "ready",
-        "schema_version": health.schema_version,
-        "expected_schema_version": MATRIX_SCHEMA_VERSION,
-        "fact_count": health.fact_count,
-        "metric_definition_count": health.metric_definition_count,
-        "metric_state_count": health.metric_state_count,
-        "change_count": health.change_count,
-        "attention_count": health.attention_count,
-        "evidence_count": health.evidence_count,
-        "entity_count": health.entity_count,
-        "relation_count": health.relation_count,
-        "metric_dependency_count": health.metric_dependency_count,
-        "compute_job_count": health.compute_job_count,
-        "quality_gate_count": health.quality_gate_count,
-        "source_pack_count": health.source_pack_count,
-        "data_plane_watermark_count": health.data_plane_watermark_count,
-        "connector_run_count": health.connector_run_count,
-        "ontology_pack_count": health.ontology_pack_count,
-        "entity_match_candidate_count": health.entity_match_candidate_count,
-        "entity_conflict_decision_count": health.entity_conflict_decision_count,
-        "metric_snapshot_count": health.metric_snapshot_count,
-        "store": store_path,
-        "capabilities": mfg_application_capabilities(),
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_data_plane_health_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let health = state
-        .services
-        .matrix
-        .data_plane_health(&state.config_home)
-        .map_err(|error| mfg_api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.data_plane.health",
-        "health": health,
-        "boundary": mfg_reality_boundary(),
     })))
 }
 

@@ -5920,6 +5920,40 @@ pub(crate) mod tests {
         assert_eq!(external_reality_metrics["kind"], "mfg.reality.metrics");
         assert_eq!(external_reality_metrics["boundary"]["engine"], "matrix");
 
+        // Health projections use the same external Matrix-facing owner.  This
+        // protects against accidentally restoring a Gateway MFG health route
+        // while the rest of the Reality read plane remains external.
+        for (path, expected_kind) in [
+            ("/api/apps/mfg/reality/health", "mfg.reality.health"),
+            (
+                "/api/apps/mfg/reality/data-plane/health",
+                "mfg.reality.data_plane.health",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header("authorization", "Bearer mfg-live-auth-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["kind"], expected_kind, "{path}");
+            assert_eq!(response["boundary"]["engine"], "matrix", "{path}");
+        }
+
         // Cockpit reads are owned by the external APP as well. This crosses
         // the full authenticated Gateway path, checks the profile visibility
         // context reaches the APP, and proves GET no longer resolves to the
