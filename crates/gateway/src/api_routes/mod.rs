@@ -5864,6 +5864,13 @@ pub(crate) mod tests {
                 format!("/api/apps/mfg/cockpit/reports/{}", cockpit_report.report_id),
                 "mfg.cockpit.report",
             ),
+            (
+                format!(
+                    "/api/apps/mfg/decision-trace?report_id={}",
+                    cockpit_report.report_id
+                ),
+                "mfg.decision_trace",
+            ),
         ] {
             let response = app
                 .clone()

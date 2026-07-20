@@ -38,12 +38,10 @@ use super::mfg_outcomes::{
     append_mfg_execution_outcome, mfg_action_execution_outcome, mfg_skill_run_execution_outcome,
 };
 mod cockpit;
-mod decision;
 mod incidents;
 mod operations;
 use super::{principal_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
 use cockpit::*;
-use decision::*;
 use incidents::*;
 use operations::*;
 
@@ -435,10 +433,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/reality/evidence/:id/context",
             get(mfg_reality_evidence_context_handler),
-        )
-        .route(
-            "/api/apps/mfg/decision-trace",
-            get(mfg_decision_trace_handler),
         )
         .route("/api/apps/mfg/incidents", post(mfg_incident_create_handler))
         .route(
