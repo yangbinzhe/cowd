@@ -233,16 +233,8 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             post(mfg_reality_source_pack_upsert_handler),
         )
         .route(
-            "/api/apps/mfg/reality/source-packs/:id/validate",
-            post(mfg_reality_source_pack_validate_handler),
-        )
-        .route(
             "/api/apps/mfg/reality/source-packs/:id/ingest-file",
             post(mfg_reality_source_pack_ingest_file_handler),
-        )
-        .route(
-            "/api/apps/mfg/reality/source-packs/:id/delta-plan",
-            post(mfg_reality_source_pack_delta_plan_handler),
         )
         .route(
             "/api/apps/mfg/reality/source-packs/:id/connector-runs/plan",
@@ -2251,38 +2243,6 @@ async fn mfg_reality_source_pack_get_handler(
         "kind": "mfg.reality.source_pack",
         "source_pack": source_pack,
         "revision": revision,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_source_pack_validate_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let validation = state
-        .services
-        .matrix
-        .validate_source_pack(&state.config_home, &id)
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.source_pack.validation",
-        "validation": validation,
-        "boundary": mfg_reality_boundary(),
-    })))
-}
-
-async fn mfg_reality_source_pack_delta_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    AxumPath(id): AxumPath<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let delta_plan = state
-        .services
-        .matrix
-        .source_pack_delta_plan(&state.config_home, &id)
-        .map_err(matrix_error)?;
-    Ok(Json(serde_json::json!({
-        "kind": "mfg.reality.source_pack.delta_plan",
-        "delta_plan": delta_plan,
         "boundary": mfg_reality_boundary(),
     })))
 }

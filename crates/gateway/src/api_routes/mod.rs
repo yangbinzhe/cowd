@@ -5844,6 +5844,39 @@ pub(crate) mod tests {
             .as_ref()
             .expect("Gateway test state has runtime services")
             .runtime_services();
+        // Seed the generic Matrix core directly.  The following MFG requests
+        // must read this same durable Reality domain through the external APP,
+        // not through the still-unmigrated MFG source-pack mutation route.
+        let source_pack: matrix_core::MatrixSourcePack =
+            serde_json::from_value(serde_json::json!({
+                "source_pack_id": "gateway-external-source-pack",
+                "source_name": "gateway_external_fixture",
+                "owner": "operations",
+                "access_mode": "connector",
+                "refresh_mode": "incremental",
+                "entity_mappings": [{
+                    "source_entity": "plant",
+                    "matrix_entity_type": "factory",
+                    "source_key_field": "plant_id"
+                }],
+                "fact_mappings": [{
+                    "source_table": "quality_events",
+                    "fact_type": "manufacturing_quality_event",
+                    "metric_key": "quality_deviation_rate",
+                    "entity_ref_fields": ["plant_id"],
+                    "measure_fields": ["deviation"],
+                    "dedup_key": "plant_id:event_id",
+                    "delta_signature": "deviation"
+                }],
+                "reconciliation_rules": ["dedup_key_unique"],
+                "quality_rules": ["deviation_non_negative"]
+            }))
+            .expect("Matrix source-pack fixture");
+        state
+            .services
+            .matrix
+            .upsert_source_pack(&config_home, source_pack)
+            .expect("seed generic Matrix source pack");
         let app = api_router(state);
 
         let bearer_snapshot = app
@@ -5996,6 +6029,41 @@ pub(crate) mod tests {
             external_ingest_plan["session_id"],
             "gateway-external-ingest-session"
         );
+
+        for (path, expected_kind) in [
+            (
+                "/api/apps/mfg/reality/source-packs/gateway-external-source-pack/validate",
+                "mfg.reality.source_pack.validation",
+            ),
+            (
+                "/api/apps/mfg/reality/source-packs/gateway-external-source-pack/delta-plan",
+                "mfg.reality.source_pack.delta_plan",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("authorization", "Bearer mfg-live-auth-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{path}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["kind"], expected_kind, "{path}");
+            assert_eq!(response["boundary"]["engine"], "matrix", "{path}");
+        }
 
         // Cockpit reads are owned by the external APP as well. This crosses
         // the full authenticated Gateway path, checks the profile visibility
