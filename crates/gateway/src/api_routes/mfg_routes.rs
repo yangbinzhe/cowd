@@ -493,8 +493,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/api/apps/mfg/reality/quality-gates/:id",
             get(mfg_reality_quality_gate_get_handler),
         )
-        .route("/api/apps/mfg/skills", get(mfg_skills_handler))
-        .route("/api/apps/mfg/skills/:id", get(mfg_skill_get_handler))
         .route(
             "/api/apps/mfg/skill-runs/:id",
             get(mfg_skill_run_get_handler),
@@ -510,22 +508,6 @@ pub(super) fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route(
             "/api/apps/mfg/decision-trace",
             get(mfg_decision_trace_handler),
-        )
-        .route(
-            "/api/apps/mfg/domain/server-manufacturing",
-            get(mfg_server_manufacturing_domain_handler),
-        )
-        .route(
-            "/api/apps/mfg/domain/server-manufacturing/seed",
-            post(mfg_server_manufacturing_seed_handler),
-        )
-        .route(
-            "/api/apps/mfg/ontology/server-manufacturing",
-            get(mfg_server_manufacturing_ontology_handler),
-        )
-        .route(
-            "/api/apps/mfg/ontology/server-manufacturing/seed",
-            post(mfg_server_manufacturing_ontology_seed_handler),
         )
         .route("/api/apps/mfg/incidents", get(mfg_incidents_list_handler))
         .route("/api/apps/mfg/incidents", post(mfg_incident_create_handler))
