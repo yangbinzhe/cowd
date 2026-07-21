@@ -209,6 +209,10 @@ pub struct AppHttpContract {
     pub routes: Vec<AppRouteMetadata>,
     #[serde(default)]
     pub openapi_components: BTreeMap<String, serde_json::Value>,
+    /// Named component used when Gateway's common auth middleware rejects a
+    /// request before it reaches the App router. `None` selects `GatewayError`.
+    #[serde(default)]
+    pub auth_error_schema: Option<String>,
 }
 
 impl AppHttpContract {
@@ -260,6 +264,15 @@ impl AppHttpContract {
                 app_id: descriptor.id.clone(),
                 reason: "OpenAPI component name is empty".to_string(),
             });
+        }
+        if let Some(error_schema) = &self.auth_error_schema {
+            if error_schema.trim().is_empty() || !self.openapi_components.contains_key(error_schema)
+            {
+                return Err(AppContractError::InvalidHttpContract {
+                    app_id: descriptor.id.clone(),
+                    reason: "auth error schema must name an App OpenAPI component".to_string(),
+                });
+            }
         }
         Ok(())
     }

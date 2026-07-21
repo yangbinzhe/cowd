@@ -341,6 +341,7 @@ pub struct AppContribution {
 pub struct RegisteredAppRouteMetadata {
     pub app_id: AppId,
     pub route: AppRouteMetadata,
+    pub auth_error_schema: Option<String>,
 }
 
 /// The host supplies only a common auth status and message. The App owns its
@@ -526,6 +527,7 @@ impl AppRegistry {
                     .map(|route| RegisteredAppRouteMetadata {
                         app_id: app_id.clone(),
                         route,
+                        auth_error_schema: registered.contract.auth_error_schema.clone(),
                     })
                     .collect::<Vec<_>>()
             })
@@ -822,6 +824,7 @@ mod tests {
                         "FixtureResponse".to_string(),
                         json!({"type": "object"}),
                     )]),
+                    auth_error_schema: None,
                 },
                 fixture_error,
             )
