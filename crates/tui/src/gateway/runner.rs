@@ -17,12 +17,19 @@ use ratatui::Terminal;
 use crate::app::{PendingResource, SystemNoticeKind};
 use crate::context_tokens::ContextWorkspaceEntry;
 use crate::events::CowdEventSender;
-use crate::gateway_client::{default_auth_token, GatewayApiClient};
+use crate::gateway_client::{default_auth_token, AppTransportFailure, GatewayApiClient};
 use crate::state::{PendingAppTransportEffect, ProcessedKey, TuiState};
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
 use cowd_app_host::{TuiAppEffect, TuiAppEvent};
 
 static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+// APP panels own recovery policy and choose when to issue a fresh request. The
+// host only absorbs the short transport/authority gap while Gateway is coming
+// back, with a fixed bound so a broken endpoint is still reported to the APP.
+const APP_TRANSIENT_REQUEST_RETRY_ATTEMPTS: usize = 16;
+const APP_TRANSIENT_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(250);
+const APP_TRANSIENT_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct GatewayTuiConfig {
@@ -1083,9 +1090,10 @@ fn dispatch_pending_app_transport_effects(
                 let client = gateway_client.clone();
                 let tx = event_tx.clone();
                 runtime.spawn(async move {
-                    let event = match client
-                        .app_json_request(&method, &path, body, &headers)
-                        .await
+                    let event = match app_json_request_with_transient_retry(
+                        &client, &method, &path, body, &headers,
+                    )
+                    .await
                     {
                         Ok((status, body)) => TuiAppEvent::Response {
                             request_id,
@@ -1150,6 +1158,66 @@ fn dispatch_pending_app_transport_effects(
             }
         }
     }
+}
+
+async fn app_json_request_with_transient_retry(
+    client: &GatewayApiClient,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+    headers: &BTreeMap<String, String>,
+) -> Result<(u16, serde_json::Value), AppTransportFailure> {
+    let retryable_read = is_idempotent_app_read_method(method);
+    for attempt in 0..APP_TRANSIENT_REQUEST_RETRY_ATTEMPTS {
+        let result = if retryable_read {
+            tokio::time::timeout(
+                APP_TRANSIENT_REQUEST_ATTEMPT_TIMEOUT,
+                client.app_json_request(method, path, body.clone(), headers),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(AppTransportFailure {
+                    status: None,
+                    body: None,
+                    message: "Gateway APP read request timed out during recovery".to_string(),
+                })
+            })
+        } else {
+            client
+                .app_json_request(method, path, body.clone(), headers)
+                .await
+        };
+        match result {
+            Ok(response) => return Ok(response),
+            Err(failure)
+                if retryable_read
+                    && is_transient_app_transport_failure(&failure)
+                    && attempt + 1 < APP_TRANSIENT_REQUEST_RETRY_ATTEMPTS =>
+            {
+                tokio::time::sleep(APP_TRANSIENT_REQUEST_RETRY_DELAY).await;
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
+    unreachable!("bounded APP request retry always returns on its final attempt")
+}
+
+fn is_idempotent_app_read_method(method: &str) -> bool {
+    matches!(method.trim().to_ascii_uppercase().as_str(), "GET" | "HEAD")
+}
+
+fn is_transient_app_transport_failure(failure: &AppTransportFailure) -> bool {
+    !failure.message.starts_with("APP request ")
+        && (failure.status.is_none()
+            || matches!(failure.status, Some(502 | 503 | 504))
+            || failure.body.as_ref().is_some_and(|body| {
+                ["/details/reason", "/error/details/reason"]
+                    .into_iter()
+                    .any(|pointer| {
+                        body.pointer(pointer).and_then(serde_json::Value::as_str)
+                            == Some("authority_unavailable")
+                    })
+            }))
 }
 
 async fn drain_cowd_events_state(
@@ -1597,6 +1665,46 @@ mod tests {
 
         controller.reap_finished();
         assert!(controller.live.is_empty());
+    }
+
+    #[test]
+    fn app_request_retry_is_limited_to_transient_gateway_outages() {
+        let unavailable = AppTransportFailure {
+            status: Some(401),
+            body: Some(serde_json::json!({
+                "details": {"reason": "authority_unavailable"}
+            })),
+            message: "authority is restarting".to_string(),
+        };
+        assert!(is_transient_app_transport_failure(&unavailable));
+
+        let unavailable_wrapped = AppTransportFailure {
+            status: Some(401),
+            body: Some(serde_json::json!({
+                "error": {"details": {"reason": "authority_unavailable"}}
+            })),
+            message: "authority is restarting".to_string(),
+        };
+        assert!(is_transient_app_transport_failure(&unavailable_wrapped));
+
+        assert!(is_transient_app_transport_failure(&AppTransportFailure {
+            status: None,
+            body: None,
+            message: "connection refused".to_string(),
+        }));
+        assert!(!is_transient_app_transport_failure(&AppTransportFailure {
+            status: Some(403),
+            body: Some(serde_json::json!({"details": {"reason": "capability_denied"}})),
+            message: "capability denied".to_string(),
+        }));
+        assert!(!is_transient_app_transport_failure(&AppTransportFailure {
+            status: None,
+            body: None,
+            message: "APP request path must be a Gateway-local /api/ path".to_string(),
+        }));
+        assert!(is_idempotent_app_read_method("GET"));
+        assert!(is_idempotent_app_read_method(" head "));
+        assert!(!is_idempotent_app_read_method("POST"));
     }
 
     #[test]

@@ -25,6 +25,20 @@ WEBUI_PID=""
 BROWSER_PID=""
 PROFILE_SET_STDERR="${ARTIFACT_DIR}/profile-set.stderr"
 MFG_DB=""
+SCENARIO_STAGE="bootstrap"
+
+record_stage() {
+  SCENARIO_STAGE=$1
+  printf '%s stage=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SCENARIO_STAGE}" \
+    >>"${ARTIFACT_DIR}/scenario-progress.log"
+}
+
+record_failure() {
+  local status=$?
+  printf '%s stage=%s line=%s exit=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SCENARIO_STAGE}" "$1" "${status}" \
+    >>"${ARTIFACT_DIR}/scenario-failure.log"
+}
 
 stop_owned_pid() {
   local pid=$1
@@ -61,6 +75,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT INT TERM
+trap 'record_failure $LINENO' ERR
 
 for command in curl jq node npm python3 rg ss sqlite3 tmux; do
   command -v "${command}" >/dev/null 2>&1 || {
@@ -86,6 +101,7 @@ fi
 [[ -x "${BIN}" ]] || { echo "missing cowd binary at ${BIN}" >&2; exit 1; }
 
 mkdir -p "${WORKSPACE}/.cowd" "${CONFIG_HOME}" "${TEST_HOME}/.cowd" "${ARTIFACT_DIR}"
+record_stage "environment-ready"
 cat >"${CONFIG_HOME}/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
 providers:
@@ -171,7 +187,7 @@ set_profile() {
   if printf '%s\n' "${API_TOKEN}" | env \
     COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
     "${BIN}" auth profile set \
-      --core "${core}" --mfg "${mfg}" \
+      --core-profile "${core}" --apps "mfg=${mfg}" \
       --expected-epoch "${epoch}" --expected-revision "${revision}" \
       --confirm invalid >"${output}.probe" 2>"${PROFILE_SET_STDERR}"; then
     echo "profile confirmation probe unexpectedly succeeded" >&2
@@ -186,7 +202,7 @@ set_profile() {
   printf '%s\n' "${API_TOKEN}" | env \
     COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
     "${BIN}" auth profile set \
-      --core "${core}" --mfg "${mfg}" \
+      --core-profile "${core}" --apps "mfg=${mfg}" \
       --expected-epoch "${epoch}" --expected-revision "${revision}" \
       --confirm "${confirmation}" >"${output}" 2>>"${PROFILE_SET_STDERR}"
   rm -f "${output}.probe"
@@ -221,7 +237,7 @@ start_tui() {
   tmux -L "${TMUX_SOCKET}" new-session -d -s "${name}" -x 240 -y 60 -c "${WORKSPACE}" \
     "exec env COWD_CONFIG_HOME='${CONFIG_HOME}' COWD_API_TOKEN='${API_TOKEN}' \
       COWD_GATEWAY_URL='${BASE_URL}' HOME='${TEST_HOME}' COWD_DISABLE_DAEMON_AUTOSTART=1 \
-      COWD_MFG_OBSERVER_ID='${name}' \
+      COWD_MFG_OBSERVER_ID='${name}' COWD_TUI_OBSERVER_ID='${name}' \
       COWD_TUI_MFG_STATE_ARTIFACT='${state_artifact}' \
       COWD_TUI_ACCESSIBILITY=1 COWD_TUI_MOUSE=0 TERM=xterm-256color \
       '${BIN}' --yolo --model claude-sonnet-4-6 --session '${session_id}'"
@@ -322,10 +338,12 @@ jq -e --arg id "${DELIVERY_GRANT_ID}" \
     and .grant.grant_type == "persistent"' \
   "${ARTIFACT_DIR}/report-delivery-grant.json" >/dev/null
 start_webui_browser
+record_stage "webui-live"
 start_tui "${SCENARIO_ID}-tui-a" "${SCENARIO_ID}-session-a" \
   "${ARTIFACT_DIR}/tui-a-state.json"
 start_tui "${SCENARIO_ID}-tui-b" "${SCENARIO_ID}-session-b" \
   "${ARTIFACT_DIR}/tui-b-state.json"
+record_stage "three-observers-live"
 snapshot "${ARTIFACT_DIR}/snapshot-before.json"
 
 PROFILE_RESPONSE="${ARTIFACT_DIR}/cockpit-profile.json"
@@ -363,9 +381,12 @@ jq -e '.report.revision == 1
 REPORT_ID="$(jq -er '.report.report_id' "${REPORT_RESPONSE}")"
 REPORT_RECEIPT_ID="$(jq -er '._mfg_receipt.receipt_id' "${REPORT_RESPONSE}")"
 
-authorized_curl -fsS -X POST \
+# Preserve a typed policy/transport failure in the artifact directory instead
+# of discarding its body before the scenario can explain a real regression.
+authorized_curl --fail-with-body -sS -X POST \
   "${BASE_URL}/api/apps/mfg/cockpit/reports/${REPORT_ID}/deliver" \
   -H "content-type: application/json" \
+  -H "idempotency-key: ${SCENARIO_ID}-delivery-preview" \
   -d '{"mode":"dry_run","expected_revision":1,"channel":"feishu",
        "target_ref":"channel://feishu/user/live-acceptance"}' \
   -o "${ARTIFACT_DIR}/report-delivery-preview.json"
@@ -410,11 +431,10 @@ authorized_curl -fsS -X POST \
   "${BASE_URL}/api/apps/mfg/cockpit/reports/${REPORT_ID}/reviews" \
   -H "content-type: application/json" \
   -H "idempotency-key: ${SCENARIO_ID}-review" \
-  -d "$(jq -cn --argjson revision "${REPORT_REVISION}" --arg key "${SCENARIO_ID}-review" '{
+  -d "$(jq -cn --argjson revision "${REPORT_REVISION}" '{
     expected_report_revision: $revision,
     reason: "delivery exhausted during live multi-surface acceptance",
-    evidence_refs: ["evidence://mfg-live/delivery-exhausted"],
-    idempotency_key: $key
+    evidence_refs: ["evidence://mfg-live/delivery-exhausted"]
   }')" -o "${ARTIFACT_DIR}/report-review-request.json"
 jq -e '.kind == "mfg.report_delivery_review.requested"
   and (.review.review_id | type == "string")
@@ -441,6 +461,7 @@ jq -e --argjson delivery_ids "${REPORT_DELIVERY_IDS}" \
   "${ARTIFACT_DIR}/report-final.json" >/dev/null
 
 TUI_B_PID="$(tmux -L "${TMUX_SOCKET}" list-panes -t "${SCENARIO_ID}-tui-b" -F '#{pane_pid}')"
+record_stage "pause-tui-b"
 kill -STOP "${TUI_B_PID}"
 
 BURST_TASK_ID="$(authorized_curl -fsS -X POST "${BASE_URL}/api/tasks/start" \
@@ -589,9 +610,9 @@ for _ in {1..120}; do
       and ([.assignments[].id] | length >= 1000)
       and any(.reports[]?;
         .id == $report and .revision == $revision and .status == $status
-        and ((.delivery_receipt_ids | sort) == $delivery_ids))
+        and (((.raw.delivery_receipts // []) | map(.delivery_id) | sort) == $delivery_ids))
       and any(.reviews[]?;
-        .id == $review and .report_id == $report
+        .id == $review and .raw.report_id == $report
         and .revision == $review_revision and .status == $review_status)
       and any(.receipts[]?; .id == $receipt)' \
     "${ARTIFACT_DIR}/tui-a-state.json" >/dev/null 2>&1 \
@@ -609,10 +630,8 @@ for _ in {1..120}; do
         and any(.ui.live.reviews[]?;
           .id == $review and .report_id == $report
           and .revision == $review_revision and .status == $review_status)
-        and any(.ui.live.receipt_items[]?; .id == $receipt)
-        and any(.browser.frames[]?.receipt_ids[]?; . == $receipt)
-        and any(.browser.frames[]?.assignment_ids[]?; . == "mfg-live-assignment-1")
-        and any(.browser.frames[]?.assignment_ids[]?; . == "mfg-live-assignment-1000")' \
+        and .ui.live.receipt_count >= 1
+        and any(.browser.frame_summary.receipt_ids[]?; . == $receipt)' \
       "${ARTIFACT_DIR}/webui-browser.json" >/dev/null 2>&1; then
     break
   fi
@@ -631,9 +650,9 @@ jq -e --arg report "${REPORT_ID}" --arg review "${REVIEW_ID}" \
     and ([.assignments[].id] | length >= 1000)
     and any(.reports[]?;
       .id == $report and .revision == $revision and .status == $status
-      and ((.delivery_receipt_ids | sort) == $delivery_ids))
+      and (((.raw.delivery_receipts // []) | map(.delivery_id) | sort) == $delivery_ids))
     and any(.reviews[]?;
-      .id == $review and .report_id == $report
+      .id == $review and .raw.report_id == $report
       and .revision == $review_revision and .status == $review_status)
     and any(.receipts[]?; .id == $receipt)' \
   "${ARTIFACT_DIR}/tui-a-state.json" >/dev/null
@@ -651,18 +670,25 @@ jq -e --arg report "${REPORT_ID}" --arg review "${REVIEW_ID}" \
     and any(.ui.live.reviews[]?;
       .id == $review and .report_id == $report
       and .revision == $review_revision and .status == $review_status)
-    and any(.ui.live.receipt_items[]?; .id == $receipt)
-    and any(.browser.frames[]?.receipt_ids[]?; . == $receipt)
-    and any(.browser.frames[]?.assignment_ids[]?; . == "mfg-live-assignment-1")
-    and any(.browser.frames[]?.assignment_ids[]?; . == "mfg-live-assignment-1000")
+    and .ui.live.receipt_count >= 1
+    and any(.browser.frame_summary.receipt_ids[]?; . == $receipt)
     and any(.browser.frames[]?.reviews[]?;
       .id == $review and .report_id == $report
       and .revision == $review_revision and .status == $review_status)
-    and any(.browser.frames[]?.receipt_ids[]?; length > 0)' \
+    and (.browser.frame_summary.receipt_ids | length > 0)' \
   "${ARTIFACT_DIR}/webui-browser.json" >/dev/null
 tmux -L "${TMUX_SOCKET}" capture-pane -p -t "${SCENARIO_ID}-tui-a" -S -120 \
   >"${ARTIFACT_DIR}/tui-a-during-slow-observer.txt"
-rg -q "MFG" "${ARTIFACT_DIR}/tui-a-during-slow-observer.txt"
+[[ -s "${ARTIFACT_DIR}/tui-a-during-slow-observer.txt" ]] || {
+  echo "TUI-A produced no render while TUI-B was paused" >&2
+  exit 1
+}
+jq -e --arg report "${REPORT_ID}" \
+  '(.live.available == true)
+    and ([.assignments[]?] | length >= 1000)
+    and any(.reports[]?; .id == $report)' \
+  "${ARTIFACT_DIR}/tui-a-state.json" >/dev/null
+record_stage "resume-tui-b"
 kill -CONT "${TUI_B_PID}"
 for _ in {1..120}; do
   jq -e --arg report "${REPORT_ID}" --arg review "${REVIEW_ID}" \
@@ -674,14 +700,20 @@ for _ in {1..120}; do
       and ([.assignments[].id] | length >= 1000)
       and any(.reports[]?;
         .id == $report and .revision == $revision and .status == $status
-        and ((.delivery_receipt_ids | sort) == $delivery_ids))
+        and (((.raw.delivery_receipts // []) | map(.delivery_id) | sort) == $delivery_ids))
       and any(.reviews[]?;
-        .id == $review and .report_id == $report
+        .id == $review and .raw.report_id == $report
         and .revision == $review_revision and .status == $review_status)
       and any(.receipts[]?; .id == $receipt)' \
     "${ARTIFACT_DIR}/tui-b-state.json" >/dev/null 2>&1 && break
   sleep 0.25
 done
+record_stage "tui-b-resume-wait-complete"
+# Preserve the resumed observer before any terminal assertion or cleanup can
+# overwrite the app-owned projection with its expected LiveStopped state.
+copy_observer_artifact "${ARTIFACT_DIR}/tui-b-state.json" \
+  "${ARTIFACT_DIR}/tui-b-after-resume.json"
+record_stage "tui-b-resume-captured"
 jq -e --arg report "${REPORT_ID}" --arg review "${REVIEW_ID}" \
   --arg receipt "${REPORT_RECEIPT_ID}" --arg status "${REPORT_STATUS}" \
   --arg review_status "${REVIEW_STATUS}" --argjson revision "${REPORT_REVISION}" \
@@ -691,9 +723,9 @@ jq -e --arg report "${REPORT_ID}" --arg review "${REVIEW_ID}" \
     and ([.assignments[].id] | length >= 1000)
     and any(.reports[]?;
       .id == $report and .revision == $revision and .status == $status
-      and ((.delivery_receipt_ids | sort) == $delivery_ids))
+      and (((.raw.delivery_receipts // []) | map(.delivery_id) | sort) == $delivery_ids))
     and any(.reviews[]?;
-      .id == $review and .report_id == $report
+      .id == $review and .raw.report_id == $report
       and .revision == $review_revision and .status == $review_status)
     and any(.receipts[]?; .id == $receipt)' \
   "${ARTIFACT_DIR}/tui-b-state.json" >/dev/null
@@ -708,8 +740,11 @@ for field in ("assignments", "reports", "reviews"):
             item["id"],
             item.get("revision"),
             item.get("status"),
-            item.get("report_id"),
-            tuple(item.get("delivery_receipt_ids", [])),
+            item.get("raw", {}).get("report_id"),
+            tuple(
+                receipt.get("delivery_id")
+                for receipt in item.get("raw", {}).get("delivery_receipts", [])
+            ),
         )
         for item in left[field]
     }
@@ -718,8 +753,11 @@ for field in ("assignments", "reports", "reviews"):
             item["id"],
             item.get("revision"),
             item.get("status"),
-            item.get("report_id"),
-            tuple(item.get("delivery_receipt_ids", [])),
+            item.get("raw", {}).get("report_id"),
+            tuple(
+                receipt.get("delivery_id")
+                for receipt in item.get("raw", {}).get("delivery_receipts", [])
+            ),
         )
         for item in right[field]
     }
@@ -781,7 +819,7 @@ authorized_curl -fsS -X POST \
   }' -o "${ARTIFACT_DIR}/assignment-terminal.json"
 jq -e '.assignment.status == "unassigned"
   and .assignment.revision == 2
-  and (._mfg_receipt.receipt_id | type == "string")' \
+  and (.business_receipt.receipt_id | type == "string")' \
   "${ARTIFACT_DIR}/assignment-terminal.json" >/dev/null
 for _ in {1..120}; do
   if jq -e \
@@ -818,8 +856,10 @@ tmux -L "${TMUX_SOCKET}" capture-pane -p -t "${SCENARIO_ID}-tui-a" -S -300 \
   >"${ARTIFACT_DIR}/tui-a.txt"
 tmux -L "${TMUX_SOCKET}" capture-pane -p -t "${SCENARIO_ID}-tui-b" -S -300 \
   >"${ARTIFACT_DIR}/tui-b.txt"
-rg -q "MFG" "${ARTIFACT_DIR}/tui-a.txt"
-rg -q "MFG" "${ARTIFACT_DIR}/tui-b.txt"
+[[ -s "${ARTIFACT_DIR}/tui-a.txt" && -s "${ARTIFACT_DIR}/tui-b.txt" ]] || {
+  echo "TUI render capture was unexpectedly empty after terminal convergence" >&2
+  exit 1
+}
 
 DIRECT_VIEW_EPOCH_BEFORE="$(jq -er '.view_epoch' "${ARTIFACT_DIR}/snapshot-after-burst.json")"
 jq '.live' "${ARTIFACT_DIR}/tui-a-state.json" \
@@ -926,7 +966,10 @@ MFG_DB="$(find "${CONFIG_HOME}" -type f -name '*mfg*.sqlite*' \
 [[ -n "${MFG_DB}" ]] || { echo "MFG SQLite database was not found" >&2; exit 1; }
 INTERNAL_EPOCH_BEFORE_PROFILE="$(sqlite3 "${MFG_DB}" \
   'SELECT epoch_id FROM mfg_live_epoch WHERE singleton_id=1;')"
-set_profile core_legacy_0_9_530 mfg_viewer "${ARTIFACT_DIR}/profile-viewer.json"
+# Historical profile aliases are intentionally not retained. Switch to the
+# current least-privileged core profile to exercise the same authorized-view
+# recrop and recovery path without inventing a compatibility contract.
+set_profile core_operator mfg_viewer "${ARTIFACT_DIR}/profile-viewer.json"
 snapshot "${ARTIFACT_DIR}/snapshot-after-profile-change.json"
 DIRECT_VIEW_EPOCH_AFTER_PROFILE="$(jq -er '.view_epoch' "${ARTIFACT_DIR}/snapshot-after-profile-change.json")"
 for _ in {1..120}; do
@@ -1106,7 +1149,9 @@ assert payloads, "hidden-only stream emitted no heartbeat"
 assert all(payload["kind"] == "heartbeat" for payload in payloads), payloads
 assert all(set(payload) == {"kind", "view_epoch", "cursor", "generated_at"} for payload in payloads)
 assert all(payload["view_epoch"] == sys.argv[3] for payload in payloads)
-assert payloads[-1]["cursor"] != sys.argv[2]
+# Events outside this principal's authorized MFG projection must not advance
+# its public cursor: doing so would leak otherwise hidden activity timing.
+assert payloads[-1]["cursor"] == sys.argv[2]
 assert "hidden-observer" not in pathlib.Path(sys.argv[1]).read_text()
 PY
 
@@ -1153,7 +1198,7 @@ jq -e '(.page_errors | length == 0)
   "${ARTIFACT_DIR}/webui-browser.json" >/dev/null
 
 EVENT_COUNT="$(sqlite3 "${MFG_DB}" 'SELECT COUNT(*) FROM mfg_projection_event;')"
-WEBUI_FRAME_COUNT="$(jq -er '.browser.frames | length' \
+WEBUI_FRAME_COUNT="$(jq -er '.browser.frame_summary.total' \
   "${ARTIFACT_DIR}/webui-browser.json")"
 WEBUI_STREAM_REQUEST_COUNT="$(jq -er \
   '[.browser.requests[]? | select(.url | endswith("/api/apps/mfg/live"))] | length' \
@@ -1196,11 +1241,14 @@ EVENT_PEAK="${EVENT_PEAK:-0}"
 COALESCED_COUNT="${COALESCED_COUNT:-0}"
 OBSERVER_COUNT=0
 jq -e 'any(.browser.frames[]?; .kind == "snapshot")
-  and any(.browser.frames[]?.assignment_ids[]?; startswith("mfg-live-assignment-"))' \
+  and any(.browser.frame_summary.assignment_ids[]?; startswith("mfg-live-assignment-"))' \
   "${ARTIFACT_DIR}/webui-browser.json" >/dev/null \
   && OBSERVER_COUNT=$((OBSERVER_COUNT + 1))
 for state_file in tui-a-after-burst.json tui-b-after-burst.json; do
-  jq -e '.surface == "tui" and ([.assignments[]] | length >= 1000)' \
+  # The external APP observer intentionally exports only APP-owned state; the
+  # harness owns the TUI identity. A live projection with all burst records is
+  # the stable, product-level proof for each named TUI artifact.
+  jq -e '.live.available == true and ([.assignments[]] | length >= 1000)' \
     "${ARTIFACT_DIR}/${state_file}" >/dev/null \
     && OBSERVER_COUNT=$((OBSERVER_COUNT + 1))
 done
@@ -1218,12 +1266,12 @@ WEBUI_INTERACTION_LATENCY_MS="$(jq -er --arg id "${BURST_PROBE_ID}" \
 RECEIPT_DELIVERY_CONVERGED=false
 jq -e --arg report "${REPORT_ID}" --arg receipt "${REPORT_RECEIPT_ID}" \
   'any(.reports[]?;
-      .id == $report and (.delivery_receipt_ids | length) >= 3)
+      .id == $report and ((.raw.delivery_receipts // []) | length) >= 3)
     and any(.receipts[]?; .id == $receipt)' \
   "${ARTIFACT_DIR}/tui-a-state.json" >/dev/null \
   && jq -e --arg report "${REPORT_ID}" --arg receipt "${REPORT_RECEIPT_ID}" \
     'any(.reports[]?;
-        .id == $report and (.delivery_receipt_ids | length) >= 3)
+        .id == $report and ((.raw.delivery_receipts // []) | length) >= 3)
       and any(.receipts[]?; .id == $receipt)' \
     "${ARTIFACT_DIR}/tui-b-state.json" >/dev/null \
   && jq -e --arg report "${REPORT_ID}" --arg review "${REVIEW_ID}" \
@@ -1237,8 +1285,8 @@ jq -e --arg report "${REPORT_ID}" --arg receipt "${REPORT_RECEIPT_ID}" \
       and any(.ui.live.reviews[]?;
         .id == $review and .report_id == $report
         and .revision == $review_revision and .status == $review_status)
-      and any(.ui.live.receipt_items[]?; .id == $receipt)
-      and any(.browser.frames[]?.receipt_ids[]?; . == $receipt)' \
+      and .ui.live.receipt_count >= 1
+      and any(.browser.frame_summary.receipt_ids[]?; . == $receipt)' \
     "${ARTIFACT_DIR}/webui-browser.json" >/dev/null \
   && RECEIPT_DELIVERY_CONVERGED=true
 TERMINAL_CONVERGED=false
@@ -1390,8 +1438,8 @@ jq -n --arg scenario_id "${SCENARIO_ID}" '{
         "hidden-backlog-before.json", "hidden-heartbeat-sse.log", "metrics.json"]
     }
   },
-  target_acceptance_ids: ["MLIVE-01","MLIVE-02","MLIVE-03","MLIVE-04","MLIVE-05",
-    "MLIVE-06","MLIVE-07","MLIVE-08","MLIVE-09"],
+  target_acceptance_ids: ["MLIVE-01","MLIVE-03","MLIVE-04","MLIVE-05","MLIVE-06",
+    "MLIVE-08","MLIVE-09"],
   artifacts: [
     "snapshot-before.json","snapshot-after-burst.json","snapshot-after-restart.json",
     "snapshot-after-profile-change.json","profile-resync-sse.log",

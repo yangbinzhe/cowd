@@ -14,10 +14,10 @@ auth-broker = { path = "../auth-broker" }
 cowd-app-host = { path = "../app-host" }
 cowd-app-sdk = { path = "../app-sdk" }
 serde_json.workspace = true
-cowd-app-mfg-contract = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "4f96893b86ad489753e01da4426f1771d07d345f" }
-cowd-app-mfg-core = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "4f96893b86ad489753e01da4426f1771d07d345f" }
-cowd-app-mfg-adapter = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "4f96893b86ad489753e01da4426f1771d07d345f" }
-cowd-app-mfg-tui = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "4f96893b86ad489753e01da4426f1771d07d345f" }
+cowd-app-mfg-contract = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "00d4957b2763b6b616ffc0e3ff5a2e420aff332f" }
+cowd-app-mfg-core = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "00d4957b2763b6b616ffc0e3ff5a2e420aff332f" }
+cowd-app-mfg-adapter = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "00d4957b2763b6b616ffc0e3ff5a2e420aff332f" }
+cowd-app-mfg-tui = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "00d4957b2763b6b616ffc0e3ff5a2e420aff332f" }
 
 [lints]
 workspace = true

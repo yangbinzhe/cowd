@@ -189,23 +189,26 @@ impl AuthorizationCatalog {
     }
 
     pub fn surface_capabilities(&self, surface_id: &str) -> Vec<String> {
-        let normalized_surface = if surface_id == "legacy_gateway" {
-            "backend"
-        } else {
-            surface_id
-        };
         let mut capabilities = CORE_HUMAN_CAPABILITIES
             .iter()
             .map(|value| (*value).to_string())
             .collect::<Vec<_>>();
         for app in &self.apps {
-            capabilities.extend(
-                app.surface_capabilities
-                    .get(normalized_surface)
-                    .into_iter()
-                    .flatten()
-                    .cloned(),
-            );
+            if surface_id == "legacy_gateway" {
+                // A bearer-only legacy Gateway request has no surface identity
+                // header. Preserve the pre-APP behavior by accepting every
+                // capability the selected APP profile exposes somewhere; the
+                // route's own capability check remains the final guard.
+                capabilities.extend(app.surface_capabilities.values().flatten().cloned());
+            } else {
+                capabilities.extend(
+                    app.surface_capabilities
+                        .get(surface_id)
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                );
+            }
         }
         capabilities.sort();
         capabilities.dedup();
@@ -865,8 +868,11 @@ impl PersistedCredentialState {
         requested: &[String],
         catalog: &AuthorizationCatalog,
     ) -> Result<HumanEntitlementProjection, AuthBrokerError> {
-        let requested =
-            validated_surface_capabilities(catalog, "legacy_gateway", requested.to_vec())?;
+        // The caller has already constrained a principal issuance request to
+        // its surface. This projection is also used by profile inspection,
+        // which has no transport surface at all, so it validates the profile
+        // ceiling rather than reapplying a legacy Gateway scope.
+        let requested = validated_human_capabilities(catalog, requested.to_vec())?;
         let granted = requested
             .iter()
             .filter(|capability| self.entitled_capabilities.contains(*capability))
@@ -1907,6 +1913,7 @@ mod generic_catalog_tests {
                         capabilities: vec![
                             "workbench.read".to_string(),
                             "workbench.manage".to_string(),
+                            "workbench.webui.manage".to_string(),
                         ],
                     },
                 ],
@@ -1916,6 +1923,13 @@ mod generic_catalog_tests {
                         vec!["workbench.read".to_string(), "workbench.manage".to_string()],
                     ),
                     ("tui".to_string(), vec!["workbench.read".to_string()]),
+                    (
+                        "webui".to_string(),
+                        vec![
+                            "workbench.read".to_string(),
+                            "workbench.webui.manage".to_string(),
+                        ],
+                    ),
                 ]),
             }],
         }
@@ -1935,6 +1949,18 @@ mod generic_catalog_tests {
             &catalog,
             "backend",
             vec!["workbench.manage".to_string()],
+        )
+        .is_ok());
+        assert!(validated_surface_capabilities(
+            &catalog,
+            "backend",
+            vec!["workbench.webui.manage".to_string()],
+        )
+        .is_err());
+        assert!(validated_surface_capabilities(
+            &catalog,
+            "legacy_gateway",
+            vec!["workbench.webui.manage".to_string()],
         )
         .is_ok());
     }

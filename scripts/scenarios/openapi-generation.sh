@@ -113,7 +113,7 @@ set_manager_profile() {
   epoch="$(jq -er '.credential_epoch' <<<"${current}")"
   revision="$(jq -er '.profile_revision' <<<"${current}")"
   if printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-    "${BIN}" auth profile set --core core_manager --mfg mfg_manager \
+    "${BIN}" auth profile set --core-profile core_manager --apps mfg=mfg_manager \
       --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm invalid \
       >/dev/null 2>"${stderr_path}"; then
     echo "invalid profile confirmation unexpectedly succeeded" >&2
@@ -122,7 +122,7 @@ set_manager_profile() {
   confirmation="$(sed -n 's/.*confirmation=\([^[:space:]]*\).*/\1/p' "${stderr_path}" | head -n 1)"
   [[ -n "${confirmation}" ]] || { echo "profile confirmation was not emitted" >&2; return 1; }
   printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-    "${BIN}" auth profile set --core core_manager --mfg mfg_manager \
+    "${BIN}" auth profile set --core-profile core_manager --apps mfg=mfg_manager \
       --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm "${confirmation}" \
       >"${SCENARIO_ROOT}/profile-manager.json"
 }

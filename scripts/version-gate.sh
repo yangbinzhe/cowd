@@ -130,7 +130,7 @@ epoch="$(jq -er '.credential_epoch' <<<"${current}")"
 revision="$(jq -er '.profile_revision' <<<"${current}")"
 profile_stderr="${SCENARIO_ROOT}/profile-set.stderr"
 if printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-  "${BIN}" auth profile set --core core_manager --mfg mfg_manager \
+  "${BIN}" auth profile set --core-profile core_manager --apps mfg=mfg_manager \
     --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm invalid \
     >/dev/null 2>"${profile_stderr}"; then
   echo "invalid profile confirmation unexpectedly succeeded" >&2
@@ -139,7 +139,7 @@ fi
 confirmation="$(sed -n 's/.*confirmation=\([^[:space:]]*\).*/\1/p' "${profile_stderr}" | head -n 1)"
 [[ -n "${confirmation}" ]] || { echo "profile confirmation was not emitted" >&2; exit 1; }
 printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-  "${BIN}" auth profile set --core core_manager --mfg mfg_manager \
+  "${BIN}" auth profile set --core-profile core_manager --apps mfg=mfg_manager \
     --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm "${confirmation}" >/dev/null
 
 OPENAPI="${SCENARIO_ROOT}/openapi.json"
