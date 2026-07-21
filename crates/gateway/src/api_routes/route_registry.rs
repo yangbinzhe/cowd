@@ -159,7 +159,7 @@ pub(crate) fn execution_projection_route_metadata() -> Vec<StableRouteMetadata> 
 }
 
 pub(crate) fn mfg_route_metadata() -> Vec<StableRouteMetadata> {
-    app_mfg_contract::mfg_route_contracts()
+    app_bundle_mfg::mfg_route_metadata()
         .into_iter()
         .map(|route| StableRouteMetadata {
             method: match route.method.as_str() {
@@ -171,11 +171,11 @@ pub(crate) fn mfg_route_metadata() -> Vec<StableRouteMetadata> {
                 _ => "UNKNOWN",
             },
             path: route.path,
-            operation_id: route.route_id.as_str().replace('.', "_"),
+            operation_id: route.operation_id,
             request_schema: (!matches!(route.method.as_str(), "GET" | "DELETE"))
                 .then_some(route.request_schema),
             response_schema: route.response_schema,
-            streaming: route.route_id == app_mfg_contract::MfgRouteId::LiveStream,
+            streaming: route.streaming,
         })
         .collect()
 }

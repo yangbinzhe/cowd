@@ -249,72 +249,123 @@ pub(crate) fn gateway_openapi_document() -> Value {
 }
 
 fn mfg_openapi_components() -> Map<String, Value> {
-    let mut registry = app_mfg_contract::MfgOpenApiSchemaRegistry::canonical();
-    app_bundle_mfg::register_mfg_openapi_schemas(&mut registry);
-    registry.register_type::<app_mfg::MfgApplicationDescriptor>("MfgApplicationDescriptor");
-    registry.register_type::<app_mfg::MfgIncident>("MfgIncident");
-    registry.register_type::<app_mfg::MfgOperationalAnalysis>("MfgOperationalAnalysis");
-    registry.register_type::<app_mfg::MfgActionExecution>("MfgActionExecution");
-    registry.register_type::<app_mfg::MfgActionFeedback>("MfgActionFeedback");
-    registry.register_type::<app_mfg::MfgCockpitProfile>("MfgCockpitProfile");
-    registry.register_type::<app_mfg::MfgCockpitProjection>("MfgCockpitProjection");
-    registry.register_type::<app_mfg::MfgCockpitWidgetProjection>("MfgCockpitWidgetProjection");
-    registry.register_type::<app_mfg::MfgCockpitReportSnapshot>("MfgCockpitReportSnapshot");
-    registry
-        .register_type::<app_mfg::MfgCockpitReportDeliveryState>("MfgCockpitReportDeliveryState");
-    registry.register_type::<app_mfg::MfgAlertRule>("MfgAlertRule");
-    registry.register_type::<app_mfg::MfgAlertOccurrence>("MfgAlertOccurrence");
-    registry.register_type::<app_mfg::MfgAlertSubscription>("MfgAlertSubscription");
-    registry.register_type::<app_mfg::MfgAssignment>("MfgAssignment");
-    registry.register_type::<app_mfg::MfgForecastProjection>("MfgForecastProjection");
-    registry.register_type::<app_mfg::MfgSkillManifest>("MfgSkillManifest");
-    registry.register_type::<app_mfg::MfgSkillRun>("MfgSkillRun");
-    registry.register_type::<app_mfg::MfgMemoryCase>("MfgMemoryCase");
-    registry.register_type::<app_mfg::MfgPlaybook>("MfgPlaybook");
-    registry.register_type::<matrix_core::MatrixDataPlaneHealth>("MatrixDataPlaneHealth");
-    registry.register_type::<matrix_core::MatrixDataPlaneIngestPlan>("MatrixDataPlaneIngestPlan");
-    registry.register_type::<matrix_core::MatrixSourcePack>("MatrixSourcePack");
-    registry.register_type::<matrix_core::MatrixSourcePackValidation>("MatrixSourcePackValidation");
-    registry.register_type::<matrix_core::MatrixSourceDeltaPlan>("MatrixSourceDeltaPlan");
-    registry.register_type::<matrix_core::MatrixConnectorRun>("MatrixConnectorRun");
-    registry.register_type::<matrix_core::MatrixMetricDefinition>("MatrixMetricDefinition");
-    registry.register_type::<matrix_core::MatrixMetricSnapshot>("MatrixMetricSnapshot");
-    registry.register_type::<matrix_core::MatrixMetricLineage>("MatrixMetricLineage");
-    registry.register_type::<matrix_core::MatrixMetricAttentionPlan>("MatrixMetricAttentionPlan");
-    registry.register_type::<matrix_core::MatrixComputeJob>("MatrixComputeJob");
-    registry.register_type::<matrix_core::MatrixEntity>("MatrixEntity");
-    registry.register_type::<matrix_core::MatrixRelation>("MatrixRelation");
-    registry.register_type::<matrix_core::MatrixFact>("MatrixFact");
-    registry.register_type::<matrix_core::MatrixChangeEvent>("MatrixChangeEvent");
-    registry.register_type::<matrix_core::MatrixAttentionItem>("MatrixAttentionItem");
-    registry.register_type::<matrix_core::MatrixEvidencePacket>("MatrixEvidencePacket");
-    registry.register_type::<matrix_core::MatrixQualityGateDecision>("MatrixQualityGateDecision");
-
-    for route in app_mfg_contract::mfg_route_contracts() {
-        let response_ref = mfg_response_schema_ref(&route);
-        registry.register_schema(
-            route.response_schema,
-            json!({"$ref": format!("#/components/schemas/{response_ref}")}),
-        );
-        let request_ref = app_bundle_mfg::mfg_request_schema_component(route.route_id);
-        registry.register_schema(
-            route.request_schema,
-            json!({"$ref": format!("#/components/schemas/{request_ref}")}),
-        );
+    let mut schemas = app_bundle_mfg::mfg_openapi_components();
+    for (name, schema) in [
+        (
+            "MatrixDataPlaneHealth",
+            openapi_schema_component::<matrix_core::MatrixDataPlaneHealth>("MatrixDataPlaneHealth"),
+        ),
+        (
+            "MatrixDataPlaneIngestPlan",
+            openapi_schema_component::<matrix_core::MatrixDataPlaneIngestPlan>(
+                "MatrixDataPlaneIngestPlan",
+            ),
+        ),
+        (
+            "MatrixSourcePack",
+            openapi_schema_component::<matrix_core::MatrixSourcePack>("MatrixSourcePack"),
+        ),
+        (
+            "MatrixSourcePackValidation",
+            openapi_schema_component::<matrix_core::MatrixSourcePackValidation>(
+                "MatrixSourcePackValidation",
+            ),
+        ),
+        (
+            "MatrixSourceDeltaPlan",
+            openapi_schema_component::<matrix_core::MatrixSourceDeltaPlan>("MatrixSourceDeltaPlan"),
+        ),
+        (
+            "MatrixConnectorRun",
+            openapi_schema_component::<matrix_core::MatrixConnectorRun>("MatrixConnectorRun"),
+        ),
+        (
+            "MatrixMetricDefinition",
+            openapi_schema_component::<matrix_core::MatrixMetricDefinition>(
+                "MatrixMetricDefinition",
+            ),
+        ),
+        (
+            "MatrixMetricSnapshot",
+            openapi_schema_component::<matrix_core::MatrixMetricSnapshot>("MatrixMetricSnapshot"),
+        ),
+        (
+            "MatrixMetricLineage",
+            openapi_schema_component::<matrix_core::MatrixMetricLineage>("MatrixMetricLineage"),
+        ),
+        (
+            "MatrixMetricAttentionPlan",
+            openapi_schema_component::<matrix_core::MatrixMetricAttentionPlan>(
+                "MatrixMetricAttentionPlan",
+            ),
+        ),
+        (
+            "MatrixComputeJob",
+            openapi_schema_component::<matrix_core::MatrixComputeJob>("MatrixComputeJob"),
+        ),
+        (
+            "MatrixEntity",
+            openapi_schema_component::<matrix_core::MatrixEntity>("MatrixEntity"),
+        ),
+        (
+            "MatrixRelation",
+            openapi_schema_component::<matrix_core::MatrixRelation>("MatrixRelation"),
+        ),
+        (
+            "MatrixFact",
+            openapi_schema_component::<matrix_core::MatrixFact>("MatrixFact"),
+        ),
+        (
+            "MatrixChangeEvent",
+            openapi_schema_component::<matrix_core::MatrixChangeEvent>("MatrixChangeEvent"),
+        ),
+        (
+            "MatrixAttentionItem",
+            openapi_schema_component::<matrix_core::MatrixAttentionItem>("MatrixAttentionItem"),
+        ),
+        (
+            "MatrixEvidencePacket",
+            openapi_schema_component::<matrix_core::MatrixEvidencePacket>("MatrixEvidencePacket"),
+        ),
+        (
+            "MatrixQualityGateDecision",
+            openapi_schema_component::<matrix_core::MatrixQualityGateDecision>(
+                "MatrixQualityGateDecision",
+            ),
+        ),
+    ] {
+        schemas.insert(name.to_string(), schema);
     }
-    registry.into_components().into_iter().collect()
+    schemas.into_iter().collect()
 }
 
-fn mfg_response_schema_ref(route: &app_mfg_contract::MfgRouteContract) -> &'static str {
-    use app_mfg_contract::MfgRouteId as R;
-    match route.route_id {
-        R::ContractGet => "MfgFrontendContractV1",
-        R::AppGet => "MfgApplicationDescriptor",
-        R::ReportReviewList => "MfgReportDeliveryReviewCollection",
-        R::ReportReviewGet => "MfgReportDeliveryReview",
-        R::LiveSnapshot => "MfgLiveEnvelopeV1",
-        _ if matches!(route.class, app_mfg_contract::MfgMutationClass::Read) => "MfgReadResponseV1",
-        _ => "MfgMutationResponseV1",
+fn openapi_schema_component<T: schemars::JsonSchema>(component: &str) -> Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(T)).unwrap_or(Value::Bool(false));
+    rewrite_openapi_local_refs(&mut schema, component);
+    schema
+}
+
+fn rewrite_openapi_local_refs(value: &mut Value, component: &str) {
+    match value {
+        Value::Object(object) => {
+            let rewritten = object
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|reference| reference.strip_prefix("#/$defs/"))
+                .map(|path| format!("#/components/schemas/{component}/$defs/{path}"));
+            if let Some(reference) = rewritten {
+                object.insert("$ref".to_string(), Value::String(reference));
+            }
+            for child in object.values_mut() {
+                rewrite_openapi_local_refs(child, component);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                rewrite_openapi_local_refs(item, component);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1657,9 +1708,9 @@ mod tests {
         let schemas = document["components"]["schemas"]
             .as_object()
             .expect("OpenAPI schemas");
-        let active = app_mfg_contract::mfg_route_contracts()
+        let active = app_bundle_mfg::mfg_route_metadata()
             .into_iter()
-            .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
+            .filter(|route| route.active)
             .collect::<Vec<_>>();
         assert_eq!(active.len(), 104);
 

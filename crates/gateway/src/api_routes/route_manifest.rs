@@ -68,9 +68,9 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
     // static APP contract, preserving any Gateway-owned route entry already
     // found above. The resulting metadata explicitly records that these are
     // APP-owned handlers rather than synthetic Gateway handlers.
-    for contract in app_mfg_contract::mfg_route_contracts()
+    for contract in app_bundle_mfg::mfg_route_metadata()
         .into_iter()
-        .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
+        .filter(|route| route.active)
     {
         if entries.iter().any(|entry: &GatewayRouteManifestEntry| {
             entry.method == contract.method && entry.path == contract.path
@@ -83,7 +83,9 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
 }
 
 fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
-    let mfg = app_mfg_contract::route::mfg_route_contract_by_method_path(route.method, route.path)
+    let mfg = app_bundle_mfg::mfg_route_metadata()
+        .into_iter()
+        .find(|contract| contract.method == route.method && contract.path == route.path)
         .map(mfg_semantic_metadata);
     GatewayRouteManifestEntry {
         method: route.method,
@@ -98,9 +100,7 @@ fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
     }
 }
 
-fn app_mfg_manifest_entry(
-    contract: app_mfg_contract::MfgRouteContract,
-) -> GatewayRouteManifestEntry {
+fn app_mfg_manifest_entry(contract: app_bundle_mfg::MfgRouteMetadata) -> GatewayRouteManifestEntry {
     GatewayRouteManifestEntry {
         method: mfg_static_method(&contract.method),
         path: contract.path.to_string(),
@@ -109,7 +109,7 @@ fn app_mfg_manifest_entry(
         criticality: route_criticality(&contract.path),
         stability: "stable",
         source: "app_registry:mfg".to_string(),
-        handler: contract.route_id.as_str().to_string(),
+        handler: contract.route_id.clone(),
         mfg: Some(mfg_semantic_metadata(contract)),
     }
 }
@@ -125,28 +125,16 @@ fn mfg_static_method(method: &str) -> &'static str {
     }
 }
 
-fn mfg_semantic_metadata(
-    contract: app_mfg_contract::MfgRouteContract,
-) -> GatewayMfgSemanticMetadata {
+fn mfg_semantic_metadata(contract: app_bundle_mfg::MfgRouteMetadata) -> GatewayMfgSemanticMetadata {
     GatewayMfgSemanticMetadata {
-        route_id: contract.route_id.as_str().to_string(),
+        route_id: contract.route_id,
         request_schema: contract.request_schema,
         response_schema: contract.response_schema,
-        class: format!("{:?}", contract.class).to_ascii_lowercase(),
-        capability: match contract.capability {
-            app_mfg_contract::MfgCapabilityRequirement::One { capability } => {
-                capability.as_str().to_string()
-            }
-            app_mfg_contract::MfgCapabilityRequirement::All { capabilities } => capabilities
-                .into_iter()
-                .map(app_mfg_contract::MfgCapabilityId::as_str)
-                .collect::<Vec<_>>()
-                .join("+"),
-            app_mfg_contract::MfgCapabilityRequirement::PerAction => "per_action".to_string(),
-        },
-        risk: format!("{:?}", contract.risk).to_ascii_lowercase(),
-        confirmation: format!("{:?}", contract.confirmation).to_ascii_lowercase(),
-        emits_live_event: contract.emits_live_event,
+        class: contract.class,
+        capability: contract.capability,
+        risk: contract.risk,
+        confirmation: contract.confirmation,
+        emits_live_event: contract.streaming,
     }
 }
 
@@ -257,9 +245,9 @@ mod tests {
             .filter(|entry| entry.path.starts_with("/api/apps/mfg/"))
             .map(|entry| (entry.method.to_string(), entry.path))
             .collect::<BTreeSet<_>>();
-        let contract = app_mfg_contract::mfg_route_contracts()
+        let contract = app_bundle_mfg::mfg_route_metadata()
             .into_iter()
-            .filter(|route| route.availability == app_mfg_contract::MfgActionAvailability::Active)
+            .filter(|route| route.active)
             .map(|route| (route.method, route.path))
             .collect::<BTreeSet<_>>();
         assert_eq!(contract.len(), 104);

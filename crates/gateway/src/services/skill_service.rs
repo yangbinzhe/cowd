@@ -27,11 +27,10 @@ use local_command::{
     render_skills_report_json, render_skills_usage, render_skills_usage_json,
 };
 use projection::{
-    activation_projection, collect_skill_catalog, filter_scope, find_catalog_item,
-    list_skill_files, local_skill_root, mfg_virtual_files, mfg_virtual_skill_markdown,
-    normalize_surface, projection_actions, projection_capabilities, projection_diagnostics,
-    projection_facets, safe_skill_file_path, SkillProjection, SkillProjectionGovernance,
-    SkillProjectionQueue,
+    activation_projection, app_virtual_files, app_virtual_skill_file, collect_skill_catalog,
+    filter_scope, find_catalog_item, list_skill_files, local_skill_root, normalize_surface,
+    projection_actions, projection_capabilities, projection_diagnostics, projection_facets,
+    safe_skill_file_path, SkillProjection, SkillProjectionGovernance, SkillProjectionQueue,
 };
 #[derive(Debug, Deserialize)]
 pub(crate) struct SkillCatalogQuery {
@@ -260,6 +259,7 @@ impl SkillService {
     pub(crate) fn resolve_invocation(
         &self,
         workspace_root: &Path,
+        app_registry: &cowd_app_host::AppRegistry,
         args: Option<&str>,
     ) -> Result<SkillSlashDispatch, String> {
         let dispatch = classify_static_skill_command(args);
@@ -269,9 +269,11 @@ impl SkillService {
                 .split_whitespace()
                 .next()
                 .unwrap_or_default();
-            if !skill_token.is_empty() && find_catalog_item(workspace_root, skill_token).is_err() {
+            if !skill_token.is_empty()
+                && find_catalog_item(workspace_root, app_registry, skill_token).is_err()
+            {
                 let mut message = format!("Unknown skill: {skill_token}");
-                if let Ok(available) = collect_skill_catalog(workspace_root) {
+                if let Ok(available) = collect_skill_catalog(workspace_root, app_registry) {
                     let names = available
                         .iter()
                         .filter(|skill| skill.status == "ready")
@@ -294,10 +296,11 @@ impl SkillService {
     pub(crate) fn catalog(
         &self,
         workspace_root: &Path,
+        app_registry: &cowd_app_host::AppRegistry,
         query: SkillCatalogQuery,
     ) -> Result<serde_json::Value, SkillServiceError> {
         let items = filter_scope(
-            collect_skill_catalog(workspace_root)?,
+            collect_skill_catalog(workspace_root, app_registry)?,
             query.scope.as_deref(),
         );
         Ok(serde_json::json!({
@@ -310,10 +313,11 @@ impl SkillService {
     pub(crate) fn projection(
         &self,
         workspace_root: &Path,
+        app_registry: &cowd_app_host::AppRegistry,
         query: SkillProjectionQuery,
     ) -> Result<serde_json::Value, SkillServiceError> {
         let surface = normalize_surface(query.surface.as_deref());
-        let items = collect_skill_catalog(workspace_root)?;
+        let items = collect_skill_catalog(workspace_root, app_registry)?;
         let activation = activation_projection(workspace_root, query.query.as_deref())?;
         serde_json::to_value(SkillProjection {
             kind: "skills.projection",
@@ -411,12 +415,13 @@ impl SkillService {
     pub(crate) fn run_action(
         &self,
         workspace_root: &Path,
+        app_registry: &cowd_app_host::AppRegistry,
         config_home: &Path,
         id: &str,
         action: SkillActionKind,
         request: SkillActionRequest,
     ) -> Result<serde_json::Value, SkillServiceError> {
-        let item = find_catalog_item(workspace_root, id)?;
+        let item = find_catalog_item(workspace_root, app_registry, id)?;
         let now = Utc::now().to_rfc3339();
         let run_id = skill_run_id(&item.id, action);
         let inspection = inspect_skill_item(&item);
@@ -474,9 +479,10 @@ impl SkillService {
     pub(crate) fn detail(
         &self,
         workspace_root: &Path,
+        app_registry: &cowd_app_host::AppRegistry,
         id: &str,
     ) -> Result<serde_json::Value, SkillServiceError> {
-        let item = find_catalog_item(workspace_root, id)?;
+        let item = find_catalog_item(workspace_root, app_registry, id)?;
         Ok(serde_json::json!({
             "kind": "skills.detail",
             "schema_version": 1,
@@ -487,11 +493,12 @@ impl SkillService {
     pub(crate) fn files(
         &self,
         workspace_root: &Path,
+        app_registry: &cowd_app_host::AppRegistry,
         id: &str,
     ) -> Result<serde_json::Value, SkillServiceError> {
-        let item = find_catalog_item(workspace_root, id)?;
-        if item.scope == "mfg" {
-            return Ok(mfg_virtual_files(&item));
+        let item = find_catalog_item(workspace_root, app_registry, id)?;
+        if let Some(files) = app_virtual_files(&item) {
+            return Ok(files);
         }
         let root = local_skill_root(&item)?;
         let files = list_skill_files(&root)
@@ -513,24 +520,25 @@ impl SkillService {
     pub(crate) fn raw_file(
         &self,
         workspace_root: &Path,
+        app_registry: &cowd_app_host::AppRegistry,
         id: &str,
         query: SkillFileQuery,
     ) -> Result<serde_json::Value, SkillServiceError> {
-        let item = find_catalog_item(workspace_root, id)?;
+        let item = find_catalog_item(workspace_root, app_registry, id)?;
         let requested = query.path.unwrap_or_else(|| "SKILL.md".to_string());
-        if item.scope == "mfg" {
-            if requested != "SKILL.md" {
+        if item.virtual_files.is_some() {
+            let Some((content_type, content)) = app_virtual_skill_file(&item, &requested) else {
                 return Err(SkillServiceError::NotFound(
                     "skill file not found".to_string(),
                 ));
-            }
+            };
             return Ok(serde_json::json!({
                 "kind": "skills.file.raw",
                 "schema_version": 1,
                 "skill": item,
-                "path": "SKILL.md",
-                "content_type": "text/markdown",
-                "content": mfg_virtual_skill_markdown(&item),
+                "path": requested,
+                "content_type": content_type,
+                "content": content,
             }));
         }
         let root = local_skill_root(&item)?;
@@ -861,6 +869,45 @@ mod tests {
         assert_eq!(response["skill_id"], "plan-review");
         assert_eq!(response["action"], "generate_revision_candidate");
         assert_eq!(response["reason"], "usage_signal_needs_revision_candidate");
+    }
+
+    #[test]
+    fn app_owned_skills_are_served_through_the_generic_registry_and_virtual_file_flow() {
+        let temp = TempTree::new("app-owned-catalogue");
+        let services = crate::services::GatewayServices::baseline();
+        let service = SkillService::new();
+
+        let catalogue = service
+            .catalog(
+                &temp.root,
+                services.app_registry.as_ref(),
+                SkillCatalogQuery {
+                    scope: Some("mfg".to_string()),
+                },
+            )
+            .expect("generic application skill catalogue");
+        let skills = catalogue["items"]
+            .as_array()
+            .expect("catalogue skill array");
+        assert_eq!(skills.len(), 7);
+        assert!(skills
+            .iter()
+            .any(|skill| skill["id"] == "mfg:supply-risk-analyst"));
+
+        let raw = service
+            .raw_file(
+                &temp.root,
+                services.app_registry.as_ref(),
+                "mfg:supply-risk-analyst",
+                SkillFileQuery {
+                    path: Some("SKILL.md".to_string()),
+                },
+            )
+            .expect("generic virtual skill file");
+        assert_eq!(raw["content_type"], "text/markdown");
+        assert!(raw["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Required Evidence")));
     }
 
     #[test]

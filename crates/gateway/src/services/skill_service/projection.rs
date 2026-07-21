@@ -3,30 +3,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use app_mfg::{server_manufacturing_skill_pack, MfgSkillManifest};
+use cowd_app_host::AppRegistry;
+use cowd_app_sdk::AppSkillDescriptor;
 use serde::Serialize;
 use skill::{profile_skill_package, SkillInfo, SkillRegistry, SkillRouter};
 
 use super::SkillServiceError;
 
-#[derive(Debug, Clone, Serialize)]
-pub(super) struct SkillCatalogItem {
-    pub(super) id: String,
-    pub(super) name: String,
-    pub(super) description: Option<String>,
-    pub(super) scope: String,
-    pub(super) source: String,
-    pub(super) domain: Option<String>,
-    pub(super) status: String,
-    pub(super) risk: String,
-    pub(super) tags: Vec<String>,
-    pub(super) tools: Vec<String>,
-    pub(super) required_evidence: Vec<String>,
-    pub(super) capabilities: Vec<String>,
-    pub(super) profile: Option<serde_json::Value>,
-    pub(super) path: Option<String>,
-    pub(super) shadowed_by: Option<String>,
-}
+pub(super) type SkillCatalogItem = AppSkillDescriptor;
 
 #[derive(Debug, Serialize)]
 pub(super) struct SkillFileEntry {
@@ -84,11 +68,9 @@ pub(super) struct SkillProjectionGovernance {
 }
 pub(super) fn collect_skill_catalog(
     workspace_root: &Path,
+    app_registry: &AppRegistry,
 ) -> Result<Vec<SkillCatalogItem>, SkillServiceError> {
-    let mut items = server_manufacturing_skill_pack()
-        .into_iter()
-        .map(mfg_skill_catalog_item)
-        .collect::<Vec<_>>();
+    let mut items = app_registry.skills();
     let registry = SkillRegistry::discover(workspace_root);
     for skill in registry
         .list()
@@ -106,46 +88,13 @@ pub(super) fn collect_skill_catalog(
 
 pub(super) fn find_catalog_item(
     workspace_root: &Path,
+    app_registry: &AppRegistry,
     id: &str,
 ) -> Result<SkillCatalogItem, SkillServiceError> {
-    collect_skill_catalog(workspace_root)?
+    collect_skill_catalog(workspace_root, app_registry)?
         .into_iter()
         .find(|item| item.id == id || item.name.eq_ignore_ascii_case(id))
         .ok_or_else(|| SkillServiceError::NotFound("skill not found".to_string()))
-}
-
-fn mfg_skill_catalog_item(skill: MfgSkillManifest) -> SkillCatalogItem {
-    let risk = mfg_risk(&skill).to_string();
-    let tags = vec![skill.domain.clone(), "mfg".to_string()];
-    let capabilities = skill
-        .output_actions
-        .iter()
-        .chain(skill.input_fact_types.iter())
-        .cloned()
-        .collect();
-    SkillCatalogItem {
-        id: format!("mfg:{}", skill.skill_id),
-        name: skill.skill_id,
-        description: Some(skill.role),
-        scope: "mfg".to_string(),
-        source: "app_mfg.server_manufacturing".to_string(),
-        domain: Some(skill.domain),
-        status: "ready".to_string(),
-        risk: risk.clone(),
-        tags,
-        tools: skill.tools,
-        required_evidence: skill.required_evidence,
-        capabilities,
-        profile: Some(serde_json::json!({
-            "kind": "domain",
-            "lifecycle_status": "usable_runtime",
-            "adapters": ["tool_guided"],
-            "risk_level": risk,
-            "owner": "app_mfg"
-        })),
-        path: None,
-        shadowed_by: None,
-    }
 }
 
 fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
@@ -175,6 +124,7 @@ fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
         required_evidence: Vec::new(),
         capabilities: skill.related_skills,
         profile,
+        virtual_files: None,
         path: Some(skill.path.display().to_string()),
         shadowed_by: skill.shadowed_by.map(|source| format!("{source:?}")),
     }
@@ -268,62 +218,34 @@ fn collect_skill_files(
     Ok(())
 }
 
-pub(super) fn mfg_virtual_files(item: &SkillCatalogItem) -> serde_json::Value {
-    serde_json::json!({
+pub(super) fn app_virtual_files(item: &SkillCatalogItem) -> Option<serde_json::Value> {
+    let virtual_files = item.virtual_files.as_ref()?;
+    Some(serde_json::json!({
         "kind": "skills.files",
         "schema_version": 1,
         "skill": item,
-        "root": "virtual://mfg/server-manufacturing",
-        "primary": "SKILL.md",
-        "files": [{
-            "path": "SKILL.md",
-            "name": "SKILL.md",
-            "kind": "file",
-            "size": mfg_virtual_skill_markdown(item).len(),
-            "primary": true
-        }],
-    })
+        "root": virtual_files.root,
+        "primary": virtual_files.primary,
+        "files": virtual_files.files.iter().map(|file| serde_json::json!({
+            "path": file.path,
+            "name": file.name,
+            "kind": file.kind,
+            "size": file.content.len(),
+            "primary": file.primary,
+        })).collect::<Vec<_>>(),
+    }))
 }
 
-pub(super) fn mfg_virtual_skill_markdown(item: &SkillCatalogItem) -> String {
-    format!(
-        "# {}\n\n{}\n\n- Scope: {}\n- Source: {}\n- Domain: {}\n- Status: {}\n- Risk: {}\n\n## Tools\n{}\n\n## Required Evidence\n{}\n\n## Capabilities\n{}\n",
-        item.name,
-        item.description.as_deref().unwrap_or("MFG manufacturing skill."),
-        item.scope,
-        item.source,
-        item.domain.as_deref().unwrap_or("manufacturing"),
-        item.status,
-        item.risk,
-        markdown_list(&item.tools),
-        markdown_list(&item.required_evidence),
-        markdown_list(&item.capabilities),
-    )
-}
-
-fn markdown_list(values: &[String]) -> String {
-    if values.is_empty() {
-        return "- none".to_string();
-    }
-    values
+pub(super) fn app_virtual_skill_file(
+    item: &SkillCatalogItem,
+    requested: &str,
+) -> Option<(String, String)> {
+    let files = item.virtual_files.as_ref()?;
+    files
+        .files
         .iter()
-        .map(|value| format!("- {value}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn mfg_risk(skill: &MfgSkillManifest) -> &'static str {
-    if skill
-        .output_actions
-        .iter()
-        .any(|action| action.contains("dispatch") || action.contains("escalation"))
-    {
-        "controlled"
-    } else if skill.tools.iter().any(|tool| tool.contains("cross_plane")) {
-        "governed"
-    } else {
-        "review"
-    }
+        .find(|file| file.path == requested)
+        .map(|file| (file.content_type.clone(), file.content.clone()))
 }
 
 pub(super) fn filter_scope(
@@ -481,8 +403,8 @@ pub(super) fn projection_facets(items: &[SkillCatalogItem]) -> SkillProjectionFa
 
 pub(super) fn projection_diagnostics(items: &[SkillCatalogItem]) -> Vec<String> {
     let mut diagnostics = Vec::new();
-    if !items.iter().any(|item| item.scope == "mfg") {
-        diagnostics.push("mfg_skill_pack_unavailable".to_string());
+    if !items.iter().any(|item| item.virtual_files.is_some()) {
+        diagnostics.push("application_skill_catalog_empty".to_string());
     }
     if !items.iter().any(|item| item.scope == "local") {
         diagnostics.push("local_skill_registry_empty".to_string());
@@ -549,7 +471,7 @@ mod tests {
         )
         .expect("write pyproject");
 
-        let items = collect_skill_catalog(&workspace).expect("catalog");
+        let items = collect_skill_catalog(&workspace, &AppRegistry::default()).expect("catalog");
         let item = items
             .iter()
             .find(|item| item.id == "local:profile-demo")

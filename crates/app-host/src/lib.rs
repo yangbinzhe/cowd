@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::Router;
-use cowd_app_sdk::{AppContractError, AppDescriptor, AppHealth, AppId, CapabilityApp};
+use cowd_app_sdk::{
+    AppContractError, AppDescriptor, AppHealth, AppId, AppSkillDescriptor, CapabilityApp,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -51,6 +53,7 @@ pub struct AppRegistry {
     apps: BTreeMap<AppId, RegisteredApp>,
     http: Vec<HttpAppContribution>,
     tui: BTreeMap<AppId, TuiAppContribution>,
+    skills: BTreeMap<AppId, Vec<AppSkillDescriptor>>,
 }
 
 impl AppRegistry {
@@ -133,6 +136,45 @@ impl AppRegistry {
             .collect()
     }
 
+    /// Attach APP-owned skill descriptors after the APP's transport
+    /// contribution has been validated. Product composition is the sole
+    /// caller: Gateway, CLI and TUI only read the flattened generic view.
+    pub fn register_app_skills(
+        &mut self,
+        app_id: &AppId,
+        skills: Vec<AppSkillDescriptor>,
+    ) -> Result<(), AppRegistryError> {
+        if !self.apps.contains_key(app_id) {
+            return Err(AppRegistryError::UnknownApp(app_id.clone()));
+        }
+        let existing_ids = self
+            .skills
+            .values()
+            .flat_map(|items| items.iter().map(|skill| skill.id.as_str()))
+            .collect::<BTreeSet<_>>();
+        let mut local_ids = BTreeSet::new();
+        for skill in &skills {
+            skill.validate(app_id)?;
+            if !local_ids.insert(skill.id.as_str()) || existing_ids.contains(skill.id.as_str()) {
+                return Err(AppRegistryError::DuplicateSkill {
+                    app_id: app_id.clone(),
+                    skill_id: skill.id.clone(),
+                });
+            }
+        }
+        self.skills.insert(app_id.clone(), skills);
+        Ok(())
+    }
+
+    /// Deterministic, app-agnostic application skill catalogue.
+    #[must_use]
+    pub fn skills(&self) -> Vec<AppSkillDescriptor> {
+        self.skills
+            .values()
+            .flat_map(|items| items.iter().cloned())
+            .collect()
+    }
+
     #[must_use]
     pub fn into_http_router(self) -> Router {
         self.http
@@ -165,6 +207,10 @@ pub enum AppRegistryError {
     },
     #[error("capability collision for app {app_id}: {capability}")]
     CapabilityCollision { app_id: AppId, capability: String },
+    #[error("application not registered: {0}")]
+    UnknownApp(AppId),
+    #[error("duplicate skill for app {app_id}: {skill_id}")]
+    DuplicateSkill { app_id: AppId, skill_id: String },
 }
 
 #[cfg(test)]

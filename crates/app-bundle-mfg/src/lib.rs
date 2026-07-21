@@ -15,8 +15,14 @@ use cowd_app_mfg_adapter::{
         MfgHostReceipt,
     },
     MfgLiveAuthorization, MfgLiveAuthorizationFailure, MfgLiveHost, MfgLivePrincipalContext,
+    MFG_APP_ID,
 };
-use cowd_app_sdk::{AppDescriptor, AppHostError, CowdAppContext, HostIntent, InvocationContext};
+use cowd_app_sdk::{
+    AppDescriptor, AppHostError, AppId, AppSkillDescriptor, AppVirtualSkillFile,
+    AppVirtualSkillFiles, CowdAppContext, HostIntent, InvocationContext,
+};
+
+pub use cowd_app_mfg_adapter::MfgRouteMetadata;
 
 /// Product-side bridge from MFG's repository-stable effect ABI to Cowd's
 /// stable SDK. The external APP never receives this type or a Gateway service.
@@ -218,7 +224,9 @@ pub fn register_mfg(
         config_home,
         authorization,
         Arc::new(CowdSdkMfgHostEffects::new(host_context)),
-    )))
+    )))?;
+    let app_id = AppId::parse(MFG_APP_ID).expect("static MFG app id is valid");
+    registry.register_app_skills(&app_id, mfg_skill_descriptors())
 }
 
 /// Register MFG with the production broker lifecycle authority.
@@ -259,19 +267,67 @@ pub fn mfg_app_descriptor() -> AppDescriptor {
     cowd_app_mfg_adapter::mfg_descriptor()
 }
 
-/// Forward MFG-owned OpenAPI schemas through product composition. Gateway can
-/// aggregate APP documentation without recreating request DTOs that belong to
-/// the external MFG adapter.
-pub fn register_mfg_openapi_schemas(registry: &mut app_mfg_contract::MfgOpenApiSchemaRegistry) {
-    cowd_app_mfg_adapter::register_mfg_openapi_schemas(registry);
+/// APP-owned metadata is re-exported only through product composition. The
+/// generic Gateway never imports MFG core/contract crates directly.
+#[must_use]
+pub fn mfg_route_metadata() -> Vec<cowd_app_mfg_adapter::MfgRouteMetadata> {
+    cowd_app_mfg_adapter::mfg_route_metadata()
 }
 
-/// APP-owned request-schema lookup used by Gateway's aggregate OpenAPI
-/// document.  Keeping this delegation here prevents Gateway from carrying
-/// parallel MFG request DTOs after static APP composition.
 #[must_use]
-pub fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteId) -> &'static str {
-    cowd_app_mfg_adapter::mfg_request_schema_component(route_id)
+pub fn mfg_openapi_components() -> std::collections::BTreeMap<String, serde_json::Value> {
+    cowd_app_mfg_adapter::mfg_openapi_components()
+}
+
+#[must_use]
+pub fn mfg_skill_quality_contract_smoke() -> bool {
+    cowd_app_mfg_adapter::mfg_skill_quality_contract_smoke()
+}
+
+#[must_use]
+pub fn mfg_auth_error_envelope(http_status: u16, message: String) -> serde_json::Value {
+    cowd_app_mfg_adapter::mfg_auth_error_envelope(http_status, message)
+}
+
+/// Convert APP-owned MFG skill data into the host-neutral application-skill
+/// ABI at the only product-composition boundary that imports MFG packages.
+#[must_use]
+pub fn mfg_skill_descriptors() -> Vec<AppSkillDescriptor> {
+    cowd_app_mfg_adapter::mfg_hosted_skill_catalog()
+        .into_iter()
+        .map(|skill| {
+            let content = cowd_app_mfg_adapter::mfg_hosted_skill_markdown(&skill);
+            AppSkillDescriptor {
+                id: skill.id,
+                name: skill.name,
+                description: Some(skill.description),
+                scope: skill.scope,
+                source: skill.source,
+                domain: Some(skill.domain),
+                status: skill.status,
+                risk: skill.risk,
+                tags: skill.tags,
+                tools: skill.tools,
+                required_evidence: skill.required_evidence,
+                capabilities: skill.capabilities,
+                profile: Some(skill.profile),
+                virtual_files: Some(AppVirtualSkillFiles {
+                    root: "virtual://mfg/server-manufacturing".to_string(),
+                    primary: "SKILL.md".to_string(),
+                    files: vec![AppVirtualSkillFile {
+                        path: "SKILL.md".to_string(),
+                        name: "SKILL.md".to_string(),
+                        kind: "file".to_string(),
+                        primary: true,
+                        content_type: "text/markdown".to_string(),
+                        content,
+                    }],
+                }),
+                path: None,
+                shadowed_by: None,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -284,5 +340,16 @@ mod tests {
         assert_eq!(descriptor.id.as_str(), "mfg");
         assert_eq!(descriptor.routes.len(), 104);
         assert_eq!(descriptor.sdk_api, cowd_app_sdk::SDK_API_VERSION);
+    }
+
+    #[test]
+    fn bundle_registers_app_owned_skills_without_leaking_mfg_types_to_hosts() {
+        let skills = mfg_skill_descriptors();
+        assert_eq!(skills.len(), 7);
+        assert!(skills.iter().all(|skill| skill.id.starts_with("mfg:")));
+        assert!(skills.iter().all(|skill| skill
+            .virtual_files
+            .as_ref()
+            .is_some_and(|files| !files.files.is_empty())));
     }
 }

@@ -467,13 +467,7 @@ fn runtime_skill_memory_candidate(
 }
 
 fn graph_skill_quality_contract_smoke() -> bool {
-    let Some(skill) = app_mfg::server_manufacturing_skill_pack()
-        .into_iter()
-        .find(|skill| skill.skill_id == "supply-risk-analyst")
-    else {
-        return false;
-    };
-    if skill.input_fact_types.is_empty() || skill.quality_gate.is_empty() {
+    if !app_bundle_mfg::mfg_skill_quality_contract_smoke() {
         return false;
     }
 

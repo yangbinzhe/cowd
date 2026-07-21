@@ -80,3 +80,44 @@ fn capability_contract_consumes_typed_route_metadata() {
     assert!(api_routes.contains("mod route_registry;"));
     assert!(api_routes.contains("mod route_manifest;"));
 }
+
+/// Product composition may depend on an external APP, but Gateway production
+/// code must see only the bundle/host ABI.  Test fixtures may seed external
+/// app data directly, so this deliberately excludes the `cfg(test)` module.
+#[test]
+fn gateway_production_has_no_direct_mfg_core_or_contract_imports() {
+    for path in [
+        "crates/gateway/src/api_routes/capability_contract.rs",
+        "crates/gateway/src/api_routes/core_routes.rs",
+        "crates/gateway/src/api_routes/route_manifest.rs",
+        "crates/gateway/src/api_routes/route_registry.rs",
+        "crates/gateway/src/api_routes/skill_routes.rs",
+        "crates/gateway/src/services/skill_service.rs",
+        "crates/gateway/src/services/skill_service/projection.rs",
+        "crates/gateway/src/entry/skill_entry.rs",
+    ] {
+        let owned_source = read_repo(path);
+        let source = production_part(&owned_source);
+        assert!(
+            !source.contains("app_mfg::") && !source.contains("app_mfg_contract::"),
+            "{path} must consume the app bundle/host ABI instead of MFG implementation types"
+        );
+    }
+
+    let api_routes = read_repo("crates/gateway/src/api_routes/mod.rs");
+    let production = api_routes
+        .split("#[cfg(test)]\npub(crate) mod tests {")
+        .next()
+        .expect("production api routes");
+    assert!(!production.contains("app_mfg::"));
+    assert!(!production.contains("app_mfg_contract::"));
+    assert!(!production.contains("mod mfg_outcomes;"));
+
+    let manifest = read_repo("crates/gateway/Cargo.toml");
+    let normal_dependencies = manifest
+        .split("[dev-dependencies]")
+        .next()
+        .expect("normal dependencies");
+    assert!(!normal_dependencies.contains("app-mfg ="));
+    assert!(!normal_dependencies.contains("app-mfg-contract ="));
+}

@@ -153,6 +153,78 @@ pub struct AppActionDescriptor {
     pub requires_confirmation: bool,
 }
 
+/// A domain APP's skill projected through Cowd's stable application ABI.
+///
+/// The host may list, inspect and run governance over this description, but
+/// it never receives an APP service, route enum, or private storage handle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSkillDescriptor {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub scope: String,
+    pub source: String,
+    pub domain: Option<String>,
+    pub status: String,
+    pub risk: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default)]
+    pub required_evidence: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub profile: Option<serde_json::Value>,
+    #[serde(default)]
+    pub virtual_files: Option<AppVirtualSkillFiles>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub shadowed_by: Option<String>,
+}
+
+impl AppSkillDescriptor {
+    pub fn validate(&self, app_id: &AppId) -> Result<(), AppContractError> {
+        let valid = !self.id.trim().is_empty()
+            && !self.name.trim().is_empty()
+            && !self.scope.trim().is_empty()
+            && !self.source.trim().is_empty()
+            && !self.status.trim().is_empty()
+            && !self.risk.trim().is_empty();
+        if valid {
+            Ok(())
+        } else {
+            Err(AppContractError::InvalidDescriptor(app_id.clone()))
+        }
+    }
+}
+
+/// A virtual, APP-owned skill document. The document is data rather than a
+/// host filesystem path, so the generic host can expose it without knowing an
+/// application's repository layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppVirtualSkillFiles {
+    pub root: String,
+    pub primary: String,
+    #[serde(default)]
+    pub files: Vec<AppVirtualSkillFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppVirtualSkillFile {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub primary: bool,
+    pub content_type: String,
+    /// Raw content is omitted from catalogue/list projections and is returned
+    /// only by the generic `files/raw` host flow.
+    #[serde(skip)]
+    pub content: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppProfileDescriptor {
     /// Build-time catalog revision supplied by the APP. This is distinct from

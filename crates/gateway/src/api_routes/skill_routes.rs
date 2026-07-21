@@ -53,7 +53,11 @@ async fn skills_catalog_handler(
     state
         .services
         .skill
-        .catalog(&state.workspace_root, query)
+        .catalog(
+            &state.workspace_root,
+            state.services.app_registry.as_ref(),
+            query,
+        )
         .map(Json)
         .map_err(skill_error)
 }
@@ -65,7 +69,11 @@ async fn skills_projection_handler(
     state
         .services
         .skill
-        .projection(&state.workspace_root, query)
+        .projection(
+            &state.workspace_root,
+            state.services.app_registry.as_ref(),
+            query,
+        )
         .map(Json)
         .map_err(skill_error)
 }
@@ -140,6 +148,7 @@ fn skill_action_handler(
         .skill
         .run_action(
             &state.workspace_root,
+            state.services.app_registry.as_ref(),
             &state.config_home,
             &id,
             action,
@@ -173,7 +182,11 @@ async fn skill_translate_handler(
     state
         .services
         .skill
-        .detail(&state.workspace_root, &id)
+        .detail(
+            &state.workspace_root,
+            state.services.app_registry.as_ref(),
+            &id,
+        )
         .map_err(skill_error)?;
 
     let runtime_config = state
@@ -246,7 +259,11 @@ async fn skill_get_handler(
     state
         .services
         .skill
-        .detail(&state.workspace_root, &id)
+        .detail(
+            &state.workspace_root,
+            state.services.app_registry.as_ref(),
+            &id,
+        )
         .map(Json)
         .map_err(skill_error)
 }
@@ -258,7 +275,11 @@ async fn skill_files_handler(
     state
         .services
         .skill
-        .files(&state.workspace_root, &id)
+        .files(
+            &state.workspace_root,
+            state.services.app_registry.as_ref(),
+            &id,
+        )
         .map(Json)
         .map_err(skill_error)
 }
@@ -271,7 +292,12 @@ async fn skill_file_raw_handler(
     state
         .services
         .skill
-        .raw_file(&state.workspace_root, &id, query)
+        .raw_file(
+            &state.workspace_root,
+            state.services.app_registry.as_ref(),
+            &id,
+            query,
+        )
         .map(Json)
         .map_err(skill_error)
 }

@@ -68,7 +68,6 @@ mod matrix_routes;
 pub(crate) mod memory_routes;
 mod message_connector_routes;
 mod message_routes;
-mod mfg_outcomes;
 mod mission_routes;
 mod profile_routes;
 mod public_routes;
@@ -339,41 +338,14 @@ fn generic_app_request_context(
 
 fn auth_error_response(is_mfg: bool, status: StatusCode, message: String) -> Response {
     if is_mfg {
-        let mut error = match status {
-            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-                app_mfg_contract::MfgApiErrorV1 {
-                    code: app_mfg_contract::MfgErrorCode::ValidationFailed,
-                    message,
-                    http_status: status.as_u16(),
-                    details: serde_json::Value::Null,
-                    retryable: false,
-                    contract_version: app_mfg_contract::MfgContractVersion::default(),
-                    recovery_actions: Vec::new(),
-                    request_id: None,
-                    receipt_ref: None,
-                }
-            }
-            StatusCode::FORBIDDEN => app_mfg_contract::MfgApiErrorV1::capability_denied(message),
-            status if status.is_server_error() => app_mfg_contract::MfgApiErrorV1 {
-                code: app_mfg_contract::MfgErrorCode::Internal,
+        return (
+            status,
+            Json(app_bundle_mfg::mfg_auth_error_envelope(
+                status.as_u16(),
                 message,
-                http_status: status.as_u16(),
-                details: serde_json::Value::Null,
-                retryable: true,
-                contract_version: app_mfg_contract::MfgContractVersion::default(),
-                recovery_actions: vec![app_mfg_contract::MfgRecoveryAction {
-                    kind: app_mfg_contract::MfgRecoveryActionKind::RetrySameIntent,
-                    label: "Retry authentication".to_string(),
-                    target: None,
-                    enabled: true,
-                }],
-                request_id: None,
-                receipt_ref: None,
-            },
-            _ => app_mfg_contract::MfgApiErrorV1::authentication_required(message),
-        };
-        error.http_status = status.as_u16();
-        return (status, Json(error)).into_response();
+            )),
+        )
+            .into_response();
     }
     (status, Json(ErrorResponse { error: message })).into_response()
 }
@@ -726,12 +698,7 @@ fn test_human_capabilities() -> Vec<String> {
         "runtime.maintenance.manage".to_string(),
         "runtime.outbox.retry".to_string(),
     ];
-    capabilities.extend(
-        app_mfg_contract::MfgCapabilityId::ALL
-            .iter()
-            .copied()
-            .map(|capability| capability.as_str().to_string()),
-    );
+    capabilities.extend(app_bundle_mfg::mfg_app_descriptor().capabilities);
     capabilities.sort();
     capabilities.dedup();
     capabilities
