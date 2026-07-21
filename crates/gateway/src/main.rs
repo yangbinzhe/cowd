@@ -310,7 +310,7 @@ fn wait_for_gateway_start(
         }
         if server::get_server_status()
             .map_err(|e| e.to_string())?
-            .is_some()
+            .is_some_and(|status| status.pid == child.id())
         {
             return Ok(());
         }

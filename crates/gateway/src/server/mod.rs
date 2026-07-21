@@ -3,6 +3,12 @@
 
 use std::{fmt, fs, path::PathBuf};
 
+#[cfg(unix)]
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
+
 use serde::Serialize;
 
 // ── Error type ───────────────────────────────────────────────────
@@ -124,22 +130,38 @@ fn process_exists(_pid: u32) -> bool {
 }
 
 pub fn stop_server() -> Result<(), ServerError> {
-    let status_pid = get_server_status()?.map(|info| info.pid);
     #[cfg(unix)]
     {
-        let mut pids = std::collections::BTreeSet::new();
-        if let Some(pid) = status_pid.filter(|pid| *pid != 0) {
-            pids.insert(pid);
-        }
-        pids.extend(discover_current_exe_gateway_run_processes());
-        for pid in pids {
-            if pid == std::process::id() {
-                continue;
-            }
+        // Never terminate a listener discovered from another Cowd binary or
+        // worktree. Service ownership is the current executable plus the
+        // exact `gateway run` command line, not merely port 8642.
+        let pids = discover_current_exe_gateway_run_processes()
+            .into_iter()
+            .filter(|pid| *pid != std::process::id())
+            .collect::<std::collections::BTreeSet<_>>();
+        for pid in &pids {
             std::process::Command::new("kill")
                 .arg("-TERM")
                 .arg(pid.to_string())
                 .output()?;
+        }
+        let remaining = wait_for_processes_to_exit(&pids, Duration::from_secs(3));
+        for pid in &remaining {
+            std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .output()?;
+        }
+        let remaining = wait_for_processes_to_exit(&remaining, Duration::from_secs(1));
+        if !remaining.is_empty() {
+            return Err(ServerError(format!(
+                "gateway process did not exit: {}",
+                remaining
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
     }
     for pid_path in status_pid_files() {
@@ -147,6 +169,25 @@ pub fn stop_server() -> Result<(), ServerError> {
         let _ = std::fs::remove_file(pid_path.with_extension("addr"));
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn wait_for_processes_to_exit(
+    pids: &std::collections::BTreeSet<u32>,
+    timeout: Duration,
+) -> std::collections::BTreeSet<u32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = pids
+            .iter()
+            .copied()
+            .filter(|pid| process_exists(*pid))
+            .collect::<std::collections::BTreeSet<_>>();
+        if remaining.is_empty() || Instant::now() >= deadline {
+            return remaining;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(unix)]
@@ -174,10 +215,12 @@ fn discover_current_exe_gateway_run_processes() -> Vec<u32> {
             if !cmdline_is_gateway_run(&cmdline) {
                 return None;
             }
-            let exe = fs::read_link(proc_dir.join("exe"))
+            let executable_matches = fs::read_link(proc_dir.join("exe"))
                 .ok()
-                .and_then(|path| fs::canonicalize(path).ok())?;
-            (exe == current_exe).then_some(pid)
+                .and_then(|path| fs::canonicalize(path).ok())
+                .is_some_and(|path| path == current_exe);
+            let launch_path_matches = cmdline_executable_matches(&cmdline, &current_exe);
+            (executable_matches || launch_path_matches).then_some(pid)
         })
         .collect()
 }
@@ -190,6 +233,24 @@ fn cmdline_is_gateway_run(cmdline: &[u8]) -> bool {
         .collect();
     args.windows(2)
         .any(|pair| pair[0] == b"gateway" && pair[1] == b"run")
+}
+
+/// A running executable may be replaced during deployment, turning
+/// `/proc/<pid>/exe` into a deleted inode. The command-line launch path stays
+/// stable, so use it as a second ownership proof in addition to the inode.
+#[cfg(unix)]
+fn cmdline_executable_matches(cmdline: &[u8], current_exe: &Path) -> bool {
+    let Some(raw_path) = cmdline.split(|byte| *byte == 0).find(|arg| !arg.is_empty()) else {
+        return false;
+    };
+    let Ok(raw_path) = std::str::from_utf8(raw_path) else {
+        return false;
+    };
+    let launch_path = Path::new(raw_path);
+    launch_path == current_exe
+        || fs::canonicalize(launch_path)
+            .ok()
+            .is_some_and(|path| path == current_exe)
 }
 
 #[cfg(unix)]
@@ -256,6 +317,20 @@ mod tests {
         assert!(super::cmdline_is_gateway_run(b"/tmp/cowd\0gateway\0run\0"));
         assert!(!super::cmdline_is_gateway_run(
             b"/tmp/cowd\0gateway\0stop\0"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matches_gateway_launch_path_after_binary_replacement() {
+        let current = std::path::Path::new("/opt/cowd/cowd");
+        assert!(super::cmdline_executable_matches(
+            b"/opt/cowd/cowd\0gateway\0run\0",
+            current,
+        ));
+        assert!(!super::cmdline_executable_matches(
+            b"/other-worktree/cowd\0gateway\0run\0",
+            current,
         ));
     }
 

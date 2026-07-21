@@ -776,6 +776,29 @@ struct PersistedCredentialState {
     last_audit_ref: Option<String>,
 }
 
+/// The v2 state existed before APP profiles became product-neutral key/value
+/// selections. It is intentionally only a deserialization boundary: after a
+/// credential-verified startup it is rewritten as v3 and never participates
+/// in normal authorization decisions again.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedCredentialStateV2 {
+    version: u32,
+    credential_digest: String,
+    credential_epoch: u64,
+    status: CredentialLifecycleStatus,
+    enrolled_at_ms: u64,
+    updated_at_ms: u64,
+    core_profile_id: String,
+    mfg_profile_id: String,
+    profile_revision: u64,
+    entitled_capabilities: Vec<String>,
+    entitlement_updated_at_ms: u64,
+    entitlement_updated_by: String,
+    #[serde(default, rename = "last_audit_ref")]
+    _legacy_last_audit_ref: Option<String>,
+}
+
 impl PersistedCredentialState {
     fn enroll(credential: &str, catalog: &AuthorizationCatalog) -> Result<Self, AuthBrokerError> {
         validate_credential_input(credential)?;
@@ -797,6 +820,81 @@ impl PersistedCredentialState {
             entitlement_updated_at_ms: now,
             entitlement_updated_by: "initial_enrollment".to_string(),
             last_audit_ref: None,
+        })
+    }
+
+    fn migrate_from_v2(
+        state: PersistedCredentialStateV2,
+        catalog: &AuthorizationCatalog,
+    ) -> Result<Self, AuthBrokerError> {
+        if state.version != 2
+            || state.credential_epoch == 0
+            || state.profile_revision == 0
+            || state.enrolled_at_ms == 0
+            || state.updated_at_ms < state.enrolled_at_ms
+        {
+            return Err(AuthBrokerError::InvalidCredentialState(
+                "credential state v2 shape is invalid".to_string(),
+            ));
+        }
+
+        // A v2 core profile was product-specific. Preserve the only current
+        // manager value; every other historical value receives the required
+        // least-privilege core profile rather than an implicit elevation.
+        let core_profile_id = if state.core_profile_id == "core_manager"
+            && catalog
+                .core_profiles
+                .iter()
+                .any(|profile| profile.id == "core_manager")
+        {
+            "core_manager".to_string()
+        } else {
+            "core_operator".to_string()
+        };
+
+        let (_, mut app_profiles) = catalog.default_selection();
+        // v2 could only select MFG. This one-time compatibility adapter may
+        // retain that profile only when the compiled generic catalogue still
+        // advertises it; all other APPs remain at their catalogue defaults.
+        if let Some(mfg) = catalog.apps.iter().find(|app| app.app_id == "mfg") {
+            if mfg
+                .profiles
+                .iter()
+                .any(|profile| profile.id == state.mfg_profile_id)
+            {
+                app_profiles.insert("mfg".to_string(), state.mfg_profile_id.clone());
+            }
+        }
+        let now = now_ms().max(state.updated_at_ms);
+        let credential_epoch = state.credential_epoch.checked_add(1).ok_or_else(|| {
+            AuthBrokerError::InvalidCredentialState(
+                "credential epoch cannot be advanced during v2 migration".to_string(),
+            )
+        })?;
+        let profile_revision = state.profile_revision.checked_add(1).ok_or_else(|| {
+            AuthBrokerError::InvalidCredentialState(
+                "profile revision cannot be advanced during v2 migration".to_string(),
+            )
+        })?;
+        let entitled_capabilities = catalog.capabilities_for(&core_profile_id, &app_profiles)?;
+        let last_audit_ref = Some(format!(
+            "auth-broker://migration/v2-to-v3/{credential_epoch}/{profile_revision}"
+        ));
+        Ok(Self {
+            version: CREDENTIAL_STATE_VERSION,
+            credential_digest: state.credential_digest,
+            credential_epoch,
+            status: state.status,
+            enrolled_at_ms: state.enrolled_at_ms,
+            updated_at_ms: now,
+            catalog_digest: catalog.digest()?,
+            core_profile_id,
+            app_profiles,
+            profile_revision,
+            entitled_capabilities,
+            entitlement_updated_at_ms: now,
+            entitlement_updated_by: "credential_state_v2_catalog_migration".to_string(),
+            last_audit_ref,
         })
     }
 
@@ -967,7 +1065,7 @@ impl LocalAuthority {
                 "legacy credential state is unsupported; remove it and enroll again".to_string(),
             ));
         }
-        let mut credential_state = if credential_state_path.exists() {
+        let (mut credential_state, migrated_from_v2) = if credential_state_path.exists() {
             read_credential_state(&credential_state_path, &catalog)?
         } else {
             // Enrollment is intentionally only possible while no lifecycle
@@ -975,14 +1073,14 @@ impl LocalAuthority {
             // must present the registered credential.
             let state = PersistedCredentialState::enroll(human_credential, &catalog)?;
             persist_credential_state(&credential_state_path, &state, &catalog)?;
-            state
+            (state, false)
         };
         let expected = credential_state.digest()?;
         let supplied = credential_digest(human_credential);
         if !bool::from(expected.ct_eq(&supplied)) {
             return Err(AuthBrokerError::InvalidCredential);
         }
-        if credential_state.reconcile_catalog(&catalog)? {
+        if migrated_from_v2 || credential_state.reconcile_catalog(&catalog)? {
             persist_credential_state(&credential_state_path, &credential_state, &catalog)?;
         }
         let key_path = root.join(KEY_FILE);
@@ -1769,7 +1867,7 @@ fn write_private_bytes(path: &Path, content: &[u8]) -> Result<(), AuthBrokerErro
 fn read_credential_state(
     path: &Path,
     catalog: &AuthorizationCatalog,
-) -> Result<PersistedCredentialState, AuthBrokerError> {
+) -> Result<(PersistedCredentialState, bool), AuthBrokerError> {
     let bytes = fs::read(path).map_err(storage_error)?;
     let document = serde_json::from_slice::<serde_json::Value>(&bytes)
         .map_err(|error| AuthBrokerError::InvalidCredentialState(error.to_string()))?;
@@ -1781,9 +1879,20 @@ fn read_credential_state(
                 "credential state version is missing".to_string(),
             )
         })?;
-    let state = match version {
-        3 => serde_json::from_value::<PersistedCredentialState>(document)
-            .map_err(|error| AuthBrokerError::InvalidCredentialState(error.to_string()))?,
+    let (state, migrated_from_v2) = match version {
+        3 => (
+            serde_json::from_value::<PersistedCredentialState>(document)
+                .map_err(|error| AuthBrokerError::InvalidCredentialState(error.to_string()))?,
+            false,
+        ),
+        2 => (
+            PersistedCredentialState::migrate_from_v2(
+                serde_json::from_value::<PersistedCredentialStateV2>(document)
+                    .map_err(|error| AuthBrokerError::InvalidCredentialState(error.to_string()))?,
+                catalog,
+            )?,
+            true,
+        ),
         other => {
             return Err(AuthBrokerError::InvalidCredentialState(format!(
                 "unsupported credential state version {other}"
@@ -1797,10 +1906,10 @@ fn read_credential_state(
             "credential state shape is invalid".to_string(),
         ));
     }
-    if state.catalog_digest == catalog.digest()? {
+    if !migrated_from_v2 && state.catalog_digest == catalog.digest()? {
         state.validate(catalog)?;
     }
-    Ok(state)
+    Ok((state, migrated_from_v2))
 }
 
 fn persist_credential_state(
@@ -1935,6 +2044,62 @@ mod generic_catalog_tests {
         }
     }
 
+    fn migration_catalog() -> AuthorizationCatalog {
+        AuthorizationCatalog {
+            schema_version: 1,
+            core_profiles: vec![
+                AuthorizationProfile {
+                    id: "core_operator".to_string(),
+                    capabilities: vec!["approval.respond".to_string()],
+                },
+                AuthorizationProfile {
+                    id: "core_manager".to_string(),
+                    capabilities: vec![
+                        "approval.respond".to_string(),
+                        "definition.manage".to_string(),
+                    ],
+                },
+            ],
+            apps: vec![AuthorizationAppProfileCatalog {
+                app_id: "mfg".to_string(),
+                default_profile_id: "mfg_viewer".to_string(),
+                profiles: vec![
+                    AuthorizationProfile {
+                        id: "mfg_viewer".to_string(),
+                        capabilities: vec!["mfg.read".to_string()],
+                    },
+                    AuthorizationProfile {
+                        id: "mfg_manager".to_string(),
+                        capabilities: vec!["mfg.read".to_string(), "mfg.manage".to_string()],
+                    },
+                ],
+                surface_capabilities: BTreeMap::new(),
+            }],
+        }
+    }
+
+    fn v2_state(
+        credential: &str,
+        core_profile_id: &str,
+        mfg_profile_id: &str,
+    ) -> PersistedCredentialStateV2 {
+        PersistedCredentialStateV2 {
+            version: 2,
+            credential_digest: hex(&credential_digest(credential)),
+            credential_epoch: 7,
+            status: CredentialLifecycleStatus::Active,
+            enrolled_at_ms: 1_700_000_000_000,
+            updated_at_ms: 1_700_000_001_000,
+            core_profile_id: core_profile_id.to_string(),
+            mfg_profile_id: mfg_profile_id.to_string(),
+            profile_revision: 4,
+            entitled_capabilities: vec!["historical.capability".to_string()],
+            entitlement_updated_at_ms: 1_700_000_001_000,
+            entitlement_updated_by: "historical_state".to_string(),
+            _legacy_last_audit_ref: Some("legacy-audit".to_string()),
+        }
+    }
+
     #[test]
     fn generic_catalog_rejects_surface_capability_outside_its_declared_surface() {
         let catalog = fixture_catalog();
@@ -2011,18 +2176,78 @@ mod generic_catalog_tests {
     }
 
     #[test]
-    fn historical_credential_state_is_rejected_without_migration() {
+    fn v2_state_migrates_once_with_catalog_bound_least_privilege() {
         let root = std::env::temp_dir().join(format!("cowd-auth-generic-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).expect("root");
-        fs::write(
-            root.join(CREDENTIAL_STATE_FILE),
-            r#"{\"version\":2,\"credential_digest\":\"abc\"}"#,
+        let source = v2_state("credential", "core_legacy_0_9_530", "mfg_manager");
+        let encoded = serde_json::to_vec_pretty(&source).expect("v2 encoding");
+        write_private_bytes(&root.join(CREDENTIAL_STATE_FILE), &encoded).expect("state");
+
+        let catalog = migration_catalog();
+        let authority = LocalAuthority::open_or_initialize(&root, "credential", catalog.clone())
+            .expect("v2 migration succeeds");
+        let projection = authority
+            .human_entitlements("credential")
+            .expect("projection");
+        assert_eq!(projection.core_profile_id, "core_operator");
+        assert_eq!(projection.app_profiles["mfg"], "mfg_manager");
+        assert_eq!(projection.credential_epoch, 8);
+        assert_eq!(projection.profile_revision, 5);
+        assert_eq!(
+            projection.ceiling,
+            catalog
+                .capabilities_for("core_operator", &projection.app_profiles)
+                .expect("current capabilities")
+        );
+
+        let saved = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(root.join(CREDENTIAL_STATE_FILE)).expect("saved state"),
         )
-        .expect("state");
+        .expect("saved json");
+        assert_eq!(saved["version"], 3);
+        assert_eq!(saved["catalog_digest"], catalog.digest().expect("digest"));
+        assert!(saved.get("mfg_profile_id").is_none());
+        assert!(saved["last_audit_ref"]
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("auth-broker://migration/v2-to-v3/")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn v2_unknown_app_profile_uses_current_default_without_elevation() {
+        let migrated = PersistedCredentialState::migrate_from_v2(
+            v2_state("credential", "core_manager", "mfg_legacy_0_9_529"),
+            &migration_catalog(),
+        )
+        .expect("migration");
+        assert_eq!(migrated.core_profile_id, "core_manager");
+        assert_eq!(migrated.app_profiles["mfg"], "mfg_viewer");
+        assert!(!migrated
+            .entitled_capabilities
+            .contains(&"historical.capability".to_string()));
+    }
+
+    #[test]
+    fn v2_state_is_not_rewritten_before_credential_verification() {
+        let root = std::env::temp_dir().join(format!("cowd-auth-generic-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("root");
+        let encoded = serde_json::to_vec_pretty(&v2_state(
+            "correct credential",
+            "core_legacy_0_9_530",
+            "mfg_viewer",
+        ))
+        .expect("v2 encoding");
+        write_private_bytes(&root.join(CREDENTIAL_STATE_FILE), &encoded).expect("state");
+
         assert!(matches!(
-            LocalAuthority::open_or_initialize(&root, "credential", fixture_catalog()),
-            Err(AuthBrokerError::InvalidCredentialState(_))
+            LocalAuthority::open_or_initialize(&root, "wrong credential", migration_catalog()),
+            Err(AuthBrokerError::InvalidCredential)
         ));
+        let saved = serde_json::from_slice::<serde_json::Value>(
+            &fs::read(root.join(CREDENTIAL_STATE_FILE)).expect("unchanged state"),
+        )
+        .expect("saved json");
+        assert_eq!(saved["version"], 2);
         let _ = fs::remove_dir_all(root);
     }
 }
