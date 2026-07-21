@@ -3,13 +3,23 @@
 //! This crate has no product application imports. Product bundles construct
 //! contributions; Gateway, TUI and WebUI consume the registry projection.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use axum::Router;
 use cowd_app_sdk::{
     AppContractError, AppDescriptor, AppHealth, AppId, AppSkillDescriptor, CapabilityApp,
 };
+use crossterm::event::KeyEvent;
+use ratatui::{
+    layout::Rect,
+    style::{Color, Style},
+    Frame,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Clone)]
@@ -30,6 +40,265 @@ pub struct TuiAppContribution {
     pub panel_id: String,
     pub title: String,
     pub actions: Vec<String>,
+}
+
+/// Stable, product-neutral visual tokens for an APP-owned terminal panel.
+///
+/// The Cowd TUI owns theme selection and converts its skin to this compact
+/// palette before rendering an external APP.  APP code deliberately never
+/// receives `SkinConfig`, `ThemeEngine`, or another private TUI type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiAppTheme {
+    pub foreground: Color,
+    pub muted: Color,
+    pub accent: Color,
+    pub success: Color,
+    pub warning: Color,
+    pub danger: Color,
+    pub border: Color,
+}
+
+impl TuiAppTheme {
+    #[must_use]
+    pub const fn dark() -> Self {
+        Self {
+            foreground: Color::White,
+            muted: Color::DarkGray,
+            accent: Color::Cyan,
+            success: Color::Green,
+            warning: Color::Yellow,
+            danger: Color::Red,
+            border: Color::DarkGray,
+        }
+    }
+
+    #[must_use]
+    pub const fn foreground_style(self) -> Style {
+        Style::new().fg(self.foreground)
+    }
+
+    #[must_use]
+    pub const fn muted_style(self) -> Style {
+        Style::new().fg(self.muted)
+    }
+
+    #[must_use]
+    pub const fn accent_style(self) -> Style {
+        Style::new().fg(self.accent)
+    }
+}
+
+/// Read-only context supplied to an APP panel while Cowd renders it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiAppRenderContext {
+    pub theme: TuiAppTheme,
+    pub focused: bool,
+}
+
+/// A generic, app-owned action displayed by the terminal command palette.
+/// The host does not interpret its risk policy: it asks the owning panel to
+/// dispatch the action and only executes the resulting generic effect.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuiAppAction {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub domain: String,
+    pub risk: String,
+    pub requires_confirmation: bool,
+    pub enabled: bool,
+    pub unavailable_reason: Option<String>,
+}
+
+/// Host-to-APP envelope. Payloads are intentionally JSON values: the APP
+/// owns its canonical typed contract and deserializes only its own messages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TuiAppEvent {
+    Response {
+        request_id: String,
+        status: u16,
+        body: Value,
+    },
+    RequestFailed {
+        request_id: String,
+        error: String,
+    },
+    LiveEnvelope {
+        subscription_id: String,
+        body: Value,
+    },
+    LiveFailed {
+        subscription_id: String,
+        error: String,
+    },
+    LiveStopped {
+        subscription_id: String,
+    },
+}
+
+/// APP-to-host command. Cowd performs network authentication, task lifetime,
+/// cross-panel navigation and composer insertion; the APP owns endpoint
+/// selection, request body, live semantics and state reduction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TuiAppEffect {
+    Request {
+        request_id: String,
+        method: String,
+        path: String,
+        body: Option<Value>,
+    },
+    Subscribe {
+        subscription_id: String,
+        path: String,
+    },
+    Unsubscribe {
+        subscription_id: String,
+    },
+    Navigate {
+        route: String,
+    },
+    Composer {
+        text: String,
+    },
+    Notice {
+        level: TuiAppNoticeLevel,
+        title: Option<String>,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiAppNoticeLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+/// Mutable effect sink passed to an APP panel. It has no network client,
+/// credential, Gateway service, Tokio handle or Cowd state access.
+#[derive(Debug, Default)]
+pub struct TuiAppEffects {
+    effects: Vec<TuiAppEffect>,
+}
+
+impl TuiAppEffects {
+    pub fn push(&mut self, effect: TuiAppEffect) {
+        self.effects.push(effect);
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.effects.is_empty()
+    }
+
+    pub fn take(&mut self) -> Vec<TuiAppEffect> {
+        std::mem::take(&mut self.effects)
+    }
+}
+
+/// Complete APP-owned TUI behavior. The trait intentionally contains the
+/// whole user-facing seam (rendering, input, app event reduction, palette and
+/// slash dispatch), so the Cowd TUI host cannot grow an APP-specific branch.
+pub trait TuiAppPanel: Send {
+    fn panel_id(&self) -> &str;
+
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect, context: TuiAppRenderContext);
+
+    fn handle_key(&mut self, key: KeyEvent, effects: &mut TuiAppEffects) -> bool;
+
+    fn apply_event(&mut self, event: TuiAppEvent, effects: &mut TuiAppEffects);
+
+    fn actions(&self) -> Vec<TuiAppAction>;
+
+    fn dispatch_action(&mut self, action_id: &str, effects: &mut TuiAppEffects) -> bool;
+
+    fn handle_command(&mut self, command: &str, effects: &mut TuiAppEffects) -> bool;
+}
+
+/// A factory is registered at product startup; each TUI process creates its
+/// own panel and state.  It prevents any APP state from leaking through the
+/// global Gateway registry.
+pub trait TuiAppPanelFactory: Send + Sync {
+    fn create(&self) -> Box<dyn TuiAppPanel>;
+}
+
+impl<F> TuiAppPanelFactory for F
+where
+    F: Fn() -> Box<dyn TuiAppPanel> + Send + Sync,
+{
+    fn create(&self) -> Box<dyn TuiAppPanel> {
+        self()
+    }
+}
+
+/// Product composition of a descriptor already visible to `AppRegistry` and
+/// the concrete external panel factory consumed by the generic TUI host.
+#[derive(Clone)]
+pub struct TuiAppSurfaceContribution {
+    pub app_id: AppId,
+    pub descriptor: TuiAppContribution,
+    factory: Arc<dyn TuiAppPanelFactory>,
+}
+
+impl std::fmt::Debug for TuiAppSurfaceContribution {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TuiAppSurfaceContribution")
+            .field("app_id", &self.app_id)
+            .field("descriptor", &self.descriptor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TuiAppSurfaceContribution {
+    #[must_use]
+    pub fn new(
+        app_id: AppId,
+        descriptor: TuiAppContribution,
+        factory: Arc<dyn TuiAppPanelFactory>,
+    ) -> Self {
+        Self {
+            app_id,
+            descriptor,
+            factory,
+        }
+    }
+
+    #[must_use]
+    pub fn create_panel(&self) -> Box<dyn TuiAppPanel> {
+        self.factory.create()
+    }
+
+    pub fn validate(&self) -> Result<(), AppRegistryError> {
+        if self.descriptor.panel_id.trim().is_empty() {
+            return Err(AppRegistryError::InvalidTuiContribution {
+                app_id: self.app_id.clone(),
+                reason: "panel_id is empty".to_string(),
+            });
+        }
+        if self.descriptor.title.trim().is_empty() {
+            return Err(AppRegistryError::InvalidTuiContribution {
+                app_id: self.app_id.clone(),
+                reason: "title is empty".to_string(),
+            });
+        }
+        let mut actions = BTreeSet::new();
+        if self
+            .descriptor
+            .actions
+            .iter()
+            .any(|action| action.trim().is_empty() || !actions.insert(action.as_str()))
+        {
+            return Err(AppRegistryError::InvalidTuiContribution {
+                app_id: self.app_id.clone(),
+                reason: "actions contain an empty or duplicate id".to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 pub struct AppContribution {
@@ -211,6 +480,8 @@ pub enum AppRegistryError {
     UnknownApp(AppId),
     #[error("duplicate skill for app {app_id}: {skill_id}")]
     DuplicateSkill { app_id: AppId, skill_id: String },
+    #[error("invalid TUI contribution for app {app_id}: {reason}")]
+    InvalidTuiContribution { app_id: AppId, reason: String },
 }
 
 #[cfg(test)]
@@ -310,5 +581,136 @@ mod tests {
             registry.register(fixture("third", "/api/apps/third/ping", "fixture.read")),
             Err(AppRegistryError::CapabilityCollision { .. })
         ));
+    }
+
+    struct FixturePanel;
+
+    impl TuiAppPanel for FixturePanel {
+        fn panel_id(&self) -> &str {
+            "fixture.panel"
+        }
+
+        fn render(&mut self, frame: &mut Frame<'_>, area: Rect, context: TuiAppRenderContext) {
+            use ratatui::widgets::Paragraph;
+
+            frame.render_widget(
+                Paragraph::new(if context.focused { "focused" } else { "idle" })
+                    .style(context.theme.accent_style()),
+                area,
+            );
+        }
+
+        fn handle_key(&mut self, key: KeyEvent, effects: &mut TuiAppEffects) -> bool {
+            if key.code == crossterm::event::KeyCode::Char('r') {
+                effects.push(TuiAppEffect::Request {
+                    request_id: "fixture.read".to_string(),
+                    method: "GET".to_string(),
+                    path: "/api/apps/fixture/ping".to_string(),
+                    body: None,
+                });
+                return true;
+            }
+            false
+        }
+
+        fn apply_event(&mut self, event: TuiAppEvent, effects: &mut TuiAppEffects) {
+            if let TuiAppEvent::RequestFailed { error, .. } = event {
+                effects.push(TuiAppEffect::Notice {
+                    level: TuiAppNoticeLevel::Error,
+                    title: Some("Fixture".to_string()),
+                    message: error,
+                });
+            }
+        }
+
+        fn actions(&self) -> Vec<TuiAppAction> {
+            vec![TuiAppAction {
+                id: "fixture.read".to_string(),
+                label: "Read fixture".to_string(),
+                description: "Issue a generic app request".to_string(),
+                domain: "fixture".to_string(),
+                risk: "low".to_string(),
+                requires_confirmation: false,
+                enabled: true,
+                unavailable_reason: None,
+            }]
+        }
+
+        fn dispatch_action(&mut self, action_id: &str, effects: &mut TuiAppEffects) -> bool {
+            if action_id == "fixture.read" {
+                effects.push(TuiAppEffect::Request {
+                    request_id: action_id.to_string(),
+                    method: "GET".to_string(),
+                    path: "/api/apps/fixture/ping".to_string(),
+                    body: None,
+                });
+                return true;
+            }
+            false
+        }
+
+        fn handle_command(&mut self, command: &str, effects: &mut TuiAppEffects) -> bool {
+            if command == "/fixture read" {
+                return self.dispatch_action("fixture.read", effects);
+            }
+            false
+        }
+    }
+
+    #[test]
+    fn external_tui_panel_factory_exercises_the_complete_generic_host_seam() {
+        let contribution = TuiAppSurfaceContribution::new(
+            AppId::parse("fixture").expect("fixture app id"),
+            TuiAppContribution {
+                panel_id: "fixture.panel".to_string(),
+                title: "Fixture".to_string(),
+                actions: vec!["fixture.read".to_string()],
+            },
+            Arc::new(|| Box::new(FixturePanel) as Box<dyn TuiAppPanel>),
+        );
+        contribution.validate().expect("valid contribution");
+
+        let mut panel = contribution.create_panel();
+        assert_eq!(panel.panel_id(), "fixture.panel");
+        assert_eq!(panel.actions().len(), 1);
+        let mut effects = TuiAppEffects::default();
+        assert!(panel.dispatch_action("fixture.read", &mut effects));
+        assert!(matches!(
+            effects.take().as_slice(),
+            [TuiAppEffect::Request { .. }]
+        ));
+        assert!(panel.handle_command("/fixture read", &mut effects));
+        assert!(matches!(
+            effects.take().as_slice(),
+            [TuiAppEffect::Request { .. }]
+        ));
+        panel.apply_event(
+            TuiAppEvent::RequestFailed {
+                request_id: "fixture.read".to_string(),
+                error: "offline".to_string(),
+            },
+            &mut effects,
+        );
+        assert!(matches!(
+            effects.take().as_slice(),
+            [TuiAppEffect::Notice { .. }]
+        ));
+
+        use ratatui::{backend::TestBackend, Terminal};
+        let backend = TestBackend::new(24, 4);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                panel.render(
+                    frame,
+                    area,
+                    TuiAppRenderContext {
+                        theme: TuiAppTheme::dark(),
+                        focused: true,
+                    },
+                );
+            })
+            .expect("render external panel");
     }
 }

@@ -8,7 +8,10 @@ publish.workspace = true
 [dependencies]
 axum = "0.7"
 cowd-app-sdk = { path = "../app-sdk" }
+crossterm = "0.28"
+ratatui = "0.29"
 serde.workspace = true
+serde_json.workspace = true
 thiserror = "2"
 
 [lints]
