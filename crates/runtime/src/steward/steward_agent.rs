@@ -161,6 +161,7 @@ mod tests {
             mission_id: Some("mission-runtime".to_string()),
             resource_ref: None,
             review_ref: None,
+            application: None,
         }
     }
 

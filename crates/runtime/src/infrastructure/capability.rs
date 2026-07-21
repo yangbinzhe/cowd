@@ -11,6 +11,7 @@ pub enum CowdCapabilityLayer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CowdCapabilityKind {
+    Application,
     Runtime,
     Context,
     Memory,
@@ -79,6 +80,22 @@ pub struct CowdCapability {
 pub struct CowdCapabilityRegistry {
     #[serde(default)]
     pub capabilities: Vec<CowdCapability>,
+}
+
+/// Product-composition input derived from a registered external application.
+/// Runtime consumes only this generic projection and never an APP contract or
+/// business type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CowdApplicationCapabilityInput {
+    pub app_id: String,
+    pub display_name: String,
+    pub version: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub actions: Vec<String>,
+    pub webui_registered: bool,
+    pub tui_registered: bool,
 }
 
 impl CowdCapabilityRegistry {
@@ -194,6 +211,40 @@ impl CowdCapabilityRegistry {
         }
     }
 
+    /// Attach the applications that the product registry selected at startup.
+    /// An input is intentionally a small, transport-neutral projection so the
+    /// runtime does not need to know any APP's domain contract.
+    #[must_use]
+    pub fn with_registered_applications(
+        mut self,
+        applications: impl IntoIterator<Item = CowdApplicationCapabilityInput>,
+    ) -> Self {
+        self.capabilities
+            .extend(applications.into_iter().map(|application| {
+                let actions = application.actions;
+                CowdCapability {
+                    id: format!("app.{}", application.app_id),
+                    name: application.display_name,
+                    layer: CowdCapabilityLayer::Application,
+                    kind: CowdCapabilityKind::Application,
+                    status: CowdCapabilityStatus::Available,
+                    owner_module: format!("app:{}", application.app_id),
+                    description: format!(
+                        "Compile-time linked application {} supplied by the product registry.",
+                        application.version
+                    ),
+                    required_permissions: application.capabilities,
+                    surfaces: application_surface_availability(
+                        application.webui_registered,
+                        application.tui_registered,
+                        actions,
+                    ),
+                    depends_on: Vec::new(),
+                }
+            }));
+        self
+    }
+
     #[must_use]
     pub fn capability(&self, id: &str) -> Option<&CowdCapability> {
         self.capabilities
@@ -285,6 +336,42 @@ fn full_surface_availability() -> Vec<CowdSurfaceAvailability> {
     ]
 }
 
+fn application_surface_availability(
+    webui_registered: bool,
+    tui_registered: bool,
+    actions: Vec<String>,
+) -> Vec<CowdSurfaceAvailability> {
+    vec![
+        CowdSurfaceAvailability {
+            surface: CowdSurface::Webui,
+            mode: if webui_registered {
+                CowdSurfaceMode::Enhanced
+            } else {
+                CowdSurfaceMode::Hidden
+            },
+            actions: actions.clone(),
+        },
+        CowdSurfaceAvailability {
+            surface: CowdSurface::Tui,
+            mode: if tui_registered {
+                CowdSurfaceMode::Full
+            } else {
+                CowdSurfaceMode::Hidden
+            },
+            actions,
+        },
+        CowdSurfaceAvailability {
+            surface: CowdSurface::Cli,
+            mode: CowdSurfaceMode::Minimal,
+            actions: vec![
+                "list".to_string(),
+                "show".to_string(),
+                "diagnose".to_string(),
+            ],
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,15 +409,17 @@ mod tests {
     }
 
     #[test]
-    fn capability_registry_does_not_register_legacy_application_capability() {
+    fn core_registry_does_not_register_an_application_capability() {
         let registry = CowdCapabilityRegistry::core();
 
-        let legacy_capability = ["ia", "cc.manufacturing.application"].concat();
-        assert!(registry.capability(&legacy_capability).is_none());
+        assert!(registry
+            .capabilities
+            .iter()
+            .all(|capability| capability.layer != CowdCapabilityLayer::Application));
     }
 
     #[test]
-    fn capability_registry_declares_matrix_as_reality_core_engine_without_mfg_ownership() {
+    fn capability_registry_declares_matrix_as_reality_core_engine_without_application_ownership() {
         let registry = CowdCapabilityRegistry::core();
 
         let matrix = registry
@@ -341,11 +430,42 @@ mod tests {
         assert_eq!(matrix.owner_module, "matrix");
         assert!(matrix.description.contains("Structured facts"));
         assert!(registry
-            .capability("mfg.manufacturing.application")
-            .is_none());
-        assert!(registry.capabilities.iter().all(|capability| {
-            !capability.id.starts_with("mfg.") && capability.owner_module != "app-mfg"
-        }));
+            .capabilities
+            .iter()
+            .all(|capability| { capability.layer != CowdCapabilityLayer::Application }));
+    }
+
+    #[test]
+    fn registered_application_is_projected_without_runtime_domain_knowledge() {
+        let registry = CowdCapabilityRegistry::core().with_registered_applications([
+            CowdApplicationCapabilityInput {
+                app_id: "fulfillment".to_string(),
+                display_name: "Fulfillment".to_string(),
+                version: "1.0.0".to_string(),
+                capabilities: vec!["fulfillment.review".to_string()],
+                actions: vec!["fulfillment.review.resolve".to_string()],
+                webui_registered: true,
+                tui_registered: true,
+            },
+        ]);
+
+        let application = registry
+            .capability("app.fulfillment")
+            .expect("registered application projection");
+        assert_eq!(application.layer, CowdCapabilityLayer::Application);
+        assert_eq!(application.kind, CowdCapabilityKind::Application);
+        assert_eq!(application.owner_module, "app:fulfillment");
+        assert!(application
+            .required_permissions
+            .contains(&"fulfillment.review".to_string()));
+        assert_eq!(
+            registry.by_surface(CowdSurface::Webui).len(),
+            registry.capabilities.len()
+        );
+        assert_eq!(
+            registry.by_surface(CowdSurface::Tui).len(),
+            registry.capabilities.len()
+        );
     }
 
     #[test]

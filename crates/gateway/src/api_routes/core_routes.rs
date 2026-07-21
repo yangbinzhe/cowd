@@ -14,7 +14,7 @@ use matrix_core::structured::{
     StructuredSource as CowdStructuredSource, StructuredWatermark as CowdWatermark,
 };
 use matrix_core::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
-use runtime::capability::{CowdCapabilityRegistry, CowdSurface};
+use runtime::capability::{CowdApplicationCapabilityInput, CowdCapabilityRegistry, CowdSurface};
 use runtime::projection::CowdProjection;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
 use runtime::surface_contract::CowdSurfaceParityContract;
@@ -60,21 +60,46 @@ struct ProjectionQuery {
     surface: Option<String>,
 }
 
-async fn capabilities_handler() -> impl IntoResponse {
-    Json(CowdCapabilityRegistry::core())
+async fn capabilities_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(product_capability_registry(&state))
 }
 
 async fn projection_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
     Query(query): Query<ProjectionQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let surface = parse_surface(query.surface.as_deref())?;
-    let registry = CowdCapabilityRegistry::core();
+    let registry = product_capability_registry(&state);
     Ok(Json(CowdProjection::for_surface(&registry, surface)))
 }
 
-async fn surfaces_handler() -> impl IntoResponse {
-    let registry = CowdCapabilityRegistry::core();
+async fn surfaces_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    let registry = product_capability_registry(&state);
     Json(CowdSurfaceParityContract::from_registry(&registry))
+}
+
+fn product_capability_registry(state: &AppState) -> CowdCapabilityRegistry {
+    CowdCapabilityRegistry::core().with_registered_applications(
+        state
+            .services
+            .app_registry
+            .apps()
+            .into_iter()
+            .map(|application| CowdApplicationCapabilityInput {
+                app_id: application.descriptor.id.as_str().to_string(),
+                display_name: application.descriptor.display_name,
+                version: application.descriptor.version,
+                capabilities: application.descriptor.capabilities,
+                actions: application
+                    .descriptor
+                    .actions
+                    .into_iter()
+                    .map(|action| action.id)
+                    .collect(),
+                webui_registered: application.http_registered,
+                tui_registered: application.tui_registered,
+            }),
+    )
 }
 
 async fn release_gate_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

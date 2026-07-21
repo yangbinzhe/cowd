@@ -3742,7 +3742,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn cowd_capabilities_route_exposes_core_registry() {
+    async fn cowd_capabilities_route_projects_registered_apps_with_the_core_registry() {
         let app = api_router(test_state());
         let response = app
             .oneshot(
@@ -3762,9 +3762,12 @@ pub(crate) mod tests {
         assert!(capabilities
             .iter()
             .any(|capability| capability["id"] == "cowd.structured_data.core"));
-        assert!(!capabilities
+        let application = capabilities
             .iter()
-            .any(|capability| capability["id"] == "mfg.manufacturing.application"));
+            .find(|capability| capability["id"] == "app.mfg")
+            .expect("registered MFG app is projected generically");
+        assert_eq!(application["layer"], "application");
+        assert_eq!(application["owner_module"], "app:mfg");
     }
 
     #[tokio::test]
@@ -5662,6 +5665,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(preview.status(), StatusCode::OK);
 
+        std::fs::create_dir_all(config_home.join("storage")).unwrap();
         let repository = matrix_repository::MatrixSqliteRepository::open(
             config_home.join("storage").join("matrix.sqlite"),
         )
@@ -7055,6 +7059,20 @@ pub(crate) mod tests {
             approval.source.review_ref.as_deref(),
             Some(review_id.as_str())
         );
+        assert_eq!(
+            approval.source.kind,
+            runtime::ApprovalSourceKind::Application
+        );
+        let application = approval
+            .source
+            .typed_application()
+            .expect("external APP approval preserves typed source metadata");
+        assert_eq!(application.app_id, "mfg");
+        assert_eq!(
+            application.correlation_schema,
+            "mfg.report.delivery.review.v1"
+        );
+        assert_eq!(application.decision_capability, "mfg.report.review");
 
         let login = app
             .clone()
@@ -11533,6 +11551,7 @@ providers:
                     mission_id: Some("mission-approval-route".to_string()),
                     resource_ref: None,
                     review_ref: None,
+                    application: None,
                 },
                 action: "apply_patch".to_string(),
                 summary: "modify runtime file".to_string(),

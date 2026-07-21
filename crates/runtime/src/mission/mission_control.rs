@@ -900,6 +900,7 @@ mod tests {
                     mission_id: Some("mission-control".to_string()),
                     resource_ref: None,
                     review_ref: None,
+                    application: None,
                 },
                 action: "dangerous-test-action".to_string(),
                 summary: "needs approval".to_string(),

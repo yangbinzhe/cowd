@@ -12,7 +12,7 @@ use std::{
 
 use async_trait::async_trait;
 use cowd_app_sdk::{
-    AppHostError, AppHostPorts, ApprovalPort, ConnectorPort, CowdAppContext, CrossPlanePort,
+    AppHostError, AppHostPorts, AppId, ApprovalPort, ConnectorPort, CowdAppContext, CrossPlanePort,
     HostIntent, HostReceipt, InvocationContext, PlatformPort, RealityPort, RuntimePort,
     WorkContextPort,
 };
@@ -21,9 +21,9 @@ use harness_contract::{
     policy::{CrossPlaneRisk, DataClassification},
 };
 use runtime::{
-    ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, CrossPlaneAction,
-    CrossPlaneDispatchTarget, IdentityTrust, PolicyDecisionKind, SubmitGlobalApprovalRequest,
-    VerifiedPrincipal,
+    ApprovalApplicationSource, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
+    CrossPlaneAction, CrossPlaneDispatchTarget, IdentityTrust, PolicyDecisionKind,
+    SubmitGlobalApprovalRequest, VerifiedPrincipal,
 };
 use serde::Deserialize;
 
@@ -314,6 +314,12 @@ impl ApprovalPort for GatewayAppHostBinding {
         match intent.kind.as_str() {
             APPROVAL_SUBMIT_INTENT_V1 => {
                 let request = ApplicationApprovalSubmitIntentV1::parse(intent)?;
+                let application = registered_application_approval_source(
+                    state.services.app_registry.as_ref(),
+                    &request.app_id,
+                    &request.correlation_schema,
+                    &request.decision_capability,
+                )?;
                 let runtime = state
                     .services
                     .runtime
@@ -331,13 +337,14 @@ impl ApprovalPort for GatewayAppHostBinding {
                         request.approval_id.clone(),
                         SubmitGlobalApprovalRequest {
                             source: ApprovalSource {
-                                kind: ApprovalSourceKind::Mfg,
+                                kind: ApprovalSourceKind::Application,
                                 session_id: None,
                                 agent_id: None,
                                 team_id: None,
                                 mission_id: None,
                                 resource_ref: Some(request.resource_ref),
                                 review_ref: Some(request.review_ref),
+                                application: Some(application),
                             },
                             action: request.action,
                             summary: request.summary,
@@ -359,12 +366,61 @@ impl ApprovalPort for GatewayAppHostBinding {
             }
             APPROVAL_DECIDE_INTENT_V1 => {
                 let request = ApplicationApprovalDecisionIntentV1::parse(intent)?;
-                if !principal.is_human_interactive()
-                    || !principal.has_capability("approval.respond")
-                    || !principal.has_capability("mfg.report.review")
+                let runtime = state
+                    .services
+                    .runtime
+                    .as_ref()
+                    .ok_or_else(|| {
+                        AppHostError::Unavailable(
+                            "Gateway runtime approval service is not configured".into(),
+                        )
+                    })?
+                    .runtime_services();
+                let approval = runtime
+                    .approval_queue()
+                    .get(&request.approval_id)
+                    .ok_or_else(|| {
+                        AppHostError::Denied("application approval request not found".into())
+                    })?;
+                let application =
+                    approval
+                        .source
+                        .typed_application()
+                        .cloned()
+                        .ok_or_else(|| {
+                            AppHostError::Denied(
+                                "application approval request has no typed source metadata".into(),
+                            )
+                        })?;
+                if application.app_id != request.app_id
+                    || application.correlation_schema != request.correlation_schema
                 {
                     return Err(AppHostError::Denied(
-                        "application approval decisions require a human-interactive mfg.report.review principal with approval.respond"
+                        "application approval source correlation mismatch".into(),
+                    ));
+                }
+                if approval.source.review_ref.as_deref() != Some(request.review_ref.as_str()) {
+                    return Err(AppHostError::Denied(
+                        "application approval review correlation mismatch".into(),
+                    ));
+                }
+                let registered = registered_application_approval_source(
+                    state.services.app_registry.as_ref(),
+                    &application.app_id,
+                    &application.correlation_schema,
+                    &application.decision_capability,
+                )?;
+                if registered != application {
+                    return Err(AppHostError::Denied(
+                        "registered application approval metadata no longer matches request".into(),
+                    ));
+                }
+                if !principal.is_human_interactive()
+                    || !principal.has_capability("approval.respond")
+                    || !principal.has_capability(&application.decision_capability)
+                {
+                    return Err(AppHostError::Denied(
+                        "application approval decisions require a human-interactive principal with the registered decision capability and approval.respond"
                             .into(),
                     ));
                 }
@@ -400,16 +456,6 @@ impl ApprovalPort for GatewayAppHostBinding {
                     .map_err(|error| {
                         AppHostError::Denied(format!("decision lease verification failed: {error}"))
                     })?;
-                let runtime = state
-                    .services
-                    .runtime
-                    .as_ref()
-                    .ok_or_else(|| {
-                        AppHostError::Unavailable(
-                            "Gateway runtime approval service is not configured".into(),
-                        )
-                    })?
-                    .runtime_services();
                 runtime
                     .consume_verified_decision_lease(verified)
                     .map_err(|error| {
@@ -424,8 +470,9 @@ impl ApprovalPort for GatewayAppHostBinding {
                 let actor = format!("principal:{}", principal.claims().principal_id);
                 let receipt = runtime
                     .approval_queue()
-                    .record_mfg_decision_fact(
+                    .record_application_decision_fact(
                         &request.approval_id,
+                        &application,
                         &request.review_ref,
                         &actor,
                         request.approved,
@@ -454,6 +501,9 @@ impl ApprovalPort for GatewayAppHostBinding {
 #[serde(deny_unknown_fields)]
 struct ApplicationApprovalSubmitIntentV1 {
     approval_id: String,
+    app_id: String,
+    correlation_schema: String,
+    decision_capability: String,
     resource_ref: String,
     review_ref: String,
     action: String,
@@ -476,6 +526,9 @@ impl ApplicationApprovalSubmitIntentV1 {
         })?;
         for (field, value) in [
             ("approval_id", request.approval_id.trim()),
+            ("app_id", request.app_id.trim()),
+            ("correlation_schema", request.correlation_schema.trim()),
+            ("decision_capability", request.decision_capability.trim()),
             ("resource_ref", request.resource_ref.trim()),
             ("review_ref", request.review_ref.trim()),
             ("action", request.action.trim()),
@@ -493,6 +546,8 @@ impl ApplicationApprovalSubmitIntentV1 {
 #[serde(deny_unknown_fields)]
 struct ApplicationApprovalDecisionIntentV1 {
     approval_id: String,
+    app_id: String,
+    correlation_schema: String,
     review_ref: String,
     action: String,
     scope: String,
@@ -515,6 +570,8 @@ impl ApplicationApprovalDecisionIntentV1 {
         })?;
         for (field, value) in [
             ("approval_id", request.approval_id.trim()),
+            ("app_id", request.app_id.trim()),
+            ("correlation_schema", request.correlation_schema.trim()),
             ("review_ref", request.review_ref.trim()),
             ("action", request.action.trim()),
             ("scope", request.scope.trim()),
@@ -526,6 +583,75 @@ impl ApplicationApprovalDecisionIntentV1 {
             }
         }
         Ok(request)
+    }
+}
+
+fn registered_application_approval_source(
+    app_registry: &cowd_app_host::AppRegistry,
+    app_id: &str,
+    correlation_schema: &str,
+    decision_capability: &str,
+) -> Result<ApprovalApplicationSource, AppHostError> {
+    let parsed_id = AppId::parse(app_id.to_string())
+        .map_err(|_| AppHostError::Denied("application approval app_id is invalid".into()))?;
+    let application = app_registry
+        .app(&parsed_id)
+        .ok_or_else(|| AppHostError::Denied("application approval app is not registered".into()))?;
+    if !application
+        .descriptor
+        .capabilities
+        .iter()
+        .any(|capability| capability == decision_capability)
+    {
+        return Err(AppHostError::Denied(
+            "application approval decision capability is not declared by the registered app".into(),
+        ));
+    }
+    Ok(ApprovalApplicationSource {
+        app_id: parsed_id.as_str().to_string(),
+        correlation_schema: correlation_schema.to_string(),
+        decision_capability: decision_capability.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_source_must_match_a_registered_app_and_declared_capability() {
+        let services = crate::services::GatewayServices::baseline();
+        let registry = services.app_registry.as_ref();
+        let source = registered_application_approval_source(
+            registry,
+            "mfg",
+            "mfg.report.delivery.review.v1",
+            "mfg.report.review",
+        )
+        .expect("embedded APP declares its review capability");
+        assert_eq!(source.app_id, "mfg");
+        assert_eq!(source.decision_capability, "mfg.report.review");
+        assert!(matches!(
+            registered_application_approval_source(
+                registry,
+                "unknown-app",
+                "unknown.review.v1",
+                "unknown.review",
+            )
+            .unwrap_err(),
+            AppHostError::Denied(message) if message == "application approval app is not registered"
+        ));
+        assert!(matches!(
+            registered_application_approval_source(
+                registry,
+                "mfg",
+                "mfg.report.delivery.review.v1",
+                "other.review",
+            )
+            .unwrap_err(),
+            AppHostError::Denied(message)
+                if message == "application approval decision capability is not declared by the registered app"
+        ));
     }
 }
 

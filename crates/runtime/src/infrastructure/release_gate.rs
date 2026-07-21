@@ -190,10 +190,6 @@ mod tests {
             .checks
             .iter()
             .any(|check| check.check_id == "matrix.kernel.registered"));
-        assert!(!report
-            .checks
-            .iter()
-            .any(|check| check.check_id == "mfg.application.boundary"));
         assert!(report.checks.iter().all(|check| check.status == "pass"));
     }
 

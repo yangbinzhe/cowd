@@ -137,8 +137,7 @@ mod tests {
         assert!(!projection
             .capabilities
             .iter()
-            .any(|capability| capability.id == "cowd.matrix.runtime"
-                || capability.id == "mfg.manufacturing.application"));
+            .any(|capability| capability.id == "cowd.matrix.runtime"));
         assert!(projection.capabilities.iter().all(|capability| capability
             .management_fields
             .contains(&"bulk_actions".to_string())));
@@ -175,8 +174,7 @@ mod tests {
         assert!(!projection
             .capabilities
             .iter()
-            .any(|capability| capability.id == "cowd.matrix.runtime"
-                || capability.id == "mfg.manufacturing.application"));
+            .any(|capability| capability.id == "cowd.matrix.runtime"));
         assert!(projection.capabilities.iter().all(|capability| {
             capability.surface_mode == CowdSurfaceMode::Minimal
                 && capability.management_fields

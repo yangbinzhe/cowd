@@ -249,9 +249,9 @@ impl ApprovalService {
         if services
             .approval_queue()
             .get(id)
-            .is_some_and(|request| request.source.kind == runtime::ApprovalSourceKind::Mfg)
+            .is_some_and(|request| request.source.typed_application().is_some())
         {
-            return Err("mfg_review_requires_typed_decision_service".to_string());
+            return Err("application_review_requires_typed_decision_service".to_string());
         }
         let graph_target = canonical_graph_approval_target(id);
         let graph_before = if let Some((graph_id, node_id)) = &graph_target {
@@ -376,12 +376,12 @@ fn approval_visible_to(
     request: &runtime::GlobalApprovalRequest,
     principal: &runtime::VerifiedPrincipal,
 ) -> bool {
-    if request.source.kind != runtime::ApprovalSourceKind::Mfg {
+    let Some(application) = request.source.typed_application() else {
         return true;
-    }
+    };
     principal.is_human_interactive()
         && principal.has_capability("approval.respond")
-        && principal.has_capability("mfg.report.review")
+        && principal.has_capability(&application.decision_capability)
         && request
             .source
             .resource_ref
@@ -508,23 +508,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mfg_approval_is_cropped_and_generic_response_fails_before_decision_write() {
+    async fn typed_application_approval_is_cropped_and_generic_response_fails_before_decision_write(
+    ) {
         let services = runtime::RuntimeServices::in_memory().unwrap();
         let request = services
             .approval_queue()
             .submit_scoped(
-                "mfg-approval:crop",
+                "application-approval:crop",
                 runtime::SubmitGlobalApprovalRequest {
                     source: runtime::ApprovalSource {
-                        kind: runtime::ApprovalSourceKind::Mfg,
+                        kind: runtime::ApprovalSourceKind::Application,
                         session_id: None,
                         agent_id: None,
                         team_id: None,
                         mission_id: None,
-                        resource_ref: Some("mfg:cockpit-report:report-crop".to_string()),
+                        resource_ref: Some("application:report:crop".to_string()),
                         review_ref: Some("review-crop".to_string()),
+                        application: Some(runtime::ApprovalApplicationSource {
+                            app_id: "fulfillment".to_string(),
+                            correlation_schema: "fulfillment.review.v1".to_string(),
+                            decision_capability: "fulfillment.review".to_string(),
+                        }),
                     },
-                    action: "mfg.report.review.typed_decision".to_string(),
+                    action: "fulfillment.review.typed_decision".to_string(),
                     summary: "review report".to_string(),
                     risk: harness_contract::core::TaskRisk::High,
                     evidence_refs: vec!["digest:crop".to_string()],
@@ -534,7 +540,7 @@ mod tests {
             .unwrap();
         let service = ApprovalService::new().with_runtime_services(Arc::clone(&services));
         let operator = review_principal(&["approval.respond"]);
-        let reviewer = review_principal(&["approval.respond", "mfg.report.review"]);
+        let reviewer = review_principal(&["approval.respond", "fulfillment.review"]);
         assert_eq!(
             service.pending(&operator).await["pending"]
                 .as_array()
@@ -561,7 +567,7 @@ mod tests {
                 .respond(&request.approval_id, true, None, &reviewer)
                 .await
                 .unwrap_err(),
-            "mfg_review_requires_typed_decision_service"
+            "application_review_requires_typed_decision_service"
         );
         assert_eq!(
             services

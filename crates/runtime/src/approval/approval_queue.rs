@@ -22,9 +22,19 @@ pub enum ApprovalSourceKind {
     Steward,
     /// A Runtime-governed release decision for an evolution candidate.
     Evolution,
-    /// A typed MFG business review. ApprovalQueue stores only the correlated
-    /// approval fact; app-mfg remains the review/effect state owner.
-    Mfg,
+    /// An APP-owned typed business review. Runtime stores only a correlated
+    /// approval fact; the application remains the review/effect state owner.
+    Application,
+}
+
+/// Immutable application metadata that binds a typed review to its owning
+/// application. Runtime deliberately treats the strings as opaque: their
+/// schema and business DTO belong to the APP, not to Cowd core.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalApplicationSource {
+    pub app_id: String,
+    pub correlation_schema: String,
+    pub decision_capability: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +48,44 @@ pub struct ApprovalSource {
     pub resource_ref: Option<String>,
     #[serde(default)]
     pub review_ref: Option<String>,
+    /// Present only for an [`ApprovalSourceKind::Application`] request.
+    #[serde(default)]
+    pub application: Option<ApprovalApplicationSource>,
+}
+
+impl ApprovalSource {
+    fn validate(&self) -> Result<(), String> {
+        match self.kind {
+            ApprovalSourceKind::Application => {
+                let application = self
+                    .application
+                    .as_ref()
+                    .ok_or_else(|| "application_approval_source_is_incomplete".to_string())?;
+                if application.app_id.trim().is_empty()
+                    || application.correlation_schema.trim().is_empty()
+                    || application.decision_capability.trim().is_empty()
+                    || self
+                        .review_ref
+                        .as_deref()
+                        .is_none_or(|review_ref| review_ref.trim().is_empty())
+                {
+                    return Err("application_approval_source_is_incomplete".to_string());
+                }
+            }
+            _ if self.application.is_some() => {
+                return Err("non_application_approval_cannot_include_application_metadata".into());
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn typed_application(&self) -> Option<&ApprovalApplicationSource> {
+        (self.kind == ApprovalSourceKind::Application)
+            .then_some(self.application.as_ref())
+            .flatten()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +183,7 @@ impl ApprovalQueue {
         approval_id: impl Into<String>,
         request: SubmitGlobalApprovalRequest,
     ) -> Result<GlobalApprovalRequest, String> {
+        request.source.validate()?;
         if request.action.trim().is_empty() {
             return Err("approval action must not be empty".to_string());
         }
@@ -222,17 +271,16 @@ impl ApprovalQueue {
         // EvolutionGovernanceService. Letting this generic queue decide the
         // approval would leave a release review approved without its matching
         // Runtime release assignment.
-        if matches!(
-            request.source.kind,
-            ApprovalSourceKind::Evolution | ApprovalSourceKind::Mfg
-        ) {
+        if request.source.kind == ApprovalSourceKind::Evolution {
             return Err(match request.source.kind {
                 ApprovalSourceKind::Evolution => {
                     "evolution_release_requires_typed_decision_service".to_string()
                 }
-                ApprovalSourceKind::Mfg => "mfg_review_requires_typed_decision_service".to_string(),
                 _ => unreachable!(),
             });
+        }
+        if request.source.typed_application().is_some() {
+            return Err("application_review_requires_typed_decision_service".to_string());
         }
         if request.status != GlobalApprovalStatus::Pending {
             return Ok(GlobalApprovalDecisionReceipt {
@@ -290,16 +338,17 @@ impl ApprovalQueue {
         Ok(receipt)
     }
 
-    /// Record a decision already authorized by the typed MFG review service.
+    /// Record a decision already authorized by an APP-owned typed review.
     ///
-    /// The caller must first persist the MFG decision intent and consume its
-    /// one-time decision lease. This method verifies the Approval correlation
-    /// before appending the generic decision fact, and never owns MFG effect
-    /// or terminal state.
+    /// The caller must first persist its decision intent and consume its
+    /// one-time decision lease. This method verifies the application, schema,
+    /// and review correlation before appending the generic decision fact. It
+    /// never owns APP effect or terminal state.
     #[allow(clippy::too_many_arguments)]
-    pub fn record_mfg_decision_fact(
+    pub fn record_application_decision_fact(
         &self,
         approval_id: &str,
+        application: &ApprovalApplicationSource,
         review_ref: &str,
         decided_by: &str,
         approved: bool,
@@ -312,7 +361,7 @@ impl ApprovalQueue {
             || decision.trim().is_empty()
             || decision_lease_ref.trim().is_empty()
         {
-            return Err("mfg_typed_decision_fact_is_incomplete".to_string());
+            return Err("application_typed_decision_fact_is_incomplete".to_string());
         }
         let mut requests = self
             .requests
@@ -321,10 +370,11 @@ impl ApprovalQueue {
         let request = requests
             .get_mut(approval_id)
             .ok_or_else(|| format!("approval request not found: {approval_id}"))?;
-        if request.source.kind != ApprovalSourceKind::Mfg
+        if request.source.kind != ApprovalSourceKind::Application
+            || request.source.application.as_ref() != Some(application)
             || request.source.review_ref.as_deref() != Some(review_ref)
         {
-            return Err("mfg_approval_correlation_mismatch".to_string());
+            return Err("application_approval_correlation_mismatch".to_string());
         }
         let next_status = if approved {
             GlobalApprovalStatus::Approved
@@ -340,14 +390,17 @@ impl ApprovalQueue {
                     message: format!("approval already {}", status_label(request.status)),
                 });
             }
-            return Err("mfg_approval_decision_conflict".to_string());
+            return Err("application_approval_decision_conflict".to_string());
         }
         let resolved_at_ms = now_ms();
         let receipt = GlobalApprovalDecisionReceipt {
             approval_id: request.approval_id.clone(),
             status: next_status,
             route_back: request.source.clone(),
-            message: format!("MFG {decision} recorded for review {review_ref} by {decided_by}"),
+            message: format!(
+                "application {} {decision} recorded for review {review_ref} by {decided_by}",
+                application.app_id
+            ),
         };
         let stream_id = format!("approval:{}", request.approval_id);
         let revision = self
@@ -358,11 +411,14 @@ impl ApprovalQueue {
             .append_batch_if_revision(
                 stream_id.clone(),
                 revision,
-                format!("mfg-approval-decision:{review_ref}:{decision}"),
+                format!(
+                    "application-approval-decision:{}:{review_ref}:{decision}",
+                    application.app_id
+                ),
                 vec![RuntimeEventInput {
                     stream_id,
                     scope: RuntimeEventScope::Approval,
-                    kind: "approval.decided.mfg".to_string(),
+                    kind: "approval.decided.application".to_string(),
                     status: Some(next_status.as_str().to_string()),
                     actor: Some(decided_by.to_string()),
                     refs: approval_source_refs(&request.source),
@@ -372,6 +428,7 @@ impl ApprovalQueue {
                         "reason": reason,
                         "review_ref": review_ref,
                         "decision_lease_ref": decision_lease_ref,
+                        "application": application,
                         "message": receipt.message,
                         "resolved_at_ms": resolved_at_ms,
                     }),
@@ -549,6 +606,16 @@ fn approval_source_refs(source: &ApprovalSource) -> Vec<RuntimeEventRef> {
             id: id.clone(),
         });
     }
+    if let Some(application) = &source.application {
+        refs.push(RuntimeEventRef {
+            kind: "application".to_string(),
+            id: application.app_id.clone(),
+        });
+        refs.push(RuntimeEventRef {
+            kind: "approval_correlation_schema".to_string(),
+            id: application.correlation_schema.clone(),
+        });
+    }
     refs
 }
 
@@ -579,7 +646,7 @@ fn restore_requests(event_store: &RuntimeEventStore) -> BTreeMap<String, GlobalA
                     requests.insert(request.approval_id.clone(), request);
                 }
             }
-            "approval.decided" | "approval.decided.mfg" | "approval.timed_out" => {
+            "approval.decided" | "approval.decided.application" | "approval.timed_out" => {
                 let Some(approval_id) = event.stream_id.strip_prefix("approval:") else {
                     continue;
                 };
@@ -627,6 +694,7 @@ mod tests {
             mission_id: None,
             resource_ref: None,
             review_ref: None,
+            application: None,
         }
     }
 
@@ -732,22 +800,48 @@ mod tests {
     }
 
     #[test]
-    fn mfg_source_rejects_generic_decision_and_accepts_only_typed_correlated_fact() {
+    fn application_source_rejects_generic_decision_and_accepts_only_typed_correlated_fact() {
         let queue = queue();
+        let application = ApprovalApplicationSource {
+            app_id: "fulfillment".to_string(),
+            correlation_schema: "fulfillment.review.v1".to_string(),
+            decision_capability: "fulfillment.review".to_string(),
+        };
+        let blank_review = queue
+            .submit(SubmitGlobalApprovalRequest {
+                source: ApprovalSource {
+                    kind: ApprovalSourceKind::Application,
+                    session_id: None,
+                    agent_id: None,
+                    team_id: None,
+                    mission_id: None,
+                    resource_ref: Some("application:report:blank-review".to_string()),
+                    review_ref: Some("   ".to_string()),
+                    application: Some(application.clone()),
+                },
+                action: "fulfillment.review".to_string(),
+                summary: "blank review must be rejected".to_string(),
+                risk: TaskRisk::High,
+                evidence_refs: Vec::new(),
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .unwrap_err();
+        assert_eq!(blank_review, "application_approval_source_is_incomplete");
         let request = queue
             .submit_scoped(
-                "mfg-approval:review-1",
+                "application-approval:review-1",
                 SubmitGlobalApprovalRequest {
                     source: ApprovalSource {
-                        kind: ApprovalSourceKind::Mfg,
+                        kind: ApprovalSourceKind::Application,
                         session_id: None,
                         agent_id: None,
                         team_id: None,
                         mission_id: None,
-                        resource_ref: Some("mfg:cockpit-report:report-1".to_string()),
+                        resource_ref: Some("application:report:report-1".to_string()),
                         review_ref: Some("review-1".to_string()),
+                        application: Some(application.clone()),
                     },
-                    action: "mfg.report.review.typed_decision".to_string(),
+                    action: "fulfillment.review.typed_decision".to_string(),
                     summary: "review failed report delivery".to_string(),
                     risk: TaskRisk::High,
                     evidence_refs: vec!["digest:dead-letter".to_string()],
@@ -766,11 +860,12 @@ mod tests {
                     },
                 )
                 .unwrap_err(),
-            "mfg_review_requires_typed_decision_service"
+            "application_review_requires_typed_decision_service"
         );
         let receipt = queue
-            .record_mfg_decision_fact(
+            .record_application_decision_fact(
                 &request.approval_id,
+                &application,
                 "review-1",
                 "principal:reviewer",
                 true,
@@ -784,6 +879,105 @@ mod tests {
         assert_eq!(
             queue.get(&request.approval_id).unwrap().status,
             GlobalApprovalStatus::Approved
+        );
+    }
+
+    #[test]
+    fn application_source_rejects_malformed_metadata_mismatch_and_conflicting_decision() {
+        let queue = queue();
+        let malformed = queue
+            .submit(SubmitGlobalApprovalRequest {
+                source: ApprovalSource {
+                    kind: ApprovalSourceKind::Application,
+                    session_id: None,
+                    agent_id: None,
+                    team_id: None,
+                    mission_id: None,
+                    resource_ref: Some("application:report:malformed".to_string()),
+                    review_ref: Some("review-malformed".to_string()),
+                    application: None,
+                },
+                action: "fulfillment.review".to_string(),
+                summary: "malformed source must be rejected".to_string(),
+                risk: TaskRisk::High,
+                evidence_refs: Vec::new(),
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .unwrap_err();
+        assert_eq!(malformed, "application_approval_source_is_incomplete");
+
+        let application = ApprovalApplicationSource {
+            app_id: "fulfillment".to_string(),
+            correlation_schema: "fulfillment.review.v1".to_string(),
+            decision_capability: "fulfillment.review".to_string(),
+        };
+        let request = queue
+            .submit_scoped(
+                "application-approval:conflict",
+                SubmitGlobalApprovalRequest {
+                    source: ApprovalSource {
+                        kind: ApprovalSourceKind::Application,
+                        session_id: None,
+                        agent_id: None,
+                        team_id: None,
+                        mission_id: None,
+                        resource_ref: Some("application:report:conflict".to_string()),
+                        review_ref: Some("review-conflict".to_string()),
+                        application: Some(application.clone()),
+                    },
+                    action: "fulfillment.review.typed_decision".to_string(),
+                    summary: "typed review".to_string(),
+                    risk: TaskRisk::High,
+                    evidence_refs: Vec::new(),
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+            )
+            .unwrap();
+        let wrong_application = ApprovalApplicationSource {
+            correlation_schema: "inventory.review.v1".to_string(),
+            ..application.clone()
+        };
+        assert_eq!(
+            queue
+                .record_application_decision_fact(
+                    &request.approval_id,
+                    &wrong_application,
+                    "review-conflict",
+                    "principal:reviewer",
+                    true,
+                    "resolve",
+                    "wrong schema",
+                    "lease:wrong",
+                )
+                .unwrap_err(),
+            "application_approval_correlation_mismatch"
+        );
+        queue
+            .record_application_decision_fact(
+                &request.approval_id,
+                &application,
+                "review-conflict",
+                "principal:reviewer",
+                true,
+                "resolve",
+                "approved",
+                "lease:approved",
+            )
+            .unwrap();
+        assert_eq!(
+            queue
+                .record_application_decision_fact(
+                    &request.approval_id,
+                    &application,
+                    "review-conflict",
+                    "principal:reviewer",
+                    false,
+                    "reject",
+                    "conflict",
+                    "lease:conflict",
+                )
+                .unwrap_err(),
+            "application_approval_decision_conflict"
         );
     }
 

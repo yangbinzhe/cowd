@@ -333,9 +333,9 @@ pub use agent_runtime::{
     LegacyAgentImportReport, LegacyAgentStateRecord,
 };
 pub use approval_queue::{
-    ApprovalDecisionCommand, ApprovalQueue, ApprovalSource, ApprovalSourceKind,
-    ApprovalTimeoutPolicy, GlobalApprovalDecisionReceipt, GlobalApprovalRequest,
-    GlobalApprovalStatus, SubmitGlobalApprovalRequest,
+    ApprovalApplicationSource, ApprovalDecisionCommand, ApprovalQueue, ApprovalSource,
+    ApprovalSourceKind, ApprovalTimeoutPolicy, GlobalApprovalDecisionReceipt,
+    GlobalApprovalRequest, GlobalApprovalStatus, SubmitGlobalApprovalRequest,
 };
 pub use autonomy_profile::{
     ApprovalPolicy as AutonomyApprovalPolicy, AutonomyBudget, AutonomyDecision,

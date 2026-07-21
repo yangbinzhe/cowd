@@ -1316,7 +1316,7 @@ impl RuntimeServices {
                 "status": terminal_status,
                 "source_receipt_ref": source_receipt_ref,
                 "correlation_id": correlation_id,
-                "observed_for": "mfg.assignment.complete",
+                "observed_for": "application.assignment.complete",
             }),
         };
         self.record_task_lifecycle_once(

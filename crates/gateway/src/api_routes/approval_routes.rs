@@ -132,7 +132,7 @@ async fn approval_respond_handler(
         .map_err(|error| {
             let status = match error.as_str() {
                 "approval_human_interactive_capability_required" => StatusCode::FORBIDDEN,
-                "mfg_review_requires_typed_decision_service" => StatusCode::CONFLICT,
+                "application_review_requires_typed_decision_service" => StatusCode::CONFLICT,
                 _ => StatusCode::NOT_FOUND,
             };
             api_error(status, error)
