@@ -122,6 +122,10 @@ pub enum TuiAppEvent {
     },
     RequestFailed {
         request_id: String,
+        #[serde(default)]
+        status: Option<u16>,
+        #[serde(default)]
+        body: Option<Value>,
         error: String,
     },
     LiveEnvelope {
@@ -130,6 +134,10 @@ pub enum TuiAppEvent {
     },
     LiveFailed {
         subscription_id: String,
+        #[serde(default)]
+        status: Option<u16>,
+        #[serde(default)]
+        body: Option<Value>,
         error: String,
     },
     LiveStopped {
@@ -704,6 +712,8 @@ mod tests {
         panel.apply_event(
             TuiAppEvent::RequestFailed {
                 request_id: "fixture.read".to_string(),
+                status: Some(503),
+                body: None,
                 error: "offline".to_string(),
             },
             &mut effects,
