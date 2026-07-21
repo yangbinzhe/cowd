@@ -10,7 +10,8 @@ use std::{
 
 use axum::Router;
 use cowd_app_sdk::{
-    AppContractError, AppDescriptor, AppHealth, AppId, AppSkillDescriptor, CapabilityApp,
+    AppContractError, AppDescriptor, AppHealth, AppHttpContract, AppId, AppRouteMetadata,
+    AppSkillDescriptor, CapabilityApp,
 };
 use crossterm::event::KeyEvent;
 use ratatui::{
@@ -333,6 +334,40 @@ pub struct AppContribution {
     pub tui: Option<TuiAppContribution>,
 }
 
+/// Product-neutral registration record for a route semantic projection. It
+/// keeps the owning App visible in public inventories without exposing any
+/// domain DTO, route enum or policy table to Gateway.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RegisteredAppRouteMetadata {
+    pub app_id: AppId,
+    pub route: AppRouteMetadata,
+}
+
+/// The host supplies only a common auth status and message. The App owns its
+/// public error JSON envelope.
+pub type AppErrorEnvelopeMapper = fn(u16, String) -> Value;
+
+#[derive(Clone)]
+struct RegisteredAppHttpContract {
+    contract: AppHttpContract,
+    error_mapper: AppErrorEnvelopeMapper,
+}
+
+/// A deterministic App-owned release predicate. It receives no Gateway
+/// service, token or mutable runtime state.
+#[derive(Debug, Clone)]
+pub struct AppQualityCheck {
+    pub id: String,
+    pub verify: fn() -> bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AppQualityCheckResult {
+    pub app_id: AppId,
+    pub id: String,
+    pub passed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisteredApp {
     pub descriptor: AppDescriptor,
@@ -347,8 +382,10 @@ pub struct RegisteredApp {
 pub struct AppRegistry {
     apps: BTreeMap<AppId, RegisteredApp>,
     http: Vec<HttpAppContribution>,
+    http_contracts: BTreeMap<AppId, RegisteredAppHttpContract>,
     tui: BTreeMap<AppId, TuiAppContribution>,
     skills: BTreeMap<AppId, Vec<AppSkillDescriptor>>,
+    quality_checks: BTreeMap<AppId, Vec<AppQualityCheck>>,
 }
 
 impl AppRegistry {
@@ -431,6 +468,134 @@ impl AppRegistry {
             .collect()
     }
 
+    /// Attach the full HTTP projection after the App router itself has been
+    /// accepted. This mirrors `register_app_skills`: product composition is
+    /// the only writer, while Gateway reads a complete, immutable projection.
+    pub fn register_app_http_contract(
+        &mut self,
+        app_id: &AppId,
+        contract: AppHttpContract,
+        error_mapper: AppErrorEnvelopeMapper,
+    ) -> Result<(), AppRegistryError> {
+        let app = self
+            .apps
+            .get(app_id)
+            .ok_or_else(|| AppRegistryError::UnknownApp(app_id.clone()))?;
+        if !app.http_registered {
+            return Err(AppRegistryError::AppHasNoHttpContribution(app_id.clone()));
+        }
+        contract.validate_against(&app.descriptor)?;
+        if self.http_contracts.contains_key(app_id) {
+            return Err(AppRegistryError::DuplicateHttpContract(app_id.clone()));
+        }
+        let existing_components = self
+            .http_contracts
+            .values()
+            .flat_map(|registered| registered.contract.openapi_components.keys())
+            .collect::<BTreeSet<_>>();
+        if let Some(component) = contract
+            .openapi_components
+            .keys()
+            .find(|component| existing_components.contains(component))
+        {
+            return Err(AppRegistryError::OpenApiComponentCollision {
+                app_id: app_id.clone(),
+                component: component.clone(),
+            });
+        }
+        self.http_contracts.insert(
+            app_id.clone(),
+            RegisteredAppHttpContract {
+                contract,
+                error_mapper,
+            },
+        );
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn route_metadata(&self) -> Vec<RegisteredAppRouteMetadata> {
+        self.http_contracts
+            .iter()
+            .flat_map(|(app_id, registered)| {
+                registered
+                    .contract
+                    .routes
+                    .iter()
+                    .cloned()
+                    .map(|route| RegisteredAppRouteMetadata {
+                        app_id: app_id.clone(),
+                        route,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn openapi_components(&self) -> BTreeMap<String, Value> {
+        self.http_contracts
+            .values()
+            .flat_map(|registered| registered.contract.openapi_components.clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn error_envelope_for_path(
+        &self,
+        path: &str,
+        status: u16,
+        message: String,
+    ) -> Option<Value> {
+        self.http_contracts.values().find_map(|registered| {
+            registered
+                .contract
+                .routes
+                .iter()
+                .any(|route| route.active && route.path == path)
+                .then(|| (registered.error_mapper)(status, message.clone()))
+        })
+    }
+
+    pub fn register_app_quality_checks(
+        &mut self,
+        app_id: &AppId,
+        checks: Vec<AppQualityCheck>,
+    ) -> Result<(), AppRegistryError> {
+        if !self.apps.contains_key(app_id) {
+            return Err(AppRegistryError::UnknownApp(app_id.clone()));
+        }
+        if self.quality_checks.contains_key(app_id) {
+            return Err(AppRegistryError::DuplicateQualityChecks(app_id.clone()));
+        }
+        let mut ids = BTreeSet::new();
+        if checks
+            .iter()
+            .any(|check| check.id.trim().is_empty() || !ids.insert(check.id.as_str()))
+        {
+            return Err(AppRegistryError::InvalidQualityCheck(app_id.clone()));
+        }
+        self.quality_checks.insert(app_id.clone(), checks);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn verify_quality_checks(&self) -> Vec<AppQualityCheckResult> {
+        self.quality_checks
+            .iter()
+            .flat_map(|(app_id, checks)| {
+                checks
+                    .iter()
+                    .map(|check| AppQualityCheckResult {
+                        app_id: app_id.clone(),
+                        id: check.id.clone(),
+                        passed: (check.verify)(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Attach APP-owned skill descriptors after the APP's transport
     /// contribution has been validated. Product composition is the sole
     /// caller: Gateway, CLI and TUI only read the flattened generic view.
@@ -502,6 +667,16 @@ pub enum AppRegistryError {
     },
     #[error("capability collision for app {app_id}: {capability}")]
     CapabilityCollision { app_id: AppId, capability: String },
+    #[error("application {0} has no HTTP contribution")]
+    AppHasNoHttpContribution(AppId),
+    #[error("application {0} registered more than one HTTP contract")]
+    DuplicateHttpContract(AppId),
+    #[error("OpenAPI component collision for app {app_id}: {component}")]
+    OpenApiComponentCollision { app_id: AppId, component: String },
+    #[error("application {0} registered more than one quality-check set")]
+    DuplicateQualityChecks(AppId),
+    #[error("application {0} contains an invalid quality check")]
+    InvalidQualityCheck(AppId),
     #[error("application not registered: {0}")]
     UnknownApp(AppId),
     #[error("duplicate skill for app {app_id}: {skill_id}")]
@@ -516,6 +691,7 @@ mod tests {
     use cowd_app_sdk::{
         AppActionDescriptor, AppProfileDescriptor, AppProfileVariant, SDK_API_VERSION,
     };
+    use serde_json::json;
 
     use super::*;
 
@@ -582,6 +758,14 @@ mod tests {
         }
     }
 
+    fn fixture_error(status: u16, message: String) -> Value {
+        json!({"status": status, "app_error": message})
+    }
+
+    fn fixture_quality() -> bool {
+        true
+    }
+
     #[test]
     fn registry_has_a_real_generic_http_and_tui_consumer() {
         let mut registry = AppRegistry::default();
@@ -607,6 +791,69 @@ mod tests {
             registry.register(fixture("third", "/api/apps/third/ping", "fixture.read")),
             Err(AppRegistryError::CapabilityCollision { .. })
         ));
+    }
+
+    #[test]
+    fn registry_projects_app_http_contract_errors_and_quality_without_domain_types() {
+        let mut registry = AppRegistry::default();
+        registry
+            .register(fixture("fixture", "/api/apps/fixture/ping", "fixture.read"))
+            .expect("fixture contribution");
+        let app_id = AppId::parse("fixture").expect("fixture id");
+        registry
+            .register_app_http_contract(
+                &app_id,
+                AppHttpContract {
+                    routes: vec![AppRouteMetadata {
+                        method: "GET".to_string(),
+                        path: "/api/apps/fixture/ping".to_string(),
+                        route_id: "fixture.ping".to_string(),
+                        operation_id: "fixture.ping".to_string(),
+                        request_schema: "FixtureNoBody".to_string(),
+                        response_schema: "FixtureResponse".to_string(),
+                        class: "read".to_string(),
+                        capability: "fixture.read".to_string(),
+                        risk: "low".to_string(),
+                        confirmation: "none".to_string(),
+                        streaming: false,
+                        active: true,
+                    }],
+                    openapi_components: BTreeMap::from([(
+                        "FixtureResponse".to_string(),
+                        json!({"type": "object"}),
+                    )]),
+                },
+                fixture_error,
+            )
+            .expect("HTTP contract");
+        registry
+            .register_app_quality_checks(
+                &app_id,
+                vec![AppQualityCheck {
+                    id: "fixture.quality".to_string(),
+                    verify: fixture_quality,
+                }],
+            )
+            .expect("quality check");
+
+        assert_eq!(registry.route_metadata().len(), 1);
+        assert!(registry
+            .openapi_components()
+            .contains_key("FixtureResponse"));
+        assert_eq!(
+            registry
+                .error_envelope_for_path("/api/apps/fixture/ping", 401, "unauthorized".to_string(),)
+                .expect("typed error")["app_error"],
+            "unauthorized"
+        );
+        assert_eq!(
+            registry.verify_quality_checks(),
+            vec![AppQualityCheckResult {
+                app_id,
+                id: "fixture.quality".to_string(),
+                passed: true,
+            }]
+        );
     }
 
     struct FixturePanel;

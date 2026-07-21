@@ -4,7 +4,11 @@
 //! An application can depend on it without gaining access to Gateway, Runtime,
 //! authentication credentials, or another application's implementation.
 
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -140,6 +144,121 @@ impl AppRouteDescriptor {
             return Err(AppContractError::InvalidRoute {
                 app_id: app_id.clone(),
                 path: self.path.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Transport semantics owned by an application for one of its declared HTTP
+/// routes. Gateway publishes this data but does not interpret an application's
+/// domain route enum, DTO or policy table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRouteMetadata {
+    pub method: String,
+    pub path: String,
+    pub route_id: String,
+    pub operation_id: String,
+    pub request_schema: String,
+    pub response_schema: String,
+    pub class: String,
+    pub capability: String,
+    pub risk: String,
+    pub confirmation: String,
+    pub streaming: bool,
+    pub active: bool,
+}
+
+impl AppRouteMetadata {
+    fn validate(&self, app_id: &AppId) -> Result<(), AppContractError> {
+        AppRouteDescriptor {
+            method: self.method.clone(),
+            path: self.path.clone(),
+            operation_id: self.operation_id.clone(),
+            streaming: self.streaming,
+        }
+        .validate(app_id)?;
+        if [
+            &self.route_id,
+            &self.request_schema,
+            &self.response_schema,
+            &self.class,
+            &self.capability,
+            &self.risk,
+            &self.confirmation,
+        ]
+        .iter()
+        .any(|field| field.trim().is_empty())
+        {
+            return Err(AppContractError::InvalidHttpContract {
+                app_id: app_id.clone(),
+                reason: "route metadata contains an empty semantic field".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Complete HTTP projection for one statically linked application.
+///
+/// OpenAPI component values are JSON because the host emits an aggregate
+/// document. The schemas themselves remain owned by the application.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AppHttpContract {
+    #[serde(default)]
+    pub routes: Vec<AppRouteMetadata>,
+    #[serde(default)]
+    pub openapi_components: BTreeMap<String, serde_json::Value>,
+}
+
+impl AppHttpContract {
+    pub fn validate_against(&self, descriptor: &AppDescriptor) -> Result<(), AppContractError> {
+        let mut metadata_routes = BTreeSet::new();
+        for route in &self.routes {
+            route.validate(&descriptor.id)?;
+            let identity = (route.method.as_str(), route.path.as_str());
+            if !metadata_routes.insert(identity) {
+                return Err(AppContractError::InvalidHttpContract {
+                    app_id: descriptor.id.clone(),
+                    reason: format!("duplicate route metadata: {} {}", route.method, route.path),
+                });
+            }
+            let declared = descriptor.routes.iter().any(|declared| {
+                declared.method == route.method
+                    && declared.path == route.path
+                    && declared.operation_id == route.operation_id
+                    && declared.streaming == route.streaming
+            });
+            if !declared {
+                return Err(AppContractError::InvalidHttpContract {
+                    app_id: descriptor.id.clone(),
+                    reason: format!(
+                        "route metadata is not declared by the app descriptor: {} {}",
+                        route.method, route.path
+                    ),
+                });
+            }
+        }
+        let declared_routes = descriptor
+            .routes
+            .iter()
+            .map(|route| (route.method.as_str(), route.path.as_str()))
+            .collect::<BTreeSet<_>>();
+        if metadata_routes != declared_routes {
+            return Err(AppContractError::InvalidHttpContract {
+                app_id: descriptor.id.clone(),
+                reason: "HTTP metadata and descriptor routes are not a one-to-one match"
+                    .to_string(),
+            });
+        }
+        if self
+            .openapi_components
+            .keys()
+            .any(|component| component.trim().is_empty())
+        {
+            return Err(AppContractError::InvalidHttpContract {
+                app_id: descriptor.id.clone(),
+                reason: "OpenAPI component name is empty".to_string(),
             });
         }
         Ok(())
@@ -414,6 +533,8 @@ pub enum AppContractError {
     InvalidDescriptor(AppId),
     #[error("invalid route {path} for app {app_id}")]
     InvalidRoute { app_id: AppId, path: String },
+    #[error("invalid HTTP contract for app {app_id}: {reason}")]
+    InvalidHttpContract { app_id: AppId, reason: String },
     #[error("app {app_id} requires SDK API {actual}, host supports {expected}")]
     UnsupportedSdkApi {
         app_id: AppId,
