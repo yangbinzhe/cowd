@@ -157,6 +157,10 @@ pub enum TuiAppEffect {
     Subscribe {
         subscription_id: String,
         path: String,
+        /// Same reserved-header policy as [`Self::Request`]. This carries
+        /// APP-owned cursors or epochs, never credentials.
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
     },
     Unsubscribe {
         subscription_id: String,
