@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -72,6 +72,21 @@ impl GatewayApiClient {
                 .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4())),
             client,
         })
+    }
+
+    /// Return the APP ids registered by the connected Gateway.  The server is
+    /// the startup-policy authority; the TUI uses this only to filter already
+    /// compiled contributions and never to load source code dynamically.
+    pub async fn enabled_app_ids(&self) -> Result<BTreeSet<String>, GatewayApiError> {
+        let value = self.get_json("/api/apps").await?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| GatewayApiError::Url("application catalogue must be an array".into()))?;
+        Ok(items
+            .iter()
+            .filter_map(|item| item.pointer("/descriptor/id").and_then(|id| id.as_str()))
+            .map(str::to_string)
+            .collect())
     }
 
     pub fn from_running_gateway(

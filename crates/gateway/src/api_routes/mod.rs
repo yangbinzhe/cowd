@@ -231,7 +231,7 @@ async fn auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, Response> {
-    let is_mfg = request.uri().path().starts_with("/api/apps/mfg");
+    let request_path = request.uri().path().to_string();
     let claims = if let Some(token) = &state.auth_token {
         let auth_header = request
             .headers()
@@ -242,7 +242,7 @@ async fn auth_middleware(
             Some(h) if h == format!("Bearer {token}") => {
                 let (surface_id, requested_capabilities) =
                     requested_capabilities_for_headers(request.headers()).map_err(|error| {
-                        auth_error_response(is_mfg, StatusCode::BAD_REQUEST, error)
+                        auth_error_response(&state, &request_path, StatusCode::BAD_REQUEST, error)
                     })?;
                 authenticated_human_principal_for_surface(
                     &state.config_home,
@@ -253,7 +253,8 @@ async fn auth_middleware(
                 .map(|(principal, _)| principal)
                 .map_err(|error| {
                     auth_error_response(
-                        is_mfg,
+                        &state,
+                        &request_path,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("authentication_authority_error:{error}"),
                     )
@@ -266,7 +267,8 @@ async fn auth_middleware(
             )
             .map_err(|error| {
                 auth_error_response(
-                    is_mfg,
+                    &state,
+                    &request_path,
                     StatusCode::UNAUTHORIZED,
                     format!("unauthorized:{error}"),
                 )
@@ -279,7 +281,8 @@ async fn auth_middleware(
         }
         #[cfg(not(any(test, feature = "test-support")))]
         return Err(auth_error_response(
-            is_mfg,
+            &state,
+            &request_path,
             StatusCode::UNAUTHORIZED,
             "authentication_not_configured".to_string(),
         ));
@@ -336,16 +339,19 @@ fn generic_app_request_context(
     }
 }
 
-fn auth_error_response(is_mfg: bool, status: StatusCode, message: String) -> Response {
-    if is_mfg {
-        return (
-            status,
-            Json(app_bundle_mfg::mfg_auth_error_envelope(
-                status.as_u16(),
-                message,
-            )),
-        )
-            .into_response();
+fn auth_error_response(
+    state: &AppState,
+    path: &str,
+    status: StatusCode,
+    message: String,
+) -> Response {
+    if let Some(envelope) =
+        state
+            .services
+            .app_registry
+            .error_envelope_for_path(path, status.as_u16(), message.clone())
+    {
+        return (status, Json(envelope)).into_response();
     }
     (status, Json(ErrorResponse { error: message })).into_response()
 }
@@ -511,6 +517,34 @@ pub(super) fn issue_web_session(
 
     #[cfg(any(test, feature = "test-support"))]
     {
+        // Keep a real-broker integration test on the same issuance path as a
+        // production browser session. The direct fixture below remains only
+        // for isolated route tests without a broker process.
+        let socket = auth_broker::BrokerClient::default_socket(config_home.join("auth-broker"));
+        if socket.exists() {
+            let client = auth_broker::BrokerClient::new(socket);
+            let result = client
+                .authenticate_human_for_surface(
+                    credential,
+                    surface_id,
+                    requested_capabilities.clone(),
+                    Some(5 * 60 * 1_000),
+                )
+                .map_err(|error| error.to_string())?;
+            let lifecycle = client
+                .credential_lifecycle()
+                .map_err(|error| error.to_string())?;
+            if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+                return Err("local human credential is revoked".to_string());
+            }
+            verify_human_envelope(
+                &result.envelope,
+                &result.public_key_base64,
+                lifecycle.credential_epoch,
+            )?;
+            return encode_web_session(&result.envelope)
+                .map(|session| (session, result.entitlement));
+        }
         let requested_capabilities = if requested_capabilities.is_empty() {
             test_human_capabilities()
         } else {
@@ -582,6 +616,26 @@ pub(super) fn web_session_principal(
 
     #[cfg(any(test, feature = "test-support"))]
     {
+        // Product integration tests may run a real broker. When it is
+        // present, a browser session must use the same authority and epoch as
+        // every other protected request; otherwise a long-lived APP stream
+        // would correctly observe a stale lifecycle immediately after login.
+        let socket = auth_broker::BrokerClient::default_socket(config_home.join("auth-broker"));
+        if socket.exists() {
+            let client = auth_broker::BrokerClient::new(socket);
+            let (key_id, public_key) =
+                client.trust_metadata().map_err(|error| error.to_string())?;
+            if envelope.key_id != key_id {
+                return Err("browser_session_authority_mismatch".to_string());
+            }
+            let lifecycle = client
+                .credential_lifecycle()
+                .map_err(|error| error.to_string())?;
+            if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+                return Err("local_human_credential_revoked".to_string());
+            }
+            return verify_human_envelope(&envelope, &public_key, lifecycle.credential_epoch);
+        }
         let (_, public_key) = auth_broker::test_support::issue_human_principal(
             config_home.join("auth-broker"),
             test_credential.ok_or_else(|| "test_browser_session_credential_missing".to_string())?,
@@ -698,7 +752,11 @@ fn test_human_capabilities() -> Vec<String> {
         "runtime.maintenance.manage".to_string(),
         "runtime.outbox.retry".to_string(),
     ];
-    capabilities.extend(app_bundle_mfg::mfg_app_descriptor().capabilities);
+    capabilities.extend(
+        cowd_product_apps::compiled_products()
+            .into_iter()
+            .flat_map(|product| product.descriptor().capabilities),
+    );
     capabilities.sort();
     capabilities.dedup();
     capabilities
@@ -5721,12 +5779,13 @@ pub(crate) mod tests {
         // otherwise the external APP quite correctly opens a different MFG
         // SQLite domain from the seeded Gateway data.
         let mut app_registry = cowd_app_host::AppRegistry::default();
-        app_bundle_mfg::register_mfg_embedded_trusted(
+        cowd_product_apps::register_enabled(
             &mut app_registry,
-            config_home.clone(),
+            &config_home,
             state_mut.services.app_host_context(),
+            &|_| true,
         )
-        .expect("test MFG APP registry");
+        .expect("test APP registry");
         state_mut.services = Arc::new(
             (*state_mut.services)
                 .clone()
@@ -7112,13 +7171,18 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(cookie_snapshot.status(), StatusCode::OK);
-        let cookie_snapshot: serde_json::Value = serde_json::from_slice(
-            &to_bytes(cookie_snapshot.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let cookie_snapshot_status = cookie_snapshot.status();
+        let cookie_snapshot_body = to_bytes(cookie_snapshot.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            cookie_snapshot_status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&cookie_snapshot_body)
+        );
+        let cookie_snapshot: serde_json::Value =
+            serde_json::from_slice(&cookie_snapshot_body).unwrap();
         assert_eq!(cookie_snapshot["kind"], "snapshot");
         assert_ne!(
             cookie_snapshot["view_epoch"], bearer_snapshot["view_epoch"],

@@ -5,7 +5,7 @@
 //! application owns rendering, input reduction, contracts and state in its
 //! own repository.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use cowd_app_host::{
     TuiAppAction, TuiAppEffect, TuiAppEffects, TuiAppEvent, TuiAppPanel, TuiAppRenderContext,
@@ -51,17 +51,25 @@ pub struct TuiAppHost {
 impl TuiAppHost {
     #[must_use]
     pub fn product() -> Self {
-        let contributions = {
-            #[cfg(feature = "app-mfg")]
-            {
-                vec![app_bundle_mfg::mfg_tui_surface_contribution()]
-            }
-            #[cfg(not(feature = "app-mfg"))]
-            {
-                Vec::new()
-            }
-        };
+        Self::from_product_contributions(product_contributions())
+    }
 
+    /// Mount only APP panels registered by the connected Gateway.  A full
+    /// binary can contain more reviewed APP code than a deployment enables;
+    /// this filter prevents terminal panels from becoming a second source of
+    /// runtime truth.
+    #[must_use]
+    pub fn product_for_enabled_apps(enabled_app_ids: &BTreeSet<String>) -> Self {
+        Self::from_product_contributions(
+            product_contributions()
+                .into_iter()
+                .filter(|contribution| enabled_app_ids.contains(contribution.app_id.as_str())),
+        )
+    }
+
+    fn from_product_contributions(
+        contributions: impl IntoIterator<Item = TuiAppSurfaceContribution>,
+    ) -> Self {
         match Self::from_contributions(contributions) {
             Ok(host) => host,
             Err(error) => Self {
@@ -222,4 +230,8 @@ impl TuiAppHost {
                 effect,
             }));
     }
+}
+
+fn product_contributions() -> Vec<TuiAppSurfaceContribution> {
+    cowd_product_apps::tui_surface_contributions()
 }

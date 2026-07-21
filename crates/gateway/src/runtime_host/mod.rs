@@ -705,18 +705,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 .map(|home| home.join(".cowd"))
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
-    // Authentication starts before the concrete HTTP host exists. It receives
-    // only generic APP descriptors; the immutable router contribution is
-    // assembled later with the stable host-effect binding.
-    let auth_catalog = auth_broker::AuthorizationCatalog::from_app_descriptors([
-        app_bundle_mfg::mfg_app_descriptor(),
-    ])
-    .map_err(|error| format!("failed to compose auth profile catalogue: {error}"))?;
-    let mut auth_broker = config
-        .auth_token
-        .as_deref()
-        .map(|credential| AuthBrokerProcess::start(&approval_dir, credential, &auth_catalog))
-        .transpose()?;
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let config_load =
         runtime::ConfigLoader::new(&workspace_root, &approval_dir).load_with_diagnostics();
@@ -730,6 +718,19 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     for diagnostic in &config_diagnostics {
         tracing::warn!(code = %diagnostic.code, message = %diagnostic.message, "runtime config diagnostic");
     }
+    // Authentication starts before the concrete HTTP host exists.  It uses
+    // exactly the same enabled-APP set that will later build AppRegistry, so
+    // a disabled APP cannot remain present in the broker's capability
+    // catalogue.
+    let auth_catalog = auth_broker::AuthorizationCatalog::from_app_descriptors(
+        crate::services::enabled_app_descriptors(runtime_config.apps()),
+    )
+    .map_err(|error| format!("failed to compose auth profile catalogue: {error}"))?;
+    let mut auth_broker = config
+        .auth_token
+        .as_deref()
+        .map(|credential| AuthBrokerProcess::start(&approval_dir, credential, &auth_catalog))
+        .transpose()?;
     let provider_registry = Arc::new(
         runtime::ProviderRegistry::new(runtime_config.providers().clone()).map_err(|rejected| {
             format!(
@@ -968,8 +969,11 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         &approval_dir,
         capacity_config,
     );
-    let app_registry =
-        crate::services::broker_backed_app_registry(&approval_dir, services.app_host_context());
+    let app_registry = crate::services::broker_backed_app_registry(
+        &approval_dir,
+        services.app_host_context(),
+        runtime_config.apps(),
+    );
     let services = Arc::new(services.with_app_registry(app_registry));
     let _cleanup_handle =
         spawn_session_cleanup_task(Arc::clone(&session_manager), Duration::from_secs(300));

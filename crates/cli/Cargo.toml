@@ -7,7 +7,7 @@ publish.workspace = true
 
 [dependencies]
 auth-broker = { path = "../auth-broker" }
-gateway = { path = "../gateway" }
+gateway = { path = "../gateway", default-features = false }
 sandbox-launcher = { path = "../sandbox-launcher" }
 runtime = { path = "../runtime" }
 serde.workspace = true
@@ -19,9 +19,10 @@ name = "cowd"
 path = "src/main.rs"
 
 [features]
-default = []
-tui-surface = ["dep:tui", "tui/app-mfg"]
-full = ["tui-surface", "tui/code-highlight", "gateway/code-index"]
+default = ["app-mfg"]
+app-mfg = ["gateway/app-mfg", "tui?/app-mfg"]
+tui-surface = ["dep:tui"]
+full = ["tui-surface", "app-mfg", "tui/code-highlight", "gateway/code-index"]
 
 [dev-dependencies]
 cowd-app-sdk = { path = "../app-sdk" }

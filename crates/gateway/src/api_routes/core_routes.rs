@@ -13,7 +13,6 @@ use matrix_core::structured::{
     StructuredIngestPlanInput as CowdStructuredIngestPlanInput,
     StructuredSource as CowdStructuredSource, StructuredWatermark as CowdWatermark,
 };
-use matrix_core::{MatrixEvidencePacket, MatrixEvidenceSourceRef};
 use runtime::capability::{CowdApplicationCapabilityInput, CowdCapabilityRegistry, CowdSurface};
 use runtime::projection::CowdProjection;
 use runtime::release_gate::{CowdReleaseGateReport, CowdReleaseGateRuntimeEvidence};
@@ -22,7 +21,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::services::GatewayMatrixRepositoryError;
 
-use super::route_manifest::gateway_route_manifest;
 use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
@@ -255,18 +253,22 @@ async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRunti
         structured_watermark_persistent,
         execution_outcome_timeline_available: execution_outcome_timeline_available(state).await,
         memory_context_bridge_available: memory_context_bridge_available(state).await,
-        graph_skill_quality_contracts_available: graph_skill_quality_contract_smoke(),
-        gateway_route_manifest_available: gateway_route_manifest_available(),
+        graph_skill_quality_contracts_available: graph_skill_quality_contracts_available(
+            state.services.app_registry.as_ref(),
+        ),
+        gateway_route_manifest_available: gateway_route_manifest_available(state),
         frontend_api_matrix_ready: frontend_api_matrix_ready(),
         surface_version_compatible: surface_version_compatible(),
     }
 }
 
-fn gateway_route_manifest_available() -> bool {
-    let routes = gateway_route_manifest();
+fn gateway_route_manifest_available(state: &AppState) -> bool {
+    let routes = super::route_manifest::gateway_route_manifest_for_apps(
+        state.services.app_registry.as_ref(),
+    );
     let pairs = routes
         .iter()
-        .map(|entry| (entry.method, entry.path.as_str()))
+        .map(|entry| (entry.method.as_str(), entry.path.as_str()))
         .collect::<BTreeSet<_>>();
     !routes.is_empty()
         && pairs.len() == routes.len()
@@ -491,27 +493,14 @@ fn runtime_skill_memory_candidate(
     })
 }
 
-fn graph_skill_quality_contract_smoke() -> bool {
-    if !app_bundle_mfg::mfg_skill_quality_contract_smoke() {
-        return false;
-    }
-
-    let mut packet = MatrixEvidencePacket::new("release gate structured quality smoke");
-    packet.packet_id = "release-gate-smoke".to_string();
-    packet.confidence = 0.9;
-    packet
-        .metric_evidence
-        .push(serde_json::json!({"metric": "material_shortage_risk"}));
-    packet.source_refs.push(MatrixEvidenceSourceRef {
-        kind: "fact".to_string(),
-        reference: "structured-fact:release-gate-smoke".to_string(),
-        summary: "release gate smoke fact".to_string(),
-    });
-    packet.confidence >= 0.75
-        && packet
-            .source_refs
-            .iter()
-            .any(|source| source.reference == "structured-fact:release-gate-smoke")
+/// A product-level release gate must only assess contracts belonging to Apps
+/// mounted in this Gateway process.  A compiled-but-disabled App cannot make
+/// the core release gate depend on its private quality fixtures.
+fn graph_skill_quality_contracts_available(app_registry: &cowd_app_host::AppRegistry) -> bool {
+    app_registry
+        .verify_quality_checks()
+        .into_iter()
+        .all(|check| check.passed)
 }
 
 fn store_error(error: GatewayMatrixRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
@@ -618,5 +607,12 @@ mod tests {
             );
             assert!(is_execution_outcome_event(&event), "missing {kind}");
         }
+    }
+
+    #[test]
+    fn registry_without_enabled_apps_has_no_quality_requirement() {
+        assert!(graph_skill_quality_contracts_available(
+            &cowd_app_host::AppRegistry::default()
+        ));
     }
 }

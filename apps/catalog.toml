@@ -1,0 +1,12 @@
+# Canonical reviewed product inputs.  Adding an APP is an explicit catalog
+# change plus its immutable source lock; source directories are never
+# auto-discovered at build time.
+schema = 1
+
+[[apps]]
+id = "mfg"
+source_lock = "mfg/source.lock.toml"
+feature = "app-mfg"
+rust_bundle_package = "cowd-app-mfg-bundle"
+rust_bundle_crate = "cowd_app_mfg_bundle"
+webui_package = "@cowd/app-mfg-webui"

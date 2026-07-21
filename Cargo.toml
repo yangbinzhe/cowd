@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/app-bundle-mfg",
+    "crates/product-apps",
     "crates/app-sdk",
     "crates/app-host",
     "crates/harness-contract",
@@ -30,7 +30,7 @@ members = [
 ]
 resolver = "2"
 default-members = [
-    "crates/app-bundle-mfg",
+    "crates/product-apps",
     "crates/app-sdk",
     "crates/app-host",
     "crates/harness-contract",
@@ -59,7 +59,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.562"
+version = "0.9.563"
 edition = "2021"
 license = "MIT"
 publish = false

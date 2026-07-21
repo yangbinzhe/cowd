@@ -10,9 +10,9 @@ use axum::{
 use serde::Deserialize;
 
 use super::capability_contract::{
-    gateway_capability_contract, gateway_openai_tools, gateway_openapi_document,
+    gateway_capability_contract_for_apps, gateway_openai_tools_for_apps,
+    gateway_openapi_document_for_apps,
 };
-use super::route_manifest::gateway_route_manifest;
 use super::{
     authenticated_human_principal_for_surface, cookie_value, issue_web_session,
     validate_surface_capability_request, web_session_principal, AppState, ErrorResponse,
@@ -76,14 +76,28 @@ async fn webui_manifest_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let health = crate::gateway_health::gateway_health_snapshot(&state);
+    let enabled_app_ids = state
+        .services
+        .app_registry
+        .apps()
+        .into_iter()
+        .map(|app| app.descriptor.id.to_string())
+        .collect();
     Json(
-        serde_json::to_value(crate::gateway_service::webui_manifest(health))
-            .unwrap_or_else(|_| serde_json::json!({"kind":"cowd.webui.manifest","status":"error"})),
+        serde_json::to_value(crate::gateway_service::webui_manifest(
+            health,
+            enabled_app_ids,
+        ))
+        .unwrap_or_else(|_| serde_json::json!({"kind":"cowd.webui.manifest","status":"error"})),
     )
 }
 
-async fn route_manifest_handler() -> Json<serde_json::Value> {
-    let routes = gateway_route_manifest();
+async fn route_manifest_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let routes = super::route_manifest::gateway_route_manifest_for_apps(
+        state.services.app_registry.as_ref(),
+    );
     Json(serde_json::json!({
         "kind": "gateway.route_manifest",
         "schema_version": 1,
@@ -92,20 +106,31 @@ async fn route_manifest_handler() -> Json<serde_json::Value> {
     }))
 }
 
-async fn capability_contract_handler() -> Json<serde_json::Value> {
+async fn capability_contract_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
     Json(
-        serde_json::to_value(gateway_capability_contract()).unwrap_or_else(
+        serde_json::to_value(gateway_capability_contract_for_apps(
+            state.services.app_registry.as_ref(),
+        ))
+        .unwrap_or_else(
             |_| serde_json::json!({"kind":"gateway.capability_contract","status":"error"}),
         ),
     )
 }
 
-async fn openapi_handler() -> Json<serde_json::Value> {
-    Json(gateway_openapi_document())
+async fn openapi_handler(AxumState(state): AxumState<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(gateway_openapi_document_for_apps(
+        state.services.app_registry.as_ref(),
+    ))
 }
 
-async fn openai_tools_handler() -> Json<serde_json::Value> {
-    Json(gateway_openai_tools())
+async fn openai_tools_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    Json(gateway_openai_tools_for_apps(
+        state.services.app_registry.as_ref(),
+    ))
 }
 
 #[derive(Deserialize)]

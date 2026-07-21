@@ -248,6 +248,21 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
             "Gateway API is required for TUI; start `cowd gateway run` or allow TUI autostart"
                 .to_string()
         })?;
+    match runtime.block_on(gateway_client.enabled_app_ids()) {
+        Ok(enabled_app_ids) => state.set_gateway_enabled_apps(&enabled_app_ids),
+        Err(error) => {
+            // A stale TUI binary must not expose an APP that this Gateway did
+            // not confirm.  Core terminal functions remain usable and the
+            // diagnostic makes the degraded bootstrap explicit.
+            state.set_gateway_enabled_apps(&std::collections::BTreeSet::new());
+            state.add_system_notice(
+                SystemNoticeKind::Warning,
+                &format!(
+                    "Application catalogue is unavailable; APP panels are hidden until Gateway confirms them: {error}"
+                ),
+            );
+        }
+    }
     let gateway_session_ids = attach_gateway_session(
         runtime,
         &gateway_client,

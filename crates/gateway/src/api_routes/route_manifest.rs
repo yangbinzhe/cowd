@@ -11,20 +11,20 @@ use super::route_registry::{
 /// constants rather than literals. Runtime callers never inspect source text.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) struct GatewayRouteManifestEntry {
-    pub(crate) method: &'static str,
+    pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) group: String,
-    pub(crate) owner: &'static str,
+    pub(crate) owner: String,
     pub(crate) criticality: &'static str,
     pub(crate) stability: &'static str,
     pub(crate) source: String,
     pub(crate) handler: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) mfg: Option<GatewayMfgSemanticMetadata>,
+    pub(crate) app: Option<GatewayAppSemanticMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
-pub(crate) struct GatewayMfgSemanticMetadata {
+pub(crate) struct GatewayAppSemanticMetadata {
     pub(crate) route_id: String,
     pub(crate) request_schema: String,
     pub(crate) response_schema: String,
@@ -33,9 +33,25 @@ pub(crate) struct GatewayMfgSemanticMetadata {
     pub(crate) risk: String,
     pub(crate) confirmation: String,
     pub(crate) emits_live_event: bool,
+    pub(crate) auth_error_schema: Option<String>,
 }
 
+/// Full product manifest used by build-time contract tests.  Runtime callers
+/// must use [`gateway_route_manifest_for_apps`] so a disabled APP is never
+/// advertised as an available route family.
 pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
+    gateway_route_manifest_with_apps(Vec::new())
+}
+
+pub(crate) fn gateway_route_manifest_for_apps(
+    app_registry: &cowd_app_host::AppRegistry,
+) -> Vec<GatewayRouteManifestEntry> {
+    gateway_route_manifest_with_apps(app_registry.route_metadata())
+}
+
+fn gateway_route_manifest_with_apps(
+    app_routes: Vec<cowd_app_host::RegisteredAppRouteMetadata>,
+) -> Vec<GatewayRouteManifestEntry> {
     let mut entries = BTreeSet::new();
     for route in generated_route_metadata() {
         entries.insert(manifest_entry(route));
@@ -51,15 +67,15 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
             entry.method == route.method && entry.path == route.path
         }) {
             entries.insert(GatewayRouteManifestEntry {
-                method: route.method,
+                method: route.method.to_string(),
                 path: route.path,
                 group: "route_registry".to_string(),
-                owner: "gateway",
+                owner: "gateway".to_string(),
                 criticality: route_criticality("runtime"),
                 stability: "stable",
                 source: "route_registry.rs".to_string(),
                 handler: route.operation_id,
-                mfg: None,
+                app: None,
             });
         }
     }
@@ -68,65 +84,63 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
     // static APP contract, preserving any Gateway-owned route entry already
     // found above. The resulting metadata explicitly records that these are
     // APP-owned handlers rather than synthetic Gateway handlers.
-    for contract in app_bundle_mfg::mfg_route_metadata()
+    for registered in app_routes
         .into_iter()
-        .filter(|route| route.active)
+        .filter(|registered| registered.route.active)
     {
+        let contract = registered.route;
+        let auth_error_schema = registered.auth_error_schema;
         if entries.iter().any(|entry: &GatewayRouteManifestEntry| {
             entry.method == contract.method && entry.path == contract.path
         }) {
             continue;
         }
-        entries.insert(app_mfg_manifest_entry(contract));
+        entries.insert(app_manifest_entry(
+            registered.app_id,
+            contract,
+            auth_error_schema,
+        ));
     }
     entries.into_iter().collect()
 }
 
 fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
-    let mfg = app_bundle_mfg::mfg_route_metadata()
-        .into_iter()
-        .find(|contract| contract.method == route.method && contract.path == route.path)
-        .map(mfg_semantic_metadata);
     GatewayRouteManifestEntry {
-        method: route.method,
+        method: route.method.to_string(),
         path: route.path.to_string(),
         group: route_group(route.source),
-        owner: "gateway",
+        owner: "gateway".to_string(),
         criticality: route_criticality(route.path),
         stability: route_stability(route.path),
         source: route.source.to_string(),
         handler: route.handler.to_string(),
-        mfg,
+        app: None,
     }
 }
 
-fn app_mfg_manifest_entry(contract: app_bundle_mfg::MfgRouteMetadata) -> GatewayRouteManifestEntry {
+fn app_manifest_entry(
+    app_id: cowd_app_sdk::AppId,
+    contract: cowd_app_sdk::AppRouteMetadata,
+    auth_error_schema: Option<String>,
+) -> GatewayRouteManifestEntry {
     GatewayRouteManifestEntry {
-        method: mfg_static_method(&contract.method),
+        method: contract.method.clone(),
         path: contract.path.to_string(),
         group: "app".to_string(),
-        owner: "app:mfg",
+        owner: format!("app:{app_id}"),
         criticality: route_criticality(&contract.path),
         stability: "stable",
-        source: "app_registry:mfg".to_string(),
+        source: format!("app_registry:{app_id}"),
         handler: contract.route_id.clone(),
-        mfg: Some(mfg_semantic_metadata(contract)),
+        app: Some(app_semantic_metadata(contract, auth_error_schema)),
     }
 }
 
-fn mfg_static_method(method: &str) -> &'static str {
-    match method {
-        "GET" => "GET",
-        "POST" => "POST",
-        "PUT" => "PUT",
-        "PATCH" => "PATCH",
-        "DELETE" => "DELETE",
-        other => panic!("MFG contract has unsupported HTTP method: {other}"),
-    }
-}
-
-fn mfg_semantic_metadata(contract: app_bundle_mfg::MfgRouteMetadata) -> GatewayMfgSemanticMetadata {
-    GatewayMfgSemanticMetadata {
+fn app_semantic_metadata(
+    contract: cowd_app_sdk::AppRouteMetadata,
+    auth_error_schema: Option<String>,
+) -> GatewayAppSemanticMetadata {
+    GatewayAppSemanticMetadata {
         route_id: contract.route_id,
         request_schema: contract.request_schema,
         response_schema: contract.response_schema,
@@ -135,6 +149,7 @@ fn mfg_semantic_metadata(contract: app_bundle_mfg::MfgRouteMetadata) -> GatewayM
         risk: contract.risk,
         confirmation: contract.confirmation,
         emits_live_event: contract.streaming,
+        auth_error_schema,
     }
 }
 
@@ -223,7 +238,7 @@ mod tests {
         let manifest = gateway_route_manifest();
         let unique = manifest
             .iter()
-            .map(|entry| (entry.method, entry.path.as_str()))
+            .map(|entry| (entry.method.as_str(), entry.path.as_str()))
             .collect::<BTreeSet<_>>();
 
         assert_eq!(unique.len(), manifest.len());
@@ -239,25 +254,10 @@ mod tests {
     }
 
     #[test]
-    fn active_mfg_contract_matches_global_route_inventory_bidirectionally() {
-        let manifest = gateway_route_manifest()
-            .into_iter()
-            .filter(|entry| entry.path.starts_with("/api/apps/mfg/"))
-            .map(|entry| (entry.method.to_string(), entry.path))
-            .collect::<BTreeSet<_>>();
-        let contract = app_bundle_mfg::mfg_route_metadata()
-            .into_iter()
-            .filter(|route| route.active)
-            .map(|route| (route.method, route.path))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(contract.len(), 104);
-        assert_eq!(manifest, contract);
-        let external_contract = gateway_route_manifest()
-            .into_iter()
-            .find(|entry| entry.method == "GET" && entry.path == "/api/apps/mfg/contract")
-            .expect("external MFG contract route is inventoried");
-        assert_eq!(external_contract.owner, "app:mfg");
-        assert_eq!(external_contract.source, "app_registry:mfg");
-        assert_eq!(external_contract.handler, "mfg.contract.get");
+    fn runtime_manifest_does_not_advertise_an_unregistered_app() {
+        let manifest = gateway_route_manifest_for_apps(&cowd_app_host::AppRegistry::default());
+        assert!(manifest
+            .iter()
+            .all(|entry| !entry.path.starts_with("/api/apps/mfg/")));
     }
 }

@@ -6,7 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-app-bundle-mfg = { path = "../app-bundle-mfg", optional = true }
+cowd-product-apps = { path = "../product-apps", default-features = false }
 cowd-app-host = { path = "../app-host" }
 harness-contract = { path = "../harness-contract" }
 chrono = { version = "0.4", features = ["serde"] }
@@ -30,7 +30,7 @@ uuid = { workspace = true }
 
 [features]
 default = []
-app-mfg = ["dep:app-bundle-mfg"]
+app-mfg = ["cowd-product-apps/app-mfg"]
 code-highlight = ["dep:syntect"]
 
 [dev-dependencies]

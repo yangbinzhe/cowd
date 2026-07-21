@@ -422,26 +422,63 @@ fn embedded_app_registry(
     config_home: &std::path::Path,
     host_context: cowd_app_sdk::CowdAppContext,
 ) -> cowd_app_host::AppRegistry {
+    embedded_app_registry_with_policy(config_home, host_context, &runtime::AppsConfig::default())
+}
+
+fn embedded_app_registry_with_policy(
+    config_home: &std::path::Path,
+    host_context: cowd_app_sdk::CowdAppContext,
+    apps: &runtime::AppsConfig,
+) -> cowd_app_host::AppRegistry {
     let mut registry = cowd_app_host::AppRegistry::default();
-    app_bundle_mfg::register_mfg_embedded_trusted(
-        &mut registry,
-        config_home.to_path_buf(),
-        host_context,
-    )
-    .expect("static MFG product contribution must have a valid descriptor");
+    cowd_product_apps::register_enabled(&mut registry, config_home, host_context, &|app_id| {
+        apps.is_enabled(app_id)
+    })
+    .expect("static APP product contributions must have valid descriptors");
     registry
+}
+
+/// The set of application descriptors admitted to this Gateway process.
+///
+/// Source selection is deliberately already complete at this point: this
+/// function only filters compile-time linked product contributions according
+/// to the unified startup policy.  The same result is used for broker
+/// capabilities and the AppRegistry so an APP cannot be authorised without
+/// being mounted, or mounted without being authorised.
+pub(crate) fn enabled_app_descriptors(
+    apps: &runtime::AppsConfig,
+) -> Vec<cowd_app_sdk::AppDescriptor> {
+    cowd_product_apps::enabled_descriptors(&|app_id| apps.is_enabled(app_id))
 }
 
 pub(crate) fn broker_backed_app_registry(
     config_home: impl AsRef<std::path::Path>,
     host_context: cowd_app_sdk::CowdAppContext,
+    apps: &runtime::AppsConfig,
 ) -> cowd_app_host::AppRegistry {
     let mut registry = cowd_app_host::AppRegistry::default();
-    app_bundle_mfg::register_mfg_with_broker(
+    cowd_product_apps::register_enabled(
         &mut registry,
-        config_home.as_ref().to_path_buf(),
+        config_home.as_ref(),
         host_context,
+        &|app_id| apps.is_enabled(app_id),
     )
-    .expect("static MFG product contribution must have a valid descriptor");
+    .expect("static APP product contributions must have valid descriptors");
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_app_is_absent_from_descriptor_and_router_composition() {
+        let apps = runtime::AppsConfig::default().with_app_enabled("mfg", false);
+        let binding = GatewayAppHostBinding::new();
+        let registry = broker_backed_app_registry(std::env::temp_dir(), binding.context(), &apps);
+
+        assert!(enabled_app_descriptors(&apps).is_empty());
+        assert!(registry.apps().is_empty());
+        assert!(registry.skills().is_empty());
+    }
 }

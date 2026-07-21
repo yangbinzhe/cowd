@@ -7,7 +7,9 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::{
-    route_manifest::{gateway_route_manifest, GatewayRouteManifestEntry},
+    route_manifest::{
+        gateway_route_manifest, gateway_route_manifest_for_apps, GatewayRouteManifestEntry,
+    },
     route_registry::stable_route_metadata,
 };
 
@@ -51,6 +53,8 @@ pub(crate) struct GatewayCapability {
     input_schema: Value,
     output_schema: Value,
     tests: Vec<String>,
+    #[serde(skip)]
+    app: Option<super::route_manifest::GatewayAppSemanticMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,7 +84,18 @@ struct GatewayCapabilityAiAffordance {
 }
 
 pub(crate) fn gateway_capability_contract() -> GatewayCapabilityContract {
-    let routes = gateway_route_manifest();
+    gateway_capability_contract_from_routes(gateway_route_manifest())
+}
+
+pub(crate) fn gateway_capability_contract_for_apps(
+    app_registry: &cowd_app_host::AppRegistry,
+) -> GatewayCapabilityContract {
+    gateway_capability_contract_from_routes(gateway_route_manifest_for_apps(app_registry))
+}
+
+fn gateway_capability_contract_from_routes(
+    routes: Vec<GatewayRouteManifestEntry>,
+) -> GatewayCapabilityContract {
     let capabilities = routes.iter().map(route_capability).collect::<Vec<_>>();
     let openapi_path_count = capabilities
         .iter()
@@ -121,6 +136,23 @@ pub(crate) fn gateway_capability_contract() -> GatewayCapabilityContract {
 
 pub(crate) fn gateway_openapi_document() -> Value {
     let contract = gateway_capability_contract();
+    gateway_openapi_document_from_contract(contract, Map::new())
+}
+
+pub(crate) fn gateway_openapi_document_for_apps(
+    app_registry: &cowd_app_host::AppRegistry,
+) -> Value {
+    let contract = gateway_capability_contract_for_apps(app_registry);
+    gateway_openapi_document_from_contract(
+        contract,
+        app_registry.openapi_components().into_iter().collect(),
+    )
+}
+
+fn gateway_openapi_document_from_contract(
+    contract: GatewayCapabilityContract,
+    app_components: Map<String, Value>,
+) -> Value {
     let mut paths = Map::new();
     for capability in &contract.capabilities {
         let path_entry = paths
@@ -217,7 +249,7 @@ pub(crate) fn gateway_openapi_document() -> Value {
     ] {
         schemas.insert(name.to_string(), schema);
     }
-    schemas.extend(mfg_openapi_components());
+    schemas.extend(app_components);
 
     json!({
         "openapi": "3.1.0",
@@ -248,129 +280,17 @@ pub(crate) fn gateway_openapi_document() -> Value {
     })
 }
 
-fn mfg_openapi_components() -> Map<String, Value> {
-    let mut schemas = app_bundle_mfg::mfg_openapi_components();
-    for (name, schema) in [
-        (
-            "MatrixDataPlaneHealth",
-            openapi_schema_component::<matrix_core::MatrixDataPlaneHealth>("MatrixDataPlaneHealth"),
-        ),
-        (
-            "MatrixDataPlaneIngestPlan",
-            openapi_schema_component::<matrix_core::MatrixDataPlaneIngestPlan>(
-                "MatrixDataPlaneIngestPlan",
-            ),
-        ),
-        (
-            "MatrixSourcePack",
-            openapi_schema_component::<matrix_core::MatrixSourcePack>("MatrixSourcePack"),
-        ),
-        (
-            "MatrixSourcePackValidation",
-            openapi_schema_component::<matrix_core::MatrixSourcePackValidation>(
-                "MatrixSourcePackValidation",
-            ),
-        ),
-        (
-            "MatrixSourceDeltaPlan",
-            openapi_schema_component::<matrix_core::MatrixSourceDeltaPlan>("MatrixSourceDeltaPlan"),
-        ),
-        (
-            "MatrixConnectorRun",
-            openapi_schema_component::<matrix_core::MatrixConnectorRun>("MatrixConnectorRun"),
-        ),
-        (
-            "MatrixMetricDefinition",
-            openapi_schema_component::<matrix_core::MatrixMetricDefinition>(
-                "MatrixMetricDefinition",
-            ),
-        ),
-        (
-            "MatrixMetricSnapshot",
-            openapi_schema_component::<matrix_core::MatrixMetricSnapshot>("MatrixMetricSnapshot"),
-        ),
-        (
-            "MatrixMetricLineage",
-            openapi_schema_component::<matrix_core::MatrixMetricLineage>("MatrixMetricLineage"),
-        ),
-        (
-            "MatrixMetricAttentionPlan",
-            openapi_schema_component::<matrix_core::MatrixMetricAttentionPlan>(
-                "MatrixMetricAttentionPlan",
-            ),
-        ),
-        (
-            "MatrixComputeJob",
-            openapi_schema_component::<matrix_core::MatrixComputeJob>("MatrixComputeJob"),
-        ),
-        (
-            "MatrixEntity",
-            openapi_schema_component::<matrix_core::MatrixEntity>("MatrixEntity"),
-        ),
-        (
-            "MatrixRelation",
-            openapi_schema_component::<matrix_core::MatrixRelation>("MatrixRelation"),
-        ),
-        (
-            "MatrixFact",
-            openapi_schema_component::<matrix_core::MatrixFact>("MatrixFact"),
-        ),
-        (
-            "MatrixChangeEvent",
-            openapi_schema_component::<matrix_core::MatrixChangeEvent>("MatrixChangeEvent"),
-        ),
-        (
-            "MatrixAttentionItem",
-            openapi_schema_component::<matrix_core::MatrixAttentionItem>("MatrixAttentionItem"),
-        ),
-        (
-            "MatrixEvidencePacket",
-            openapi_schema_component::<matrix_core::MatrixEvidencePacket>("MatrixEvidencePacket"),
-        ),
-        (
-            "MatrixQualityGateDecision",
-            openapi_schema_component::<matrix_core::MatrixQualityGateDecision>(
-                "MatrixQualityGateDecision",
-            ),
-        ),
-    ] {
-        schemas.insert(name.to_string(), schema);
-    }
-    schemas.into_iter().collect()
-}
-
-fn openapi_schema_component<T: schemars::JsonSchema>(component: &str) -> Value {
-    let mut schema = serde_json::to_value(schemars::schema_for!(T)).unwrap_or(Value::Bool(false));
-    rewrite_openapi_local_refs(&mut schema, component);
-    schema
-}
-
-fn rewrite_openapi_local_refs(value: &mut Value, component: &str) {
-    match value {
-        Value::Object(object) => {
-            let rewritten = object
-                .get("$ref")
-                .and_then(Value::as_str)
-                .and_then(|reference| reference.strip_prefix("#/$defs/"))
-                .map(|path| format!("#/components/schemas/{component}/$defs/{path}"));
-            if let Some(reference) = rewritten {
-                object.insert("$ref".to_string(), Value::String(reference));
-            }
-            for child in object.values_mut() {
-                rewrite_openapi_local_refs(child, component);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                rewrite_openapi_local_refs(item, component);
-            }
-        }
-        _ => {}
-    }
-}
-
 pub(crate) fn gateway_openai_tools() -> Value {
     let contract = gateway_capability_contract();
+    gateway_openai_tools_from_contract(contract)
+}
+
+pub(crate) fn gateway_openai_tools_for_apps(app_registry: &cowd_app_host::AppRegistry) -> Value {
+    let contract = gateway_capability_contract_for_apps(app_registry);
+    gateway_openai_tools_from_contract(contract)
+}
+
+fn gateway_openai_tools_from_contract(contract: GatewayCapabilityContract) -> Value {
     let mut seen_names = BTreeSet::new();
     let tools = contract
         .capabilities
@@ -445,6 +365,7 @@ fn route_capability(route: &GatewayRouteManifestEntry) -> GatewayCapability {
         input_schema,
         output_schema,
         tests,
+        app: route.app.clone(),
     }
 }
 
@@ -727,7 +648,7 @@ fn capability_title(route: &GatewayRouteManifestEntry, domain: &str) -> String {
 }
 
 fn capability_description(route: &GatewayRouteManifestEntry, domain: &str) -> String {
-    let action = match route.method {
+    let action = match route.method.as_str() {
         "GET" => "Query",
         "POST" => "Invoke or create",
         "PUT" => "Replace",
@@ -913,6 +834,7 @@ fn openapi_path(path: &str) -> String {
 fn openapi_operation(capability: &GatewayCapability) -> Value {
     let mut operation = Map::new();
     let stable_metadata = stable_route_metadata(&capability.http.method, &capability.http.path);
+    let app_metadata = capability.app.as_ref();
     operation.insert(
         "operationId".to_string(),
         Value::String(
@@ -947,14 +869,18 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
     if capability.http.method != "GET" && capability.http.method != "DELETE" {
-        let request_schema =
-            stable_request_schema(capability).unwrap_or_else(|| capability.input_schema.clone());
+        let request_schema = app_metadata
+            .map(|metadata| {
+                json!({"$ref": format!("#/components/schemas/{}", metadata.request_schema)})
+            })
+            .or_else(|| stable_request_schema(capability))
+            .unwrap_or_else(|| capability.input_schema.clone());
         let mut request_content = Map::new();
         request_content.insert(
             "application/json".to_string(),
             json!({"schema": request_schema.clone()}),
         );
-        if !capability.http.path.starts_with("/api/apps/mfg/") {
+        if app_metadata.is_none() {
             request_content.insert(
                 "multipart/form-data".to_string(),
                 json!({"schema": request_schema}),
@@ -968,20 +894,29 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
             }),
         );
     }
-    let response_schema =
-        stable_response_schema(capability).unwrap_or_else(|| capability.output_schema.clone());
+    let response_schema = app_metadata
+        .map(|metadata| {
+            json!({"$ref": format!("#/components/schemas/{}", metadata.response_schema)})
+        })
+        .or_else(|| stable_response_schema(capability))
+        .unwrap_or_else(|| capability.output_schema.clone());
     let mut content = Map::new();
     content.insert(
         "application/json".to_string(),
         json!({"schema": response_schema}),
     );
-    if stable_metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.streaming)
+    if app_metadata
+        .map(|metadata| metadata.emits_live_event)
+        .or_else(|| stable_metadata.as_ref().map(|metadata| metadata.streaming))
+        .unwrap_or(false)
     {
-        let event_schema = stable_metadata
-            .as_ref()
+        let event_schema = app_metadata
             .map(|metadata| metadata.response_schema.as_str())
+            .or_else(|| {
+                stable_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.response_schema.as_str())
+            })
             .unwrap_or("ProjectionDelta");
         content.insert(
             "text/event-stream".to_string(),
@@ -991,19 +926,19 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
             }),
         );
     }
-    let responses = if capability.http.path.starts_with("/api/apps/mfg/") {
+    let responses = if let Some(metadata) = app_metadata {
         json!({
             "200": {
                 "description": "Successful Gateway response",
                 "content": Value::Object(content)
             },
-            "400": mfg_openapi_error_response("Bad request"),
-            "401": mfg_openapi_error_response("Unauthorized"),
-            "403": mfg_openapi_error_response("Capability or scope denied"),
-            "404": mfg_openapi_error_response("Resource is outside the verified scope"),
-            "409": mfg_openapi_error_response("Revision or idempotency conflict"),
-            "429": mfg_openapi_error_response("Rate limited"),
-            "500": mfg_openapi_error_response("Gateway internal error")
+            "400": app_openapi_error_response("Bad request", metadata.auth_error_schema.as_deref()),
+            "401": app_openapi_error_response("Unauthorized", metadata.auth_error_schema.as_deref()),
+            "403": app_openapi_error_response("Capability or scope denied", metadata.auth_error_schema.as_deref()),
+            "404": app_openapi_error_response("Resource is outside the verified scope", metadata.auth_error_schema.as_deref()),
+            "409": app_openapi_error_response("Revision or idempotency conflict", metadata.auth_error_schema.as_deref()),
+            "429": app_openapi_error_response("Rate limited", metadata.auth_error_schema.as_deref()),
+            "500": app_openapi_error_response("Gateway internal error", metadata.auth_error_schema.as_deref())
         })
     } else {
         json!({
@@ -1032,12 +967,12 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
     Value::Object(operation)
 }
 
-fn mfg_openapi_error_response(description: &str) -> Value {
+fn app_openapi_error_response(description: &str, error_schema: Option<&str>) -> Value {
     json!({
         "description": description,
         "content": {
             "application/json": {
-                "schema": {"$ref": "#/components/schemas/MfgApiErrorV1"}
+                "schema": {"$ref": format!("#/components/schemas/{}", error_schema.unwrap_or("GatewayError"))}
             }
         }
     })
@@ -1637,6 +1572,28 @@ mod tests {
     }
 
     #[test]
+    fn disabled_app_is_not_published_to_http_or_ai_contracts() {
+        let app_registry = cowd_app_host::AppRegistry::default();
+        let contract = gateway_capability_contract_for_apps(&app_registry);
+        let openapi = gateway_openapi_document_for_apps(&app_registry);
+        let tools = gateway_openai_tools_for_apps(&app_registry);
+
+        assert!(contract
+            .capabilities
+            .iter()
+            .all(|capability| !capability.http.path.starts_with("/api/apps/mfg")));
+        assert!(openapi["paths"]["/api/apps/mfg/projects"].is_null());
+        assert!(openapi["components"]["schemas"]["MfgApiErrorV1"].is_null());
+        assert!(tools["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .all(|tool| !tool["x-cowd"]["http"]["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("/api/apps/mfg"))));
+    }
+
+    #[test]
     fn execution_projection_openapi_uses_typed_route_schema_metadata() {
         let document = gateway_openapi_document();
         let snapshot = &document["paths"]["/api/runtime/executions/{id}"]["get"];
@@ -1703,18 +1660,22 @@ mod tests {
     }
 
     #[test]
-    fn active_mfg_openapi_uses_only_named_contract_components() {
-        let document = gateway_openapi_document();
+    fn registered_app_openapi_uses_only_named_contract_components() {
+        let services = crate::services::GatewayServices::baseline();
+        let document = gateway_openapi_document_for_apps(services.app_registry.as_ref());
         let schemas = document["components"]["schemas"]
             .as_object()
             .expect("OpenAPI schemas");
-        let active = app_bundle_mfg::mfg_route_metadata()
+        let active = services
+            .app_registry
+            .route_metadata()
             .into_iter()
-            .filter(|route| route.active)
+            .filter(|registered| registered.app_id.as_str() == "mfg" && registered.route.active)
             .collect::<Vec<_>>();
         assert_eq!(active.len(), 104);
 
-        for route in active {
+        for registered in active {
+            let route = registered.route;
             let path = openapi_path(&route.path);
             let method = route.method.to_ascii_lowercase();
             let operation = &document["paths"][&path][&method];

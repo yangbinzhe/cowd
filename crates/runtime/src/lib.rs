@@ -365,7 +365,7 @@ pub use compact::{
     should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    redact_serde_json, ApprovalConfig, CompressionConfig,
+    redact_serde_json, AppStartupConfig, ApprovalConfig, AppsConfig, CompressionConfig,
     ConfigDiagnostic as RuntimeConfigDiagnostic, ConfigDiagnosticSeverity, ConfigEntry,
     ConfigError, ConfigLoadResult, ConfigLoader, ConfigSource, DomainProfile, GateAutoFixConfig,
     GatewayCapacityConfig, GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig,

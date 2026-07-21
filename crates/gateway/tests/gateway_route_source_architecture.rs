@@ -118,6 +118,16 @@ fn gateway_production_has_no_direct_mfg_core_or_contract_imports() {
         .split("[dev-dependencies]")
         .next()
         .expect("normal dependencies");
-    assert!(!normal_dependencies.contains("app-mfg ="));
-    assert!(!normal_dependencies.contains("app-mfg-contract ="));
+    assert!(
+        !normal_dependencies
+            .lines()
+            .any(|line| line.trim_start().starts_with("app-mfg = {")),
+        "Gateway must not import the MFG core package directly; the app-mfg feature may only forward to cowd-product-apps"
+    );
+    assert!(
+        !normal_dependencies
+            .lines()
+            .any(|line| line.trim_start().starts_with("app-mfg-contract = {")),
+        "Gateway must not import the MFG contract package directly"
+    );
 }

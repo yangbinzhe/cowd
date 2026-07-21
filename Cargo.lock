@@ -45,23 +45,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "app-bundle-mfg"
-version = "0.9.562"
-dependencies = [
- "async-trait",
- "auth-broker",
- "cowd-app-host",
- "cowd-app-mfg-adapter",
- "cowd-app-mfg-contract",
- "cowd-app-mfg-core",
- "cowd-app-mfg-tui",
- "cowd-app-sdk",
- "serde_json",
-]
-
-[[package]]
 name = "approval"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "serde",
  "serde_json",
@@ -89,7 +74,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-broker"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "base64",
  "cowd-app-sdk",
@@ -287,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "auth-broker",
  "cowd-app-sdk",
@@ -316,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -338,7 +323,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-app-host"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "axum",
  "cowd-app-sdk",
@@ -352,7 +337,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-adapter"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=00d4957b2763b6b616ffc0e3ff5a2e420aff332f#00d4957b2763b6b616ffc0e3ff5a2e420aff332f"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=2932eba83d30e05f24cee0e19713bc4640104000#2932eba83d30e05f24cee0e19713bc4640104000"
 dependencies = [
  "async-trait",
  "axum",
@@ -375,9 +360,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowd-app-mfg-bundle"
+version = "0.9.562-dev"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=2932eba83d30e05f24cee0e19713bc4640104000#2932eba83d30e05f24cee0e19713bc4640104000"
+dependencies = [
+ "async-trait",
+ "cowd-app-host",
+ "cowd-app-mfg-adapter",
+ "cowd-app-mfg-tui",
+ "cowd-app-sdk",
+]
+
+[[package]]
 name = "cowd-app-mfg-contract"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=00d4957b2763b6b616ffc0e3ff5a2e420aff332f#00d4957b2763b6b616ffc0e3ff5a2e420aff332f"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=2932eba83d30e05f24cee0e19713bc4640104000#2932eba83d30e05f24cee0e19713bc4640104000"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -390,7 +387,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-core"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=00d4957b2763b6b616ffc0e3ff5a2e420aff332f#00d4957b2763b6b616ffc0e3ff5a2e420aff332f"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=2932eba83d30e05f24cee0e19713bc4640104000#2932eba83d30e05f24cee0e19713bc4640104000"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
@@ -409,7 +406,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-tui"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=00d4957b2763b6b616ffc0e3ff5a2e420aff332f#00d4957b2763b6b616ffc0e3ff5a2e420aff332f"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=2932eba83d30e05f24cee0e19713bc4640104000#2932eba83d30e05f24cee0e19713bc4640104000"
 dependencies = [
  "chrono",
  "cowd-app-host",
@@ -426,12 +423,21 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-sdk"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "async-trait",
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "cowd-product-apps"
+version = "0.9.563"
+dependencies = [
+ "cowd-app-host",
+ "cowd-app-mfg-bundle",
+ "cowd-app-sdk",
 ]
 
 [[package]]
@@ -664,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "chrono",
  "serde",
@@ -846,9 +852,8 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
- "app-bundle-mfg",
  "approval",
  "async-trait",
  "auth-broker",
@@ -860,6 +865,7 @@ dependencies = [
  "cowd-app-host",
  "cowd-app-mfg-core",
  "cowd-app-sdk",
+ "cowd-product-apps",
  "fact-kernel",
  "futures",
  "harness-contract",
@@ -976,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "harness-contract"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "chrono",
  "serde",
@@ -988,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "harness-eval"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "async-trait",
  "fact-kernel",
@@ -1510,7 +1516,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -1523,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -1539,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "serde",
  "serde_json",
@@ -1554,7 +1560,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memory"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1644,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "lru",
  "serde",
@@ -1705,7 +1711,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1831,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "serde",
  "serde_json",
@@ -1872,7 +1878,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "model-protocol",
  "reqwest",
@@ -2199,7 +2205,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "approval",
  "async-trait",
@@ -2277,7 +2283,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2351,7 +2357,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-launcher"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "landlock",
  "libc",
@@ -2536,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "memory",
  "serde",
@@ -2622,7 +2628,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "harness-contract",
  "regex",
@@ -2674,7 +2680,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "rusqlite",
  "serde",
@@ -2725,7 +2731,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "chrono",
  "serde",
@@ -3005,7 +3011,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "base64",
  "flate2",
@@ -3248,11 +3254,11 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
- "app-bundle-mfg",
  "chrono",
  "cowd-app-host",
+ "cowd-product-apps",
  "crossterm",
  "futures",
  "harness-contract",
@@ -3638,15 +3644,6 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
@@ -3802,7 +3799,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.562"
+version = "0.9.563"
 dependencies = [
  "toml",
 ]

@@ -23,7 +23,7 @@
         │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────┐  │
         │  │ RuntimeHost  │  │ SurfaceHost  │  │ GatewayServices (24)  │  │
         │  │ 会话热加载    │  │ Inbox/Outbox │  │ runtime·session·task  │  │
-        │  │ turn 执行     │  │ DLQ·重试·回放│  │ memory·matrix·mfg    │  │
+        │  │ turn 执行     │  │ DLQ·重试·回放│  │ memory·matrix·apps   │  │
         │  │ token 管控    │  │ sidecar 托管 │  │ tools·skills·agents  │  │
         │  └──────┬───────┘  └──────┬───────┘  │ surface·approval·...  │  │
         │         │                 │           └───────────────────────┘  │
@@ -59,8 +59,8 @@
     │   │ fact-kernel │  │ tools        │  │ model-protocol   │   │
     │   │   memory    │  │  · MCP bridge│  │   provider       │   │
     │   │   matrix    │  │  · plugins   │  │   mcp            │   │
-    │   │   app-mfg   │  │  · sandbox   │  │ (OpenAI/Anthro/  │   │
-    │   │             │  │  · LSP/file  │  │  DeepSeek/Qwen)  │   │
+    │   │ App bundles │  │  · sandbox   │  │ (OpenAI/Anthro/  │   │
+    │   │ MFG / future│  │  · LSP/file  │  │  DeepSeek/Qwen)  │   │
     │   └─────────────┘  └──────────────┘  └──────────────────┘   │
     │                                                              │
     │   底层存储: storage (SQLite·WAL·Migration·Health)              │
@@ -85,8 +85,8 @@
 │ Tool/Skill 层    tools · skill · connector · surface::channel       │
 │                   内置工具 · 技能目录 · 外部连接器 · 渠道合同         │
 ├─────────────────────────────────────────────────────────────────────┤
-│ Application 层   app-mfg · storage · telemetry                      │
-│                   制造应用 · 通用存储 · 遥测基础                     │
+│ Application 层   app-sdk · app-host · product-apps · storage        │
+│                   受治理业务 App · 通用存储 · 遥测基础                │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -171,6 +171,7 @@
 | **Harness Eval** | 场景矩阵、确定性 smoke、能力覆盖报告、Gateway 服务化 | ✅ 生产就绪 | `harness-eval` · `/api/harness-eval/*` |
 | **TUI 控制面** | Clean/Panorama 双模式、Control Deck、键盘优先、SSE attach | ✅ 生产就绪 | `tui` · `GatewayTuiConfig` |
 | **插件系统** | Builtin/Bundled/External 三级插件 + Pre/Post Hook | ✅ 生产就绪 | `plugins` · `PluginRegistry` · `HookRunner` |
+| **通用 App 宿主** | 已编译 App 的统一注册、配置启停、路由/技能/授权/界面同步投影；MFG 为首个参考 App | ✅ V563：catalog/source lock、可选静态链接与统一启停已落地 | `app-sdk` · `app-host` · `product-apps` · `AppRegistry` |
 | **沙箱执行** | Linux 容器检测、workspace-only/allow-list 隔离模式 | ✅ 基础完成 | `sandbox` · `sandbox_exec` |
 | **执行模式** | Deliberation/ReWOO/Tool DAG/Reflexion 等执行策略 | 🔶 基础完成 | `execution_core` · `orchestration` · `strategy_matcher` |
 
@@ -261,9 +262,11 @@ Surface & Cross-Plane
 ├── GET  /api/cross-plane                     跨面治理
 └── POST /api/cross-plane/action/execute      跨面行动执行
 
-MFG & Eval & Edge
-├── GET  /api/apps/mfg/app                   MFG 应用描述
-├── POST /api/apps/mfg/incidents              创建事件
+Apps & Eval & Edge
+├── GET  /api/apps                           已启用 App catalog
+├── /api/apps/:id/*                          已注册 App 的受治理路由前缀
+├── GET  /api/apps/mfg/app                   MFG 参考 App 描述
+├── POST /api/apps/mfg/incidents              MFG 创建事件
 ├── GET  /api/harness-eval/reports            评测报告
 ├── POST /api/harness-eval/runs               触发评测跑
 └── GET  /api/edges                           边缘注册表
@@ -453,7 +456,7 @@ Fact/application layer
   fact-kernel
   memory
   matrix
-  app-mfg
+  app bundles (MFG / future apps)
 ```
 
 ### 1.2 第一原则
@@ -466,7 +469,28 @@ Fact/application layer
 - 只有 TUI 联调、完整产品验证和正式 release 才构建 `--features full`。
 - 非 TUI surface 不在 core workspace 编译，全部从 `cowd-edge` 按需独立构建和交付。
 - Memory 处理非结构化记忆和经验关联，Matrix 处理结构化事实、实体、关系和证据。
-- MFG 是应用层，不是 AI Harness 内核。
+- App 是应用层，不是 AI Harness 内核；MFG 只是第一个参考 App，Cowd 可以容纳多个受治理的业务 App。
+
+### 1.3 通用 App 平台：编译期组成，启动期启用
+
+Cowd 的 App 模型分为两个不可混淆的控制面：构建期决定某个受审核 App 是否进入产品二进制与 WebUI 静态资源；启动期的 `apps.<id>.enabled` 决定已编入 App 是否注册路由、技能、授权、AI tools 和界面入口。
+
+```text
+apps/catalog.toml + 审核 App source lock（Git + 固定 commit）
+                │
+                ▼
+Cargo / WebUI 构建 ──> 静态 product-apps ──> apps.<id>.enabled
+                                                   │
+                                                   ▼
+Gateway AppRegistry ──> API / Skill / Auth / OpenAPI / AI tools / TUI / WebUI
+```
+
+- MFG 不是唯一应用；未来工程、产品交付或其他领域 App 都遵守同一套 ID、来源锁定、产品组成和统一能力投影约定。
+- Cowd 运行期绝不从配置、Git 地址或环境变量拉取、编译或执行未知 App 源码。
+- TUI 与 WebUI 只消费 Gateway 的 App catalog/manifest，不各自维护启停状态。
+- 当前已实现多 App 的显式 catalog/source lock、可选 Cargo feature 产品矩阵与统一运行时启停；MFG 是第一个真实参考 App。
+
+完整规范见 [通用 App 开发与产品组合规范](docs/architecture/application-development-and-product-composition.md) 与 [当前 App 启停和构建说明](docs/architecture/app-activation-and-build.md)。
 
 ---
 
@@ -583,9 +607,15 @@ Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结
 
 | crate | 职责 |
 |---|---|
-| `crates/app-mfg` | MFG 制造应用层。基于 Matrix/Memory，不属于内核。 |
+| `crates/app-sdk` | App descriptor、受限宿主上下文与 App contribution 合同。 |
+| `crates/app-host` | `AppRegistry` 与统一 HTTP/Skill/catalog 投影宿主。 |
+| `crates/product-apps` | 由 `apps/catalog.toml` 生成的唯一 Cowd 产品组合入口；只聚合外部 App 的静态贡献。 |
+| 外部 `cowd-app-<id>-bundle` | 由对应 App 仓库拥有的组成适配层；MFG 是首个真实 bundle。 |
+| 后续 `app-<id>` | 遵守同一来源锁定、所有权、feature、配置启停与界面投影规约的领域 App。 |
 | `crates/storage` | 通用 SQLite/存储基础。 |
 | `crates/model-protocol::telemetry` | provider/runtime 共享的事件和遥测基础类型。 |
+
+App 的业务代码可在独立仓库中开发；Cowd 通过受审核的 catalog/source lock、外部 `app-<id>-bundle` 与 `AppRegistry` 将其纳入产品。MFG 不是 App 框架的例外，也不是其他业务 App 的模板外特权。
 
 ---
 
@@ -706,6 +736,8 @@ gateway:
 
 WebUI 作为静态 surface 也可以通过 `surface.json` 被 Gateway 发现。构建产物必须包含 `dist/index.html`，这样根路由和 `/s/webui/*` 的 SPA fallback 都能工作；`dist/index.dev.html` 只是开发入口，不应作为 Gateway fallback 的唯一入口。
 
+WebUI 是否展示业务 App 不由前端本地配置决定。它在挂载前读取 Gateway 的 `/api/webui/manifest`，并据其中的已启用 App 清单注册对应页面、导航和 capability 请求；后端禁用 App 时，即使静态资源仍包含其代码，也不会暴露入口。
+
 ### 4.4 TUI
 
 TUI 是 core 仓内唯一 UI surface，但默认 debug 不编译。这样日常开发可以让 Gateway 和 TUI 分开演进，避免所有开发者都为终端渲染依赖付出编译成本。
@@ -729,6 +761,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 - `Control Deck` 聚合 Gateway、Runtime readiness、session、lease、task、approval、surface、Reality Core、Fact Flow 和 degraded signal。
 - TUI 不直接读取 runtime/channel/provider/store，不越过 Gateway 查内部表。
 - Surface 面板提供轻量可靠消息操作：`i/o/v` 查看 inbox/outbox/delivery events，`p/d/D` 执行 replay/retry/DLQ。
+- TUI 建立 Gateway 会话前读取 `/api/apps`，只挂载 Gateway 实际注册的已编译 App contribution；catalog 读取失败时按 fail-closed 隐藏 App 面板。
 
 ### 4.5 Harness Eval 服务化
 
@@ -797,7 +830,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 
 ### 5.4 Skills
 
-Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 只负责发现、投影、文件查看和治理评估；具体领域的 Skill 执行由上层应用路由承接，例如 MFG 的运行能力在 `/api/apps/mfg/**` 下。
+Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 只负责发现、投影、文件查看和治理评估；具体领域的 Skill 执行由已注册 App 在 `/api/apps/<id>/**` 下承接。MFG 仅是这个通用规则的第一个实例。
 
 | API | 用途 |
 |---|---|
@@ -809,6 +842,7 @@ Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 只�
 | `GET /api/skills/:id/files` | 技能文件列表 |
 | `GET /api/skills/:id/files/raw` | 技能文件内容 |
 | `POST /api/skills/maintenance/evaluate` | 技能维护与演进建议 |
+| `GET /api/apps` | 当前 Gateway 已注册、可投影的 App catalog |
 | `POST /api/apps/mfg/incidents/:id/skills/plan` | MFG 应用层技能规划 |
 | `POST /api/apps/mfg/incidents/:id/skills/:skill_id/run` | MFG 应用层技能执行 |
 | `GET /api/apps/mfg/incidents/:id/skills` | MFG 事件技能运行记录 |
@@ -827,9 +861,9 @@ Skills API 分三层：Catalog、Projection、Governance。通用 Skill API 只�
 | `POST /api/tools/intent-plan` | intent plan |
 | `POST /api/tools/context-fanout/plan` | context fanout plan |
 
-### 5.6 Matrix / MFG
+### 5.6 Matrix / App 示例（MFG）
 
-Matrix 是结构化事实引擎，MFG 是基于 Matrix/Memory 的制造应用层。
+Matrix 是结构化事实引擎。业务 App 可以基于 Matrix/Memory 构建领域能力；MFG 是制造领域的参考 App，不构成 Cowd 对应用类型的限制。
 
 | API | 用途 |
 |---|---|
@@ -859,6 +893,14 @@ cargo check --workspace --exclude tui --no-default-features
 cargo test -p gateway --test gateway_runtimehost_architecture --no-default-features
 cargo build -p cli --bin cowd
 ```
+
+当前 App catalog 与受锁定来源可在完整产品构建前校验：
+
+```bash
+cargo run -p xtask -- apps verify --locked
+```
+
+`gateway`、`tui` 与 `cli` 通过相同的 `app-<id>` feature 选择 `cowd-product-apps` 中的静态 bundle。正常产品默认包含 MFG；`cargo build -p cli --no-default-features` 生成不含 MFG 的 core-only 产品，`cargo build -p cli --features full` 显式构建 TUI 与当前审核 App。YAML 配置仅控制已编译 App 的启停，不能替代 catalog/source lock 审核。
 
 ### 6.2 Gateway
 
@@ -1006,7 +1048,7 @@ model-protocol
 - Runtime 不依赖 `channel` 和 `surface`，也不链接飞书、邮件、企微、WebUI 等平台 SDK。
 - 非 TUI surface 不再进入 core workspace，外部 surface 通过 `surface.json` 和 JSONL sidecar 与 Gateway 连接。
 - Matrix 和 Memory 没有互相直接吞并，二者通过 `fact-kernel` 保持事实语义边界。
-- Gateway 作为后台服务聚合边界，集中承接 Runtime、Reality Core、Skill、Tool、Surface、MFG 的 API 暴露。
+- Gateway 作为后台服务聚合边界，集中承接 Runtime、Reality Core、Skill、Tool、Surface 与已注册 App 的 API 暴露；MFG 只是当前参考 App。
 - Tools 已经从 `runtime` 和 `provider` 中解耦，只保留工具 schema、权限需求、纯执行支撑和工具局部治理能力。
 - Gateway 的生产路径不再保留旧 `LiveCli`、`run_prompt`、REPL prompt loop、`AnthropicRuntimeClient` 和 `CliToolExecutor` 执行壳；Runtime 装载由 `runtime_factory` 创建，热 runtime 生命周期由 `GatewayRuntimeEntry` 与 `RuntimeService` 承接。
 - API routes 和 services 不直接持有热 runtime lock，不直接调用 `run_turn_async`；运行时操作收敛到 `RuntimeService` 边界。
@@ -1028,6 +1070,9 @@ model-protocol
 model: "claude-sonnet-4-6"
 permissions:
   defaultMode: "dontAsk"
+apps:
+  mfg:
+    enabled: true
 gateway:
   enabled: true
   host: "127.0.0.1"
@@ -1036,6 +1081,8 @@ gateway:
 ```
 
 模型/API 密钥属于配置和 secrets，不应成为顶层 auth 模块。Gateway 的 WebUI 静态资源配置是可选项，缺失时服务仍应可用。
+
+`apps.<id>.enabled` 是已编译、已审核 App 的唯一启动期开关：修改后重启 Gateway。关闭某个 App 会从 App catalog、路由、Skill、Auth capability、OpenAPI、AI tools、TUI 与 WebUI 投影中同步移除它；该配置不会在运行期拉取源码，也不会改变二进制中已编入的代码。新增通用 App 的来源锁定、开发/发行模式和后续 Cargo feature 规约见 [App 规范](docs/architecture/application-development-and-product-composition.md)。
 
 ---
 
@@ -1136,4 +1183,4 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - Runtime 继续承载 AI Harness 内核，但 runtime 内部要按业务子域收束，避免变成无边界大桶。
 - Gateway 保持统一后台入口，继续承接 surface、WebUI、TUI、channel sidecar、callback、静态资源和服务 API，但不保存第二套执行状态。
 - WebUI 做最完整的 Mission Control / Reality Core / Tool / Skill / Surface 管理面；TUI 做低噪声、高效率、键盘优先的终端控制面。
-- Memory 和 Matrix 继续作为 Reality Core 的两个事实引擎，MFG 作为消费 Reality Core 的应用，不再混入内核概念。
+- Memory 和 Matrix 继续作为 Reality Core 的两个事实引擎；MFG 与未来业务 App 都作为消费 Reality Core 的应用，不再混入内核概念。

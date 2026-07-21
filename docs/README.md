@@ -12,6 +12,11 @@ Current retained sections:
 - `architecture/` - active architecture, boundary, and module relationship documents.
 - `operator/` - active operator runbooks and runtime readiness evidence.
 
+Application architecture:
+
+- `architecture/application-development-and-product-composition.md` - multi-App ownership, source locking, development/release modes, product composition, and acceptance rules.
+- `architecture/app-activation-and-build.md` - current unified runtime enablement and build behavior for compiled Apps.
+
 Gateway API references:
 
 - `api/gateway-api-reference.md` - full Gateway API route inventory generated from `crates/gateway/src/api_routes/**/*.rs`.

@@ -16,6 +16,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
@@ -851,6 +852,18 @@ impl TuiState {
     pub(crate) fn take_pending_app_transport_effects(&mut self) -> Vec<PendingAppTransportEffect> {
         self.flush_app_effects();
         std::mem::take(&mut self.pending_app_transport_effects)
+    }
+
+    /// Reconcile the statically linked terminal contributions with the APPs
+    /// actually registered by the connected Gateway.  This is called before
+    /// the first terminal frame, so a server-disabled APP never becomes a
+    /// visible panel or emits a bootstrap request.
+    pub(crate) fn set_gateway_enabled_apps(&mut self, enabled_app_ids: &BTreeSet<String>) {
+        self.app_tui_host = TuiAppHost::product_for_enabled_apps(enabled_app_ids);
+        self.active_app_panel = self.app_tui_host.panel_ids().into_iter().next();
+        self.pending_app_transport_effects.clear();
+        self.flush_app_effects();
+        self.sync_app_palette_actions();
     }
 
     fn sync_app_palette_actions(&mut self) {
@@ -5153,6 +5166,17 @@ mod tests {
                 if request_id.starts_with("mfg.live.snapshot:")
                     && path == "/api/apps/mfg/live/snapshot"
         )));
+    }
+
+    #[cfg(feature = "app-mfg")]
+    #[test]
+    fn gateway_disabled_app_is_not_left_visible_in_tui() {
+        let mut state = TuiState::new("test-model", "test-session");
+        state.set_gateway_enabled_apps(&std::collections::BTreeSet::new());
+
+        assert!(state.app_tui_host.is_empty());
+        assert!(state.active_app_panel.is_none());
+        assert!(state.take_pending_app_transport_effects().is_empty());
     }
 
     #[cfg(not(feature = "app-mfg"))]

@@ -158,32 +158,9 @@ pub(crate) fn execution_projection_route_metadata() -> Vec<StableRouteMetadata> 
     ]
 }
 
-pub(crate) fn mfg_route_metadata() -> Vec<StableRouteMetadata> {
-    app_bundle_mfg::mfg_route_metadata()
-        .into_iter()
-        .map(|route| StableRouteMetadata {
-            method: match route.method.as_str() {
-                "GET" => "GET",
-                "POST" => "POST",
-                "PUT" => "PUT",
-                "PATCH" => "PATCH",
-                "DELETE" => "DELETE",
-                _ => "UNKNOWN",
-            },
-            path: route.path,
-            operation_id: route.operation_id,
-            request_schema: (!matches!(route.method.as_str(), "GET" | "DELETE"))
-                .then_some(route.request_schema),
-            response_schema: route.response_schema,
-            streaming: route.streaming,
-        })
-        .collect()
-}
-
 pub(crate) fn stable_route_metadata(method: &str, path: &str) -> Option<StableRouteMetadata> {
     execution_projection_route_metadata()
         .into_iter()
-        .chain(mfg_route_metadata())
         .find(|spec| spec.method == method && spec.path == path)
 }
 

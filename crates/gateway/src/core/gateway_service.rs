@@ -11,10 +11,17 @@ pub(crate) struct GatewayServiceManifest {
     pub(crate) api_router: &'static str,
     pub(crate) static_webui: &'static str,
     pub(crate) control_channel: &'static str,
+    /// APP ids actually registered in this Gateway process.  Browser clients
+    /// use this public bootstrap fact to avoid mounting a statically bundled
+    /// contribution when the server startup policy disabled it.
+    pub(crate) enabled_app_ids: Vec<String>,
     pub(crate) health: GatewayHealthSnapshot,
 }
 
-pub(crate) fn webui_manifest(health: GatewayHealthSnapshot) -> GatewayServiceManifest {
+pub(crate) fn webui_manifest(
+    health: GatewayHealthSnapshot,
+    enabled_app_ids: Vec<String>,
+) -> GatewayServiceManifest {
     GatewayServiceManifest {
         kind: "cowd.webui.manifest",
         runtime_host: "gateway internal runtime host",
@@ -23,6 +30,7 @@ pub(crate) fn webui_manifest(health: GatewayHealthSnapshot) -> GatewayServiceMan
         api_router: "gateway service route table",
         static_webui: "gateway served browser console",
         control_channel: "runtime host local control channel",
+        enabled_app_ids,
         health,
     }
 }
