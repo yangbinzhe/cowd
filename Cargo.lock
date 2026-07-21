@@ -290,6 +290,7 @@ name = "cli"
 version = "0.9.562"
 dependencies = [
  "auth-broker",
+ "cowd-app-sdk",
  "gateway",
  "runtime",
  "sandbox-launcher",

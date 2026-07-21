@@ -74,7 +74,6 @@ impl CliSurfacePolicy {
                 "session",
                 "memory",
                 "matrix",
-                "mfg",
                 "mcp serve",
             ]
             .into_iter()

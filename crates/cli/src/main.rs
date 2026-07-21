@@ -290,7 +290,7 @@ mod tests {
             "--core-profile".to_string(),
             "core_manager".to_string(),
             "--apps".to_string(),
-            "mfg=mfg_manager,developer=developer".to_string(),
+            "workbench=manager,developer=developer".to_string(),
         ];
         assert!(parse_exact_flags(
             &args,
@@ -307,7 +307,7 @@ mod tests {
             "--core-profile".to_string(),
             "core_manager".to_string(),
             "--apps".to_string(),
-            "mfg=mfg_manager,developer=developer".to_string(),
+            "workbench=manager,developer=developer".to_string(),
             "--expected-epoch".to_string(),
             "1".to_string(),
             "--expected-revision".to_string(),
@@ -327,16 +327,16 @@ mod tests {
                 ]
             )
             .unwrap()["--apps"],
-            "mfg=mfg_manager,developer=developer"
+            "workbench=manager,developer=developer"
         );
         assert_eq!(
-            parse_app_profiles("mfg=mfg_manager,developer=developer").unwrap(),
+            parse_app_profiles("workbench=manager,developer=developer").unwrap(),
             std::collections::BTreeMap::from([
                 ("developer".to_string(), "developer".to_string()),
-                ("mfg".to_string(), "mfg_manager".to_string()),
+                ("workbench".to_string(), "manager".to_string()),
             ])
         );
-        assert!(parse_app_profiles("mfg=mfg_viewer,mfg=mfg_manager").is_err());
+        assert!(parse_app_profiles("workbench=viewer,workbench=manager").is_err());
         assert!(parse_app_profiles("missing-separator").is_err());
         let mut unknown = complete;
         unknown.extend(["--capability".to_string(), "app.read".to_string()]);

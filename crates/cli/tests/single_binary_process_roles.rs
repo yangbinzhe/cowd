@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::collections::BTreeMap;
+
 const INTERNAL_DISPATCH: &str = "__cowd_internal";
 
 fn cowd_binary() -> &'static str {
@@ -26,6 +28,104 @@ fn temp_root(label: &str) -> PathBuf {
 fn stop_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn wait_for_broker(client: &auth_broker::BrokerClient, child: &mut Child) {
+    for _ in 0..80 {
+        if client.trust_metadata().is_ok() {
+            return;
+        }
+        assert!(
+            child.try_wait().expect("inspect broker startup").is_none(),
+            "Cowd internal auth broker exited before becoming ready"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("Cowd internal auth broker never became ready");
+}
+
+fn workbench_catalog() -> auth_broker::AuthorizationCatalog {
+    auth_broker::AuthorizationCatalog::from_app_descriptors([cowd_app_sdk::AppDescriptor {
+        id: cowd_app_sdk::AppId::parse("workbench").expect("valid generic app id"),
+        display_name: "Workbench".to_string(),
+        sdk_api: cowd_app_sdk::SDK_API_VERSION,
+        version: "test".to_string(),
+        capabilities: Vec::new(),
+        routes: Vec::new(),
+        actions: Vec::new(),
+        profile: Some(cowd_app_sdk::AppProfileDescriptor {
+            catalog_revision: 1,
+            capability_digest: "sha256:workbench-test-profile".to_string(),
+            default_profile_id: "viewer".to_string(),
+            profiles: vec![
+                cowd_app_sdk::AppProfileVariant {
+                    id: "viewer".to_string(),
+                    capabilities: vec!["workbench.read".to_string()],
+                },
+                cowd_app_sdk::AppProfileVariant {
+                    id: "manager".to_string(),
+                    capabilities: vec![
+                        "workbench.read".to_string(),
+                        "workbench.manage".to_string(),
+                    ],
+                },
+            ],
+            surface_capabilities: BTreeMap::from([
+                (
+                    "backend".to_string(),
+                    vec!["workbench.read".to_string(), "workbench.manage".to_string()],
+                ),
+                ("tui".to_string(), vec!["workbench.read".to_string()]),
+            ]),
+        }),
+    }])
+    .expect("generic descriptor catalogue")
+}
+
+fn spawn_auth_broker(
+    authority_root: &Path,
+    socket: &Path,
+    catalog: &auth_broker::AuthorizationCatalog,
+    credential: &str,
+) -> Child {
+    fs::create_dir_all(authority_root).expect("create authority root");
+    let catalog_path = auth_broker::catalog_file(authority_root);
+    auth_broker::write_catalog(&catalog_path, catalog).expect("write catalogue");
+    let mut child = Command::new(cowd_binary())
+        .args([
+            INTERNAL_DISPATCH,
+            "auth-broker",
+            "--root",
+            authority_root.to_str().expect("utf-8 authority root"),
+            "--socket",
+            socket.to_str().expect("utf-8 socket"),
+            "--catalog",
+            catalog_path.to_str().expect("utf-8 catalogue"),
+            "--credential-stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Cowd auth broker role");
+    writeln!(child.stdin.take().expect("broker stdin"), "{credential}").expect("enroll broker");
+    child
+}
+
+fn run_auth_profile(args: &[&str], config_home: &Path, credential: &str) -> std::process::Output {
+    let mut command = Command::new(cowd_binary());
+    command
+        .args(args)
+        .env("COWD_CONFIG_HOME", config_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("start auth profile command");
+    writeln!(child.stdin.take().expect("profile stdin"), "{credential}")
+        .expect("supply profile credential");
+    child
+        .wait_with_output()
+        .expect("wait for auth profile command")
 }
 
 fn bwrap_available() -> bool {
@@ -124,54 +224,119 @@ fn cowd_runs_the_auth_broker_as_an_internal_child_role() {
     let fixture = temp_root("auth");
     let authority_root = fixture.join("authority");
     let socket = fixture.join("broker.sock");
-    fs::create_dir_all(&authority_root).expect("create authority root");
-    let catalog_path = auth_broker::catalog_file(&authority_root);
-    auth_broker::write_catalog(
-        &catalog_path,
+    let mut child = spawn_auth_broker(
+        &authority_root,
+        &socket,
         &auth_broker::AuthorizationCatalog::from_app_descriptors(Vec::new())
             .expect("generic core catalogue"),
-    )
-    .expect("write catalogue");
-    let mut child = Command::new(cowd_binary())
-        .args([
-            INTERNAL_DISPATCH,
-            "auth-broker",
-            "--root",
-            authority_root.to_str().expect("utf-8 authority root"),
-            "--socket",
-            socket.to_str().expect("utf-8 socket"),
-            "--catalog",
-            catalog_path.to_str().expect("utf-8 catalogue"),
-            "--credential-stdin",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn Cowd auth broker role");
-    child
-        .stdin
-        .take()
-        .expect("broker stdin")
-        .write_all(b"single-binary-test-credential\n")
-        .expect("enroll broker");
+        "single-binary-test-credential",
+    );
 
     let client = auth_broker::BrokerClient::new(&socket);
-    let mut ready = false;
-    for _ in 0..80 {
-        if client.trust_metadata().is_ok() {
-            ready = true;
-            break;
-        }
-        if child.try_wait().expect("inspect broker").is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
+    wait_for_broker(&client, &mut child);
 
     stop_child(&mut child);
     let _ = fs::remove_dir_all(&fixture);
-    assert!(ready, "Cowd internal auth broker never became ready");
+}
+
+#[test]
+fn cowd_auth_profile_uses_a_descriptor_catalog_through_the_live_internal_broker() {
+    let fixture = temp_root("generic-auth-profile");
+    let config_home = fixture.join("config");
+    let authority_root = config_home.join("auth-broker");
+    let socket = auth_broker::BrokerClient::default_socket(&authority_root);
+    let credential = "generic-profile-test-credential";
+    let mut broker = spawn_auth_broker(&authority_root, &socket, &workbench_catalog(), credential);
+    let client = auth_broker::BrokerClient::new(&socket);
+    wait_for_broker(&client, &mut broker);
+
+    let initial = client
+        .human_entitlements(credential)
+        .expect("read initial generic profile");
+    assert_eq!(initial.app_profiles["workbench"], "viewer");
+    let target_profiles = BTreeMap::from([("workbench".to_string(), "manager".to_string())]);
+    let (_, confirmation) = client
+        .preview_human_entitlements(credential, "core_manager", target_profiles.clone())
+        .expect("preview generic profile");
+    let expected_epoch = initial.credential_epoch.to_string();
+    let expected_revision = initial.profile_revision.to_string();
+    let set = run_auth_profile(
+        &[
+            "auth",
+            "profile",
+            "set",
+            "--core-profile",
+            "core_manager",
+            "--apps",
+            "workbench=manager",
+            "--expected-epoch",
+            &expected_epoch,
+            "--expected-revision",
+            &expected_revision,
+            "--confirm",
+            &confirmation,
+        ],
+        &config_home,
+        credential,
+    );
+    assert!(
+        set.status.success(),
+        "profile set failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&set.stdout),
+        String::from_utf8_lossy(&set.stderr)
+    );
+    assert!(String::from_utf8_lossy(&set.stderr)
+        .contains("profile preview: core=core_manager apps=workbench=manager"));
+    let updated: serde_json::Value = serde_json::from_slice(&set.stdout).expect("profile JSON");
+    assert_eq!(updated["app_profiles"]["workbench"], "manager");
+
+    let show = run_auth_profile(&["auth", "profile", "show"], &config_home, credential);
+    assert!(show.status.success(), "profile show failed: {show:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).expect("shown profile");
+    assert_eq!(shown["app_profiles"]["workbench"], "manager");
+
+    let stale = run_auth_profile(
+        &[
+            "auth",
+            "profile",
+            "set",
+            "--core-profile",
+            "core_manager",
+            "--apps",
+            "workbench=manager",
+            "--expected-epoch",
+            &expected_epoch,
+            "--expected-revision",
+            &expected_revision,
+            "--confirm",
+            &confirmation,
+        ],
+        &config_home,
+        credential,
+    );
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("stale profile state"));
+    assert!(client
+        .set_human_entitlements(
+            credential,
+            initial.credential_epoch,
+            initial.profile_revision,
+            "core_manager",
+            target_profiles,
+            confirmation,
+        )
+        .is_err());
+    assert!(client
+        .authenticate_human_for_surface(
+            credential,
+            "tui",
+            vec!["workbench.manage".to_string()],
+            None,
+        )
+        .is_err());
+
+    stop_child(&mut broker);
+    let _ = fs::remove_dir_all(&fixture);
 }
 
 #[cfg(unix)]

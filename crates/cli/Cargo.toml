@@ -24,6 +24,7 @@ tui-surface = ["dep:tui", "tui/app-mfg"]
 full = ["tui-surface", "tui/code-highlight", "gateway/code-index"]
 
 [dev-dependencies]
+cowd-app-sdk = { path = "../app-sdk" }
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
