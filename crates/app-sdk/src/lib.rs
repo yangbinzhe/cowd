@@ -495,6 +495,42 @@ pub trait PlatformPort: Send + Sync {
     ) -> Result<HostReceipt, AppHostError>;
 }
 
+/// Non-secret credential facts captured when a request entered an APP.
+///
+/// Long-lived APP projections use this closed value to ask the host whether
+/// the authority is still valid.  It deliberately carries neither a token nor
+/// an application-specific identity type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialLifecycleCheck {
+    pub credential_epoch: u64,
+    pub profile_revision: u64,
+}
+
+/// A closed result for credential lifecycle revalidation.
+///
+/// The host may implement this through a local broker, an operating-system
+/// credential store, or a remote authority.  Applications observe only the
+/// durable lifecycle outcome and never the concrete authority.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum CredentialLifecycleError {
+    #[error("credential lifecycle authority is unavailable: {0}")]
+    AuthorityUnavailable(String),
+    #[error("credential is inactive")]
+    CredentialInactive,
+    #[error("credential epoch changed")]
+    CredentialEpochChanged,
+    #[error("credential profile revision changed")]
+    ProfileRevisionChanged,
+}
+
+/// Host-owned lifecycle revalidation for APP streams or other long-running
+/// projections.  This is synchronous because an APP's stream checkpoint is
+/// already executed on a blocking boundary; implementations must perform one
+/// bounded authority lookup only.
+pub trait CredentialLifecyclePort: Send + Sync {
+    fn verify(&self, check: CredentialLifecycleCheck) -> Result<(), CredentialLifecycleError>;
+}
+
 /// The only service bundle visible to an APP. Concrete Cowd services are
 /// intentionally hidden behind explicit ports so an APP cannot downcast into
 /// Gateway state or obtain secrets.
@@ -506,6 +542,7 @@ pub trait AppHostPorts: Send + Sync {
     fn reality(&self) -> &dyn RealityPort;
     fn work_context(&self) -> &dyn WorkContextPort;
     fn platform(&self) -> &dyn PlatformPort;
+    fn credential_lifecycle(&self) -> &dyn CredentialLifecyclePort;
 }
 
 #[derive(Clone)]

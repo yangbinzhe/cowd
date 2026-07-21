@@ -12,7 +12,8 @@ use std::{
 
 use async_trait::async_trait;
 use cowd_app_sdk::{
-    AppHostError, AppHostPorts, AppId, ApprovalPort, ConnectorPort, CowdAppContext, CrossPlanePort,
+    AppHostError, AppHostPorts, AppId, ApprovalPort, ConnectorPort, CowdAppContext,
+    CredentialLifecycleCheck, CredentialLifecycleError, CredentialLifecyclePort, CrossPlanePort,
     HostIntent, HostReceipt, InvocationContext, PlatformPort, RealityPort, RuntimePort,
     WorkContextPort,
 };
@@ -236,6 +237,42 @@ impl AppHostPorts for GatewayAppHostBinding {
 
     fn platform(&self) -> &dyn PlatformPort {
         self
+    }
+
+    fn credential_lifecycle(&self) -> &dyn CredentialLifecyclePort {
+        self
+    }
+}
+
+impl CredentialLifecyclePort for GatewayAppHostBinding {
+    fn verify(&self, check: CredentialLifecycleCheck) -> Result<(), CredentialLifecycleError> {
+        let state = self
+            .state()
+            .map_err(|error| CredentialLifecycleError::AuthorityUnavailable(error.to_string()))?;
+        let socket =
+            auth_broker::BrokerClient::default_socket(state.config_home.join("auth-broker"));
+
+        // Isolated Gateway tests intentionally have no broker child. Production
+        // composition never takes this branch and therefore always revalidates
+        // an active broker lifecycle before an APP stream advances.
+        #[cfg(any(test, feature = "test-support"))]
+        if !socket.exists() {
+            return Ok(());
+        }
+
+        let lifecycle = auth_broker::BrokerClient::new(socket)
+            .credential_lifecycle()
+            .map_err(|error| CredentialLifecycleError::AuthorityUnavailable(error.to_string()))?;
+        if lifecycle.status != auth_broker::CredentialLifecycleStatus::Active {
+            return Err(CredentialLifecycleError::CredentialInactive);
+        }
+        if lifecycle.credential_epoch != check.credential_epoch {
+            return Err(CredentialLifecycleError::CredentialEpochChanged);
+        }
+        if lifecycle.profile_revision != check.profile_revision {
+            return Err(CredentialLifecycleError::ProfileRevisionChanged);
+        }
+        Ok(())
     }
 }
 
