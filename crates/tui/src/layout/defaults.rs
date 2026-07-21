@@ -18,7 +18,6 @@ use crate::components::file_changes_panel::FileChangesPanel;
 use crate::components::file_tree::FileTree;
 use crate::components::gateway_panel::GatewayPanel;
 use crate::components::goal_workbench_panel::GoalWorkbenchPanel;
-use crate::components::mfg_operations_panel::MfgOperationsPanel;
 use crate::components::runtime_activity_panel::RuntimeActivityPanel;
 use crate::components::session_sidebar::SessionSidebar;
 use crate::components::surface_panel::SurfacePanel;
@@ -71,7 +70,7 @@ impl Component for PlaceholderComponent {
 ///         ├── Tab 6: "files"        (📁)
 ///         ├── Tab 7: "sessions"     (◫)
 ///         ├── Tab 8: "surfaces"     (S)
-///         ├── Tab 9: "mfg"           (M)
+///         ├── Tab 9: "apps"          (A)
 ///         └── Tab 10: "gateway"      (🌐)
 /// ```
 #[must_use]
@@ -92,7 +91,7 @@ pub fn build_default_layout() -> LayoutTree {
                     "files" => "📁",
                     "sessions" => "◫",
                     "surfaces" => "S",
-                    "mfg" => "M",
+                    "apps" => "A",
                     "gateway" => "🌐",
                     _ => "?",
                 }
@@ -108,7 +107,9 @@ pub fn build_default_layout() -> LayoutTree {
                 "files" => Box::new(FileTree::new()) as Box<dyn Component>,
                 "sessions" => Box::new(SessionSidebar::new("")) as Box<dyn Component>,
                 "surfaces" => Box::new(SurfacePanel::new()) as Box<dyn Component>,
-                "mfg" => Box::new(MfgOperationsPanel::new()) as Box<dyn Component>,
+                // APP panels render through the generic `TuiAppHost` owned
+                // by `TuiState`; this structural component is never used.
+                "apps" => Box::new(RuntimeActivityPanel::new()) as Box<dyn Component>,
                 "gateway" => Box::new(GatewayPanel::new()) as Box<dyn Component>,
                 _ => Box::new(RuntimeActivityPanel::new()) as Box<dyn Component>,
             },
@@ -375,7 +376,7 @@ mod tests {
                             ("files", "Files"),
                             ("sessions", "Sessions"),
                             ("surfaces", "Surfaces"),
-                            ("mfg", "MFG"),
+                            ("apps", "Apps"),
                             ("gateway", "Gateway"),
                         ];
                         for (i, (id, label)) in expected.iter().enumerate() {
@@ -671,7 +672,7 @@ mod tests {
 
                         tg.next_tab();
                         assert_eq!(tg.active, 9);
-                        assert_eq!(tg.active_tab().unwrap().id, "mfg");
+                        assert_eq!(tg.active_tab().unwrap().id, "apps");
 
                         tg.next_tab();
                         assert_eq!(tg.active, 10);
@@ -709,7 +710,7 @@ mod tests {
                     assert_eq!(tg.tabs[6].icon.as_deref(), Some("📁"));
                     assert_eq!(tg.tabs[7].icon.as_deref(), Some("◫"));
                     assert_eq!(tg.tabs[8].icon.as_deref(), Some("S"));
-                    assert_eq!(tg.tabs[9].icon.as_deref(), Some("M"));
+                    assert_eq!(tg.tabs[9].icon.as_deref(), Some("A"));
                     assert_eq!(tg.tabs[10].icon.as_deref(), Some("🌐"));
                 }
                 _ => panic!("expected TabGroup as second child"),

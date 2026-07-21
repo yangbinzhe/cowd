@@ -202,18 +202,20 @@ impl ApprovalCockpitPanel {
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
-                if item.is_mfg_review() {
+                if item.has_application_review() {
+                    let app_id = item.application_source_id().unwrap_or("app");
                     lines.push(Line::from(Span::styled(
                         format!(
-                            "  typed MFG review {} · /mfg review {}; generic boolean disabled",
+                            "  application review {} · /{} review {}; generic boolean disabled",
                             item.review_ref.as_deref().unwrap_or("unknown"),
+                            app_id,
                             item.review_ref.as_deref().unwrap_or("unknown")
                         ),
                         Style::default().fg(Color::LightMagenta),
                     )));
-                } else if item.is_mfg_source() {
+                } else if item.application_source_id().is_some() {
                     lines.push(Line::from(Span::styled(
-                        "  invalid MFG approval: typed review reference missing; generic boolean disabled",
+                        "  invalid application approval: review reference missing; generic boolean disabled",
                         Style::default().fg(Color::LightRed),
                     )));
                 }

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-use crate::runtime_control_store::MfgOperationsSnapshot;
+use cowd_app_host::TuiAppEvent;
 
 pub use harness_contract::projection::{
     ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection, ProjectionDelta,
@@ -188,24 +188,6 @@ pub enum CowdEvent {
         generation: u64,
         projection: ExecutionProjection,
     },
-    RuntimeBacklinkResolved {
-        target: String,
-        object: Value,
-        mfg_generation: u64,
-        selection_revision: u64,
-        live_generation: u64,
-        live_epoch: Option<String>,
-        live_reauthentication_count: u64,
-    },
-    RuntimeBacklinkFailed {
-        target: String,
-        message: String,
-        mfg_generation: u64,
-        selection_revision: u64,
-        live_generation: u64,
-        live_epoch: Option<String>,
-        live_reauthentication_count: u64,
-    },
     /// A stream established under an earlier credential or schema contract
     /// must never keep rendering its last full snapshot after Gateway rejects
     /// it.  The generation makes a delayed revoke harmless after a selection
@@ -213,22 +195,6 @@ pub enum CowdEvent {
     ExecutionProjectionAccessRevoked {
         generation: u64,
         execution_id: String,
-        message: String,
-    },
-    ApprovalBacklinkResolved {
-        target: String,
-        object: Value,
-    },
-    ApprovalBacklinkFailed {
-        target: String,
-        message: String,
-    },
-    SurfaceBacklinkResolved {
-        target: String,
-        receipt: Value,
-    },
-    SurfaceBacklinkFailed {
-        target: String,
         message: String,
     },
     Warning {
@@ -277,37 +243,12 @@ pub enum CowdEvent {
     ApprovalRequested {
         tool: String,
     },
-    MfgContract {
-        generation: u64,
-        contract: app_mfg_contract::MfgFrontendContractV1,
-    },
-    MfgSnapshot {
-        generation: u64,
-        snapshot: MfgOperationsSnapshot,
-    },
-    MfgReadFailed {
-        generation: u64,
-        section: String,
-        error: app_mfg_contract::MfgApiErrorV1,
-    },
-    MfgLiveEnvelope {
-        generation: u64,
-        envelope: app_mfg_contract::MfgLiveEnvelopeV1,
-    },
-    MfgLiveFailed {
-        generation: u64,
-        error: app_mfg_contract::MfgApiErrorV1,
-    },
-    MfgLiveStopped {
-        generation: u64,
-    },
-    MfgActionAccepted {
-        intent_id: String,
-        response: app_mfg_contract::MfgMutationResponseV1,
-    },
-    MfgActionFailed {
-        intent_id: String,
-        error: app_mfg_contract::MfgApiErrorV1,
+    /// Generic asynchronous result for a statically-linked APP terminal
+    /// surface. The host routes it by panel id; the APP alone deserializes
+    /// its domain contract and reduces the state.
+    AppTui {
+        panel_id: String,
+        event: TuiAppEvent,
     },
 }
 

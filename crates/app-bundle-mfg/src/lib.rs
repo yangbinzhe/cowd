@@ -7,7 +7,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use cowd_app_host::{AppRegistry, AppRegistryError};
+use cowd_app_host::{AppRegistry, AppRegistryError, TuiAppSurfaceContribution};
 use cowd_app_mfg_adapter::{
     contribution_with_live_host,
     effects::{
@@ -267,6 +267,17 @@ pub fn mfg_app_descriptor() -> AppDescriptor {
     cowd_app_mfg_adapter::mfg_descriptor()
 }
 
+/// Return the external MFG terminal surface through the host-neutral ABI.
+///
+/// This product bundle is deliberately the only Cowd crate that knows the
+/// concrete MFG TUI package.  The Cowd TUI receives only a
+/// [`TuiAppSurfaceContribution`] and therefore cannot accumulate MFG state,
+/// route, action or rendering branches of its own.
+#[must_use]
+pub fn mfg_tui_surface_contribution() -> TuiAppSurfaceContribution {
+    cowd_app_mfg_tui::mfg_tui_surface_contribution()
+}
+
 /// APP-owned metadata is re-exported only through product composition. The
 /// generic Gateway never imports MFG core/contract crates directly.
 #[must_use]
@@ -351,5 +362,20 @@ mod tests {
             .virtual_files
             .as_ref()
             .is_some_and(|files| !files.files.is_empty())));
+    }
+
+    #[test]
+    fn bundle_exposes_the_external_tui_surface_without_a_cowd_tui_type() {
+        let contribution = mfg_tui_surface_contribution();
+        contribution
+            .validate()
+            .expect("external MFG TUI contribution is valid");
+        assert_eq!(contribution.app_id.as_str(), "mfg");
+        assert_eq!(contribution.descriptor.panel_id, "mfg");
+        assert!(contribution
+            .descriptor
+            .actions
+            .iter()
+            .any(|action| action == "mfg.incident.create"));
     }
 }

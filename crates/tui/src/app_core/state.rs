@@ -25,6 +25,7 @@ use ratatui::Frame;
 use crate::accessibility::AccessibilityMode;
 use crate::animation::{AnimationEngine, AnimationKind};
 use crate::app::{App, SystemNoticeKind};
+use crate::app_surface_host::{PendingAppEffect, TuiAppHost};
 use crate::components::activity_panel::ActivityPanel;
 use crate::components::agent_team_panel::AgentTeamPanel;
 use crate::components::agents_overlay::AgentsOverlay;
@@ -43,7 +44,6 @@ use crate::components::file_tree::FileTree;
 use crate::components::gateway_panel::GatewayPanel;
 use crate::components::goal_workbench_panel::GoalWorkbenchPanel;
 use crate::components::memory_panel::MemoryPanel;
-use crate::components::mfg_operations_panel::MfgOperationsPanel;
 use crate::components::performance_dashboard::PerformanceDashboard;
 use crate::components::prompt::Prompt;
 use crate::components::question_form::QuestionForm;
@@ -69,10 +69,10 @@ use crate::keybind::which_key::WhichKey;
 use crate::keybind::{default_bindings, KeybindEngine};
 use crate::layout::{LayoutState, LayoutTree};
 use crate::profiler::{FrameTimer, RenderProfiler};
-use crate::runtime_control_store::{MfgBacklinkKind, MfgIntentStatus, MfgViewFocus};
 use crate::theme::ThemeEngine;
 use crate::workbench::panel_registry;
 use crate::CowdEvent;
+use cowd_app_host::{TuiAppEffect, TuiAppNoticeLevel};
 
 /// Result of processing a key event through the TUI input pipeline.
 #[derive(Debug, Clone)]
@@ -93,8 +93,18 @@ pub(crate) const TAB_TODO: usize = 5;
 pub(crate) const TAB_FILES: usize = 6;
 pub(crate) const TAB_SESSIONS: usize = 7;
 pub(crate) const TAB_SURFACES: usize = 8;
-pub(crate) const TAB_MFG: usize = 9;
+pub(crate) const TAB_APPS: usize = 9;
 pub(crate) const TAB_GATEWAY: usize = 10;
+
+/// A generic APP transport command waiting for the Gateway-owned client.
+/// The external APP never receives the client, credential or runtime handle;
+/// it only receives the corresponding [`CowdEvent::AppTui`] result.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PendingAppTransportEffect {
+    pub app_id: String,
+    pub panel_id: String,
+    pub effect: TuiAppEffect,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FocusTarget {
@@ -396,8 +406,11 @@ pub struct TuiState {
     /// Surface panel showing Gateway-managed UI and external surface registry.
     pub surface_panel: SurfacePanel,
 
-    /// Read-only MFG control-plane panel. It owns no business state.
-    pub mfg_operations_panel: MfgOperationsPanel,
+    /// Statically-linked APP terminal panels. The host has no application
+    /// domain state; each mounted panel owns that state in its own package.
+    pub app_tui_host: TuiAppHost,
+    pending_app_transport_effects: Vec<PendingAppTransportEffect>,
+    active_app_panel: Option<String>,
 
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
@@ -413,7 +426,7 @@ pub struct TuiState {
     pub activity_panel_visible: bool,
 
     /// Active tab index in the sidebar.
-    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Surfaces, 9=MFG, 10=Gateway.
+    /// 0=Runtime, 1=Tools, 2=Changes, 3=Goals, 4=Approvals, 5=Todo, 6=Files, 7=Sessions, 8=Surfaces, 9=Apps, 10=Gateway.
     pub sidebar_active_tab: usize,
 
     /// Heavy topic panel opened on demand instead of participating in normal tab rotation.
@@ -529,13 +542,14 @@ impl TuiState {
         let config_panel = ConfigPanel::new();
         let gateway_panel = GatewayPanel::new();
         let surface_panel = SurfacePanel::new();
-        let mfg_operations_panel = MfgOperationsPanel::new();
+        let app_tui_host = TuiAppHost::product();
+        let active_app_panel = app_tui_host.panel_ids().into_iter().next();
         let runtime_activity_panel = RuntimeActivityPanel::new();
         let tool_ops_panel = ToolOpsPanel::new();
         let system_status_bar = SystemStatusBar::new();
         let activity_panel = ActivityPanel::new();
 
-        Self {
+        let mut state = Self {
             app,
             layout_tree,
             layout_state,
@@ -582,7 +596,9 @@ impl TuiState {
             config_panel,
             gateway_panel,
             surface_panel,
-            mfg_operations_panel,
+            app_tui_host,
+            pending_app_transport_effects: Vec::new(),
+            active_app_panel,
             runtime_activity_panel,
             tool_ops_panel,
             system_status_bar,
@@ -601,7 +617,10 @@ impl TuiState {
             pending_cancel: false,
             pending_quit: false,
             last_terminal_width: 80,
-        }
+        };
+        state.flush_app_effects();
+        state.sync_app_palette_actions();
+        state
     }
 
     /// Build a `TuiState` from an existing `App`, preserving all app state.
@@ -645,17 +664,15 @@ impl TuiState {
     /// internal state-change notification. It is intentionally not encoded
     /// as a fake terminal event.
     pub fn apply_event(&mut self, event: CowdEvent) {
-        let updates_mfg_actions = matches!(
-            &event,
-            CowdEvent::MfgContract { .. }
-                | CowdEvent::MfgSnapshot { .. }
-                | CowdEvent::MfgReadFailed { .. }
-                | CowdEvent::MfgLiveEnvelope { .. }
-                | CowdEvent::MfgLiveFailed { .. }
-                | CowdEvent::MfgLiveStopped { .. }
-                | CowdEvent::MfgActionAccepted { .. }
-                | CowdEvent::MfgActionFailed { .. }
-        );
+        if let CowdEvent::AppTui { panel_id, event } = event {
+            self.app_tui_host.apply_event(&panel_id, event);
+            self.flush_app_effects();
+            self.sync_app_palette_actions();
+            self.event_bus.notify_state_changed();
+            self.event_dispatcher.dispatch(&self.event_bus);
+            return;
+        }
+
         match &event {
             CowdEvent::TurnStarted => self.app.turn_interaction.submit_started(),
             CowdEvent::ExecutionGraphSummary { summary } => {
@@ -663,132 +680,6 @@ impl TuiState {
                     self.app.turn_interaction.ingress_accepted(execution_id);
                 }
             }
-            CowdEvent::RuntimeBacklinkResolved {
-                target,
-                object,
-                mfg_generation,
-                selection_revision,
-                live_generation,
-                live_epoch,
-                live_reauthentication_count,
-            } => {
-                let accepted = self.app.mfg_operations.accepts_runtime_backlink_result(
-                    target,
-                    *mfg_generation,
-                    *selection_revision,
-                    *live_generation,
-                    live_epoch.as_deref(),
-                    *live_reauthentication_count,
-                );
-                if !accepted {
-                    // A selection, generation, or reauthentication changed
-                    // while this request was in flight.  Do not let stale
-                    // success reclaim the Runtime panel or strategy cache.
-                } else if !runtime_backlink_object_matches_target(target, object) {
-                    self.app
-                        .mfg_operations
-                        .invalidate_runtime_strategy_target(target);
-                    self.runtime_activity_panel.record_backlink_failure(
-                        target.clone(),
-                        "Gateway returned an object whose canonical identity does not match the backlink",
-                    );
-                } else if target.starts_with("runtime-execution://") {
-                    if let Ok(projection) = serde_json::from_value::<
-                        crate::protocol::ExecutionProjection,
-                    >(object.clone())
-                    {
-                        if crate::protocol::validate_execution_projection_schema(&projection)
-                            .is_ok()
-                        {
-                            self.app.mfg_operations.record_runtime_strategy_projection(
-                                &projection,
-                                *mfg_generation,
-                                *selection_revision,
-                                *live_generation,
-                                live_epoch.clone(),
-                                *live_reauthentication_count,
-                            );
-                            self.runtime_activity_panel
-                                .record_backlink_object(target.clone(), object);
-                        } else {
-                            self.app
-                                .mfg_operations
-                                .invalidate_runtime_strategy_target(target);
-                            self.runtime_activity_panel.record_backlink_failure(
-                                target.clone(),
-                                "Gateway returned an unsupported execution projection schema",
-                            );
-                        }
-                    } else {
-                        self.app
-                            .mfg_operations
-                            .invalidate_runtime_strategy_target(target);
-                        self.runtime_activity_panel.record_backlink_failure(
-                            target.clone(),
-                            "Gateway returned an invalid execution projection contract",
-                        );
-                    }
-                } else {
-                    self.runtime_activity_panel
-                        .record_backlink_object(target.clone(), object);
-                }
-            }
-            CowdEvent::RuntimeBacklinkFailed {
-                target,
-                message,
-                mfg_generation,
-                selection_revision,
-                live_generation,
-                live_epoch,
-                live_reauthentication_count,
-            } => {
-                if self.app.mfg_operations.accepts_runtime_backlink_result(
-                    target,
-                    *mfg_generation,
-                    *selection_revision,
-                    *live_generation,
-                    live_epoch.as_deref(),
-                    *live_reauthentication_count,
-                ) {
-                    self.app
-                        .mfg_operations
-                        .invalidate_runtime_strategy_target(target);
-                    self.runtime_activity_panel
-                        .record_backlink_failure(target.clone(), message.clone());
-                }
-            }
-            CowdEvent::ApprovalBacklinkResolved { target, object } => {
-                if approval_backlink_object_matches_target(target, object) {
-                    self.approval_cockpit_panel
-                        .record_backlink_object(target.clone(), object);
-                } else {
-                    self.approval_cockpit_panel.record_backlink_failure(
-                        target.clone(),
-                        "Gateway returned an approval whose canonical identity does not match the backlink",
-                    );
-                }
-            }
-            CowdEvent::ApprovalBacklinkFailed { target, message } => {
-                self.approval_cockpit_panel
-                    .record_backlink_failure(target.clone(), message.clone());
-            }
-            CowdEvent::SurfaceBacklinkResolved { target, receipt } => {
-                if surface_backlink_receipt_matches_target(target, receipt) {
-                    self.surface_panel
-                        .record_backlink_receipt(target.clone(), receipt.clone());
-                } else {
-                    self.surface_panel.record_backlink_failure(
-                        target.clone(),
-                        "Gateway returned a Surface receipt whose canonical identity does not match the backlink",
-                    );
-                }
-            }
-            CowdEvent::SurfaceBacklinkFailed { target, message } => {
-                self.surface_panel
-                    .record_backlink_failure(target.clone(), message.clone());
-            }
-            // Stream terminal events update the timeline only. Runtime
-            // projection terminal_ref remains the lifecycle authority.
             CowdEvent::TurnComplete { .. } | CowdEvent::TurnError { .. } => {}
             CowdEvent::SessionInputProjection { .. } => {}
             CowdEvent::Warning { message } if message.contains("projection stream interrupted") => {
@@ -796,7 +687,6 @@ impl TuiState {
             }
             _ => {}
         }
-        // Push toast on errors
         if let CowdEvent::TurnError { ref error } = event {
             self.toast_manager.push(
                 ToastVariant::Error,
@@ -805,20 +695,243 @@ impl TuiState {
                 5000,
             );
         }
-
-        // Preserve ALL existing App behavior
         self.app.apply_event(event);
-        if updates_mfg_actions {
-            self.command_palette
-                .sync_mfg_actions(&self.app.mfg_operations);
+        self.event_bus.notify_state_changed();
+        self.event_dispatcher.dispatch(&self.event_bus);
+    }
+
+    /// Drain APP effects after every APP lifecycle transition. UI effects are
+    /// applied locally; only transport effects cross to the Gateway runner.
+    /// This makes APP code deterministic and keeps credentials and task
+    /// ownership inside Cowd.
+    fn flush_app_effects(&mut self) {
+        for message in self.app_tui_host.take_startup_notices() {
+            self.toast_manager.push(
+                ToastVariant::Error,
+                Some("Applications".into()),
+                message,
+                5000,
+            );
+        }
+        for PendingAppEffect {
+            app_id,
+            panel_id,
+            effect,
+        } in self.app_tui_host.take_effects()
+        {
+            match effect {
+                TuiAppEffect::Navigate { route, context } => {
+                    self.open_surface_for_slash_result(route.trim_start_matches('/'));
+                    if let Some(context) = context.as_ref() {
+                        self.apply_app_navigation_context(context);
+                    }
+                }
+                TuiAppEffect::Composer { text } => {
+                    self.app.input.set_text(&text);
+                    self.set_focus_target(FocusTarget::Input);
+                }
+                TuiAppEffect::Notice {
+                    level,
+                    title,
+                    message,
+                } => {
+                    let variant = match level {
+                        TuiAppNoticeLevel::Info => ToastVariant::Info,
+                        TuiAppNoticeLevel::Warning => ToastVariant::Warning,
+                        TuiAppNoticeLevel::Error => ToastVariant::Error,
+                    };
+                    self.toast_manager.push(variant, title, message, 3200);
+                }
+                effect @ (TuiAppEffect::Request { .. }
+                | TuiAppEffect::Subscribe { .. }
+                | TuiAppEffect::Unsubscribe { .. }) => {
+                    self.pending_app_transport_effects
+                        .push(PendingAppTransportEffect {
+                            app_id,
+                            panel_id,
+                            effect,
+                        });
+                }
+            }
+        }
+    }
+
+    /// Apply a host-neutral application backlink after opening its core
+    /// destination. The linked APP chooses the route and carries an opaque
+    /// context envelope; Cowd accepts a resolved object only after validating
+    /// the canonical resource identity for the destination panel.
+    fn apply_app_navigation_context(&mut self, context: &serde_json::Value) {
+        if context.get("kind").and_then(serde_json::Value::as_str) != Some("backlink") {
+            return;
+        }
+        let Some(target) = context
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .filter(|target| !target.trim().is_empty())
+        else {
+            return;
+        };
+        let object = context.get("object");
+        let failure = context
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .filter(|message| !message.trim().is_empty());
+
+        if target.starts_with("runtime-execution://")
+            || target.starts_with("application-execution://")
+            || target.starts_with("task://")
+        {
+            self.runtime_activity_panel.focus_backlink_target(target);
+            if let Some(object) = object {
+                if runtime_backlink_object_matches_target(target, object) {
+                    if target.starts_with("runtime-execution://") {
+                        if let Ok(projection) = serde_json::from_value::<
+                            crate::protocol::ExecutionProjection,
+                        >(object.clone())
+                        {
+                            if crate::protocol::validate_execution_projection_schema(&projection)
+                                .is_ok()
+                            {
+                                self.app.apply_execution_projection(projection);
+                            }
+                        }
+                    }
+                    self.runtime_activity_panel
+                        .record_backlink_object(target, object);
+                } else {
+                    self.runtime_activity_panel.record_backlink_failure(
+                        target,
+                        "Application returned an object whose canonical identity does not match the backlink",
+                    );
+                }
+            } else if let Some(message) = failure {
+                self.runtime_activity_panel
+                    .record_backlink_failure(target, message);
+            }
+            return;
         }
 
-        // Bridge: notify new components that state has changed without
-        // overloading an operating-system input event.
-        self.event_bus.notify_state_changed();
+        if target.starts_with("approval://") {
+            self.approval_cockpit_panel.focus_backlink_target(target);
+            if let Some(object) = object {
+                if approval_backlink_object_matches_target(target, object) {
+                    self.approval_cockpit_panel
+                        .record_backlink_object(target, object);
+                } else {
+                    self.approval_cockpit_panel.record_backlink_failure(
+                        target,
+                        "Application returned an approval whose canonical identity does not match the backlink",
+                    );
+                }
+            } else if let Some(message) = failure {
+                self.approval_cockpit_panel
+                    .record_backlink_failure(target, message);
+            }
+            return;
+        }
 
-        // Drain and dispatch to registered components.
-        self.event_dispatcher.dispatch(&self.event_bus);
+        if target.starts_with("receipt://cross-plane/") || target.starts_with("surface://") {
+            self.surface_panel.focus_backlink_target(target);
+            if let Some(object) = object {
+                if surface_backlink_receipt_matches_target(target, object) {
+                    self.surface_panel
+                        .record_backlink_receipt(target, object.clone());
+                } else {
+                    self.surface_panel.record_backlink_failure(
+                        target,
+                        "Application returned a Surface receipt whose canonical identity does not match the backlink",
+                    );
+                }
+            } else if let Some(message) = failure {
+                self.surface_panel.record_backlink_failure(target, message);
+            }
+        }
+    }
+
+    pub(crate) fn take_pending_app_transport_effects(&mut self) -> Vec<PendingAppTransportEffect> {
+        self.flush_app_effects();
+        std::mem::take(&mut self.pending_app_transport_effects)
+    }
+
+    fn sync_app_palette_actions(&mut self) {
+        let actions = self.app_tui_host.actions();
+        self.command_palette.sync_app_actions(&actions);
+    }
+
+    fn active_app_panel_id(&self) -> Option<&str> {
+        self.active_app_panel.as_deref()
+    }
+
+    fn cycle_app_panel(&mut self, reverse: bool) -> bool {
+        let panels = self.app_tui_host.panel_ids();
+        if panels.is_empty() {
+            return false;
+        }
+        let current = self
+            .active_app_panel
+            .as_ref()
+            .and_then(|id| panels.iter().position(|candidate| candidate == id))
+            .unwrap_or(0);
+        let next = if reverse {
+            current.checked_sub(1).unwrap_or(panels.len() - 1)
+        } else {
+            (current + 1) % panels.len()
+        };
+        self.active_app_panel = Some(panels[next].clone());
+        true
+    }
+
+    fn handle_app_panel_key(&mut self, key: KeyEvent) -> bool {
+        if !self.layout_state.sidebar_visible
+            || self.active_topic_panel.is_some()
+            || self.sidebar_active_tab != TAB_APPS
+            || self.focus_target != FocusTarget::Sidebar
+        {
+            return false;
+        }
+        if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.cycle_app_panel(false);
+        }
+        if key.code == KeyCode::BackTab && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.cycle_app_panel(true);
+        }
+        let Some(panel_id) = self.active_app_panel.clone() else {
+            return false;
+        };
+        let handled = self.app_tui_host.handle_key(&panel_id, key);
+        self.flush_app_effects();
+        self.sync_app_palette_actions();
+        handled
+    }
+
+    fn handle_app_command(&mut self, command: &str) -> bool {
+        if let Some(rest) = command.trim().strip_prefix("/app ") {
+            let mut parts = rest.split_whitespace();
+            let Some(panel_id) = parts.next() else {
+                return false;
+            };
+            let Some(action_id) = parts.next() else {
+                return false;
+            };
+            if parts.next().is_some() {
+                return false;
+            }
+            let handled = self.app_tui_host.dispatch_action(panel_id, action_id);
+            if handled {
+                self.active_app_panel = Some(panel_id.to_string());
+                self.open_sidebar_tab(TAB_APPS, "Apps");
+                self.flush_app_effects();
+                self.sync_app_palette_actions();
+            }
+            return handled;
+        }
+        let handled = self.app_tui_host.handle_command(command);
+        if handled {
+            self.open_sidebar_tab(TAB_APPS, "Apps");
+            self.flush_app_effects();
+            self.sync_app_palette_actions();
+        }
+        handled
     }
 
     /// Install a canonical Runtime projection and derive only the UI view
@@ -905,7 +1018,7 @@ impl TuiState {
                             .set_current_session(&self.app.session_id);
                     }
                     TAB_SURFACES => self.surface_panel.sync_from_app(&self.app),
-                    TAB_MFG => {}
+                    TAB_APPS => {}
                     TAB_GATEWAY => self.gateway_panel.sync_from_app(&self.app),
                     _ => {}
                 }
@@ -994,9 +1107,9 @@ impl TuiState {
             let topic_fullscreen = self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
                 && frame_areas.body.width < 100;
-            let mfg_fullscreen = self.layout_state.sidebar_visible
+            let app_fullscreen = self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_none()
-                && self.sidebar_active_tab == TAB_MFG;
+                && self.sidebar_active_tab == TAB_APPS;
             if self.layout_state.sidebar_visible
                 && self.active_topic_panel.is_some()
                 && frame_areas.body.width >= 100
@@ -1009,7 +1122,7 @@ impl TuiState {
                 .clamp(48, max_topic_w);
                 chat_area.width = frame_areas.body.width.saturating_sub(topic_w).max(40);
             }
-            if topic_fullscreen || mfg_fullscreen {
+            if topic_fullscreen || app_fullscreen {
                 chat_area.width = 0;
                 toast_anchor_area = ratatui::layout::Rect::new(
                     frame_areas.body.x,
@@ -1039,7 +1152,7 @@ impl TuiState {
             } else {
                 None
             };
-            let sidebar_area = if topic_fullscreen || mfg_fullscreen {
+            let sidebar_area = if topic_fullscreen || app_fullscreen {
                 frame_areas.body
             } else {
                 let sidebar_x = chat_area.x.saturating_add(chat_area.width);
@@ -1281,23 +1394,25 @@ impl TuiState {
                                 }),
                             );
                         }
-                        TAB_MFG => {
+                        TAB_APPS => {
                             let _ = error_recovery::catch_render_panic(
-                                "mfg_operations_panel",
+                                "app_surface_host",
                                 AssertUnwindSafe(|| {
-                                    self.mfg_operations_panel.render_state(
-                                        &mut main_ctx,
-                                        panel_area,
-                                        &self.app.mfg_operations,
-                                        self.app
-                                            .latest_execution_projection
-                                            .as_ref()
-                                            .and_then(|projection| projection.strategy.as_ref()),
-                                        self.app
-                                            .latest_execution_projection
-                                            .as_ref()
-                                            .map_or(&[], |projection| projection.agents.as_slice()),
-                                    );
+                                    if let Some(panel_id) = self.active_app_panel.clone() {
+                                        self.app_tui_host.render(
+                                            &panel_id,
+                                            main_ctx.frame_mut(),
+                                            panel_area,
+                                            self.focus_target == FocusTarget::Sidebar,
+                                        );
+                                    } else {
+                                        main_ctx.frame_mut().render_widget(
+                                            ratatui::widgets::Paragraph::new(
+                                                "No application terminal surface is linked into this build.",
+                                            ),
+                                            panel_area,
+                                        );
+                                    }
                                 }),
                             );
                         }
@@ -1633,7 +1748,7 @@ impl TuiState {
             }
         }
 
-        if self.handle_mfg_panel_key(event) {
+        if self.handle_app_panel_key(event) {
             return true;
         }
 
@@ -1815,7 +1930,7 @@ impl TuiState {
             }
         }
 
-        if self.handle_mfg_panel_key(key) {
+        if self.handle_app_panel_key(key) {
             return ProcessedKey::Nothing;
         }
 
@@ -2446,9 +2561,9 @@ impl TuiState {
                     self.surface_panel.handle_event(&event)
                 }
             }
-            TAB_MFG => {
+            TAB_APPS => {
                 if let crossterm::event::Event::Key(key) = event {
-                    if self.handle_mfg_panel_key(key) {
+                    if self.handle_app_panel_key(key) {
                         crate::components::EventResult::Consumed
                     } else {
                         crate::components::EventResult::NotConsumed
@@ -2470,275 +2585,6 @@ impl TuiState {
             self.set_focus_target(FocusTarget::Sidebar);
         }
         consumed
-    }
-
-    fn handle_mfg_panel_key(&mut self, key: KeyEvent) -> bool {
-        if !self.layout_state.sidebar_visible
-            || self.active_topic_panel.is_some()
-            || self.sidebar_active_tab != TAB_MFG
-            || self.focus_target != FocusTarget::Sidebar
-        {
-            return false;
-        }
-        match key.code {
-            // Plain Tab/Shift+Tab are reserved for the global sidebar.  The
-            // MFG workbench still has a local focus ring, but it must not
-            // strand users in the panel or make the documented global switch
-            // appear unresponsive.
-            KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
-                    MfgViewFocus::Tabs => MfgViewFocus::List,
-                    MfgViewFocus::List => MfgViewFocus::Detail,
-                    MfgViewFocus::Detail => MfgViewFocus::Backlinks,
-                    MfgViewFocus::Backlinks => MfgViewFocus::Actions,
-                    MfgViewFocus::Actions => MfgViewFocus::Tabs,
-                };
-                true
-            }
-            KeyCode::BackTab if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
-                    MfgViewFocus::Tabs => MfgViewFocus::Actions,
-                    MfgViewFocus::List => MfgViewFocus::Tabs,
-                    MfgViewFocus::Detail => MfgViewFocus::List,
-                    MfgViewFocus::Backlinks => MfgViewFocus::Detail,
-                    MfgViewFocus::Actions => MfgViewFocus::Backlinks,
-                };
-                true
-            }
-            KeyCode::Left if self.app.mfg_operations.focus == MfgViewFocus::Tabs => {
-                self.app.mfg_operations.cycle_tab(true);
-                true
-            }
-            KeyCode::Right if self.app.mfg_operations.focus == MfgViewFocus::Tabs => {
-                self.app.mfg_operations.cycle_tab(false);
-                true
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.app.mfg_operations.focus == MfgViewFocus::Detail {
-                    self.app.mfg_operations.detail_scroll =
-                        self.app.mfg_operations.detail_scroll.saturating_add(1);
-                } else if self.app.mfg_operations.focus == MfgViewFocus::Actions {
-                    self.app.mfg_operations.move_action_selection(true);
-                } else {
-                    self.app.mfg_operations.move_selection(true);
-                }
-                true
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.app.mfg_operations.focus == MfgViewFocus::Detail {
-                    self.app.mfg_operations.detail_scroll =
-                        self.app.mfg_operations.detail_scroll.saturating_sub(1);
-                } else if self.app.mfg_operations.focus == MfgViewFocus::Actions {
-                    self.app.mfg_operations.move_action_selection(false);
-                } else {
-                    self.app.mfg_operations.move_selection(false);
-                }
-                true
-            }
-            KeyCode::Enter => {
-                if self.app.mfg_operations.focus == MfgViewFocus::Actions {
-                    let should_confirm = self
-                        .app
-                        .mfg_operations
-                        .latest_action_intent()
-                        .is_some_and(|intent| {
-                            intent.status == MfgIntentStatus::AwaitingConfirmation
-                                && self
-                                    .app
-                                    .mfg_operations
-                                    .selected_action_contract()
-                                    .is_some_and(|action| action.action_id == intent.action_id)
-                        });
-                    if !should_confirm
-                        && self
-                            .app
-                            .mfg_operations
-                            .selected_action_contract()
-                            .is_some_and(|action| {
-                                crate::runtime_control_store::mfg_action_requires_explicit_input(
-                                    action.action_id,
-                                )
-                            })
-                    {
-                        let result = self
-                            .app
-                            .mfg_operations
-                            .selected_action_contract()
-                            .ok_or_else(|| "No MFG action is selected.".to_string())
-                            .and_then(|action| {
-                                self.app
-                                    .mfg_operations
-                                    .action_input_command(action.action_id)
-                            });
-                        self.prepare_mfg_action_composer(result);
-                        return true;
-                    }
-                    let result = if should_confirm {
-                        self.app.mfg_operations.confirm_pending_action()
-                    } else {
-                        self.app.mfg_operations.prepare_selected_action(None)
-                    };
-                    self.notify_mfg_intent_result(result);
-                } else {
-                    self.app.mfg_operations.focus = match self.app.mfg_operations.focus {
-                        MfgViewFocus::Detail | MfgViewFocus::Backlinks => MfgViewFocus::List,
-                        MfgViewFocus::Tabs | MfgViewFocus::List => MfgViewFocus::Detail,
-                        MfgViewFocus::Actions => MfgViewFocus::Actions,
-                    };
-                }
-                true
-            }
-            KeyCode::Char('a') => {
-                self.app.mfg_operations.focus = MfgViewFocus::Actions;
-                true
-            }
-            KeyCode::Char('y') => {
-                let result = self.app.mfg_operations.confirm_pending_action();
-                self.notify_mfg_intent_result(result);
-                true
-            }
-            KeyCode::Char('c') => {
-                let result = self.app.mfg_operations.cancel_pending_action();
-                self.notify_mfg_intent_result(result);
-                true
-            }
-            KeyCode::Char('R') => {
-                let result = self.app.mfg_operations.retry_failed_action();
-                self.notify_mfg_intent_result(result);
-                true
-            }
-            KeyCode::Char('r') => {
-                self.app.mfg_operations.request_refresh();
-                self.toast_manager.push(
-                    ToastVariant::Info,
-                    Some("MFG".into()),
-                    "Refreshing canonical MFG projection".into(),
-                    1600,
-                );
-                true
-            }
-            KeyCode::Char(']') => {
-                if self.app.mfg_operations.adjust_page_limit(true) {
-                    self.toast_manager.push(
-                        ToastVariant::Info,
-                        Some("MFG pagination".into()),
-                        "Loading more records from Gateway".into(),
-                        1600,
-                    );
-                }
-                true
-            }
-            KeyCode::Char('[') => {
-                if self.app.mfg_operations.adjust_page_limit(false) {
-                    self.toast_manager.push(
-                        ToastVariant::Info,
-                        Some("MFG pagination".into()),
-                        "Reducing the canonical page window".into(),
-                        1600,
-                    );
-                }
-                true
-            }
-            KeyCode::Char('e') => self.activate_mfg_backlink(MfgBacklinkKind::Evidence),
-            KeyCode::Char('p') => self.activate_mfg_backlink(MfgBacklinkKind::Approval),
-            KeyCode::Char('s') => self.activate_mfg_backlink(MfgBacklinkKind::Surface),
-            KeyCode::Char('x') => self.activate_mfg_backlink(MfgBacklinkKind::Runtime),
-            KeyCode::Esc => {
-                if let Ok(intent_id) = self.app.mfg_operations.cancel_pending_action() {
-                    self.notify_mfg_intent_result(Ok(intent_id));
-                } else {
-                    self.layout_state.toggle_sidebar(&mut self.layout_tree);
-                    self.set_focus_target(FocusTarget::Chat);
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn notify_mfg_intent_result(&mut self, result: Result<String, String>) {
-        match result {
-            Ok(intent_id) => self.toast_manager.push(
-                ToastVariant::Info,
-                Some("MFG governed action".into()),
-                format!("Intent {intent_id} updated"),
-                1800,
-            ),
-            Err(error) => self.toast_manager.push(
-                ToastVariant::Warning,
-                Some("MFG governed action".into()),
-                error,
-                3200,
-            ),
-        }
-    }
-
-    fn prepare_mfg_action_composer(&mut self, result: Result<String, String>) {
-        match result {
-            Ok(command) => {
-                self.app.input.set_text(&command);
-                self.set_focus_target(FocusTarget::Chat);
-                self.toast_manager.push(
-                    ToastVariant::Info,
-                    Some("MFG governed input".into()),
-                    "Required fields are in the composer. Replace every <required:...> value, then submit."
-                        .into(),
-                    3600,
-                );
-            }
-            Err(error) => self.notify_mfg_intent_result(Err(error)),
-        }
-    }
-
-    fn activate_mfg_backlink(&mut self, kind: MfgBacklinkKind) -> bool {
-        let Some(backlink) = self.app.mfg_operations.activate_backlink(kind) else {
-            self.toast_manager.push(
-                ToastVariant::Warning,
-                Some("MFG backlink".into()),
-                format!("No {} backlink is available", kind.label()),
-                1800,
-            );
-            return true;
-        };
-        match kind {
-            MfgBacklinkKind::Evidence => {
-                self.open_sidebar_tab(TAB_MFG, "MFG evidence");
-                self.app
-                    .mfg_operations
-                    .focus_evidence_backlink(&backlink.target);
-            }
-            MfgBacklinkKind::Approval => {
-                self.open_sidebar_tab(TAB_APPROVALS, "Approvals");
-                self.approval_cockpit_panel
-                    .focus_backlink_target(backlink.target.clone());
-                self.app
-                    .mfg_operations
-                    .request_approval_backlink(&backlink.target);
-            }
-            MfgBacklinkKind::Surface => {
-                self.open_sidebar_tab(TAB_SURFACES, "Surfaces");
-                self.surface_panel
-                    .focus_backlink_target(backlink.target.clone());
-                self.app
-                    .mfg_operations
-                    .request_surface_receipt(&backlink.target);
-            }
-            MfgBacklinkKind::Runtime => {
-                self.open_sidebar_tab(TAB_RUNTIME, "Runtime");
-                self.runtime_activity_panel
-                    .focus_backlink_target(backlink.target.clone());
-                self.app
-                    .mfg_operations
-                    .request_runtime_backlink(&backlink.target);
-            }
-        }
-        self.toast_manager.push(
-            ToastVariant::Info,
-            Some(format!("{} backlink", kind.label())),
-            backlink.target,
-            2200,
-        );
-        true
     }
 
     fn refresh_file_preview_from_gateway(&mut self) {
@@ -3651,9 +3497,6 @@ impl TuiState {
         if self.sidebar_active_tab == TAB_TOOLS {
             self.refresh_tool_ops_panel_overview();
         }
-        if self.sidebar_active_tab == TAB_MFG && self.app.mfg_operations.last_updated_at.is_none() {
-            self.app.mfg_operations.request_refresh();
-        }
         self.toast_manager.push(
             ToastVariant::Info,
             Some("Panel".into()),
@@ -3739,78 +3582,7 @@ impl TuiState {
             return true;
         }
 
-        if let Some(rest) = command.strip_prefix("/mfg ") {
-            self.open_sidebar_tab(TAB_MFG, "MFG Operations");
-            let rest = rest.trim();
-            let result = match rest {
-                "confirm" => {
-                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
-                    self.app.mfg_operations.confirm_pending_action()
-                }
-                "cancel" => {
-                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
-                    self.app.mfg_operations.cancel_pending_action()
-                }
-                "retry" => {
-                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
-                    self.app.mfg_operations.retry_failed_action()
-                }
-                _ if rest.starts_with("review ") => {
-                    let review_id = rest["review ".len()..].trim();
-                    if review_id.is_empty() {
-                        Err("MFG review id is required.".to_string())
-                    } else {
-                        self.app
-                            .mfg_operations
-                            .select_tab(crate::runtime_control_store::MfgViewTab::Reviews);
-                        self.app.mfg_operations.selected_review_id = Some(review_id.to_string());
-                        self.app.mfg_operations.focus = MfgViewFocus::Detail;
-                        Ok(format!("mfg-review:{review_id}"))
-                    }
-                }
-                _ if rest.starts_with("draft ") => {
-                    let action_id = rest["draft ".len()..].trim();
-                    let Some(action_id) = app_mfg_contract::MfgActionId::parse(action_id) else {
-                        self.notify_mfg_intent_result(Err(format!(
-                            "Unknown MFG action id: {action_id}"
-                        )));
-                        return true;
-                    };
-                    let result = self.app.mfg_operations.action_input_command(action_id);
-                    self.prepare_mfg_action_composer(result);
-                    return true;
-                }
-                _ if rest.starts_with("action ") => {
-                    self.app.mfg_operations.focus = MfgViewFocus::Actions;
-                    let action = rest["action ".len()..].trim();
-                    let (action_id, payload) = action
-                        .split_once(char::is_whitespace)
-                        .map_or((action, None), |(id, payload)| (id, Some(payload.trim())));
-                    let Some(action_id) = app_mfg_contract::MfgActionId::parse(action_id) else {
-                        self.notify_mfg_intent_result(Err(format!(
-                            "Unknown MFG action id: {action_id}"
-                        )));
-                        return true;
-                    };
-                    let payload = match payload.filter(|payload| !payload.is_empty()) {
-                        Some(payload) => match serde_json::from_str::<serde_json::Value>(payload) {
-                            Ok(payload) => Some(payload),
-                            Err(error) => {
-                                self.notify_mfg_intent_result(Err(format!(
-                                    "MFG action JSON is invalid: {error}"
-                                )));
-                                return true;
-                            }
-                        },
-                        None => None,
-                    };
-                    self.app.mfg_operations.prepare_action(action_id, payload)
-                }
-                _ => Err(
-                    "Use /mfg review <review_id>, /mfg draft <action_id>, /mfg action <action_id> [JSON], /mfg confirm, /mfg cancel, or /mfg retry".to_string(),
-                ),
-            };
-            self.notify_mfg_intent_result(result);
+        if self.handle_app_command(command) {
             return true;
         }
 
@@ -3895,9 +3667,7 @@ impl TuiState {
             "approvals" => self.open_sidebar_tab(TAB_APPROVALS, "Approvals"),
             "session" | "resume" => self.open_sidebar_tab(TAB_SESSIONS, "Sessions"),
             "surfaces" | "surface" => self.open_sidebar_tab(TAB_SURFACES, "Surfaces"),
-            "mfg" | "manufacturing" | "operations" => {
-                self.open_sidebar_tab(TAB_MFG, "MFG Operations")
-            }
+            "apps" | "app" => self.open_sidebar_tab(TAB_APPS, "Apps"),
             "gateway" => self.open_sidebar_tab(TAB_GATEWAY, "Gateway"),
             _ => {}
         }
@@ -3912,7 +3682,7 @@ impl TuiState {
             self.toast_manager.push(
                 ToastVariant::Info,
                 Some("Focus".into()),
-                "Use /focus chat|input|activity|runtime|tools|files|sessions|mfg|gateway|diff|memory|skills|config"
+                "Use /focus chat|input|activity|runtime|tools|files|sessions|apps|gateway|diff|memory|skills|config"
                     .into(),
                 2400,
             );
@@ -3975,8 +3745,7 @@ impl TuiState {
         self.refresh_command_projection_from_gateway();
         let snapshot = crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
-        self.command_palette
-            .sync_mfg_actions(&self.app.mfg_operations);
+        self.sync_app_palette_actions();
         self.command_palette.open();
         self.set_focus_target(FocusTarget::CommandPalette);
     }
@@ -3985,8 +3754,7 @@ impl TuiState {
         self.refresh_command_projection_from_gateway();
         let snapshot = crate::runtime_control_store::RuntimeControlSnapshot::from_app(&self.app);
         self.command_palette.sync_runtime_actions(&snapshot);
-        self.command_palette
-            .sync_mfg_actions(&self.app.mfg_operations);
+        self.sync_app_palette_actions();
         self.command_palette.open_with_query(query);
         self.set_focus_target(FocusTarget::CommandPalette);
     }
@@ -3996,8 +3764,7 @@ impl TuiState {
             run_gateway_api_blocking(|client| async move { client.slash_projection("tui").await })
         {
             self.command_palette.sync_command_projection(&payload);
-            self.command_palette
-                .sync_mfg_actions(&self.app.mfg_operations);
+            self.sync_app_palette_actions();
             self.prompt
                 .sync_command_suggestions_from_projection(&payload);
         }
@@ -4309,39 +4076,42 @@ impl TuiState {
                     .show_notification("Command prepared. Press Enter to run.");
             }
             Action::RespondGatewayApproval { id, approved } => {
-                if let Some(mfg_approval) = self
+                if let Some(application_approval) = self
                     .app
                     .gateway_approval_items
                     .iter()
-                    .find(|approval| approval.id == *id && approval.is_mfg_source())
+                    .find(|approval| approval.id == *id)
                 {
-                    let Some(review_ref) = mfg_approval
-                        .review_ref
-                        .clone()
-                        .filter(|review| !review.trim().is_empty())
-                    else {
+                    if application_approval.has_application_review() {
+                        let app_id = application_approval
+                            .application_source_id()
+                            .unwrap_or_default();
+                        let review_ref = application_approval
+                            .review_ref
+                            .as_deref()
+                            .unwrap_or_default();
+                        if self.handle_app_command(&format!("/{app_id} review {review_ref}")) {
+                            return;
+                        }
                         self.toast_manager.push(
                             ToastVariant::Error,
-                            Some("MFG approval contract".into()),
-                            "Typed MFG review reference is missing; generic approve/reject is fail-closed."
+                            Some("Application approval".into()),
+                            "The owning application review surface is unavailable; approval remains fail-closed."
                                 .into(),
                             4200,
                         );
                         return;
-                    };
-                    self.open_sidebar_tab(TAB_MFG, "Typed MFG Review");
-                    self.app
-                        .mfg_operations
-                        .select_tab(crate::runtime_control_store::MfgViewTab::Reviews);
-                    self.app.mfg_operations.selected_review_id = Some(review_ref.clone());
-                    self.app.mfg_operations.focus = MfgViewFocus::Detail;
-                    self.toast_manager.push(
-                        ToastVariant::Info,
-                        Some("MFG Review".into()),
-                        format!("{review_ref} requires force_retry/reroute/abandon/resolve/reject"),
-                        3000,
-                    );
-                    return;
+                    }
+                    if application_approval.application_source_id().is_some() {
+                        self.toast_manager.push(
+                            ToastVariant::Error,
+                            Some("Application approval".into()),
+                            "Application approval has no typed review reference; generic approval remains fail-closed."
+                                .into(),
+                            4200,
+                        );
+                        return;
+                    }
                 }
                 let approval_id = id.clone();
                 let projection_id = id.clone();
@@ -5364,8 +5134,37 @@ mod tests {
         assert_eq!(state.theme_engine.theme.name, "dark");
     }
 
+    #[cfg(feature = "app-mfg")]
     #[test]
-    fn mfg_backlink_identity_guards_accept_only_the_canonical_approval_and_surface_object() {
+    fn product_app_surface_mounts_the_external_panel_and_its_transport_effects() {
+        let mut state = TuiState::new("test-model", "test-session");
+        assert_eq!(state.app_tui_host.panel_ids(), vec!["mfg".to_string()]);
+
+        let effects = state.take_pending_app_transport_effects();
+        assert!(effects.iter().any(|pending| matches!(
+            &pending.effect,
+            TuiAppEffect::Request { request_id, path, .. }
+                if request_id.starts_with("mfg.contract:")
+                    && path == "/api/apps/mfg/contract"
+        )));
+        assert!(effects.iter().any(|pending| matches!(
+            &pending.effect,
+            TuiAppEffect::Request { request_id, path, .. }
+                if request_id.starts_with("mfg.live.snapshot:")
+                    && path == "/api/apps/mfg/live/snapshot"
+        )));
+    }
+
+    #[cfg(not(feature = "app-mfg"))]
+    #[test]
+    fn core_only_product_has_no_linked_application_surface() {
+        let state = TuiState::new("test-model", "test-session");
+        assert!(state.app_tui_host.is_empty());
+    }
+
+    #[test]
+    fn application_backlink_identity_guards_accept_only_the_canonical_approval_and_surface_object()
+    {
         assert!(approval_backlink_object_matches_target(
             "approval://approval-1",
             &serde_json::json!({"approval_id": "approval-1", "status": "pending"}),
@@ -5876,14 +5675,14 @@ mod tests {
         assert_eq!(compact[TAB_TOOLS], "Tool");
         assert_eq!(compact[TAB_APPROVALS], "Appr");
         assert_eq!(compact[TAB_FILES], "File");
-        assert_eq!(compact[TAB_MFG], "MFG");
+        assert_eq!(compact[TAB_APPS], "Apps");
         assert!(!compact.contains(&"Mem"));
         assert!(!compact.contains(&"Skill"));
         assert_eq!(full[TAB_RUNTIME], "Runtime");
         assert_eq!(full[TAB_TOOLS], "Tools");
         assert_eq!(full[TAB_APPROVALS], "Approvals");
         assert_eq!(full[TAB_FILES], "Files");
-        assert_eq!(full[TAB_MFG], "MFG");
+        assert_eq!(full[TAB_APPS], "Apps");
         assert!(!full.contains(&"Memory"));
         assert!(!full.contains(&"Skills"));
     }
@@ -6067,7 +5866,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_mfg_and_gateway_panel_commands_open_expected_tabs() {
+    fn runtime_apps_and_gateway_panel_commands_open_expected_tabs() {
         let mut state = TuiState::new("m", "s");
 
         state.dispatch_action(Action::Execute("/runtime".into()));
@@ -6082,49 +5881,17 @@ mod tests {
         assert_eq!(state.sidebar_active_tab, TAB_TOOLS);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
 
-        state.dispatch_action(Action::Execute("/mfg".into()));
+        state.dispatch_action(Action::Execute("/apps".into()));
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
-        assert_eq!(state.sidebar_active_tab, TAB_MFG);
+        assert_eq!(state.sidebar_active_tab, TAB_APPS);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
-        assert!(state.app.mfg_operations.refresh_requested);
 
         state.dispatch_action(Action::Execute("/gateway".into()));
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.active_topic_panel, None);
         assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
-    }
-
-    #[test]
-    fn mfg_focus_chain_uses_ctrl_tab_without_blocking_global_sidebar_rotation() {
-        let mut state = TuiState::new("m", "s");
-        state.dispatch_action(Action::Execute("/mfg".into()));
-        assert_eq!(state.sidebar_active_tab, TAB_MFG);
-        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
-
-        state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
-        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
-
-        state.process_raw_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(state.sidebar_active_tab, TAB_MFG);
-        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
-
-        state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
-        assert_eq!(state.sidebar_active_tab, TAB_MFG);
-        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::List);
-
-        state.process_raw_key(KeyEvent::new(
-            KeyCode::BackTab,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
-        assert_eq!(state.sidebar_active_tab, TAB_MFG);
-        assert_eq!(state.app.mfg_operations.focus, MfgViewFocus::Tabs);
-
-        state.app.mfg_operations.active_tab = crate::runtime_control_store::MfgViewTab::Incidents;
-        state.process_raw_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
-        assert_eq!(state.app.mfg_operations.pagination["incidents"].limit, 100);
     }
 
     #[test]
@@ -6572,109 +6339,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn mfg_uses_the_full_workbench_for_real_80_96_120_frame_layouts() {
-        for (width, height, expect_detail, expect_backlinks) in [
-            (80, 24, false, false),
-            (96, 28, true, false),
-            (120, 40, true, true),
-        ] {
-            let mut state = TuiState::new("m", "mfg-layout");
-            state.layout_state.toggle_sidebar(&mut state.layout_tree);
-            state.sidebar_active_tab = TAB_MFG;
-            state.app.mfg_operations.active_tab =
-                crate::runtime_control_store::MfgViewTab::Incidents;
-            state.app.mfg_operations.focus = MfgViewFocus::List;
-            state.app.mfg_operations.incidents =
-                vec![crate::runtime_control_store::MfgItemSummary {
-                    id: "incident-1".to_string(),
-                    kind: "incident".to_string(),
-                    title: "Line stop".to_string(),
-                    status: "open".to_string(),
-                    ..crate::runtime_control_store::MfgItemSummary::default()
-                }];
-            state.app.mfg_operations.selected_incident_id = Some("incident-1".to_string());
-
-            let mut terminal = MockTerminal::new(width, height);
-            terminal.draw(|frame| state.render(frame));
-            let joined = terminal.buffer_lines().join("\n");
-            assert!(joined.contains("MFG Operations"));
-            assert!(joined.contains("incident-1"));
-            assert_eq!(joined.contains("Detail"), expect_detail);
-            assert_eq!(joined.contains("Backlinks"), expect_backlinks);
-        }
-    }
-
-    #[test]
-    fn mfg_backlinks_navigate_to_real_surface_panels() {
-        let mut state = TuiState::new("m", "mfg-backlinks");
-        state.layout_state.toggle_sidebar(&mut state.layout_tree);
-        state.sidebar_active_tab = TAB_MFG;
-        state.focus_target = FocusTarget::Sidebar;
-        state.app.mfg_operations.active_tab = crate::runtime_control_store::MfgViewTab::Incidents;
-        state.app.mfg_operations.incidents = vec![crate::runtime_control_store::MfgItemSummary {
-            id: "incident-1".to_string(),
-            backlinks: vec![
-                crate::runtime_control_store::MfgBacklink {
-                    kind: MfgBacklinkKind::Evidence,
-                    target: "evidence://packet-1".to_string(),
-                    label: "Evidence".to_string(),
-                },
-                crate::runtime_control_store::MfgBacklink {
-                    kind: MfgBacklinkKind::Approval,
-                    target: "approval://review-1".to_string(),
-                    label: "Approval".to_string(),
-                },
-                crate::runtime_control_store::MfgBacklink {
-                    kind: MfgBacklinkKind::Surface,
-                    target: "surface://webui/report-1".to_string(),
-                    label: "Surface".to_string(),
-                },
-                crate::runtime_control_store::MfgBacklink {
-                    kind: MfgBacklinkKind::Runtime,
-                    target: "runtime-execution://mfg-skill-graph-1".to_string(),
-                    label: "Runtime".to_string(),
-                },
-            ],
-            ..crate::runtime_control_store::MfgItemSummary::default()
-        }];
-        state.app.mfg_operations.selected_incident_id = Some("incident-1".to_string());
-
-        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Approval));
-        assert_eq!(state.sidebar_active_tab, TAB_APPROVALS);
-        state.sidebar_active_tab = TAB_MFG;
-        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Surface));
-        assert_eq!(state.sidebar_active_tab, TAB_SURFACES);
-        state.sidebar_active_tab = TAB_MFG;
-        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Runtime));
-        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
-        assert_eq!(
-            state
-                .app
-                .mfg_operations
-                .last_backlink_intent
-                .as_ref()
-                .map(|link| link.target.as_str()),
-            Some("runtime-execution://mfg-skill-graph-1")
-        );
-        state.sidebar_active_tab = TAB_MFG;
-        assert!(state.activate_mfg_backlink(MfgBacklinkKind::Evidence));
-        assert_eq!(state.sidebar_active_tab, TAB_MFG);
-        assert_eq!(
-            state.app.mfg_operations.focused_evidence_ref.as_deref(),
-            Some("packet-1")
-        );
-        assert_eq!(
-            state
-                .app
-                .mfg_operations
-                .last_backlink_intent
-                .as_ref()
-                .map(|link| link.target.as_str()),
-            Some("evidence://packet-1")
-        );
     }
 
     #[test]

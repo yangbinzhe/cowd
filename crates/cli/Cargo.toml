@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-tui-surface = ["dep:tui"]
+tui-surface = ["dep:tui", "tui/app-mfg"]
 full = ["tui-surface", "tui/code-highlight", "gateway/code-index"]
 
 [dev-dependencies]

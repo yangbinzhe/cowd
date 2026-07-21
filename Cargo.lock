@@ -351,7 +351,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-adapter"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=85671604ad69e54d312cbdcf3d08fd7063b22cc9#85671604ad69e54d312cbdcf3d08fd7063b22cc9"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=95d8e49d9c32b7ea5aabcadbece960c1a875346e#95d8e49d9c32b7ea5aabcadbece960c1a875346e"
 dependencies = [
  "async-trait",
  "axum",
@@ -376,7 +376,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-contract"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=85671604ad69e54d312cbdcf3d08fd7063b22cc9#85671604ad69e54d312cbdcf3d08fd7063b22cc9"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=95d8e49d9c32b7ea5aabcadbece960c1a875346e#95d8e49d9c32b7ea5aabcadbece960c1a875346e"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -389,7 +389,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-core"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=85671604ad69e54d312cbdcf3d08fd7063b22cc9#85671604ad69e54d312cbdcf3d08fd7063b22cc9"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=95d8e49d9c32b7ea5aabcadbece960c1a875346e#95d8e49d9c32b7ea5aabcadbece960c1a875346e"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
@@ -408,10 +408,19 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-tui"
 version = "0.9.562-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=85671604ad69e54d312cbdcf3d08fd7063b22cc9#85671604ad69e54d312cbdcf3d08fd7063b22cc9"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=95d8e49d9c32b7ea5aabcadbece960c1a875346e#95d8e49d9c32b7ea5aabcadbece960c1a875346e"
 dependencies = [
+ "chrono",
+ "cowd-app-host",
  "cowd-app-mfg-contract",
+ "cowd-app-sdk",
+ "crossterm",
+ "harness-contract",
+ "ratatui",
  "serde",
+ "serde_json",
+ "sha2",
+ "uuid",
 ]
 
 [[package]]
@@ -3240,8 +3249,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tui"
 version = "0.9.562"
 dependencies = [
+ "app-bundle-mfg",
  "chrono",
- "cowd-app-mfg-contract",
+ "cowd-app-host",
  "crossterm",
  "futures",
  "harness-contract",

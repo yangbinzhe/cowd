@@ -24,7 +24,7 @@ impl TuiBoundaryPolicy {
             ],
             forbidden_direct_dependencies: [
                 "runtime",
-                "app_mfg",
+                "application-domain",
                 "matrix-core",
                 "matrix-repository",
                 "storage",

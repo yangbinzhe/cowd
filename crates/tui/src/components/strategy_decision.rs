@@ -545,7 +545,7 @@ mod tests {
         assert!(!strategy_matches_target(&strategy, "execution-547"));
         assert!(!strategy_matches_target(
             &strategy,
-            "mfg:execution:execution-547"
+            "application:execution:execution-547"
         ));
     }
 

@@ -318,10 +318,6 @@ pub struct App {
     pub gateway_lease_owner: Option<String>,
     /// Current runtime session lease mode for the attached TUI session.
     pub gateway_lease_mode: Option<String>,
-    /// Canonical MFG read-only control-plane projection. Network tasks emit
-    /// generation-guarded events; panels only render and change view intent.
-    pub mfg_operations: crate::runtime_control_store::MfgOperationsState,
-
     pub scroll_offset: usize,
     pub auto_scroll: bool,
 
@@ -607,8 +603,6 @@ impl App {
             gateway_degraded_reasons: Vec::new(),
             gateway_lease_owner: None,
             gateway_lease_mode: None,
-            mfg_operations: crate::runtime_control_store::MfgOperationsState::default(),
-
             scroll_offset: 0,
             auto_scroll: true,
 
@@ -1650,57 +1644,6 @@ impl App {
             CowdEvent::Warning { message } => {
                 self.show_notification(&message);
             }
-            CowdEvent::MfgContract {
-                generation,
-                contract,
-            } => {
-                self.mfg_operations.apply_contract(generation, contract);
-                self.msg_version = self.msg_version.wrapping_add(1);
-            }
-            CowdEvent::MfgSnapshot {
-                generation,
-                snapshot,
-            } => {
-                self.mfg_operations.apply_snapshot(generation, snapshot);
-                self.msg_version = self.msg_version.wrapping_add(1);
-            }
-            CowdEvent::MfgReadFailed {
-                generation,
-                section,
-                error,
-            } => {
-                self.mfg_operations.apply_error(generation, section, error);
-                self.msg_version = self.msg_version.wrapping_add(1);
-            }
-            CowdEvent::MfgLiveEnvelope {
-                generation,
-                envelope,
-            } => {
-                self.mfg_operations
-                    .apply_live_envelope(generation, envelope);
-                self.msg_version = self.msg_version.wrapping_add(1);
-            }
-            CowdEvent::MfgLiveFailed { generation, error } => {
-                self.mfg_operations.apply_live_error(generation, error);
-                self.msg_version = self.msg_version.wrapping_add(1);
-            }
-            CowdEvent::MfgLiveStopped { generation } => {
-                self.mfg_operations.stop_live_consumer(generation);
-                self.msg_version = self.msg_version.wrapping_add(1);
-            }
-            CowdEvent::MfgActionAccepted {
-                intent_id,
-                response,
-            } => {
-                self.mfg_operations
-                    .apply_action_success(&intent_id, response);
-                self.msg_version = self.msg_version.wrapping_add(1);
-            }
-            CowdEvent::MfgActionFailed { intent_id, error } => {
-                self.mfg_operations.apply_action_error(&intent_id, error);
-                self.msg_version = self.msg_version.wrapping_add(1);
-            }
-
             // New CowdEvent variants not yet consumed by TUI
             _ => {}
         }

@@ -947,8 +947,8 @@ fn flatten_builtin_skills(categories: &[(&str, Vec<BuiltinSkill>)]) -> Vec<Skill
 }
 
 fn entry_action_hints(entry: &SkillDisplayEntry) -> Vec<&'static str> {
-    if entry.source.eq_ignore_ascii_case("mfg")
-        || entry.tags.iter().any(|tag| tag.eq_ignore_ascii_case("mfg"))
+    if entry.risk.eq_ignore_ascii_case("governed")
+        || entry.category.to_ascii_lowercase().starts_with("server_")
     {
         vec!["view", "validate", "plan", "run", "maintenance"]
     } else if entry.category.eq_ignore_ascii_case("local")
@@ -1161,8 +1161,8 @@ mod tests {
             name: "TestSkill".to_string(),
             description: "A test skill".to_string(),
             installed: true,
-            category: "mfg".to_string(),
-            source: "mfg".to_string(),
+            category: "application".to_string(),
+            source: "application".to_string(),
             status: "ready".to_string(),
             risk: "governed".to_string(),
             tags: vec!["demo".to_string()],
@@ -1174,17 +1174,17 @@ mod tests {
     }
 
     #[test]
-    fn unified_mfg_entries_render_action_hints() {
+    fn governed_application_entries_render_action_hints() {
         let mut app = App::new("test-model", "test-session");
         app.skill_list = vec![SkillSummary {
             name: "supply-risk-analyst".to_string(),
             description: "Supply Risk Analyst".to_string(),
             installed: true,
             category: "server_manufacturing".to_string(),
-            source: "mfg".to_string(),
+            source: "application".to_string(),
             status: "ready".to_string(),
             risk: "governed".to_string(),
-            tags: vec!["mfg".to_string()],
+            tags: vec!["application".to_string()],
         }];
         let mut panel = SkillsPanel::from_app(&app);
         let lines = render_panel(&mut panel, 92, 12);

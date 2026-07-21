@@ -23,7 +23,6 @@ pub mod gateway_panel;
 pub mod goal_workbench_panel;
 pub mod l4_memory_view;
 pub mod memory_panel;
-pub mod mfg_operations_panel;
 pub mod panel_scroll;
 pub mod performance_dashboard;
 pub mod prompt;

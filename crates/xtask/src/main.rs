@@ -91,8 +91,9 @@ fn verify_locked(root: &Path) -> Result<(), String> {
 }
 
 /// Re-render only deterministic build inputs. It never clones, fetches,
-/// installs packages or rewrites a resolver lock. Direct product consumers
-/// are also pinned here so one MFG source revision cannot split Rust types.
+/// installs packages or rewrites a resolver lock. The generated product
+/// bundle is the sole normal dependency carrier; only explicit test fixtures
+/// remain as direct APP consumers and are pinned here.
 fn sync_locked(root: &Path) -> Result<(), String> {
     let lock = parse_lock(&root.join("apps/mfg/source.lock.toml"))?;
     validate_lock(&lock)?;
@@ -242,11 +243,8 @@ fn write_generated(path: &Path, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn mfg_consumer_manifests(root: &Path) -> [PathBuf; 2] {
-    [
-        root.join("crates/gateway/Cargo.toml"),
-        root.join("crates/tui/Cargo.toml"),
-    ]
+fn mfg_consumer_manifests(root: &Path) -> [PathBuf; 1] {
+    [root.join("crates/gateway/Cargo.toml")]
 }
 
 fn check_mfg_consumer_manifest(path: &Path, lock: &AppSourceLock) -> Result<(), String> {
@@ -372,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_mfg_consumers_cannot_drift_from_the_source_lock() {
+    fn direct_mfg_test_fixtures_cannot_drift_from_the_source_lock() {
         let lock = lock();
         let manifest = format!(
             "app-mfg = {{ git = \"{}\", rev = \"old-revision\" }}\n",

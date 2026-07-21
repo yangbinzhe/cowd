@@ -16,6 +16,8 @@ pub mod action_coverage;
 pub mod animation;
 #[path = "app_core/app.rs"]
 pub mod app;
+#[path = "app_core/app_surface_host.rs"]
+pub mod app_surface_host;
 #[path = "app_core/boundary_policy.rs"]
 mod boundary_policy;
 #[path = "platform/clipboard.rs"]

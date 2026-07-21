@@ -868,14 +868,16 @@ fn short_id(id: &str) -> String {
 fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
     let target = target.trim();
     let query = target.split_once('?').map(|(_, query)| query);
-    let target_id = target
+    let target = target
         .strip_prefix("runtime-execution://")
         .unwrap_or(target)
         .trim_start_matches("execution://")
-        .trim_start_matches("mfg:execution:")
         .trim_start_matches("execution:")
         .trim_start_matches("task://")
-        .trim_start_matches("task:")
+        .trim_start_matches("task:");
+    let target_id = target
+        .split_once(":execution:")
+        .map_or_else(|| target, |(_, execution_id)| execution_id)
         .split(['/', '?', '#'])
         .next()
         .unwrap_or_default();

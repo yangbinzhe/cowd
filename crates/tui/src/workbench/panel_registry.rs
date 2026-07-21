@@ -97,7 +97,7 @@ pub const PANEL_SURFACES: PanelDefinition = PanelDefinition {
     compact_label: "Surf",
     domain: WorkbenchDomain::SurfaceApp,
     sidebar_index: Some(8),
-    aliases: &["surfaces", "surface", "apps", "app"],
+    aliases: &["surfaces", "surface"],
 };
 
 pub const PANEL_GATEWAY: PanelDefinition = PanelDefinition {
@@ -109,13 +109,13 @@ pub const PANEL_GATEWAY: PanelDefinition = PanelDefinition {
     aliases: &["gateway", "diagnostics", "doctor"],
 };
 
-pub const PANEL_MFG: PanelDefinition = PanelDefinition {
-    id: "mfg",
-    label: "MFG",
-    compact_label: "MFG",
+pub const PANEL_APPS: PanelDefinition = PanelDefinition {
+    id: "apps",
+    label: "Apps",
+    compact_label: "Apps",
     domain: WorkbenchDomain::SurfaceApp,
     sidebar_index: Some(9),
-    aliases: &["mfg", "manufacturing", "operations"],
+    aliases: &["apps", "app"],
 };
 
 pub const PANEL_CONFIG: PanelDefinition = PanelDefinition {
@@ -146,7 +146,7 @@ pub const PANELS: &[PanelDefinition] = &[
     PANEL_FILES,
     PANEL_SESSIONS,
     PANEL_SURFACES,
-    PANEL_MFG,
+    PANEL_APPS,
     PANEL_GATEWAY,
     PANEL_CONFIG,
     PANEL_REALITY,
@@ -217,7 +217,7 @@ mod tests {
                 "Files",
                 "Sessions",
                 "Surfaces",
-                "MFG",
+                "Apps",
                 "Gateway"
             ]
         );
@@ -235,6 +235,6 @@ mod tests {
             find_by_alias("matrix").unwrap().domain,
             WorkbenchDomain::Reality
         );
-        assert_eq!(find_by_alias("/mfg").unwrap().id, "mfg");
+        assert_eq!(find_by_alias("/apps").unwrap().id, "apps");
     }
 }

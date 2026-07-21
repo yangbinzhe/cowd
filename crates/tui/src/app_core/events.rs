@@ -88,11 +88,7 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::ExecutionProjectionLoaded { .. }
             | CowdEvent::ExecutionProjectionAccessRevoked { .. }
             | CowdEvent::ExecutionGraphSummary { .. }
-            | CowdEvent::MfgContract { .. }
-            | CowdEvent::MfgSnapshot { .. }
-            | CowdEvent::MfgReadFailed { .. }
-            | CowdEvent::MfgActionAccepted { .. }
-            | CowdEvent::MfgActionFailed { .. }
+            | CowdEvent::AppTui { .. }
     )
 }
 
@@ -151,68 +147,6 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
                 }
             }
         }
-        CowdEvent::MfgContract { .. }
-        | CowdEvent::MfgSnapshot { .. }
-        | CowdEvent::MfgReadFailed { .. }
-        | CowdEvent::MfgActionAccepted { .. }
-        | CowdEvent::MfgActionFailed { .. } => {
-            if let Some(index) = queue.iter().position(|queued| match (&event, queued) {
-                (
-                    CowdEvent::MfgContract {
-                        generation: event_generation,
-                        ..
-                    },
-                    CowdEvent::MfgContract {
-                        generation: queued_generation,
-                        ..
-                    },
-                ) => queued_generation == event_generation,
-                (
-                    CowdEvent::MfgSnapshot {
-                        generation: event_generation,
-                        ..
-                    },
-                    CowdEvent::MfgSnapshot {
-                        generation: queued_generation,
-                        ..
-                    },
-                ) => queued_generation == event_generation,
-                (
-                    CowdEvent::MfgReadFailed {
-                        generation: event_generation,
-                        section: event_section,
-                        ..
-                    },
-                    CowdEvent::MfgReadFailed {
-                        generation: queued_generation,
-                        section: queued_section,
-                        ..
-                    },
-                ) => queued_generation == event_generation && queued_section == event_section,
-                (
-                    CowdEvent::MfgActionAccepted {
-                        intent_id: event_intent,
-                        ..
-                    }
-                    | CowdEvent::MfgActionFailed {
-                        intent_id: event_intent,
-                        ..
-                    },
-                    CowdEvent::MfgActionAccepted {
-                        intent_id: queued_intent,
-                        ..
-                    }
-                    | CowdEvent::MfgActionFailed {
-                        intent_id: queued_intent,
-                        ..
-                    },
-                ) => queued_intent == event_intent,
-                _ => false,
-            }) {
-                queue[index] = event;
-                return;
-            }
-        }
         _ => {}
     }
 
@@ -226,11 +160,7 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
                 CowdEvent::ExecutionProjectionDelta { .. }
                     | CowdEvent::ExecutionProjectionAccessRevoked { .. }
                     | CowdEvent::ExecutionGraphSummary { .. }
-                    | CowdEvent::MfgContract { .. }
-                    | CowdEvent::MfgSnapshot { .. }
-                    | CowdEvent::MfgReadFailed { .. }
-                    | CowdEvent::MfgActionAccepted { .. }
-                    | CowdEvent::MfgActionFailed { .. }
+                    | CowdEvent::AppTui { .. }
             )
         }) {
             queue.remove(index);
@@ -321,8 +251,13 @@ mod tests {
         let pending = tokio::spawn({
             let tx = tx.clone();
             async move {
-                tx.send_wait(CowdEvent::MfgLiveStopped { generation: 7 })
-                    .await
+                tx.send_wait(CowdEvent::AppTui {
+                    panel_id: "fixture".to_string(),
+                    event: cowd_app_host::TuiAppEvent::LiveStopped {
+                        subscription_id: "fixture.live".to_string(),
+                    },
+                })
+                .await
             }
         });
         tokio::task::yield_now().await;
