@@ -148,6 +148,11 @@ pub enum TuiAppEffect {
         method: String,
         path: String,
         body: Option<Value>,
+        /// APP-provided request metadata. The host must reject attempts to
+        /// override authentication, surface identity or any reserved Cowd
+        /// transport header before the request is sent.
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
     },
     Subscribe {
         subscription_id: String,
@@ -204,6 +209,10 @@ impl TuiAppEffects {
 /// slash dispatch), so the Cowd TUI host cannot grow an APP-specific branch.
 pub trait TuiAppPanel: Send {
     fn panel_id(&self) -> &str;
+
+    /// Called once after the host has mounted a fresh APP panel. The APP can
+    /// request its contract/snapshot without receiving a runtime handle.
+    fn on_mount(&mut self, _effects: &mut TuiAppEffects) {}
 
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect, context: TuiAppRenderContext);
 
@@ -607,6 +616,7 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/api/apps/fixture/ping".to_string(),
                     body: None,
+                    headers: BTreeMap::new(),
                 });
                 return true;
             }
@@ -643,6 +653,7 @@ mod tests {
                     method: "GET".to_string(),
                     path: "/api/apps/fixture/ping".to_string(),
                     body: None,
+                    headers: BTreeMap::new(),
                 });
                 return true;
             }
@@ -674,6 +685,8 @@ mod tests {
         assert_eq!(panel.panel_id(), "fixture.panel");
         assert_eq!(panel.actions().len(), 1);
         let mut effects = TuiAppEffects::default();
+        panel.on_mount(&mut effects);
+        assert!(effects.is_empty());
         assert!(panel.dispatch_action("fixture.read", &mut effects));
         assert!(matches!(
             effects.take().as_slice(),
