@@ -175,6 +175,11 @@ pub enum TuiAppEffect {
     },
     Navigate {
         route: String,
+        /// Optional application-owned navigation context. Cowd recognizes
+        /// only its generic backlink envelope and validates the canonical
+        /// identity before a core panel can display the resolved object.
+        #[serde(default)]
+        context: Option<Value>,
     },
     Composer {
         text: String,
