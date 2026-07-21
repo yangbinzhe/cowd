@@ -5,13 +5,14 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     sync::Arc,
 };
 
 use axum::Router;
 use cowd_app_sdk::{
     AppContractError, AppDescriptor, AppHealth, AppHttpContract, AppId, AppRouteMetadata,
-    AppSkillDescriptor, CapabilityApp,
+    AppSkillDescriptor, CapabilityApp, CowdAppContext,
 };
 use crossterm::event::KeyEvent;
 use ratatui::{
@@ -685,6 +686,58 @@ pub enum AppRegistryError {
     DuplicateSkill { app_id: AppId, skill_id: String },
     #[error("invalid TUI contribution for app {app_id}: {reason}")]
     InvalidTuiContribution { app_id: AppId, reason: String },
+}
+
+/// A reviewed, compile-time linked application product contribution.
+///
+/// This is deliberately a small static factory contract rather than a dynamic
+/// plug-in ABI.  An APP repository owns its domain adapters and returns one
+/// value; the product composer can then aggregate any number of such values
+/// without importing an APP's DTOs, router functions, or TUI implementation.
+#[derive(Clone, Copy)]
+pub struct StaticAppProduct {
+    descriptor: fn() -> AppDescriptor,
+    register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
+    tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
+}
+
+impl StaticAppProduct {
+    #[must_use]
+    pub const fn new(
+        descriptor: fn() -> AppDescriptor,
+        register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
+        tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
+    ) -> Self {
+        Self {
+            descriptor,
+            register,
+            tui_surface,
+        }
+    }
+
+    #[must_use]
+    pub fn descriptor(self) -> AppDescriptor {
+        (self.descriptor)()
+    }
+
+    #[must_use]
+    pub fn app_id(self) -> AppId {
+        self.descriptor().id
+    }
+
+    pub fn register(
+        self,
+        registry: &mut AppRegistry,
+        config_home: PathBuf,
+        context: CowdAppContext,
+    ) -> Result<(), AppRegistryError> {
+        (self.register)(registry, config_home, context)
+    }
+
+    #[must_use]
+    pub fn tui_surface(self) -> Option<TuiAppSurfaceContribution> {
+        self.tui_surface.map(|factory| factory())
+    }
 }
 
 #[cfg(test)]
