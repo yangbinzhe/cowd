@@ -154,7 +154,7 @@
 | 特性域 | 能力 | 成熟度 | 关键组件 |
 |--------|------|--------|----------|
 | **多模型路由** | OpenAI/Anthropic/DeepSeek/Qwen 自动适配 + Provider fallback 链 | ✅ 生产就绪 | `provider` · `model-protocol` · `ModelRouteDecision` |
-| **会话管理** | 多 session 并行、切换、后台运行、暂停/关闭、检查点/恢复 | ✅ 生产就绪 | `session_execution` · `SessionExecutionPlane` |
+| **会话管理** | 多 session 并行、切换、后台运行、暂停/关闭、检查点/恢复；持久化连接池并发访问 | ✅ 生产就绪（V564 已消除全局存储锁） | `session_execution` · `SessionExecutionPlane` · `UnifiedSessionStore` |
 | **上下文工程** | 动态预算分配、硬容量预检、语义检查点压缩、记忆召回、知识激活、证据规划 | ✅ 生产就绪 | `context_runtime` · `budget_policy` · `compact` |
 | **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
 | **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + SQLite 持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
@@ -171,7 +171,7 @@
 | **Harness Eval** | 场景矩阵、确定性 smoke、能力覆盖报告、Gateway 服务化 | ✅ 生产就绪 | `harness-eval` · `/api/harness-eval/*` |
 | **TUI 控制面** | Clean/Panorama 双模式、Control Deck、键盘优先、SSE attach | ✅ 生产就绪 | `tui` · `GatewayTuiConfig` |
 | **插件系统** | Builtin/Bundled/External 三级插件 + Pre/Post Hook | ✅ 生产就绪 | `plugins` · `PluginRegistry` · `HookRunner` |
-| **通用 App 宿主** | 已编译 App 的统一注册、配置启停、路由/技能/授权/界面同步投影；MFG 为首个参考 App | ✅ V563：catalog/source lock、可选静态链接与统一启停已落地 | `app-sdk` · `app-host` · `product-apps` · `AppRegistry` |
+| **通用 App 宿主** | 已编译 App 的统一注册、配置启停、路由/技能/授权/界面同步投影；MFG 为首个参考 App | ✅ V563 建立 catalog/source lock 与统一启停；V564 补齐授权目录状态迁移和默认服务收敛 | `app-sdk` · `app-host` · `product-apps` · `AppRegistry` · `auth-broker` |
 | **沙箱执行** | Linux 容器检测、workspace-only/allow-list 隔离模式 | ✅ 基础完成 | `sandbox` · `sandbox_exec` |
 | **执行模式** | Deliberation/ReWOO/Tool DAG/Reflexion 等执行策略 | 🔶 基础完成 | `execution_core` · `orchestration` · `strategy_matcher` |
 
@@ -489,8 +489,10 @@ Gateway AppRegistry ──> API / Skill / Auth / OpenAPI / AI tools / TUI / WebU
 - Cowd 运行期绝不从配置、Git 地址或环境变量拉取、编译或执行未知 App 源码。
 - TUI 与 WebUI 只消费 Gateway 的 App catalog/manifest，不各自维护启停状态。
 - 当前已实现多 App 的显式 catalog/source lock、可选 Cargo feature 产品矩阵与统一运行时启停；MFG 是第一个真实参考 App。
+- App catalog 变更会进入 Auth Broker 的通用授权目录。V564 对历史 v2 状态提供一次性、凭据验证后的迁移：能力始终按当前已编译 catalog 重算，未知历史档位回落到当前最小权限；迁移后只运行 v3 状态，不保留历史授权执行路径。
 
 完整规范见 [通用 App 开发与产品组合规范](docs/architecture/application-development-and-product-composition.md) 与 [当前 App 启停和构建说明](docs/architecture/app-activation-and-build.md)。
+Gateway 的安全启动、二进制替换和运行核验见 [Gateway 生命周期运行手册](docs/operator/gateway-lifecycle.md)。
 
 ---
 
@@ -907,10 +909,14 @@ cargo run -p xtask -- apps verify --locked
 Gateway 是后台服务入口：
 
 ```bash
-cargo run -p cli --bin cowd -- gateway
+# Gateway 服务管理
+cowd gateway start
+cowd gateway status
+cowd gateway restart
+cowd gateway stop
 ```
 
-Gateway 启动后，TUI、WebUI 和外部 surface 都通过 Gateway API 使用核心能力。
+Gateway 启动后，TUI、WebUI 和外部 surface 都通过 Gateway API 使用核心能力。`restart` 只回收同一可执行文件启动的 `gateway run` 进程；二进制覆盖安装后也会通过启动路径识别旧进程，等待其退出后再拉起新实例，避免两个 Gateway 同时占用同一会话库。
 
 ### 6.3 TUI 联调
 
@@ -1082,7 +1088,7 @@ gateway:
 
 模型/API 密钥属于配置和 secrets，不应成为顶层 auth 模块。Gateway 的 WebUI 静态资源配置是可选项，缺失时服务仍应可用。
 
-`apps.<id>.enabled` 是已编译、已审核 App 的唯一启动期开关：修改后重启 Gateway。关闭某个 App 会从 App catalog、路由、Skill、Auth capability、OpenAPI、AI tools、TUI 与 WebUI 投影中同步移除它；该配置不会在运行期拉取源码，也不会改变二进制中已编入的代码。新增通用 App 的来源锁定、开发/发行模式和后续 Cargo feature 规约见 [App 规范](docs/architecture/application-development-and-product-composition.md)。
+`apps.<id>.enabled` 是已编译、已审核 App 的唯一启动期开关：修改后重启 Gateway。关闭某个 App 会从 App catalog、路由、Skill、Auth capability、OpenAPI、AI tools、TUI 与 WebUI 投影中同步移除它；该配置不会在运行期拉取源码，也不会改变二进制中已编入的代码。新增通用 App 的来源锁定、开发/发行模式和后续 Cargo feature 规约见 [App 规范](docs/architecture/application-development-and-product-composition.md)。服务更新、认证状态迁移和单实例核验按 [Gateway 生命周期运行手册](docs/operator/gateway-lifecycle.md) 执行；不要手工编辑 `credential-state.json` 或复制认证凭据。
 
 ---
 

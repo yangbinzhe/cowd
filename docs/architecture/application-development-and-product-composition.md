@@ -49,6 +49,8 @@ Cowd 二进制 + WebUI static assets                ├─ OpenAPI / AI tools / 
 
 当前 MFG 已完成构建期与启动期的统一控制：`apps/catalog.toml` + `apps/mfg/source.lock.toml` 生成 `cowd-product-apps`，`app-mfg` feature 决定代码是否静态链接；`apps.mfg.enabled` 决定已链接代码是否注册到 Gateway、TUI 与 WebUI。`--no-default-features` 的 Gateway/CLI 不含 MFG，`full` 显式选择 `tui-surface + app-mfg`。
 
+授权目录也是这个统一投影的一部分：Gateway 从当前 App descriptor 构造通用 `AuthorizationCatalog`，Auth Broker 只按该目录保存 `app_profiles` 和重算后的能力快照。产品组成升级若改变该目录，必须提供凭据验证后的单次状态迁移、能力回退规则和 epoch/revision 失效语义；不得把历史 App enum、历史能力或更高权限作为长期兼容执行路径。V564 对 MFG 时代的 v2 状态完成了这一迁移，后续新 App 必须沿用这一通用目录边界。
+
 | 项目 | 当前状态 | 后续实现边界 |
 |---|---|---|
 | AppRegistry、统一路由/技能/授权/界面投影 | 已实现，MFG 作为当前贡献 | 新 App 必须复用这一投影，不能新增旁路 |

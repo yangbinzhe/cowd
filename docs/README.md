@@ -17,6 +17,10 @@ Application architecture:
 - `architecture/application-development-and-product-composition.md` - multi-App ownership, source locking, development/release modes, product composition, and acceptance rules.
 - `architecture/app-activation-and-build.md` - current unified runtime enablement and build behavior for compiled Apps.
 
+Gateway operations:
+
+- `operator/gateway-lifecycle.md` - safe Gateway start/stop/restart, binary replacement, authorization-state migration, and single-instance verification.
+
 Gateway API references:
 
 - `api/gateway-api-reference.md` - full Gateway API route inventory generated from `crates/gateway/src/api_routes/**/*.rs`.

@@ -1,6 +1,6 @@
 # 已编译 App 的统一启停与构建模型
 
-状态：已实施（V563：显式 catalog、静态产品组合与统一启停）
+状态：已实施（V563：显式 catalog、静态产品组合与统一启停；V564：授权状态迁移与 Gateway 生命周期收敛）
 
 ## 结论
 
@@ -61,6 +61,21 @@ cargo build -p cli --no-default-features
 ```
 
 `app-mfg` 是构建期开关，`apps.mfg.enabled` 是启动期开关；二者不可互相替代。
+
+## 安全启动、授权目录与更新
+
+App 启动事实不只影响路由和界面，也影响人类交互主体可请求的 capability ceiling。Auth Broker 将当前已启用 App descriptor 组合为通用授权目录；持久状态保存所选 core profile、`app_profiles`、目录摘要和能力快照。
+
+当旧状态升级到当前通用目录格式时，V564 的迁移规则是：
+
+1. 先使用恒定时间比较验证已有凭据；认证失败时不写回状态。
+2. 仅接受一次性的 v2 输入格式，并原子写成当前 v3；后续运行没有 v2 授权分支。
+3. 按**当前已编译且已启用**的 catalog 重新计算能力；未知历史 core 档位回落为 `core_operator`，未知 App 档位回落为该 App 的默认档位，绝不隐式扩权。
+4. 递增 credential epoch 与 profile revision，使旧签名 envelope 失效；状态通过私有权限临时文件、`fsync` 与原子 rename 持久化。
+
+因此，升级后不得手工编辑或复制 `credential-state.json`，也不得为了绕过启动错误删除凭据校验。正确做法是使用相同配置启动 V564+ Gateway；若凭据本身无效，按配置/凭据运维流程修复，而不是修改状态文件。
+
+配置变更或二进制更新使用 `cowd gateway restart`。它只回收由**同一可执行文件**启动的 `gateway run` 进程：先请求优雅退出，超时后有界强制回收；二进制覆盖时仍通过原始启动路径识别 deleted inode 进程。新 child 只有在自身 PID 成为监听者后才算启动成功，避免旧监听者被误认为新服务。完整操作和核验见 [Gateway 生命周期运行手册](../operator/gateway-lifecycle.md)。
 
 ## 新 App 的边界
 
