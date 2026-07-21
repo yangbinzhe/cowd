@@ -159,7 +159,6 @@ impl GatewayServices {
             skill: SkillService::new(),
             agent: AgentService::new(),
             matrix: MatrixService::new(),
-            mfg: MfgService::new(),
             mission: MissionService::new(),
             capacity,
             owner: "0.9.380 GatewayServices",
@@ -292,7 +291,6 @@ impl GatewayServices {
             self.skill.label,
             self.agent.label,
             self.matrix.label,
-            self.mfg.label,
             self.mission.label,
         ]
     }
@@ -319,7 +317,6 @@ impl GatewayServices {
         contracts.extend(self.skill.contracts());
         contracts.extend(self.agent.contracts());
         contracts.extend(self.matrix.contracts());
-        contracts.extend(self.mfg.contracts());
         contracts.extend(self.mission.contracts());
         contracts
     }

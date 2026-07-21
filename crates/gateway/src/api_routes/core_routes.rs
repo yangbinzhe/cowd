@@ -230,7 +230,7 @@ async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRunti
         structured_watermark_persistent,
         execution_outcome_timeline_available: execution_outcome_timeline_available(state).await,
         memory_context_bridge_available: memory_context_bridge_available(state).await,
-        graph_skill_quality_contracts_available: graph_skill_quality_contract_smoke(state),
+        graph_skill_quality_contracts_available: graph_skill_quality_contract_smoke(),
         gateway_route_manifest_available: gateway_route_manifest_available(),
         frontend_api_matrix_ready: frontend_api_matrix_ready(),
         surface_version_compatible: surface_version_compatible(),
@@ -466,8 +466,11 @@ fn runtime_skill_memory_candidate(
     })
 }
 
-fn graph_skill_quality_contract_smoke(state: &AppState) -> bool {
-    let Some(skill) = state.services.mfg.skill_manifest("supply-risk-analyst") else {
+fn graph_skill_quality_contract_smoke() -> bool {
+    let Some(skill) = app_mfg::server_manufacturing_skill_pack()
+        .into_iter()
+        .find(|skill| skill.skill_id == "supply-risk-analyst")
+    else {
         return false;
     };
     if skill.input_fact_types.is_empty() || skill.quality_gate.is_empty() {

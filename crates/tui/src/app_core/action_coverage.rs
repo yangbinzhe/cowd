@@ -256,7 +256,6 @@ mod tests {
     const MFG_PANEL: &str = include_str!("../components/mfg_operations_panel.rs");
     const MFG_STATE: &str = include_str!("runtime_control_store.rs");
     const MFG_RUNNER: &str = include_str!("../gateway/runner.rs");
-    const MFG_ROUTES: &str = include_str!("../../../gateway/src/api_routes/mfg_routes.rs");
     const MFG_ACTION_REGISTRY: &str = include_str!("../workbench/action_registry.rs");
 
     #[test]
@@ -360,8 +359,9 @@ mod tests {
                 action.action_id.as_str()
             );
             assert!(
-                MFG_ROUTES.contains(&route.path),
-                "{} gateway route is not mounted: {}",
+                app_mfg_contract::route::mfg_route_contract_by_method_path("POST", &route.path)
+                    .is_some(),
+                "{} external APP route is absent from the canonical contract: {}",
                 action.action_id.as_str(),
                 route.path
             );

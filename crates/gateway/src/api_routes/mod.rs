@@ -69,7 +69,6 @@ pub(crate) mod memory_routes;
 mod message_connector_routes;
 mod message_routes;
 mod mfg_outcomes;
-mod mfg_routes;
 mod mission_routes;
 mod profile_routes;
 mod public_routes;
@@ -1050,7 +1049,6 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(harness_eval_routes::router())
         .merge(managed_agent_routes::router())
         .merge(matrix_routes::router())
-        .merge(mfg_routes::router(state.clone()))
         .merge(mission_routes::router())
         .merge(memory_routes::router())
         .merge(message_routes::router())
@@ -4307,7 +4305,11 @@ pub(crate) mod tests {
         );
 
         let report_key = "decision-trace-report";
-        let report_id = mfg_routes::stable_mfg_resource_id("cockpit-report", report_key);
+        let report_id = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(format!("cockpit-report:{report_key}").as_bytes());
+            format!("cockpit-report-{digest:x}")[.."cockpit-report".len() + 1 + 20].to_string()
+        };
         let report = app
             .clone()
             .oneshot(
@@ -5759,48 +5761,50 @@ pub(crate) mod tests {
                 .clone()
                 .with_app_registry(app_registry),
         );
-        let cockpit_profile = state
-            .services
-            .mfg
-            .upsert_cockpit_profile(
-                &config_home,
-                &app_mfg::MfgCockpitProfile::from_input(app_mfg::MfgCockpitProfileInput {
-                    profile_id: Some("gateway-external-cockpit".to_string()),
-                    owner_ref: "principal:local-human".to_string(),
-                    display_name: Some("Gateway external Cockpit".to_string()),
-                    focus_refs: Vec::new(),
-                    focus_metric_ids: Vec::new(),
-                    thresholds: serde_json::Value::Null,
-                    template_id: None,
-                    cadence: None,
-                    expected_revision: None,
-                    scope: None,
-                    layout: None,
-                    global_filters: serde_json::Value::Null,
-                    widget_instances: Vec::new(),
-                    sharing_policy: Some(app_mfg::MfgDashboardSharingPolicy {
-                        visibility: "private".to_string(),
-                        viewer_refs: Vec::new(),
-                        editor_refs: Vec::new(),
+        let cockpit_profile = {
+            let store = app_mfg::MfgStore::open_config_home(&config_home)
+                .expect("open external MFG store for cockpit fixture");
+            store
+                .upsert_cockpit_profile(
+                    &app_mfg::MfgCockpitProfile::from_input(app_mfg::MfgCockpitProfileInput {
+                        profile_id: Some("gateway-external-cockpit".to_string()),
+                        owner_ref: "principal:local-human".to_string(),
+                        display_name: Some("Gateway external Cockpit".to_string()),
+                        focus_refs: Vec::new(),
+                        focus_metric_ids: Vec::new(),
+                        thresholds: serde_json::Value::Null,
+                        template_id: None,
+                        cadence: None,
+                        expected_revision: None,
+                        scope: None,
+                        layout: None,
+                        global_filters: serde_json::Value::Null,
+                        widget_instances: Vec::new(),
+                        sharing_policy: Some(app_mfg::MfgDashboardSharingPolicy {
+                            visibility: "private".to_string(),
+                            viewer_refs: Vec::new(),
+                            editor_refs: Vec::new(),
+                        }),
                     }),
-                }),
-                None,
-            )
-            .expect("seed cockpit profile for external APP route");
-        let cockpit_report = state
-            .services
-            .mfg
-            .generate_cockpit_report(
-                &config_home,
-                &cockpit_profile.profile_id,
-                app_mfg::MfgCockpitReportRequest {
-                    report_id: Some("gateway-external-cockpit-report".to_string()),
-                    cadence: None,
-                    delivery_ref: None,
-                    note: None,
-                },
-            )
-            .expect("seed cockpit report for external APP route");
+                    None,
+                )
+                .expect("seed cockpit profile for external APP route")
+        };
+        let cockpit_report = {
+            let store = app_mfg::MfgStore::open_config_home(&config_home)
+                .expect("open external MFG store for cockpit report fixture");
+            store
+                .generate_cockpit_report(
+                    &cockpit_profile.profile_id,
+                    app_mfg::MfgCockpitReportRequest {
+                        report_id: Some("gateway-external-cockpit-report".to_string()),
+                        cadence: None,
+                        delivery_ref: None,
+                        note: None,
+                    },
+                )
+                .expect("seed cockpit report for external APP route")
+        };
         // Seed an external dead-letter report before product composition.
         // The following HTTP sequence proves the new external review owner
         // calls the real Gateway approval/decision host, rather than an
@@ -5881,6 +5885,7 @@ pub(crate) mod tests {
             )
             .expect("seed runtime task for external assignment");
         let assignment_surface = state.services.surface.clone();
+        let incident_task_service = state.services.task.clone();
         let app = api_router(state);
 
         // Assignment is an external APP mutation. This product request proves
@@ -6144,6 +6149,65 @@ pub(crate) mod tests {
             external_context["context_item"]["id"],
             format!("structured-evidence:{packet_id}")
         );
+
+        // Incident creation is external: the APP owns evidence resolution
+        // and workflow persistence, while Cowd contributes only the closed
+        // Runtime and WorkContext effects.
+        let external_incident = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/apps/mfg/incidents")
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-incident")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "request_id": "gateway-external-incident",
+                            "evidence_packet_id": packet_id,
+                            "title": "Gateway external incident"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = external_incident.status();
+        let body = to_bytes(external_incident.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let external_incident: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(external_incident["kind"], "mfg.incident");
+        let incident_id = external_incident["incident"]["incident_id"]
+            .as_str()
+            .expect("external incident id")
+            .to_string();
+        let incident_task_id = external_incident["task"]["id"]
+            .as_str()
+            .expect("external Runtime task id")
+            .to_string();
+        assert!(incident_task_service
+            .list_records()
+            .expect("list Runtime tasks")
+            .iter()
+            .any(|task| task.id == incident_task_id));
+        let external_analysis = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/apps/mfg/incidents/{incident_id}/analyze"))
+                    .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("idempotency-key", "gateway-external-incident-analysis")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(external_analysis.status(), StatusCode::OK);
 
         // This is a real Gateway -> verified APP request, not an adapter
         // fixture. It proves the migrated write opens canonical Matrix, emits

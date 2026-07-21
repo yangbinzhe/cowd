@@ -27,8 +27,6 @@ mod growth_service;
 mod harness_eval_service;
 mod matrix_service;
 mod memory_service;
-mod mfg_service;
-mod mfg_skill_executor;
 mod mission_service;
 mod policy;
 pub(crate) mod reality_service;
@@ -47,7 +45,7 @@ pub(crate) use app_host_ports::GatewayAppHostBinding;
 pub(crate) use approval_service::ApprovalService;
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_executor::{GatewayConnectorServiceExecutor, GatewayCrossPlaneExecutor};
-pub(crate) use cross_plane_service::{CrossPlaneCommitGraphError, CrossPlaneExecutionRecord};
+pub(crate) use cross_plane_service::CrossPlaneExecutionRecord;
 pub(crate) use evolution_service::{
     EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionServiceError,
     EvolutionSignalCreateRequest,
@@ -56,10 +54,6 @@ pub(crate) use growth_service::growth_storage_migrations;
 pub(crate) use harness_eval_service::HarnessEvalServiceError;
 pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
-pub(crate) use mfg_service::{
-    MfgCrossPlaneBridgeRequest, MfgLivePrincipalContext, MfgLiveServiceError, MfgService,
-};
-pub(crate) use mfg_skill_executor::{GatewayMfgSkillExecutor, MfgSkillExecutionPayload};
 pub(crate) use mission_service::{
     AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,
     DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,
@@ -578,7 +572,6 @@ pub(crate) struct GatewayServices {
     pub(crate) skill: SkillService,
     pub(crate) agent: AgentService,
     pub(crate) matrix: MatrixService,
-    pub(crate) mfg: MfgService,
     pub(crate) mission: MissionService,
     pub(crate) capacity: crate::gateway_capacity::GatewayCapacityController,
     pub(crate) owner: &'static str,
@@ -900,11 +893,6 @@ mod tests {
             "task_projection"
         );
         assert_eq!(services.matrix.health().operation, "health");
-        assert!(services
-            .mfg
-            .contracts()
-            .iter()
-            .any(|contract| contract.operation == "incident"));
         assert_eq!(
             services.mission.projection_contract().operation,
             "projection"

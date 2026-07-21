@@ -77,6 +77,9 @@ pub(crate) const WORK_CONTEXT_INSPECT_TASK_TERMINAL_INTENT_V1: &str =
 /// host owns the durable outbox/idempotency identity for every delivery.
 pub(crate) const CONNECTOR_SURFACE_DISPATCH_BATCH_INTENT_V1: &str =
     "cowd.connector.surface_dispatch_batch.v1";
+/// Closed Runtime task creation. APPs supply a bounded objective and stable
+/// id; Gateway owns task persistence, scheduling and the returned task fact.
+pub(crate) const RUNTIME_START_GOAL_INTENT_V1: &str = "cowd.runtime.start_goal.v1";
 /// Closed, read-only host snapshot for an APP's own production-governance
 /// projection. The response is product status only, not a configuration API.
 pub(crate) const PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1: &str =
@@ -240,11 +243,63 @@ impl AppHostPorts for GatewayAppHostBinding {
 impl RuntimePort for GatewayAppHostBinding {
     async fn execute(
         &self,
-        _context: &InvocationContext,
+        context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
-        Err(Self::unsupported("runtime", &intent.kind))
+        let state = self.state()?;
+        let _principal = self.verified_principal(context)?;
+        match intent.kind.as_str() {
+            RUNTIME_START_GOAL_INTENT_V1 => {
+                let request: RuntimeStartGoalIntentV1 = serde_json::from_value(intent.payload)
+                    .map_err(|error| {
+                        AppHostError::Denied(format!(
+                            "start_goal intent must contain the closed task envelope: {error}"
+                        ))
+                    })?;
+                if !valid_runtime_task_id(&request.task_id)
+                    || request.objective.trim().is_empty()
+                    || request.objective.len() > 4 * 1024
+                    || request.objective.chars().any(char::is_control)
+                {
+                    return Err(AppHostError::Denied(
+                        "runtime task id or objective is invalid".to_string(),
+                    ));
+                }
+                let task = state
+                    .services
+                    .task
+                    .start_goal_idempotent(&request.task_id, request.objective, request.preemptive)
+                    .map_err(AppHostError::Unavailable)?;
+                Ok(HostReceipt {
+                    id: format!("runtime:start-goal:{}", task.id),
+                    status: task.status.as_str().to_string(),
+                    replayed: false,
+                    payload: serde_json::json!({
+                        "kind": "cowd.runtime.start_goal.receipt.v1",
+                        "task": task,
+                    }),
+                })
+            }
+            _ => Err(Self::unsupported("runtime", &intent.kind)),
+        }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeStartGoalIntentV1 {
+    task_id: String,
+    objective: String,
+    #[serde(default)]
+    preemptive: bool,
+}
+
+fn valid_runtime_task_id(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 256
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
 }
 
 #[async_trait]

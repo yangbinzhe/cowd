@@ -250,7 +250,7 @@ pub(crate) fn gateway_openapi_document() -> Value {
 
 fn mfg_openapi_components() -> Map<String, Value> {
     let mut registry = app_mfg_contract::MfgOpenApiSchemaRegistry::canonical();
-    super::mfg_routes::register_mfg_openapi_schemas(&mut registry);
+    app_bundle_mfg::register_mfg_openapi_schemas(&mut registry);
     registry.register_type::<app_mfg::MfgApplicationDescriptor>("MfgApplicationDescriptor");
     registry.register_type::<app_mfg::MfgIncident>("MfgIncident");
     registry.register_type::<app_mfg::MfgOperationalAnalysis>("MfgOperationalAnalysis");
@@ -296,7 +296,7 @@ fn mfg_openapi_components() -> Map<String, Value> {
             route.response_schema,
             json!({"$ref": format!("#/components/schemas/{response_ref}")}),
         );
-        let request_ref = super::mfg_routes::mfg_request_schema_component(route.route_id);
+        let request_ref = app_bundle_mfg::mfg_request_schema_component(route.route_id);
         registry.register_schema(
             route.request_schema,
             json!({"$ref": format!("#/components/schemas/{request_ref}")}),

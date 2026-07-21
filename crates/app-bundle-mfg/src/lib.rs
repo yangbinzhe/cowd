@@ -266,6 +266,14 @@ pub fn register_mfg_openapi_schemas(registry: &mut app_mfg_contract::MfgOpenApiS
     cowd_app_mfg_adapter::register_mfg_openapi_schemas(registry);
 }
 
+/// APP-owned request-schema lookup used by Gateway's aggregate OpenAPI
+/// document.  Keeping this delegation here prevents Gateway from carrying
+/// parallel MFG request DTOs after static APP composition.
+#[must_use]
+pub fn mfg_request_schema_component(route_id: app_mfg_contract::MfgRouteId) -> &'static str {
+    cowd_app_mfg_adapter::mfg_request_schema_component(route_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
