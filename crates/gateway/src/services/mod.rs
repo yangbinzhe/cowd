@@ -109,6 +109,7 @@ impl ContextService {
 pub(crate) struct ConnectorService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    resource_directory_factory: Arc<dyn connector::ResourceDirectoryFactory>,
 }
 
 impl ConnectorService {
@@ -116,6 +117,18 @@ impl ConnectorService {
         Self {
             label: "connector",
             owner: "0.9.315 Connector service boundary",
+            resource_directory_factory: Arc::new(connector::SqliteResourceDirectoryFactory),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_resource_directory_factory(
+        factory: Arc<dyn connector::ResourceDirectoryFactory>,
+    ) -> Self {
+        Self {
+            label: "connector",
+            owner: "0.9.567 Connector durable port",
+            resource_directory_factory: factory,
         }
     }
 

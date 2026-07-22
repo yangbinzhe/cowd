@@ -17,7 +17,7 @@ pub mod source;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -25,6 +25,7 @@ pub use harness_contract::policy::{CrossPlaneRisk, DataClassification};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 
 pub use source::{
     builtin_source_adapter_manifests, canonical_source_resource_ref, read_local_source_batch,
@@ -513,6 +514,132 @@ pub struct ResourceDirectory {
     resources: RwLock<HashMap<String, ExternalResourceRef>>,
 }
 
+/// Backend-neutral resource-directory error exposed to Gateway and callers.
+/// Backend driver details are intentionally flattened here: connector callers
+/// can act on a durable-directory failure without learning whether the domain
+/// runs on SQLite or PostgreSQL.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("resource directory error: {message}")]
+pub struct ResourceDirectoryError {
+    message: String,
+}
+
+impl ResourceDirectoryError {
+    #[must_use]
+    pub fn backend(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+        }
+    }
+}
+
+pub type ResourceDirectoryResult<T> = Result<T, ResourceDirectoryError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceDirectorySourceBinding {
+    pub reference: String,
+    pub source_kind: String,
+    pub source_id: String,
+    pub attached_at: String,
+}
+
+/// Internal durable representation used only by an explicit backend cutover.
+/// Public resource APIs remain DTO-based; migration additionally retains the
+/// ordering timestamps that drive `list_recent`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableResourceDirectoryRecord {
+    pub resource: ExternalResourceRef,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_seen_at: String,
+}
+
+/// The complete durable contract for connector resource metadata. Gateway
+/// depends on this port only; SQLite and PostgreSQL adapters are composed at
+/// the storage boundary rather than selected by route logic.
+pub trait ResourceDirectoryRepository: Send + Sync {
+    fn upsert(
+        &self,
+        resource: &ExternalResourceRef,
+    ) -> ResourceDirectoryResult<ExternalResourceRef>;
+    fn get(&self, reference: &str) -> ResourceDirectoryResult<Option<ExternalResourceRef>>;
+    fn list_recent(&self, limit: usize) -> ResourceDirectoryResult<Vec<ExternalResourceRef>>;
+    fn list_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> ResourceDirectoryResult<Vec<ExternalResourceRef>>;
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> ResourceDirectoryResult<Vec<ExternalResourceRef>>;
+    fn mark_indexed(&self, reference: &str) -> ResourceDirectoryResult<bool>;
+    fn mark_stale(&self, reference: &str) -> ResourceDirectoryResult<bool>;
+    fn attach_source(
+        &self,
+        reference: &str,
+        source_kind: &str,
+        source_id: &str,
+    ) -> ResourceDirectoryResult<()>;
+    fn list_sources(
+        &self,
+        reference: &str,
+    ) -> ResourceDirectoryResult<Vec<ResourceDirectorySourceBinding>>;
+    fn import_source_binding(
+        &self,
+        binding: &ResourceDirectorySourceBinding,
+    ) -> ResourceDirectoryResult<()>;
+    fn export_records(&self) -> ResourceDirectoryResult<Vec<DurableResourceDirectoryRecord>>;
+    fn import_record(&self, record: &DurableResourceDirectoryRecord)
+        -> ResourceDirectoryResult<()>;
+}
+
+/// Opens the selected durable implementation for one registered endpoint.
+/// The factory makes backend choice a composition concern, not a Gateway route
+/// concern.
+pub trait ResourceDirectoryFactory: Send + Sync {
+    fn open(
+        &self,
+        handle: &storage::StorageHandle,
+    ) -> ResourceDirectoryResult<Arc<dyn ResourceDirectoryRepository>>;
+
+    fn is_initialized(&self, handle: &storage::StorageHandle) -> bool;
+}
+
+#[derive(Debug, Default)]
+pub struct SqliteResourceDirectoryFactory;
+
+impl ResourceDirectoryFactory for SqliteResourceDirectoryFactory {
+    fn open(
+        &self,
+        handle: &storage::StorageHandle,
+    ) -> ResourceDirectoryResult<Arc<dyn ResourceDirectoryRepository>> {
+        if handle.backend != storage::StorageBackendKind::Sqlite {
+            return Err(ResourceDirectoryError::backend(format!(
+                "sqlite resource directory cannot open `{}` backend",
+                match handle.backend {
+                    storage::StorageBackendKind::Postgres => "postgres",
+                    storage::StorageBackendKind::FileJson => "file_json",
+                    storage::StorageBackendKind::Directory => "directory",
+                    storage::StorageBackendKind::BlobDirectory => "blob_directory",
+                    storage::StorageBackendKind::Sqlite => "sqlite",
+                }
+            )));
+        }
+        if let Some(parent) = handle.path.parent() {
+            std::fs::create_dir_all(parent).map_err(ResourceDirectoryError::backend)?;
+        }
+        SqliteResourceDirectory::open_storage_handle(handle)
+            .map(|directory| Arc::new(directory) as Arc<dyn ResourceDirectoryRepository>)
+            .map_err(ResourceDirectoryError::backend)
+    }
+
+    fn is_initialized(&self, handle: &storage::StorageHandle) -> bool {
+        handle.backend == storage::StorageBackendKind::Sqlite && handle.path.exists()
+    }
+}
+
 impl ResourceDirectory {
     #[must_use]
     pub fn new() -> Self {
@@ -758,6 +885,196 @@ impl SqliteResourceDirectory {
         )?;
         Ok(())
     }
+
+    pub fn list_sources(
+        &self,
+        reference: &str,
+    ) -> rusqlite::Result<Vec<ResourceDirectorySourceBinding>> {
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let mut statement = connection.prepare(
+            "SELECT reference, source_kind, source_id, attached_at
+               FROM connector_resource_sources
+              WHERE reference = ?1
+              ORDER BY source_kind ASC, source_id ASC",
+        )?;
+        let bindings = statement
+            .query_map(params![reference], |row| {
+                Ok(ResourceDirectorySourceBinding {
+                    reference: row.get(0)?,
+                    source_kind: row.get(1)?,
+                    source_id: row.get(2)?,
+                    attached_at: row.get(3)?,
+                })
+            })?
+            .collect();
+        bindings
+    }
+
+    pub fn export_records(&self) -> rusqlite::Result<Vec<DurableResourceDirectoryRecord>> {
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let mut statement = connection.prepare(
+            "SELECT reference, provider, account_id, resource_type, title, source,
+                permissions_summary, digest, indexed_state, created_at, updated_at, last_seen_at
+              FROM connector_resources
+              ORDER BY reference ASC",
+        )?;
+        let records = statement
+            .query_map([], row_to_durable_resource_directory_record)?
+            .collect();
+        records
+    }
+
+    pub fn import_record(&self, record: &DurableResourceDirectoryRecord) -> rusqlite::Result<()> {
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        connection.execute(
+            r"INSERT INTO connector_resources (
+                reference, provider, account_id, resource_type, title, source,
+                permissions_summary, digest, indexed_state, created_at, updated_at, last_seen_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(reference) DO UPDATE SET
+                provider = excluded.provider,
+                account_id = excluded.account_id,
+                resource_type = excluded.resource_type,
+                title = excluded.title,
+                source = excluded.source,
+                permissions_summary = excluded.permissions_summary,
+                digest = excluded.digest,
+                indexed_state = excluded.indexed_state,
+                created_at = excluded.created_at,
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at",
+            params![
+                record.resource.reference,
+                record.resource.provider,
+                record.resource.account_id,
+                record.resource.resource_type,
+                record.resource.title,
+                record.resource.source,
+                record.resource.permissions_summary,
+                record.resource.digest,
+                record.resource.indexed_state,
+                record.created_at,
+                record.updated_at,
+                record.last_seen_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn import_source_binding(
+        &self,
+        binding: &ResourceDirectorySourceBinding,
+    ) -> rusqlite::Result<()> {
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        connection.execute(
+            r"INSERT INTO connector_resource_sources
+                (reference, source_kind, source_id, attached_at)
+              VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(reference, source_kind, source_id) DO UPDATE SET
+                attached_at = excluded.attached_at",
+            params![
+                binding.reference,
+                binding.source_kind,
+                binding.source_id,
+                binding.attached_at,
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+impl ResourceDirectoryRepository for SqliteResourceDirectory {
+    fn upsert(
+        &self,
+        resource: &ExternalResourceRef,
+    ) -> ResourceDirectoryResult<ExternalResourceRef> {
+        SqliteResourceDirectory::upsert(self, resource).map_err(ResourceDirectoryError::backend)
+    }
+
+    fn get(&self, reference: &str) -> ResourceDirectoryResult<Option<ExternalResourceRef>> {
+        SqliteResourceDirectory::get(self, reference).map_err(ResourceDirectoryError::backend)
+    }
+
+    fn list_recent(&self, limit: usize) -> ResourceDirectoryResult<Vec<ExternalResourceRef>> {
+        SqliteResourceDirectory::list_recent(self, limit).map_err(ResourceDirectoryError::backend)
+    }
+
+    fn list_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> ResourceDirectoryResult<Vec<ExternalResourceRef>> {
+        SqliteResourceDirectory::list_page(self, limit, offset)
+            .map_err(ResourceDirectoryError::backend)
+    }
+
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> ResourceDirectoryResult<Vec<ExternalResourceRef>> {
+        SqliteResourceDirectory::search(self, query, limit).map_err(ResourceDirectoryError::backend)
+    }
+
+    fn mark_indexed(&self, reference: &str) -> ResourceDirectoryResult<bool> {
+        SqliteResourceDirectory::mark_indexed(self, reference)
+            .map_err(ResourceDirectoryError::backend)
+    }
+
+    fn mark_stale(&self, reference: &str) -> ResourceDirectoryResult<bool> {
+        SqliteResourceDirectory::mark_stale(self, reference)
+            .map_err(ResourceDirectoryError::backend)
+    }
+
+    fn attach_source(
+        &self,
+        reference: &str,
+        source_kind: &str,
+        source_id: &str,
+    ) -> ResourceDirectoryResult<()> {
+        SqliteResourceDirectory::attach_source(self, reference, source_kind, source_id)
+            .map_err(ResourceDirectoryError::backend)
+    }
+
+    fn list_sources(
+        &self,
+        reference: &str,
+    ) -> ResourceDirectoryResult<Vec<ResourceDirectorySourceBinding>> {
+        SqliteResourceDirectory::list_sources(self, reference)
+            .map_err(ResourceDirectoryError::backend)
+    }
+
+    fn export_records(&self) -> ResourceDirectoryResult<Vec<DurableResourceDirectoryRecord>> {
+        SqliteResourceDirectory::export_records(self).map_err(ResourceDirectoryError::backend)
+    }
+
+    fn import_record(
+        &self,
+        record: &DurableResourceDirectoryRecord,
+    ) -> ResourceDirectoryResult<()> {
+        SqliteResourceDirectory::import_record(self, record)
+            .map_err(ResourceDirectoryError::backend)
+    }
+
+    fn import_source_binding(
+        &self,
+        binding: &ResourceDirectorySourceBinding,
+    ) -> ResourceDirectoryResult<()> {
+        SqliteResourceDirectory::import_source_binding(self, binding)
+            .map_err(ResourceDirectoryError::backend)
+    }
 }
 
 fn initialize_resource_directory_schema(connection: &Connection) -> rusqlite::Result<()> {
@@ -810,6 +1127,27 @@ fn row_to_resource_ref(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExternalReso
         permissions_summary: row.get(6)?,
         digest: row.get(7)?,
         indexed_state: row.get(8)?,
+    })
+}
+
+fn row_to_durable_resource_directory_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DurableResourceDirectoryRecord> {
+    Ok(DurableResourceDirectoryRecord {
+        resource: ExternalResourceRef {
+            reference: row.get(0)?,
+            provider: row.get(1)?,
+            account_id: row.get(2)?,
+            resource_type: row.get(3)?,
+            title: row.get(4)?,
+            source: row.get(5)?,
+            permissions_summary: row.get(6)?,
+            digest: row.get(7)?,
+            indexed_state: row.get(8)?,
+        },
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        last_seen_at: row.get(11)?,
     })
 }
 
@@ -1406,5 +1744,30 @@ mod tests {
             worker.join().unwrap();
         }
         assert_eq!(directory.list_recent(32).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn sqlite_resource_directory_factory_exposes_complete_durable_port() {
+        let temporary = tempfile::tempdir().unwrap();
+        let handle = storage::StorageHandle::sqlite(
+            "connector_directory",
+            temporary.path().join("resources.sqlite"),
+            "connector",
+            "test",
+        );
+        let factory = SqliteResourceDirectoryFactory;
+        let directory = factory.open(&handle).unwrap();
+        let resource = ExternalResourceRef::new("feishu", "bitable", "factory", "Factory port");
+        directory.upsert(&resource).unwrap();
+        directory
+            .attach_source(&resource.reference, "bitable", "app/table")
+            .unwrap();
+        let sources = directory.list_sources(&resource.reference).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].reference, resource.reference);
+        assert_eq!(sources[0].source_kind, "bitable");
+        assert_eq!(sources[0].source_id, "app/table");
+        assert!(!sources[0].attached_at.is_empty());
+        assert!(factory.is_initialized(&handle));
     }
 }

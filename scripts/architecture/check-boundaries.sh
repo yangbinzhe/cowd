@@ -46,6 +46,22 @@ if [[ "${1:-}" == "--v566-sqlite" ]]; then
   exit "$fail"
 fi
 
+if [[ "${1:-}" == "--v567-postgres" ]]; then
+  # V567 validates the first complete PostgreSQL domain without pretending
+  # that the global deployment switch is ready. Connector keeps a backend-free
+  # port; its PostgreSQL driver lives in the dedicated adapter crate.
+  check_empty "V567 Gateway must not name the concrete SQLite directory" \
+    rg -n '\bSqliteResourceDirectory\b|resource_directory_path' \
+      crates/gateway/src/services crates/gateway/src/api_routes --glob '*.rs'
+  check_empty "V567 global PostgreSQL switch must remain unavailable" \
+    rg -n 'StorageBackendKind::Postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
+  check_empty "V567 connector manifest must not depend on PostgreSQL" \
+    rg -n '^postgres\s*=|^tokio-postgres\s*=|^r2d2_postgres\s*=' crates/connector/Cargo.toml
+  check_empty "V567 PostgreSQL adapter crate must exist" \
+    bash -c 'if [[ ! -f crates/connector-postgres/Cargo.toml || ! -f crates/connector-postgres/src/lib.rs ]]; then echo missing; fi'
+  exit "$fail"
+fi
+
 check_empty "cli business command names" \
   rg -n "\\b(run|chat|prompt|mcp serve)\\b" crates/cli/src/main.rs --glob '*.rs'
 

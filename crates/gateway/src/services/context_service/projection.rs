@@ -101,7 +101,7 @@ impl ContextService {
         workspace_root: &Path,
         query: &str,
     ) -> Vec<ContextItem> {
-        if !connector.resource_directory_path(workspace_root).exists() {
+        if !connector.resource_directory_initialized(workspace_root) {
             return Vec::new();
         }
         let resources = if query.trim().is_empty() {

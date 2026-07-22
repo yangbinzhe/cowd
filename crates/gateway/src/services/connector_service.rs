@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use connector::{ExternalResourceRef, SqliteResourceDirectory};
+use connector::{ExternalResourceRef, ResourceDirectoryRepository, ResourceDirectoryResult};
 use runtime::{
     CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneExecutionReceipt,
     CrossPlanePolicyDecision, PolicyDecisionKind,
@@ -100,17 +100,9 @@ impl ConnectorService {
     pub(crate) fn resource_directory(
         &self,
         workspace_root: impl AsRef<Path>,
-    ) -> rusqlite::Result<SqliteResourceDirectory> {
+    ) -> ResourceDirectoryResult<std::sync::Arc<dyn ResourceDirectoryRepository>> {
         let handle = self.resource_directory_handle(workspace_root);
-        if let Some(parent) = handle.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                    error.kind(),
-                    format!("failed to create resource directory parent: {error}"),
-                )))
-            })?;
-        }
-        SqliteResourceDirectory::open_storage_handle(&handle)
+        self.resource_directory_factory.open(&handle)
     }
 
     pub(crate) fn resource_directory_handle(
@@ -129,8 +121,9 @@ impl ConnectorService {
             .expect("workspace connector endpoint registration must be valid")
     }
 
-    pub(crate) fn resource_directory_path(&self, workspace_root: impl AsRef<Path>) -> PathBuf {
-        self.resource_directory_handle(workspace_root).path
+    pub(crate) fn resource_directory_initialized(&self, workspace_root: impl AsRef<Path>) -> bool {
+        let handle = self.resource_directory_handle(workspace_root);
+        self.resource_directory_factory.is_initialized(&handle)
     }
 
     pub(crate) fn list_resources(
@@ -139,7 +132,7 @@ impl ConnectorService {
         limit: usize,
         offset: usize,
         query: Option<&str>,
-    ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+    ) -> ResourceDirectoryResult<Vec<ExternalResourceRef>> {
         let directory = self.resource_directory(workspace_root)?;
         query
             .map(|value| directory.search(value, limit))
@@ -150,7 +143,7 @@ impl ConnectorService {
         &self,
         workspace_root: impl AsRef<Path>,
         limit: usize,
-    ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+    ) -> ResourceDirectoryResult<Vec<ExternalResourceRef>> {
         self.resource_directory(workspace_root)?.list_recent(limit)
     }
 
@@ -159,7 +152,7 @@ impl ConnectorService {
         workspace_root: impl AsRef<Path>,
         query: &str,
         limit: usize,
-    ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
+    ) -> ResourceDirectoryResult<Vec<ExternalResourceRef>> {
         self.resource_directory(workspace_root)?
             .search(query, limit)
     }
@@ -168,7 +161,7 @@ impl ConnectorService {
         &self,
         workspace_root: impl AsRef<Path>,
         reference: &str,
-    ) -> rusqlite::Result<Option<ExternalResourceRef>> {
+    ) -> ResourceDirectoryResult<Option<ExternalResourceRef>> {
         self.resource_directory(workspace_root)?.get(reference)
     }
 
@@ -176,7 +169,7 @@ impl ConnectorService {
         &self,
         workspace_root: impl AsRef<Path>,
         resource: &ExternalResourceRef,
-    ) -> rusqlite::Result<()> {
+    ) -> ResourceDirectoryResult<()> {
         self.resource_directory(workspace_root)?
             .upsert(resource)
             .map(|_| ())
@@ -187,7 +180,7 @@ impl ConnectorService {
         workspace_root: impl AsRef<Path>,
         reference: &str,
         desired_state: &str,
-    ) -> rusqlite::Result<(bool, Option<ExternalResourceRef>, Option<String>)> {
+    ) -> ResourceDirectoryResult<(bool, Option<ExternalResourceRef>, Option<String>)> {
         let directory = self.resource_directory(workspace_root)?;
         let changed = match desired_state {
             "indexed" => directory.mark_indexed(reference)?,
@@ -204,5 +197,27 @@ impl ConnectorService {
             self.resource_revalidate(),
             self.resource_promote_memory(),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gateway_connector_service_uses_durable_directory_port() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let service = ConnectorService::new();
+        let resource =
+            ExternalResourceRef::new("feishu", "bitable", "gateway-port", "Gateway port");
+        service
+            .upsert_resource(workspace.path(), &resource)
+            .expect("upsert through connector port");
+        let (changed, persisted, reason) = service
+            .mark_resource_state(workspace.path(), &resource.reference, "indexed")
+            .expect("mark state through connector port");
+        assert!(changed);
+        assert!(reason.is_none());
+        assert_eq!(persisted.expect("resource exists").indexed_state, "indexed");
     }
 }

@@ -9,12 +9,20 @@
     )
 )]
 
+#[cfg(feature = "storage-postgres")]
+mod postgres;
 mod sqlite;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "storage-postgres")]
+pub use postgres::{
+    PostgresConnectionConfig, PostgresExecutor, PostgresExecutorHealth, PostgresExecutorMetrics,
+    PostgresMigrationReport, PostgresMigrationSpec, ResolvedPostgresUrl, SecretRefResolver,
+    StaticSecretRefResolver,
+};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -33,6 +41,9 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[cfg(feature = "storage-postgres")]
+    #[error("postgres error: {0}")]
+    Postgres(#[from] ::postgres::Error),
     #[error("{0}")]
     Other(String),
 }
@@ -69,6 +80,7 @@ pub trait MatrixRepository {
 #[serde(rename_all = "snake_case")]
 pub enum StorageBackendKind {
     Sqlite,
+    Postgres,
     FileJson,
     Directory,
     BlobDirectory,
@@ -207,6 +219,26 @@ impl StorageEndpoint {
         )
     }
 
+    /// A PostgreSQL endpoint carries no connection URL in the registry. The
+    /// embedding host resolves its secret reference into a `PostgresExecutor`
+    /// at composition time, so inventory and health cannot leak credentials.
+    #[must_use]
+    pub fn postgres(
+        domain: StorageDomainId,
+        scope: StorageScope,
+        owner: impl Into<String>,
+        migration: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            domain,
+            scope,
+            StorageBackendKind::Postgres,
+            PathBuf::new(),
+            owner,
+            migration,
+        )
+    }
+
     #[must_use]
     pub fn as_handle(&self) -> StorageHandle {
         StorageHandle {
@@ -284,6 +316,21 @@ impl StorageHandle {
             domain: domain.into(),
             backend: StorageBackendKind::Sqlite,
             path: path.into(),
+            owner: owner.into(),
+            migration: migration.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn postgres(
+        domain: impl Into<String>,
+        owner: impl Into<String>,
+        migration: impl Into<String>,
+    ) -> Self {
+        Self {
+            domain: domain.into(),
+            backend: StorageBackendKind::Postgres,
+            path: PathBuf::new(),
             owner: owner.into(),
             migration: migration.into(),
         }
@@ -634,6 +681,7 @@ impl StorageRegistry {
                 StorageBackendKind::Directory | StorageBackendKind::BlobDirectory => {
                     endpoint.path.as_path()
                 }
+                StorageBackendKind::Postgres => continue,
                 _ => endpoint.path.parent().unwrap_or_else(|| Path::new(".")),
             };
             fs::create_dir_all(directory)?;
@@ -717,6 +765,20 @@ pub struct StorageEndpointHealth {
 
 impl StorageEndpointHealth {
     fn from_endpoint(endpoint: &StorageEndpoint) -> Self {
+        if endpoint.backend == StorageBackendKind::Postgres {
+            return Self {
+                id: endpoint.logical_id(),
+                domain: endpoint.domain.clone(),
+                scope: endpoint.scope.clone(),
+                backend: endpoint.backend.clone(),
+                owner: endpoint.owner.clone(),
+                // Connection health is reported by PostgresExecutor. A
+                // registry alone cannot and must not resolve a secret, so it
+                // must not claim a remote endpoint is presently reachable.
+                present: false,
+                writable_parent: false,
+            };
+        }
         let parent = match endpoint.backend {
             StorageBackendKind::Directory | StorageBackendKind::BlobDirectory => {
                 endpoint.path.as_path()

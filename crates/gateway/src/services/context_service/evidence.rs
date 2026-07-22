@@ -89,7 +89,7 @@ impl ContextService {
         workspace_root: &Path,
         reference: &str,
     ) -> serde_json::Value {
-        if !connector.resource_directory_path(workspace_root).exists() {
+        if !connector.resource_directory_initialized(workspace_root) {
             return serde_json::json!({
                 "ref": reference,
                 "kind": "resource",
