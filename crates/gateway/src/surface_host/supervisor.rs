@@ -236,7 +236,7 @@ async fn start_managed_process(
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
     managed: Arc<AsyncMutex<HashMap<String, Arc<ManagedSurfaceProcess>>>>,
     event_tx: broadcast::Sender<SurfaceFrame>,
-    messages: Arc<super::SurfaceMessageStore>,
+    messages: Arc<dyn surface::SurfaceMessageLedger>,
 ) -> Result<ManagedSurfaceProcess, SurfaceError> {
     let surface_id = surface.id.clone();
     let (artifact, driver_profile) =

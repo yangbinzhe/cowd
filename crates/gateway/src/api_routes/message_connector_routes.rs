@@ -422,7 +422,11 @@ async fn list_message_bindings_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
     let mut bindings = BTreeMap::<String, serde_json::Value>::new();
-    for inbox in state.services.surface.all_inbox() {
+    let inboxes = match state.services.surface.all_inbox() {
+        Ok(inboxes) => inboxes,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    for inbox in inboxes {
         let endpoint = inbox
             .sender_id
             .clone()
@@ -446,7 +450,11 @@ async fn list_message_bindings_handler(
             }),
         );
     }
-    for outbox in state.services.surface.all_outbox() {
+    let outbox_records = match state.services.surface.all_outbox() {
+        Ok(outbox) => outbox,
+        Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    };
+    for outbox in outbox_records {
         let endpoint = outbox.recipient.clone();
         let thread = outbox.thread_id.clone().unwrap_or_default();
         let key = format!("{}:{}:{}", outbox.surface, endpoint, thread);
@@ -479,6 +487,7 @@ async fn list_message_bindings_handler(
         "kind": "message.conversation.bindings",
         "bindings": bindings,
     }))
+    .into_response()
 }
 
 fn message_endpoint_projection(platform: &PlatformReadiness) -> Vec<serde_json::Value> {

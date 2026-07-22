@@ -19,6 +19,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod message;
+pub mod message_ledger;
+
+pub use message_ledger::{
+    SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
+    SurfaceMessageLedger, SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
+    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
+};
 
 include!("edge_v2_generated.rs");
 

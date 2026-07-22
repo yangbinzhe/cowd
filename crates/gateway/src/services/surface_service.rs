@@ -228,7 +228,9 @@ impl SurfaceService {
         self.host.retry_trigger_event(surface, idempotency_key)
     }
 
-    pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
+    pub(crate) fn due_trigger_event_retries(
+        &self,
+    ) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
         self.host.due_trigger_event_retries()
     }
 
@@ -249,36 +251,42 @@ impl SurfaceService {
         self.host.fail_ingress_frame(record_key, error)
     }
 
-    pub(crate) fn inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
+    pub(crate) fn inbox(&self, surface: &str) -> Result<Vec<SurfaceInboxRecord>, String> {
         self.host.inbox(surface)
     }
 
-    pub(crate) fn outbox(&self, surface: &str) -> Vec<SurfaceOutboxRecord> {
+    pub(crate) fn outbox(&self, surface: &str) -> Result<Vec<SurfaceOutboxRecord>, String> {
         self.host.outbox(surface)
     }
 
-    pub(crate) fn trigger_events(&self, surface: &str) -> Vec<SurfaceTriggerEventRecord> {
+    pub(crate) fn trigger_events(
+        &self,
+        surface: &str,
+    ) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
         self.host.trigger_events(surface)
     }
 
-    pub(crate) fn all_inbox(&self) -> Vec<SurfaceInboxRecord> {
+    pub(crate) fn all_inbox(&self) -> Result<Vec<SurfaceInboxRecord>, String> {
         self.host.all_inbox()
     }
 
-    pub(crate) fn all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
+    pub(crate) fn all_outbox(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
         self.host.all_outbox()
     }
 
-    pub(crate) fn delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
+    pub(crate) fn delivery_events(
+        &self,
+        surface: &str,
+    ) -> Result<Vec<SurfaceDeliveryEvent>, String> {
         self.host.delivery_events(surface)
     }
 
-    pub(crate) fn message_snapshot(&self, surface: &str) -> SurfaceMessageSnapshot {
+    pub(crate) fn message_snapshot(&self, surface: &str) -> Result<SurfaceMessageSnapshot, String> {
         self.host.message_snapshot(surface)
     }
 
     pub(crate) fn message_store_root(&self) -> std::path::PathBuf {
-        self.host.message_store_root().to_path_buf()
+        self.host.message_store_root()
     }
 
     pub(crate) fn archive_dead_letters(

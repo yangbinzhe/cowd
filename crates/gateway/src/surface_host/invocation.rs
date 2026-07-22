@@ -69,7 +69,8 @@ impl SurfaceHost {
         delivery_id: &str,
         reason: impl Into<String>,
     ) -> Result<crate::surface_host::SurfaceOutboxRecord, String> {
-        self.messages.mark_delivery_dead_letter(delivery_id, reason)
+        self.messages
+            .mark_delivery_dead_letter(delivery_id, &reason.into())
     }
 
     async fn deliver_outbox(
@@ -79,6 +80,10 @@ impl SurfaceHost {
         let delivery = self
             .messages
             .get_outbox_by_delivery(delivery_id)
+            .map_err(|reason| SurfaceError::Invocation {
+                surface: "unknown".to_string(),
+                reason,
+            })?
             .ok_or_else(|| SurfaceError::Invocation {
                 surface: "unknown".to_string(),
                 reason: format!("surface delivery `{delivery_id}` not found"),
@@ -116,7 +121,7 @@ impl SurfaceHost {
                     .map(|error| is_retryable_surface_error(&error.code))
                     .unwrap_or(true);
                 self.messages
-                    .mark_delivery_failed(delivery_id, message, retryable)
+                    .mark_delivery_failed(delivery_id, &message, retryable)
                     .map_err(|error| SurfaceError::Invocation {
                         surface: result.surface.clone(),
                         reason: error,
@@ -128,7 +133,7 @@ impl SurfaceHost {
                 let message = error.to_string();
                 let _ = self
                     .messages
-                    .mark_delivery_failed(delivery_id, message.clone(), true);
+                    .mark_delivery_failed(delivery_id, &message, true);
                 Err(SurfaceError::Invocation {
                     surface,
                     reason: message,
@@ -608,7 +613,7 @@ mod tests {
             })
             .await;
 
-        let outbox = host.outbox("feishu");
+        let outbox = host.outbox("feishu").unwrap();
         assert_eq!(outbox.len(), 1);
         assert_eq!(
             outbox[0].reply_to_message_id.as_deref(),

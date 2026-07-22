@@ -136,7 +136,14 @@ async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
     let Some(store) = runtime_service.session_kernel().unified_store() else {
         return;
     };
-    for inbox in state.services.surface.all_inbox() {
+    let inboxes = match state.services.surface.all_inbox() {
+        Ok(inboxes) => inboxes,
+        Err(error) => {
+            tracing::warn!(error = %error, "surface terminal bridge inbox scan failed");
+            return;
+        }
+    };
+    for inbox in inboxes {
         if !matches!(inbox.status.as_str(), "processing" | "processed") {
             continue;
         }
@@ -378,7 +385,14 @@ async fn persist_and_dispatch_surface_trigger(
 }
 
 async fn retry_surface_trigger_events(state: &Arc<AppState>) {
-    for record in state.services.surface.due_trigger_event_retries() {
+    let records = match state.services.surface.due_trigger_event_retries() {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(error = %error, "surface trigger retry scan failed");
+            return;
+        }
+    };
+    for record in records {
         dispatch_surface_trigger_event(state.clone(), record.idempotency_key).await;
     }
 }
@@ -567,7 +581,7 @@ async fn handle_surface_message(
         .ok_or_else(|| "runtime service unavailable".to_string())?;
     let current_media = payload_media_attachments(&payload, &message_id);
     let recent_media = if current_media.is_empty() && content_references_surface_media(&content) {
-        recent_surface_media(&state, &surface, &session_id, &message_id)
+        recent_surface_media(&state, &surface, &session_id, &message_id)?
     } else {
         Vec::new()
     };
@@ -1147,11 +1161,11 @@ fn recent_surface_media(
     surface: &str,
     session_id: &str,
     current_message_id: &str,
-) -> Vec<SurfaceMediaAttachment> {
+) -> Result<Vec<SurfaceMediaAttachment>, String> {
     let mut attachments = state
         .services
         .surface
-        .inbox(surface)
+        .inbox(surface)?
         .into_iter()
         .filter(|record| record.runtime_session_id.as_deref() == Some(session_id))
         .filter(|record| record.message_id != current_message_id)
@@ -1168,11 +1182,11 @@ fn recent_surface_media(
             acc
         });
     attachments.sort_by_key(|(received_at_ms, _)| std::cmp::Reverse(*received_at_ms));
-    attachments
+    Ok(attachments
         .into_iter()
         .map(|(_, attachment)| attachment)
         .take(3)
-        .collect()
+        .collect())
 }
 
 fn payload_media_attachments(

@@ -109,6 +109,25 @@ if [[ "${1:-}" == "--v570-task-postgres" ]]; then
   exit "$fail"
 fi
 
+if [[ "${1:-}" == "--v571-surface-ledger-port" ]]; then
+  # V571 moves Surface durable facts and operations behind a storage-neutral,
+  # object-safe contract. SQLite remains a private Gateway adapter; PostgreSQL
+  # composition and any deployment switch are intentionally deferred.
+  check_empty "V571 surface contract must own the durable ledger port" \
+    bash -c 'if ! rg -q "pub trait SurfaceMessageLedger" crates/surface/src/message_ledger.rs; then echo missing; fi'
+  check_empty "V571 host and managed transports must not retain concrete SQLite ledger types" \
+    bash -c 'rg -n "Arc<SqliteSurfaceMessageStore>" crates/gateway/src/surface_host --glob "*.rs" | rg -v "#\[cfg\(test\)\]" || true'
+  check_empty "V571 Gateway must not redefine surface durable DTOs" \
+    rg -n 'pub\(crate\) struct Surface(TurnCorrelation|InboxRecord|OutboxRecord|TriggerEventRecord|DeliveryEvent|MessageSnapshot)' crates/gateway/src/surface_host/message_store.rs
+  check_empty "V571 nonfallible ledger projections must remain test-only" \
+    bash -c 'awk "/^\/\/\/ Gateway.s current SQLite implementation/{exit} {print}" crates/gateway/src/surface_host/message_store.rs | rg -n "fn (get_outbox_by_delivery|due_retry_deliveries|due_trigger_event_retries|get_inbox_message|list_inbox|list_outbox|list_all_inbox|list_all_outbox|list_trigger_events|list_delivery_events|snapshot)\(.*-> (Option<|Vec<|SurfaceMessageSnapshot)" || true'
+  check_empty "V571 Surface and Gateway normal dependency trees must stay PostgreSQL-free" \
+    bash -c '(cargo tree -p surface --edges normal; cargo tree -p gateway --edges normal) 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
+  check_empty "V571 global PostgreSQL switch must remain unavailable" \
+    rg -n 'StorageBackendKind::Postgres|control_plane_backend.*postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
+  exit "$fail"
+fi
+
 check_empty "cli business command names" \
   rg -n "\\b(run|chat|prompt|mcp serve)\\b" crates/cli/src/main.rs --glob '*.rs'
 

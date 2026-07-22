@@ -15,7 +15,10 @@ use surface::{
 use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use super::SurfaceMessageStore;
+use surface::SurfaceMessageLedger;
+
+#[cfg(test)]
+use super::SqliteSurfaceMessageStore;
 
 const AUTH_HEADER: &str = "x-cowd-edge-token";
 const MAX_RESPONSE_BODY: usize = 2 * 1024 * 1024;
@@ -172,7 +175,7 @@ impl EdgeH2Client {
         &self,
         events: Arc<Mutex<VecDeque<SurfaceFrame>>>,
         event_tx: broadcast::Sender<SurfaceFrame>,
-        messages: Arc<SurfaceMessageStore>,
+        messages: Arc<dyn SurfaceMessageLedger>,
     ) {
         let client = self.clone();
         tokio::spawn(async move {
@@ -186,7 +189,7 @@ impl EdgeH2Client {
         &self,
         events: Arc<Mutex<VecDeque<SurfaceFrame>>>,
         event_tx: broadcast::Sender<SurfaceFrame>,
-        messages: Arc<SurfaceMessageStore>,
+        messages: Arc<dyn SurfaceMessageLedger>,
     ) -> Result<(), SurfaceError> {
         let request = self.request(Method::GET, "/_cowd/edge/v2/events?after=0", Bytes::new())?;
         let response = self.send(request).await?;
@@ -610,7 +613,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let socket = root.join("edge.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let store = Arc::new(SurfaceMessageStore::new(root.join("messages")));
+        let store = Arc::new(SqliteSurfaceMessageStore::new(root.join("messages")));
         let acked = Arc::new(Notify::new());
         let persisted_before_ack = Arc::new(AtomicBool::new(false));
         let server_store = store.clone();

@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use surface::{SurfaceDescriptor, SurfaceFrame, SurfaceRuntimeSnapshot, SurfaceSupervisorEvent};
+use surface::{
+    SurfaceDescriptor, SurfaceFrame, SurfaceMessageLedger, SurfaceRuntimeSnapshot,
+    SurfaceSupervisorEvent,
+};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 mod edge_h2;
@@ -18,9 +21,10 @@ mod supervisor;
 mod types;
 
 pub(crate) use ingress::spawn_surface_ingress_dispatcher;
+use message_store::SqliteSurfaceMessageStore;
 pub(crate) use message_store::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
-    SurfaceMessageSnapshot, SurfaceMessageStore, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
+    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
     SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 pub(crate) use types::{
@@ -41,7 +45,7 @@ pub(crate) struct SurfaceHost {
     roots: Vec<PathBuf>,
     managed: Arc<AsyncMutex<HashMap<String, Arc<ManagedSurfaceProcess>>>>,
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
-    messages: Arc<SurfaceMessageStore>,
+    messages: Arc<dyn SurfaceMessageLedger>,
     event_tx: broadcast::Sender<SurfaceFrame>,
     monitor_started: Arc<RwLock<bool>>,
 }
@@ -70,14 +74,14 @@ impl SurfaceHost {
         Self::with_configs_and_message_store(
             roots,
             configs,
-            Arc::new(SurfaceMessageStore::new(message_root)),
+            Arc::new(SqliteSurfaceMessageStore::new(message_root)),
         )
     }
 
     fn with_configs_and_message_store(
         roots: Vec<PathBuf>,
         configs: BTreeMap<String, serde_json::Value>,
-        messages: Arc<SurfaceMessageStore>,
+        messages: Arc<dyn SurfaceMessageLedger>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(1024);
         let host = Self {
@@ -112,7 +116,7 @@ impl SurfaceHost {
             roots.append(&mut install_roots);
         }
         roots.extend(edge_manifest_roots(config_home));
-        let message_root = SurfaceMessageStore::default_root(config_home);
+        let message_root = SqliteSurfaceMessageStore::default_root(config_home);
         let storage = storage::StorageRegistry::default_for_config_home(config_home)
             .with_surface_message_root(&message_root)
             .expect("surface storage endpoint registration must not collide");
@@ -122,7 +126,7 @@ impl SurfaceHost {
         Self::with_configs_and_message_store(
             roots,
             configs,
-            Arc::new(SurfaceMessageStore::from_storage_endpoint(endpoint)),
+            Arc::new(SqliteSurfaceMessageStore::from_storage_endpoint(endpoint)),
         )
     }
 
@@ -130,8 +134,8 @@ impl SurfaceHost {
         self.event_tx.subscribe()
     }
 
-    pub(crate) fn message_store_root(&self) -> &Path {
-        self.messages.root()
+    pub(crate) fn message_store_root(&self) -> PathBuf {
+        self.messages.diagnostic_root()
     }
 }
 
@@ -199,6 +203,25 @@ mod tests {
             .message_store_root()
             .components()
             .any(|component| component.as_os_str() == "cowd-surface-messages"));
+    }
+
+    #[test]
+    fn surface_host_composes_message_ledger_through_storage_neutral_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-ledger-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let messages: Arc<dyn SurfaceMessageLedger> =
+            Arc::new(SqliteSurfaceMessageStore::new(&root));
+        let host = SurfaceHost::with_configs_and_message_store(
+            Vec::new(),
+            BTreeMap::new(),
+            messages.clone(),
+        );
+
+        assert_eq!(host.message_store_root(), root);
+        assert!(messages.list_inbox("fixture").unwrap().is_empty());
+        let _ = fs::remove_dir_all(host.message_store_root());
     }
 
     #[tokio::test]

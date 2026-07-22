@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
+harness-contract = { path = "../harness-contract" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "2"

@@ -5991,10 +5991,14 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let assignment_started: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(assignment_started["assignment"]["status"], "in_progress");
-        assert!(assignment_surface.all_outbox().iter().any(|entry| {
-            entry.idempotency_key == "gateway-external-assignment-start:surface:0"
-                && entry.surface == "fixture-surface"
-        }));
+        assert!(assignment_surface
+            .all_outbox()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry.idempotency_key == "gateway-external-assignment-start:surface:0"
+                    && entry.surface == "fixture-surface"
+            }));
 
         let external_alert_rule = app
             .clone()

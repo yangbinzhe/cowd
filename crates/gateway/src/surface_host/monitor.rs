@@ -67,7 +67,14 @@ impl SurfaceHost {
     }
 
     async fn retry_due_deliveries(&self) {
-        for delivery in self.messages.due_retry_deliveries() {
+        let deliveries = match self.messages.due_retry_deliveries() {
+            Ok(deliveries) => deliveries,
+            Err(error) => {
+                tracing::warn!(error = %error, "surface outbox retry scan failed");
+                return;
+            }
+        };
+        for delivery in deliveries {
             let delivery_id = delivery.delivery_id.clone();
             if let Err(error) = self.retry_outbox_delivery(&delivery_id).await {
                 tracing::warn!(

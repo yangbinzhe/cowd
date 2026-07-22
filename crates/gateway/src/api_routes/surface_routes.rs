@@ -417,11 +417,21 @@ async fn get_surface_inbox_handler(
         ));
     }
     let surface = surface::normalize_surface_id(&id);
+    let inbox = state
+        .services
+        .surface
+        .inbox(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let snapshot = state
+        .services
+        .surface
+        .message_snapshot(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "surface.inbox",
         "surface": surface,
-        "inbox": state.services.surface.inbox(&id),
-        "snapshot": state.services.surface.message_snapshot(&id),
+        "inbox": inbox,
+        "snapshot": snapshot,
     })))
 }
 
@@ -436,11 +446,21 @@ async fn get_surface_outbox_handler(
         ));
     }
     let surface = surface::normalize_surface_id(&id);
+    let outbox = state
+        .services
+        .surface
+        .outbox(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let snapshot = state
+        .services
+        .surface
+        .message_snapshot(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "surface.outbox",
         "surface": surface,
-        "outbox": state.services.surface.outbox(&id),
-        "dead_letters": state.services.surface.message_snapshot(&id).dead_letters,
+        "outbox": outbox,
+        "dead_letters": snapshot.dead_letters,
     })))
 }
 
@@ -458,6 +478,7 @@ async fn get_surface_outbox_delivery_handler(
         .services
         .surface
         .outbox(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .into_iter()
         .find(|record| record.delivery_id == delivery_id)
         .ok_or_else(|| {
@@ -483,7 +504,11 @@ async fn get_surface_messages_handler(
             format!("surface `{id}` not found"),
         ));
     }
-    let snapshot = state.services.surface.message_snapshot(&id);
+    let snapshot = state
+        .services
+        .surface
+        .message_snapshot(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "surface.messages",
         "surface": surface::normalize_surface_id(&id),
@@ -513,7 +538,8 @@ async fn archive_surface_messages_handler(
         "surface": surface::normalize_surface_id(&id),
         "archived_count": archived.len(),
         "archived": archived,
-        "snapshot": state.services.surface.message_snapshot(&id),
+        "snapshot": state.services.surface.message_snapshot(&id)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?,
     })))
 }
 
@@ -537,7 +563,8 @@ async fn purge_archived_surface_messages_handler(
         "kind": "surface.messages.purge_archived_events",
         "surface": surface::normalize_surface_id(&id),
         "purged_count": purged_count,
-        "snapshot": state.services.surface.message_snapshot(&id),
+        "snapshot": state.services.surface.message_snapshot(&id)
+            .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?,
     })))
 }
 
@@ -552,10 +579,15 @@ async fn get_surface_deliveries_handler(
         ));
     }
     let surface = surface::normalize_surface_id(&id);
+    let deliveries = state
+        .services
+        .surface
+        .delivery_events(&id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     Ok(Json(serde_json::json!({
         "kind": "surface.deliveries",
         "surface": surface,
-        "deliveries": state.services.surface.delivery_events(&id),
+        "deliveries": deliveries,
     })))
 }
 
@@ -631,6 +663,7 @@ fn ensure_surface_delivery(
         .services
         .surface
         .outbox(&normalized)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
         .iter()
         .any(|record| record.delivery_id == delivery_id);
     if !belongs_to_surface {

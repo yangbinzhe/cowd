@@ -8,8 +8,16 @@ use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use surface::SurfaceFrame;
-use surface::{normalize_surface_id, SurfaceOperationResult, SurfaceSendRequest};
+use surface::{
+    normalize_surface_id, SurfaceFrame, SurfaceMessageLedger, SurfaceOperationResult,
+    SurfaceSendRequest,
+};
+
+pub(crate) use surface::{
+    SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
+    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
+    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
+};
 
 const INBOX_FILE: &str = "surface_inbox.jsonl";
 const OUTBOX_FILE: &str = "surface_outbox.jsonl";
@@ -17,148 +25,6 @@ const EVENT_FILE: &str = "surface_delivery_event.jsonl";
 const TRIGGER_EVENT_FILE: &str = "surface_trigger_event.jsonl";
 const DATABASE_FILE: &str = "surface_messages.sqlite3";
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SurfaceTurnCorrelation {
-    /// Stable transport identity retained with the original inbox record.
-    pub surface: String,
-    pub message_id: String,
-    pub inbox_idempotency_key: String,
-    /// Canonical SessionIngress and Runtime identities.  These are never
-    /// inferred from message text or timestamps during recovery.
-    pub session_id: String,
-    pub turn_id: String,
-    pub execution_id: String,
-    pub reply_to_message_id: String,
-    pub reply_idempotency_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub terminal_id: Option<String>,
-    /// Monotonic terminal-delivery observation revision.  It protects
-    /// restart/replay reconciliation while the unchanged outbox key provides
-    /// the side-effect idempotency boundary.
-    #[serde(default)]
-    pub terminal_delivery_revision: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SurfaceInboxRecord {
-    pub id: String,
-    pub surface: String,
-    pub message_id: String,
-    pub idempotency_key: String,
-    pub thread_id: Option<String>,
-    pub sender_id: Option<String>,
-    pub payload_hash: String,
-    pub payload_summary: String,
-    pub payload_json: serde_json::Value,
-    pub status: String,
-    pub received_at_ms: i64,
-    pub updated_at_ms: i64,
-    pub runtime_session_id: Option<String>,
-    pub runtime_turn_id: Option<String>,
-    /// Additive migration carrier for canonical ingress/terminal recovery.
-    /// Older JSONL records deserialize without it and remain readable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub correlation: Option<SurfaceTurnCorrelation>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SurfaceOutboxRecord {
-    pub delivery_id: String,
-    pub surface: String,
-    pub recipient: String,
-    pub thread_id: Option<String>,
-    pub idempotency_key: String,
-    pub text_hash: String,
-    pub text_summary: String,
-    pub request_json: serde_json::Value,
-    pub status: String,
-    pub attempts: u32,
-    pub max_attempts: u32,
-    pub next_retry_at_ms: Option<i64>,
-    #[serde(default)]
-    pub claim_owner: Option<String>,
-    #[serde(default)]
-    pub lease_until_ms: Option<i64>,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
-    pub sent_at_ms: Option<i64>,
-    pub last_error: Option<String>,
-    pub source_session_id: Option<String>,
-    pub reply_to_message_id: Option<String>,
-}
-
-/// Durable handoff from a Surface transport into Runtime's Managed Agent
-/// trigger boundary.  The Surface layer owns only delivery/recovery of this
-/// transport fact; Runtime remains the owner of matching, authorization,
-/// idempotency and invocation scheduling.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SurfaceTriggerEventRecord {
-    pub idempotency_key: String,
-    pub surface: String,
-    pub event_type: String,
-    pub trigger: ManagedAgentTriggerEvent,
-    pub payload_json: serde_json::Value,
-    pub status: String,
-    pub attempts: u32,
-    pub max_attempts: u32,
-    pub next_retry_at_ms: Option<i64>,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
-    pub accepted_at_ms: Option<i64>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SurfaceDeliveryEvent {
-    pub event_id: String,
-    pub surface: String,
-    pub delivery_id: Option<String>,
-    pub message_id: Option<String>,
-    pub kind: String,
-    pub status: String,
-    pub detail_json: serde_json::Value,
-    pub created_at_ms: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SurfaceMessageSnapshot {
-    pub kind: &'static str,
-    pub surface: String,
-    pub message_root: PathBuf,
-    pub inbox: Vec<SurfaceInboxRecord>,
-    pub active_inbox: Vec<SurfaceInboxRecord>,
-    pub terminal_inbox: Vec<SurfaceInboxRecord>,
-    pub trigger_events: Vec<SurfaceTriggerEventRecord>,
-    pub active_trigger_events: Vec<SurfaceTriggerEventRecord>,
-    pub failed_trigger_events: Vec<SurfaceTriggerEventRecord>,
-    pub outbox: Vec<SurfaceOutboxRecord>,
-    pub active_outbox: Vec<SurfaceOutboxRecord>,
-    pub terminal_outbox: Vec<SurfaceOutboxRecord>,
-    pub deliveries: Vec<SurfaceDeliveryEvent>,
-    pub dead_letters: Vec<SurfaceOutboxRecord>,
-    pub archived_outbox: Vec<SurfaceOutboxRecord>,
-    pub archived_count: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SurfaceInboxReceipt {
-    pub record: SurfaceInboxRecord,
-    pub duplicate: bool,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SurfaceTriggerEventReceipt {
-    pub record: SurfaceTriggerEventRecord,
-    pub duplicate: bool,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SurfaceIngressClaim {
-    pub record_key: String,
-    pub frame: SurfaceFrame,
-}
 
 #[derive(Debug, Default)]
 struct SurfaceMessageState {
@@ -169,12 +35,12 @@ struct SurfaceMessageState {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SurfaceMessageStore {
+pub(crate) struct SqliteSurfaceMessageStore {
     root: PathBuf,
     executor: storage::SqliteExecutor,
 }
 
-impl SurfaceMessageStore {
+impl SqliteSurfaceMessageStore {
     pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self::open_at(root.clone(), root.join(DATABASE_FILE))
@@ -1054,7 +920,7 @@ impl SurfaceMessageStore {
         delivery_id: &str,
     ) -> Result<SurfaceOutboxRecord, String> {
         let current = self
-            .get_outbox_by_delivery(delivery_id)
+            .try_get_outbox_by_delivery(delivery_id)?
             .ok_or_else(|| format!("surface delivery `{delivery_id}` not found"))?;
         if current.status != "dead_letter" {
             return Err(format!(
@@ -1185,33 +1051,32 @@ impl SurfaceMessageStore {
         Ok(purged_event_ids.len())
     }
 
-    pub(crate) fn get_outbox_by_delivery(&self, delivery_id: &str) -> Option<SurfaceOutboxRecord> {
-        self.lock_state().ok().and_then(|state| {
-            state
-                .outbox
-                .values()
-                .find(|record| record.delivery_id == delivery_id)
-                .cloned()
-        })
+    fn try_get_outbox_by_delivery(
+        &self,
+        delivery_id: &str,
+    ) -> Result<Option<SurfaceOutboxRecord>, String> {
+        Ok(self
+            .lock_state()?
+            .outbox
+            .values()
+            .find(|record| record.delivery_id == delivery_id)
+            .cloned())
     }
 
-    pub(crate) fn due_retry_deliveries(&self) -> Vec<SurfaceOutboxRecord> {
-        let _ = self.recover_expired_outbox_claims();
+    fn try_due_retry_deliveries(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        self.recover_expired_outbox_claims()?;
         let now = now_ms();
-        self.lock_state()
-            .map(|state| {
-                state
-                    .outbox
-                    .values()
-                    .filter(|record| {
-                        record.status == "retry_scheduled"
-                            && record.attempts < record.max_attempts
-                            && record.next_retry_at_ms.is_some_and(|due| due <= now)
-                    })
-                    .cloned()
-                    .collect()
+        Ok(self
+            .lock_state()?
+            .outbox
+            .values()
+            .filter(|record| {
+                record.status == "retry_scheduled"
+                    && record.attempts < record.max_attempts
+                    && record.next_retry_at_ms.is_some_and(|due| due <= now)
             })
-            .unwrap_or_default()
+            .cloned()
+            .collect())
     }
 
     fn recover_expired_outbox_claims(&self) -> Result<(), String> {
@@ -1239,115 +1104,98 @@ impl SurfaceMessageStore {
         Ok(())
     }
 
-    pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
+    fn try_due_trigger_event_retries(&self) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
         let now = now_ms();
-        self.lock_state()
-            .map(|state| {
-                state
-                    .trigger_events
-                    .values()
-                    .filter(|record| {
-                        matches!(record.status.as_str(), "received" | "retry_scheduled")
-                            && record.attempts < record.max_attempts
-                            && record.next_retry_at_ms.is_some_and(|due| due <= now)
-                    })
-                    .cloned()
-                    .collect()
+        Ok(self
+            .lock_state()?
+            .trigger_events
+            .values()
+            .filter(|record| {
+                matches!(record.status.as_str(), "received" | "retry_scheduled")
+                    && record.attempts < record.max_attempts
+                    && record.next_retry_at_ms.is_some_and(|due| due <= now)
             })
-            .unwrap_or_default()
+            .cloned()
+            .collect())
     }
 
-    pub(crate) fn get_inbox_message(
+    fn try_get_inbox_message(
         &self,
         surface: &str,
         message_id: &str,
-    ) -> Option<SurfaceInboxRecord> {
+    ) -> Result<Option<SurfaceInboxRecord>, String> {
         let surface = normalize_surface_id(surface);
-        self.lock_state().ok().and_then(|state| {
-            state
-                .inbox
-                .values()
-                .find(|record| {
-                    record.surface == surface
-                        && (record.message_id == message_id || record.id == message_id)
-                })
-                .cloned()
-        })
-    }
-
-    pub(crate) fn list_inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
-        let surface = normalize_surface_id(surface);
-        self.lock_state()
-            .map(|state| {
-                state
-                    .inbox
-                    .values()
-                    .filter(|record| record.surface == surface)
-                    .cloned()
-                    .collect()
+        Ok(self
+            .lock_state()?
+            .inbox
+            .values()
+            .find(|record| {
+                record.surface == surface
+                    && (record.message_id == message_id || record.id == message_id)
             })
-            .unwrap_or_default()
+            .cloned())
     }
 
-    pub(crate) fn list_outbox(&self, surface: &str) -> Vec<SurfaceOutboxRecord> {
+    fn try_list_inbox(&self, surface: &str) -> Result<Vec<SurfaceInboxRecord>, String> {
         let surface = normalize_surface_id(surface);
-        self.lock_state()
-            .map(|state| {
-                state
-                    .outbox
-                    .values()
-                    .filter(|record| record.surface == surface)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        Ok(self
+            .lock_state()?
+            .inbox
+            .values()
+            .filter(|record| record.surface == surface)
+            .cloned()
+            .collect())
     }
 
-    pub(crate) fn list_all_inbox(&self) -> Vec<SurfaceInboxRecord> {
-        self.lock_state()
-            .map(|state| state.inbox.values().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn list_all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
-        self.lock_state()
-            .map(|state| state.outbox.values().cloned().collect())
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn list_trigger_events(&self, surface: &str) -> Vec<SurfaceTriggerEventRecord> {
+    fn try_list_outbox(&self, surface: &str) -> Result<Vec<SurfaceOutboxRecord>, String> {
         let surface = normalize_surface_id(surface);
-        self.lock_state()
-            .map(|state| {
-                state
-                    .trigger_events
-                    .values()
-                    .filter(|record| record.surface == surface)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+        Ok(self
+            .lock_state()?
+            .outbox
+            .values()
+            .filter(|record| record.surface == surface)
+            .cloned()
+            .collect())
     }
 
-    pub(crate) fn list_delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
-        let surface = normalize_surface_id(surface);
-        self.lock_state()
-            .map(|state| {
-                state
-                    .events
-                    .values()
-                    .filter(|event| event.surface == surface)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn try_list_all_inbox(&self) -> Result<Vec<SurfaceInboxRecord>, String> {
+        Ok(self.lock_state()?.inbox.values().cloned().collect())
     }
 
-    pub(crate) fn snapshot(&self, surface: &str) -> SurfaceMessageSnapshot {
+    fn try_list_all_outbox(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        Ok(self.lock_state()?.outbox.values().cloned().collect())
+    }
+
+    fn try_list_trigger_events(
+        &self,
+        surface: &str,
+    ) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
         let surface = normalize_surface_id(surface);
-        let inbox = self.list_inbox(&surface);
-        let outbox = self.list_outbox(&surface);
-        let trigger_events = self.list_trigger_events(&surface);
+        Ok(self
+            .lock_state()?
+            .trigger_events
+            .values()
+            .filter(|record| record.surface == surface)
+            .cloned()
+            .collect())
+    }
+
+    fn try_list_delivery_events(&self, surface: &str) -> Result<Vec<SurfaceDeliveryEvent>, String> {
+        let surface = normalize_surface_id(surface);
+        Ok(self
+            .lock_state()?
+            .events
+            .values()
+            .filter(|event| event.surface == surface)
+            .cloned()
+            .collect())
+    }
+
+    fn try_snapshot(&self, surface: &str) -> Result<SurfaceMessageSnapshot, String> {
+        let surface = normalize_surface_id(surface);
+        let inbox = self.try_list_inbox(&surface)?;
+        let outbox = self.try_list_outbox(&surface)?;
+        let trigger_events = self.try_list_trigger_events(&surface)?;
         let active_inbox = inbox
             .iter()
             .filter(|record| is_active_inbox_status(&record.status))
@@ -1389,7 +1237,7 @@ impl SurfaceMessageStore {
             .cloned()
             .collect::<Vec<_>>();
         let archived_count = archived_outbox.len();
-        SurfaceMessageSnapshot {
+        Ok(SurfaceMessageSnapshot {
             kind: "surface.message_snapshot",
             surface: surface.clone(),
             message_root: self.root.clone(),
@@ -1402,11 +1250,11 @@ impl SurfaceMessageStore {
             outbox,
             active_outbox,
             terminal_outbox,
-            deliveries: self.list_delivery_events(&surface),
+            deliveries: self.try_list_delivery_events(&surface)?,
             dead_letters,
             archived_outbox,
             archived_count,
-        }
+        })
     }
 
     fn update_inbox_status(
@@ -1721,6 +1569,239 @@ impl SurfaceMessageStore {
             .map_err(|error| error.to_string())?;
         persist_state_transaction(&transaction, &state)?;
         transaction.commit().map_err(|error| error.to_string())
+    }
+}
+
+/// Gateway's current SQLite implementation of the storage-neutral Surface
+/// ledger.  The host only retains this object through `SurfaceMessageLedger`;
+/// a future PostgreSQL adapter therefore changes composition, not callers.
+impl SurfaceMessageLedger for SqliteSurfaceMessageStore {
+    fn diagnostic_root(&self) -> PathBuf {
+        self.root.clone()
+    }
+    fn persist_ingress_frame(&self, frame: &SurfaceFrame) -> Result<String, String> {
+        self.persist_ingress_frame(frame)
+    }
+    fn claim_ingress_frames(
+        &self,
+        owner: &str,
+        limit: usize,
+        lease_ms: i64,
+    ) -> Result<Vec<SurfaceIngressClaim>, String> {
+        self.claim_ingress_frames(owner, limit, lease_ms)
+    }
+    fn complete_ingress_frame(&self, key: &str) -> Result<(), String> {
+        self.complete_ingress_frame(key)
+    }
+    fn fail_ingress_frame(&self, key: &str, error: &str) -> Result<(), String> {
+        self.fail_ingress_frame(key, error)
+    }
+    fn record_inbox_received(
+        &self,
+        surface: &str,
+        message_id: &str,
+        payload: &serde_json::Value,
+        session: &str,
+        thread: Option<String>,
+        sender: Option<String>,
+    ) -> Result<SurfaceInboxReceipt, String> {
+        self.record_inbox_received(surface, message_id, payload, session, thread, sender)
+    }
+    fn mark_inbox_processing(&self, key: &str) -> Result<(), String> {
+        self.mark_inbox_processing(key)
+    }
+    fn mark_inbox_processed(&self, key: &str, turn: Option<String>) -> Result<(), String> {
+        self.mark_inbox_processed(key, turn)
+    }
+    fn mark_inbox_admitted(
+        &self,
+        key: &str,
+        correlation: SurfaceTurnCorrelation,
+    ) -> Result<(), String> {
+        self.mark_inbox_admitted(key, correlation)
+    }
+    fn record_inbox_terminal_delivery(&self, key: &str, terminal: &str) -> Result<(), String> {
+        self.record_inbox_terminal_delivery(key, terminal)
+    }
+    fn mark_inbox_replied(&self, key: &str) -> Result<(), String> {
+        self.mark_inbox_replied(key)
+    }
+    fn mark_inbox_reply_failed(&self, key: &str, error: &str) -> Result<(), String> {
+        self.mark_inbox_reply_failed(key, error)
+    }
+    fn mark_inbox_failed(&self, key: &str, error: &str) -> Result<(), String> {
+        self.mark_inbox_failed(key, error)
+    }
+    fn record_trigger_event_received(
+        &self,
+        surface: &str,
+        event_type: &str,
+        trigger: &ManagedAgentTriggerEvent,
+        payload: &serde_json::Value,
+    ) -> Result<SurfaceTriggerEventReceipt, String> {
+        self.record_trigger_event_received(surface, event_type, trigger, payload)
+    }
+    fn mark_trigger_event_dispatching(
+        &self,
+        key: &str,
+    ) -> Result<Option<SurfaceTriggerEventRecord>, String> {
+        self.mark_trigger_event_dispatching(key)
+    }
+    fn mark_trigger_event_accepted(&self, key: &str) -> Result<SurfaceTriggerEventRecord, String> {
+        self.mark_trigger_event_accepted(key)
+    }
+    fn mark_trigger_event_failed(
+        &self,
+        key: &str,
+        error: &str,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.mark_trigger_event_failed(key, error)
+    }
+    fn retry_trigger_event(
+        &self,
+        surface: &str,
+        key: &str,
+    ) -> Result<SurfaceTriggerEventRecord, String> {
+        self.retry_trigger_event(surface, key)
+    }
+    fn queue_outbox(
+        &self,
+        request: &SurfaceSendRequest,
+        session: Option<String>,
+        reply_to: Option<String>,
+    ) -> Result<SurfaceOutboxRecord, String> {
+        self.queue_outbox(request, session, reply_to)
+    }
+    fn mark_delivery_sending(&self, id: &str) -> Result<SurfaceOutboxRecord, String> {
+        self.mark_delivery_sending(id)
+    }
+    fn mark_delivery_sent(
+        &self,
+        id: &str,
+        result: &SurfaceOperationResult,
+    ) -> Result<SurfaceOutboxRecord, String> {
+        self.mark_delivery_sent(id, result)
+    }
+    fn mark_delivery_failed(
+        &self,
+        id: &str,
+        error: &str,
+        retryable: bool,
+    ) -> Result<SurfaceOutboxRecord, String> {
+        self.mark_delivery_failed(id, error, retryable)
+    }
+    fn mark_delivery_dead_letter(
+        &self,
+        id: &str,
+        reason: &str,
+    ) -> Result<SurfaceOutboxRecord, String> {
+        self.mark_delivery_dead_letter(id, reason)
+    }
+    fn mark_delivery_replayed(&self, id: &str) -> Result<SurfaceOutboxRecord, String> {
+        self.mark_delivery_replayed(id)
+    }
+    fn archive_dead_letters(
+        &self,
+        surface: &str,
+        older_than: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        self.archive_dead_letters(surface, older_than, limit)
+    }
+    fn purge_archived_events(
+        &self,
+        surface: &str,
+        older_than: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, String> {
+        self.purge_archived_events(surface, older_than, limit)
+    }
+    fn get_outbox_by_delivery(&self, id: &str) -> Result<Option<SurfaceOutboxRecord>, String> {
+        self.try_get_outbox_by_delivery(id)
+    }
+    fn due_retry_deliveries(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        self.try_due_retry_deliveries()
+    }
+    fn due_trigger_event_retries(&self) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
+        self.try_due_trigger_event_retries()
+    }
+    fn get_inbox_message(
+        &self,
+        surface: &str,
+        id: &str,
+    ) -> Result<Option<SurfaceInboxRecord>, String> {
+        self.try_get_inbox_message(surface, id)
+    }
+    fn list_inbox(&self, surface: &str) -> Result<Vec<SurfaceInboxRecord>, String> {
+        self.try_list_inbox(surface)
+    }
+    fn list_outbox(&self, surface: &str) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        self.try_list_outbox(surface)
+    }
+    fn list_all_inbox(&self) -> Result<Vec<SurfaceInboxRecord>, String> {
+        self.try_list_all_inbox()
+    }
+    fn list_all_outbox(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
+        self.try_list_all_outbox()
+    }
+    fn list_trigger_events(&self, surface: &str) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
+        self.try_list_trigger_events(surface)
+    }
+    fn list_delivery_events(&self, surface: &str) -> Result<Vec<SurfaceDeliveryEvent>, String> {
+        self.try_list_delivery_events(surface)
+    }
+    fn snapshot(&self, surface: &str) -> Result<SurfaceMessageSnapshot, String> {
+        self.try_snapshot(surface)
+    }
+}
+
+#[cfg(test)]
+impl SqliteSurfaceMessageStore {
+    // Test-only projections keep existing behavior assertions concise.  They
+    // are not available to Gateway production callers, which use the fallible
+    // `SurfaceMessageLedger` contract above.
+    fn get_outbox_by_delivery(&self, id: &str) -> Option<SurfaceOutboxRecord> {
+        self.try_get_outbox_by_delivery(id)
+            .expect("test surface ledger read")
+    }
+    fn due_retry_deliveries(&self) -> Vec<SurfaceOutboxRecord> {
+        self.try_due_retry_deliveries()
+            .expect("test surface ledger read")
+    }
+    fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
+        self.try_due_trigger_event_retries()
+            .expect("test surface ledger read")
+    }
+    fn get_inbox_message(&self, surface: &str, id: &str) -> Option<SurfaceInboxRecord> {
+        self.try_get_inbox_message(surface, id)
+            .expect("test surface ledger read")
+    }
+    fn list_inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
+        self.try_list_inbox(surface)
+            .expect("test surface ledger read")
+    }
+    fn list_outbox(&self, surface: &str) -> Vec<SurfaceOutboxRecord> {
+        self.try_list_outbox(surface)
+            .expect("test surface ledger read")
+    }
+    fn list_all_inbox(&self) -> Vec<SurfaceInboxRecord> {
+        self.try_list_all_inbox().expect("test surface ledger read")
+    }
+    fn list_all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
+        self.try_list_all_outbox()
+            .expect("test surface ledger read")
+    }
+    fn list_trigger_events(&self, surface: &str) -> Vec<SurfaceTriggerEventRecord> {
+        self.try_list_trigger_events(surface)
+            .expect("test surface ledger read")
+    }
+    fn list_delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
+        self.try_list_delivery_events(surface)
+            .expect("test surface ledger read")
+    }
+    fn snapshot(&self, surface: &str) -> SurfaceMessageSnapshot {
+        self.try_snapshot(surface)
+            .expect("test surface ledger read")
     }
 }
 
@@ -2264,7 +2345,7 @@ mod tests {
             "cowd-edge-trigger-event-store-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let event = trigger_event("event-1");
         let received = store
             .record_trigger_event_received(
@@ -2282,7 +2363,7 @@ mod tests {
         assert_eq!(claimed.status, "dispatching");
         assert_eq!(claimed.attempts, 1);
 
-        let reloaded = SurfaceMessageStore::new(&root);
+        let reloaded = SqliteSurfaceMessageStore::new(&root);
         let recovered = reloaded.due_trigger_event_retries();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].status, "retry_scheduled");
@@ -2318,7 +2399,7 @@ mod tests {
             "cowd-edge-trigger-event-dead-letter-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let event = trigger_event("event-2");
         let received = store
             .record_trigger_event_received(
@@ -2373,7 +2454,7 @@ mod tests {
     fn surface_inbox_dedupes_across_store_reload() {
         let root =
             std::env::temp_dir().join(format!("cowd-edge-inbox-store-{}", uuid::Uuid::new_v4()));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let receipt = store
             .record_inbox_received(
                 "Lark",
@@ -2386,7 +2467,7 @@ mod tests {
             .unwrap();
         assert!(!receipt.duplicate);
 
-        let reloaded = SurfaceMessageStore::new(&root);
+        let reloaded = SqliteSurfaceMessageStore::new(&root);
         let duplicate = reloaded
             .record_inbox_received(
                 "feishu",
@@ -2407,7 +2488,7 @@ mod tests {
     fn surface_outbox_records_retry_and_dead_letter_states() {
         let root =
             std::env::temp_dir().join(format!("cowd-edge-outbox-store-{}", uuid::Uuid::new_v4()));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let request = SurfaceSendRequest {
             surface: "feishu".to_string(),
             recipient: "user-1".to_string(),
@@ -2448,7 +2529,7 @@ mod tests {
             "cowd-edge-idempotent-store-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let mut request = SurfaceSendRequest {
             surface: "feishu".to_string(),
             recipient: "user-1".to_string(),
@@ -2468,7 +2549,7 @@ mod tests {
     fn surface_retry_dead_letter_requires_operator_action() {
         let root =
             std::env::temp_dir().join(format!("cowd-edge-retry-store-{}", uuid::Uuid::new_v4()));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let request = SurfaceSendRequest {
             surface: "feishu".to_string(),
             recipient: "user-1".to_string(),
@@ -2496,7 +2577,7 @@ mod tests {
     fn surface_archive_dead_letters_preserves_audit_state() {
         let root =
             std::env::temp_dir().join(format!("cowd-edge-archive-store-{}", uuid::Uuid::new_v4()));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let request = SurfaceSendRequest {
             surface: "feishu".to_string(),
             recipient: "user-1".to_string(),
@@ -2528,7 +2609,7 @@ mod tests {
     fn surface_inbox_reaches_replied_after_reply_delivery() {
         let root =
             std::env::temp_dir().join(format!("cowd-edge-replied-store-{}", uuid::Uuid::new_v4()));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let inbox = store
             .record_inbox_received(
                 "feishu",
@@ -2576,7 +2657,7 @@ mod tests {
         assert!(snapshot.active_inbox.is_empty());
         assert_eq!(snapshot.terminal_inbox.len(), 1);
 
-        let reloaded = SurfaceMessageStore::new(&root);
+        let reloaded = SqliteSurfaceMessageStore::new(&root);
         assert_eq!(reloaded.snapshot("feishu").inbox[0].status, "replied");
 
         let _ = std::fs::remove_dir_all(root);
@@ -2588,7 +2669,7 @@ mod tests {
             "cowd-edge-surface-correlation-store-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let inbox = store
             .record_inbox_received(
                 "wecom",
@@ -2623,7 +2704,7 @@ mod tests {
             .record_inbox_terminal_delivery(&inbox.record.idempotency_key, "turn-terminal:req-1")
             .unwrap();
 
-        let reloaded = SurfaceMessageStore::new(&root);
+        let reloaded = SqliteSurfaceMessageStore::new(&root);
         let record = reloaded
             .get_inbox_message("wecom", "message-1")
             .expect("correlation must be durable");
@@ -2654,7 +2735,7 @@ mod tests {
             "cowd-edge-failure-notice-store-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let inbox = store
             .record_inbox_received(
                 "feishu",
@@ -2714,7 +2795,7 @@ mod tests {
         assert!(snapshot.active_inbox.is_empty());
         assert_eq!(snapshot.terminal_inbox.len(), 1);
 
-        let reloaded = SurfaceMessageStore::new(&root);
+        let reloaded = SqliteSurfaceMessageStore::new(&root);
         assert_eq!(
             reloaded.snapshot("feishu").inbox[0].status,
             "failed_notified"
@@ -2729,7 +2810,7 @@ mod tests {
             "cowd-edge-orphan-inbox-store-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let inbox = store
             .record_inbox_received(
                 "feishu",
@@ -2744,7 +2825,7 @@ mod tests {
             .mark_inbox_processing(&inbox.record.idempotency_key)
             .unwrap();
 
-        let reloaded = SurfaceMessageStore::new(&root);
+        let reloaded = SqliteSurfaceMessageStore::new(&root);
         let snapshot = reloaded.snapshot("feishu");
         assert_eq!(snapshot.inbox[0].status, "failed");
         assert!(snapshot.active_inbox.is_empty());
@@ -2760,7 +2841,7 @@ mod tests {
     fn surface_purge_archived_events_keeps_outbox_terminal_state() {
         let root =
             std::env::temp_dir().join(format!("cowd-edge-purge-store-{}", uuid::Uuid::new_v4()));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let request = SurfaceSendRequest {
             surface: "feishu".to_string(),
             recipient: "user-1".to_string(),
@@ -2788,7 +2869,7 @@ mod tests {
             .iter()
             .all(|event| event.delivery_id.as_deref() != Some(&queued.delivery_id)));
 
-        let reloaded = SurfaceMessageStore::new(&root);
+        let reloaded = SqliteSurfaceMessageStore::new(&root);
         assert_eq!(reloaded.snapshot("feishu").archived_count, 1);
         assert!(reloaded
             .list_delivery_events("feishu")
@@ -2804,7 +2885,7 @@ mod tests {
             "cowd-surface-ingress-claim-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let frame = |session: &str, message: &str| SurfaceFrame::Event {
             surface: "feishu".to_string(),
             event: "message.received".to_string(),
@@ -2839,7 +2920,7 @@ mod tests {
         );
         store.complete_ingress_frame(&first_key).unwrap();
 
-        let reloaded = SurfaceMessageStore::new(&root);
+        let reloaded = SqliteSurfaceMessageStore::new(&root);
         let recovered = reloaded
             .claim_ingress_frames("worker-2", 8, 300_000)
             .unwrap();
@@ -2862,7 +2943,7 @@ mod tests {
     fn production_mutations_write_sqlite_without_jsonl_dual_write() {
         let root =
             std::env::temp_dir().join(format!("cowd-surface-sqlite-only-{}", uuid::Uuid::new_v4()));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         store
             .record_inbox_received(
                 "feishu",
@@ -2911,7 +2992,7 @@ mod tests {
         )
         .unwrap();
 
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         assert_eq!(store.list_inbox("feishu").len(), 1);
         let evidence = store
             .executor
@@ -2946,7 +3027,7 @@ mod tests {
     fn concurrent_outbox_idempotency_creates_one_durable_delivery_identity() {
         let root =
             std::env::temp_dir().join(format!("cowd-surface-outbox-race-{}", uuid::Uuid::new_v4()));
-        let store = Arc::new(SurfaceMessageStore::new(&root));
+        let store = Arc::new(SqliteSurfaceMessageStore::new(&root));
         let mut workers = Vec::new();
         for _ in 0..32 {
             let store = store.clone();
@@ -2984,7 +3065,7 @@ mod tests {
             "cowd-surface-ingress-burst-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = SurfaceMessageStore::new(&root);
+        let store = SqliteSurfaceMessageStore::new(&root);
         let started = std::time::Instant::now();
         for index in 0..320 {
             store
@@ -3029,7 +3110,7 @@ mod tests {
             "cowd-surface-outbox-lease-{}",
             uuid::Uuid::new_v4()
         ));
-        let store = Arc::new(SurfaceMessageStore::new(&root));
+        let store = Arc::new(SqliteSurfaceMessageStore::new(&root));
         let queued = store
             .queue_outbox(
                 &SurfaceSendRequest {

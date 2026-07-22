@@ -739,6 +739,7 @@ impl ConnectorPort for GatewayAppHostBinding {
                         .services
                         .surface
                         .all_outbox()
+                        .map_err(AppHostError::Failed)?
                         .into_iter()
                         .find(|entry| entry.idempotency_key == delivery_key)
                     {

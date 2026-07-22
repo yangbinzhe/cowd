@@ -94,7 +94,7 @@ impl SurfaceHost {
         error: impl Into<String>,
     ) -> Result<(), String> {
         self.messages
-            .mark_inbox_reply_failed(idempotency_key, error)
+            .mark_inbox_reply_failed(idempotency_key, &error.into())
     }
 
     pub(crate) fn mark_inbox_failed(
@@ -102,7 +102,8 @@ impl SurfaceHost {
         idempotency_key: &str,
         error: impl Into<String>,
     ) -> Result<(), String> {
-        self.messages.mark_inbox_failed(idempotency_key, error)
+        self.messages
+            .mark_inbox_failed(idempotency_key, &error.into())
     }
 
     pub(crate) fn record_trigger_event_received(
@@ -137,7 +138,7 @@ impl SurfaceHost {
         error: impl Into<String>,
     ) -> Result<SurfaceTriggerEventRecord, String> {
         self.messages
-            .mark_trigger_event_failed(idempotency_key, error)
+            .mark_trigger_event_failed(idempotency_key, &error.into())
     }
 
     pub(crate) fn retry_trigger_event(
@@ -148,7 +149,9 @@ impl SurfaceHost {
         self.messages.retry_trigger_event(surface, idempotency_key)
     }
 
-    pub(crate) fn due_trigger_event_retries(&self) -> Vec<SurfaceTriggerEventRecord> {
+    pub(crate) fn due_trigger_event_retries(
+        &self,
+    ) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
         self.messages.due_trigger_event_retries()
     }
 
@@ -170,31 +173,37 @@ impl SurfaceHost {
         self.messages.fail_ingress_frame(record_key, error)
     }
 
-    pub(crate) fn inbox(&self, surface: &str) -> Vec<SurfaceInboxRecord> {
+    pub(crate) fn inbox(&self, surface: &str) -> Result<Vec<SurfaceInboxRecord>, String> {
         self.messages.list_inbox(surface)
     }
 
-    pub(crate) fn outbox(&self, surface: &str) -> Vec<SurfaceOutboxRecord> {
+    pub(crate) fn outbox(&self, surface: &str) -> Result<Vec<SurfaceOutboxRecord>, String> {
         self.messages.list_outbox(surface)
     }
 
-    pub(crate) fn trigger_events(&self, surface: &str) -> Vec<SurfaceTriggerEventRecord> {
+    pub(crate) fn trigger_events(
+        &self,
+        surface: &str,
+    ) -> Result<Vec<SurfaceTriggerEventRecord>, String> {
         self.messages.list_trigger_events(surface)
     }
 
-    pub(crate) fn all_inbox(&self) -> Vec<SurfaceInboxRecord> {
+    pub(crate) fn all_inbox(&self) -> Result<Vec<SurfaceInboxRecord>, String> {
         self.messages.list_all_inbox()
     }
 
-    pub(crate) fn all_outbox(&self) -> Vec<SurfaceOutboxRecord> {
+    pub(crate) fn all_outbox(&self) -> Result<Vec<SurfaceOutboxRecord>, String> {
         self.messages.list_all_outbox()
     }
 
-    pub(crate) fn delivery_events(&self, surface: &str) -> Vec<SurfaceDeliveryEvent> {
+    pub(crate) fn delivery_events(
+        &self,
+        surface: &str,
+    ) -> Result<Vec<SurfaceDeliveryEvent>, String> {
         self.messages.list_delivery_events(surface)
     }
 
-    pub(crate) fn message_snapshot(&self, surface: &str) -> SurfaceMessageSnapshot {
+    pub(crate) fn message_snapshot(&self, surface: &str) -> Result<SurfaceMessageSnapshot, String> {
         self.messages.snapshot(surface)
     }
 
@@ -226,7 +235,7 @@ impl SurfaceHost {
         let surface = normalize_surface_id(surface);
         let record = self
             .messages
-            .get_inbox_message(&surface, message_id)
+            .get_inbox_message(&surface, message_id)?
             .ok_or_else(|| format!("surface inbox `{surface}/{message_id}` not found"))?;
         let replay_message_id = format!("{}:replay:{}", record.message_id, uuid::Uuid::new_v4());
         let mut payload = record.payload_json.clone();
