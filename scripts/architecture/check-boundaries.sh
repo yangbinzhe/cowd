@@ -75,6 +75,23 @@ if [[ "${1:-}" == "--v568-runtime-port" ]]; then
   exit "$fail"
 fi
 
+if [[ "${1:-}" == "--v569-runtime-postgres" ]]; then
+  # V569 keeps PostgreSQL infrastructure outside Runtime while proving a full
+  # adapter can be composed explicitly. A deployment-wide backend toggle is
+  # still forbidden until every required domain has migrated.
+  check_empty "V569 runtime normal dependency tree must not include PostgreSQL driver" \
+    bash -c 'cargo tree -p runtime --edges normal 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
+  check_empty "V569 runtime manifest must not name PostgreSQL driver" \
+    rg -n '^postgres\s*=|^tokio-postgres\s*=|^r2d2_postgres\s*=' crates/runtime/Cargo.toml
+  check_empty "V569 global PostgreSQL switch must remain unavailable" \
+    rg -n 'StorageBackendKind::Postgres|control_plane_backend.*postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
+  check_empty "V569 dedicated runtime PostgreSQL adapter crate must exist" \
+    bash -c 'if [[ ! -f crates/runtime-postgres/Cargo.toml || ! -f crates/runtime-postgres/src/lib.rs ]]; then echo missing; fi'
+  check_empty "V569 RuntimeServices must retain explicit event backend injection" \
+    bash -c 'if ! rg -q "pub fn runtime_event_store\(" crates/runtime/src/execution_core/services.rs; then echo missing; fi'
+  exit "$fail"
+fi
+
 check_empty "cli business command names" \
   rg -n "\\b(run|chat|prompt|mcp serve)\\b" crates/cli/src/main.rs --glob '*.rs'
 

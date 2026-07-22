@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -301,17 +302,231 @@ pub struct RuntimeSessionOutboxHealth {
     pub blocked: u64,
 }
 
-/// The sole Runtime-facing durable event-store API.  Backends remain private
-/// to this module: Runtime callers depend on lifecycle semantics rather than
-/// SQLite connections, paths, pragmas, or schema details.
-#[derive(Debug)]
-pub struct RuntimeEventStore {
-    backend: RuntimeEventStoreBackend,
+/// One committed Runtime transaction preserved for a backend migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEventCommitSnapshot {
+    pub commit_cursor: u64,
+    pub transaction_id: String,
+    pub request_hash: String,
+    pub created_at_ms: u64,
 }
 
+/// A stream revision captured as part of a committed Runtime transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEventTransactionStreamSnapshot {
+    pub transaction_id: String,
+    pub stream_id: String,
+    pub expected_revision: u64,
+    pub committed_revision: u64,
+}
+
+/// The current revision of one Runtime event stream at migration cutover.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeEventStreamHeadSnapshot {
+    pub stream_id: String,
+    pub revision: u64,
+}
+
+/// The durable replay fence for a verified human decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeDecisionLeaseSnapshot {
+    pub lease_id: String,
+    pub principal_id: String,
+    pub review_id: String,
+    pub action: String,
+    pub scope: String,
+    pub evidence_digest: String,
+    pub credential_epoch: u64,
+    pub consumed_at_ms: u64,
+}
+
+/// Complete, ordered RuntimeEvent migration payload. It is domain-owned and
+/// is valid only for a quiesced source and an empty verified target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RuntimeEventStoreSnapshot {
+    pub commits: Vec<RuntimeEventCommitSnapshot>,
+    pub events: Vec<DurableRuntimeEvent>,
+    pub transaction_streams: Vec<RuntimeEventTransactionStreamSnapshot>,
+    pub stream_heads: Vec<RuntimeEventStreamHeadSnapshot>,
+    pub session_outbox: Vec<RuntimeSessionOutboxRecord>,
+    pub decision_leases: Vec<RuntimeDecisionLeaseSnapshot>,
+}
+
+impl RuntimeEventStoreSnapshot {
+    /// Stable digest used to prove source/target migration equivalence. The
+    /// digest does not include a database path, URL, pool identity, or secret.
+    pub fn canonical_digest(&self) -> RuntimeEventStoreResult<String> {
+        let mut canonical = self.clone();
+        canonical.canonicalize();
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&canonical)?)
+        ))
+    }
+
+    /// Reject malformed cross-table linkages before a target backend accepts a
+    /// copy. Operational source quiescence remains the migration
+    /// coordinator's responsibility.
+    pub fn validate(&self) -> RuntimeEventStoreResult<()> {
+        validate_migration_snapshot(self)
+    }
+
+    fn canonicalize(&mut self) {
+        self.commits.sort_by_key(|commit| commit.commit_cursor);
+        self.events
+            .sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+        self.transaction_streams.sort_by(|left, right| {
+            (&left.transaction_id, &left.stream_id).cmp(&(&right.transaction_id, &right.stream_id))
+        });
+        self.stream_heads
+            .sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
+        self.session_outbox
+            .sort_by(|left, right| left.terminal_id.cmp(&right.terminal_id));
+        self.decision_leases
+            .sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
+    }
+}
+
+/// Backend contract for the durable Runtime lifecycle ledger.
+///
+/// Runtime business callers must use [`RuntimeEventStore`], never this port.
+/// It is public solely so an isolated infrastructure crate can provide a
+/// backend without pulling a database driver into the Runtime dependency tree.
+/// Every method preserves event transaction, revision, lease, and outbox
+/// semantics; a backend must not provide a partial implementation.
+pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
+    fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String>;
+    fn append_transaction(
+        &self,
+        request: AppendTransactionRequest,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+    fn append_transaction_with_terminal(
+        &self,
+        request: AppendTransactionRequest,
+        terminal: SessionTerminalInput,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+    #[allow(clippy::too_many_arguments)]
+    fn consume_verified_decision_lease(
+        &self,
+        lease_id: &str,
+        principal_id: &str,
+        review_id: &str,
+        action: &str,
+        scope: &str,
+        evidence_digest: &str,
+        credential_epoch: u64,
+        consumed_at_ms: u64,
+    ) -> RuntimeEventStoreResult<()>;
+    fn append_transaction_with_verified_decision_lease(
+        &self,
+        request: AppendTransactionRequest,
+        lease: &crate::VerifiedDecisionLease,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+    fn append_batch_if_revision(
+        &self,
+        stream_id: String,
+        expected_revision: u64,
+        transaction_id: String,
+        events: Vec<RuntimeTransactionEventInput>,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt>;
+    fn events_after_cursor(
+        &self,
+        cursor: u64,
+        max_commits: usize,
+    ) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>>;
+    fn event_by_idempotency_key(
+        &self,
+        stream_id: &str,
+        idempotency_key: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>>;
+    fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64>;
+    fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn execution_events_for_session(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn list_scope(
+        &self,
+        scope: RuntimeEventScope,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn stream_ids_for_scope(
+        &self,
+        scope: RuntimeEventScope,
+    ) -> RuntimeEventStoreResult<Vec<String>>;
+    fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn latest_for_stream(&self, stream_id: &str) -> Result<Option<DurableRuntimeEvent>, String>;
+    fn enqueue_session_terminal(
+        &self,
+        terminal_id: &str,
+        message_id: &str,
+        session_id: &str,
+        commit_cursor: u64,
+        payload_ref: &str,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+    fn claim_session_terminals(
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>>;
+    fn session_terminal(
+        &self,
+        terminal_id: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>>;
+    fn materialized_session_terminals_after(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>>;
+    fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth>;
+    fn blocked_session_terminals(
+        &self,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>>;
+    fn retry_session_terminal(
+        &self,
+        terminal_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+    fn ack_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+    #[allow(clippy::too_many_arguments)]
+    fn fail_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        class: RuntimeSessionOutboxFailureClass,
+        error: &str,
+        retry_at_ms: u64,
+        max_attempts: u32,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+    fn export_migration_snapshot(&self) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot>;
+    fn import_migration_snapshot(
+        &self,
+        snapshot: &RuntimeEventStoreSnapshot,
+    ) -> RuntimeEventStoreResult<()>;
+}
+
+/// The sole Runtime-facing durable event-store API. Runtime callers depend on
+/// lifecycle semantics rather than a concrete database, path, pragma, or SQL
+/// schema. Backend adapters are composed explicitly at the trusted host root.
 #[derive(Debug)]
-enum RuntimeEventStoreBackend {
-    Sqlite(SqliteRuntimeEventStore),
+pub struct RuntimeEventStore {
+    backend: Arc<dyn RuntimeEventStoreBackend>,
 }
 
 impl RuntimeEventStore {
@@ -320,7 +535,7 @@ impl RuntimeEventStore {
     }
 
     pub fn try_open(path: impl AsRef<Path>) -> RuntimeEventStoreResult<Self> {
-        SqliteRuntimeEventStore::try_open(path).map(Self::from_sqlite)
+        SqliteRuntimeEventStore::try_open(path).map(|store| Self::from_backend(Arc::new(store)))
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
@@ -328,30 +543,24 @@ impl RuntimeEventStore {
     }
 
     pub fn try_open_in_memory() -> RuntimeEventStoreResult<Self> {
-        SqliteRuntimeEventStore::try_open_in_memory().map(Self::from_sqlite)
+        SqliteRuntimeEventStore::try_open_in_memory()
+            .map(|store| Self::from_backend(Arc::new(store)))
     }
 
-    fn from_sqlite(store: SqliteRuntimeEventStore) -> Self {
-        Self {
-            backend: RuntimeEventStoreBackend::Sqlite(store),
-        }
-    }
-
-    fn sqlite(&self) -> &SqliteRuntimeEventStore {
-        match &self.backend {
-            RuntimeEventStoreBackend::Sqlite(store) => store,
-        }
+    #[must_use]
+    pub fn from_backend(backend: Arc<dyn RuntimeEventStoreBackend>) -> Self {
+        Self { backend }
     }
 
     pub fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
-        self.sqlite().append(input)
+        self.backend.append(input)
     }
 
     pub fn append_transaction(
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        self.sqlite().append_transaction(request)
+        self.backend.append_transaction(request)
     }
 
     pub fn append_transaction_with_terminal(
@@ -359,7 +568,7 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: SessionTerminalInput,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        self.sqlite()
+        self.backend
             .append_transaction_with_terminal(request, terminal)
     }
 
@@ -375,7 +584,7 @@ impl RuntimeEventStore {
         credential_epoch: u64,
         consumed_at_ms: u64,
     ) -> RuntimeEventStoreResult<()> {
-        self.sqlite().consume_verified_decision_lease(
+        self.backend.consume_verified_decision_lease(
             lease_id,
             principal_id,
             review_id,
@@ -392,7 +601,7 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         lease: &crate::VerifiedDecisionLease,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        self.sqlite()
+        self.backend
             .append_transaction_with_verified_decision_lease(request, lease)
     }
 
@@ -403,8 +612,12 @@ impl RuntimeEventStore {
         transaction_id: impl Into<String>,
         events: Vec<RuntimeTransactionEventInput>,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        self.sqlite()
-            .append_batch_if_revision(stream_id, expected_revision, transaction_id, events)
+        self.backend.append_batch_if_revision(
+            stream_id.into(),
+            expected_revision,
+            transaction_id.into(),
+            events,
+        )
     }
 
     pub fn events_after_cursor(
@@ -412,7 +625,7 @@ impl RuntimeEventStore {
         cursor: u64,
         max_commits: usize,
     ) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>> {
-        self.sqlite().events_after_cursor(cursor, max_commits)
+        self.backend.events_after_cursor(cursor, max_commits)
     }
 
     pub fn event_by_idempotency_key(
@@ -420,16 +633,16 @@ impl RuntimeEventStore {
         stream_id: &str,
         idempotency_key: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
-        self.sqlite()
+        self.backend
             .event_by_idempotency_key(stream_id, idempotency_key)
     }
 
     pub fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64> {
-        self.sqlite().stream_revision(stream_id)
+        self.backend.stream_revision(stream_id)
     }
 
     pub fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
-        self.sqlite().list_stream(stream_id)
+        self.backend.list_stream(stream_id)
     }
 
     pub fn execution_events_for_session(
@@ -438,7 +651,7 @@ impl RuntimeEventStore {
         after_commit_cursor: u64,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
-        self.sqlite()
+        self.backend
             .execution_events_for_session(session_id, after_commit_cursor, limit)
     }
 
@@ -447,25 +660,25 @@ impl RuntimeEventStore {
         scope: RuntimeEventScope,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
-        self.sqlite().list_scope(scope, limit)
+        self.backend.list_scope(scope, limit)
     }
 
     pub fn stream_ids_for_scope(
         &self,
         scope: RuntimeEventScope,
     ) -> RuntimeEventStoreResult<Vec<String>> {
-        self.sqlite().stream_ids_for_scope(scope)
+        self.backend.stream_ids_for_scope(scope)
     }
 
     pub fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
-        self.sqlite().all_events(limit)
+        self.backend.all_events(limit)
     }
 
     pub fn latest_for_stream(
         &self,
         stream_id: &str,
     ) -> Result<Option<DurableRuntimeEvent>, String> {
-        self.sqlite().latest_for_stream(stream_id)
+        self.backend.latest_for_stream(stream_id)
     }
 
     pub fn enqueue_session_terminal(
@@ -476,7 +689,7 @@ impl RuntimeEventStore {
         commit_cursor: u64,
         payload_ref: &str,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        self.sqlite().enqueue_session_terminal(
+        self.backend.enqueue_session_terminal(
             terminal_id,
             message_id,
             session_id,
@@ -492,7 +705,7 @@ impl RuntimeEventStore {
         lease_ms: u64,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        self.sqlite()
+        self.backend
             .claim_session_terminals(worker_id, now_ms, lease_ms, limit)
     }
 
@@ -500,7 +713,7 @@ impl RuntimeEventStore {
         &self,
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
-        self.sqlite().session_terminal(terminal_id)
+        self.backend.session_terminal(terminal_id)
     }
 
     pub fn materialized_session_terminals_after(
@@ -509,19 +722,19 @@ impl RuntimeEventStore {
         after_commit_cursor: u64,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        self.sqlite()
+        self.backend
             .materialized_session_terminals_after(session_id, after_commit_cursor, limit)
     }
 
     pub fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth> {
-        self.sqlite().session_terminal_health()
+        self.backend.session_terminal_health()
     }
 
     pub fn blocked_session_terminals(
         &self,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        self.sqlite().blocked_session_terminals(limit)
+        self.backend.blocked_session_terminals(limit)
     }
 
     pub fn retry_session_terminal(
@@ -531,7 +744,7 @@ impl RuntimeEventStore {
         reason: &str,
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        self.sqlite()
+        self.backend
             .retry_session_terminal(terminal_id, actor, reason, now_ms)
     }
 
@@ -542,7 +755,7 @@ impl RuntimeEventStore {
         expected_revision: u64,
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        self.sqlite()
+        self.backend
             .ack_session_terminal(terminal_id, worker_id, expected_revision, now_ms)
     }
 
@@ -558,7 +771,7 @@ impl RuntimeEventStore {
         max_attempts: u32,
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        self.sqlite().fail_session_terminal(
+        self.backend.fail_session_terminal(
             terminal_id,
             worker_id,
             expected_revision,
@@ -568,6 +781,20 @@ impl RuntimeEventStore {
             max_attempts,
             now_ms,
         )
+    }
+
+    /// Export a canonical, read-only migration payload from a quiesced source.
+    pub fn export_migration_snapshot(&self) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot> {
+        self.backend.export_migration_snapshot()
+    }
+
+    /// Import a migration payload into an empty, already verified target.
+    /// Normal Runtime execution must never call this API.
+    pub fn import_migration_snapshot(
+        &self,
+        snapshot: &RuntimeEventStoreSnapshot,
+    ) -> RuntimeEventStoreResult<()> {
+        self.backend.import_migration_snapshot(snapshot)
     }
 }
 
@@ -1324,6 +1551,606 @@ impl SqliteRuntimeEventStore {
     }
 }
 
+impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
+    fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
+        Self::append(self, input)
+    }
+
+    fn append_transaction(
+        &self,
+        request: AppendTransactionRequest,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        Self::append_transaction(self, request)
+    }
+
+    fn append_transaction_with_terminal(
+        &self,
+        request: AppendTransactionRequest,
+        terminal: SessionTerminalInput,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        Self::append_transaction_with_terminal(self, request, terminal)
+    }
+
+    fn consume_verified_decision_lease(
+        &self,
+        lease_id: &str,
+        principal_id: &str,
+        review_id: &str,
+        action: &str,
+        scope: &str,
+        evidence_digest: &str,
+        credential_epoch: u64,
+        consumed_at_ms: u64,
+    ) -> RuntimeEventStoreResult<()> {
+        Self::consume_verified_decision_lease(
+            self,
+            lease_id,
+            principal_id,
+            review_id,
+            action,
+            scope,
+            evidence_digest,
+            credential_epoch,
+            consumed_at_ms,
+        )
+    }
+
+    fn append_transaction_with_verified_decision_lease(
+        &self,
+        request: AppendTransactionRequest,
+        lease: &crate::VerifiedDecisionLease,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        Self::append_transaction_with_verified_decision_lease(self, request, lease)
+    }
+
+    fn append_batch_if_revision(
+        &self,
+        stream_id: String,
+        expected_revision: u64,
+        transaction_id: String,
+        events: Vec<RuntimeTransactionEventInput>,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        Self::append_batch_if_revision(self, stream_id, expected_revision, transaction_id, events)
+    }
+
+    fn events_after_cursor(
+        &self,
+        cursor: u64,
+        max_commits: usize,
+    ) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>> {
+        Self::events_after_cursor(self, cursor, max_commits)
+    }
+
+    fn event_by_idempotency_key(
+        &self,
+        stream_id: &str,
+        idempotency_key: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
+        Self::event_by_idempotency_key(self, stream_id, idempotency_key)
+    }
+
+    fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64> {
+        Self::stream_revision(self, stream_id)
+    }
+
+    fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::list_stream(self, stream_id)
+    }
+
+    fn execution_events_for_session(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::execution_events_for_session(self, session_id, after_commit_cursor, limit)
+    }
+
+    fn list_scope(
+        &self,
+        scope: RuntimeEventScope,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::list_scope(self, scope, limit)
+    }
+
+    fn stream_ids_for_scope(
+        &self,
+        scope: RuntimeEventScope,
+    ) -> RuntimeEventStoreResult<Vec<String>> {
+        Self::stream_ids_for_scope(self, scope)
+    }
+
+    fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::all_events(self, limit)
+    }
+
+    fn latest_for_stream(&self, stream_id: &str) -> Result<Option<DurableRuntimeEvent>, String> {
+        Self::latest_for_stream(self, stream_id)
+    }
+
+    fn enqueue_session_terminal(
+        &self,
+        terminal_id: &str,
+        message_id: &str,
+        session_id: &str,
+        commit_cursor: u64,
+        payload_ref: &str,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        Self::enqueue_session_terminal(
+            self,
+            terminal_id,
+            message_id,
+            session_id,
+            commit_cursor,
+            payload_ref,
+        )
+    }
+
+    fn claim_session_terminals(
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
+        Self::claim_session_terminals(self, worker_id, now_ms, lease_ms, limit)
+    }
+
+    fn session_terminal(
+        &self,
+        terminal_id: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
+        Self::session_terminal(self, terminal_id)
+    }
+
+    fn materialized_session_terminals_after(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
+        Self::materialized_session_terminals_after(self, session_id, after_commit_cursor, limit)
+    }
+
+    fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth> {
+        Self::session_terminal_health(self)
+    }
+
+    fn blocked_session_terminals(
+        &self,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
+        Self::blocked_session_terminals(self, limit)
+    }
+
+    fn retry_session_terminal(
+        &self,
+        terminal_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        Self::retry_session_terminal(self, terminal_id, actor, reason, now_ms)
+    }
+
+    fn ack_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        Self::ack_session_terminal(self, terminal_id, worker_id, expected_revision, now_ms)
+    }
+
+    fn fail_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        class: RuntimeSessionOutboxFailureClass,
+        error: &str,
+        retry_at_ms: u64,
+        max_attempts: u32,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        Self::fail_session_terminal(
+            self,
+            terminal_id,
+            worker_id,
+            expected_revision,
+            class,
+            error,
+            retry_at_ms,
+            max_attempts,
+            now_ms,
+        )
+    }
+
+    fn export_migration_snapshot(&self) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot> {
+        let conn = self.executor.checkout()?;
+        export_sqlite_migration_snapshot(&conn)
+    }
+
+    fn import_migration_snapshot(
+        &self,
+        snapshot: &RuntimeEventStoreSnapshot,
+    ) -> RuntimeEventStoreResult<()> {
+        let mut conn = self.executor.checkout()?;
+        import_sqlite_migration_snapshot(&mut conn, snapshot)
+    }
+}
+
+fn export_sqlite_migration_snapshot(
+    conn: &Connection,
+) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot> {
+    let commits = conn
+        .prepare(
+            "SELECT commit_cursor, transaction_id, request_hash, created_at_ms
+               FROM runtime_commits ORDER BY commit_cursor ASC",
+        )?
+        .query_map([], |row| {
+            Ok(RuntimeEventCommitSnapshot {
+                commit_cursor: row.get::<_, i64>(0)? as u64,
+                transaction_id: row.get(1)?,
+                request_hash: row.get(2)?,
+                created_at_ms: row.get::<_, i64>(3)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let events = conn
+        .prepare(&format!(
+            "{} ORDER BY commit_cursor ASC, transaction_index ASC",
+            event_select()
+        ))?
+        .query_map([], row_to_event)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let transaction_streams = conn
+        .prepare(
+            "SELECT transaction_id, stream_id, expected_revision, committed_revision
+               FROM runtime_transaction_streams ORDER BY transaction_id ASC, stream_id ASC",
+        )?
+        .query_map([], |row| {
+            Ok(RuntimeEventTransactionStreamSnapshot {
+                transaction_id: row.get(0)?,
+                stream_id: row.get(1)?,
+                expected_revision: row.get::<_, i64>(2)? as u64,
+                committed_revision: row.get::<_, i64>(3)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let stream_heads = conn
+        .prepare("SELECT stream_id, revision FROM runtime_stream_heads ORDER BY stream_id ASC")?
+        .query_map([], |row| {
+            Ok(RuntimeEventStreamHeadSnapshot {
+                stream_id: row.get(0)?,
+                revision: row.get::<_, i64>(1)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let session_outbox = conn
+        .prepare(
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+                    attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
+                    last_error, materialized_at, revision
+               FROM runtime_session_outbox ORDER BY terminal_id ASC",
+        )?
+        .query_map([], row_to_runtime_session_outbox)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let decision_leases = conn
+        .prepare(
+            "SELECT lease_id, principal_id, review_id, action, scope, evidence_digest,
+                    credential_epoch, consumed_at_ms
+               FROM runtime_consumed_decision_leases ORDER BY lease_id ASC",
+        )?
+        .query_map([], |row| {
+            Ok(RuntimeDecisionLeaseSnapshot {
+                lease_id: row.get(0)?,
+                principal_id: row.get(1)?,
+                review_id: row.get(2)?,
+                action: row.get(3)?,
+                scope: row.get(4)?,
+                evidence_digest: row.get(5)?,
+                credential_epoch: row.get::<_, i64>(6)? as u64,
+                consumed_at_ms: row.get::<_, i64>(7)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut snapshot = RuntimeEventStoreSnapshot {
+        commits,
+        events,
+        transaction_streams,
+        stream_heads,
+        session_outbox,
+        decision_leases,
+    };
+    snapshot.canonicalize();
+    Ok(snapshot)
+}
+
+fn import_sqlite_migration_snapshot(
+    conn: &mut Connection,
+    snapshot: &RuntimeEventStoreSnapshot,
+) -> RuntimeEventStoreResult<()> {
+    validate_migration_snapshot(snapshot)?;
+    let mut snapshot = snapshot.clone();
+    snapshot.canonicalize();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for table in [
+        "runtime_commits",
+        "runtime_events",
+        "runtime_transaction_streams",
+        "runtime_stream_heads",
+        "runtime_session_outbox",
+        "runtime_consumed_decision_leases",
+    ] {
+        let count = tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        if count != 0 {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "runtime event migration target table `{table}` is not empty"
+            )));
+        }
+    }
+    for commit in &snapshot.commits {
+        tx.execute(
+            "INSERT INTO runtime_commits(commit_cursor, transaction_id, request_hash, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                snapshot_i64(commit.commit_cursor, "commit_cursor")?,
+                commit.transaction_id,
+                commit.request_hash,
+                snapshot_i64(commit.created_at_ms, "created_at_ms")?,
+            ],
+        )?;
+    }
+    for event in &snapshot.events {
+        tx.execute(
+            "INSERT INTO runtime_events
+             (event_id, stream_id, sequence, scope, kind, status, actor, payload, refs, created_at_ms,
+              commit_cursor, transaction_id, transaction_index, schema_version, idempotency_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                event.event_id,
+                event.stream_id,
+                snapshot_i64(event.sequence, "sequence")?,
+                event.scope.as_str(),
+                event.kind,
+                event.status,
+                event.actor,
+                serde_json::to_string(&event.payload)?,
+                serde_json::to_string(&event.refs)?,
+                snapshot_i64(event.created_at_ms, "created_at_ms")?,
+                snapshot_i64(event.commit_cursor, "commit_cursor")?,
+                event.transaction_id,
+                i64::from(event.transaction_index),
+                i64::from(event.schema_version),
+                event.idempotency_key,
+            ],
+        )?;
+    }
+    for stream in &snapshot.transaction_streams {
+        tx.execute(
+            "INSERT INTO runtime_transaction_streams
+             (transaction_id, stream_id, expected_revision, committed_revision)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                stream.transaction_id,
+                stream.stream_id,
+                snapshot_i64(stream.expected_revision, "expected_revision")?,
+                snapshot_i64(stream.committed_revision, "committed_revision")?,
+            ],
+        )?;
+    }
+    for head in &snapshot.stream_heads {
+        tx.execute(
+            "INSERT INTO runtime_stream_heads(stream_id, revision) VALUES (?1, ?2)",
+            params![head.stream_id, snapshot_i64(head.revision, "revision")?,],
+        )?;
+    }
+    for terminal in &snapshot.session_outbox {
+        tx.execute(
+            "INSERT INTO runtime_session_outbox
+             (terminal_id, message_id, session_id, commit_cursor, payload_ref, status, attempts,
+              next_attempt_at, claim_owner, claim_expires_at, failure_class, last_error,
+              materialized_at, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                terminal.terminal_id,
+                terminal.message_id,
+                terminal.session_id,
+                snapshot_i64(terminal.commit_cursor, "commit_cursor")?,
+                terminal.payload_ref,
+                terminal.status,
+                i64::from(terminal.attempts),
+                terminal
+                    .next_attempt_at_ms
+                    .map(|value| snapshot_i64(value, "next_attempt_at"))
+                    .transpose()?,
+                terminal.claim_owner,
+                terminal
+                    .claim_expires_at_ms
+                    .map(|value| snapshot_i64(value, "claim_expires_at"))
+                    .transpose()?,
+                terminal.failure_class,
+                terminal.last_error,
+                terminal
+                    .materialized_at_ms
+                    .map(|value| snapshot_i64(value, "materialized_at"))
+                    .transpose()?,
+                snapshot_i64(terminal.revision, "revision")?,
+            ],
+        )?;
+    }
+    for lease in &snapshot.decision_leases {
+        tx.execute(
+            "INSERT INTO runtime_consumed_decision_leases
+             (lease_id, principal_id, review_id, action, scope, evidence_digest, credential_epoch, consumed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                lease.lease_id,
+                lease.principal_id,
+                lease.review_id,
+                lease.action,
+                lease.scope,
+                lease.evidence_digest,
+                snapshot_i64(lease.credential_epoch, "credential_epoch")?,
+                snapshot_i64(lease.consumed_at_ms, "consumed_at_ms")?,
+            ],
+        )?;
+    }
+    if let Some(max_cursor) = snapshot.commits.last().map(|commit| commit.commit_cursor) {
+        tx.execute(
+            "DELETE FROM sqlite_sequence WHERE name='runtime_commits'",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('runtime_commits', ?1)",
+            params![snapshot_i64(max_cursor, "commit_cursor")?],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn validate_migration_snapshot(
+    snapshot: &RuntimeEventStoreSnapshot,
+) -> RuntimeEventStoreResult<()> {
+    let mut commits = BTreeMap::new();
+    let mut commit_cursors = BTreeSet::new();
+    for commit in &snapshot.commits {
+        if commit.commit_cursor == 0
+            || commit.transaction_id.trim().is_empty()
+            || commit.request_hash.trim().is_empty()
+            || commits
+                .insert(commit.transaction_id.as_str(), commit.commit_cursor)
+                .is_some()
+            || !commit_cursors.insert(commit.commit_cursor)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "runtime event migration snapshot has an invalid commit".to_string(),
+            ));
+        }
+    }
+    let mut event_ids = BTreeSet::new();
+    let mut event_sequences = BTreeSet::new();
+    let mut event_indexes = BTreeSet::new();
+    let mut events_per_transaction_stream = BTreeMap::<(&str, &str), u64>::new();
+    for event in &snapshot.events {
+        if !event_ids.insert(event.event_id.as_str())
+            || commits.get(event.transaction_id.as_str()) != Some(&event.commit_cursor)
+            || !commit_cursors.contains(&event.commit_cursor)
+            || event.sequence == 0
+            || event.schema_version == 0
+            || !event_sequences.insert((event.stream_id.as_str(), event.sequence))
+            || !event_indexes.insert((event.transaction_id.as_str(), event.transaction_index))
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "runtime event migration snapshot has an invalid event linkage".to_string(),
+            ));
+        }
+        *events_per_transaction_stream
+            .entry((event.transaction_id.as_str(), event.stream_id.as_str()))
+            .or_default() += 1;
+    }
+    let mut transaction_streams = BTreeSet::new();
+    let mut heads_from_transactions = BTreeMap::<&str, (u64, u64)>::new();
+    for stream in &snapshot.transaction_streams {
+        if !commits.contains_key(stream.transaction_id.as_str())
+            || stream.stream_id.trim().is_empty()
+            || !transaction_streams
+                .insert((stream.transaction_id.as_str(), stream.stream_id.as_str()))
+            || stream.committed_revision
+                != stream.expected_revision
+                    + events_per_transaction_stream
+                        .get(&(stream.transaction_id.as_str(), stream.stream_id.as_str()))
+                        .copied()
+                        .unwrap_or_default()
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "runtime event migration snapshot has an invalid transaction stream".to_string(),
+            ));
+        }
+        let commit_cursor = commits[stream.transaction_id.as_str()];
+        heads_from_transactions
+            .entry(stream.stream_id.as_str())
+            .and_modify(|current| {
+                if commit_cursor > current.0 {
+                    *current = (commit_cursor, stream.committed_revision);
+                }
+            })
+            .or_insert((commit_cursor, stream.committed_revision));
+    }
+    if events_per_transaction_stream
+        .keys()
+        .any(|stream| !transaction_streams.contains(stream))
+    {
+        return Err(RuntimeEventStoreError::InvalidTransaction(
+            "runtime event migration snapshot is missing a transaction stream".to_string(),
+        ));
+    }
+    let mut stream_heads = BTreeMap::new();
+    for head in &snapshot.stream_heads {
+        if head.stream_id.trim().is_empty()
+            || stream_heads
+                .insert(head.stream_id.as_str(), head.revision)
+                .is_some()
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "runtime event migration snapshot has an invalid stream head".to_string(),
+            ));
+        }
+    }
+    if stream_heads.len() != heads_from_transactions.len()
+        || heads_from_transactions
+            .iter()
+            .any(|(stream_id, (_, revision))| stream_heads.get(stream_id) != Some(revision))
+    {
+        return Err(RuntimeEventStoreError::InvalidTransaction(
+            "runtime event migration snapshot stream heads do not match events".to_string(),
+        ));
+    }
+    let mut terminal_ids = BTreeSet::new();
+    let mut message_ids = BTreeSet::new();
+    for terminal in &snapshot.session_outbox {
+        if terminal.terminal_id.trim().is_empty()
+            || terminal.message_id.trim().is_empty()
+            || !terminal_ids.insert(terminal.terminal_id.as_str())
+            || !message_ids.insert(terminal.message_id.as_str())
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "runtime event migration snapshot has an invalid terminal outbox row".to_string(),
+            ));
+        }
+    }
+    let mut lease_ids = BTreeSet::new();
+    for lease in &snapshot.decision_leases {
+        if lease.lease_id.trim().is_empty()
+            || lease.principal_id.trim().is_empty()
+            || lease.review_id.trim().is_empty()
+            || lease.action.trim().is_empty()
+            || lease.scope.trim().is_empty()
+            || lease.evidence_digest.trim().is_empty()
+            || !lease_ids.insert(lease.lease_id.as_str())
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "runtime event migration snapshot has an invalid decision lease".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_i64(value: u64, field: &str) -> RuntimeEventStoreResult<i64> {
+    i64::try_from(value).map_err(|_| {
+        RuntimeEventStoreError::InvalidTransaction(format!(
+            "runtime event migration `{field}` exceeds i64"
+        ))
+    })
+}
+
 fn configure_connection(conn: &Connection, in_memory: bool) -> RuntimeEventStoreResult<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -2001,6 +2828,49 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn migration_snapshot_round_trip_preserves_canonical_digest_and_rejects_nonempty_target() {
+        let source = RuntimeEventStore::try_open_in_memory().expect("source store");
+        source
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: "migration-round-trip".to_string(),
+                expected_streams: vec![
+                    ExpectedStreamRevision {
+                        stream_id: "migration:stream".to_string(),
+                        expected_revision: 0,
+                    },
+                    ExpectedStreamRevision {
+                        stream_id: "migration:empty-stream".to_string(),
+                        expected_revision: 0,
+                    },
+                ],
+                events: vec![input(
+                    "migration:stream",
+                    RuntimeEventScope::Recovery,
+                    "migration.seeded",
+                )
+                .into()],
+            })
+            .expect("source event");
+        let snapshot = source
+            .export_migration_snapshot()
+            .expect("export source snapshot");
+        let digest = snapshot.canonical_digest().expect("source digest");
+        let target = RuntimeEventStore::try_open_in_memory().expect("target store");
+        target
+            .import_migration_snapshot(&snapshot)
+            .expect("import snapshot");
+        assert_eq!(
+            target
+                .export_migration_snapshot()
+                .expect("export target snapshot")
+                .canonical_digest()
+                .expect("target digest"),
+            digest
+        );
+        assert!(target.import_migration_snapshot(&snapshot).is_err());
     }
 
     #[test]

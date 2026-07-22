@@ -121,6 +121,7 @@ pub struct ExecutionStartupRecoveryError {
 pub struct RuntimeServicesBuilder {
     cowd_home: PathBuf,
     workspace_root: PathBuf,
+    runtime_event_store: Option<Arc<RuntimeEventStore>>,
     builtin_definitions_root: Option<PathBuf>,
     resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
     provider_registry: Arc<crate::ProviderRegistry>,
@@ -428,6 +429,15 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Compose a verified durable event backend at the Runtime host boundary.
+    /// This is explicit injection, not a process-wide backend switch; business
+    /// callers continue to depend only on Runtime event semantics.
+    #[must_use]
+    pub fn runtime_event_store(mut self, store: Arc<RuntimeEventStore>) -> Self {
+        self.runtime_event_store = Some(store);
+        self
+    }
+
     pub fn build(self) -> Result<Arc<RuntimeServices>, RuntimeServicesError> {
         if self.cowd_home.as_os_str().is_empty() || self.workspace_root.as_os_str().is_empty() {
             return Err(RuntimeServicesError::EmptyRoot);
@@ -455,10 +465,15 @@ impl RuntimeServicesBuilder {
             builtin_definitions_root,
             &workspace_root,
         )?);
-        let event_scope = storage::StorageScope::workspace_for_root(&workspace_root);
-        let runtime_event_handle = storage_registry
-            .endpoint_in_scope(&storage::StorageDomainId::RuntimeEvents, &event_scope)?
-            .as_handle();
+        let event_store = if let Some(store) = self.runtime_event_store {
+            store
+        } else {
+            let event_scope = storage::StorageScope::workspace_for_root(&workspace_root);
+            let runtime_event_handle = storage_registry
+                .endpoint_in_scope(&storage::StorageDomainId::RuntimeEvents, &event_scope)?
+                .as_handle();
+            Arc::new(RuntimeEventStore::try_open(runtime_event_handle.path)?)
+        };
         let resource_state_root = std::env::temp_dir()
             .join("cowd-runtime-resource-locks")
             .join(&workspace_key);
@@ -475,7 +490,7 @@ impl RuntimeServicesBuilder {
             self.cowd_home.clone(),
             workspace_root,
             workspace_key,
-            Arc::new(RuntimeEventStore::try_open(runtime_event_handle.path)?),
+            event_store,
             worktree_leases,
             scope_locks,
             self.resource_quotas,
@@ -573,6 +588,7 @@ impl RuntimeServices {
         RuntimeServicesBuilder {
             cowd_home: cowd_home.into(),
             workspace_root: workspace_root.into(),
+            runtime_event_store: None,
             builtin_definitions_root: None,
             resource_quotas: default_resource_quotas(),
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),

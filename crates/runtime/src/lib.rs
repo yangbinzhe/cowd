@@ -611,19 +611,17 @@ pub use runtime_event_replay::{
     candidate_from_action, RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind,
     RuntimeRecoveryCandidate, RuntimeReplayReport,
 };
-#[cfg(not(feature = "test-fixtures"))]
-#[allow(unused_imports)]
-pub(crate) use runtime_event_store::{
-    AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventStore,
-    RuntimeTransactionEventInput,
-};
 pub use runtime_event_store::{
-    DurableRuntimeEvent, RuntimeEventRef, RuntimeEventScope, RuntimeEventStoreError,
-    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
+    AppendTransactionReceipt, AppendTransactionRequest, CommittedEventBatch,
+    CommittedStreamRevision, DurableRuntimeEvent, ExpectedStreamRevision,
+    RuntimeDecisionLeaseSnapshot, RuntimeEventCommitSnapshot, RuntimeEventInput,
+    RuntimeEventRecord, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
+    RuntimeEventStoreSnapshot, RuntimeEventStreamHeadSnapshot,
+    RuntimeEventTransactionStreamSnapshot, RuntimeSessionOutboxFailureClass,
+    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeTransactionEventInput,
     SessionTerminalInput,
 };
-#[cfg(feature = "test-fixtures")]
-pub use runtime_event_store::{RuntimeEventInput, RuntimeEventStore};
 pub use sandbox::{
     detect_container_environment, detect_container_environment_from, resolve_sandbox_status,
     resolve_sandbox_status_for_request, ContainerEnvironment, FilesystemIsolationMode,
