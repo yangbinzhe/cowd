@@ -128,6 +128,26 @@ if [[ "${1:-}" == "--v571-surface-ledger-port" ]]; then
   exit "$fail"
 fi
 
+if [[ "${1:-}" == "--v572-surface-ledger-postgres" ]]; then
+  # V572 introduces a complete PostgreSQL implementation of the V571 port.
+  # The adapter may depend on the driver, while the contract and Gateway
+  # production graph must stay database-driver-free until a separately
+  # approved deployment-wide cutover.
+  check_empty "V572 dedicated Surface PostgreSQL adapter must exist" \
+    bash -c 'if [[ ! -f crates/surface-postgres/Cargo.toml || ! -f crates/surface-postgres/src/lib.rs ]]; then echo missing; fi'
+  check_empty "V572 Surface and Gateway normal dependency trees must stay PostgreSQL-free" \
+    bash -c '(cargo tree -p surface --edges normal; cargo tree -p gateway --edges normal) 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
+  check_empty "V572 Surface contract must not name a PostgreSQL driver" \
+    rg -n '^postgres\s*=|^tokio-postgres\s*=|^r2d2_postgres\s*=' crates/surface/Cargo.toml
+  check_empty "V572 Gateway production source must not compose the PostgreSQL adapter" \
+    bash -c 'awk "/#\[cfg\(test\)\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" crates/gateway/src/surface_host/message_store.rs | rg -n "surface_postgres|PostgresSurfaceMessageLedger" || true'
+  check_empty "V572 migration carrier must be owned by the Surface contract" \
+    bash -c 'if ! rg -q "SurfaceMessageLedgerMigrationSnapshot" crates/surface/src/message_ledger.rs; then echo missing; fi'
+  check_empty "V572 global PostgreSQL switch must remain unavailable" \
+    rg -n 'StorageBackendKind::Postgres|control_plane_backend.*postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
+  exit "$fail"
+fi
+
 check_empty "cli business command names" \
   rg -n "\\b(run|chat|prompt|mcp serve)\\b" crates/cli/src/main.rs --glob '*.rs'
 

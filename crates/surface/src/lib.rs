@@ -23,7 +23,8 @@ pub mod message_ledger;
 
 pub use message_ledger::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
-    SurfaceMessageLedger, SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
+    SurfaceIngressFrameRecord, SurfaceMessageLedger, SurfaceMessageLedgerMigrationSnapshot,
+    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
     SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 

@@ -26,6 +26,7 @@ members = [
     "crates/skill/service",
     "crates/storage",
     "crates/surface",
+    "crates/surface-postgres",
     "crates/tools",
     "crates/tui",
     "crates/xtask",
@@ -58,12 +59,13 @@ default-members = [
     "crates/skill/service",
     "crates/storage",
     "crates/surface",
+    "crates/surface-postgres",
     "crates/tools",
     "crates/xtask",
 ]
 
 [workspace.package]
-version = "0.9.571"
+version = "0.9.572"
 edition = "2021"
 license = "MIT"
 publish = false

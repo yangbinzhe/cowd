@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-use crate::{SurfaceFrame, SurfaceOperationResult, SurfaceSendRequest};
+use crate::{normalize_surface_id, SurfaceFrame, SurfaceOperationResult, SurfaceSendRequest};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SurfaceTurnCorrelation {
@@ -143,6 +144,166 @@ pub struct SurfaceIngressClaim {
     pub frame: SurfaceFrame,
 }
 
+/// Full durable ingress state used only for quiesced backend migration.
+/// It retains ownership/lease facts so a restart after copy has the same
+/// recovery behavior as the source ledger.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SurfaceIngressFrameRecord {
+    pub record_key: String,
+    pub surface: String,
+    pub session_id: String,
+    pub status: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub next_retry_at_ms: Option<i64>,
+    pub claim_owner: Option<String>,
+    pub lease_until_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub frame: SurfaceFrame,
+    pub last_error: Option<String>,
+}
+
+/// Backend-neutral, complete Surface ledger migration carrier.
+///
+/// The snapshot excludes diagnostic paths, connection URLs and any secret.
+/// It is only valid when the source has been quiesced by its operator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SurfaceMessageLedgerMigrationSnapshot {
+    pub inbox: Vec<SurfaceInboxRecord>,
+    pub outbox: Vec<SurfaceOutboxRecord>,
+    pub trigger_events: Vec<SurfaceTriggerEventRecord>,
+    pub delivery_events: Vec<SurfaceDeliveryEvent>,
+    pub ingress_frames: Vec<SurfaceIngressFrameRecord>,
+}
+
+impl SurfaceMessageLedgerMigrationSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_unique(
+            self.inbox
+                .iter()
+                .map(|record| record.idempotency_key.as_str()),
+            "surface inbox idempotency key",
+        )?;
+        validate_unique(
+            self.outbox
+                .iter()
+                .map(|record| record.idempotency_key.as_str()),
+            "surface outbox idempotency key",
+        )?;
+        validate_unique(
+            self.outbox.iter().map(|record| record.delivery_id.as_str()),
+            "surface delivery id",
+        )?;
+        validate_unique(
+            self.trigger_events
+                .iter()
+                .map(|record| record.idempotency_key.as_str()),
+            "surface trigger idempotency key",
+        )?;
+        validate_unique(
+            self.delivery_events
+                .iter()
+                .map(|record| record.event_id.as_str()),
+            "surface delivery event id",
+        )?;
+        validate_unique(
+            self.ingress_frames
+                .iter()
+                .map(|record| record.record_key.as_str()),
+            "surface ingress record key",
+        )?;
+        for record in &self.inbox {
+            if record.surface.trim().is_empty()
+                || record.message_id.trim().is_empty()
+                || record.idempotency_key.trim().is_empty()
+            {
+                return Err("surface inbox migration record is missing identity".to_string());
+            }
+        }
+        for record in &self.outbox {
+            if record.surface.trim().is_empty()
+                || record.delivery_id.trim().is_empty()
+                || record.idempotency_key.trim().is_empty()
+            {
+                return Err("surface outbox migration record is missing identity".to_string());
+            }
+        }
+        for record in &self.trigger_events {
+            if record.surface.trim().is_empty()
+                || record.event_type.trim().is_empty()
+                || record.idempotency_key.trim().is_empty()
+            {
+                return Err("surface trigger migration record is missing identity".to_string());
+            }
+        }
+        for record in &self.delivery_events {
+            if record.surface.trim().is_empty() || record.event_id.trim().is_empty() {
+                return Err(
+                    "surface delivery event migration record is missing identity".to_string(),
+                );
+            }
+        }
+        for record in &self.ingress_frames {
+            if record.record_key.trim().is_empty()
+                || record.surface.trim().is_empty()
+                || record.session_id.trim().is_empty()
+                || record.status.trim().is_empty()
+                || record.max_attempts == 0
+                || record.attempts > record.max_attempts
+            {
+                return Err("surface ingress migration record is invalid".to_string());
+            }
+            match &record.frame {
+                SurfaceFrame::Event { surface, .. }
+                    if normalize_surface_id(surface) == normalize_surface_id(&record.surface) => {}
+                SurfaceFrame::Event { .. } => {
+                    return Err("surface ingress frame surface does not match record".to_string())
+                }
+                _ => return Err("surface ingress migration frame must be an event".to_string()),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn canonical_digest(&self) -> Result<String, String> {
+        self.validate()?;
+        let mut canonical = self.clone();
+        canonical
+            .inbox
+            .sort_by(|left, right| left.idempotency_key.cmp(&right.idempotency_key));
+        canonical
+            .outbox
+            .sort_by(|left, right| left.idempotency_key.cmp(&right.idempotency_key));
+        canonical
+            .trigger_events
+            .sort_by(|left, right| left.idempotency_key.cmp(&right.idempotency_key));
+        canonical
+            .delivery_events
+            .sort_by(|left, right| left.event_id.cmp(&right.event_id));
+        canonical
+            .ingress_frames
+            .sort_by(|left, right| left.record_key.cmp(&right.record_key));
+        let payload = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
+        Ok(format!("{:x}", Sha256::digest(payload)))
+    }
+}
+
+fn validate_unique<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+    name: &str,
+) -> Result<(), String> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return Err(format!("{name} must not be empty"));
+    }
+    if values.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(format!("duplicate {name} in migration snapshot"));
+    }
+    Ok(())
+}
+
 /// Canonical durable operations for a Surface message ledger.
 ///
 /// Methods return storage errors explicitly: an unavailable ledger is not an
@@ -266,4 +427,9 @@ pub trait SurfaceMessageLedger: std::fmt::Debug + Send + Sync {
     fn list_trigger_events(&self, surface: &str) -> Result<Vec<SurfaceTriggerEventRecord>, String>;
     fn list_delivery_events(&self, surface: &str) -> Result<Vec<SurfaceDeliveryEvent>, String>;
     fn snapshot(&self, surface: &str) -> Result<SurfaceMessageSnapshot, String>;
+    fn export_migration_snapshot(&self) -> Result<SurfaceMessageLedgerMigrationSnapshot, String>;
+    fn import_migration_snapshot(
+        &self,
+        snapshot: &SurfaceMessageLedgerMigrationSnapshot,
+    ) -> Result<(), String>;
 }

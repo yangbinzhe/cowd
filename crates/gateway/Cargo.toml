@@ -111,6 +111,7 @@ auth-broker = { path = "../auth-broker", features = ["test-support"] }
 runtime = { path = "../runtime", features = ["test-fixtures"] }
 serde_json.workspace = true
 serial_test = "3"
+surface-postgres = { path = "../surface-postgres" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }

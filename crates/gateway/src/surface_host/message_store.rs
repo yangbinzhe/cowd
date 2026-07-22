@@ -15,8 +15,9 @@ use surface::{
 
 pub(crate) use surface::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
-    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
-    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
+    SurfaceIngressFrameRecord, SurfaceMessageLedgerMigrationSnapshot, SurfaceMessageSnapshot,
+    SurfaceOutboxRecord, SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord,
+    SurfaceTurnCorrelation,
 };
 
 const INBOX_FILE: &str = "surface_inbox.jsonl";
@@ -1753,6 +1754,89 @@ impl SurfaceMessageLedger for SqliteSurfaceMessageStore {
     fn snapshot(&self, surface: &str) -> Result<SurfaceMessageSnapshot, String> {
         self.try_snapshot(surface)
     }
+    fn export_migration_snapshot(&self) -> Result<SurfaceMessageLedgerMigrationSnapshot, String> {
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let state = load_database_state(&transaction)?;
+        let ingress_frames = load_ingress_frames(&transaction)?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        let snapshot = SurfaceMessageLedgerMigrationSnapshot {
+            inbox: state.inbox.into_values().collect(),
+            outbox: state.outbox.into_values().collect(),
+            trigger_events: state.trigger_events.into_values().collect(),
+            delivery_events: state.events.into_values().collect(),
+            ingress_frames,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+    fn import_migration_snapshot(
+        &self,
+        snapshot: &SurfaceMessageLedgerMigrationSnapshot,
+    ) -> Result<(), String> {
+        snapshot.validate()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        for table in [
+            "surface_inbox",
+            "surface_outbox",
+            "surface_trigger_event",
+            "surface_delivery_event",
+            "surface_ingress_frame",
+        ] {
+            let count = transaction
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(|error| error.to_string())?;
+            if count != 0 {
+                return Err(format!(
+                    "surface migration target table `{table}` is not empty"
+                ));
+            }
+        }
+        let state = SurfaceMessageState {
+            inbox: snapshot
+                .inbox
+                .iter()
+                .cloned()
+                .map(|record| (record.idempotency_key.clone(), record))
+                .collect(),
+            outbox: snapshot
+                .outbox
+                .iter()
+                .cloned()
+                .map(|record| (record.idempotency_key.clone(), record))
+                .collect(),
+            trigger_events: snapshot
+                .trigger_events
+                .iter()
+                .cloned()
+                .map(|record| (record.idempotency_key.clone(), record))
+                .collect(),
+            events: snapshot
+                .delivery_events
+                .iter()
+                .cloned()
+                .map(|record| (record.event_id.clone(), record))
+                .collect(),
+        };
+        persist_state_transaction(&transaction, &state)?;
+        for record in &snapshot.ingress_frames {
+            insert_ingress_frame(&transaction, record)?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1983,6 +2067,79 @@ fn load_database_state(connection: &Connection) -> Result<SurfaceMessageState, S
         trigger_events: load_database_records(connection, "surface_trigger_event")?,
         events: load_database_records(connection, "surface_delivery_event")?,
     })
+}
+
+fn load_ingress_frames(connection: &Connection) -> Result<Vec<SurfaceIngressFrameRecord>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT record_key, surface, session_id, status, attempts, max_attempts,
+                    next_retry_at_ms, claim_owner, lease_until_ms, created_at_ms, updated_at_ms,
+                    payload_json, last_error
+               FROM surface_ingress_frame
+              ORDER BY record_key ASC",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            let payload_json = row.get::<_, String>(11)?;
+            let frame = serde_json::from_str(&payload_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(SurfaceIngressFrameRecord {
+                record_key: row.get(0)?,
+                surface: row.get(1)?,
+                session_id: row.get(2)?,
+                status: row.get(3)?,
+                attempts: row.get(4)?,
+                max_attempts: row.get(5)?,
+                next_retry_at_ms: row.get(6)?,
+                claim_owner: row.get(7)?,
+                lease_until_ms: row.get(8)?,
+                created_at_ms: row.get(9)?,
+                updated_at_ms: row.get(10)?,
+                frame,
+                last_error: row.get(12)?,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+fn insert_ingress_frame(
+    transaction: &Transaction<'_>,
+    record: &SurfaceIngressFrameRecord,
+) -> Result<(), String> {
+    let payload_json = serde_json::to_string(&record.frame).map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT INTO surface_ingress_frame(
+                record_key, surface, session_id, status, attempts, max_attempts,
+                next_retry_at_ms, claim_owner, lease_until_ms, created_at_ms, updated_at_ms,
+                payload_json, last_error
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                &record.record_key,
+                &record.surface,
+                &record.session_id,
+                &record.status,
+                record.attempts,
+                record.max_attempts,
+                record.next_retry_at_ms,
+                &record.claim_owner,
+                record.lease_until_ms,
+                record.created_at_ms,
+                record.updated_at_ms,
+                payload_json,
+                &record.last_error,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn persist_state_transaction(
@@ -3149,6 +3306,180 @@ mod tests {
         let retry = store.due_retry_deliveries();
         assert_eq!(retry.len(), 1);
         assert_eq!(retry[0].status, "retry_scheduled");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_snapshot_preserves_every_surface_ledger_family() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-migration-source-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = SqliteSurfaceMessageStore::new(&root);
+        source
+            .persist_ingress_frame(&SurfaceFrame::Event {
+                surface: "feishu".to_string(),
+                event: "message.received".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "migration-session",
+                    "message_id": "migration-message",
+                    "text": "migrate every durable family"
+                }),
+            })
+            .unwrap();
+        source
+            .record_inbox_received(
+                "feishu",
+                "migration-message",
+                &serde_json::json!({"text": "inbox"}),
+                "migration-session",
+                None,
+                None,
+            )
+            .unwrap();
+        source
+            .record_trigger_event_received(
+                "feishu",
+                "message.received",
+                &trigger_event("migration-trigger"),
+                &serde_json::json!({"text": "trigger"}),
+            )
+            .unwrap();
+        source
+            .queue_outbox(
+                &SurfaceSendRequest {
+                    surface: "feishu".to_string(),
+                    recipient: "migration-recipient".to_string(),
+                    thread: None,
+                    text: "outbox".to_string(),
+                    idempotency_key: Some("migration-outbox".to_string()),
+                    metadata: serde_json::Value::Null,
+                },
+                Some("migration-session".to_string()),
+                Some("migration-message".to_string()),
+            )
+            .unwrap();
+
+        let snapshot = source.export_migration_snapshot().unwrap();
+        assert_eq!(snapshot.inbox.len(), 1);
+        assert_eq!(snapshot.outbox.len(), 1);
+        assert_eq!(snapshot.trigger_events.len(), 1);
+        assert_eq!(snapshot.delivery_events.len(), 3);
+        assert_eq!(snapshot.ingress_frames.len(), 1);
+        let source_digest = snapshot.canonical_digest().unwrap();
+
+        let target_root = std::env::temp_dir().join(format!(
+            "cowd-surface-migration-target-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let target = SqliteSurfaceMessageStore::new(&target_root);
+        target.import_migration_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            target
+                .export_migration_snapshot()
+                .unwrap()
+                .canonical_digest()
+                .unwrap(),
+            source_digest
+        );
+        assert!(target.import_migration_snapshot(&snapshot).is_err());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(target_root);
+    }
+
+    /// This is intentionally an opt-in integration test: it proves that the
+    /// SQLite implementation exported by the Gateway can be copied into the
+    /// PostgreSQL adapter without either backend knowing about the other.
+    /// The caller supplies an isolated disposable database through
+    /// `COWD_TEST_POSTGRES_URL`.
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn sqlite_snapshot_copies_to_postgres_with_exact_digest() {
+        let url = std::env::var("COWD_TEST_POSTGRES_URL")
+            .expect("COWD_TEST_POSTGRES_URL is required for PostgreSQL integration tests");
+        let resolver = storage::StaticSecretRefResolver::new([("v572-test".into(), url)]);
+        let target = surface_postgres::PostgresSurfaceMessageLedger::connect(
+            storage::PostgresConnectionConfig::new(
+                "surface-v572-sqlite-source",
+                "v572-test",
+                "cowd-v572-sqlite-source",
+            ),
+            &resolver,
+        )
+        .unwrap();
+        target
+            .executor()
+            .checkout()
+            .unwrap()
+            .batch_execute(
+                "TRUNCATE TABLE surface_delivery_event, surface_ingress_frame, surface_outbox, \
+                 surface_trigger_event, surface_inbox",
+            )
+            .unwrap();
+
+        let root = std::env::temp_dir().join(format!(
+            "cowd-surface-v572-sqlite-source-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let source = SqliteSurfaceMessageStore::new(&root);
+        source
+            .persist_ingress_frame(&SurfaceFrame::Event {
+                surface: "feishu".to_string(),
+                event: "message.received".to_string(),
+                payload: serde_json::json!({
+                    "session_id": "postgres-migration-session",
+                    "message_id": "postgres-migration-message",
+                    "text": "copy every durable family"
+                }),
+            })
+            .unwrap();
+        source
+            .record_inbox_received(
+                "feishu",
+                "postgres-migration-message",
+                &serde_json::json!({"text": "inbox"}),
+                "postgres-migration-session",
+                None,
+                None,
+            )
+            .unwrap();
+        source
+            .record_trigger_event_received(
+                "feishu",
+                "message.received",
+                &trigger_event("postgres-migration-trigger"),
+                &serde_json::json!({"text": "trigger"}),
+            )
+            .unwrap();
+        source
+            .queue_outbox(
+                &SurfaceSendRequest {
+                    surface: "feishu".to_string(),
+                    recipient: "postgres-migration-recipient".to_string(),
+                    thread: None,
+                    text: "outbox".to_string(),
+                    idempotency_key: Some("postgres-migration-outbox".to_string()),
+                    metadata: serde_json::Value::Null,
+                },
+                Some("postgres-migration-session".to_string()),
+                Some("postgres-migration-message".to_string()),
+            )
+            .unwrap();
+
+        let manifest = surface_postgres::copy_quiesced_surface_message_ledger(
+            &source,
+            &target,
+            root.join("surface-message-migration-manifest.json"),
+        )
+        .unwrap();
+        assert_eq!(manifest.source_digest, manifest.target_digest);
+        assert_eq!(manifest.inbox_count, 1);
+        assert_eq!(manifest.outbox_count, 1);
+        assert_eq!(manifest.trigger_event_count, 1);
+        assert_eq!(manifest.ingress_frame_count, 1);
+        assert!(target
+            .import_migration_snapshot(&source.export_migration_snapshot().unwrap())
+            .is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }
