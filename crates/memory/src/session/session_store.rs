@@ -1,8 +1,7 @@
 //! Unified session store — the canonical wrapper for session persistence.
 //!
-//! `UnifiedSessionStore` delegates to [`SqliteSessionStore`] internally,
-//! providing a stable public API while the backend implementation can evolve
-//! independently.
+//! `UnifiedSessionStore` delegates to a complete selected durable backend,
+//! while retaining explicit SQLite construction helpers for SQLite topology.
 //!
 //! # Migration from SqliteSessionStore
 //!
@@ -26,6 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::runtime_event::{SessionDomainEvent, SessionDomainEventPage, SESSION_DOMAIN_EVENT_TYPE};
+use crate::session_backend::SharedSessionStoreBackend;
 use crate::store::session::{
     OutboxFailureClass, SessionEvent, SessionListOptions, SessionListPage, SessionMessage,
     SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
@@ -40,11 +40,9 @@ use crate::store::Result;
 
 /// Canonical session store for the cowd AI assistant.
 ///
-/// Shares [`SqliteSessionStore`] through `Arc`. The inner store already owns a
-/// bounded SQLite connection pool and configures WAL mode, so a second
-/// process-wide async mutex would only serialize unrelated sessions and let a
-/// stalled operation block all ingress. The public API mirrors the inner
-/// store exactly while preserving pool-level concurrency.
+/// Holds a complete selected session backend through `Arc`. Each concrete
+/// backend owns its bounded connection pool; no process-wide async mutex is
+/// introduced, so unrelated sessions remain independently schedulable.
 ///
 /// # Example
 ///
@@ -56,7 +54,7 @@ use crate::store::Result;
 /// ```
 #[derive(Debug, Clone)]
 pub struct UnifiedSessionStore {
-    inner: Arc<SqliteSessionStore>,
+    inner: SharedSessionStoreBackend,
 }
 
 impl UnifiedSessionStore {
@@ -70,13 +68,12 @@ impl UnifiedSessionStore {
     /// the database is new.
     pub fn open(path: &Path) -> Result<Self> {
         let store = SqliteSessionStore::open(path)?;
-        Ok(Self {
-            inner: Arc::new(store),
-        })
+        Ok(Self::from_backend(Arc::new(store)))
     }
 
-    /// Open a session database from the storage registry session handle.
-    pub fn open_storage_handle(handle: &storage::StorageHandle) -> Result<Self> {
+    /// Open a SQLite session database from an explicitly SQLite storage
+    /// handle. PostgreSQL composition uses [`Self::from_backend`] instead.
+    pub fn open_sqlite_storage_handle(handle: &storage::StorageHandle) -> Result<Self> {
         if handle.backend != storage::StorageBackendKind::Sqlite {
             return Err(crate::error::MemoryError::Store(format!(
                 "storage handle `{}` is not sqlite-backed",
@@ -84,17 +81,26 @@ impl UnifiedSessionStore {
             )));
         }
         let store = SqliteSessionStore::open_storage_handle(handle)?;
-        Ok(Self {
-            inner: Arc::new(store),
-        })
+        Ok(Self::from_backend(Arc::new(store)))
     }
 
     /// Open an in-memory session database (useful for testing).
     pub fn open_in_memory() -> Result<Self> {
         let store = SqliteSessionStore::open_in_memory()?;
-        Ok(Self {
-            inner: Arc::new(store),
-        })
+        Ok(Self::from_backend(Arc::new(store)))
+    }
+
+    /// Build the application-facing store from the selected durable backend.
+    /// Composition roots use this to inject PostgreSQL without exposing a
+    /// driver, URL, path, or adapter type to Gateway/Runtime callers.
+    #[must_use]
+    pub fn from_backend(inner: SharedSessionStoreBackend) -> Self {
+        Self { inner }
+    }
+
+    #[must_use]
+    pub fn backend(&self) -> &SharedSessionStoreBackend {
+        &self.inner
     }
 
     // -----------------------------------------------------------------------
@@ -192,7 +198,7 @@ impl UnifiedSessionStore {
         self.inner.list_sessions_by_workspace_root(workspace_root)
     }
 
-    /// Search sessions using FTS5 full-text search.
+    /// Search sessions using the selected backend's full-text capability.
     ///
     /// Searches across platform, chat_id, user_id, and metadata_json.
     /// Returns results with highlighted snippets from metadata.

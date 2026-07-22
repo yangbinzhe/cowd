@@ -40,7 +40,7 @@ impl GatewayStorage {
         if let Some(parent) = handle.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        memory::UnifiedSessionStore::open_storage_handle(&handle).map_err(|error| {
+        memory::UnifiedSessionStore::open_sqlite_storage_handle(&handle).map_err(|error| {
             let message = format!(
                 "failed to open unified session store at {:?}: {error}",
                 handle.path

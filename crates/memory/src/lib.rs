@@ -114,6 +114,8 @@ pub(crate) mod runtime_event;
 pub mod search;
 #[path = "ingestion/seeds.rs"]
 pub mod seeds;
+#[path = "session/backend.rs"]
+pub mod session_backend;
 #[path = "session/session_resume.rs"]
 pub mod session_resume;
 #[path = "session/session_store.rs"]
@@ -211,6 +213,7 @@ pub use runtime_event::{
     SESSION_DOMAIN_EVENT_TYPE,
 };
 pub use search::{BM25Scorer, HybridSearcher, SearchResult as HybridSearchResult};
+pub use session_backend::{SessionStoreBackend, SharedSessionStoreBackend};
 pub use session_resume::SessionResume;
 pub use session_store::UnifiedSessionStore;
 pub use state_rebuilder::{

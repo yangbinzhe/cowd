@@ -6,17 +6,18 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(test)]
 use tempfile::TempDir;
 
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::legacy_jsonl::legacy_jsonl_session_import_enabled;
 use crate::types::{
     Decision, DecisionStatus, HandoffData, MemoryEntry, MemoryLayer, WorkItem, WorkItemStatus,
 };
+use crate::{SessionMessage, SessionRecord, UnifiedSessionStore};
 
 /// Source of state for reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,6 +203,7 @@ pub struct StateRebuilder {
     #[allow(dead_code)] // Derived field; cc_dir is the active path
     workspace: PathBuf,
     cc_dir: PathBuf,
+    session_store: Option<Arc<UnifiedSessionStore>>,
 }
 
 impl StateRebuilder {
@@ -209,7 +211,26 @@ impl StateRebuilder {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         let workspace = workspace.into();
         let cc_dir = workspace.join(".cowd");
-        Self { workspace, cc_dir }
+        Self {
+            workspace,
+            cc_dir,
+            session_store: None,
+        }
+    }
+
+    /// Attach the selected durable session owner. State rebuilding must not
+    /// infer a SQLite filename or open a database behind composition's back.
+    #[must_use]
+    pub fn with_session_store(
+        workspace: impl Into<PathBuf>,
+        session_store: Arc<UnifiedSessionStore>,
+    ) -> Self {
+        let workspace = workspace.into();
+        Self {
+            cc_dir: workspace.join(".cowd"),
+            workspace,
+            session_store: Some(session_store),
+        }
     }
 
     /// Rebuild state from all available sources.
@@ -489,19 +510,25 @@ impl StateRebuilder {
 
     /// Rebuild from session store.
     async fn rebuild_from_session_store(&self) -> Option<SessionStoreEntry> {
-        let store_path = self.cc_dir.join("sessions.db");
-        if !store_path.exists() {
-            return None;
-        }
-
-        let conn = rusqlite::Connection::open_with_flags(
-            &store_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .ok()?;
-        let latest = latest_session_entry(&conn)?;
-        let messages = recent_session_messages(&conn, &latest.id, 16);
-        let snapshot_summary = latest_snapshot_summary(&conn, &latest.id);
+        let store = self.session_store.as_ref()?;
+        let record = store.list_sessions().await.ok()?.into_iter().next()?;
+        let latest = session_store_entry(&record);
+        let message_count = store.get_message_count(&latest.id).await.ok()?;
+        let recent_offset = message_count.saturating_sub(16);
+        let messages = store
+            .get_messages(&latest.id, recent_offset, 16)
+            .await
+            .ok()?;
+        let snapshot_summary = store
+            .get_latest_snapshot(&latest.id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|snapshot| snapshot_summary_from_json(&snapshot.messages_json));
+        let messages = messages
+            .into_iter()
+            .map(session_store_message)
+            .collect::<Vec<_>>();
         let message_summary = summarize_session_messages(&messages);
         let context_summary = snapshot_summary.or(message_summary);
         let pending_tasks = messages
@@ -572,81 +599,29 @@ struct SessionStoreMessage {
     created_at_ms: i64,
 }
 
-fn latest_session_entry(conn: &rusqlite::Connection) -> Option<SessionStoreEntry> {
-    let modern = conn
-        .query_row(
-            "SELECT session_id, created_at_ms, updated_at_ms FROM sessions ORDER BY updated_at_ms DESC, created_at_ms DESC LIMIT 1",
-            [],
-            |row| {
-                Ok(SessionStoreEntry {
-                    id: row.get(0)?,
-                    updated_at: row.get::<_, i64>(2)?,
-                    context_summary: None,
-                    pending_tasks: Vec::new(),
-                    decisions: Vec::new(),
-                })
-            },
-        )
-        .optional()
-        .ok()
-        .flatten();
-    if modern.is_some() {
-        return modern;
+fn session_store_entry(record: &SessionRecord) -> SessionStoreEntry {
+    let updated_at = chrono::DateTime::parse_from_rfc3339(&record.last_activity)
+        .map(|value| value.timestamp())
+        .unwrap_or_default();
+    SessionStoreEntry {
+        id: record.session_id.clone(),
+        updated_at,
+        context_summary: None,
+        pending_tasks: Vec::new(),
+        decisions: Vec::new(),
     }
-    conn.query_row(
-        "SELECT session_id, 0, 0 FROM sessions ORDER BY last_activity DESC, created_at DESC LIMIT 1",
-        [],
-        |row| {
-            Ok(SessionStoreEntry {
-                id: row.get(0)?,
-                updated_at: row.get::<_, i64>(2)?,
-                context_summary: None,
-                pending_tasks: Vec::new(),
-                decisions: Vec::new(),
-            })
-        },
-    )
-    .optional()
-    .ok()
-    .flatten()
 }
 
-fn recent_session_messages(
-    conn: &rusqlite::Connection,
-    session_id: &str,
-    limit: usize,
-) -> Vec<SessionStoreMessage> {
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT role, content_json, created_at_ms FROM messages WHERE session_id = ?1 ORDER BY sequence DESC LIMIT ?2",
-    ) else {
-        return Vec::new();
-    };
-    let Ok(rows) = stmt.query_map(rusqlite::params![session_id, limit as i64], |row| {
-        let content_json: String = row.get(1)?;
-        Ok(SessionStoreMessage {
-            role: row.get(0)?,
-            text: session_content_json_to_text(&content_json),
-            created_at_ms: row.get::<_, i64>(2).unwrap_or_default(),
-        })
-    }) else {
-        return Vec::new();
-    };
-    let mut messages = rows.filter_map(Result::ok).collect::<Vec<_>>();
-    messages.reverse();
-    messages
+fn session_store_message(message: SessionMessage) -> SessionStoreMessage {
+    SessionStoreMessage {
+        role: message.role,
+        text: session_content_json_to_text(&message.content_json),
+        created_at_ms: i64::try_from(message.created_at_ms).unwrap_or(i64::MAX),
+    }
 }
 
-fn latest_snapshot_summary(conn: &rusqlite::Connection, session_id: &str) -> Option<String> {
-    let payload = conn
-        .query_row(
-            "SELECT messages_json FROM session_snapshots WHERE session_id = ?1 ORDER BY event_idx DESC LIMIT 1",
-            rusqlite::params![session_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .ok()
-        .flatten()?;
-    let value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
+fn snapshot_summary_from_json(payload: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
     let messages = value.as_array()?;
     let summary = messages
         .iter()
@@ -853,48 +828,53 @@ mod tests {
     #[tokio::test]
     async fn test_rebuild_uses_session_store_context_tasks_and_decisions() {
         let tmp = TempDir::new().unwrap();
-        let cowd_dir = tmp.path().join(".cowd");
-        fs::create_dir_all(&cowd_dir).unwrap();
-        let db_path = cowd_dir.join("sessions.db");
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            r#"
-            CREATE TABLE sessions (
-                session_id TEXT PRIMARY KEY,
-                created_at_ms INTEGER NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE messages (
-                session_id TEXT NOT NULL,
-                sequence INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content_json TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL
-            );
-            CREATE TABLE session_snapshots (
-                session_id TEXT NOT NULL,
-                event_idx INTEGER NOT NULL,
-                messages_json TEXT NOT NULL
-            );
-            INSERT INTO sessions VALUES ('session-a', 10, 20);
-            INSERT INTO messages VALUES (
-                'session-a',
-                1,
-                'user',
-                '"- [ ] finish recovery\nDecision: use session store as recovery source"',
-                11
-            );
-            INSERT INTO session_snapshots VALUES (
-                'session-a',
-                1,
-                '[{"content":"snapshot summary"}]'
-            );
-            "#,
-        )
-        .unwrap();
-        drop(conn);
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&SessionRecord {
+                session_id: "session-a".to_string(),
+                platform: "test".to_string(),
+                chat_id: "chat-a".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+                last_activity: "2024-01-01T00:00:20Z".to_string(),
+                message_count: 1,
+                reset_policy: "none".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .insert_message(&SessionMessage {
+                stable_message_id: "message-a".to_string(),
+                session_id: "session-a".to_string(),
+                sequence: 1,
+                role: "user".to_string(),
+                content_json: r#"[{"type":"text","text":"- [ ] finish recovery\nDecision: use session store as recovery source"}]"#
+                    .to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: 11,
+            })
+            .await
+            .unwrap();
+        store
+            .save_snapshot(&crate::store::session::SessionSnapshot {
+                session_id: "session-a".to_string(),
+                event_idx: 1,
+                messages_json: "[{\"content\":\"snapshot summary\"}]".to_string(),
+                created_at_ms: 12,
+            })
+            .await
+            .unwrap();
 
-        let rebuilder = StateRebuilder::new(tmp.path());
+        let rebuilder = StateRebuilder::with_session_store(tmp.path(), store);
         let state = rebuilder
             .rebuild(&RebuildOptions {
                 include_history: false,

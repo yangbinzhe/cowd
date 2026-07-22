@@ -667,11 +667,18 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
 
     // 1. Initialise shared state
     let sessions = Arc::new(ActiveSessions::default());
+    let unified_store = crate::get_unified_store().ok().map(Arc::new);
 
     let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {
             tracing::info!("initialising memory manager...");
-            match CognitiveContextManager::new(mem_cfg.clone()).await {
+            match CognitiveContextManager::new_with_workspace_and_session_store(
+                mem_cfg.clone(),
+                None,
+                unified_store.clone(),
+            )
+            .await
+            {
                 Ok(manager) => Some(Arc::new(manager)),
                 Err(err) => {
                     tracing::error!(error = %err, "memory manager initialisation failed");
@@ -684,7 +691,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
 
     let event_bus = SessionEventBus::new();
     let lease_registry = Arc::new(SessionLeaseRegistry::default());
-    let unified_store = crate::get_unified_store().ok().map(Arc::new);
     let lifecycle_kernel = Arc::new(
         unified_store
             .as_ref()

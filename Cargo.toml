@@ -25,6 +25,7 @@ members = [
     "crates/runtime-postgres",
     "crates/sandbox-launcher",
     "crates/session",
+    "crates/session-postgres",
     "crates/skill/service",
     "crates/storage",
     "crates/surface",
@@ -60,6 +61,7 @@ default-members = [
     "crates/runtime-postgres",
     "crates/sandbox-launcher",
     "crates/session",
+    "crates/session-postgres",
     "crates/skill/service",
     "crates/storage",
     "crates/surface",
@@ -69,7 +71,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.576"
+version = "0.9.577"
 edition = "2021"
 license = "MIT"
 publish = false

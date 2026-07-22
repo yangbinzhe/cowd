@@ -70,7 +70,7 @@ use crate::{
     write_guard::{
         AuditEntry, AuditLog, AuditOperation, IntegrityChecker, MemoryWriteGuard, WriteSource,
     },
-    MemoryScope, SessionResume,
+    MemoryScope, SessionResume, UnifiedSessionStore,
 };
 
 /// Result alias used throughout this module.
@@ -245,7 +245,7 @@ impl CognitiveContextManager {
 
     /// Initialise the manager from `config`, opening all storage backends.
     pub async fn new(config: MemoryConfig) -> Result<Self> {
-        Self::new_with_workspace(config, None).await
+        Self::new_with_workspace_and_session_store(config, None, None).await
     }
 
     /// Initialise the manager with an explicit workspace root for L2 project
@@ -253,6 +253,16 @@ impl CognitiveContextManager {
     pub async fn new_with_workspace(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
+    ) -> Result<Self> {
+        Self::new_with_workspace_and_session_store(config, workspace_root, None).await
+    }
+
+    /// Initialise with the selected durable session owner.  Session recovery
+    /// is deliberately injected rather than inferred from a SQLite path.
+    pub async fn new_with_workspace_and_session_store(
+        config: MemoryConfig,
+        workspace_root: Option<PathBuf>,
+        session_store: Option<Arc<UnifiedSessionStore>>,
     ) -> Result<Self> {
         // Build the orchestrator (opens SQLite, wires all layers).
         let orchestrator = Arc::new(
@@ -480,7 +490,11 @@ impl CognitiveContextManager {
 
         // Build state_rebuilder if workspace_root is available
         let ws_root = workspace_root.clone();
-        let state_rebuilder = ws_root.as_ref().map(|ws| StateRebuilder::new(ws.clone()));
+        let state_rebuilder = ws_root.as_ref().and_then(|workspace| {
+            session_store.as_ref().map(|store| {
+                StateRebuilder::with_session_store(workspace.clone(), Arc::clone(store))
+            })
+        });
         let tool_sandbox = ToolOutputSandbox::new().map(Mutex::new).map_err(|error| {
             MemoryError::Other(format!("failed to initialize tool output sandbox: {error}"))
         })?;

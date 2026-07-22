@@ -62,7 +62,7 @@ fn set_conn_pragmas(conn: &Connection) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// FTS5 search result for sessions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSearchResult {
     pub session_id: String,
     pub platform: String,
@@ -89,7 +89,7 @@ pub struct SessionListOptions<'a> {
 
 /// A page of session records plus the total number of rows matching the
 /// filters before pagination.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionListPage {
     pub records: Vec<SessionRecord>,
     pub total: usize,
@@ -100,7 +100,7 @@ pub struct SessionListPage {
 /// Each message belongs to a session and is ordered by `sequence`.
 /// The `content_json` field stores the message blocks as a JSON array
 /// of `ContentBlock` objects (text, tool_use, tool_result, etc.).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionMessage {
     /// Immutable cross-surface identity. Sequence is ordering metadata, not a
     /// durable identity: clients must use this value for replay and dedupe.
@@ -128,7 +128,8 @@ pub enum OutboxStatus {
 }
 
 impl OutboxStatus {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Claimed => "claimed",
@@ -138,7 +139,7 @@ impl OutboxStatus {
         }
     }
 
-    fn parse(value: &str) -> rusqlite::Result<Self> {
+    pub fn parse(value: &str) -> rusqlite::Result<Self> {
         match value {
             "pending" => Ok(Self::Pending),
             "claimed" => Ok(Self::Claimed),
@@ -165,7 +166,8 @@ pub enum OutboxFailureClass {
 }
 
 impl OutboxFailureClass {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Retryable => "retryable",
             Self::Permanent => "permanent",
@@ -174,7 +176,7 @@ impl OutboxFailureClass {
         }
     }
 
-    fn parse(value: &str) -> rusqlite::Result<Self> {
+    pub fn parse(value: &str) -> rusqlite::Result<Self> {
         match value {
             "retryable" => Ok(Self::Retryable),
             "permanent" => Ok(Self::Permanent),
@@ -247,7 +249,8 @@ pub enum SessionMissionOutboxOperation {
 }
 
 impl SessionMissionOutboxOperation {
-    fn as_str(self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Register => "register",
             Self::Start => "start",
@@ -255,7 +258,7 @@ impl SessionMissionOutboxOperation {
         }
     }
 
-    fn parse(value: &str) -> rusqlite::Result<Self> {
+    pub fn parse(value: &str) -> rusqlite::Result<Self> {
         match value {
             "register" => Ok(Self::Register),
             "start" => Ok(Self::Start),
@@ -878,7 +881,7 @@ fn migrate_legacy_session_domain_events(conn: &Connection) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// A serialisable snapshot of a single session's metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     /// Unique session identifier (UUID string).
     pub session_id: String,
@@ -1177,7 +1180,7 @@ fn insert_mission_outbox(
 ///
 /// Each event is associated with a monotonically-increasing `sequence`
 /// that orders it within the session's event log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionEvent {
     pub session_id: String,
     pub event_type: String,
@@ -1188,7 +1191,7 @@ pub struct SessionEvent {
 
 /// A full-message-list snapshot taken at a specific event index, used
 /// as a basis for fast replay from that point forward.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub session_id: String,
     /// Event sequence index this snapshot corresponds to.
