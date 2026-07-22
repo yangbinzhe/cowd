@@ -5,7 +5,7 @@
 //! monotonic commit cursor and never a partially appended multi-stream update.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -301,10 +301,17 @@ pub struct RuntimeSessionOutboxHealth {
     pub blocked: u64,
 }
 
+/// The sole Runtime-facing durable event-store API.  Backends remain private
+/// to this module: Runtime callers depend on lifecycle semantics rather than
+/// SQLite connections, paths, pragmas, or schema details.
 #[derive(Debug)]
 pub struct RuntimeEventStore {
-    path: PathBuf,
-    executor: SqliteExecutor,
+    backend: RuntimeEventStoreBackend,
+}
+
+#[derive(Debug)]
+enum RuntimeEventStoreBackend {
+    Sqlite(SqliteRuntimeEventStore),
 }
 
 impl RuntimeEventStore {
@@ -313,6 +320,264 @@ impl RuntimeEventStore {
     }
 
     pub fn try_open(path: impl AsRef<Path>) -> RuntimeEventStoreResult<Self> {
+        SqliteRuntimeEventStore::try_open(path).map(Self::from_sqlite)
+    }
+
+    pub fn open_in_memory() -> Result<Self, String> {
+        Self::try_open_in_memory().map_err(|error| error.to_string())
+    }
+
+    pub fn try_open_in_memory() -> RuntimeEventStoreResult<Self> {
+        SqliteRuntimeEventStore::try_open_in_memory().map(Self::from_sqlite)
+    }
+
+    fn from_sqlite(store: SqliteRuntimeEventStore) -> Self {
+        Self {
+            backend: RuntimeEventStoreBackend::Sqlite(store),
+        }
+    }
+
+    fn sqlite(&self) -> &SqliteRuntimeEventStore {
+        match &self.backend {
+            RuntimeEventStoreBackend::Sqlite(store) => store,
+        }
+    }
+
+    pub fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
+        self.sqlite().append(input)
+    }
+
+    pub fn append_transaction(
+        &self,
+        request: AppendTransactionRequest,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.sqlite().append_transaction(request)
+    }
+
+    pub fn append_transaction_with_terminal(
+        &self,
+        request: AppendTransactionRequest,
+        terminal: SessionTerminalInput,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.sqlite()
+            .append_transaction_with_terminal(request, terminal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn consume_verified_decision_lease(
+        &self,
+        lease_id: &str,
+        principal_id: &str,
+        review_id: &str,
+        action: &str,
+        scope: &str,
+        evidence_digest: &str,
+        credential_epoch: u64,
+        consumed_at_ms: u64,
+    ) -> RuntimeEventStoreResult<()> {
+        self.sqlite().consume_verified_decision_lease(
+            lease_id,
+            principal_id,
+            review_id,
+            action,
+            scope,
+            evidence_digest,
+            credential_epoch,
+            consumed_at_ms,
+        )
+    }
+
+    pub(crate) fn append_transaction_with_verified_decision_lease(
+        &self,
+        request: AppendTransactionRequest,
+        lease: &crate::VerifiedDecisionLease,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.sqlite()
+            .append_transaction_with_verified_decision_lease(request, lease)
+    }
+
+    pub fn append_batch_if_revision(
+        &self,
+        stream_id: impl Into<String>,
+        expected_revision: u64,
+        transaction_id: impl Into<String>,
+        events: Vec<RuntimeTransactionEventInput>,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        self.sqlite()
+            .append_batch_if_revision(stream_id, expected_revision, transaction_id, events)
+    }
+
+    pub fn events_after_cursor(
+        &self,
+        cursor: u64,
+        max_commits: usize,
+    ) -> RuntimeEventStoreResult<Vec<CommittedEventBatch>> {
+        self.sqlite().events_after_cursor(cursor, max_commits)
+    }
+
+    pub fn event_by_idempotency_key(
+        &self,
+        stream_id: &str,
+        idempotency_key: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
+        self.sqlite()
+            .event_by_idempotency_key(stream_id, idempotency_key)
+    }
+
+    pub fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64> {
+        self.sqlite().stream_revision(stream_id)
+    }
+
+    pub fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.sqlite().list_stream(stream_id)
+    }
+
+    pub fn execution_events_for_session(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.sqlite()
+            .execution_events_for_session(session_id, after_commit_cursor, limit)
+    }
+
+    pub fn list_scope(
+        &self,
+        scope: RuntimeEventScope,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.sqlite().list_scope(scope, limit)
+    }
+
+    pub fn stream_ids_for_scope(
+        &self,
+        scope: RuntimeEventScope,
+    ) -> RuntimeEventStoreResult<Vec<String>> {
+        self.sqlite().stream_ids_for_scope(scope)
+    }
+
+    pub fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.sqlite().all_events(limit)
+    }
+
+    pub fn latest_for_stream(
+        &self,
+        stream_id: &str,
+    ) -> Result<Option<DurableRuntimeEvent>, String> {
+        self.sqlite().latest_for_stream(stream_id)
+    }
+
+    pub fn enqueue_session_terminal(
+        &self,
+        terminal_id: &str,
+        message_id: &str,
+        session_id: &str,
+        commit_cursor: u64,
+        payload_ref: &str,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        self.sqlite().enqueue_session_terminal(
+            terminal_id,
+            message_id,
+            session_id,
+            commit_cursor,
+            payload_ref,
+        )
+    }
+
+    pub fn claim_session_terminals(
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
+        self.sqlite()
+            .claim_session_terminals(worker_id, now_ms, lease_ms, limit)
+    }
+
+    pub fn session_terminal(
+        &self,
+        terminal_id: &str,
+    ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
+        self.sqlite().session_terminal(terminal_id)
+    }
+
+    pub fn materialized_session_terminals_after(
+        &self,
+        session_id: &str,
+        after_commit_cursor: u64,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
+        self.sqlite()
+            .materialized_session_terminals_after(session_id, after_commit_cursor, limit)
+    }
+
+    pub fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth> {
+        self.sqlite().session_terminal_health()
+    }
+
+    pub fn blocked_session_terminals(
+        &self,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
+        self.sqlite().blocked_session_terminals(limit)
+    }
+
+    pub fn retry_session_terminal(
+        &self,
+        terminal_id: &str,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        self.sqlite()
+            .retry_session_terminal(terminal_id, actor, reason, now_ms)
+    }
+
+    pub fn ack_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        self.sqlite()
+            .ack_session_terminal(terminal_id, worker_id, expected_revision, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn fail_session_terminal(
+        &self,
+        terminal_id: &str,
+        worker_id: &str,
+        expected_revision: u64,
+        class: RuntimeSessionOutboxFailureClass,
+        error: &str,
+        retry_at_ms: u64,
+        max_attempts: u32,
+        now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        self.sqlite().fail_session_terminal(
+            terminal_id,
+            worker_id,
+            expected_revision,
+            class,
+            error,
+            retry_at_ms,
+            max_attempts,
+            now_ms,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct SqliteRuntimeEventStore {
+    executor: SqliteExecutor,
+}
+
+impl SqliteRuntimeEventStore {
+    fn try_open(path: impl AsRef<Path>) -> RuntimeEventStoreResult<Self> {
         let path = path.as_ref().to_path_buf();
         let handle = StorageHandle::sqlite(
             "runtime_events",
@@ -324,27 +589,15 @@ impl RuntimeEventStore {
         let mut conn = executor.checkout()?;
         configure_connection(&conn, false)?;
         migrate_schema(&mut conn)?;
-        Ok(Self { path, executor })
+        Ok(Self { executor })
     }
 
-    pub fn open_in_memory() -> Result<Self, String> {
-        Self::try_open_in_memory().map_err(|error| error.to_string())
-    }
-
-    pub fn try_open_in_memory() -> RuntimeEventStoreResult<Self> {
+    fn try_open_in_memory() -> RuntimeEventStoreResult<Self> {
         let executor = SqliteExecutor::in_memory("runtime-event-store")?;
         let mut conn = executor.checkout()?;
         configure_connection(&conn, true)?;
         migrate_schema(&mut conn)?;
-        Ok(Self {
-            path: PathBuf::from(":memory:"),
-            executor,
-        })
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
+        Ok(Self { executor })
     }
 
     /// Compatibility convenience for existing single-stream producers.

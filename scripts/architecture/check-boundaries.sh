@@ -62,6 +62,19 @@ if [[ "${1:-}" == "--v567-postgres" ]]; then
   exit "$fail"
 fi
 
+if [[ "${1:-}" == "--v568-runtime-port" ]]; then
+  # V568 moves Runtime callers behind the durable event-store façade. The
+  # SQLite adapter may remain in its owner module until V569 adds PostgreSQL;
+  # no other Runtime production module may learn its concrete type or SQL API.
+  check_empty "V568 runtime callers must not name SQLite event adapter" \
+    bash -c 'rg -n "SqliteRuntimeEventStore|RuntimeEventStoreBackend" crates/runtime/src --glob "*.rs" | rg -v "^crates/runtime/src/recovery/runtime_event_store.rs:" | rg -v "/tests?/" | rg -v "/tests\\.rs:" || true'
+  check_empty "V568 runtime callers must not use event-store file paths" \
+    rg -n 'RuntimeEventStore.*\.path\(|event_store\.path\(' crates/runtime/src --glob '*.rs' --glob '!**/tests/**' --glob '!**/tests.rs'
+  check_empty "V568 public event adapter must not leak outside owner module" \
+    bash -c 'rg -n "pub struct SqliteRuntimeEventStore|pub enum RuntimeEventStoreBackend" crates/runtime/src/recovery/runtime_event_store.rs || true'
+  exit "$fail"
+fi
+
 check_empty "cli business command names" \
   rg -n "\\b(run|chat|prompt|mcp serve)\\b" crates/cli/src/main.rs --glob '*.rs'
 
