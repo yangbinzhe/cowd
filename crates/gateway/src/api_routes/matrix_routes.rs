@@ -395,10 +395,10 @@ async fn matrix_health_handler(
         .repository_health(&state.config_home)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let capabilities = matrix_health_capabilities();
-    let store_path = state
+    let storage = state
         .services
         .matrix
-        .store_path(&state.config_home)
+        .storage_projection(&state.config_home)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok(Json(serde_json::json!({
         "kind": "matrix.health",
@@ -424,7 +424,7 @@ async fn matrix_health_handler(
         "entity_match_candidate_count": health.entity_match_candidate_count,
         "entity_conflict_decision_count": health.entity_conflict_decision_count,
         "metric_snapshot_count": health.metric_snapshot_count,
-        "store": store_path,
+        "storage": storage,
         "capabilities": capabilities,
     })))
 }

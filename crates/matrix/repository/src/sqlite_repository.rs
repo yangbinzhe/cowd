@@ -9,7 +9,11 @@ use serde_json::Value;
 use storage::{SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
-use crate::{MatrixHealth, MatrixMetricRecomputeResult, MatrixRevisioned, MatrixSqliteDataPlane};
+use crate::migration::canonicalize_payload;
+use crate::{
+    MatrixHealth, MatrixMetricRecomputeResult, MatrixMigrationSnapshot, MatrixRevisioned,
+    MatrixSqliteDataPlane,
+};
 use matrix_core::{
     build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
     MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
@@ -35,6 +39,8 @@ pub enum MatrixSqliteRepositoryError {
     Json(#[from] serde_json::Error),
     #[error("matrix record not found: {0}")]
     NotFound(String),
+    #[error("matrix migration error: {0}")]
+    Migration(String),
     #[error("invalid matrix scenario: {0}")]
     InvalidScenario(String),
     #[error("matrix scenario state conflict: {0}")]
@@ -109,6 +115,77 @@ impl MatrixSqliteRepository {
             scenario_run_count: count_table(&connection, "matrix_scenario_run")?,
             scenario_result_count: count_table(&connection, "matrix_scenario_result")?,
         })
+    }
+
+    /// Export every Matrix aggregate and optimistic revision for a verified
+    /// maintenance-window migration.  Normal request paths must use the
+    /// typed store operations instead.
+    pub fn export_migration_snapshot(
+        &self,
+    ) -> Result<MatrixMigrationSnapshot, MatrixSqliteRepositoryError> {
+        let connection = self.executor.checkout()?;
+        let mut tables = BTreeMap::new();
+        for (table, id_column, payload_column) in [
+            ("matrix_entity", "entity_id", "entity_json"),
+            ("matrix_relation", "relation_id", "relation_json"),
+            ("matrix_attention_item", "attention_id", "attention_json"),
+            ("matrix_evidence_packet", "packet_id", "packet_json"),
+            ("matrix_quality_gate", "gate_id", "gate_json"),
+            ("matrix_metric_definition", "metric_id", "definition_json"),
+            (
+                "matrix_metric_dependency",
+                "dependency_id",
+                "dependency_json",
+            ),
+            ("matrix_metric_state", "state_id", "state_json"),
+            ("matrix_metric_snapshot", "snapshot_id", "snapshot_json"),
+            ("matrix_compute_job", "job_id", "job_json"),
+            ("matrix_change_event", "change_id", "change_json"),
+            ("matrix_source_pack", "source_pack_id", "source_pack_json"),
+            ("matrix_connector_run", "run_id", "run_json"),
+            ("matrix_source_snapshot", "snapshot_id", "snapshot_json"),
+            ("matrix_ontology_pack", "ontology_id", "pack_json"),
+            (
+                "matrix_entity_match_candidate",
+                "candidate_id",
+                "candidate_json",
+            ),
+            (
+                "matrix_entity_conflict_decision",
+                "decision_id",
+                "decision_json",
+            ),
+            ("matrix_scenario_spec", "scenario_id", "spec_json"),
+            ("matrix_scenario_run", "run_id", "run_json"),
+            ("matrix_scenario_result", "result_id", "result_json"),
+        ] {
+            tables.insert(
+                table.to_string(),
+                export_json_records(&connection, table, id_column, payload_column)?,
+            );
+        }
+        let facts = list_facts(&connection, i64::MAX as usize)?
+            .into_iter()
+            .map(|fact| {
+                let id = fact.fact_id.clone();
+                serde_json::to_value(fact)
+                    .map_err(MatrixSqliteRepositoryError::from)
+                    .and_then(|payload| {
+                        canonicalize_payload("matrix_fact", payload).map_err(|error| {
+                            MatrixSqliteRepositoryError::Migration(error.to_string())
+                        })
+                    })
+                    .map(|payload| (id, payload))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        tables.insert("matrix_fact".to_string(), facts);
+        tables.insert(
+            "matrix_data_plane_watermark".to_string(),
+            export_watermark_records(&connection)?,
+        );
+        let revisions = export_revisions(&connection)?;
+        MatrixMigrationSnapshot::new(schema_version(&connection)?, tables, revisions)
+            .map_err(|error| MatrixSqliteRepositoryError::Migration(error.to_string()))
     }
 
     pub fn data_plane_health(&self) -> Result<MatrixDataPlaneHealth, MatrixSqliteRepositoryError> {
@@ -1846,6 +1923,82 @@ fn count_table(connection: &Connection, table: &str) -> rusqlite::Result<u64> {
     connection
         .query_row(&sql, [], |row| row.get::<_, i64>(0))
         .map(|value| value as u64)
+}
+
+fn export_json_records(
+    connection: &Connection,
+    table: &str,
+    id_column: &str,
+    payload_column: &str,
+) -> Result<BTreeMap<String, Value>, MatrixSqliteRepositoryError> {
+    let sql = format!("SELECT {id_column}, {payload_column} FROM {table} ORDER BY {id_column} ASC");
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut records = BTreeMap::new();
+    for row in rows {
+        let (id, payload) = row?;
+        let payload = serde_json::from_str(&payload)?;
+        records.insert(
+            id,
+            canonicalize_payload(table, payload)
+                .map_err(|error| MatrixSqliteRepositoryError::Migration(error.to_string()))?,
+        );
+    }
+    Ok(records)
+}
+
+fn export_watermark_records(
+    connection: &Connection,
+) -> Result<BTreeMap<String, Value>, MatrixSqliteRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT source_ref, fact_type, partition_ref, watermark_json \
+         FROM matrix_data_plane_watermark \
+         ORDER BY source_ref ASC, fact_type ASC, partition_ref ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut records = BTreeMap::new();
+    for row in rows {
+        let (source_ref, fact_type, partition_ref, payload) = row?;
+        let payload = serde_json::from_str(&payload)?;
+        records.insert(
+            format!("{source_ref}\0{fact_type}\0{partition_ref}"),
+            canonicalize_payload("matrix_data_plane_watermark", payload)
+                .map_err(|error| MatrixSqliteRepositoryError::Migration(error.to_string()))?,
+        );
+    }
+    Ok(records)
+}
+
+fn export_revisions(
+    connection: &Connection,
+) -> Result<BTreeMap<String, u64>, MatrixSqliteRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT resource_kind, resource_id, revision \
+         FROM matrix_resource_revision \
+         ORDER BY resource_kind ASC, resource_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as u64,
+        ))
+    })?;
+    let mut revisions = BTreeMap::new();
+    for row in rows {
+        let (resource_kind, resource_id, revision) = row?;
+        revisions.insert(format!("{resource_kind}\0{resource_id}"), revision);
+    }
+    Ok(revisions)
 }
 
 fn insert_ontology_pack(

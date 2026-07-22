@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::Utc;
 use connector::{SourceIngestionReceipt, SourceRecordBatch, SourceWatermark};
@@ -14,7 +14,7 @@ use matrix_core::{
     MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
     MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
 };
-use matrix_repository::{MatrixHealth, MatrixRepository};
+use matrix_repository::MatrixHealth;
 use serde_json::Value;
 
 use super::{GatewayMatrixRepositoryError, ServiceEnvelope};
@@ -43,21 +43,22 @@ impl MatrixService {
         }
     }
 
-    pub(crate) fn repository_handle(
+    pub(crate) fn storage_projection(
         &self,
         config_home: impl AsRef<Path>,
-    ) -> Result<
-        ::matrix_repository::MatrixRepositoryHandle,
-        ::matrix_repository::MatrixRepositoryError,
-    > {
-        ::matrix_repository::MatrixRepositoryHandle::from_config_home(config_home)
-    }
-
-    pub(crate) fn store_path(
-        &self,
-        config_home: impl AsRef<Path>,
-    ) -> Result<PathBuf, ::matrix_repository::MatrixRepositoryError> {
-        Ok(self.repository_handle(config_home)?.db_path())
+    ) -> Result<serde_json::Value, GatewayMatrixRepositoryError> {
+        let registry = storage::StorageRegistry::default_for_config_home(config_home);
+        let endpoint = registry
+            .endpoint(&storage::StorageDomainId::Matrix)
+            .map_err(|error| GatewayMatrixRepositoryError::Backend(error.to_string()))?;
+        Ok(serde_json::json!({
+            "logical_id": endpoint.logical_id(),
+            "backend": endpoint.backend,
+            "owner": endpoint.owner,
+            "storage_domain": endpoint.domain,
+            "storage_scope": endpoint.scope,
+            "migration": endpoint.migration,
+        }))
     }
 
     pub(crate) fn health(&self) -> ServiceEnvelope {

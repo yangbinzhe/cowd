@@ -21,10 +21,10 @@ use matrix_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage::{StorageBackendKind, StorageEndpoint};
+use storage::{PostgresExecutor, StorageBackendKind, StorageEndpoint};
 use thiserror::Error;
 
-use crate::{MatrixSqliteRepository, MatrixSqliteRepositoryError};
+use crate::{MatrixSqliteRepository, MatrixSqliteRepositoryError, PostgresMatrixRepository};
 
 pub type MatrixStoreResult<T> = Result<T, MatrixStoreError>;
 
@@ -53,6 +53,7 @@ impl From<MatrixSqliteRepositoryError> for MatrixStoreError {
     fn from(error: MatrixSqliteRepositoryError) -> Self {
         match error {
             MatrixSqliteRepositoryError::NotFound(message) => Self::NotFound(message),
+            MatrixSqliteRepositoryError::Migration(message) => Self::Backend(message),
             MatrixSqliteRepositoryError::InvalidScenario(message) => Self::InvalidScenario(message),
             MatrixSqliteRepositoryError::ScenarioState(message) => Self::ScenarioState(message),
             MatrixSqliteRepositoryError::RevisionConflict {
@@ -188,6 +189,11 @@ macro_rules! matrix_store_operations {
     };
 }
 
+// Kept crate-visible so every concrete adapter expands the exact same full
+// operation list.  Adding an operation to the port therefore turns a missing
+// adapter implementation into a compile error rather than a latent fallback.
+pub(crate) use matrix_store_operations;
+
 macro_rules! declare_matrix_store_operations {
     ($($method:ident($($argument:ident: $argument_type:ty),*) -> $output:ty;)*) => {
         $(fn $method(&self, $($argument: $argument_type),*) -> MatrixStoreResult<$output>;)*
@@ -214,9 +220,10 @@ impl MatrixStore for MatrixSqliteRepository {
     matrix_store_operations!(delegate_matrix_store_operations);
 }
 
-/// Endpoint-bound composition seam. V574 deliberately supports only the
-/// existing SQLite owner; V575 adds PostgreSQL here after its adapter passes
-/// the same complete contract.
+/// Endpoint-bound composition seam.  SQLite can be opened from its local
+/// endpoint; PostgreSQL must be provided by the composition root as an
+/// already-resolved bounded executor.  This prevents a domain adapter from
+/// reading secrets or falling back to a local file behind the caller's back.
 #[derive(Debug, Clone)]
 pub struct MatrixStoreHandle {
     endpoint: StorageEndpoint,
@@ -236,7 +243,7 @@ impl MatrixStoreHandle {
     pub fn open(&self) -> MatrixStoreResult<Arc<dyn MatrixStore>> {
         if self.endpoint.backend != StorageBackendKind::Sqlite {
             return Err(MatrixStoreError::Backend(format!(
-                "Matrix backend `{:?}` is not available in V574",
+                "Matrix backend `{:?}` requires an injected backend executor",
                 self.endpoint.backend
             )));
         }
@@ -248,6 +255,19 @@ impl MatrixStoreHandle {
         Ok(Arc::new(
             MatrixSqliteRepository::open_storage_handle(&handle).map_err(MatrixStoreError::from)?,
         ))
+    }
+
+    pub fn open_with_postgres_executor(
+        &self,
+        executor: PostgresExecutor,
+    ) -> MatrixStoreResult<Arc<dyn MatrixStore>> {
+        if self.endpoint.backend != StorageBackendKind::Postgres {
+            return Err(MatrixStoreError::Backend(format!(
+                "Matrix endpoint is `{:?}`, not PostgreSQL",
+                self.endpoint.backend
+            )));
+        }
+        Ok(Arc::new(PostgresMatrixRepository::new(executor)?))
     }
 }
 
@@ -262,6 +282,11 @@ mod tests {
     #[test]
     fn sqlite_adapter_implements_the_complete_matrix_store_contract() {
         assert_matrix_store::<MatrixSqliteRepository>();
+    }
+
+    #[test]
+    fn postgres_adapter_implements_the_complete_matrix_store_contract() {
+        assert_matrix_store::<PostgresMatrixRepository>();
     }
 
     #[test]

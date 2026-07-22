@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use storage::{StorageDomainId, StorageEndpoint, StorageLayout, StorageRegistry};
@@ -39,7 +39,6 @@ impl MatrixRepositoryConfig {
 }
 
 pub trait MatrixRepository {
-    fn db_path(&self) -> PathBuf;
     fn health_projection(&self) -> Result<serde_json::Value, MatrixRepositoryError>;
 }
 
@@ -65,10 +64,6 @@ impl MatrixRepositoryHandle {
 }
 
 impl MatrixRepository for MatrixRepositoryHandle {
-    fn db_path(&self) -> PathBuf {
-        self.config.endpoint.as_handle().path
-    }
-
     fn health_projection(&self) -> Result<serde_json::Value, MatrixRepositoryError> {
         Ok(serde_json::json!({
             "backend": self.config.endpoint.backend,
@@ -84,11 +79,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repository_uses_storage_layout_matrix_path() {
+    fn repository_exposes_logical_matrix_storage_contract() {
         let dir = tempfile::tempdir().unwrap();
         let repo = MatrixRepositoryHandle::from_config_home(dir.path()).unwrap();
 
-        assert!(repo.db_path().ends_with("storage/matrix.sqlite"));
         assert_eq!(repo.health_projection().unwrap()["owner"], "matrix");
+        assert_eq!(
+            repo.health_projection().unwrap()["storage_domain"]["kind"],
+            "matrix"
+        );
     }
 }
