@@ -45,10 +45,7 @@ pub(crate) fn jsonl_sessions_dir() -> PathBuf {
 }
 
 pub(crate) fn session_db_path() -> PathBuf {
-    storage::StorageLayout::default_for_config_home(runtime::cowd_dirs::config_home_dir())
-        .sqlite_path("session")
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("sessions.db"))
+    GatewayStorage::session_db_path(runtime::cowd_dirs::config_home_dir())
 }
 
 pub(crate) fn discover_local_session_import_candidates() -> Vec<LocalSessionImportCandidate> {

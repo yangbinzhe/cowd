@@ -4,7 +4,7 @@
 //! executable Definition resolvers. It deliberately has no current-directory
 //! discovery, no name shadowing, and no Gateway dependency.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use harness_contract::agent::{
     AgentDefinitionId, AgentDefinitionRevisionRef, DefaultPointer, ReleaseAssignment,
@@ -80,6 +80,37 @@ pub struct RuntimeDefinitionRegistry {
 }
 
 impl RuntimeDefinitionRegistry {
+    /// Production composition from resolved storage endpoints. Definition
+    /// stores receive only their registered roots; they never derive config or
+    /// workspace paths themselves.
+    pub fn from_storage_registry(
+        storage: &storage::StorageRegistry,
+        builtin_definitions_root: impl Into<PathBuf>,
+        workspace_root: impl AsRef<Path>,
+    ) -> Result<Self, DefinitionRegistryError> {
+        let builtin_definitions_root = builtin_definitions_root.into();
+        let agents =
+            AgentDefinitionStore::new(RegisteredAgentDefinitionLayout::from_storage_registry(
+                storage,
+                builtin_definitions_root.clone(),
+                workspace_root.as_ref(),
+            )?);
+        let teams =
+            TeamTemplateDefinitionStore::new(RegisteredTeamTemplateLayout::from_storage_registry(
+                storage,
+                builtin_definitions_root,
+                workspace_root,
+            )?);
+        let builtin_agent_trust = bootstrap_builtin_agents(&agents)?;
+        let builtin_team_trust = bootstrap_builtin_teams(&teams)?;
+        Ok(Self {
+            agents,
+            teams,
+            builtin_agent_trust,
+            builtin_team_trust,
+        })
+    }
+
     /// Create the registry from a registered user storage layout and explicit
     /// builtin/workspace roots. `builtin_definitions_root` is the verified
     /// release bundle's definitions root, never a user-configurable path.

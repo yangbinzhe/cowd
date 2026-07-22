@@ -4,10 +4,11 @@
 //! this binary.  This crate applies only generic descriptor, registration and
 //! terminal-surface operations; it contains no product-domain logic.
 
-use std::path::Path;
+use std::{collections::BTreeSet, path::Path};
 
 use cowd_app_host::{AppRegistry, AppRegistryError, StaticAppProduct, TuiAppSurfaceContribution};
-use cowd_app_sdk::{AppDescriptor, CowdAppContext};
+use cowd_app_sdk::{AppDescriptor, AppStorageBackend, AppStorageScope, CowdAppContext};
+use thiserror::Error;
 
 mod generated;
 
@@ -27,6 +28,61 @@ pub fn enabled_descriptors(is_enabled: &dyn Fn(&str) -> bool) -> Vec<AppDescript
             is_enabled(descriptor.id.as_str()).then_some(descriptor)
         })
         .collect()
+}
+
+/// Resolves every enabled APP's declarative storage requirements into the
+/// host-owned inventory. Product code can name its data domain but cannot
+/// choose a path, connection string, or another APP's namespace.
+pub fn registry_with_enabled_app_storage(
+    mut registry: storage::StorageRegistry,
+    is_enabled: &dyn Fn(&str) -> bool,
+) -> Result<storage::StorageRegistry, AppStorageResolutionError> {
+    let mut registered = BTreeSet::new();
+    for product in compiled_products() {
+        let descriptor = product.descriptor();
+        if !is_enabled(descriptor.id.as_str()) {
+            continue;
+        }
+        for requirement in product.storage_requirements() {
+            requirement.validate(&descriptor.id)?;
+            if !registered.insert((
+                descriptor.id.as_str().to_string(),
+                requirement.domain.clone(),
+                requirement.scope.clone(),
+            )) {
+                return Err(AppStorageResolutionError::DuplicateRequirement {
+                    app_id: descriptor.id.to_string(),
+                    domain: requirement.domain,
+                });
+            }
+            if requirement.backend != AppStorageBackend::Sqlite
+                || requirement.scope != AppStorageScope::App
+            {
+                return Err(AppStorageResolutionError::UnsupportedRequirement {
+                    app_id: descriptor.id.to_string(),
+                    domain: requirement.domain,
+                });
+            }
+            registry = registry.with_app_sqlite(
+                descriptor.id.as_str(),
+                requirement.domain,
+                requirement.migration,
+            )?;
+        }
+    }
+    Ok(registry)
+}
+
+#[derive(Debug, Error)]
+pub enum AppStorageResolutionError {
+    #[error(transparent)]
+    Contract(#[from] cowd_app_sdk::AppContractError),
+    #[error(transparent)]
+    Storage(#[from] storage::StorageError),
+    #[error("duplicate storage requirement `{domain}` declared by app {app_id}")]
+    DuplicateRequirement { app_id: String, domain: String },
+    #[error("unsupported storage requirement `{domain}` declared by app {app_id}")]
+    UnsupportedRequirement { app_id: String, domain: String },
 }
 
 /// Mount all statically linked APPs allowed by the runtime startup policy.

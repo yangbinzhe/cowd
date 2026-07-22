@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 pub use sqlite::SqliteStorage;
 pub use sqlite::{SqliteConnectionFactory, SqlitePragmaConfig};
 use thiserror::Error;
@@ -70,6 +71,196 @@ pub enum StorageBackendKind {
     BlobDirectory,
 }
 
+/// A stable, typed identity for every durable Cowd storage domain.
+///
+/// The identity is deliberately separate from the physical backend location:
+/// a future PostgreSQL adapter must preserve the same domain and scope rather
+/// than asking callers to branch on a filename or connection string.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StorageDomainId {
+    Session,
+    Memory,
+    Knowledge,
+    Fact,
+    Matrix,
+    Tasks,
+    Audit,
+    Approval,
+    Growth,
+    RuntimeEvents,
+    SurfaceMessages,
+    ConnectorDirectory,
+    ApprovalHistory,
+    AlwaysApproved,
+    AuditLog,
+    Definitions,
+    Blobs,
+    App { app_id: String, domain: String },
+}
+
+impl StorageDomainId {
+    #[must_use]
+    pub fn app(app_id: impl Into<String>, domain: impl Into<String>) -> Self {
+        Self::App {
+            app_id: app_id.into(),
+            domain: domain.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn logical_name(&self) -> String {
+        match self {
+            Self::Session => "session".to_string(),
+            Self::Memory => "memory".to_string(),
+            Self::Knowledge => "knowledge".to_string(),
+            Self::Fact => "fact".to_string(),
+            Self::Matrix => "matrix".to_string(),
+            Self::Tasks => "tasks".to_string(),
+            Self::Audit => "audit".to_string(),
+            Self::Approval => "approval".to_string(),
+            Self::Growth => "growth".to_string(),
+            Self::RuntimeEvents => "runtime_events".to_string(),
+            Self::SurfaceMessages => "surface_messages".to_string(),
+            Self::ConnectorDirectory => "connector_directory".to_string(),
+            Self::ApprovalHistory => "approval_history".to_string(),
+            Self::AlwaysApproved => "always_approved".to_string(),
+            Self::AuditLog => "audit_log".to_string(),
+            Self::Definitions => "definitions".to_string(),
+            Self::Blobs => "blobs".to_string(),
+            Self::App { app_id, domain } => format!("app:{app_id}:{domain}"),
+        }
+    }
+}
+
+/// The data-isolation scope of a durable storage endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StorageScope {
+    Global,
+    Workspace { key: String },
+    App { app_id: String },
+}
+
+impl StorageScope {
+    #[must_use]
+    pub fn workspace_for_root(root: impl AsRef<Path>) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(root.as_ref().as_os_str().as_encoded_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        Self::Workspace {
+            key: digest[..24].to_string(),
+        }
+    }
+}
+
+/// A resolved physical target for one durable domain. `path` is private to
+/// backend adapters; application composition should pass endpoints, not paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageEndpoint {
+    pub domain: StorageDomainId,
+    pub scope: StorageScope,
+    pub backend: StorageBackendKind,
+    pub path: PathBuf,
+    pub owner: String,
+    pub migration: String,
+}
+
+impl StorageEndpoint {
+    #[must_use]
+    pub fn new(
+        domain: StorageDomainId,
+        scope: StorageScope,
+        backend: StorageBackendKind,
+        path: impl Into<PathBuf>,
+        owner: impl Into<String>,
+        migration: impl Into<String>,
+    ) -> Self {
+        Self {
+            domain,
+            scope,
+            backend,
+            path: path.into(),
+            owner: owner.into(),
+            migration: migration.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn sqlite(
+        domain: StorageDomainId,
+        scope: StorageScope,
+        path: impl Into<PathBuf>,
+        owner: impl Into<String>,
+        migration: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            domain,
+            scope,
+            StorageBackendKind::Sqlite,
+            path,
+            owner,
+            migration,
+        )
+    }
+
+    #[must_use]
+    pub fn as_handle(&self) -> StorageHandle {
+        StorageHandle {
+            domain: self.domain.logical_name(),
+            backend: self.backend.clone(),
+            path: self.path.clone(),
+            owner: self.owner.clone(),
+            migration: self.migration.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn logical_id(&self) -> String {
+        match &self.scope {
+            StorageScope::Global => self.domain.logical_name(),
+            StorageScope::Workspace { key } => {
+                format!("{}@workspace:{key}", self.domain.logical_name())
+            }
+            StorageScope::App { app_id } => format!("{}@app:{app_id}", self.domain.logical_name()),
+        }
+    }
+}
+
+fn endpoint_from_handle(handle: &StorageHandle) -> StorageEndpoint {
+    let domain = match handle.domain.as_str() {
+        "session" => StorageDomainId::Session,
+        "memory" => StorageDomainId::Memory,
+        "knowledge" => StorageDomainId::Knowledge,
+        "fact" => StorageDomainId::Fact,
+        "matrix" => StorageDomainId::Matrix,
+        "tasks" => StorageDomainId::Tasks,
+        "audit" => StorageDomainId::Audit,
+        "approval" => StorageDomainId::Approval,
+        "growth" => StorageDomainId::Growth,
+        "approval_history" => StorageDomainId::ApprovalHistory,
+        "always_approved" => StorageDomainId::AlwaysApproved,
+        "audit_log" => StorageDomainId::AuditLog,
+        "definitions" => StorageDomainId::Definitions,
+        "blobs" => StorageDomainId::Blobs,
+        other => StorageDomainId::app("storage", other),
+    };
+    let scope = match &domain {
+        StorageDomainId::App { app_id, .. } if app_id != "storage" => StorageScope::App {
+            app_id: app_id.clone(),
+        },
+        _ => StorageScope::Global,
+    };
+    StorageEndpoint::new(
+        domain,
+        scope,
+        handle.backend.clone(),
+        handle.path.clone(),
+        handle.owner.clone(),
+        handle.migration.clone(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageHandle {
     pub domain: String,
@@ -117,11 +308,6 @@ impl StorageLayout {
             ("knowledge".to_string(), root.join("knowledge.sqlite")),
             ("fact".to_string(), root.join("fact.sqlite")),
             ("matrix".to_string(), root.join("matrix.sqlite")),
-            ("mfg".to_string(), root.join("mfg.sqlite")),
-            (
-                "resource_directory".to_string(),
-                root.join("resource-directory.sqlite"),
-            ),
             ("tasks".to_string(), root.join("tasks.sqlite")),
             ("audit".to_string(), root.join("audit.sqlite")),
             ("approval".to_string(), root.join("approval.sqlite")),
@@ -206,6 +392,7 @@ impl StorageConfig {
 pub struct StorageRegistry {
     pub layout: StorageLayout,
     pub handles: Vec<StorageHandle>,
+    pub endpoints: Vec<StorageEndpoint>,
 }
 
 impl StorageRegistry {
@@ -251,7 +438,13 @@ impl StorageRegistry {
             migration: "blob_root_registered_since_0.9.295".to_string(),
         });
         handles.sort_by(|left, right| left.domain.cmp(&right.domain));
-        Self { layout, handles }
+        let mut endpoints = handles.iter().map(endpoint_from_handle).collect::<Vec<_>>();
+        endpoints.sort_by(|left, right| left.logical_id().cmp(&right.logical_id()));
+        Self {
+            layout,
+            handles,
+            endpoints,
+        }
     }
 
     pub fn handle(&self, domain: &str) -> Option<&StorageHandle> {
@@ -270,6 +463,204 @@ impl StorageRegistry {
         Ok(handle)
     }
 
+    pub fn endpoint(&self, domain: &StorageDomainId) -> Result<&StorageEndpoint, StorageError> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.domain == *domain && endpoint.scope == StorageScope::Global)
+            .ok_or_else(|| {
+                StorageError::Other(format!(
+                    "storage endpoint `{}` in global scope is not registered",
+                    domain.logical_name()
+                ))
+            })
+    }
+
+    pub fn endpoint_in_scope(
+        &self,
+        domain: &StorageDomainId,
+        scope: &StorageScope,
+    ) -> Result<&StorageEndpoint, StorageError> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.domain == *domain && endpoint.scope == *scope)
+            .ok_or_else(|| {
+                StorageError::Other(format!(
+                    "storage endpoint `{}` is not registered for scope {:?}",
+                    domain.logical_name(),
+                    scope
+                ))
+            })
+    }
+
+    pub fn register_endpoint(&mut self, endpoint: StorageEndpoint) -> Result<(), StorageError> {
+        if self
+            .endpoints
+            .iter()
+            .any(|current| current.domain == endpoint.domain && current.scope == endpoint.scope)
+        {
+            return Err(StorageError::Other(format!(
+                "storage endpoint collision: {}",
+                endpoint.logical_id()
+            )));
+        }
+        self.endpoints.push(endpoint);
+        self.endpoints
+            .sort_by(|left, right| left.logical_id().cmp(&right.logical_id()));
+        Ok(())
+    }
+
+    pub fn replace_endpoint(&mut self, endpoint: StorageEndpoint) -> Result<(), StorageError> {
+        let Some(index) = self.endpoints.iter().position(|current| {
+            current.domain == endpoint.domain && current.scope == endpoint.scope
+        }) else {
+            return self.register_endpoint(endpoint);
+        };
+        self.endpoints[index] = endpoint;
+        self.endpoints
+            .sort_by(|left, right| left.logical_id().cmp(&right.logical_id()));
+        Ok(())
+    }
+
+    pub fn with_memory_root(mut self, root: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let root = root.as_ref();
+        self.replace_endpoint(StorageEndpoint::sqlite(
+            StorageDomainId::Memory,
+            StorageScope::Global,
+            root.join("memory.db"),
+            "memory",
+            "memory_root_override_registered_since_0.9.565",
+        ))?;
+        self.replace_endpoint(StorageEndpoint::new(
+            StorageDomainId::Blobs,
+            StorageScope::Global,
+            StorageBackendKind::BlobDirectory,
+            root.join("blobs"),
+            "memory",
+            "memory_blob_root_override_registered_since_0.9.565",
+        ))?;
+        Ok(self)
+    }
+
+    /// Register one APP-owned durable SQLite target using Cowd's generic
+    /// location convention. The host never needs to know an APP's schema;
+    /// it only provides a stable owner/scope/location envelope.
+    pub fn with_app_sqlite(
+        mut self,
+        app_id: impl AsRef<str>,
+        domain: impl AsRef<str>,
+        migration: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        let app_id = app_id.as_ref();
+        let domain = domain.as_ref();
+        if !is_storage_segment(app_id) || !is_storage_segment(domain) {
+            return Err(StorageError::Other(format!(
+                "invalid app storage identity `{app_id}:{domain}`"
+            )));
+        }
+        self.register_endpoint(StorageEndpoint::sqlite(
+            StorageDomainId::app(app_id, domain),
+            StorageScope::App {
+                app_id: app_id.to_string(),
+            },
+            self.layout
+                .root
+                .join("apps")
+                .join(app_id)
+                .join(format!("{domain}.sqlite")),
+            app_id,
+            migration,
+        ))?;
+        Ok(self)
+    }
+
+    pub fn with_workspace(
+        mut self,
+        workspace_root: impl AsRef<Path>,
+    ) -> Result<Self, StorageError> {
+        let workspace_root = workspace_root.as_ref();
+        let scope = StorageScope::workspace_for_root(workspace_root);
+        self.register_endpoint(StorageEndpoint::sqlite(
+            StorageDomainId::ConnectorDirectory,
+            scope.clone(),
+            workspace_root
+                .join(".cowd")
+                .join("storage")
+                .join("resource-directory.sqlite"),
+            "connector",
+            "workspace_scoped_storage_endpoint_since_0.9.565",
+        ))?;
+        self.register_endpoint(StorageEndpoint::new(
+            StorageDomainId::Definitions,
+            scope.clone(),
+            StorageBackendKind::Directory,
+            workspace_root.join(".cowd").join("definitions"),
+            "runtime",
+            "workspace_definition_endpoint_since_0.9.565",
+        ))?;
+        let StorageScope::Workspace { key } = scope else {
+            unreachable!("workspace_for_root always creates a workspace scope");
+        };
+        self.register_endpoint(StorageEndpoint::sqlite(
+            StorageDomainId::RuntimeEvents,
+            StorageScope::Workspace { key: key.clone() },
+            self.layout
+                .root
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("runtime")
+                .join("workspaces")
+                .join(key)
+                .join("runtime-events.sqlite"),
+            "runtime",
+            "workspace_runtime_event_endpoint_since_0.9.565",
+        ))?;
+        Ok(self)
+    }
+
+    pub fn with_surface_messages(self) -> Result<Self, StorageError> {
+        let config_home = self
+            .layout
+            .root
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        self.with_surface_message_root(config_home.join("surface-messages"))
+    }
+
+    pub fn with_surface_message_root(
+        mut self,
+        root: impl AsRef<Path>,
+    ) -> Result<Self, StorageError> {
+        self.register_endpoint(StorageEndpoint::sqlite(
+            StorageDomainId::SurfaceMessages,
+            StorageScope::Global,
+            root.as_ref().join("surface_messages.sqlite3"),
+            "surface",
+            "surface_message_endpoint_since_0.9.565",
+        ))?;
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn inventory(&self) -> Vec<StorageEndpoint> {
+        self.endpoints.clone()
+    }
+
+    /// Materialize only the parent directories of resolved endpoints. Domain
+    /// implementations remain responsible for schemas and migrations.
+    pub fn ensure_directories(&self) -> Result<(), StorageError> {
+        for endpoint in &self.endpoints {
+            let directory = match endpoint.backend {
+                StorageBackendKind::Directory | StorageBackendKind::BlobDirectory => {
+                    endpoint.path.as_path()
+                }
+                _ => endpoint.path.parent().unwrap_or_else(|| Path::new(".")),
+            };
+            fs::create_dir_all(directory)?;
+        }
+        Ok(())
+    }
+
     pub fn health(&self) -> StorageHealth {
         StorageHealth::from_registry(self)
     }
@@ -282,8 +673,6 @@ fn owner_for_domain(domain: &str) -> &'static str {
         "knowledge" => "memory",
         "fact" => "fact-kernel",
         "matrix" => "matrix",
-        "mfg" => "mfg",
-        "resource_directory" => "connector",
         "tasks" => "task",
         "audit" | "audit_log" => "audit",
         "approval" | "approval_history" | "always_approved" => "approval",
@@ -293,14 +682,24 @@ fn owner_for_domain(domain: &str) -> &'static str {
     }
 }
 
+fn is_storage_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageHealth {
     pub status: String,
     pub root: PathBuf,
     pub handle_count: usize,
+    pub endpoint_count: usize,
     pub present_count: usize,
     pub missing_count: usize,
     pub handles: Vec<StorageHandleHealth>,
+    pub endpoints: Vec<StorageEndpointHealth>,
 }
 
 impl StorageHealth {
@@ -312,6 +711,11 @@ impl StorageHealth {
             .collect();
         let present_count = handles.iter().filter(|handle| handle.present).count();
         let missing_count = handles.len().saturating_sub(present_count);
+        let endpoints = registry
+            .endpoints
+            .iter()
+            .map(StorageEndpointHealth::from_endpoint)
+            .collect::<Vec<_>>();
         Self {
             status: if missing_count == 0 {
                 "ready".to_string()
@@ -320,9 +724,42 @@ impl StorageHealth {
             },
             root: registry.layout.root.clone(),
             handle_count: handles.len(),
+            endpoint_count: endpoints.len(),
             present_count,
             missing_count,
             handles,
+            endpoints,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageEndpointHealth {
+    pub id: String,
+    pub domain: StorageDomainId,
+    pub scope: StorageScope,
+    pub backend: StorageBackendKind,
+    pub owner: String,
+    pub present: bool,
+    pub writable_parent: bool,
+}
+
+impl StorageEndpointHealth {
+    fn from_endpoint(endpoint: &StorageEndpoint) -> Self {
+        let parent = match endpoint.backend {
+            StorageBackendKind::Directory | StorageBackendKind::BlobDirectory => {
+                endpoint.path.as_path()
+            }
+            _ => endpoint.path.parent().unwrap_or_else(|| Path::new(".")),
+        };
+        Self {
+            id: endpoint.logical_id(),
+            domain: endpoint.domain.clone(),
+            scope: endpoint.scope.clone(),
+            backend: endpoint.backend.clone(),
+            owner: endpoint.owner.clone(),
+            present: endpoint.path.exists(),
+            writable_parent: writable_directory_or_existing_ancestor(parent),
         }
     }
 }
@@ -378,15 +815,15 @@ impl MigrationRunner {
     pub fn from_registry(registry: &StorageRegistry) -> Self {
         Self {
             migrations: registry
-                .handles
+                .endpoints
                 .iter()
-                .map(|handle| StorageMigration {
-                    id: format!("storage.{}.layout", handle.domain),
-                    domain: handle.domain.clone(),
+                .map(|endpoint| StorageMigration {
+                    id: format!("storage.{}.endpoint", endpoint.logical_id()),
+                    domain: endpoint.domain.logical_name(),
                     version: 0,
                     status: "registered".to_string(),
-                    target: handle.path.clone(),
-                    description: handle.migration.clone(),
+                    target: endpoint.path.clone(),
+                    description: endpoint.migration.clone(),
                     error: None,
                 })
                 .collect(),
@@ -792,7 +1229,6 @@ mod tests {
             "session",
             "memory",
             "matrix",
-            "resource_directory",
             "tasks",
             "audit",
             "approval",
@@ -805,17 +1241,67 @@ mod tests {
         ] {
             assert!(registry.handle(domain).is_some(), "missing {domain}");
         }
+        assert!(registry
+            .endpoint(&StorageDomainId::Session)
+            .is_ok_and(|endpoint| endpoint.scope == StorageScope::Global));
+        assert!(registry
+            .endpoint(&StorageDomainId::ConnectorDirectory)
+            .is_err());
+    }
+
+    #[test]
+    fn registry_resolves_workspace_and_app_endpoints_without_core_special_cases() {
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = StorageRegistry::default_for_config_home("/tmp/cowd-config")
+            .with_workspace(workspace.path())
+            .unwrap()
+            .with_app_sqlite("mfg", "primary", "test")
+            .unwrap();
+        let workspace_scope = StorageScope::workspace_for_root(workspace.path());
+        let connector = registry
+            .endpoint_in_scope(&StorageDomainId::ConnectorDirectory, &workspace_scope)
+            .unwrap();
+        assert!(connector
+            .as_handle()
+            .path
+            .ends_with(".cowd/storage/resource-directory.sqlite"));
+        let mfg_scope = StorageScope::App {
+            app_id: "mfg".to_string(),
+        };
+        let mfg = registry
+            .endpoint_in_scope(&StorageDomainId::app("mfg", "primary"), &mfg_scope)
+            .unwrap();
+        assert!(mfg
+            .as_handle()
+            .path
+            .ends_with("storage/apps/mfg/primary.sqlite"));
+        assert!(registry
+            .with_app_sqlite("mfg", "primary", "duplicate")
+            .is_err());
+    }
+
+    #[test]
+    fn endpoint_health_is_logical_and_does_not_expose_paths() {
+        let registry = StorageRegistry::default_for_config_home("/tmp/cowd-config");
+        let value = serde_json::to_value(registry.health()).unwrap();
+        let endpoint = value["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|endpoint| endpoint["id"] == "session")
+            .unwrap();
+        assert!(endpoint.get("path").is_none());
     }
 
     #[test]
     fn migration_runner_reports_registered_targets() {
         let registry = StorageRegistry::default_for_config_home("/tmp/cowd-config");
         let runner = MigrationRunner::from_registry(&registry);
-        assert_eq!(runner.status().len(), registry.handles.len());
+        assert_eq!(runner.status().len(), registry.endpoints.len());
         assert!(runner
             .status()
             .iter()
-            .any(|migration| migration.id == "storage.matrix.layout"));
+            .any(|migration| migration.id == "storage.matrix.endpoint"));
     }
 
     #[test]
@@ -923,8 +1409,8 @@ mod tests {
         let registry = StorageRegistry::default_for_config_home(dir.path());
         let health = registry.health();
         assert_eq!(health.status, "registered");
-        assert_eq!(health.handle_count, registry.handles.len());
-        assert!(health.handle_count >= 11);
+        assert_eq!(health.endpoint_count, registry.endpoints.len());
+        assert!(health.endpoint_count >= 13);
         assert!(health.missing_count > 0);
     }
 

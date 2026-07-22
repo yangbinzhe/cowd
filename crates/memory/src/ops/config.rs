@@ -504,10 +504,20 @@ pub struct StoreConfig {
 
 impl Default for StoreConfig {
     fn default() -> Self {
-        let store_dir = default_memory_store_dir();
+        let registry = storage::StorageRegistry::default_for_config_home(default_config_home());
+        let sqlite_path = registry
+            .endpoint(&storage::StorageDomainId::Memory)
+            .expect("memory endpoint is part of the default Cowd storage inventory")
+            .as_handle()
+            .path;
+        let blob_dir = registry
+            .endpoint(&storage::StorageDomainId::Blobs)
+            .expect("blob endpoint is part of the default Cowd storage inventory")
+            .as_handle()
+            .path;
         Self {
-            sqlite_path: store_dir.join("memory.db"),
-            blob_dir: store_dir.join("blobs"),
+            sqlite_path,
+            blob_dir,
             enable_vector_index: false,
             cache_capacity: 512,
             vector: VectorConfig::default(),
@@ -515,9 +525,9 @@ impl Default for StoreConfig {
     }
 }
 
-fn default_memory_store_dir() -> PathBuf {
+fn default_config_home() -> PathBuf {
     if let Some(path) = std::env::var_os("COWD_CONFIG_HOME") {
-        return PathBuf::from(path).join("memory");
+        return PathBuf::from(path);
     }
 
     let dot_dir = std::env::var("COWD_DIR_NAME").unwrap_or_else(|_| ".cowd".to_string());
@@ -525,7 +535,6 @@ fn default_memory_store_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(dot_dir)
-        .join("memory")
 }
 
 /// Remote embedding model configuration.

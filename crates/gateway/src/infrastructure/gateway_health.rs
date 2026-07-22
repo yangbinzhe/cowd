@@ -1,4 +1,5 @@
 use serde::Serialize;
+use std::collections::BTreeSet;
 use storage::{
     MigrationRunner, SqlitePragmaConfig, StorageHealth, StorageLockDiagnostics, StorageRegistry,
 };
@@ -66,7 +67,23 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         event_bus: true,
         session_kernel: true,
     };
-    let storage_registry = StorageRegistry::default_for_config_home(&state.config_home);
+    let enabled_apps = state
+        .services
+        .app_registry
+        .apps()
+        .into_iter()
+        .map(|app| app.descriptor.id.to_string())
+        .collect::<BTreeSet<_>>();
+    let storage_registry = StorageRegistry::default_for_config_home(&state.config_home)
+        .with_workspace(&state.workspace_root)
+        .and_then(StorageRegistry::with_surface_messages)
+        .and_then(|registry| {
+            cowd_product_apps::registry_with_enabled_app_storage(registry, &|app_id| {
+                enabled_apps.contains(app_id)
+            })
+            .map_err(|error| storage::StorageError::Other(error.to_string()))
+        })
+        .expect("gateway storage endpoint registration must not collide");
     let pragma = SqlitePragmaConfig::default();
     let mut migrations = MigrationRunner::from_registry(&storage_registry).status();
     migrations.extend(inspect_growth_migrations(&storage_registry));
@@ -74,10 +91,12 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         registry: storage_registry.health(),
         migrations,
         locks: storage_registry
-            .handles
+            .endpoints
             .iter()
-            .filter(|handle| matches!(handle.backend, storage::StorageBackendKind::Sqlite))
-            .map(|handle| StorageLockDiagnostics::for_handle(handle, pragma.busy_timeout_ms))
+            .filter(|endpoint| matches!(endpoint.backend, storage::StorageBackendKind::Sqlite))
+            .map(|endpoint| {
+                StorageLockDiagnostics::for_handle(&endpoint.as_handle(), pragma.busy_timeout_ms)
+            })
             .collect(),
     };
     let status = if runtime.session_kernel && runtime.event_bus {
@@ -104,7 +123,10 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
 }
 
 fn inspect_growth_migrations(registry: &StorageRegistry) -> Vec<storage::StorageMigration> {
-    let Ok(handle) = registry.sqlite_handle("growth") else {
+    let Ok(handle) = registry
+        .endpoint(&storage::StorageDomainId::Growth)
+        .map(storage::StorageEndpoint::as_handle)
+    else {
         return Vec::new();
     };
     let specs = growth_storage_migrations();
@@ -122,9 +144,9 @@ fn inspect_growth_migrations(registry: &StorageRegistry) -> Vec<storage::Storage
             })
             .collect();
     }
-    match storage::SqliteConnectionFactory::default().open_handle(handle) {
+    match storage::SqliteConnectionFactory::default().open_handle(&handle) {
         Ok(connection) => {
-            match MigrationRunner::inspect_sqlite_domain(&connection, handle, &specs) {
+            match MigrationRunner::inspect_sqlite_domain(&connection, &handle, &specs) {
                 Ok(reports) => reports,
                 Err(error) => specs
                     .into_iter()
@@ -167,9 +189,9 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
     if !health
         .storage
         .registry
-        .handles
+        .endpoints
         .iter()
-        .all(|handle| handle.writable_parent)
+        .all(|endpoint| endpoint.writable_parent)
     {
         degraded.push("storage.parent_not_writable".to_string());
     }

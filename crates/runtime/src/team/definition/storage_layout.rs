@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use harness_contract::agent::DefinitionScope;
-use storage::StorageLayout;
+use storage::{StorageDomainId, StorageRegistry, StorageScope};
 
 use super::store::{TeamDefinitionStoreError, TeamTemplateStorageLayout};
 
@@ -23,8 +23,31 @@ pub struct RegisteredTeamTemplateLayout {
 }
 
 impl RegisteredTeamTemplateLayout {
+    pub fn from_storage_registry(
+        registry: &StorageRegistry,
+        builtin_root: impl Into<PathBuf>,
+        workspace_root: impl AsRef<std::path::Path>,
+    ) -> Result<Self, TeamDefinitionStoreError> {
+        let user_root = registry
+            .endpoint(&StorageDomainId::Definitions)
+            .map_err(|_| TeamDefinitionStoreError::UnregisteredStorageRoot {
+                domain: DEFINITIONS_DOMAIN.to_string(),
+            })?
+            .as_handle()
+            .path;
+        let scope = StorageScope::workspace_for_root(workspace_root.as_ref());
+        let workspace_definition_root = registry
+            .endpoint_in_scope(&StorageDomainId::Definitions, &scope)
+            .map_err(|_| TeamDefinitionStoreError::UnregisteredStorageRoot {
+                domain: "definitions@workspace".to_string(),
+            })?
+            .as_handle()
+            .path;
+        Self::from_registered_roots(builtin_root, user_root, workspace_definition_root)
+    }
+
     pub fn from_storage_layout(
-        layout: &StorageLayout,
+        layout: &storage::StorageLayout,
         builtin_root: impl Into<PathBuf>,
         workspace_root: impl Into<PathBuf>,
     ) -> Result<Self, TeamDefinitionStoreError> {
@@ -37,21 +60,33 @@ impl RegisteredTeamTemplateLayout {
         Self::new(builtin_root, user_root, workspace_root)
     }
 
+    fn from_registered_roots(
+        builtin_root: impl Into<PathBuf>,
+        user_root: impl Into<PathBuf>,
+        workspace_definition_root: impl Into<PathBuf>,
+    ) -> Result<Self, TeamDefinitionStoreError> {
+        Ok(Self {
+            builtin_root: require_non_empty_root("builtin", builtin_root.into())?,
+            user_root: require_non_empty_root("user", user_root.into())?,
+            workspace_root: require_non_empty_root("workspace", workspace_definition_root.into())?,
+        })
+    }
+
     pub fn new(
         builtin_root: impl Into<PathBuf>,
         user_root: impl Into<PathBuf>,
         workspace_root: impl Into<PathBuf>,
     ) -> Result<Self, TeamDefinitionStoreError> {
-        Ok(Self {
-            builtin_root: require_non_empty_root("builtin", builtin_root.into())?,
-            user_root: require_non_empty_root("user", user_root.into())?,
-            workspace_root: require_non_empty_root("workspace", workspace_root.into())?,
-        })
+        Self::from_registered_roots(
+            builtin_root,
+            user_root,
+            workspace_root.into().join(".cowd").join("definitions"),
+        )
     }
 
     #[must_use]
     pub fn workspace_definition_root(&self) -> PathBuf {
-        self.workspace_root.join(".cowd").join("definitions")
+        self.workspace_root.clone()
     }
 }
 

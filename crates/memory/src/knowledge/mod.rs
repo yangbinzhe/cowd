@@ -177,6 +177,8 @@ impl KnowledgeSnapshot {
 pub enum KnowledgeStoreError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("storage error: {0}")]
+    Storage(#[from] storage::StorageError),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
@@ -1016,11 +1018,11 @@ impl SqliteKnowledgeStore {
 pub fn durable_knowledge_fabric_for_config_home(
     config_home: impl AsRef<Path>,
 ) -> Result<KnowledgeFabric, KnowledgeStoreError> {
-    let layout = storage::StorageLayout::default_for_config_home(config_home);
-    let db_path = layout
-        .sqlite_path("knowledge")
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| layout.root.join("knowledge.sqlite"));
+    let registry = storage::StorageRegistry::default_for_config_home(config_home);
+    let db_path = registry
+        .endpoint(&storage::StorageDomainId::Knowledge)?
+        .as_handle()
+        .path;
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

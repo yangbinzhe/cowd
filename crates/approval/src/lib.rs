@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use storage::StorageLayout;
+use storage::{StorageBackendKind, StorageEndpoint, StorageLayout};
 use thiserror::Error;
 
 pub mod cache;
@@ -30,6 +30,8 @@ pub enum ApprovalRepositoryError {
     Json(#[from] serde_json::Error),
     #[error("storage handle missing: {0}")]
     MissingHandle(String),
+    #[error("storage endpoint `{domain}` must use file_json backend")]
+    InvalidBackend { domain: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +77,27 @@ pub struct FileApprovalRepository {
 }
 
 impl FileApprovalRepository {
+    pub fn from_storage_endpoints(
+        history: &StorageEndpoint,
+        always_allowed: &StorageEndpoint,
+    ) -> Result<Self, ApprovalRepositoryError> {
+        if history.backend != StorageBackendKind::FileJson {
+            return Err(ApprovalRepositoryError::InvalidBackend {
+                domain: history.logical_id(),
+            });
+        }
+        if always_allowed.backend != StorageBackendKind::FileJson {
+            return Err(ApprovalRepositoryError::InvalidBackend {
+                domain: always_allowed.logical_id(),
+            });
+        }
+        Ok(Self {
+            history_path: history.as_handle().path,
+            always_allowed_path: always_allowed.as_handle().path,
+            max_history: 200,
+        })
+    }
+
     pub fn from_storage_layout(layout: &StorageLayout) -> Result<Self, ApprovalRepositoryError> {
         let history_path = layout
             .file_path("approval_history")

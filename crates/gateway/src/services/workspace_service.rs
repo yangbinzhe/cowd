@@ -72,11 +72,13 @@ impl WorkspaceService {
             "workspace_canonical": workspace_canonical.map(|path| path.display().to_string()),
             "profile_id": profile_id,
             "config_home": config_home.display().to_string(),
-            "sessions_db": storage::StorageLayout::default_for_config_home(config_home)
-                .sqlite_path("session")
-                .map(std::path::Path::display)
-                .map(|display| display.to_string())
-                .unwrap_or_else(|| config_home.join("sessions.db").display().to_string()),
+            "sessions_db": storage::StorageRegistry::default_for_config_home(config_home)
+                .endpoint(&storage::StorageDomainId::Session)
+                .expect("session endpoint is part of the default Cowd storage inventory")
+                .as_handle()
+                .path
+                .display()
+                .to_string(),
             "memory_dir": config_home.join("memory").display().to_string(),
         })
     }

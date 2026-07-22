@@ -57,7 +57,7 @@ impl MatrixService {
         &self,
         config_home: impl AsRef<Path>,
     ) -> Result<PathBuf, ::matrix_repository::MatrixRepositoryError> {
-        Ok(self.repository_handle(config_home)?.db_path().to_path_buf())
+        Ok(self.repository_handle(config_home)?.db_path())
     }
 
     pub(crate) fn health(&self) -> ServiceEnvelope {

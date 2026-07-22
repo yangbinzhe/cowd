@@ -112,12 +112,17 @@ impl SurfaceHost {
             roots.append(&mut install_roots);
         }
         roots.extend(edge_manifest_roots(config_home));
+        let message_root = SurfaceMessageStore::default_root(config_home);
+        let storage = storage::StorageRegistry::default_for_config_home(config_home)
+            .with_surface_message_root(&message_root)
+            .expect("surface storage endpoint registration must not collide");
+        let endpoint = storage
+            .endpoint(&storage::StorageDomainId::SurfaceMessages)
+            .expect("surface messages endpoint must be registered");
         Self::with_configs_and_message_store(
             roots,
             configs,
-            Arc::new(SurfaceMessageStore::new(SurfaceMessageStore::default_root(
-                config_home,
-            ))),
+            Arc::new(SurfaceMessageStore::from_storage_endpoint(endpoint)),
         )
     }
 

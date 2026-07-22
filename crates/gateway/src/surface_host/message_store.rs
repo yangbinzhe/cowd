@@ -178,15 +178,36 @@ pub(crate) struct SurfaceMessageStore {
 impl SurfaceMessageStore {
     pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
+        Self::open_at(root.clone(), root.join(DATABASE_FILE))
+    }
+
+    /// Production composition receives the resolved endpoint from `storage`.
+    /// The `new(root)` helper remains for isolated tests and intentionally
+    /// does not participate in Gateway's durable-store bootstrap.
+    pub(crate) fn from_storage_endpoint(endpoint: &storage::StorageEndpoint) -> Self {
+        assert_eq!(
+            endpoint.backend,
+            storage::StorageBackendKind::Sqlite,
+            "surface messages require a sqlite endpoint"
+        );
+        let database_path = endpoint.as_handle().path;
+        let root = database_path
+            .parent()
+            .map(Path::to_path_buf)
+            .expect("surface storage endpoint must name a database file");
+        Self::open_at(root, database_path)
+    }
+
+    fn open_at(root: PathBuf, database_path: PathBuf) -> Self {
         if let Err(error) = fs::create_dir_all(&root) {
             tracing::error!(path = %root.display(), error = %error, "surface durable store directory creation failed");
             eprintln!("surface durable store directory creation failed: {error}");
             std::process::abort();
         }
-        let connection = match Connection::open(root.join(DATABASE_FILE)) {
+        let connection = match Connection::open(&database_path) {
             Ok(connection) => connection,
             Err(error) => {
-                tracing::error!(path = %root.display(), error = %error, "surface durable store open failed");
+                tracing::error!(path = %database_path.display(), error = %error, "surface durable store open failed");
                 eprintln!("surface durable store open failed: {error}");
                 std::process::abort();
             }

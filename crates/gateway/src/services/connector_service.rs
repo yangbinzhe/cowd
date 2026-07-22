@@ -117,26 +117,20 @@ impl ConnectorService {
         &self,
         workspace_root: impl AsRef<Path>,
     ) -> storage::StorageHandle {
-        let config_home = workspace_root.as_ref().join(".cowd");
-        storage::StorageRegistry::default_for_config_home(config_home)
-            .sqlite_handle("resource_directory")
-            .cloned()
-            .unwrap_or_else(|_| {
-                storage::StorageHandle::sqlite(
-                    "resource_directory",
-                    self.resource_directory_path(workspace_root),
-                    "connector",
-                    "workspace_scoped_storage_handle_since_0.9.315",
-                )
+        let workspace_root = workspace_root.as_ref();
+        let scope = storage::StorageScope::workspace_for_root(workspace_root);
+        storage::StorageRegistry::default_for_config_home(workspace_root.join(".cowd"))
+            .with_workspace(workspace_root)
+            .and_then(|registry| {
+                registry
+                    .endpoint_in_scope(&storage::StorageDomainId::ConnectorDirectory, &scope)
+                    .map(storage::StorageEndpoint::as_handle)
             })
+            .expect("workspace connector endpoint registration must be valid")
     }
 
     pub(crate) fn resource_directory_path(&self, workspace_root: impl AsRef<Path>) -> PathBuf {
-        workspace_root
-            .as_ref()
-            .join(".cowd")
-            .join("storage")
-            .join("resource-directory.sqlite")
+        self.resource_directory_handle(workspace_root).path
     }
 
     pub(crate) fn list_resources(

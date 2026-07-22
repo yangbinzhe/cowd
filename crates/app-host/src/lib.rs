@@ -12,7 +12,7 @@ use std::{
 use axum::Router;
 use cowd_app_sdk::{
     AppContractError, AppDescriptor, AppHealth, AppHttpContract, AppId, AppRouteMetadata,
-    AppSkillDescriptor, CapabilityApp, CowdAppContext,
+    AppSkillDescriptor, AppStorageRequirement, CapabilityApp, CowdAppContext,
 };
 use crossterm::event::KeyEvent;
 use ratatui::{
@@ -699,6 +699,7 @@ pub struct StaticAppProduct {
     descriptor: fn() -> AppDescriptor,
     register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
     tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
+    storage_requirements: Option<fn() -> Vec<AppStorageRequirement>>,
 }
 
 impl StaticAppProduct {
@@ -712,6 +713,25 @@ impl StaticAppProduct {
             descriptor,
             register,
             tui_surface,
+            storage_requirements: None,
+        }
+    }
+
+    /// Extend a reviewed static product with declarative durable-storage
+    /// requirements. The legacy constructor remains source compatible for an
+    /// APP with no durable state; new products should use this constructor.
+    #[must_use]
+    pub const fn with_storage_requirements(
+        descriptor: fn() -> AppDescriptor,
+        register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
+        tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
+        storage_requirements: fn() -> Vec<AppStorageRequirement>,
+    ) -> Self {
+        Self {
+            descriptor,
+            register,
+            tui_surface,
+            storage_requirements: Some(storage_requirements),
         }
     }
 
@@ -737,6 +757,12 @@ impl StaticAppProduct {
     #[must_use]
     pub fn tui_surface(self) -> Option<TuiAppSurfaceContribution> {
         self.tui_surface.map(|factory| factory())
+    }
+
+    #[must_use]
+    pub fn storage_requirements(self) -> Vec<AppStorageRequirement> {
+        self.storage_requirements
+            .map_or_else(Vec::new, |factory| factory())
     }
 }
 

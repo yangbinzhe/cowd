@@ -123,6 +123,56 @@ impl AppDescriptor {
     }
 }
 
+/// Backend-neutral durable storage requested by a product APP.
+///
+/// An APP may name its own data domains but may not choose a host filesystem
+/// path, connection URL, credential, or another APP's namespace.  The product
+/// composer resolves this declaration into a `storage::StorageEndpoint`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppStorageBackend {
+    Sqlite,
+    FileJson,
+    Directory,
+    BlobDirectory,
+}
+
+/// Isolation required for an APP-owned durable domain.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppStorageScope {
+    App,
+    Workspace,
+}
+
+/// A declarative product-storage request. This is intentionally a stable SDK
+/// DTO rather than a `PathBuf`: the host owns deployment topology and future
+/// backend selection, while the APP owns only its domain contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStorageRequirement {
+    pub domain: String,
+    pub backend: AppStorageBackend,
+    pub scope: AppStorageScope,
+    pub migration: String,
+}
+
+impl AppStorageRequirement {
+    pub fn validate(&self, app_id: &AppId) -> Result<(), AppContractError> {
+        let valid_domain = !self.domain.is_empty()
+            && self.domain.len() <= 63
+            && self.domain.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+            });
+        if !valid_domain || self.migration.trim().is_empty() {
+            return Err(AppContractError::InvalidStorageRequirement {
+                app_id: app_id.clone(),
+                domain: self.domain.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRouteDescriptor {
     pub method: String,
@@ -585,6 +635,8 @@ pub enum AppContractError {
     InvalidRoute { app_id: AppId, path: String },
     #[error("invalid HTTP contract for app {app_id}: {reason}")]
     InvalidHttpContract { app_id: AppId, reason: String },
+    #[error("invalid storage requirement `{domain}` for app {app_id}")]
+    InvalidStorageRequirement { app_id: AppId, domain: String },
     #[error("app {app_id} requires SDK API {actual}, host supports {expected}")]
     UnsupportedSdkApi {
         app_id: AppId,
@@ -623,6 +675,27 @@ mod tests {
             descriptor.validate(),
             Err(AppContractError::UnsupportedSdkApi { .. })
         ));
+    }
+
+    #[test]
+    fn app_storage_requirement_is_namespaced_and_path_free() {
+        let app_id = AppId::parse("fixture").expect("fixture app id");
+        AppStorageRequirement {
+            domain: "primary_data".to_string(),
+            backend: AppStorageBackend::Sqlite,
+            scope: AppStorageScope::App,
+            migration: "fixture_primary_v1".to_string(),
+        }
+        .validate(&app_id)
+        .expect("valid generic requirement");
+        assert!(AppStorageRequirement {
+            domain: "../escape".to_string(),
+            backend: AppStorageBackend::Sqlite,
+            scope: AppStorageScope::App,
+            migration: "fixture_primary_v1".to_string(),
+        }
+        .validate(&app_id)
+        .is_err());
     }
 
     #[test]

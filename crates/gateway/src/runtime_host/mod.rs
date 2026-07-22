@@ -755,19 +755,22 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     }
     let runtime_mcp_service =
         Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config).await);
-    let storage_config = storage::StorageConfig::default_for_config_home(&approval_dir);
-    storage_config
-        .layout
+    let storage_registry = storage::StorageRegistry::default_for_config_home(&approval_dir);
+    storage_registry
         .ensure_directories()
         .map_err(|e| format!("failed to initialize storage layout: {e}"))?;
-    let approval_history_path = storage_config
-        .layout
-        .file_path("approval_history")
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| approval_dir.join("approval_history.json"));
-    let approval_repository =
-        approval::FileApprovalRepository::from_storage_layout(&storage_config.layout)
-            .map_err(|e| format!("failed to initialize approval repository: {e}"))?;
+    let history_endpoint = storage_registry
+        .endpoint(&storage::StorageDomainId::ApprovalHistory)
+        .map_err(|error| error.to_string())?;
+    let always_allowed_endpoint = storage_registry
+        .endpoint(&storage::StorageDomainId::AlwaysApproved)
+        .map_err(|error| error.to_string())?;
+    let approval_history_path = history_endpoint.as_handle().path;
+    let approval_repository = approval::FileApprovalRepository::from_storage_endpoints(
+        history_endpoint,
+        always_allowed_endpoint,
+    )
+    .map_err(|e| format!("failed to initialize approval repository: {e}"))?;
     let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
         Arc::new(
             runtime::permission_enforcer::DestructivePatternDetector::new(approval_dir.clone()),

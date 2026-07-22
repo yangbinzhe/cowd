@@ -326,24 +326,26 @@ fn ensure_matrix_snapshot_granted(
 fn open_matrix_repository(config_home: &Path) -> Result<MatrixSqliteRepository, String> {
     let registry = StorageRegistry::default_for_config_home(config_home);
     let handle = registry
-        .sqlite_handle("matrix")
+        .endpoint(&storage::StorageDomainId::Matrix)
+        .map(storage::StorageEndpoint::as_handle)
         .map_err(|error| error.to_string())?;
     if let Some(parent) = handle.path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    open_matrix_sqlite_repository_handle(handle).map_err(|error| error.to_string())
+    open_matrix_sqlite_repository_handle(&handle).map_err(|error| error.to_string())
 }
 
 fn load_fact_records(config_home: &Path) -> Result<Vec<fact_kernel::FactRecord>, String> {
     let registry = StorageRegistry::default_for_config_home(config_home);
     let handle = registry
-        .sqlite_handle("fact")
+        .endpoint(&storage::StorageDomainId::Fact)
+        .map(storage::StorageEndpoint::as_handle)
         .map_err(|error| error.to_string())?;
     if !handle.path.exists() {
         return Ok(Vec::new());
     }
     let connection = SqliteConnectionFactory::default()
-        .open_handle(handle)
+        .open_handle(&handle)
         .map_err(|error| error.to_string())?;
     let table_exists = connection
         .query_row(

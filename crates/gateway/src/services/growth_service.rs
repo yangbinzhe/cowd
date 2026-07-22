@@ -36,13 +36,14 @@ impl GatewayFactStore {
     pub(crate) fn open_for_config_home(config_home: impl AsRef<Path>) -> Result<Self, String> {
         let registry = StorageRegistry::default_for_config_home(config_home);
         let handle = registry
-            .sqlite_handle("fact")
+            .endpoint(&storage::StorageDomainId::Fact)
+            .map(storage::StorageEndpoint::as_handle)
             .map_err(|error| error.to_string())?;
         if let Some(parent) = handle.path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
         let conn = SqliteConnectionFactory::default()
-            .open_handle(handle)
+            .open_handle(&handle)
             .map_err(|error| error.to_string())?;
         conn.execute_batch(
             r#"
@@ -623,16 +624,17 @@ impl GrowthService {
 fn open_growth_store(config_home: &Path) -> Result<Connection, String> {
     let registry = StorageRegistry::default_for_config_home(config_home);
     let handle = registry
-        .sqlite_handle("growth")
+        .endpoint(&storage::StorageDomainId::Growth)
+        .map(storage::StorageEndpoint::as_handle)
         .map_err(|error| error.to_string())?;
     if let Some(parent) = handle.path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let conn = SqliteConnectionFactory::default()
-        .open_handle(handle)
+        .open_handle(&handle)
         .map_err(|error| error.to_string())?;
     let migration_reports =
-        MigrationRunner::run_sqlite_domain(&conn, handle, &growth_storage_migrations())
+        MigrationRunner::run_sqlite_domain(&conn, &handle, &growth_storage_migrations())
             .map_err(|error| error.to_string())?;
     if let Some(failed) = migration_reports
         .iter()

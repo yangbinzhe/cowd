@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use harness_contract::agent::DefinitionScope;
-use storage::StorageLayout;
+use storage::{StorageDomainId, StorageRegistry, StorageScope};
 
 use super::store::{DefinitionStorageLayout, DefinitionStoreError};
 
@@ -29,10 +29,36 @@ pub struct RegisteredAgentDefinitionLayout {
 }
 
 impl RegisteredAgentDefinitionLayout {
+    /// Compose roots from endpoint registry entries. This is the production
+    /// constructor: storage ownership and workspace isolation are resolved
+    /// before Definition persistence starts.
+    pub fn from_storage_registry(
+        registry: &StorageRegistry,
+        builtin_root: impl Into<PathBuf>,
+        workspace_root: impl AsRef<Path>,
+    ) -> Result<Self, DefinitionStoreError> {
+        let user_root = registry
+            .endpoint(&StorageDomainId::Definitions)
+            .map_err(|_| DefinitionStoreError::UnregisteredStorageRoot {
+                domain: DEFINITIONS_DOMAIN.to_string(),
+            })?
+            .as_handle()
+            .path;
+        let workspace_scope = StorageScope::workspace_for_root(workspace_root.as_ref());
+        let workspace_definition_root = registry
+            .endpoint_in_scope(&StorageDomainId::Definitions, &workspace_scope)
+            .map_err(|_| DefinitionStoreError::UnregisteredStorageRoot {
+                domain: "definitions@workspace".to_string(),
+            })?
+            .as_handle()
+            .path;
+        Self::from_registered_roots(builtin_root, user_root, workspace_definition_root)
+    }
+
     /// Compose roots from registered user storage plus explicit installation
     /// and workspace boundaries.
     pub fn from_storage_layout(
-        layout: &StorageLayout,
+        layout: &storage::StorageLayout,
         builtin_root: impl Into<PathBuf>,
         workspace_root: impl Into<PathBuf>,
     ) -> Result<Self, DefinitionStoreError> {
@@ -45,6 +71,21 @@ impl RegisteredAgentDefinitionLayout {
         Self::new(builtin_root, user_root, workspace_root)
     }
 
+    fn from_registered_roots(
+        builtin_root: impl Into<PathBuf>,
+        user_root: impl Into<PathBuf>,
+        workspace_definition_root: impl Into<PathBuf>,
+    ) -> Result<Self, DefinitionStoreError> {
+        let builtin_root = require_non_empty_root("builtin", builtin_root.into())?;
+        let user_root = require_non_empty_root("user", user_root.into())?;
+        let workspace_root = require_non_empty_root("workspace", workspace_definition_root.into())?;
+        Ok(Self {
+            builtin_root,
+            user_root,
+            workspace_root,
+        })
+    }
+
     /// Construct from already registered roots. `workspace_root` is the
     /// workspace itself, not an arbitrary definitions directory.
     pub fn new(
@@ -52,14 +93,11 @@ impl RegisteredAgentDefinitionLayout {
         user_root: impl Into<PathBuf>,
         workspace_root: impl Into<PathBuf>,
     ) -> Result<Self, DefinitionStoreError> {
-        let builtin_root = require_non_empty_root("builtin", builtin_root.into())?;
-        let user_root = require_non_empty_root("user", user_root.into())?;
-        let workspace_root = require_non_empty_root("workspace", workspace_root.into())?;
-        Ok(Self {
+        Self::from_registered_roots(
             builtin_root,
             user_root,
-            workspace_root,
-        })
+            workspace_root.into().join(".cowd").join("definitions"),
+        )
     }
 
     #[must_use]
@@ -79,7 +117,7 @@ impl RegisteredAgentDefinitionLayout {
 
     #[must_use]
     pub fn workspace_definition_root(&self) -> PathBuf {
-        self.workspace_root.join(".cowd").join("definitions")
+        self.workspace_root.clone()
     }
 }
 

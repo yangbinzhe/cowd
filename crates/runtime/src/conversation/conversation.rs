@@ -7932,21 +7932,24 @@ pub fn build_cc_memory_config_with_budget(
     };
 
     let mem = feature_config.memory();
-    let storage_layout =
-        storage::StorageLayout::default_for_config_home(crate::cowd_dirs::config_home_dir());
-    let (sqlite_path, blob_dir) = if let Some(store_path) = mem.store_path.as_ref() {
-        (store_path.join("memory.db"), store_path.join("blobs"))
+    let config_home = crate::cowd_dirs::config_home_dir();
+    let registry = if let Some(store_path) = mem.store_path.as_ref() {
+        storage::StorageRegistry::default_for_config_home(&config_home)
+            .with_memory_root(store_path)
+            .expect("memory storage override must not collide with the core inventory")
     } else {
-        (
-            storage_layout
-                .sqlite_path("memory")
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| {
-                    crate::cowd_dirs::config_home_dir().join("storage/memory.sqlite")
-                }),
-            storage_layout.blobs.join("memory"),
-        )
+        storage::StorageRegistry::default_for_config_home(&config_home)
     };
+    let sqlite_path = registry
+        .endpoint(&storage::StorageDomainId::Memory)
+        .expect("memory endpoint is part of the default Cowd storage inventory")
+        .as_handle()
+        .path;
+    let blob_dir = registry
+        .endpoint(&storage::StorageDomainId::Blobs)
+        .expect("blob endpoint is part of the default Cowd storage inventory")
+        .as_handle()
+        .path;
 
     CcMemoryConfig {
         store: StoreConfig {

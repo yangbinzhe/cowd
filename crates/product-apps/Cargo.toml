@@ -10,7 +10,9 @@ publish.workspace = true
 [dependencies]
 cowd-app-host = { path = "../app-host" }
 cowd-app-sdk = { path = "../app-sdk" }
+storage = { path = "../storage" }
 cowd-app-mfg-bundle = { git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "2932eba83d30e05f24cee0e19713bc4640104000", optional = true }
+thiserror = "2"
 
 [features]
 default = ["app-mfg"]

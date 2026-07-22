@@ -369,32 +369,35 @@ fn build_memory_config(
     if !src.enabled {
         return None;
     }
-    let storage_layout =
-        storage::StorageLayout::default_for_config_home(runtime::cowd_dirs::config_home_dir());
-    let mut mc = memory::MemoryConfig::default();
-    if let Some(store_path) = src.store_path.as_ref().map(|p| expand_home(p)) {
-        if let Err(e) = std::fs::create_dir_all(&store_path) {
-            tracing::warn!("failed to create memory store dir {:?}: {e}", store_path);
+    let config_home = runtime::cowd_dirs::config_home_dir();
+    let registry = if let Some(store_path) = src.store_path.as_ref().map(|path| expand_home(path)) {
+        if let Err(error) = std::fs::create_dir_all(&store_path) {
+            tracing::warn!(?store_path, "failed to create memory store dir: {error}");
         }
-        mc.store.sqlite_path = store_path.join("memory.db");
-        mc.store.blob_dir = store_path.join("blobs");
+        storage::StorageRegistry::default_for_config_home(&config_home)
+            .with_memory_root(&store_path)
+            .expect("memory storage override must not collide with the core inventory")
     } else {
-        mc.store.sqlite_path = storage_layout
-            .sqlite_path("memory")
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| runtime::cowd_dirs::config_home_dir().join("storage/memory.sqlite"));
-        mc.store.blob_dir = storage_layout.blobs.join("memory");
-        if let Some(parent) = mc.store.sqlite_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!("failed to create memory sqlite dir {:?}: {e}", parent);
-            }
+        storage::StorageRegistry::default_for_config_home(&config_home)
+    };
+    let mut mc = memory::MemoryConfig::default();
+    let memory_handle = registry
+        .endpoint(&storage::StorageDomainId::Memory)
+        .expect("memory endpoint is part of the default Cowd storage inventory")
+        .as_handle();
+    let blob_handle = registry
+        .endpoint(&storage::StorageDomainId::Blobs)
+        .expect("blob endpoint is part of the default Cowd storage inventory")
+        .as_handle();
+    mc.store.sqlite_path = memory_handle.path;
+    mc.store.blob_dir = blob_handle.path;
+    if let Some(parent) = mc.store.sqlite_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(?parent, "failed to create memory sqlite dir: {error}");
         }
-        if let Err(e) = std::fs::create_dir_all(&mc.store.blob_dir) {
-            tracing::warn!(
-                "failed to create memory blob dir {:?}: {e}",
-                mc.store.blob_dir
-            );
-        }
+    }
+    if let Err(error) = std::fs::create_dir_all(&mc.store.blob_dir) {
+        tracing::warn!(path = %mc.store.blob_dir.display(), "failed to create memory blob dir: {error}");
     }
     mc.store.enable_vector_index = src.vector.enabled;
     mc.store.vector.enabled = src.vector.enabled;

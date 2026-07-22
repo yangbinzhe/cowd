@@ -50,6 +50,8 @@ use crate::{
 #[derive(Debug, Error)]
 pub enum RuntimeServicesError {
     #[error(transparent)]
+    Storage(#[from] storage::StorageError),
+    #[error(transparent)]
     DefinitionRegistry(#[from] DefinitionRegistryError),
     #[error(transparent)]
     EventStore(#[from] RuntimeEventStoreError),
@@ -439,7 +441,8 @@ impl RuntimeServicesBuilder {
         let legacy_team_profile_archive_root = self.cowd_home.join("migrations").join("teams");
         let workspace_root = canonical_workspace_root(&self.workspace_root)?;
         let workspace_key = workspace_key(&workspace_root);
-        let storage_layout = storage::StorageLayout::default_for_config_home(&self.cowd_home);
+        let storage_registry = storage::StorageRegistry::default_for_config_home(&self.cowd_home)
+            .with_workspace(&workspace_root)?;
         let builtin_definitions_root = self.builtin_definitions_root.unwrap_or_else(|| {
             // An unconfigured installation has no runnable builtin Definitions
             // yet. This explicit empty bundle root preserves scope separation;
@@ -447,16 +450,15 @@ impl RuntimeServicesBuilder {
             // builtin bootstrap is enabled.
             self.cowd_home.join("runtime").join("builtin-definitions")
         });
-        let definition_registry = Arc::new(RuntimeDefinitionRegistry::from_storage_layout(
-            &storage_layout,
+        let definition_registry = Arc::new(RuntimeDefinitionRegistry::from_storage_registry(
+            &storage_registry,
             builtin_definitions_root,
             &workspace_root,
         )?);
-        let state_root = self
-            .cowd_home
-            .join("runtime")
-            .join("workspaces")
-            .join(&workspace_key);
+        let event_scope = storage::StorageScope::workspace_for_root(&workspace_root);
+        let runtime_event_handle = storage_registry
+            .endpoint_in_scope(&storage::StorageDomainId::RuntimeEvents, &event_scope)?
+            .as_handle();
         let resource_state_root = std::env::temp_dir()
             .join("cowd-runtime-resource-locks")
             .join(&workspace_key);
@@ -473,9 +475,7 @@ impl RuntimeServicesBuilder {
             self.cowd_home.clone(),
             workspace_root,
             workspace_key,
-            Arc::new(RuntimeEventStore::try_open(
-                state_root.join("runtime-events.sqlite"),
-            )?),
+            Arc::new(RuntimeEventStore::try_open(runtime_event_handle.path)?),
             worktree_leases,
             scope_locks,
             self.resource_quotas,
@@ -593,8 +593,10 @@ impl RuntimeServices {
             .join(&workspace_key)
             .join("definitions");
         let config_home = definition_root.join("config-home");
-        let definition_registry = Arc::new(RuntimeDefinitionRegistry::from_storage_layout(
-            &storage::StorageLayout::default_for_config_home(&config_home),
+        let storage_registry = storage::StorageRegistry::default_for_config_home(&config_home)
+            .with_workspace(&workspace_root)?;
+        let definition_registry = Arc::new(RuntimeDefinitionRegistry::from_storage_registry(
+            &storage_registry,
             definition_root.join("builtin"),
             &workspace_root,
         )?);

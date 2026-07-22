@@ -2881,7 +2881,7 @@ pub(crate) mod tests {
         assert_eq!(json["runtime"]["session_kernel"], true);
         assert_eq!(json["runtime"]["event_bus"], true);
         assert!(
-            json["storage"]["registry"]["handle_count"]
+            json["storage"]["registry"]["endpoint_count"]
                 .as_u64()
                 .unwrap_or_default()
                 >= 11
@@ -2894,7 +2894,7 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["id"] == "storage.matrix.layout"));
+            .any(|item| item["id"] == "storage.matrix.endpoint"));
         assert!(json["storage"]["migrations"]
             .as_array()
             .unwrap()
@@ -2926,14 +2926,14 @@ pub(crate) mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        let handles = json["storage"]["registry"]["handles"].as_array().unwrap();
-        assert!(handles.iter().any(|item| item["domain"] == "session"));
-        assert!(handles.iter().any(|item| item["domain"] == "memory"));
-        assert!(handles.iter().any(|item| item["domain"] == "matrix"));
-        assert!(handles
+        let endpoints = json["storage"]["registry"]["endpoints"].as_array().unwrap();
+        assert!(endpoints.iter().any(|item| item["id"] == "session"));
+        assert!(endpoints.iter().any(|item| item["id"] == "memory"));
+        assert!(endpoints.iter().any(|item| item["id"] == "matrix"));
+        assert!(endpoints
             .iter()
-            .any(|item| item["domain"] == "resource_directory"));
-        assert!(handles.iter().any(|item| item["domain"] == "tasks"));
+            .any(|item| item["domain"]["kind"] == "connector_directory"));
+        assert!(endpoints.iter().any(|item| item["id"] == "tasks"));
         assert!(
             json["storage"]["locks"].as_array().unwrap().len() >= 7,
             "storage lock list should include all core sqlite domains"
@@ -2942,7 +2942,7 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["id"] == "storage.tasks.layout"));
+            .any(|item| item["id"] == "storage.tasks.endpoint"));
         assert!(json["storage"]["migrations"]
             .as_array()
             .unwrap()

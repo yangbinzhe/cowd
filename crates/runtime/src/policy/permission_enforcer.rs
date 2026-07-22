@@ -740,14 +740,16 @@ pub struct DestructivePatternDetector {
 impl DestructivePatternDetector {
     /// Create a new detector with all built-in patterns
     pub fn new(config_dir: PathBuf) -> Self {
-        let storage_layout = storage::StorageLayout::default_for_config_home(&config_dir);
-        let approval_repository = FileApprovalRepository::from_storage_layout(&storage_layout)
-            .unwrap_or_else(|_| {
-                FileApprovalRepository::new(
-                    config_dir.join("storage").join("approval_history.json"),
-                    config_dir.join("storage").join("always_approved.json"),
-                )
-            });
+        let registry = storage::StorageRegistry::default_for_config_home(&config_dir);
+        let approval_repository = FileApprovalRepository::from_storage_endpoints(
+            registry
+                .endpoint(&storage::StorageDomainId::ApprovalHistory)
+                .expect("approval history endpoint is part of the default Cowd storage inventory"),
+            registry
+                .endpoint(&storage::StorageDomainId::AlwaysApproved)
+                .expect("always-approved endpoint is part of the default Cowd storage inventory"),
+        )
+        .expect("approval endpoints must use the file_json backend");
         let patterns = Self::build_patterns();
         Self {
             patterns,
