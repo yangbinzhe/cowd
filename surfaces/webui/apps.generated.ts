@@ -4,7 +4,7 @@ export const cowdAppSources = [
   {
     appId: "mfg",
     git: "https://gitee.com/eyeout/cowd-app-mfg",
-    rev: "2932eba83d30e05f24cee0e19713bc4640104000",
+    rev: "db13d02e611840b95160c8a4effb383c0835e399",
     package: "@cowd/app-mfg-webui",
   },
 ] as const;

@@ -391,7 +391,6 @@ impl StorageConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageRegistry {
     pub layout: StorageLayout,
-    pub handles: Vec<StorageHandle>,
     pub endpoints: Vec<StorageEndpoint>,
 }
 
@@ -402,65 +401,43 @@ impl StorageRegistry {
     }
 
     pub fn from_layout(layout: StorageLayout) -> Self {
-        let mut handles = Vec::new();
+        let mut endpoints = Vec::new();
         for (domain, path) in &layout.sqlite {
-            handles.push(StorageHandle {
+            endpoints.push(endpoint_from_handle(&StorageHandle {
                 domain: domain.clone(),
                 backend: StorageBackendKind::Sqlite,
                 path: path.clone(),
                 owner: owner_for_domain(domain).to_string(),
                 migration: "managed_by_storage_layout_since_0.9.295".to_string(),
-            });
+            }));
         }
         for (domain, path) in &layout.files {
-            handles.push(StorageHandle {
+            endpoints.push(endpoint_from_handle(&StorageHandle {
                 domain: domain.clone(),
                 backend: StorageBackendKind::FileJson,
                 path: path.clone(),
                 owner: owner_for_domain(domain).to_string(),
                 migration: "file_path_registered_since_0.9.295".to_string(),
-            });
+            }));
         }
         for (domain, path) in &layout.directories {
-            handles.push(StorageHandle {
+            endpoints.push(endpoint_from_handle(&StorageHandle {
                 domain: domain.clone(),
                 backend: StorageBackendKind::Directory,
                 path: path.clone(),
                 owner: owner_for_domain(domain).to_string(),
                 migration: "directory_registered_since_0.9.484".to_string(),
-            });
+            }));
         }
-        handles.push(StorageHandle {
+        endpoints.push(endpoint_from_handle(&StorageHandle {
             domain: "blobs".to_string(),
             backend: StorageBackendKind::BlobDirectory,
             path: layout.blobs.clone(),
             owner: "storage".to_string(),
             migration: "blob_root_registered_since_0.9.295".to_string(),
-        });
-        handles.sort_by(|left, right| left.domain.cmp(&right.domain));
-        let mut endpoints = handles.iter().map(endpoint_from_handle).collect::<Vec<_>>();
+        }));
         endpoints.sort_by(|left, right| left.logical_id().cmp(&right.logical_id()));
-        Self {
-            layout,
-            handles,
-            endpoints,
-        }
-    }
-
-    pub fn handle(&self, domain: &str) -> Option<&StorageHandle> {
-        self.handles.iter().find(|handle| handle.domain == domain)
-    }
-
-    pub fn sqlite_handle(&self, domain: &str) -> Result<&StorageHandle, StorageError> {
-        let handle = self.handle(domain).ok_or_else(|| {
-            StorageError::Other(format!("storage domain `{domain}` is not registered"))
-        })?;
-        if handle.backend != StorageBackendKind::Sqlite {
-            return Err(StorageError::Other(format!(
-                "storage domain `{domain}` is not sqlite-backed"
-            )));
-        }
-        Ok(handle)
+        Self { layout, endpoints }
     }
 
     pub fn endpoint(&self, domain: &StorageDomainId) -> Result<&StorageEndpoint, StorageError> {
@@ -694,28 +671,21 @@ fn is_storage_segment(value: &str) -> bool {
 pub struct StorageHealth {
     pub status: String,
     pub root: PathBuf,
-    pub handle_count: usize,
     pub endpoint_count: usize,
     pub present_count: usize,
     pub missing_count: usize,
-    pub handles: Vec<StorageHandleHealth>,
     pub endpoints: Vec<StorageEndpointHealth>,
 }
 
 impl StorageHealth {
     pub fn from_registry(registry: &StorageRegistry) -> Self {
-        let handles: Vec<StorageHandleHealth> = registry
-            .handles
-            .iter()
-            .map(StorageHandleHealth::from_handle)
-            .collect();
-        let present_count = handles.iter().filter(|handle| handle.present).count();
-        let missing_count = handles.len().saturating_sub(present_count);
         let endpoints = registry
             .endpoints
             .iter()
             .map(StorageEndpointHealth::from_endpoint)
             .collect::<Vec<_>>();
+        let present_count = endpoints.iter().filter(|endpoint| endpoint.present).count();
+        let missing_count = endpoints.len().saturating_sub(present_count);
         Self {
             status: if missing_count == 0 {
                 "ready".to_string()
@@ -723,11 +693,9 @@ impl StorageHealth {
                 "registered".to_string()
             },
             root: registry.layout.root.clone(),
-            handle_count: handles.len(),
             endpoint_count: endpoints.len(),
             present_count,
             missing_count,
-            handles,
             endpoints,
         }
     }
@@ -759,35 +727,6 @@ impl StorageEndpointHealth {
             backend: endpoint.backend.clone(),
             owner: endpoint.owner.clone(),
             present: endpoint.path.exists(),
-            writable_parent: writable_directory_or_existing_ancestor(parent),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StorageHandleHealth {
-    pub domain: String,
-    pub backend: StorageBackendKind,
-    pub path: PathBuf,
-    pub owner: String,
-    pub present: bool,
-    pub writable_parent: bool,
-}
-
-impl StorageHandleHealth {
-    fn from_handle(handle: &StorageHandle) -> Self {
-        let parent = match handle.backend {
-            StorageBackendKind::Directory | StorageBackendKind::BlobDirectory => {
-                handle.path.as_path()
-            }
-            _ => handle.path.parent().unwrap_or_else(|| Path::new(".")),
-        };
-        Self {
-            domain: handle.domain.clone(),
-            backend: handle.backend.clone(),
-            path: handle.path.clone(),
-            owner: handle.owner.clone(),
-            present: handle.path.exists(),
             writable_parent: writable_directory_or_existing_ancestor(parent),
         }
     }
@@ -1239,7 +1178,13 @@ mod tests {
             "audit_log",
             "blobs",
         ] {
-            assert!(registry.handle(domain).is_some(), "missing {domain}");
+            assert!(
+                registry
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.domain.logical_name() == domain),
+                "missing {domain}"
+            );
         }
         assert!(registry
             .endpoint(&StorageDomainId::Session)

@@ -7,7 +7,7 @@ use harness_contract::agent::{
 use matrix_core::{MatrixFact, MatrixFactInput, MatrixSourceKind, MatrixSourceSnapshotInput};
 use matrix_repository::open_matrix_sqlite_repository_handle;
 use runtime::{AgentBindingRequest, ContextSourceKind, RealityRecallPort, RuntimeServices};
-use storage::{SqliteConnectionFactory, StorageRegistry};
+use storage::{SqliteConnectionFactory, StorageDomainId, StorageRegistry};
 
 #[test]
 fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_binding() {
@@ -15,12 +15,13 @@ fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_bind
     let registry = StorageRegistry::default_for_config_home(home.path());
 
     let matrix_handle = registry
-        .sqlite_handle("matrix")
-        .expect("matrix storage handle");
+        .endpoint(&StorageDomainId::Matrix)
+        .expect("matrix storage endpoint")
+        .as_handle();
     std::fs::create_dir_all(matrix_handle.path.parent().expect("matrix parent"))
         .expect("matrix dir");
     let repository =
-        open_matrix_sqlite_repository_handle(matrix_handle).expect("matrix repository");
+        open_matrix_sqlite_repository_handle(&matrix_handle).expect("matrix repository");
     let snapshot = repository
         .create_source_snapshot(MatrixSourceSnapshotInput {
             snapshot_id: Some("recall-port-snapshot".to_string()),
@@ -55,10 +56,13 @@ fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_bind
         }))
         .expect("ingest Matrix fact");
 
-    let fact_handle = registry.sqlite_handle("fact").expect("fact storage handle");
+    let fact_handle = registry
+        .endpoint(&StorageDomainId::Fact)
+        .expect("fact storage endpoint")
+        .as_handle();
     std::fs::create_dir_all(fact_handle.path.parent().expect("fact parent")).expect("fact dir");
     let connection = SqliteConnectionFactory::default()
-        .open_handle(fact_handle)
+        .open_handle(&fact_handle)
         .expect("fact db");
     connection
         .execute_batch(

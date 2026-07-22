@@ -11449,10 +11449,13 @@ mod tests {
     async fn runtime_reality_binding_injects_only_leased_fact_evidence_into_the_prompt() {
         let home = tempfile::tempdir().expect("temporary config home");
         let registry = StorageRegistry::default_for_config_home(home.path());
-        let handle = registry.sqlite_handle("fact").expect("fact handle");
+        let handle = registry
+            .endpoint(&storage::StorageDomainId::Fact)
+            .expect("fact endpoint")
+            .as_handle();
         std::fs::create_dir_all(handle.path.parent().expect("fact parent")).expect("fact parent");
         let connection = SqliteConnectionFactory::default()
-            .open_handle(handle)
+            .open_handle(&handle)
             .expect("fact database");
         connection
             .execute_batch(

@@ -128,4 +128,32 @@ mod tests {
             assert!(ids.insert(descriptor.id));
         }
     }
+
+    #[test]
+    fn enabled_product_storage_is_resolved_from_app_declaration() {
+        let registry = registry_with_enabled_app_storage(
+            storage::StorageRegistry::default_for_config_home("/tmp/cowd-product-storage"),
+            &|app_id| app_id == "mfg",
+        )
+        .expect("declared MFG storage must resolve");
+        let scope = storage::StorageScope::App {
+            app_id: "mfg".to_string(),
+        };
+        let endpoint = registry
+            .endpoint_in_scope(&storage::StorageDomainId::app("mfg", "primary"), &scope)
+            .expect("MFG declared endpoint");
+        assert!(endpoint
+            .as_handle()
+            .path
+            .ends_with("storage/apps/mfg/primary.sqlite"));
+
+        let disabled = registry_with_enabled_app_storage(
+            storage::StorageRegistry::default_for_config_home("/tmp/cowd-product-storage"),
+            &|_| false,
+        )
+        .expect("disabled app has no storage collision");
+        assert!(disabled
+            .endpoint_in_scope(&storage::StorageDomainId::app("mfg", "primary"), &scope)
+            .is_err());
+    }
 }

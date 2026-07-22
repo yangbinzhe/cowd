@@ -2959,14 +2959,17 @@ pub(crate) mod tests {
         ));
         let config_home = tmp.join("config");
         let registry = storage::StorageRegistry::default_for_config_home(&config_home);
-        let handle = registry.sqlite_handle("growth").unwrap();
+        let handle = registry
+            .endpoint(&storage::StorageDomainId::Growth)
+            .unwrap()
+            .as_handle();
         std::fs::create_dir_all(handle.path.parent().unwrap()).unwrap();
         let conn = storage::SqliteConnectionFactory::default()
-            .open_handle(handle)
+            .open_handle(&handle)
             .unwrap();
         storage::MigrationRunner::run_sqlite_domain(
             &conn,
-            handle,
+            &handle,
             &crate::services::growth_storage_migrations(),
         )
         .unwrap();
@@ -3017,7 +3020,7 @@ pub(crate) mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["storage"]["registry"]["status"], "registered");
         assert!(
-            json["storage"]["registry"]["handle_count"]
+            json["storage"]["registry"]["endpoint_count"]
                 .as_u64()
                 .unwrap_or_default()
                 >= 11

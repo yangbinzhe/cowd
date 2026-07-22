@@ -571,9 +571,12 @@ mod tests {
     fn matrix_scenario_port_refuses_unleased_snapshot_and_returns_candidate_only() {
         let home = tempfile::tempdir().unwrap();
         let registry = StorageRegistry::default_for_config_home(home.path());
-        let handle = registry.sqlite_handle("matrix").unwrap();
+        let handle = registry
+            .endpoint(&storage::StorageDomainId::Matrix)
+            .unwrap()
+            .as_handle();
         std::fs::create_dir_all(handle.path.parent().unwrap()).unwrap();
-        let repository = open_matrix_sqlite_repository_handle(handle).unwrap();
+        let repository = open_matrix_sqlite_repository_handle(&handle).unwrap();
         let snapshot = repository
             .create_source_snapshot(MatrixSourceSnapshotInput {
                 snapshot_id: Some("scenario-port-snapshot".to_string()),
@@ -630,9 +633,12 @@ mod tests {
     fn recall_port_injects_only_binding_leased_fact_and_matrix_evidence() {
         let home = tempfile::tempdir().unwrap();
         let registry = StorageRegistry::default_for_config_home(home.path());
-        let matrix_handle = registry.sqlite_handle("matrix").unwrap();
+        let matrix_handle = registry
+            .endpoint(&storage::StorageDomainId::Matrix)
+            .unwrap()
+            .as_handle();
         std::fs::create_dir_all(matrix_handle.path.parent().unwrap()).unwrap();
-        let repository = open_matrix_sqlite_repository_handle(matrix_handle).unwrap();
+        let repository = open_matrix_sqlite_repository_handle(&matrix_handle).unwrap();
         let snapshot = repository
             .create_source_snapshot(MatrixSourceSnapshotInput {
                 snapshot_id: Some("recall-port-snapshot".to_string()),
@@ -667,10 +673,13 @@ mod tests {
             }))
             .unwrap();
 
-        let fact_handle = registry.sqlite_handle("fact").unwrap();
+        let fact_handle = registry
+            .endpoint(&storage::StorageDomainId::Fact)
+            .unwrap()
+            .as_handle();
         std::fs::create_dir_all(fact_handle.path.parent().unwrap()).unwrap();
         let connection = SqliteConnectionFactory::default()
-            .open_handle(fact_handle)
+            .open_handle(&fact_handle)
             .unwrap();
         connection
             .execute_batch(

@@ -1073,10 +1073,10 @@ mod tests {
         ));
         let conn = open_growth_store(&config_home).expect("growth store should open");
         let path = StorageRegistry::default_for_config_home(&config_home)
-            .sqlite_handle("growth")
-            .expect("growth handle")
-            .path
-            .clone();
+            .endpoint(&storage::StorageDomainId::Growth)
+            .expect("growth endpoint")
+            .as_handle()
+            .path;
         assert!(path.ends_with("storage/growth.sqlite"));
         assert!(path.exists());
         let table_count: i64 = conn

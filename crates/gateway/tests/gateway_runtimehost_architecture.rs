@@ -948,7 +948,7 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     assert!(
         storage_source.contains("(\"growth\".to_string(), root.join(\"growth.sqlite\"))")
             && growth_service.contains("StorageRegistry::default_for_config_home")
-            && growth_service.contains(".sqlite_handle(\"growth\")")
+            && growth_service.contains("StorageDomainId::Growth")
             && growth_service.contains("MigrationRunner::run_sqlite_domain")
             && growth_service.contains("growth_storage_migrations")
             && growth_service.contains("growth_events")
