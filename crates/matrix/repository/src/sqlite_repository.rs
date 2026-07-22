@@ -5,12 +5,11 @@ use std::path::Path;
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::{SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
-use crate::MatrixSqliteDataPlane;
+use crate::{MatrixHealth, MatrixMetricRecomputeResult, MatrixRevisioned, MatrixSqliteDataPlane};
 use matrix_core::{
     build_metric_compute_jobs, MatrixAttentionItem, MatrixChangeEvent, MatrixComputeJob,
     MatrixComputeJobInput, MatrixComputePlan, MatrixConnectorRun, MatrixConnectorRunInput,
@@ -48,51 +47,6 @@ pub enum MatrixSqliteRepositoryError {
         expected: Option<u64>,
         actual: Option<u64>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MatrixRevisioned<T> {
-    pub resource: T,
-    pub previous_revision: Option<u64>,
-    pub revision: u64,
-    pub created: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MatrixHealth {
-    pub schema_version: i64,
-    pub fact_count: u64,
-    pub metric_definition_count: u64,
-    pub metric_state_count: u64,
-    pub change_count: u64,
-    pub attention_count: u64,
-    pub evidence_count: u64,
-    pub entity_count: u64,
-    pub relation_count: u64,
-    pub metric_dependency_count: u64,
-    pub compute_job_count: u64,
-    pub quality_gate_count: u64,
-    pub source_pack_count: u64,
-    pub data_plane_watermark_count: u64,
-    pub connector_run_count: u64,
-    pub source_snapshot_count: u64,
-    pub ontology_pack_count: u64,
-    pub entity_match_candidate_count: u64,
-    pub entity_conflict_decision_count: u64,
-    pub metric_snapshot_count: u64,
-    pub scenario_spec_count: u64,
-    pub scenario_run_count: u64,
-    pub scenario_result_count: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MatrixMetricRecomputeResult {
-    pub metric_state_count: usize,
-    pub change_count: usize,
-    pub attention_count: usize,
-    pub metric_states: Vec<MatrixMetricState>,
-    pub changes: Vec<MatrixChangeEvent>,
-    pub attention: Vec<MatrixAttentionItem>,
 }
 
 #[derive(Debug)]

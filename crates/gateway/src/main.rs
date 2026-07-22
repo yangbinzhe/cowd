@@ -50,8 +50,8 @@ mod init;
 mod lark_cli_tool;
 #[path = "core/logging.rs"]
 mod logging;
-#[path = "infrastructure/matrix_sqlite_repository.rs"]
-mod matrix_sqlite_repository;
+#[path = "infrastructure/matrix_store.rs"]
+mod matrix_store;
 #[path = "runtime/mcp_serve.rs"]
 mod mcp_serve;
 #[path = "static/plugin_static.rs"]

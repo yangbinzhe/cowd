@@ -78,7 +78,7 @@ impl MatrixService {
         resource_kind: &str,
         resource_id: &str,
     ) -> Result<u64, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .resource_revision_for_existing(resource_kind, resource_id)
     }
 
@@ -86,14 +86,14 @@ impl MatrixService {
         &self,
         config_home: impl AsRef<Path>,
     ) -> Result<MatrixHealth, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.health()
+        self.store(config_home)?.health()
     }
 
     pub(crate) fn data_plane_health(
         &self,
         config_home: impl AsRef<Path>,
     ) -> Result<MatrixDataPlaneHealth, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.data_plane_health()
+        self.store(config_home)?.data_plane_health()
     }
 
     pub(crate) fn upsert_source_pack(
@@ -101,8 +101,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         source_pack: MatrixSourcePack,
     ) -> Result<MatrixSourcePack, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .upsert_source_pack(source_pack)
+        self.store(config_home)?.upsert_source_pack(source_pack)
     }
 
     pub(crate) fn upsert_source_pack_checked(
@@ -112,7 +111,7 @@ impl MatrixService {
         expected_revision: Option<u64>,
     ) -> Result<matrix_repository::MatrixRevisioned<MatrixSourcePack>, GatewayMatrixRepositoryError>
     {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .upsert_source_pack_checked(source_pack, expected_revision)
     }
 
@@ -121,8 +120,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         limit: usize,
     ) -> Result<Vec<MatrixSourcePack>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .list_source_packs(limit)
+        self.store(config_home)?.list_source_packs(limit)
     }
 
     pub(crate) fn get_source_pack(
@@ -130,8 +128,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         source_pack_id: &str,
     ) -> Result<Option<MatrixSourcePack>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .get_source_pack(source_pack_id)
+        self.store(config_home)?.get_source_pack(source_pack_id)
     }
 
     pub(crate) fn validate_source_pack(
@@ -139,7 +136,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         source_pack_id: &str,
     ) -> Result<MatrixSourcePackValidation, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .validate_source_pack(source_pack_id)
     }
 
@@ -148,7 +145,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         source_pack_id: &str,
     ) -> Result<MatrixSourceDeltaPlan, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .source_pack_delta_plan(source_pack_id)
     }
 
@@ -158,7 +155,7 @@ impl MatrixService {
         source_pack_id: &str,
         input: MatrixConnectorRunInput,
     ) -> Result<MatrixConnectorRun, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .plan_connector_run(source_pack_id, input)
     }
 
@@ -167,8 +164,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         run_id: &str,
     ) -> Result<Option<MatrixConnectorRun>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .get_connector_run(run_id)
+        self.store(config_home)?.get_connector_run(run_id)
     }
 
     pub(crate) fn plan_source_snapshot(
@@ -178,11 +174,8 @@ impl MatrixService {
         resource_ref: Option<String>,
         estimated_rows: Option<u64>,
     ) -> Result<MatrixSourceSnapshotPlan, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.plan_source_snapshot(
-            source_pack_id,
-            resource_ref,
-            estimated_rows,
-        )
+        self.store(config_home)?
+            .plan_source_snapshot(source_pack_id, resource_ref, estimated_rows)
     }
 
     pub(crate) fn create_source_snapshot(
@@ -190,8 +183,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         input: MatrixSourceSnapshotInput,
     ) -> Result<MatrixSourceSnapshot, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .create_source_snapshot(input)
+        self.store(config_home)?.create_source_snapshot(input)
     }
 
     pub(crate) fn get_source_snapshot(
@@ -199,8 +191,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         snapshot_id: &str,
     ) -> Result<Option<MatrixSourceSnapshot>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .get_source_snapshot(snapshot_id)
+        self.store(config_home)?.get_source_snapshot(snapshot_id)
     }
 
     pub(crate) fn list_source_snapshots(
@@ -209,7 +200,7 @@ impl MatrixService {
         source_pack_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MatrixSourceSnapshot>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .list_source_snapshots(source_pack_id, limit)
     }
 
@@ -220,7 +211,7 @@ impl MatrixService {
         snapshot: MatrixSourceSnapshot,
         rows: &[Value],
     ) -> Result<MatrixSourceSnapshotApplyReport, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .apply_source_snapshot_rows(source_pack_id, snapshot, rows)
     }
 
@@ -242,7 +233,7 @@ impl MatrixService {
         watermark_after: Option<SourceWatermark>,
         final_chunk: bool,
     ) -> Result<SourceIngestionReceipt, GatewayMatrixRepositoryError> {
-        let repository = self.sqlite_repository(&config_home)?;
+        let repository = self.store(&config_home)?;
         let source_pack_id = source_pack_id_for_batch(batch);
         let table = batch
             .table
@@ -395,8 +386,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         input: MatrixDataPlaneIngestPlanInput,
     ) -> Result<MatrixDataPlaneIngestPlan, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .plan_data_plane_ingest(input)
+        self.store(config_home)?.plan_data_plane_ingest(input)
     }
 
     pub(crate) fn list_facts(
@@ -404,7 +394,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         limit: usize,
     ) -> Result<Vec<MatrixFact>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.list_facts(limit)
+        self.store(config_home)?.list_facts(limit)
     }
 
     pub(crate) fn ingest_fact(
@@ -412,7 +402,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         fact: &MatrixFact,
     ) -> Result<MatrixAttentionItem, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.ingest_fact(fact)
+        self.store(config_home)?.ingest_fact(fact)
     }
 
     pub(crate) fn list_entities(
@@ -420,7 +410,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         limit: usize,
     ) -> Result<Vec<MatrixEntity>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.list_entities(limit)
+        self.store(config_home)?.list_entities(limit)
     }
 
     pub(crate) fn upsert_entity(
@@ -428,7 +418,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         entity: &MatrixEntity,
     ) -> Result<MatrixEntity, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.upsert_entity(entity)
+        self.store(config_home)?.upsert_entity(entity)
     }
 
     pub(crate) fn upsert_entity_checked(
@@ -438,7 +428,7 @@ impl MatrixService {
         expected_revision: Option<u64>,
     ) -> Result<matrix_repository::MatrixRevisioned<MatrixEntity>, GatewayMatrixRepositoryError>
     {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .upsert_entity_checked(entity, expected_revision)
     }
 
@@ -447,7 +437,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         entity_id: &str,
     ) -> Result<Option<MatrixEntity>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.get_entity(entity_id)
+        self.store(config_home)?.get_entity(entity_id)
     }
 
     pub(crate) fn resolve_entity_by_source_key(
@@ -456,7 +446,7 @@ impl MatrixService {
         source_system: &str,
         source_key: &str,
     ) -> Result<Option<MatrixEntity>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .resolve_entity_by_source_key(source_system, source_key)
     }
 
@@ -466,7 +456,7 @@ impl MatrixService {
         left_entity_id: &str,
         right_entity_id: &str,
     ) -> Result<MatrixEntityMatchCandidate, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .propose_entity_match(left_entity_id, right_entity_id)
     }
 
@@ -479,7 +469,7 @@ impl MatrixService {
         survivorship_rule: &str,
         notes: Option<String>,
     ) -> Result<MatrixEntityConflictDecision, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.decide_entity_conflict(
+        self.store(config_home)?.decide_entity_conflict(
             candidate_id,
             survivor_entity_id,
             retired_entity_id,
@@ -493,8 +483,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         relation: &MatrixRelation,
     ) -> Result<MatrixRelation, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .upsert_relation(relation)
+        self.store(config_home)?.upsert_relation(relation)
     }
 
     pub(crate) fn upsert_relation_checked(
@@ -504,7 +493,7 @@ impl MatrixService {
         expected_revision: Option<u64>,
     ) -> Result<matrix_repository::MatrixRevisioned<MatrixRelation>, GatewayMatrixRepositoryError>
     {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .upsert_relation_checked(relation, expected_revision)
     }
 
@@ -514,7 +503,7 @@ impl MatrixService {
         entity_id: &str,
         limit: usize,
     ) -> Result<Vec<MatrixRelation>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .list_entity_relations(entity_id, limit)
     }
 
@@ -524,8 +513,7 @@ impl MatrixService {
         entity_id: &str,
         max_depth: usize,
     ) -> Result<MatrixImpactTrace, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .impact_trace(entity_id, max_depth)
+        self.store(config_home)?.impact_trace(entity_id, max_depth)
     }
 
     pub(crate) fn list_evidence_packets(
@@ -533,16 +521,14 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         limit: usize,
     ) -> Result<Vec<MatrixEvidencePacket>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .list_evidence_packets(limit)
+        self.store(config_home)?.list_evidence_packets(limit)
     }
 
     pub(crate) fn list_metric_definitions(
         &self,
         config_home: impl AsRef<Path>,
     ) -> Result<Vec<MatrixMetricDefinition>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .list_metric_definitions()
+        self.store(config_home)?.list_metric_definitions()
     }
 
     pub(crate) fn metric_states(
@@ -550,8 +536,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         metric_id: &str,
     ) -> Result<Vec<MatrixMetricState>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .metric_states(metric_id)
+        self.store(config_home)?.metric_states(metric_id)
     }
 
     pub(crate) fn metric_lineage(
@@ -560,7 +545,7 @@ impl MatrixService {
         metric_id: &str,
         max_depth: usize,
     ) -> Result<MatrixMetricLineage, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .metric_lineage(metric_id, max_depth)
     }
 
@@ -572,7 +557,7 @@ impl MatrixService {
         period: Option<String>,
         limit: usize,
     ) -> Result<MatrixMetricAttentionPlan, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.plan_metric_attention(
+        self.store(config_home)?.plan_metric_attention(
             trigger_fact_type,
             entity_scope,
             period,
@@ -586,7 +571,7 @@ impl MatrixService {
         metric_ids: Vec<String>,
         scope_ref: Option<String>,
     ) -> Result<MatrixMetricSnapshot, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .materialize_metric_snapshot(metric_ids, scope_ref)
     }
 
@@ -595,7 +580,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         dependency: &MatrixMetricDependency,
     ) -> Result<MatrixMetricDependency, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .upsert_metric_dependency(dependency)
     }
 
@@ -608,7 +593,7 @@ impl MatrixService {
         matrix_repository::MatrixRevisioned<MatrixMetricDependency>,
         GatewayMatrixRepositoryError,
     > {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .upsert_metric_dependency_checked(dependency, expected_revision)
     }
 
@@ -617,7 +602,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         fact_type: &str,
     ) -> Result<Vec<String>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .metrics_affected_by_fact_type(fact_type)
     }
 
@@ -626,7 +611,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         input: MatrixComputeJobInput,
     ) -> Result<MatrixComputePlan, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .plan_compute_job_for_fact_type(input)
     }
 
@@ -635,7 +620,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         job_id: &str,
     ) -> Result<Option<MatrixComputeJob>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.get_compute_job(job_id)
+        self.store(config_home)?.get_compute_job(job_id)
     }
 
     pub(crate) fn run_compute_job(
@@ -643,14 +628,14 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         job_id: &str,
     ) -> Result<MatrixComputeJob, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.run_compute_job(job_id)
+        self.store(config_home)?.run_compute_job(job_id)
     }
 
     pub(crate) fn recompute_metrics(
         &self,
         config_home: impl AsRef<Path>,
     ) -> Result<matrix_repository::MatrixMetricRecomputeResult, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.recompute_metrics()
+        self.store(config_home)?.recompute_metrics()
     }
 
     pub(crate) fn list_changes(
@@ -658,7 +643,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         limit: usize,
     ) -> Result<Vec<MatrixChangeEvent>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.list_changes(limit)
+        self.store(config_home)?.list_changes(limit)
     }
 
     pub(crate) fn list_attention(
@@ -666,7 +651,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         limit: usize,
     ) -> Result<Vec<MatrixAttentionItem>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?.list_attention(limit)
+        self.store(config_home)?.list_attention(limit)
     }
 
     pub(crate) fn build_evidence_packet(
@@ -675,7 +660,7 @@ impl MatrixService {
         attention_id: Option<&str>,
         problem_statement: Option<&str>,
     ) -> Result<MatrixEvidencePacket, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .build_evidence_packet(attention_id, problem_statement)
     }
 
@@ -684,7 +669,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         packet: &MatrixEvidencePacket,
     ) -> Result<MatrixEvidencePacket, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .insert_ai_harness_evidence_packet(packet)
     }
 
@@ -693,7 +678,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         input: memory::KnowledgeMatrixBridgeInput,
     ) -> Result<Vec<MatrixAttentionItem>, GatewayMatrixRepositoryError> {
-        let repository = self.sqlite_repository(config_home)?;
+        let repository = self.store(config_home)?;
         let source_pack = MatrixSourcePack {
             source_pack_id: input.source_pack_id.clone(),
             source_name: input.source_name.clone(),
@@ -794,8 +779,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         packet_id: &str,
     ) -> Result<Option<MatrixEvidencePacket>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .get_evidence_packet(packet_id)
+        self.store(config_home)?.get_evidence_packet(packet_id)
     }
 
     pub(crate) fn evaluate_evidence_quality(
@@ -803,7 +787,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         packet_id: &str,
     ) -> Result<MatrixQualityGateDecision, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .evaluate_evidence_quality(packet_id)
     }
 
@@ -813,7 +797,7 @@ impl MatrixService {
         packet_id: &str,
         gate_id: &str,
     ) -> Result<MatrixQualityGateDecision, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
+        self.store(config_home)?
             .evaluate_evidence_quality_with_gate_id(packet_id, gate_id)
     }
 
@@ -822,8 +806,7 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         gate_id: &str,
     ) -> Result<Option<MatrixQualityGateDecision>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .get_quality_gate(gate_id)
+        self.store(config_home)?.get_quality_gate(gate_id)
     }
 
     pub(crate) fn connector_source_watermark(
@@ -836,7 +819,7 @@ impl MatrixService {
         let fact_type = format!("source.{adapter_id}.row");
         let partition_ref = table.unwrap_or("default-partition");
         Ok(self
-            .sqlite_repository(config_home)?
+            .store(config_home)?
             .get_data_plane_watermark(resource_ref, &fact_type, partition_ref)?
             .map(|watermark| SourceWatermark {
                 adapter_id: watermark
@@ -865,12 +848,11 @@ impl MatrixService {
         config_home: impl AsRef<Path>,
         limit: usize,
     ) -> Result<Vec<MatrixDataPlaneWatermark>, GatewayMatrixRepositoryError> {
-        self.sqlite_repository(config_home)?
-            .list_data_plane_watermarks(limit)
+        self.store(config_home)?.list_data_plane_watermarks(limit)
     }
 
     pub(crate) fn structured_runtime_ready(&self, config_home: impl AsRef<Path>) -> (bool, bool) {
-        let Ok(store) = self.sqlite_repository(config_home) else {
+        let Ok(store) = self.store(config_home) else {
             return (false, false);
         };
         let indexes_ready = store.list_source_packs(1).is_ok()

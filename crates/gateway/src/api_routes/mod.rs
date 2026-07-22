@@ -1635,6 +1635,22 @@ pub(crate) mod tests {
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
         tool_workspace_root: PathBuf,
     ) -> Arc<crate::services::GatewayServices> {
+        test_services_for_workspace_with_config_home(
+            session_kernel,
+            task_kernel,
+            surface_host,
+            tool_workspace_root,
+            isolated_test_config_home(),
+        )
+    }
+
+    fn test_services_for_workspace_with_config_home(
+        session_kernel: Arc<SessionKernel>,
+        task_kernel: Arc<TaskKernel>,
+        surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
+        tool_workspace_root: PathBuf,
+        config_home: PathBuf,
+    ) -> Arc<crate::services::GatewayServices> {
         let sessions = Arc::new(ActiveSessions::new());
         let runtime_services =
             runtime::RuntimeServices::in_memory().expect("test runtime services");
@@ -1682,7 +1698,7 @@ pub(crate) mod tests {
             Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
                 runtime::session_lifecycle::SessionLifecycleConfig::default(),
             )),
-            isolated_test_config_home(),
+            config_home,
         ))
     }
 
@@ -1842,14 +1858,15 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: workspace_root.clone(),
-            config_home,
+            config_home: config_home.clone(),
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services_for_workspace(
+            services: test_services_for_workspace_with_config_home(
                 session_kernel,
                 task_kernel,
                 None,
                 workspace_root,
+                config_home.clone(),
             ),
             session_lease_registry: None,
         })
@@ -1966,14 +1983,15 @@ pub(crate) mod tests {
             approval_gate: None,
             auth_token: None,
             workspace_root: workspace_root.clone(),
-            config_home,
+            config_home: config_home.clone(),
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services_for_workspace(
+            services: test_services_for_workspace_with_config_home(
                 session_kernel,
                 task_kernel,
                 None,
                 workspace_root,
+                config_home,
             ),
             session_lease_registry: None,
         })

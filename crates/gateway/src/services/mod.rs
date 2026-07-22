@@ -78,7 +78,7 @@ pub(crate) use surface_service::SurfaceService;
 pub(crate) use task_service::TaskService;
 
 pub(crate) type GatewayMemoryManager = CognitiveContextManager;
-pub(crate) type GatewayMatrixRepositoryError = ::matrix_repository::MatrixSqliteRepositoryError;
+pub(crate) type GatewayMatrixRepositoryError = ::matrix_repository::MatrixStoreError;
 pub(crate) type RuntimeContextBoundary = runtime::ContextRuntimeKernel;
 
 #[allow(dead_code)]

@@ -14,7 +14,9 @@ use fact_kernel::{
 };
 use harness_contract::agent::AgentBindingSnapshot;
 use matrix_core::{MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioSpec, MatrixSnapshotRef};
-use matrix_repository::{open_matrix_sqlite_repository_handle, MatrixSqliteRepository};
+#[cfg(test)]
+use matrix_repository::open_matrix_sqlite_repository_handle;
+use matrix_repository::{MatrixStore, MatrixStoreHandle};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::StorageRegistry;
@@ -50,8 +52,9 @@ impl RealityRecallReport {
 /// intentionally stateless so every request must carry a Binding snapshot.
 #[derive(Clone)]
 pub struct RealityRecallPort {
-    config_home: PathBuf,
     fact_ledger: Arc<dyn FactLedger>,
+    matrix_store: Option<Arc<dyn MatrixStore>>,
+    matrix_store_error: Option<String>,
 }
 
 impl RealityRecallPort {
@@ -66,9 +69,12 @@ impl RealityRecallPort {
             })
             .map(|ledger| Arc::new(ledger) as Arc<dyn FactLedger>)
             .unwrap_or_else(|error| Arc::new(UnavailableFactLedger::new(error)));
+        let (matrix_store, matrix_store_error) = matrix_store_for_config_home(&config_home)
+            .map_or_else(|error| (None, Some(error)), |store| (Some(store), None));
         Self {
-            config_home,
             fact_ledger: ledger,
+            matrix_store,
+            matrix_store_error,
         }
     }
 
@@ -80,9 +86,29 @@ impl RealityRecallPort {
         config_home: impl Into<PathBuf>,
         fact_ledger: Arc<dyn FactLedger>,
     ) -> Self {
+        let config_home = config_home.into();
+        let (matrix_store, matrix_store_error) = matrix_store_for_config_home(&config_home)
+            .map_or_else(|error| (None, Some(error)), |store| (Some(store), None));
         Self {
-            config_home: config_home.into(),
             fact_ledger,
+            matrix_store,
+            matrix_store_error,
+        }
+    }
+
+    /// Compose Runtime against prevalidated durable Fact and Matrix ports.
+    /// Global selected-backend composition injects both adapters here; Runtime
+    /// never opens a Matrix concrete repository on a recall/scenario path.
+    #[must_use]
+    pub fn with_fact_and_matrix_store(
+        _config_home: impl Into<PathBuf>,
+        fact_ledger: Arc<dyn FactLedger>,
+        matrix_store: Arc<dyn MatrixStore>,
+    ) -> Self {
+        Self {
+            fact_ledger,
+            matrix_store: Some(matrix_store),
+            matrix_store_error: None,
         }
     }
 
@@ -118,7 +144,8 @@ impl RealityRecallPort {
     #[must_use]
     pub fn matrix_scenarios(&self) -> MatrixScenarioPort {
         MatrixScenarioPort {
-            config_home: self.config_home.clone(),
+            matrix_store: self.matrix_store.clone(),
+            matrix_store_error: self.matrix_store_error.clone(),
         }
     }
 
@@ -197,7 +224,7 @@ impl RealityRecallPort {
                 ),
             );
         }
-        let repository = match open_matrix_repository(&self.config_home) {
+        let repository = match self.matrix_store() {
             Ok(repository) => repository,
             Err(error) => {
                 return (
@@ -244,13 +271,22 @@ impl RealityRecallPort {
             },
         )
     }
+
+    fn matrix_store(&self) -> Result<&Arc<dyn MatrixStore>, String> {
+        self.matrix_store.as_ref().ok_or_else(|| {
+            self.matrix_store_error
+                .clone()
+                .unwrap_or_else(|| "Matrix store is unavailable".to_string())
+        })
+    }
 }
 
 /// Matrix scenario command owned by Runtime. Gateway and surfaces may invoke
 /// it through Runtime APIs but never receive a repository write handle.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MatrixScenarioPort {
-    config_home: PathBuf,
+    matrix_store: Option<Arc<dyn MatrixStore>>,
+    matrix_store_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -266,7 +302,7 @@ impl MatrixScenarioPort {
         request: MatrixScenarioStartRequest,
     ) -> Result<MatrixScenarioRun, String> {
         ensure_matrix_snapshot_granted(binding, &request.spec.base_snapshot)?;
-        let repository = open_matrix_repository(&self.config_home)?;
+        let repository = self.matrix_store()?;
         let spec = repository
             .create_scenario_spec(request.spec)
             .map_err(|error| error.to_string())?;
@@ -280,7 +316,7 @@ impl MatrixScenarioPort {
         binding: &AgentBindingSnapshot,
         result: MatrixScenarioResult,
     ) -> Result<MatrixScenarioResult, String> {
-        let repository = open_matrix_repository(&self.config_home)?;
+        let repository = self.matrix_store()?;
         let run = repository
             .get_scenario_run(&result.run_id)
             .map_err(|error| error.to_string())?
@@ -300,7 +336,7 @@ impl MatrixScenarioPort {
         result: &MatrixScenarioResult,
         statement: impl Into<String>,
     ) -> Result<FactCandidate, String> {
-        let repository = open_matrix_repository(&self.config_home)?;
+        let repository = self.matrix_store()?;
         let run = repository
             .get_scenario_run(&result.run_id)
             .map_err(|error| error.to_string())?
@@ -329,6 +365,14 @@ impl MatrixScenarioPort {
             format!("result:{}", result.result_id),
         ]))
     }
+
+    fn matrix_store(&self) -> Result<&Arc<dyn MatrixStore>, String> {
+        self.matrix_store.as_ref().ok_or_else(|| {
+            self.matrix_store_error
+                .clone()
+                .unwrap_or_else(|| "Matrix store is unavailable".to_string())
+        })
+    }
 }
 
 fn ensure_matrix_snapshot_granted(
@@ -350,16 +394,15 @@ fn ensure_matrix_snapshot_granted(
     Ok(())
 }
 
-fn open_matrix_repository(config_home: &Path) -> Result<MatrixSqliteRepository, String> {
+fn matrix_store_for_config_home(config_home: &Path) -> Result<Arc<dyn MatrixStore>, String> {
     let registry = StorageRegistry::default_for_config_home(config_home);
-    let handle = registry
+    let endpoint = registry
         .endpoint(&storage::StorageDomainId::Matrix)
-        .map(storage::StorageEndpoint::as_handle)
+        .cloned()
         .map_err(|error| error.to_string())?;
-    if let Some(parent) = handle.path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    open_matrix_sqlite_repository_handle(&handle).map_err(|error| error.to_string())
+    MatrixStoreHandle::new(endpoint)
+        .open()
+        .map_err(|error| error.to_string())
 }
 
 fn fact_granted(
