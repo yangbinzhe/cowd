@@ -35,6 +35,8 @@ hyper = { version = "1", features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "http2", "tokio"] }
 libc = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 reqwest.workspace = true
 runtime = { path = "../runtime" }
 sandbox-launcher = { path = "../sandbox-launcher" }

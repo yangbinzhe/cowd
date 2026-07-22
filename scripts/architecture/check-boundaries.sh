@@ -27,6 +27,25 @@ check_empty() {
   fi
 }
 
+if [[ "${1:-}" == "--v566-sqlite" ]]; then
+  # This focused gate is intentionally independent from older whole-repository
+  # architecture checks. It verifies the V566 ownership boundary without
+  # claiming unrelated historical checks have passed.
+  check_empty "V566 durable owners must use StorageRuntime executors" \
+    bash -c 'for file in \
+      crates/connector/src/lib.rs \
+      crates/matrix/repository/src/sqlite_repository.rs \
+      crates/runtime/src/recovery/runtime_event_store.rs \
+      crates/runtime/src/mission/task.rs \
+      crates/runtime/src/context/reality_recall_port.rs \
+      crates/gateway/src/surface_host/message_store.rs \
+      crates/gateway/src/services/growth_service.rs \
+      crates/gateway/src/infrastructure/gateway_health.rs; do
+      awk "/#\[cfg\(test\)\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"
+    done | rg -n "Connection::open\\(|SqliteConnectionManager::file|Mutex<Connection>|SqliteConnectionFactory" || true'
+  exit "$fail"
+fi
+
 check_empty "cli business command names" \
   rg -n "\\b(run|chat|prompt|mcp serve)\\b" crates/cli/src/main.rs --glob '*.rs'
 

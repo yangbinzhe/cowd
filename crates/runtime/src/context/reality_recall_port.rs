@@ -15,7 +15,7 @@ use matrix_repository::{open_matrix_sqlite_repository_handle, MatrixSqliteReposi
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage::{SqliteConnectionFactory, StorageRegistry};
+use storage::{SqliteExecutor, StorageRegistry};
 
 use crate::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 
@@ -337,15 +337,14 @@ fn open_matrix_repository(config_home: &Path) -> Result<MatrixSqliteRepository, 
 
 fn load_fact_records(config_home: &Path) -> Result<Vec<fact_kernel::FactRecord>, String> {
     let registry = StorageRegistry::default_for_config_home(config_home);
-    let handle = registry
+    let endpoint = registry
         .endpoint(&storage::StorageDomainId::Fact)
-        .map(storage::StorageEndpoint::as_handle)
         .map_err(|error| error.to_string())?;
-    if !handle.path.exists() {
+    if !endpoint.path.exists() {
         return Ok(Vec::new());
     }
-    let connection = SqliteConnectionFactory::default()
-        .open_handle(&handle)
+    let connection = SqliteExecutor::for_endpoint(endpoint)
+        .and_then(|executor| executor.checkout())
         .map_err(|error| error.to_string())?;
     let table_exists = connection
         .query_row(
@@ -524,7 +523,7 @@ mod tests {
         MatrixFact, MatrixFactInput, MatrixScenarioOutputContract, MatrixSourceKind,
         MatrixSourceSnapshotInput,
     };
-    use storage::StorageRegistry;
+    use storage::{SqliteExecutor, StorageRegistry};
 
     fn binding(config_home: &Path, snapshot_ref: Option<String>) -> AgentBindingSnapshot {
         let _ = config_home;
@@ -678,8 +677,9 @@ mod tests {
             .unwrap()
             .as_handle();
         std::fs::create_dir_all(fact_handle.path.parent().unwrap()).unwrap();
-        let connection = SqliteConnectionFactory::default()
-            .open_handle(&fact_handle)
+        let connection = SqliteExecutor::for_handle(&fact_handle)
+            .unwrap()
+            .checkout()
             .unwrap();
         connection
             .execute_batch(

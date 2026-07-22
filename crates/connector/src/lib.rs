@@ -576,7 +576,7 @@ impl ResourceDirectory {
 
 #[derive(Debug)]
 pub struct SqliteResourceDirectory {
-    connection: Mutex<Connection>,
+    executor: storage::SqliteExecutor,
 }
 
 impl SqliteResourceDirectory {
@@ -591,29 +591,31 @@ impl SqliteResourceDirectory {
     }
 
     pub fn open_storage_handle(handle: &storage::StorageHandle) -> rusqlite::Result<Self> {
-        let connection = storage::SqliteConnectionFactory::default()
-            .open_handle(handle)
+        let executor = storage::SqliteExecutor::for_handle(handle)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        Self::from_connection(connection)
+        Self::from_executor(executor)
     }
 
     pub fn in_memory() -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        let executor = storage::SqliteExecutor::in_memory("connector-resource-directory")
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        Self::from_executor(executor)
     }
 
-    fn from_connection(connection: Connection) -> rusqlite::Result<Self> {
+    fn from_executor(executor: storage::SqliteExecutor) -> rusqlite::Result<Self> {
+        let connection = executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         initialize_resource_directory_schema(&connection)?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-        })
+        Ok(Self { executor })
     }
 
     pub fn upsert(&self, resource: &ExternalResourceRef) -> rusqlite::Result<ExternalResourceRef> {
         let now = Utc::now().to_rfc3339();
         let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         connection.execute(
             r"INSERT INTO connector_resources (
                 reference, provider, account_id, resource_type, title, source,
@@ -648,9 +650,9 @@ impl SqliteResourceDirectory {
 
     pub fn get(&self, reference: &str) -> rusqlite::Result<Option<ExternalResourceRef>> {
         let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         connection
             .query_row(
                 r"SELECT reference, provider, account_id, resource_type, title, source,
@@ -673,9 +675,9 @@ impl SqliteResourceDirectory {
         offset: usize,
     ) -> rusqlite::Result<Vec<ExternalResourceRef>> {
         let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let mut statement = connection.prepare(
             r"SELECT reference, provider, account_id, resource_type, title, source,
                 permissions_summary, digest, indexed_state
@@ -696,9 +698,9 @@ impl SqliteResourceDirectory {
         }
         let pattern = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
         let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let mut statement = connection.prepare(
             r"SELECT reference, provider, account_id, resource_type, title, source,
                 permissions_summary, digest, indexed_state
@@ -727,9 +729,9 @@ impl SqliteResourceDirectory {
     fn update_indexed_state(&self, reference: &str, indexed_state: &str) -> rusqlite::Result<bool> {
         let now = Utc::now().to_rfc3339();
         let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let changed = connection.execute(
             "UPDATE connector_resources SET indexed_state = ?1, updated_at = ?2 WHERE reference = ?3",
             params![indexed_state, now, reference],
@@ -745,9 +747,9 @@ impl SqliteResourceDirectory {
     ) -> rusqlite::Result<()> {
         let now = Utc::now().to_rfc3339();
         let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .executor
+            .checkout()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         connection.execute(
             r"INSERT OR REPLACE INTO connector_resource_sources
                 (reference, source_kind, source_id, attached_at)
@@ -1375,5 +1377,34 @@ mod tests {
                 .indexed_state,
             "stale"
         );
+    }
+
+    #[test]
+    fn sqlite_resource_directory_accepts_parallel_independent_upserts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = std::sync::Arc::new(
+            SqliteResourceDirectory::open(temporary.path().join("resources.sqlite")).unwrap(),
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let directory = std::sync::Arc::clone(&directory);
+            let barrier = std::sync::Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let resource = ExternalResourceRef::new(
+                    "local.docs",
+                    "document",
+                    format!("parallel-{index}"),
+                    format!("Parallel {index}"),
+                );
+                directory.upsert(&resource).unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(directory.list_recent(32).unwrap().len(), 8);
     }
 }

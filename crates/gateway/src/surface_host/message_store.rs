@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use harness_contract::managed_agent::ManagedAgentTriggerEvent;
@@ -172,7 +171,7 @@ struct SurfaceMessageState {
 #[derive(Debug, Clone)]
 pub(crate) struct SurfaceMessageStore {
     root: PathBuf,
-    database: Arc<Mutex<Connection>>,
+    executor: storage::SqliteExecutor,
 }
 
 impl SurfaceMessageStore {
@@ -195,32 +194,42 @@ impl SurfaceMessageStore {
             .parent()
             .map(Path::to_path_buf)
             .expect("surface storage endpoint must name a database file");
-        Self::open_at(root, database_path)
+        let executor = storage::SqliteExecutor::for_endpoint(endpoint).unwrap_or_else(|error| {
+            tracing::error!(error = %error, "surface durable executor creation failed");
+            eprintln!("surface durable executor creation failed: {error}");
+            std::process::abort();
+        });
+        Self::open_with_executor(root, executor)
     }
 
     fn open_at(root: PathBuf, database_path: PathBuf) -> Self {
-        if let Err(error) = fs::create_dir_all(&root) {
-            tracing::error!(path = %root.display(), error = %error, "surface durable store directory creation failed");
-            eprintln!("surface durable store directory creation failed: {error}");
+        let handle = storage::StorageHandle::sqlite(
+            "surface_messages",
+            database_path,
+            "surface",
+            "surface_message_executor",
+        );
+        let executor = storage::SqliteExecutor::for_handle(&handle).unwrap_or_else(|error| {
+            tracing::error!(error = %error, "surface durable executor creation failed");
+            eprintln!("surface durable executor creation failed: {error}");
             std::process::abort();
-        }
-        let connection = match Connection::open(&database_path) {
-            Ok(connection) => connection,
-            Err(error) => {
-                tracing::error!(path = %database_path.display(), error = %error, "surface durable store open failed");
-                eprintln!("surface durable store open failed: {error}");
-                std::process::abort();
-            }
-        };
+        });
+        Self::open_with_executor(root, executor)
+    }
+
+    fn open_with_executor(root: PathBuf, executor: storage::SqliteExecutor) -> Self {
+        let connection = executor.checkout().unwrap_or_else(|error| {
+            tracing::error!(path = %root.display(), error = %error, "surface durable store open failed");
+            eprintln!("surface durable store open failed: {error}");
+            std::process::abort();
+        });
         if let Err(error) = initialize_database(&connection) {
             tracing::error!(path = %root.display(), error = %error, "surface durable store schema initialization failed");
             eprintln!("surface durable store schema initialization failed: {error}");
             std::process::abort();
         }
-        let store = Self {
-            root,
-            database: Arc::new(Mutex::new(connection)),
-        };
+        drop(connection);
+        let store = Self { root, executor };
         if let Err(error) = store.import_legacy_jsonl_once() {
             tracing::error!(path = %store.root.display(), error = %error, "surface JSONL import failed");
             eprintln!("surface JSONL import failed: {error}");
@@ -270,7 +279,10 @@ impl SurfaceMessageStore {
         let record_key = format!("surface-ingress:{}", hash_json(&frame_json));
         let session_id = super::ingress::surface_session_id(surface, payload);
         let now = now_ms();
-        let connection = self.lock_connection()?;
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         connection
             .execute(
                 "INSERT OR IGNORE INTO surface_ingress_frame(
@@ -298,9 +310,12 @@ impl SurfaceMessageStore {
     ) -> Result<Vec<SurfaceIngressClaim>, String> {
         let now = now_ms();
         let lease_until = now.saturating_add(lease_ms.max(1));
-        let mut connection = self.lock_connection()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         transaction
             .execute(
@@ -382,7 +397,10 @@ impl SurfaceMessageStore {
     }
 
     pub(crate) fn complete_ingress_frame(&self, record_key: &str) -> Result<(), String> {
-        let connection = self.lock_connection()?;
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         connection
             .execute(
                 "UPDATE surface_ingress_frame
@@ -396,7 +414,10 @@ impl SurfaceMessageStore {
     }
 
     pub(crate) fn fail_ingress_frame(&self, record_key: &str, error: &str) -> Result<(), String> {
-        let connection = self.lock_connection()?;
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         let (attempts, max_attempts) = connection
             .query_row(
                 "SELECT attempts, max_attempts FROM surface_ingress_frame WHERE record_key=?1",
@@ -429,7 +450,9 @@ impl SurfaceMessageStore {
 
     #[cfg(test)]
     pub(crate) fn ingress_frame_count(&self) -> usize {
-        self.lock_connection()
+        self.executor
+            .checkout()
+            .map_err(|error| error.to_string())
             .ok()
             .and_then(|connection| {
                 connection
@@ -1538,9 +1561,12 @@ impl SurfaceMessageStore {
         T: for<'de> Deserialize<'de> + Serialize,
     {
         let table = table_for_file(file)?;
-        let mut connection = self.lock_connection()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let payload = transaction
             .query_row(
@@ -1559,9 +1585,12 @@ impl SurfaceMessageStore {
 
     fn upsert_record<T: Serialize>(&self, file: &str, record: &T) -> Result<(), String> {
         let value = serde_json::to_value(record).map_err(|error| error.to_string())?;
-        let mut connection = self.lock_connection()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         upsert_json_record(&transaction, file, &value)?;
         transaction.commit().map_err(|error| error.to_string())
@@ -1576,7 +1605,10 @@ impl SurfaceMessageStore {
         let table = table_for_file(file)?;
         let (key, surface, status, next_retry_at_ms, updated_at_ms) = record_columns(file, &value)?;
         let payload = value.to_string();
-        let connection = self.lock_connection()?;
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         connection
             .execute(
                 &format!(
@@ -1602,9 +1634,12 @@ impl SurfaceMessageStore {
         file: &str,
         records: &[T],
     ) -> Result<(), String> {
-        let mut connection = self.lock_connection()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         transaction
             .execute(&format!("DELETE FROM {}", table_for_file(file)?), [])
@@ -1617,18 +1652,18 @@ impl SurfaceMessageStore {
     }
 
     fn lock_state(&self) -> Result<SurfaceMessageState, String> {
-        let connection = self.lock_connection()?;
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         load_database_state(&connection)
     }
 
-    fn lock_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, String> {
-        self.database
-            .lock()
-            .map_err(|_| "surface message store lock poisoned".to_string())
-    }
-
     fn import_legacy_jsonl_once(&self) -> Result<(), String> {
-        let mut connection = self.lock_connection()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         let imported = connection
             .query_row(
                 "SELECT value FROM surface_store_meta WHERE key = 'legacy_jsonl_import_v1'",
@@ -1642,7 +1677,7 @@ impl SurfaceMessageStore {
         }
         let state = load_legacy_state(&self.root)?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         persist_state_transaction(&transaction, &state)?;
         let evidence = legacy_import_evidence(&self.root, &state);
@@ -1657,7 +1692,10 @@ impl SurfaceMessageStore {
 
     fn reconcile_after_restart(&self) -> Result<(), String> {
         {
-            let connection = self.lock_connection()?;
+            let connection = self
+                .executor
+                .checkout()
+                .map_err(|error| error.to_string())?;
             let now = now_ms();
             connection
                 .execute(
@@ -1674,9 +1712,12 @@ impl SurfaceMessageStore {
         normalize_terminal_outbox_state(&mut state);
         normalize_trigger_event_state(&mut state);
         reconcile_inbox_with_outbox(&mut state);
-        let mut connection = self.lock_connection()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         let transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         persist_state_transaction(&transaction, &state)?;
         transaction.commit().map_err(|error| error.to_string())
@@ -2197,6 +2238,7 @@ fn outbox_failure_reason(record: &SurfaceOutboxRecord) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn trigger_event(id: &str) -> ManagedAgentTriggerEvent {
         ManagedAgentTriggerEvent {
@@ -2872,7 +2914,8 @@ mod tests {
         let store = SurfaceMessageStore::new(&root);
         assert_eq!(store.list_inbox("feishu").len(), 1);
         let evidence = store
-            .lock_connection()
+            .executor
+            .checkout()
             .unwrap()
             .query_row(
                 "SELECT value FROM surface_store_meta WHERE key='legacy_jsonl_import_v1'",

@@ -43,6 +43,7 @@ pub(crate) struct StorageGatewaySnapshot {
     pub(crate) registry: StorageHealth,
     pub(crate) migrations: Vec<storage::StorageMigration>,
     pub(crate) locks: Vec<StorageLockDiagnostics>,
+    pub(crate) executors: Vec<storage::SqliteExecutorHealth>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +99,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
                 StorageLockDiagnostics::for_handle(&endpoint.as_handle(), pragma.busy_timeout_ms)
             })
             .collect(),
+        executors: storage::StorageRuntime::global().sqlite_health(),
     };
     let status = if runtime.session_kernel && runtime.event_bus {
         "healthy"
@@ -123,12 +125,10 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
 }
 
 fn inspect_growth_migrations(registry: &StorageRegistry) -> Vec<storage::StorageMigration> {
-    let Ok(handle) = registry
-        .endpoint(&storage::StorageDomainId::Growth)
-        .map(storage::StorageEndpoint::as_handle)
-    else {
+    let Ok(endpoint) = registry.endpoint(&storage::StorageDomainId::Growth) else {
         return Vec::new();
     };
+    let handle = endpoint.as_handle();
     let specs = growth_storage_migrations();
     if !handle.path.exists() {
         return specs
@@ -144,7 +144,7 @@ fn inspect_growth_migrations(registry: &StorageRegistry) -> Vec<storage::Storage
             })
             .collect();
     }
-    match storage::SqliteConnectionFactory::default().open_handle(&handle) {
+    match storage::SqliteExecutor::for_endpoint(endpoint).and_then(|executor| executor.checkout()) {
         Ok(connection) => {
             match MigrationRunner::inspect_sqlite_domain(&connection, &handle, &specs) {
                 Ok(reports) => reports,

@@ -17,13 +17,13 @@ use memory::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use storage::{MigrationRunner, SqliteConnectionFactory, StorageMigrationSpec, StorageRegistry};
+use storage::{MigrationRunner, SqliteExecutor, StorageMigrationSpec, StorageRegistry};
 
 use super::{GrowthService, MatrixService, MemoryService};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct GatewayFactStore {
-    db_handle: Option<storage::StorageHandle>,
+    db_executor: Option<SqliteExecutor>,
     facts: BTreeMap<String, FactRecord>,
     evidence: BTreeMap<String, EvidencePacket>,
 }
@@ -35,16 +35,11 @@ impl GatewayFactStore {
 
     pub(crate) fn open_for_config_home(config_home: impl AsRef<Path>) -> Result<Self, String> {
         let registry = StorageRegistry::default_for_config_home(config_home);
-        let handle = registry
+        let endpoint = registry
             .endpoint(&storage::StorageDomainId::Fact)
-            .map(storage::StorageEndpoint::as_handle)
             .map_err(|error| error.to_string())?;
-        if let Some(parent) = handle.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        let conn = SqliteConnectionFactory::default()
-            .open_handle(&handle)
-            .map_err(|error| error.to_string())?;
+        let executor = SqliteExecutor::for_endpoint(endpoint).map_err(|error| error.to_string())?;
+        let conn = executor.checkout().map_err(|error| error.to_string())?;
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS fact_records (
@@ -66,18 +61,20 @@ impl GatewayFactStore {
         let facts = load_fact_records(&conn)?;
         let evidence = load_fact_evidence(&conn)?;
         Ok(Self {
-            db_handle: Some(handle.clone()),
+            db_executor: Some(executor),
             facts,
             evidence,
         })
     }
 
-    fn connection(&self) -> Result<Option<Connection>, String> {
-        let Some(handle) = self.db_handle.as_ref() else {
+    fn connection(
+        &self,
+    ) -> Result<Option<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>>, String> {
+        let Some(executor) = self.db_executor.as_ref() else {
             return Ok(None);
         };
-        SqliteConnectionFactory::default()
-            .open_handle(handle)
+        executor
+            .checkout()
             .map(Some)
             .map_err(|error| error.to_string())
     }
@@ -621,18 +618,16 @@ impl GrowthService {
     }
 }
 
-fn open_growth_store(config_home: &Path) -> Result<Connection, String> {
+fn open_growth_store(
+    config_home: &Path,
+) -> Result<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>, String> {
     let registry = StorageRegistry::default_for_config_home(config_home);
-    let handle = registry
+    let endpoint = registry
         .endpoint(&storage::StorageDomainId::Growth)
-        .map(storage::StorageEndpoint::as_handle)
         .map_err(|error| error.to_string())?;
-    if let Some(parent) = handle.path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let conn = SqliteConnectionFactory::default()
-        .open_handle(&handle)
-        .map_err(|error| error.to_string())?;
+    let executor = SqliteExecutor::for_endpoint(endpoint).map_err(|error| error.to_string())?;
+    let conn = executor.checkout().map_err(|error| error.to_string())?;
+    let handle = endpoint.as_handle();
     let migration_reports =
         MigrationRunner::run_sqlite_domain(&conn, &handle, &growth_storage_migrations())
             .map_err(|error| error.to_string())?;

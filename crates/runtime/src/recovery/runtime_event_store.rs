@@ -6,12 +6,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use storage::{SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
 const STORE_SCHEMA_VERSION: i64 = 4;
@@ -142,6 +142,8 @@ pub enum RuntimeEventStoreError {
     Serialization(#[from] serde_json::Error),
     #[error("runtime event store I/O failure: {0}")]
     Io(#[from] std::io::Error),
+    #[error("runtime event store storage failure: {0}")]
+    Storage(#[from] storage::StorageError),
 }
 
 pub type RuntimeEventStoreResult<T> = Result<T, RuntimeEventStoreError>;
@@ -302,7 +304,7 @@ pub struct RuntimeSessionOutboxHealth {
 #[derive(Debug)]
 pub struct RuntimeEventStore {
     path: PathBuf,
-    conn: Mutex<Connection>,
+    executor: SqliteExecutor,
 }
 
 impl RuntimeEventStore {
@@ -312,16 +314,17 @@ impl RuntimeEventStore {
 
     pub fn try_open(path: impl AsRef<Path>) -> RuntimeEventStoreResult<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut conn = Connection::open(&path)?;
+        let handle = StorageHandle::sqlite(
+            "runtime_events",
+            path.clone(),
+            "runtime",
+            "runtime_event_executor",
+        );
+        let executor = SqliteExecutor::for_handle(&handle)?;
+        let mut conn = executor.checkout()?;
         configure_connection(&conn, false)?;
         migrate_schema(&mut conn)?;
-        Ok(Self {
-            path,
-            conn: Mutex::new(conn),
-        })
+        Ok(Self { path, executor })
     }
 
     pub fn open_in_memory() -> Result<Self, String> {
@@ -329,12 +332,13 @@ impl RuntimeEventStore {
     }
 
     pub fn try_open_in_memory() -> RuntimeEventStoreResult<Self> {
-        let mut conn = Connection::open_in_memory()?;
+        let executor = SqliteExecutor::in_memory("runtime-event-store")?;
+        let mut conn = executor.checkout()?;
         configure_connection(&conn, true)?;
         migrate_schema(&mut conn)?;
         Ok(Self {
             path: PathBuf::from(":memory:"),
-            conn: Mutex::new(conn),
+            executor,
         })
     }
 
@@ -356,8 +360,8 @@ impl RuntimeEventStore {
         input: RuntimeEventInput,
     ) -> RuntimeEventStoreResult<DurableRuntimeEvent> {
         validate_event(&input)?;
-        let mut conn = lock_connection(&self.conn);
-        let tx = conn.transaction()?;
+        let mut conn = self.executor.checkout()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let expected_revision = stream_head(&tx, &input.stream_id)?;
         let request = AppendTransactionRequest {
             transaction_id: format!("runtime-tx-{}", uuid::Uuid::new_v4()),
@@ -382,8 +386,8 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
         validate_transaction(&request)?;
-        let mut conn = lock_connection(&self.conn);
-        let tx = conn.transaction()?;
+        let mut conn = self.executor.checkout()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let receipt = append_transaction_in_tx(&tx, &request, None)?;
         tx.commit()?;
         Ok(receipt)
@@ -394,8 +398,8 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: SessionTerminalInput,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let mut conn = lock_connection(&self.conn);
-        let tx = conn.transaction()?;
+        let mut conn = self.executor.checkout()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let receipt = append_transaction_in_tx(&tx, &request, Some(&terminal))?;
         tx.commit()?;
         Ok(receipt)
@@ -426,8 +430,8 @@ impl RuntimeEventStore {
                 "decision lease consumption requires non-empty bound claims".to_string(),
             ));
         }
-        let mut conn = lock_connection(&self.conn);
-        let tx = conn.transaction()?;
+        let mut conn = self.executor.checkout()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO runtime_consumed_decision_leases \
              (lease_id, principal_id, review_id, action, scope, evidence_digest, credential_epoch, consumed_at_ms) \
@@ -470,8 +474,8 @@ impl RuntimeEventStore {
             lease.evidence_digest(),
         )?;
         validate_transaction(&request)?;
-        let mut conn = lock_connection(&self.conn);
-        let tx = conn.transaction()?;
+        let mut conn = self.executor.checkout()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let receipt = append_transaction_in_tx(&tx, &request, None)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO runtime_consumed_decision_leases \
@@ -558,7 +562,7 @@ impl RuntimeEventStore {
         if max_commits == 0 {
             return Ok(Vec::new());
         }
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         let mut stmt = conn.prepare(
             "SELECT commit_cursor, transaction_id FROM runtime_commits \
              WHERE commit_cursor > ?1 ORDER BY commit_cursor ASC LIMIT ?2",
@@ -585,7 +589,7 @@ impl RuntimeEventStore {
         stream_id: &str,
         idempotency_key: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         conn.query_row(
             &format!(
                 "{} WHERE stream_id = ?1 AND idempotency_key = ?2",
@@ -599,7 +603,7 @@ impl RuntimeEventStore {
     }
 
     pub fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64> {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         stream_head(&conn, stream_id)
     }
 
@@ -703,7 +707,7 @@ impl RuntimeEventStore {
         &self,
         scope: RuntimeEventScope,
     ) -> RuntimeEventStoreResult<Vec<String>> {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         let mut statement = conn.prepare(
             "SELECT stream_id FROM runtime_events
              WHERE scope = ?1
@@ -732,7 +736,10 @@ impl RuntimeEventStore {
         &self,
         stream_id: &str,
     ) -> Result<Option<DurableRuntimeEvent>, String> {
-        let conn = lock_connection(&self.conn);
+        let conn = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
         conn.query_row(
             &format!(
                 "{} WHERE stream_id = ?1 ORDER BY sequence DESC LIMIT 1",
@@ -753,7 +760,7 @@ impl RuntimeEventStore {
     where
         P: rusqlite::Params,
     {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         let mut stmt = conn.prepare(sql)?;
         let events = stmt
             .query_map(params, row_to_event)?
@@ -771,7 +778,7 @@ impl RuntimeEventStore {
         commit_cursor: u64,
         payload_ref: &str,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         conn.execute(
             "INSERT INTO runtime_session_outbox
              (terminal_id, message_id, session_id, commit_cursor, payload_ref, status, revision)
@@ -814,8 +821,8 @@ impl RuntimeEventStore {
                 "terminal claim requires worker, lease and limit".to_string(),
             ));
         }
-        let mut conn = lock_connection(&self.conn);
-        let tx = conn.transaction()?;
+        let mut conn = self.executor.checkout()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let ids = {
             let mut statement = tx.prepare(
                 "SELECT terminal_id FROM runtime_session_outbox
@@ -854,7 +861,8 @@ impl RuntimeEventStore {
         &self,
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
-        query_runtime_session_outbox(&lock_connection(&self.conn), terminal_id)
+        let connection = self.executor.checkout()?;
+        query_runtime_session_outbox(&connection, terminal_id)
     }
 
     /// Return already materialized terminal commits after a durable runtime
@@ -866,7 +874,7 @@ impl RuntimeEventStore {
         after_commit_cursor: u64,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         let mut statement = conn.prepare(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
@@ -893,7 +901,7 @@ impl RuntimeEventStore {
     }
 
     pub fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth> {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         let mut health = RuntimeSessionOutboxHealth::default();
         let mut statement =
             conn.prepare("SELECT status, COUNT(*) FROM runtime_session_outbox GROUP BY status")?;
@@ -918,7 +926,7 @@ impl RuntimeEventStore {
         &self,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         let mut statement = conn.prepare(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
@@ -948,7 +956,7 @@ impl RuntimeEventStore {
                 "manual terminal retry requires actor and reason".to_string(),
             ));
         }
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         let changed = conn.execute(
             "UPDATE runtime_session_outbox SET status='retry_scheduled', next_attempt_at=?1,
              claim_owner=NULL, claim_expires_at=NULL, failure_class=NULL,
@@ -1000,7 +1008,7 @@ impl RuntimeEventStore {
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
         let current = {
-            let conn = lock_connection(&self.conn);
+            let conn = self.executor.checkout()?;
             query_runtime_session_outbox(&conn, terminal_id)?
         }
         .ok_or_else(|| {
@@ -1030,7 +1038,7 @@ impl RuntimeEventStore {
         retry_at_ms: Option<u64>,
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        let conn = lock_connection(&self.conn);
+        let conn = self.executor.checkout()?;
         let (failure_class, last_error) = failure.unzip();
         let changed = conn.execute(
             "UPDATE runtime_session_outbox SET status=?1, next_attempt_at=?2,
@@ -1092,7 +1100,7 @@ fn migrate_schema(conn: &mut Connection) -> RuntimeEventStoreResult<()> {
     if current == STORE_SCHEMA_VERSION {
         return validate_schema(conn);
     }
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     create_current_tables(&tx)?;
     migrate_legacy_runtime_events(&tx)?;
     tx.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
@@ -1684,12 +1692,6 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> RuntimeEven
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(columns.iter().any(|candidate| candidate == column))
-}
-
-fn lock_connection(mutex: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn now_ms() -> u64 {

@@ -2,13 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::Mutex;
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage::{SqliteConnectionFactory, StorageHandle};
+use storage::{SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
 use crate::MatrixSqliteDataPlane;
@@ -98,41 +97,33 @@ pub struct MatrixMetricRecomputeResult {
 
 #[derive(Debug)]
 pub struct MatrixSqliteRepository {
-    connection: Mutex<Connection>,
+    executor: SqliteExecutor,
 }
 
 impl MatrixSqliteRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MatrixSqliteRepositoryError> {
-        let connection = Connection::open(path)?;
-        Self::from_connection(connection)
+        let handle = StorageHandle::sqlite("matrix", path.as_ref(), "matrix", "matrix_executor");
+        Self::open_storage_handle(&handle)
     }
 
     pub fn open_storage_handle(
         handle: &StorageHandle,
     ) -> Result<Self, MatrixSqliteRepositoryError> {
-        let connection = SqliteConnectionFactory::default().open_handle(handle)?;
-        Self::from_connection(connection)
+        Self::from_executor(SqliteExecutor::for_handle(handle)?)
     }
 
     pub fn in_memory() -> Result<Self, MatrixSqliteRepositoryError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_executor(SqliteExecutor::in_memory("matrix-repository")?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, MatrixSqliteRepositoryError> {
-        connection.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()))?;
-        connection.query_row("PRAGMA busy_timeout=5000", [], |_| Ok(()))?;
-        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+    fn from_executor(executor: SqliteExecutor) -> Result<Self, MatrixSqliteRepositoryError> {
+        let connection = executor.checkout()?;
         initialize_schema(&connection)?;
-        Ok(Self {
-            connection: Mutex::new(connection),
-        })
+        Ok(Self { executor })
     }
 
     pub fn health(&self) -> Result<MatrixHealth, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         Ok(MatrixHealth {
             schema_version: schema_version(&connection)?,
             fact_count: count_table(&connection, "matrix_fact")?,
@@ -179,10 +170,7 @@ impl MatrixSqliteRepository {
         let mut plan = MatrixSqliteDataPlane::new(self.health()?.data_plane_watermark_count)
             .plan_ingest(input);
         if plan.affected_metric_ids.is_empty() {
-            let connection = self
-                .connection
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let connection = self.executor.checkout()?;
             let mut affected = metrics_affected_by_fact_type(&connection, &plan.fact_type)?;
             affected.extend(metric_ids_for_fact_type(&connection, &plan.fact_type)?);
             // A source-pack is the canonical declaration of the metrics that
@@ -233,11 +221,9 @@ impl MatrixSqliteRepository {
         &self,
         plan: &MatrixDataPlaneIngestPlan,
     ) -> Result<MatrixDataPlaneWatermark, MatrixSqliteRepositoryError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let mut connection = self.executor.checkout()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let resource_id = data_plane_watermark_resource_id(&plan.watermark);
         let exists = transaction
             .query_row(
@@ -285,10 +271,7 @@ impl MatrixSqliteRepository {
         resource_kind: &str,
         resource_id: &str,
     ) -> Result<u64, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         Ok(connection
             .query_row(
                 "SELECT revision FROM matrix_resource_revision
@@ -315,11 +298,9 @@ impl MatrixSqliteRepository {
         expected_revision: Option<u64>,
         enforce_revision: bool,
     ) -> Result<MatrixRevisioned<MatrixEntity>, MatrixSqliteRepositoryError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let mut connection = self.executor.checkout()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing =
             find_entity_by_canonical(&transaction, &entity.entity_type, &entity.canonical_key)?;
         let resource_id = existing
@@ -349,10 +330,7 @@ impl MatrixSqliteRepository {
         &self,
         entity_id: &str,
     ) -> Result<Option<MatrixEntity>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_entity(&connection, entity_id)
     }
 
@@ -361,10 +339,7 @@ impl MatrixSqliteRepository {
         source_system: &str,
         source_key: &str,
     ) -> Result<Option<MatrixEntity>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_entity_by_source_key(&connection, source_system, source_key)
     }
 
@@ -372,10 +347,7 @@ impl MatrixSqliteRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<MatrixEntity>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         list_entities(&connection, limit)
     }
 
@@ -383,10 +355,7 @@ impl MatrixSqliteRepository {
         &self,
         ontology_id: &str,
     ) -> Result<Option<MatrixOntologyPack>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_ontology_pack(&connection, ontology_id)
     }
 
@@ -395,10 +364,7 @@ impl MatrixSqliteRepository {
         left_entity_id: &str,
         right_entity_id: &str,
     ) -> Result<matrix_core::MatrixEntityMatchCandidate, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let left = find_entity(&connection, left_entity_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(left_entity_id.to_string()))?;
         let right = find_entity(&connection, right_entity_id)?
@@ -419,10 +385,7 @@ impl MatrixSqliteRepository {
         survivorship_rule: &str,
         notes: Option<String>,
     ) -> Result<matrix_core::MatrixEntityConflictDecision, MatrixSqliteRepositoryError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut connection = self.executor.checkout()?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let survivor = find_entity(&transaction, survivor_entity_id)?
@@ -482,10 +445,7 @@ impl MatrixSqliteRepository {
         period: Option<String>,
         limit: usize,
     ) -> Result<MatrixMetricAttentionPlan, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let mut metric_ids = metrics_affected_by_fact_type(&connection, trigger_fact_type)?;
         metric_ids.extend(metric_ids_for_fact_type(&connection, trigger_fact_type)?);
         metric_ids.sort();
@@ -506,10 +466,7 @@ impl MatrixSqliteRepository {
         metric_ids: Vec<String>,
         scope_ref: Option<String>,
     ) -> Result<MatrixMetricSnapshot, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let snapshot = build_metric_snapshot(&connection, metric_ids, scope_ref)?;
         insert_metric_snapshot(&connection, &snapshot)?;
         Ok(snapshot)
@@ -538,11 +495,9 @@ impl MatrixSqliteRepository {
         expected_revision: Option<u64>,
         enforce_revision: bool,
     ) -> Result<MatrixRevisioned<MatrixRelation>, MatrixSqliteRepositoryError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let mut connection = self.executor.checkout()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = find_relation_by_key(
             &transaction,
             &relation.relation_type,
@@ -582,10 +537,7 @@ impl MatrixSqliteRepository {
         entity_id: &str,
         limit: usize,
     ) -> Result<Vec<MatrixRelation>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         if find_entity(&connection, entity_id)?.is_none() {
             return Err(MatrixSqliteRepositoryError::NotFound(entity_id.to_string()));
         }
@@ -597,10 +549,7 @@ impl MatrixSqliteRepository {
         entity_id: &str,
         max_depth: usize,
     ) -> Result<MatrixImpactTrace, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         if find_entity(&connection, entity_id)?.is_none() {
             return Err(MatrixSqliteRepositoryError::NotFound(entity_id.to_string()));
         }
@@ -611,10 +560,7 @@ impl MatrixSqliteRepository {
         &self,
         definition: &MatrixMetricDefinition,
     ) -> Result<(), MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         upsert_metric_definition(&connection, definition)
     }
 
@@ -641,11 +587,9 @@ impl MatrixSqliteRepository {
         expected_revision: Option<u64>,
         enforce_revision: bool,
     ) -> Result<MatrixRevisioned<MatrixMetricDependency>, MatrixSqliteRepositoryError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let mut connection = self.executor.checkout()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = find_metric_dependency_by_key(
             &transaction,
             &dependency.upstream_metric_id,
@@ -685,10 +629,7 @@ impl MatrixSqliteRepository {
         metric_id: &str,
         max_depth: usize,
     ) -> Result<MatrixMetricLineage, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         build_metric_lineage(&connection, metric_id, max_depth)
     }
 
@@ -696,10 +637,7 @@ impl MatrixSqliteRepository {
         &self,
         fact_type: &str,
     ) -> Result<Vec<String>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         metrics_affected_by_fact_type(&connection, fact_type)
     }
 
@@ -707,10 +645,7 @@ impl MatrixSqliteRepository {
         &self,
         input: MatrixComputeJobInput,
     ) -> Result<MatrixComputePlan, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let mut affected_metric_ids = if input.metric_ids.is_empty() {
             metrics_affected_by_fact_type(&connection, &input.trigger_fact_type)?
         } else {
@@ -738,10 +673,7 @@ impl MatrixSqliteRepository {
         &self,
         job_id: &str,
     ) -> Result<Option<MatrixComputeJob>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_compute_job(&connection, job_id)
     }
 
@@ -750,10 +682,7 @@ impl MatrixSqliteRepository {
         job_id: &str,
     ) -> Result<MatrixComputeJob, MatrixSqliteRepositoryError> {
         let mut job = {
-            let connection = self
-                .connection
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let connection = self.executor.checkout()?;
             let mut job = find_compute_job(&connection, job_id)?
                 .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(job_id.to_string()))?;
             job.status = "running".to_string();
@@ -772,10 +701,7 @@ impl MatrixSqliteRepository {
             "attention_count": recompute.attention_count,
         });
         job.updated_at = Utc::now();
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         upsert_compute_job(&connection, &job)
     }
 
@@ -789,10 +715,7 @@ impl MatrixSqliteRepository {
             fact.entity_refs.first().cloned(),
             fact.confidence,
         );
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         connection.execute(
             r"INSERT OR REPLACE INTO matrix_fact (
                 fact_id, snapshot_id, fact_type, entity_refs_json, metric_key,
@@ -844,11 +767,9 @@ impl MatrixSqliteRepository {
         enforce_revision: bool,
     ) -> Result<MatrixRevisioned<MatrixSourcePack>, MatrixSqliteRepositoryError> {
         let mut source_pack = source_pack.normalized();
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let mut connection = self.executor.checkout()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let existing = find_source_pack(&transaction, &source_pack.source_pack_id)?;
         if let Some(existing) = &existing {
             source_pack.created_at = existing.created_at.to_owned();
@@ -881,10 +802,7 @@ impl MatrixSqliteRepository {
         &self,
         source_pack_id: &str,
     ) -> Result<Option<MatrixSourcePack>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_source_pack(&connection, source_pack_id)
     }
 
@@ -892,10 +810,7 @@ impl MatrixSqliteRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<MatrixSourcePack>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         list_source_packs(&connection, limit)
     }
 
@@ -903,10 +818,7 @@ impl MatrixSqliteRepository {
         &self,
         source_pack_id: &str,
     ) -> Result<MatrixSourcePackValidation, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let source_pack = find_source_pack(&connection, source_pack_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
         Ok(source_pack.validate())
@@ -916,10 +828,7 @@ impl MatrixSqliteRepository {
         &self,
         source_pack_id: &str,
     ) -> Result<MatrixSourceDeltaPlan, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let source_pack = find_source_pack(&connection, source_pack_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
         source_pack_delta_plan_for(&connection, &source_pack)
@@ -930,10 +839,7 @@ impl MatrixSqliteRepository {
         source_pack_id: &str,
         input: MatrixConnectorRunInput,
     ) -> Result<MatrixConnectorRun, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let source_pack = find_source_pack(&connection, source_pack_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
         let delta_plan = source_pack_delta_plan_for(&connection, &source_pack)?;
@@ -946,10 +852,7 @@ impl MatrixSqliteRepository {
         &self,
         run_id: &str,
     ) -> Result<Option<MatrixConnectorRun>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_connector_run(&connection, run_id)
     }
 
@@ -959,10 +862,7 @@ impl MatrixSqliteRepository {
         resource_ref: Option<String>,
         estimated_rows: Option<u64>,
     ) -> Result<MatrixSourceSnapshotPlan, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let source_pack = find_source_pack(&connection, source_pack_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
         let delta_plan = source_pack_delta_plan_for(&connection, &source_pack)?;
@@ -985,10 +885,7 @@ impl MatrixSqliteRepository {
         &self,
         snapshot: MatrixSourceSnapshot,
     ) -> Result<MatrixSourceSnapshot, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         insert_source_snapshot(&connection, &snapshot)?;
         Ok(snapshot)
     }
@@ -1004,10 +901,7 @@ impl MatrixSqliteRepository {
         &self,
         snapshot_id: &str,
     ) -> Result<Option<MatrixSourceSnapshot>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_source_snapshot(&connection, snapshot_id)
     }
 
@@ -1016,10 +910,7 @@ impl MatrixSqliteRepository {
         source_pack_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MatrixSourceSnapshot>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         list_source_snapshots(&connection, source_pack_id, limit)
     }
 
@@ -1032,10 +923,7 @@ impl MatrixSqliteRepository {
     ) -> Result<MatrixScenarioSpec, MatrixSqliteRepositoryError> {
         spec.validate()
             .map_err(MatrixSqliteRepositoryError::InvalidScenario)?;
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let snapshot_id = &spec.base_snapshot.snapshot_id;
         if find_source_snapshot(&connection, snapshot_id)?.is_none() {
             return Err(MatrixSqliteRepositoryError::NotFound(format!(
@@ -1050,10 +938,7 @@ impl MatrixSqliteRepository {
         &self,
         scenario_id: &str,
     ) -> Result<Option<MatrixScenarioSpec>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_scenario_spec(&connection, scenario_id)
     }
 
@@ -1061,10 +946,7 @@ impl MatrixSqliteRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<MatrixScenarioSpec>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         list_scenario_specs(&connection, limit)
     }
 
@@ -1076,10 +958,7 @@ impl MatrixSqliteRepository {
         scenario_id: &str,
         parameters: Value,
     ) -> Result<MatrixScenarioRun, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let spec = find_scenario_spec(&connection, scenario_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(scenario_id.to_string()))?;
         let run = MatrixScenarioRun::start(&spec, parameters);
@@ -1093,10 +972,7 @@ impl MatrixSqliteRepository {
         &self,
         run_id: &str,
     ) -> Result<Option<MatrixScenarioRun>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_scenario_run(&connection, run_id)
     }
 
@@ -1105,10 +981,7 @@ impl MatrixSqliteRepository {
         scenario_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<MatrixScenarioRun>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         list_scenario_runs(&connection, scenario_id, limit)
     }
 
@@ -1118,11 +991,9 @@ impl MatrixSqliteRepository {
         &self,
         result: MatrixScenarioResult,
     ) -> Result<MatrixScenarioResult, MatrixSqliteRepositoryError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let transaction = connection.transaction()?;
+        let mut connection = self.executor.checkout()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut run = find_scenario_run(&transaction, &result.run_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(result.run_id.clone()))?;
         if run.status != MatrixScenarioRunStatus::Running {
@@ -1146,10 +1017,7 @@ impl MatrixSqliteRepository {
         &self,
         run_id: &str,
     ) -> Result<Option<MatrixScenarioResult>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_scenario_result(&connection, run_id)
     }
 
@@ -1163,10 +1031,7 @@ impl MatrixSqliteRepository {
         let mut relation_count = 0usize;
         let mut fact_refs = Vec::new();
         let mut warnings = BTreeSet::new();
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let source_pack = find_source_pack(&connection, source_pack_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(source_pack_id.to_string()))?;
         insert_source_snapshot(&connection, &snapshot)?;
@@ -1362,10 +1227,7 @@ impl MatrixSqliteRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<MatrixAttentionItem>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let mut statement = connection.prepare(
             r"SELECT attention_json
               FROM matrix_attention_item
@@ -1377,10 +1239,7 @@ impl MatrixSqliteRepository {
     }
 
     pub fn list_facts(&self, limit: usize) -> Result<Vec<MatrixFact>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         list_facts(&connection, limit)
     }
 
@@ -1402,10 +1261,7 @@ impl MatrixSqliteRepository {
         &self,
         metric_filter: Option<&BTreeSet<String>>,
     ) -> Result<MatrixMetricRecomputeResult, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let facts = metric_facts(&connection)?;
         let mut groups = BTreeMap::<MetricGroupKey, MetricAccumulator>::new();
         for fact in facts {
@@ -1485,10 +1341,7 @@ impl MatrixSqliteRepository {
     pub fn list_metric_definitions(
         &self,
     ) -> Result<Vec<MatrixMetricDefinition>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let mut statement = connection.prepare(
             r"SELECT definition_json
               FROM matrix_metric_definition
@@ -1502,10 +1355,7 @@ impl MatrixSqliteRepository {
         &self,
         metric_id: &str,
     ) -> Result<Vec<MatrixMetricState>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let mut statement = connection.prepare(
             r"SELECT state_json
               FROM matrix_metric_state
@@ -1520,10 +1370,7 @@ impl MatrixSqliteRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<MatrixChangeEvent>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let mut statement = connection.prepare(
             r"SELECT change_json
               FROM matrix_change_event
@@ -1539,10 +1386,7 @@ impl MatrixSqliteRepository {
         attention_id: Option<&str>,
         problem_statement: Option<&str>,
     ) -> Result<MatrixEvidencePacket, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let attention = match attention_id {
             Some(id) => Some(
                 find_attention(&connection, id)?
@@ -1601,10 +1445,7 @@ impl MatrixSqliteRepository {
         &self,
         packet: &MatrixEvidencePacket,
     ) -> Result<MatrixEvidencePacket, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         insert_evidence_packet(&connection, packet)?;
         Ok(packet.clone())
     }
@@ -1613,10 +1454,7 @@ impl MatrixSqliteRepository {
         &self,
         packet_id: &str,
     ) -> Result<Option<MatrixEvidencePacket>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_evidence_packet(&connection, packet_id)
     }
 
@@ -1624,10 +1462,7 @@ impl MatrixSqliteRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<MatrixEvidencePacket>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         list_evidence_packets(&connection, limit)
     }
 
@@ -1635,10 +1470,7 @@ impl MatrixSqliteRepository {
         &self,
         packet_id: &str,
     ) -> Result<MatrixQualityGateDecision, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let packet = find_evidence_packet(&connection, packet_id)?
             .ok_or_else(|| MatrixSqliteRepositoryError::NotFound(packet_id.to_string()))?;
         let decision = MatrixQualityGateDecision::for_evidence_packet(&packet);
@@ -1651,10 +1483,7 @@ impl MatrixSqliteRepository {
         packet_id: &str,
         gate_id: &str,
     ) -> Result<MatrixQualityGateDecision, MatrixSqliteRepositoryError> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut connection = self.executor.checkout()?;
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if let Some(existing) = find_quality_gate(&transaction, gate_id)? {
@@ -1679,10 +1508,7 @@ impl MatrixSqliteRepository {
         &self,
         gate_id: &str,
     ) -> Result<Option<MatrixQualityGateDecision>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         find_quality_gate(&connection, gate_id)
     }
 
@@ -1690,10 +1516,7 @@ impl MatrixSqliteRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<MatrixDataPlaneWatermark>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         list_data_plane_watermarks(&connection, limit)
     }
 
@@ -1703,10 +1526,7 @@ impl MatrixSqliteRepository {
         fact_type: &str,
         partition_ref: &str,
     ) -> Result<Option<MatrixDataPlaneWatermark>, MatrixSqliteRepositoryError> {
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection = self.executor.checkout()?;
         let json = connection
             .query_row(
                 "SELECT watermark_json FROM matrix_data_plane_watermark

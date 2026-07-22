@@ -116,6 +116,7 @@ fn require_non_empty_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage::StorageLayout;
 
     #[test]
     fn scope_roots_are_registered_and_explicit() {

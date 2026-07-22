@@ -19,7 +19,10 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 pub use sqlite::SqliteStorage;
-pub use sqlite::{SqliteConnectionFactory, SqlitePragmaConfig};
+pub use sqlite::{
+    SqliteConnectionFactory, SqliteExecutionProfile, SqliteExecutor, SqliteExecutorHealth,
+    SqliteExecutorMetrics, SqlitePragmaConfig, StorageRuntime,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
