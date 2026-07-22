@@ -299,15 +299,26 @@ async fn reality_evidence_handler(
         })));
     }
 
-    if let Some(packet) = state.services.growth.fact_evidence(reference) {
-        return Ok(Json(serde_json::json!({
-            "kind": "reality.evidence",
-            "ok": true,
-            "envelope": state.services.reality.envelope("evidence"),
-            "ref": reference,
-            "source": "fact-kernel",
-            "evidence": packet,
-        })));
+    match state.services.growth.fact_evidence(reference) {
+        Ok(Some(packet)) => {
+            return Ok(Json(serde_json::json!({
+                "kind": "reality.evidence",
+                "ok": true,
+                "envelope": state.services.reality.envelope("evidence"),
+                "ref": reference,
+                "source": "fact-ledger",
+                "evidence": packet,
+            })));
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: format!("fact evidence ledger unavailable: {error}"),
+                }),
+            ));
+        }
     }
 
     let session_id = params

@@ -18,6 +18,7 @@ cowd-app-sdk = { path = "../app-sdk" }
 auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }
 fact-kernel = { path = "../fact-kernel" }
+fact-sqlite = { path = "../fact-sqlite" }
 model-protocol = { path = "../model-protocol" }
 storage = { path = "../storage" }
 surface = { path = "../surface" }

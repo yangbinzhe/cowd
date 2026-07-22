@@ -1,13 +1,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use chrono::Utc;
+use fact_kernel::FactLedger;
 use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, DefinitionScope, RevisionSelector,
 };
 use matrix_core::{MatrixFact, MatrixFactInput, MatrixSourceKind, MatrixSourceSnapshotInput};
 use matrix_repository::open_matrix_sqlite_repository_handle;
 use runtime::{AgentBindingRequest, ContextSourceKind, RealityRecallPort, RuntimeServices};
-use storage::{SqliteConnectionFactory, StorageDomainId, StorageRegistry};
+use storage::{StorageDomainId, StorageRegistry};
 
 #[test]
 fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_binding() {
@@ -56,44 +57,17 @@ fn reality_recall_port_injects_only_fact_and_matrix_evidence_granted_by_the_bind
         }))
         .expect("ingest Matrix fact");
 
-    let fact_handle = registry
+    let fact_endpoint = registry
         .endpoint(&StorageDomainId::Fact)
-        .expect("fact storage endpoint")
-        .as_handle();
-    std::fs::create_dir_all(fact_handle.path.parent().expect("fact parent")).expect("fact dir");
-    let connection = SqliteConnectionFactory::default()
-        .open_handle(&fact_handle)
-        .expect("fact db");
-    connection
-        .execute_batch(
-            "CREATE TABLE fact_records (
-                fact_id TEXT PRIMARY KEY,
-                fact_type TEXT NOT NULL,
-                status TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );",
-        )
-        .expect("fact table");
+        .expect("fact storage endpoint");
+    let fact_ledger = fact_sqlite::SqliteFactLedger::open(fact_endpoint).expect("fact ledger");
     let mut fact = fact_kernel::FactRecord::new(
         "supply.policy",
         "east region requires an expedited allocation",
     );
     fact.id = fact_kernel::FactId::from_string("fact-recall-policy");
     fact.confidence = fact_kernel::Confidence::from_basis_points(9_400);
-    connection
-        .execute(
-            "INSERT INTO fact_records (fact_id, fact_type, status, payload_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                fact.id.as_str(),
-                &fact.fact_type,
-                &fact.status,
-                serde_json::to_string(&fact).expect("fact json"),
-                fact.updated_at.to_rfc3339(),
-            ],
-        )
-        .expect("persist Fact");
+    fact_ledger.upsert_fact(fact).expect("persist Fact");
 
     let services = RuntimeServices::in_memory().expect("runtime");
     let mut request = AgentBindingRequest::new(

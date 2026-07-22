@@ -1,13 +1,14 @@
-use std::{collections::BTreeMap, path::Path};
+use std::path::Path;
 
 use chrono::Utc;
 use fact_kernel::{
-    core::{EvidenceId, EvidencePacket, FactRecord, FactSource, SourceKind},
+    core::{EvidencePacket, FactSource, SourceKind},
     growth::GrowthCandidate,
     hypothesis::HypothesisBoundary,
     matrix::MatrixFact as KernelMatrixFact,
     memory::MemoryCandidate as KernelMemoryCandidate,
-    Confidence, FactId, FactStore,
+    Confidence, EvidenceId, FactGrowthBatch, FactId, FactKernelService, GrowthPromotionRecord,
+    InMemoryFactStore,
 };
 use harness_contract::growth::{GrowthEvent, GrowthMatrixSignal, GrowthMemoryCandidate};
 use matrix_core::{MatrixFact, MatrixFactInput};
@@ -15,165 +16,9 @@ use memory::{
     project_scope::MemoryScope,
     types::{AgentVisibility, MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Priority},
 };
-use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use storage::{MigrationRunner, SqliteExecutor, StorageMigrationSpec, StorageRegistry};
 
 use super::{GrowthService, MatrixService, MemoryService};
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct GatewayFactStore {
-    db_executor: Option<SqliteExecutor>,
-    facts: BTreeMap<String, FactRecord>,
-    evidence: BTreeMap<String, EvidencePacket>,
-}
-
-impl GatewayFactStore {
-    pub(crate) fn memory_only() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn open_for_config_home(config_home: impl AsRef<Path>) -> Result<Self, String> {
-        let registry = StorageRegistry::default_for_config_home(config_home);
-        let endpoint = registry
-            .endpoint(&storage::StorageDomainId::Fact)
-            .map_err(|error| error.to_string())?;
-        let executor = SqliteExecutor::for_endpoint(endpoint).map_err(|error| error.to_string())?;
-        let conn = executor.checkout().map_err(|error| error.to_string())?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS fact_records (
-                fact_id TEXT PRIMARY KEY,
-                fact_type TEXT NOT NULL,
-                status TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS fact_evidence (
-                evidence_id TEXT PRIMARY KEY,
-                source_kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                collected_at TEXT NOT NULL
-            );
-            "#,
-        )
-        .map_err(|error| error.to_string())?;
-        let facts = load_fact_records(&conn)?;
-        let evidence = load_fact_evidence(&conn)?;
-        Ok(Self {
-            db_executor: Some(executor),
-            facts,
-            evidence,
-        })
-    }
-
-    fn connection(
-        &self,
-    ) -> Result<Option<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>>, String> {
-        let Some(executor) = self.db_executor.as_ref() else {
-            return Ok(None);
-        };
-        executor
-            .checkout()
-            .map(Some)
-            .map_err(|error| error.to_string())
-    }
-}
-
-impl FactStore for GatewayFactStore {
-    fn upsert_fact(&mut self, fact: FactRecord) -> FactRecord {
-        if let Ok(Some(conn)) = self.connection() {
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO fact_records (fact_id, fact_type, status, payload_json, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    fact.id.as_str(),
-                    &fact.fact_type,
-                    &fact.status,
-                    serde_json::to_string(&fact).unwrap_or_default(),
-                    fact.updated_at.to_rfc3339(),
-                ],
-            );
-        }
-        self.facts
-            .insert(fact.id.as_str().to_string(), fact.clone());
-        fact
-    }
-
-    fn get_fact(&self, id: &FactId) -> Option<&FactRecord> {
-        self.facts.get(id.as_str())
-    }
-
-    fn list_facts(&self) -> Vec<FactRecord> {
-        self.facts.values().cloned().collect()
-    }
-
-    fn insert_evidence(&mut self, evidence: EvidencePacket) -> EvidencePacket {
-        if let Ok(Some(conn)) = self.connection() {
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO fact_evidence (evidence_id, source_kind, payload_json, collected_at) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    evidence.id.as_str(),
-                    format!("{:?}", evidence.source.kind),
-                    serde_json::to_string(&evidence).unwrap_or_default(),
-                    evidence.collected_at.to_rfc3339(),
-                ],
-            );
-        }
-        self.evidence
-            .insert(evidence.id.as_str().to_string(), evidence.clone());
-        evidence
-    }
-
-    fn get_evidence(&self, id: &EvidenceId) -> Option<&EvidencePacket> {
-        self.evidence.get(id.as_str())
-    }
-
-    fn list_evidence(&self) -> Vec<EvidencePacket> {
-        self.evidence.values().cloned().collect()
-    }
-}
-
-fn load_fact_records(conn: &Connection) -> Result<BTreeMap<String, FactRecord>, String> {
-    let mut stmt = conn
-        .prepare("SELECT fact_id, payload_json FROM fact_records ORDER BY updated_at DESC")
-        .map_err(|error| error.to_string())?;
-    let rows = stmt
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let payload: String = row.get(1)?;
-            Ok((id, payload))
-        })
-        .map_err(|error| error.to_string())?;
-    let mut facts = BTreeMap::new();
-    for row in rows {
-        let (id, payload) = row.map_err(|error| error.to_string())?;
-        let fact =
-            serde_json::from_str::<FactRecord>(&payload).map_err(|error| error.to_string())?;
-        facts.insert(id, fact);
-    }
-    Ok(facts)
-}
-
-fn load_fact_evidence(conn: &Connection) -> Result<BTreeMap<String, EvidencePacket>, String> {
-    let mut stmt = conn
-        .prepare("SELECT evidence_id, payload_json FROM fact_evidence ORDER BY collected_at DESC")
-        .map_err(|error| error.to_string())?;
-    let rows = stmt
-        .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let payload: String = row.get(1)?;
-            Ok((id, payload))
-        })
-        .map_err(|error| error.to_string())?;
-    let mut evidence = BTreeMap::new();
-    for row in rows {
-        let (id, payload) = row.map_err(|error| error.to_string())?;
-        let packet =
-            serde_json::from_str::<EvidencePacket>(&payload).map_err(|error| error.to_string())?;
-        evidence.insert(id, packet);
-    }
-    Ok(evidence)
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct GrowthPromotionReceipt {
@@ -182,6 +27,18 @@ pub(crate) struct GrowthPromotionReceipt {
     pub(crate) target_id: Option<String>,
     pub(crate) summary: String,
     pub(crate) error: Option<String>,
+}
+
+impl From<GrowthPromotionRecord> for GrowthPromotionReceipt {
+    fn from(record: GrowthPromotionRecord) -> Self {
+        Self {
+            target: record.target,
+            status: record.status,
+            target_id: record.target_id,
+            summary: record.summary,
+            error: record.error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,37 +51,28 @@ pub(crate) struct GrowthIngestReceipt {
 }
 
 impl GrowthService {
-    pub(crate) fn fact_evidence(&self, evidence_id: &str) -> Option<fact_kernel::EvidencePacket> {
-        let kernel = self
-            .fact_kernel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        kernel
-            .store()
-            .get_evidence(&fact_kernel::EvidenceId::from_string(evidence_id))
-            .cloned()
+    pub(crate) fn fact_evidence(
+        &self,
+        evidence_id: &str,
+    ) -> Result<Option<fact_kernel::EvidencePacket>, String> {
+        self.ledger
+            .get_evidence(evidence_id)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn recall_facts(
         &self,
         query: &str,
         limit: usize,
-    ) -> Vec<fact_kernel::FactSearchHit> {
-        let kernel = self
-            .fact_kernel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ) -> Result<Vec<fact_kernel::FactSearchHit>, String> {
+        let kernel = self.semantic_kernel()?;
         let mut recall_query = fact_kernel::memory::RecallQuery::new(query);
         recall_query.limit = limit.max(1);
-        kernel.recall(&recall_query)
+        Ok(kernel.recall(&recall_query))
     }
 
-    pub(crate) fn list_fact_records(&self) -> Vec<fact_kernel::FactRecord> {
-        let kernel = self
-            .fact_kernel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        kernel.store().list_facts()
+    pub(crate) fn list_fact_records(&self) -> Result<Vec<fact_kernel::FactRecord>, String> {
+        self.ledger.list_facts().map_err(|error| error.to_string())
     }
 
     pub(crate) async fn ingest_growth_event(
@@ -234,36 +82,40 @@ impl GrowthService {
         matrix: &MatrixService,
         event: GrowthEvent,
     ) -> GrowthIngestReceipt {
-        self.record_event(event.clone());
         let mut errors = Vec::new();
-        let durable = match self.persist_event(config_home.as_ref(), &event) {
-            Ok(()) => true,
+        let mut promotions = match self.promote_event_to_fact_kernel(&event) {
+            Ok(receipts) => receipts,
             Err(error) => {
-                errors.push(error);
-                false
+                return GrowthIngestReceipt {
+                    event_id: event.id,
+                    durable: false,
+                    promotions: Vec::new(),
+                    fact_health_issues: Vec::new(),
+                    errors: vec![error],
+                };
             }
         };
-
-        let mut promotions = Vec::new();
-        promotions.extend(self.promote_event_to_fact_kernel(&event));
+        let fact_promotion_count = promotions.len();
         promotions.extend(self.promote_event_to_matrix(config_home.as_ref(), matrix, &event));
         promotions.extend(self.promote_event_to_memory(memory, &event).await);
 
-        for promotion in &promotions {
-            if let Err(error) = self.persist_promotion(config_home.as_ref(), &event.id, promotion) {
+        for promotion in promotions.iter().skip(fact_promotion_count) {
+            if let Err(error) = self.persist_promotion(&event.id, promotion) {
                 errors.push(error);
             }
         }
 
-        let fact_health_issues = self
-            .fact_kernel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .evaluate_health();
+        let fact_health_issues = match self.semantic_kernel() {
+            Ok(kernel) => kernel.evaluate_health(),
+            Err(error) => {
+                errors.push(error);
+                Vec::new()
+            }
+        };
 
         GrowthIngestReceipt {
             event_id: event.id,
-            durable,
+            durable: true,
             promotions,
             fact_health_issues,
             errors,
@@ -289,52 +141,22 @@ impl GrowthService {
         })
     }
 
-    pub(crate) fn durable_event_log(
-        &self,
-        config_home: impl AsRef<Path>,
-    ) -> Result<Vec<GrowthEvent>, String> {
-        let conn = open_growth_store(config_home.as_ref())?;
-        let mut statement = conn
-            .prepare("SELECT payload FROM growth_events ORDER BY created_at DESC, event_id DESC")
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map([], |row| {
-                let payload: String = row.get(0)?;
-                Ok(payload)
-            })
-            .map_err(|error| error.to_string())?;
-        let mut events = Vec::new();
-        for row in rows {
-            let payload = row.map_err(|error| error.to_string())?;
-            let event =
-                serde_json::from_str::<GrowthEvent>(&payload).map_err(|error| error.to_string())?;
-            events.push(event);
-        }
-        Ok(events)
+    pub(crate) fn durable_event_log(&self) -> Result<Vec<GrowthEvent>, String> {
+        self.ledger
+            .list_growth_events()
+            .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn durable_promotion_log(
-        &self,
-        config_home: impl AsRef<Path>,
-    ) -> Result<Vec<GrowthPromotionReceipt>, String> {
-        let conn = open_growth_store(config_home.as_ref())?;
-        let mut statement = conn
-            .prepare("SELECT payload FROM growth_promotions ORDER BY created_at DESC, id DESC")
-            .map_err(|error| error.to_string())?;
-        let rows = statement
-            .query_map([], |row| {
-                let payload: String = row.get(0)?;
-                Ok(payload)
+    pub(crate) fn durable_promotion_log(&self) -> Result<Vec<GrowthPromotionReceipt>, String> {
+        self.ledger
+            .list_growth_promotions()
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(GrowthPromotionReceipt::from)
+                    .collect()
             })
-            .map_err(|error| error.to_string())?;
-        let mut promotions = Vec::new();
-        for row in rows {
-            let payload = row.map_err(|error| error.to_string())?;
-            let promotion = serde_json::from_str::<GrowthPromotionReceipt>(&payload)
-                .map_err(|error| error.to_string())?;
-            promotions.push(promotion);
-        }
-        Ok(promotions)
+            .map_err(|error| error.to_string())
     }
 
     fn build_risk_gate_event(
@@ -385,66 +207,37 @@ impl GrowthService {
         })
     }
 
-    fn persist_event(&self, config_home: &Path, event: &GrowthEvent) -> Result<(), String> {
-        let conn = open_growth_store(config_home)?;
-        let payload = serde_json::to_string(event).map_err(|error| error.to_string())?;
-        conn.execute(
-            "INSERT OR REPLACE INTO growth_events(event_id, session_id, source_event_kind, payload, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                event.id,
-                event.session_id,
-                event.source_event_kind,
-                payload,
-                Utc::now().to_rfc3339()
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
     fn persist_promotion(
         &self,
-        config_home: &Path,
         event_id: &str,
         promotion: &GrowthPromotionReceipt,
     ) -> Result<(), String> {
-        let conn = open_growth_store(config_home)?;
-        let payload = serde_json::to_string(promotion).map_err(|error| error.to_string())?;
-        let stable_id = format!(
-            "{}:{}:{}",
-            event_id,
-            promotion.target,
-            promotion
-                .target_id
-                .clone()
-                .unwrap_or_else(|| promotion.summary.clone())
-        );
-        conn.execute(
-            "INSERT OR REPLACE INTO growth_promotions(id, event_id, target, status, target_id, summary, payload, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                stable_id,
-                event_id,
-                promotion.target,
-                promotion.status,
-                promotion.target_id,
-                promotion.summary,
-                payload,
-                Utc::now().to_rfc3339()
-            ],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
+        self.ledger
+            .record_growth_promotion(GrowthPromotionRecord {
+                id: GrowthPromotionRecord::stable_id(
+                    event_id,
+                    &promotion.target,
+                    promotion.target_id.as_deref(),
+                    &promotion.summary,
+                ),
+                event_id: event_id.to_string(),
+                target: promotion.target.clone(),
+                status: promotion.status.clone(),
+                target_id: promotion.target_id.clone(),
+                summary: promotion.summary.clone(),
+                error: promotion.error.clone(),
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .map_err(|error| error.to_string())
     }
 
-    fn promote_event_to_fact_kernel(&self, event: &GrowthEvent) -> Vec<GrowthPromotionReceipt> {
-        let mut kernel = self
-            .fact_kernel
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn promote_event_to_fact_kernel(
+        &self,
+        event: &GrowthEvent,
+    ) -> Result<Vec<GrowthPromotionReceipt>, String> {
+        let mut kernel = self.semantic_kernel()?;
         let source = growth_fact_source(event);
-        let evidence = kernel.ingest_evidence(EvidencePacket::new(
+        let mut evidence = EvidencePacket::new(
             source.clone(),
             serde_json::json!({
                 "event_id": event.id,
@@ -452,43 +245,110 @@ impl GrowthService {
                 "signals": event.signals,
                 "evidence_refs": event.evidence_refs,
             }),
-        ));
+        );
+        evidence.id = EvidenceId::from_string(format!("growth:evidence:{}", event.id));
+        kernel.ingest_evidence(evidence.clone());
 
         let mut receipts = Vec::new();
+        let mut facts = Vec::new();
         for candidate in &event.memory_candidates {
-            let receipt = kernel.promote_candidate(GrowthCandidate::Memory(
-                kernel_memory_candidate(event, candidate, &source, &evidence.id),
-            ));
-            receipts.push(GrowthPromotionReceipt {
-                target: "fact.memory".to_string(),
-                status: format!("{:?}", receipt.decision.decision).to_ascii_lowercase(),
-                target_id: receipt
-                    .promoted_fact
-                    .as_ref()
-                    .map(|fact| fact.id.as_str().to_string()),
-                summary: receipt.decision.reason,
-                error: None,
-            });
+            let (receipt, fact) = self.plan_fact_candidate(
+                &mut kernel,
+                "fact.memory",
+                GrowthCandidate::Memory(kernel_memory_candidate(
+                    event,
+                    candidate,
+                    &source,
+                    &evidence.id,
+                )),
+                Some(format!("growth:{}:fact.memory:{}", event.id, candidate.id)),
+            );
+            receipts.push(receipt);
+            facts.extend(fact);
         }
         for signal in &event.matrix_signals {
-            let receipt = kernel.promote_candidate(GrowthCandidate::Matrix(kernel_matrix_fact(
-                event,
-                signal,
-                &source,
-                &evidence.id,
-            )));
-            receipts.push(GrowthPromotionReceipt {
-                target: "fact.matrix".to_string(),
+            let (receipt, fact) = self.plan_fact_candidate(
+                &mut kernel,
+                "fact.matrix",
+                GrowthCandidate::Matrix(kernel_matrix_fact(event, signal, &source, &evidence.id)),
+                None,
+            );
+            receipts.push(receipt);
+            facts.extend(fact);
+        }
+        let promotion_records = receipts
+            .iter()
+            .map(|receipt| self.promotion_record(event, receipt))
+            .collect();
+        self.ledger
+            .persist_growth_fact_batch(FactGrowthBatch {
+                event: event.clone(),
+                evidence,
+                facts,
+                promotions: promotion_records,
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(receipts)
+    }
+
+    fn semantic_kernel(&self) -> Result<FactKernelService<InMemoryFactStore>, String> {
+        let snapshot = self
+            .ledger
+            .export_snapshot()
+            .map_err(|error| error.to_string())?;
+        Ok(FactKernelService::from_durable_records(
+            snapshot.facts,
+            snapshot.evidence,
+        ))
+    }
+
+    fn plan_fact_candidate(
+        &self,
+        kernel: &mut FactKernelService<InMemoryFactStore>,
+        target: &str,
+        candidate: GrowthCandidate,
+        deterministic_fact_id: Option<String>,
+    ) -> (GrowthPromotionReceipt, Option<fact_kernel::FactRecord>) {
+        let mut receipt = kernel.plan_candidate_promotion(candidate);
+        let mut fact = receipt.promoted_fact.take();
+        if let (Some(fact), Some(id)) = (&mut fact, deterministic_fact_id) {
+            fact.id = FactId::from_string(id);
+        }
+        if let Some(fact) = &fact {
+            kernel.upsert_fact(fact.clone());
+        }
+        (
+            GrowthPromotionReceipt {
+                target: target.to_string(),
                 status: format!("{:?}", receipt.decision.decision).to_ascii_lowercase(),
-                target_id: receipt
-                    .promoted_fact
-                    .as_ref()
-                    .map(|fact| fact.id.as_str().to_string()),
+                target_id: fact.as_ref().map(|fact| fact.id.as_str().to_string()),
                 summary: receipt.decision.reason,
                 error: None,
-            });
+            },
+            fact,
+        )
+    }
+
+    fn promotion_record(
+        &self,
+        event: &GrowthEvent,
+        promotion: &GrowthPromotionReceipt,
+    ) -> GrowthPromotionRecord {
+        GrowthPromotionRecord {
+            id: GrowthPromotionRecord::stable_id(
+                &event.id,
+                &promotion.target,
+                promotion.target_id.as_deref(),
+                &promotion.summary,
+            ),
+            event_id: event.id.clone(),
+            target: promotion.target.clone(),
+            status: promotion.status.clone(),
+            target_id: promotion.target_id.clone(),
+            summary: promotion.summary.clone(),
+            error: promotion.error.clone(),
+            created_at: Utc::now().to_rfc3339(),
         }
-        receipts
     }
 
     fn promote_event_to_matrix(
@@ -616,63 +476,6 @@ impl GrowthService {
         }
         receipts
     }
-}
-
-fn open_growth_store(
-    config_home: &Path,
-) -> Result<r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager>, String> {
-    let registry = StorageRegistry::default_for_config_home(config_home);
-    let endpoint = registry
-        .endpoint(&storage::StorageDomainId::Growth)
-        .map_err(|error| error.to_string())?;
-    let executor = SqliteExecutor::for_endpoint(endpoint).map_err(|error| error.to_string())?;
-    let conn = executor.checkout().map_err(|error| error.to_string())?;
-    let handle = endpoint.as_handle();
-    let migration_reports =
-        MigrationRunner::run_sqlite_domain(&conn, &handle, &growth_storage_migrations())
-            .map_err(|error| error.to_string())?;
-    if let Some(failed) = migration_reports
-        .iter()
-        .find(|report| report.status == "failed")
-    {
-        return Err(format!(
-            "growth storage migration {} failed: {}",
-            failed.id,
-            failed
-                .error
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string())
-        ));
-    }
-    Ok(conn)
-}
-
-pub(crate) fn growth_storage_migrations() -> Vec<StorageMigrationSpec> {
-    vec![StorageMigrationSpec {
-        id: "growth.v1.init",
-        domain: "growth",
-        version: 1,
-        description: "initialize growth durable event and promotion schema",
-        statements: &[
-            "CREATE TABLE IF NOT EXISTS growth_events (
-                event_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                source_event_kind TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );",
-            "CREATE TABLE IF NOT EXISTS growth_promotions (
-                id TEXT PRIMARY KEY,
-                event_id TEXT NOT NULL,
-                target TEXT NOT NULL,
-                status TEXT NOT NULL,
-                target_id TEXT,
-                summary TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );",
-        ],
-    }]
 }
 
 fn growth_fact_source(event: &GrowthEvent) -> FactSource {
@@ -989,21 +792,6 @@ fn matrix_fact_from_signal(event: &GrowthEvent, signal: &GrowthMatrixSignal) -> 
     })
 }
 
-#[allow(dead_code)]
-fn event_exists(config_home: &Path, event_id: &str) -> Result<bool, String> {
-    let conn = open_growth_store(config_home)?;
-    let found = conn
-        .query_row(
-            "SELECT event_id FROM growth_events WHERE event_id = ?1",
-            params![event_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .is_some();
-    Ok(found)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1061,35 +849,21 @@ mod tests {
     }
 
     #[test]
-    fn growth_store_is_opened_from_storage_registry() {
+    fn growth_service_opens_a_single_canonical_fact_growth_ledger() {
         let config_home = std::env::temp_dir().join(format!(
             "cowd-growth-storage-registry-test-{}",
             uuid::Uuid::new_v4()
         ));
-        let conn = open_growth_store(&config_home).expect("growth store should open");
-        let path = StorageRegistry::default_for_config_home(&config_home)
-            .endpoint(&storage::StorageDomainId::Growth)
+        let growth = GrowthService::new_for_config_home(&config_home);
+        let path = storage::StorageRegistry::default_for_config_home(&config_home)
+            .endpoint(&storage::StorageDomainId::Fact)
             .expect("growth endpoint")
             .as_handle()
             .path;
-        assert!(path.ends_with("storage/growth.sqlite"));
+        assert!(path.ends_with("storage/fact.sqlite"));
         assert!(path.exists());
-        let table_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('growth_events', 'growth_promotions')",
-                [],
-                |row| row.get(0),
-            )
-            .expect("table count");
-        assert_eq!(table_count, 2);
-        let migration_id: String = conn
-            .query_row(
-                "SELECT id FROM schema_migrations WHERE id = 'growth.v1.init'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("growth migration should be recorded");
-        assert_eq!(migration_id, "growth.v1.init");
+        assert!(growth.durable_event_log().is_ok());
+        assert!(growth.durable_promotion_log().is_ok());
         let _ = std::fs::remove_dir_all(config_home);
     }
 

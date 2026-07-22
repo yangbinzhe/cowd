@@ -38,6 +38,16 @@ impl FactKernelService<InMemoryFactStore> {
     pub fn new() -> Self {
         Self::with_store(InMemoryFactStore::new())
     }
+
+    /// Rebuild the pure promotion/recall index from canonical durable facts.
+    /// This deliberately does not open a database or retain a durable owner.
+    #[must_use]
+    pub fn from_durable_records(
+        facts: impl IntoIterator<Item = FactRecord>,
+        evidence: impl IntoIterator<Item = EvidencePacket>,
+    ) -> Self {
+        Self::with_store(InMemoryFactStore::from_records(facts, evidence))
+    }
 }
 
 impl<S> FactKernelService<S>
@@ -78,10 +88,22 @@ where
     }
 
     pub fn promote_candidate(&mut self, candidate: GrowthCandidate) -> PromotionReceipt {
+        let planned = self.plan_candidate_promotion(candidate);
+        let promoted_fact = planned.promoted_fact.map(|fact| self.upsert_fact(fact));
+        PromotionReceipt {
+            decision: planned.decision,
+            promoted_fact,
+        }
+    }
+
+    /// Evaluate Growth policy without mutating the store. Durable callers use
+    /// this method, commit the returned fact through their fallible ledger,
+    /// and only then rebuild or update an in-memory semantic index.
+    #[must_use]
+    pub fn plan_candidate_promotion(&self, candidate: GrowthCandidate) -> PromotionReceipt {
         let decision = decide_candidate_promotion(candidate);
         let promoted_fact = if decision.decision == PromotionDecision::Promote {
             self.fact_from_candidate(&decision.candidate)
-                .map(|fact| self.upsert_fact(fact))
         } else {
             None
         };

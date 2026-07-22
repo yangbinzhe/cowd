@@ -23,6 +23,26 @@ impl InMemoryFactStore {
         Self::default()
     }
 
+    /// Build a purely semantic store from an already durable ledger snapshot.
+    /// The returned store is an index/input cache only; callers must not treat
+    /// it as a persistence fallback.
+    #[must_use]
+    pub fn from_records(
+        facts: impl IntoIterator<Item = FactRecord>,
+        evidence: impl IntoIterator<Item = EvidencePacket>,
+    ) -> Self {
+        Self {
+            facts: facts
+                .into_iter()
+                .map(|fact| (fact.id.as_str().to_string(), fact))
+                .collect(),
+            evidence: evidence
+                .into_iter()
+                .map(|packet| (packet.id.as_str().to_string(), packet))
+                .collect(),
+        }
+    }
+
     #[must_use]
     pub fn fact_count(&self) -> usize {
         self.facts.len()

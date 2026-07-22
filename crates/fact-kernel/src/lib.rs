@@ -20,6 +20,7 @@ pub mod growth;
 pub mod health;
 pub mod hypothesis;
 pub mod indexer;
+pub mod ledger;
 pub mod matrix;
 pub mod memory;
 pub mod review;
@@ -38,6 +39,10 @@ pub use extraction::{
     FactExtractionBatch, FactExtractionBatchId, FactExtractionTokenUsage, FactExtractionTrigger,
 };
 pub use indexer::FactSearchHit;
+pub use ledger::{
+    FactGrowthBatch, FactLedger, FactLedgerError, FactLedgerResult, FactLedgerSnapshot,
+    GrowthPromotionRecord, UnavailableFactLedger,
+};
 pub use review::{FactConflict, FactReviewDecision, FactReviewDecisionKind, FactReviewReceipt};
 pub use service::{FactKernelService, PromotionReceipt};
 pub use store::{FactStore, InMemoryFactStore};

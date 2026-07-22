@@ -8673,8 +8673,9 @@ mod tests {
         assert!(receipt.summary.contains("implemented-v546-0"));
         assert!(!receipt.summary.contains("omitted; retrieve"));
     }
+    use fact_kernel::FactLedger;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use storage::{SqliteConnectionFactory, StorageRegistry};
+    use storage::StorageRegistry;
 
     fn rendered_prompt(prompt: &PromptAssembly) -> String {
         let mut segments = prompt.trusted_system.clone();
@@ -11449,43 +11450,16 @@ mod tests {
     async fn runtime_reality_binding_injects_only_leased_fact_evidence_into_the_prompt() {
         let home = tempfile::tempdir().expect("temporary config home");
         let registry = StorageRegistry::default_for_config_home(home.path());
-        let handle = registry
+        let endpoint = registry
             .endpoint(&storage::StorageDomainId::Fact)
-            .expect("fact endpoint")
-            .as_handle();
-        std::fs::create_dir_all(handle.path.parent().expect("fact parent")).expect("fact parent");
-        let connection = SqliteConnectionFactory::default()
-            .open_handle(&handle)
-            .expect("fact database");
-        connection
-            .execute_batch(
-                "CREATE TABLE fact_records (
-                    fact_id TEXT PRIMARY KEY,
-                    fact_type TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );",
-            )
-            .expect("fact schema");
+            .expect("fact endpoint");
+        let fact_ledger = fact_sqlite::SqliteFactLedger::open(endpoint).expect("fact ledger");
         let mut fact = fact_kernel::FactRecord::new(
             "supply.policy",
             "east allocation requires expedited approval",
         );
         fact.id = fact_kernel::FactId::from_string("primary-turn-fact");
-        connection
-            .execute(
-                "INSERT INTO fact_records (fact_id, fact_type, status, payload_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    fact.id.as_str(),
-                    &fact.fact_type,
-                    &fact.status,
-                    serde_json::to_string(&fact).expect("fact payload"),
-                    fact.updated_at.to_rfc3339(),
-                ],
-            )
-            .expect("persist fact");
+        fact_ledger.upsert_fact(fact).expect("persist fact");
 
         let binding = AgentBindingSnapshot {
             binding_id: "binding:primary-reality".to_string(),

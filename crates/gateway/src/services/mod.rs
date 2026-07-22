@@ -50,7 +50,7 @@ pub(crate) use evolution_service::{
     EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionServiceError,
     EvolutionSignalCreateRequest,
 };
-pub(crate) use growth_service::growth_storage_migrations;
+pub(crate) use growth_service::GrowthPromotionReceipt;
 pub(crate) use harness_eval_service::HarnessEvalServiceError;
 pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
@@ -396,8 +396,7 @@ impl ProviderService {
 pub(crate) struct GrowthService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
-    events: Arc<Mutex<Vec<GrowthEvent>>>,
-    fact_kernel: Arc<Mutex<fact_kernel::FactKernelService<growth_service::GatewayFactStore>>>,
+    ledger: Arc<dyn fact_kernel::FactLedger>,
 }
 
 impl GrowthService {
@@ -406,17 +405,35 @@ impl GrowthService {
     }
 
     pub(crate) fn new_for_config_home(config_home: impl AsRef<Path>) -> Self {
+        let registry = storage::StorageRegistry::default_for_config_home(config_home);
+        let ledger = registry
+            .endpoint(&storage::StorageDomainId::Fact)
+            .map_err(|error| error.to_string())
+            .and_then(|fact_endpoint| {
+                let growth_endpoint = registry
+                    .endpoint(&storage::StorageDomainId::Growth)
+                    .map_err(|error| error.to_string())?;
+                fact_sqlite::SqliteFactLedger::open_with_legacy_growth(fact_endpoint, growth_endpoint)
+                    .map_err(|error| error.to_string())
+            })
+            .map(|ledger| Arc::new(ledger) as Arc<dyn fact_kernel::FactLedger>)
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "fact/growth ledger unavailable; growth operations will fail closed");
+                Arc::new(fact_kernel::UnavailableFactLedger::new(error))
+            });
         Self {
             label: "growth",
             owner: "0.9.380 Growth service boundary",
-            events: Arc::new(Mutex::new(Vec::new())),
-            fact_kernel: Arc::new(Mutex::new(fact_kernel::FactKernelService::with_store(
-                growth_service::GatewayFactStore::open_for_config_home(config_home)
-                .unwrap_or_else(|error| {
-                    tracing::warn!(%error, "durable fact store unavailable; using memory-only gateway fact store");
-                    growth_service::GatewayFactStore::memory_only()
-                }),
-            ))),
+            ledger,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ledger_for_tests(ledger: Arc<dyn fact_kernel::FactLedger>) -> Self {
+        Self {
+            label: "growth",
+            owner: "0.9.573 Growth service boundary",
+            ledger,
         }
     }
 
@@ -465,26 +482,14 @@ impl GrowthService {
                 ),
             )],
         });
-        self.record_event(event.clone());
+        let durability = self.ledger.record_growth_event(event.clone());
 
         serde_json::json!({
             "envelope": self.envelope("risk_gate_event"),
             "event": event,
+            "durable": durability.is_ok(),
+            "error": durability.err().map(|error| error.to_string()),
         })
-    }
-
-    pub(crate) fn record_event(&self, event: GrowthEvent) {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(event);
-    }
-
-    pub(crate) fn event_log(&self) -> Vec<GrowthEvent> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
     }
 }
 
@@ -929,11 +934,11 @@ mod tests {
 
     #[tokio::test]
     async fn growth_service_persists_and_projects_events_to_fact_and_matrix() {
-        let services = GatewayServices::baseline();
         let config_home = std::env::temp_dir().join(format!(
             "cowd-growth-pipeline-test-{}",
             uuid::Uuid::new_v4()
         ));
+        let services = GatewayServices::baseline_with_config_home(&config_home);
         let record = LearningRecord::from_input(GrowthInput {
             selected_pattern: ExecutionPattern::Execute,
             complexity: TaskComplexity::Complex,
@@ -987,14 +992,14 @@ mod tests {
         assert_eq!(
             services
                 .growth
-                .durable_event_log(&config_home)
+                .durable_event_log()
                 .expect("durable events")
                 .len(),
             1
         );
         assert!(!services
             .growth
-            .durable_promotion_log(&config_home)
+            .durable_promotion_log()
             .expect("durable promotions")
             .is_empty());
         assert!(!services
@@ -1002,6 +1007,36 @@ mod tests {
             .list_facts(&config_home, 10)
             .expect("matrix facts")
             .is_empty());
+
+        let fact_count_before_replay = services
+            .growth
+            .list_fact_records()
+            .expect("durable facts")
+            .len();
+        let replay = services
+            .growth
+            .ingest_growth_event(&config_home, &services.memory, &services.matrix, event)
+            .await;
+        assert!(replay.durable, "{replay:#?}");
+        assert!(replay.errors.is_empty(), "{replay:#?}");
+        assert_eq!(
+            services
+                .growth
+                .durable_event_log()
+                .expect("replayed durable events")
+                .len(),
+            1,
+            "same event id must not create a second Growth event"
+        );
+        assert_eq!(
+            services
+                .growth
+                .list_fact_records()
+                .expect("replayed durable facts")
+                .len(),
+            fact_count_before_replay,
+            "deterministic fact ids must make event replay idempotent"
+        );
 
         let _ = std::fs::remove_dir_all(config_home);
     }

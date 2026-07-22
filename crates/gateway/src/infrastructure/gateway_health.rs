@@ -1,12 +1,9 @@
 use serde::Serialize;
 use std::collections::BTreeSet;
-use storage::{
-    MigrationRunner, SqlitePragmaConfig, StorageHealth, StorageLockDiagnostics, StorageRegistry,
-};
+use storage::{SqlitePragmaConfig, StorageHealth, StorageLockDiagnostics, StorageRegistry};
 
 use crate::api_routes::AppState;
 use crate::gateway_static::StaticWebUiSource;
-use crate::services::growth_storage_migrations;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct GatewayProcessSnapshot {
@@ -86,11 +83,9 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         })
         .expect("gateway storage endpoint registration must not collide");
     let pragma = SqlitePragmaConfig::default();
-    let mut migrations = MigrationRunner::from_registry(&storage_registry).status();
-    migrations.extend(inspect_growth_migrations(&storage_registry));
     let storage = StorageGatewaySnapshot {
         registry: storage_registry.health(),
-        migrations,
+        migrations: storage::MigrationRunner::from_registry(&storage_registry).status(),
         locks: storage_registry
             .endpoints
             .iter()
@@ -121,59 +116,6 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         runtime,
         storage,
         capacity: state.services.capacity.snapshot(),
-    }
-}
-
-fn inspect_growth_migrations(registry: &StorageRegistry) -> Vec<storage::StorageMigration> {
-    let Ok(endpoint) = registry.endpoint(&storage::StorageDomainId::Growth) else {
-        return Vec::new();
-    };
-    let handle = endpoint.as_handle();
-    let specs = growth_storage_migrations();
-    if !handle.path.exists() {
-        return specs
-            .into_iter()
-            .map(|spec| storage::StorageMigration {
-                id: spec.id.to_string(),
-                domain: spec.domain.to_string(),
-                version: spec.version,
-                status: "pending".to_string(),
-                target: handle.path.clone(),
-                description: spec.description.to_string(),
-                error: None,
-            })
-            .collect();
-    }
-    match storage::SqliteExecutor::for_endpoint(endpoint).and_then(|executor| executor.checkout()) {
-        Ok(connection) => {
-            match MigrationRunner::inspect_sqlite_domain(&connection, &handle, &specs) {
-                Ok(reports) => reports,
-                Err(error) => specs
-                    .into_iter()
-                    .map(|spec| storage::StorageMigration {
-                        id: spec.id.to_string(),
-                        domain: spec.domain.to_string(),
-                        version: spec.version,
-                        status: "failed".to_string(),
-                        target: handle.path.clone(),
-                        description: spec.description.to_string(),
-                        error: Some(error.to_string()),
-                    })
-                    .collect(),
-            }
-        }
-        Err(error) => specs
-            .into_iter()
-            .map(|spec| storage::StorageMigration {
-                id: spec.id.to_string(),
-                domain: spec.domain.to_string(),
-                version: spec.version,
-                status: "failed".to_string(),
-                target: handle.path.clone(),
-                description: spec.description.to_string(),
-                error: Some(error.to_string()),
-            })
-            .collect(),
     }
 }
 

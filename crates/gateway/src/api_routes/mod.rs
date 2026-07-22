@@ -2947,33 +2947,16 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["id"] == "growth.v1.init"
-                && item["description"] == "initialize growth durable event and promotion schema"));
+            .any(|item| item["id"] == "storage.fact.endpoint"));
     }
 
     #[tokio::test]
-    async fn gateway_storage_health_reports_applied_growth_migration() {
+    async fn gateway_storage_health_reports_canonical_fact_growth_endpoint() {
         let tmp = std::env::temp_dir().join(format!(
             "cowd-gateway-growth-health-test-{}",
             uuid::Uuid::new_v4()
         ));
         let config_home = tmp.join("config");
-        let registry = storage::StorageRegistry::default_for_config_home(&config_home);
-        let handle = registry
-            .endpoint(&storage::StorageDomainId::Growth)
-            .unwrap()
-            .as_handle();
-        std::fs::create_dir_all(handle.path.parent().unwrap()).unwrap();
-        let conn = storage::SqliteConnectionFactory::default()
-            .open_handle(&handle)
-            .unwrap();
-        storage::MigrationRunner::run_sqlite_domain(
-            &conn,
-            &handle,
-            &crate::services::growth_storage_migrations(),
-        )
-        .unwrap();
-
         let app = api_router(test_state_with_workspace(
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             config_home,
@@ -2995,10 +2978,7 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["id"] == "growth.v1.init"
-                && item["domain"] == "growth"
-                && item["status"] == "applied"
-                && item["version"] == 1));
+            .any(|item| item["id"] == "storage.fact.endpoint" && item["domain"] == "fact"));
         let _ = std::fs::remove_dir_all(tmp);
     }
 

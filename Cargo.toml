@@ -8,6 +8,8 @@ members = [
     "crates/approval",
     "crates/cli",
     "crates/fact-kernel",
+    "crates/fact-sqlite",
+    "crates/fact-postgres",
     "crates/gateway",
     "crates/harness-eval",
     "crates/matrix/core",
@@ -41,6 +43,8 @@ default-members = [
     "crates/approval",
     "crates/cli",
     "crates/fact-kernel",
+    "crates/fact-sqlite",
+    "crates/fact-postgres",
     "crates/gateway",
     "crates/harness-eval",
     "crates/matrix/core",
@@ -65,7 +69,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.572"
+version = "0.9.573"
 edition = "2021"
 license = "MIT"
 publish = false

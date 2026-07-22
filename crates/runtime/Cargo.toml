@@ -23,6 +23,7 @@ required-features = ["test-fixtures"]
 [dependencies]
 harness-contract = { path = "../harness-contract" }
 fact-kernel = { path = "../fact-kernel" }
+fact-sqlite = { path = "../fact-sqlite" }
 matrix-core = { path = "../matrix/core" }
 matrix-repository = { path = "../matrix/repository" }
 model-protocol = { path = "../model-protocol" }

@@ -6,16 +6,18 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fact_kernel::hypothesis::FactReality;
-use fact_kernel::{Confidence, FactCandidate, FactScope, FactSource, SourceKind};
+use fact_kernel::{
+    Confidence, FactCandidate, FactLedger, FactScope, FactSource, SourceKind, UnavailableFactLedger,
+};
 use harness_contract::agent::AgentBindingSnapshot;
 use matrix_core::{MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioSpec, MatrixSnapshotRef};
 use matrix_repository::{open_matrix_sqlite_repository_handle, MatrixSqliteRepository};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use storage::{SqliteExecutor, StorageRegistry};
+use storage::StorageRegistry;
 
 use crate::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 
@@ -46,16 +48,41 @@ impl RealityRecallReport {
 
 /// Read-only Runtime adapter over the durable Fact and Matrix stores. It is
 /// intentionally stateless so every request must carry a Binding snapshot.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RealityRecallPort {
     config_home: PathBuf,
+    fact_ledger: Arc<dyn FactLedger>,
 }
 
 impl RealityRecallPort {
     #[must_use]
     pub fn for_config_home(config_home: impl Into<PathBuf>) -> Self {
+        let config_home = config_home.into();
+        let ledger = StorageRegistry::default_for_config_home(&config_home)
+            .endpoint(&storage::StorageDomainId::Fact)
+            .map_err(|error| error.to_string())
+            .and_then(|endpoint| {
+                fact_sqlite::SqliteFactLedger::open(endpoint).map_err(|error| error.to_string())
+            })
+            .map(|ledger| Arc::new(ledger) as Arc<dyn FactLedger>)
+            .unwrap_or_else(|error| Arc::new(UnavailableFactLedger::new(error)));
+        Self {
+            config_home,
+            fact_ledger: ledger,
+        }
+    }
+
+    /// Compose Runtime against a prevalidated Fact ledger. PostgreSQL/global
+    /// composition injects its adapter here; Runtime never chooses a driver
+    /// or opens a fact database on the recall path.
+    #[must_use]
+    pub fn with_fact_ledger(
+        config_home: impl Into<PathBuf>,
+        fact_ledger: Arc<dyn FactLedger>,
+    ) -> Self {
         Self {
             config_home: config_home.into(),
+            fact_ledger,
         }
     }
 
@@ -111,7 +138,7 @@ impl RealityRecallPort {
                 ),
             );
         }
-        let facts = match load_fact_records(&self.config_home) {
+        let facts = match self.fact_ledger.list_facts() {
             Ok(facts) => facts,
             Err(error) => {
                 return (
@@ -335,42 +362,6 @@ fn open_matrix_repository(config_home: &Path) -> Result<MatrixSqliteRepository, 
     open_matrix_sqlite_repository_handle(&handle).map_err(|error| error.to_string())
 }
 
-fn load_fact_records(config_home: &Path) -> Result<Vec<fact_kernel::FactRecord>, String> {
-    let registry = StorageRegistry::default_for_config_home(config_home);
-    let endpoint = registry
-        .endpoint(&storage::StorageDomainId::Fact)
-        .map_err(|error| error.to_string())?;
-    if !endpoint.path.exists() {
-        return Ok(Vec::new());
-    }
-    let connection = SqliteExecutor::for_endpoint(endpoint)
-        .and_then(|executor| executor.checkout())
-        .map_err(|error| error.to_string())?;
-    let table_exists = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fact_records'",
-            [],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .is_some();
-    if !table_exists {
-        return Ok(Vec::new());
-    }
-    let mut statement = connection
-        .prepare("SELECT payload_json FROM fact_records ORDER BY updated_at DESC LIMIT 512")
-        .map_err(|error| error.to_string())?;
-    let rows = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|error| error.to_string())?;
-    rows.map(|row| {
-        let payload = row.map_err(|error| error.to_string())?;
-        serde_json::from_str(&payload).map_err(|error| error.to_string())
-    })
-    .collect()
-}
-
 fn fact_granted(
     fact: &fact_kernel::FactRecord,
     granted_refs: &BTreeSet<&String>,
@@ -515,6 +506,7 @@ fn degraded_status(
 mod tests {
     use super::*;
     use chrono::Utc;
+    use fact_kernel::FactLedger;
     use harness_contract::agent::{
         AgentCapability, AgentDefinitionId, AgentDefinitionRevisionRef, AgentExecutorPolicy,
         AgentInstanceRef, AgentModelPolicy, CognitiveReadScope, CognitiveWriteMode,
@@ -523,7 +515,7 @@ mod tests {
         MatrixFact, MatrixFactInput, MatrixScenarioOutputContract, MatrixSourceKind,
         MatrixSourceSnapshotInput,
     };
-    use storage::{SqliteExecutor, StorageRegistry};
+    use storage::StorageRegistry;
 
     fn binding(config_home: &Path, snapshot_ref: Option<String>) -> AgentBindingSnapshot {
         let _ = config_home;
@@ -672,45 +664,15 @@ mod tests {
             }))
             .unwrap();
 
-        let fact_handle = registry
-            .endpoint(&storage::StorageDomainId::Fact)
-            .unwrap()
-            .as_handle();
-        std::fs::create_dir_all(fact_handle.path.parent().unwrap()).unwrap();
-        let connection = SqliteExecutor::for_handle(&fact_handle)
-            .unwrap()
-            .checkout()
-            .unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE fact_records (
-                    fact_id TEXT PRIMARY KEY,
-                    fact_type TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );",
-            )
-            .unwrap();
+        let fact_endpoint = registry.endpoint(&storage::StorageDomainId::Fact).unwrap();
+        let fact_ledger = fact_sqlite::SqliteFactLedger::open(fact_endpoint).unwrap();
         let mut fact = fact_kernel::FactRecord::new(
             "supply.policy",
             "east region requires an expedited allocation",
         );
         fact.id = fact_kernel::FactId::from_string("fact-recall-policy");
         fact.confidence = Confidence::from_basis_points(9_400);
-        connection
-            .execute(
-                "INSERT INTO fact_records (fact_id, fact_type, status, payload_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    fact.id.as_str(),
-                    &fact.fact_type,
-                    &fact.status,
-                    serde_json::to_string(&fact).unwrap(),
-                    fact.updated_at.to_rfc3339(),
-                ],
-            )
-            .unwrap();
+        fact_ledger.upsert_fact(fact).unwrap();
 
         let mut leased = binding(
             home.path(),

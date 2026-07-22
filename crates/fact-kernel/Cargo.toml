@@ -10,6 +10,8 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+harness-contract = { path = "../harness-contract" }
+sha2 = "0.10"
 
 [lints]
 workspace = true

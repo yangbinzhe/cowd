@@ -103,13 +103,27 @@ impl RealityService {
         inject_context_envelope_projection(&mut memory_status, &context_envelope_projection);
         let knowledge_status = memory.knowledge_projection(config_home).await;
         let matrix_health = matrix_health_value(matrix, config_home);
-        let growth_events = growth
-            .durable_event_log(config_home)
-            .unwrap_or_else(|_| growth.event_log());
-        let growth_promotions = growth
-            .durable_promotion_log(config_home)
-            .unwrap_or_default();
-        let degraded_reasons = degraded_reasons(&memory_status, &matrix_health);
+        let growth_events = growth.durable_event_log();
+        let growth_promotions = growth.durable_promotion_log();
+        let mut degraded_reasons = degraded_reasons(&memory_status, &matrix_health);
+        if let Err(error) = &growth_events {
+            degraded_reasons.push(format!("growth event ledger unavailable: {error}"));
+        }
+        if let Err(error) = &growth_promotions {
+            degraded_reasons.push(format!("growth promotion ledger unavailable: {error}"));
+        }
+        let growth_event_count = growth_events.as_ref().map_or(0, Vec::len);
+        let growth_promotion_count = growth_promotions.as_ref().map_or(0, Vec::len);
+        let latest_growth_event = growth_events
+            .as_ref()
+            .ok()
+            .and_then(|events| events.first())
+            .cloned();
+        let latest_growth_promotion = growth_promotions
+            .as_ref()
+            .ok()
+            .and_then(|promotions| promotions.first())
+            .cloned();
         let capabilities = reality_capabilities(&memory_status, &knowledge_status, &matrix_health);
         let context_runtime = context_runtime_projection(&context_envelope_projection);
 
@@ -156,9 +170,9 @@ impl RealityService {
                 },
                 "matrix": engine_summary("matrix", &matrix.health(), matrix_health),
                 "growth": {
-                    "status": "ready",
-                    "event_count": growth_events.len(),
-                    "promotion_count": growth_promotions.len(),
+                    "status": if degraded_reasons.is_empty() { "ready" } else { "degraded" },
+                    "event_count": growth_event_count,
+                    "promotion_count": growth_promotion_count,
                     "envelope": growth.event_log_contract(),
                 },
                 "context": {
@@ -175,8 +189,8 @@ impl RealityService {
                 },
             },
             "latest": {
-                "growth_event": growth_events.first(),
-                "promotion": growth_promotions.first(),
+                "growth_event": latest_growth_event,
+                "promotion": latest_growth_promotion,
             },
         })
     }
@@ -344,24 +358,29 @@ impl RealityService {
 
     pub(crate) async fn flow_projection(
         &self,
-        config_home: &Path,
+        _config_home: &Path,
         growth: &GrowthService,
         query: RealityFlowQuery,
     ) -> FactFlowProjection {
-        let events = filter_events(
-            growth
-                .durable_event_log(config_home)
-                .unwrap_or_else(|_| growth.event_log()),
-            query.session_id.as_deref(),
-            query.limit,
-        );
-        let promotions = filter_promotions(
-            growth
-                .durable_promotion_log(config_home)
-                .unwrap_or_default(),
-            query.session_id.as_deref(),
-            query.limit.saturating_mul(6).max(12),
-        );
+        let mut degraded_reasons = Vec::new();
+        let events = match growth.durable_event_log() {
+            Ok(events) => filter_events(events, query.session_id.as_deref(), query.limit),
+            Err(error) => {
+                degraded_reasons.push(format!("growth event ledger unavailable: {error}"));
+                Vec::new()
+            }
+        };
+        let promotions = match growth.durable_promotion_log() {
+            Ok(promotions) => filter_promotions(
+                promotions,
+                query.session_id.as_deref(),
+                query.limit.saturating_mul(6).max(12),
+            ),
+            Err(error) => {
+                degraded_reasons.push(format!("growth promotion ledger unavailable: {error}"));
+                Vec::new()
+            }
+        };
         let stages = fact_flow_stages(&events, &promotions);
         let edges = fact_flow_edges(&stages);
 
@@ -369,13 +388,13 @@ impl RealityService {
             "kind": "reality.fact_flow",
             "schema_version": "reality.fact_flow.v1",
             "revision": events.len().saturating_add(promotions.len()),
-            "ok": true,
+            "ok": degraded_reasons.is_empty(),
             "generated_at": Utc::now(),
             "envelope": self.flow_contract(),
             "session_id": query.session_id,
             "source": "growth.promotions",
-            "degraded": false,
-            "degraded_reasons": [],
+            "degraded": !degraded_reasons.is_empty(),
+            "degraded_reasons": degraded_reasons,
             "stage_count": stages.len(),
             "event_count": events.len(),
             "promotion_count": promotions.len(),
@@ -388,20 +407,20 @@ impl RealityService {
 
     pub(crate) fn promotions_projection(
         &self,
-        config_home: &Path,
+        _config_home: &Path,
         growth: &GrowthService,
         session_id: Option<&str>,
         target: Option<&str>,
         status: Option<&str>,
         limit: usize,
     ) -> PromotionTraceProjection {
-        let mut promotions = filter_promotions(
-            growth
-                .durable_promotion_log(config_home)
-                .unwrap_or_default(),
-            session_id,
-            limit,
-        );
+        let (mut promotions, degraded_reason) = match growth.durable_promotion_log() {
+            Ok(promotions) => (filter_promotions(promotions, session_id, limit), None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("growth promotion ledger unavailable: {error}")),
+            ),
+        };
         if let Some(target) = target {
             promotions.retain(|promotion| promotion.target == target);
         }
@@ -410,22 +429,27 @@ impl RealityService {
         }
         serde_json::json!({
             "kind": "reality.promotions",
-            "ok": true,
+            "ok": degraded_reason.is_none(),
             "generated_at": Utc::now(),
             "envelope": self.promotions_contract(),
             "total": promotions.len(),
             "promotions": promotions,
+            "degraded_reason": degraded_reason,
         })
     }
 
     pub(crate) fn boundaries_projection(
         &self,
-        config_home: &Path,
+        _config_home: &Path,
         growth: &GrowthService,
     ) -> RealityBoundaryProjection {
-        let promotions = growth
-            .durable_promotion_log(config_home)
-            .unwrap_or_default();
+        let (promotions, degraded_reason) = match growth.durable_promotion_log() {
+            Ok(promotions) => (promotions, None),
+            Err(error) => (
+                Vec::new(),
+                Some(format!("growth promotion ledger unavailable: {error}")),
+            ),
+        };
         let promoted = promotions
             .iter()
             .filter(|promotion| matches!(promotion.status.as_str(), "promote" | "promoted"))
@@ -445,7 +469,7 @@ impl RealityService {
             .count();
         serde_json::json!({
             "kind": "reality.boundaries",
-            "ok": true,
+            "ok": degraded_reason.is_none(),
             "generated_at": Utc::now(),
             "envelope": self.boundaries_contract(),
             "boundaries": [
@@ -481,6 +505,7 @@ impl RealityService {
                 }
             ],
             "source": "growth.promotion_receipts",
+            "degraded_reason": degraded_reason,
         })
     }
 
@@ -496,7 +521,7 @@ impl RealityService {
         let mut augmentation = RealityRecallAugmentation::default();
         let mut fact_omitted = 0usize;
         let fact_hits = growth.recall_facts(query, limit);
-        for hit in fact_hits {
+        for hit in fact_hits.as_ref().map_or_else(|_| Vec::new(), Clone::clone) {
             let fact = hit.fact;
             let boundary = fact_boundary(&fact);
             if !boundary.can_be_authoritative() {
@@ -521,14 +546,21 @@ impl RealityService {
         }
         augmentation.sources.push(RecallSourceResult {
             source: RecallSourceKind::Fact,
-            status: "enabled_and_wired".to_string(),
+            status: if fact_hits.is_ok() {
+                "enabled_and_wired"
+            } else {
+                "degraded"
+            }
+            .to_string(),
             selected_count: augmentation
                 .candidates
                 .iter()
                 .filter(|candidate| candidate.source == RecallSourceKind::Fact)
                 .count(),
             omitted_count: fact_omitted,
-            degraded_reason: None,
+            degraded_reason: fact_hits
+                .err()
+                .map(|error| format!("fact ledger recall unavailable: {error}")),
         });
 
         match matrix.list_facts(config_home, limit.saturating_mul(3)) {
