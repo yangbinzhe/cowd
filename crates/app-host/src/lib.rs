@@ -699,29 +699,17 @@ pub struct StaticAppProduct {
     descriptor: fn() -> AppDescriptor,
     register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
     tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
-    storage_requirements: Option<fn() -> Vec<AppStorageRequirement>>,
+    storage_requirements: fn() -> Vec<AppStorageRequirement>,
 }
 
 impl StaticAppProduct {
+    /// A reviewed static product must declare its durable-storage contract.
+    ///
+    /// Stateless APPs return an empty vector. Requiring this declaration in
+    /// the sole constructor prevents a product from silently bypassing the
+    /// host-owned storage inventory.
     #[must_use]
     pub const fn new(
-        descriptor: fn() -> AppDescriptor,
-        register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
-        tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
-    ) -> Self {
-        Self {
-            descriptor,
-            register,
-            tui_surface,
-            storage_requirements: None,
-        }
-    }
-
-    /// Extend a reviewed static product with declarative durable-storage
-    /// requirements. The legacy constructor remains source compatible for an
-    /// APP with no durable state; new products should use this constructor.
-    #[must_use]
-    pub const fn with_storage_requirements(
         descriptor: fn() -> AppDescriptor,
         register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
         tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
@@ -731,7 +719,7 @@ impl StaticAppProduct {
             descriptor,
             register,
             tui_surface,
-            storage_requirements: Some(storage_requirements),
+            storage_requirements,
         }
     }
 
@@ -761,8 +749,7 @@ impl StaticAppProduct {
 
     #[must_use]
     pub fn storage_requirements(self) -> Vec<AppStorageRequirement> {
-        self.storage_requirements
-            .map_or_else(Vec::new, |factory| factory())
+        (self.storage_requirements)()
     }
 }
 
