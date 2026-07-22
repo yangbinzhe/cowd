@@ -7,7 +7,7 @@
 //! active `PermissionPolicy`.
 
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
-use approval::{ApprovalRepository, FileApprovalRepository};
+use approval::{ApprovalPolicyArtifact, FileApprovalPolicyArtifact};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -733,28 +733,25 @@ pub struct DestructivePatternDetector {
     patterns: Vec<DangerPattern>,
     /// Session-level approval cache (command_hash → persistence)
     session_approved: Arc<RwLock<HashMap<String, ApprovalPersistence>>>,
-    /// Permanent approval repository.
-    approval_repository: FileApprovalRepository,
+    /// Explicit user-managed permanent allow-list artifact.
+    approval_policy: FileApprovalPolicyArtifact,
 }
 
 impl DestructivePatternDetector {
     /// Create a new detector with all built-in patterns
     pub fn new(config_dir: PathBuf) -> Self {
         let registry = storage::StorageRegistry::default_for_config_home(&config_dir);
-        let approval_repository = FileApprovalRepository::from_storage_endpoints(
-            registry
-                .endpoint(&storage::StorageDomainId::ApprovalHistory)
-                .expect("approval history endpoint is part of the default Cowd storage inventory"),
+        let approval_policy = FileApprovalPolicyArtifact::from_storage_endpoint(
             registry
                 .endpoint(&storage::StorageDomainId::AlwaysApproved)
                 .expect("always-approved endpoint is part of the default Cowd storage inventory"),
         )
-        .expect("approval endpoints must use the file_json backend");
+        .expect("always-approved endpoint must use the file_json backend");
         let patterns = Self::build_patterns();
         Self {
             patterns,
             session_approved: Arc::new(RwLock::new(HashMap::new())),
-            approval_repository,
+            approval_policy,
         }
     }
 
@@ -1124,7 +1121,7 @@ impl DestructivePatternDetector {
 
     /// Check if command is permanently approved
     fn is_always_approved(&self, _normalized: &str) -> bool {
-        self.approval_repository
+        self.approval_policy
             .list_always_allowed()
             .map(|patterns| patterns.iter().any(|p| _normalized.contains(p)))
             .unwrap_or(false)
@@ -1181,8 +1178,15 @@ impl DestructivePatternDetector {
         })
     }
 
-    /// Record an approval decision in the session cache
-    pub async fn record_approval(&self, command: &str, persistence: ApprovalPersistence) {
+    /// Apply an approved decision's requested cache/policy persistence.
+    /// The decision receipt itself is written by `SmartApprovalGate` before
+    /// this method is invoked; a failed always-allow artifact is observable
+    /// and intentionally never converted into a silent bypass.
+    pub async fn record_approval(
+        &self,
+        command: &str,
+        persistence: ApprovalPersistence,
+    ) -> Result<(), approval::ApprovalRepositoryError> {
         let normalized = Self::normalize_command(command);
         let cache_key = self.command_cache_key(&normalized);
 
@@ -1190,11 +1194,10 @@ impl DestructivePatternDetector {
             ApprovalPersistence::Session => {
                 let mut cache = self.session_approved.write().await;
                 cache.insert(cache_key, persistence);
+                Ok(())
             }
-            ApprovalPersistence::Once => {}
-            ApprovalPersistence::Always => {
-                let _ = self.approval_repository.add_always_allowed(&normalized);
-            }
+            ApprovalPersistence::Once => Ok(()),
+            ApprovalPersistence::Always => self.approval_policy.add_always_allowed(&normalized),
         }
     }
 }

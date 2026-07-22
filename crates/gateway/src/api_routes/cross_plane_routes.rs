@@ -165,37 +165,41 @@ fn default_identity_trust() -> runtime::IdentityTrust {
 async fn cross_plane_summary_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let summary = state
+    match state
         .services
         .cross_plane
         .control()
-        .summary(chrono::Utc::now());
-    Json(serde_json::json!({
-        "kind": "cross_plane_summary",
-        "providers": [],
-        "channels": [],
-        "services": [],
-        "identity_bindings": {
-            "verified": summary.verified_identities,
-            "claimed": summary.claimed_identities,
-            "observed": summary.observed_identities,
-            "unknown": 0
-        },
-        "grants": {
-            "active": summary.active_grants,
-            "expiring": 0,
-            "expired": 0
-        },
-        "approvals": {
-            "pending": 0
-        },
-        "interop": {
-            "actions_24h": summary.audit_records,
-            "allowed_24h": summary.allowed_actions,
-            "denied_24h": summary.denied_actions,
-            "approval_required_24h": summary.approval_required_actions
-        }
-    }))
+        .summary(chrono::Utc::now())
+    {
+        Ok(summary) => Json(serde_json::json!({
+            "kind": "cross_plane_summary",
+            "providers": [],
+            "channels": [],
+            "services": [],
+            "identity_bindings": {
+                "verified": summary.verified_identities,
+                "claimed": summary.claimed_identities,
+                "observed": summary.observed_identities,
+                "unknown": 0
+            },
+            "grants": {
+                "active": summary.active_grants,
+                "expiring": 0,
+                "expired": 0
+            },
+            "approvals": {
+                "pending": 0
+            },
+            "interop": {
+                "actions_24h": summary.audit_records,
+                "allowed_24h": summary.allowed_actions,
+                "denied_24h": summary.denied_actions,
+                "approval_required_24h": summary.approval_required_actions
+            }
+        }))
+        .into_response(),
+        Err(error) => cross_plane_commit_error("summary", error),
+    }
 }
 
 async fn cross_plane_grants_handler(
@@ -299,13 +303,15 @@ fn cross_plane_commit_error(
 async fn cross_plane_audit_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let records = state.services.cross_plane.control().list_audit(100, 0);
-    let total = records.len();
-    Json(serde_json::json!({
-        "kind": "cross_plane_audit",
-        "records": records,
-        "total": total
-    }))
+    match state.services.cross_plane.control().list_audit(100, 0) {
+        Ok((records, total)) => Json(serde_json::json!({
+            "kind": "cross_plane_audit",
+            "records": records,
+            "total": total
+        }))
+        .into_response(),
+        Err(error) => cross_plane_commit_error("audit", error),
+    }
 }
 
 async fn cross_plane_action_adapters_handler(
@@ -594,18 +600,23 @@ async fn cross_plane_action_execute_handler(
     } {
         Ok(committed) => committed,
         Err(error) => {
-            let status = if matches!(
-                error,
-                runtime::CrossPlaneRuntimeError::IdempotencyConflict(_)
-            ) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+            let (status, code) = match &error {
+                runtime::CrossPlaneRuntimeError::IdempotencyConflict(_) => {
+                    (StatusCode::CONFLICT, "cross_plane_idempotency_conflict")
+                }
+                runtime::CrossPlaneRuntimeError::GrantUnavailable(_) => {
+                    (StatusCode::CONFLICT, "cross_plane_grant_unavailable")
+                }
+                _ => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cross_plane_action_execution_failed",
+                ),
             };
             return (
                 status,
                 Json(serde_json::json!({
                     "kind": "cross_plane_action_execution_failed",
+                    "code": code,
                     "error": error.to_string(),
                 })),
             )

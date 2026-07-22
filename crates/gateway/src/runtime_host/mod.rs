@@ -759,24 +759,31 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     storage_registry
         .ensure_directories()
         .map_err(|e| format!("failed to initialize storage layout: {e}"))?;
-    let history_endpoint = storage_registry
+    let approval_endpoint = storage_registry
+        .endpoint(&storage::StorageDomainId::Approval)
+        .map_err(|error| error.to_string())?;
+    let legacy_history_endpoint = storage_registry
         .endpoint(&storage::StorageDomainId::ApprovalHistory)
         .map_err(|error| error.to_string())?;
-    let always_allowed_endpoint = storage_registry
-        .endpoint(&storage::StorageDomainId::AlwaysApproved)
-        .map_err(|error| error.to_string())?;
-    let approval_history_path = history_endpoint.as_handle().path;
-    let approval_repository = approval::FileApprovalRepository::from_storage_endpoints(
-        history_endpoint,
-        always_allowed_endpoint,
-    )
-    .map_err(|e| format!("failed to initialize approval repository: {e}"))?;
+    let approval_ledger = approval::SqliteApprovalHistoryLedger::open(approval_endpoint)
+        .map_err(|error| format!("failed to initialize approval decision ledger: {error}"))?;
+    if approval_ledger
+        .export_migration_snapshot()
+        .map_err(|error| format!("failed to inspect approval decision ledger: {error}"))?
+        .entries
+        .is_empty()
+    {
+        approval_ledger
+            .import_legacy_json(legacy_history_endpoint.as_handle().path)
+            .map_err(|error| format!("failed to import legacy approval history: {error}"))?;
+    }
+    let approval_ledger: approval::SharedApprovalHistoryLedger = Arc::new(approval_ledger);
     let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
         Arc::new(
             runtime::permission_enforcer::DestructivePatternDetector::new(approval_dir.clone()),
         ),
         runtime::ApprovalConfig::default(),
-        Some(approval_history_path),
+        Arc::clone(&approval_ledger),
     ));
     let profile_manager = Arc::new(runtime::ProfileManager::from_config_home(&approval_dir));
     if let Err(e) = profile_manager.initialize() {
@@ -967,7 +974,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         surface_host.clone(),
         cognitive.clone(),
         approval_gate.clone(),
-        approval_repository,
+        approval_ledger,
         Arc::clone(&session_manager),
         &approval_dir,
         capacity_config,

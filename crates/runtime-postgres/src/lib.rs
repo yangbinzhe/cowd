@@ -440,6 +440,43 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         .map_err(|error| error.to_string())
     }
 
+    fn list_stream_page_desc(
+        &self,
+        stream_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+        let offset = to_i64(offset as u64, "offset").map_err(|error| error.to_string())?;
+        pg(connection.query(
+            &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 ORDER BY sequence DESC LIMIT $2 OFFSET $3"),
+            &[&stream_id, &limit, &offset],
+        ))
+        .and_then(rows_to_events)
+        .map_err(|error| error.to_string())
+    }
+
+    fn stream_event_count(&self, stream_id: &str) -> Result<usize, String> {
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let count: i64 = pg(connection.query_one(
+            "SELECT COUNT(*) FROM runtime_events WHERE stream_id=$1",
+            &[&stream_id],
+        ))
+        .and_then(|row| pg(row.try_get(0)))
+        .map_err(|error| error.to_string())?;
+        usize::try_from(count).map_err(|_| "runtime stream event count overflow".to_string())
+    }
+
     fn execution_events_for_session(
         &self,
         session_id: &str,

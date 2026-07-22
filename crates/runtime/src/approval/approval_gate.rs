@@ -6,12 +6,15 @@
 //! the blocking approval flow with the frontend via SSE + oneshot channels.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, RwLock};
+
+#[cfg(test)]
+use approval::SqliteApprovalHistoryLedger;
+use approval::{ApprovalHistoryEntry, ApprovalHistoryOutcome, SharedApprovalHistoryLedger};
 
 use harness_contract::policy::{
     PermissionOperation, PermissionResource, PermissionScope,
@@ -35,99 +38,6 @@ pub enum ApprovalGateResult {
     Denied { reason: String },
     /// Approval request timed out without user response.
     TimedOut,
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Approval History
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Outcome of an approval decision.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalHistoryOutcome {
-    Approved { persistence: String },
-    Denied { reason: String },
-    TimedOut,
-}
-
-/// A single approval history entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalHistoryEntry {
-    pub id: String,
-    pub request_id: String,
-    pub command: String,
-    pub normalized_command: String,
-    pub risk_level: String,
-    pub matched_patterns: Vec<String>,
-    pub outcome: ApprovalHistoryOutcome,
-    pub resolved_at: String,
-}
-
-const APPROVAL_HISTORY_MAX: usize = 200;
-
-/// Persistent store for approval history.
-pub struct ApprovalHistoryStore {
-    entries: Arc<RwLock<Vec<ApprovalHistoryEntry>>>,
-    storage_path: Option<PathBuf>,
-}
-
-impl ApprovalHistoryStore {
-    pub fn new(storage_path: Option<PathBuf>) -> Self {
-        let entries = storage_path
-            .as_ref()
-            .and_then(|p| Self::load_from_disk(p).ok())
-            .unwrap_or_default();
-        Self {
-            entries: Arc::new(RwLock::new(entries)),
-            storage_path,
-        }
-    }
-
-    fn load_from_disk(path: &PathBuf) -> Result<Vec<ApprovalHistoryEntry>, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let entries: Vec<ApprovalHistoryEntry> =
-            serde_json::from_str(&content).map_err(|e| e.to_string())?;
-        Ok(entries)
-    }
-
-    async fn save_to_disk(&self) -> Result<(), String> {
-        let path = match &self.storage_path {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let entries = self.entries.read().await;
-        let content = serde_json::to_string_pretty(&*entries).map_err(|e| e.to_string())?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(path, content).map_err(|e| e.to_string())
-    }
-
-    /// Record an approval history entry and persist.
-    pub async fn record(&self, entry: ApprovalHistoryEntry) {
-        let mut entries = self.entries.write().await;
-        entries.insert(0, entry);
-        if entries.len() > APPROVAL_HISTORY_MAX {
-            entries.truncate(APPROVAL_HISTORY_MAX);
-        }
-        drop(entries);
-        if let Err(e) = self.save_to_disk().await {
-            tracing::warn!("Failed to persist approval history: {e}");
-        }
-    }
-
-    /// List approval history with pagination.
-    pub async fn list_history(
-        &self,
-        limit: usize,
-        offset: usize,
-    ) -> (Vec<ApprovalHistoryEntry>, usize) {
-        let entries = self.entries.read().await;
-        let total = entries.len();
-        let page: Vec<ApprovalHistoryEntry> =
-            entries.iter().skip(offset).take(limit).cloned().collect();
-        (page, total)
-    }
 }
 
 /// Trait for sending approval-related SSE events to the frontend.
@@ -163,7 +73,7 @@ pub struct SmartApprovalGate {
     /// Optional SSE sender for pushing approval events to the frontend.
     sse_sender: Option<Arc<dyn ApprovalSseSender>>,
     /// Persistent approval history store.
-    history: Arc<ApprovalHistoryStore>,
+    history: SharedApprovalHistoryLedger,
     session_approved: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
@@ -182,14 +92,14 @@ impl SmartApprovalGate {
     pub fn new(
         detector: Arc<DestructivePatternDetector>,
         config: ApprovalConfig,
-        history_path: Option<PathBuf>,
+        history: SharedApprovalHistoryLedger,
     ) -> Self {
         Self {
             detector,
             config: Arc::new(RwLock::new(config)),
             pending: Arc::new(RwLock::new(HashMap::new())),
             sse_sender: None,
-            history: Arc::new(ApprovalHistoryStore::new(history_path)),
+            history,
             session_approved: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
         }
     }
@@ -219,8 +129,30 @@ impl SmartApprovalGate {
     }
 
     /// Get a reference to the approval history store (for API endpoints).
-    pub fn history(&self) -> &Arc<ApprovalHistoryStore> {
+    pub fn history(&self) -> &SharedApprovalHistoryLedger {
         &self.history
+    }
+
+    fn history_entry(
+        request: &ApprovalRequest,
+        outcome: ApprovalHistoryOutcome,
+    ) -> ApprovalHistoryEntry {
+        ApprovalHistoryEntry {
+            id: format!("ah_{}", uuid::Uuid::new_v4()),
+            request_id: request.id.clone(),
+            command: request.command.clone(),
+            normalized_command: request.normalized_command.clone(),
+            risk_level: format!("{:?}", request.risk_level).to_lowercase(),
+            matched_patterns: request.matched_patterns.clone(),
+            outcome,
+            resolved_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn record_history(&self, entry: ApprovalHistoryEntry) -> Result<(), String> {
+        self.history
+            .append(entry)
+            .map_err(|error| error.to_string())
     }
 
     /// Update the approval configuration at runtime (for SOLO toggle, etc.).
@@ -425,23 +357,15 @@ impl SmartApprovalGate {
             Ok(Err(_)) => {
                 // Channel closed without response
                 self.pending.write().await.remove(&request_id);
-                // Record history: denied due to channel closed
-                let entry = ApprovalHistoryEntry {
-                    id: format!("ah_{}", rand::random::<u32>()),
-                    request_id: request.id.clone(),
-                    command: request.command.clone(),
-                    normalized_command: request.normalized_command.clone(),
-                    risk_level: format!("{:?}", request.risk_level).to_lowercase(),
-                    matched_patterns: request.matched_patterns.clone(),
-                    outcome: ApprovalHistoryOutcome::Denied {
+                let entry = Self::history_entry(
+                    &request,
+                    ApprovalHistoryOutcome::Denied {
                         reason: "Approval channel closed".to_string(),
                     },
-                    resolved_at: chrono::Utc::now().to_rfc3339(),
-                };
-                let history = self.history.clone();
-                tokio::spawn(async move {
-                    history.record(entry).await;
-                });
+                );
+                if let Err(error) = self.record_history(entry) {
+                    tracing::error!(%request_id, %error, "approval channel-close denial was not persisted");
+                }
                 ApprovalGateResult::Denied {
                     reason: "Approval channel closed".to_string(),
                 }
@@ -452,21 +376,10 @@ impl SmartApprovalGate {
                 if let Some(sender) = &self.sse_sender {
                     sender.send_approval_resolved(&request_id, &ApprovalVerdict::TimedOut);
                 }
-                // Record history: timed out
-                let entry = ApprovalHistoryEntry {
-                    id: format!("ah_{}", rand::random::<u32>()),
-                    request_id: request.id.clone(),
-                    command: request.command.clone(),
-                    normalized_command: request.normalized_command.clone(),
-                    risk_level: format!("{:?}", request.risk_level).to_lowercase(),
-                    matched_patterns: request.matched_patterns.clone(),
-                    outcome: ApprovalHistoryOutcome::TimedOut,
-                    resolved_at: chrono::Utc::now().to_rfc3339(),
-                };
-                let history = self.history.clone();
-                tokio::spawn(async move {
-                    history.record(entry).await;
-                });
+                let entry = Self::history_entry(&request, ApprovalHistoryOutcome::TimedOut);
+                if let Err(error) = self.record_history(entry) {
+                    tracing::error!(%request_id, %error, "approval timeout was not persisted");
+                }
                 ApprovalGateResult::TimedOut
             }
         }
@@ -503,15 +416,45 @@ impl SmartApprovalGate {
         verdict: ApprovalVerdict,
         persistence: ApprovalPersistence,
     ) -> Option<ApprovalRequest> {
-        // Capture persistence string before it's moved into record_approval
-        let persistence_str = format!("{:?}", persistence).to_lowercase();
+        // Claim the one-shot request under the short-lived map lock, then do
+        // durable I/O and policy work after releasing it.  A history backend
+        // stall must not serialize unrelated approval decisions in this
+        // Gateway process.
+        let pending = { self.pending.write().await.remove(request_id) };
+        if let Some((request, sender)) = pending {
+            let history_outcome = match &verdict {
+                ApprovalVerdict::Approved => ApprovalHistoryOutcome::Approved {
+                    persistence: format!("{:?}", persistence).to_lowercase(),
+                },
+                ApprovalVerdict::Denied { reason } => ApprovalHistoryOutcome::Denied {
+                    reason: reason.clone(),
+                },
+                ApprovalVerdict::TimedOut => ApprovalHistoryOutcome::TimedOut,
+            };
+            let mut effective_verdict = verdict;
+            if let Err(error) = self.record_history(Self::history_entry(&request, history_outcome))
+            {
+                tracing::error!(%request_id, %error, "approval resolution receipt persistence failed");
+                if matches!(effective_verdict, ApprovalVerdict::Approved) {
+                    effective_verdict = ApprovalVerdict::Denied {
+                        reason: "approval decision persistence failed; action was not approved"
+                            .to_string(),
+                    };
+                }
+            }
 
-        let mut pending = self.pending.write().await;
-        if let Some((request, sender)) = pending.remove(request_id) {
-            if matches!(verdict, ApprovalVerdict::Approved) {
-                self.detector
+            if matches!(effective_verdict, ApprovalVerdict::Approved) {
+                if let Err(error) = self
+                    .detector
                     .record_approval(&request.command, persistence.clone())
-                    .await;
+                    .await
+                {
+                    // The manual decision is already durably recorded; an
+                    // unavailable "always" policy artifact must not create a
+                    // hidden bypass. The current action remains one explicit
+                    // approval and the persistence failure is observable.
+                    tracing::error!(%request_id, %error, "approval persistence policy was not applied");
+                }
                 if let Some(action) = request
                     .matched_patterns
                     .iter()
@@ -527,38 +470,10 @@ impl SmartApprovalGate {
                 }
             }
 
-            // Send the verdict through the oneshot channel
-            let _ = sender.send(verdict.clone());
-
-            // Notify frontend of resolution
+            let _ = sender.send(effective_verdict.clone());
             if let Some(sse_sender) = &self.sse_sender {
-                sse_sender.send_approval_resolved(request_id, &verdict);
+                sse_sender.send_approval_resolved(request_id, &effective_verdict);
             }
-
-            // Record approval history
-            let history_outcome = match &verdict {
-                ApprovalVerdict::Approved => ApprovalHistoryOutcome::Approved {
-                    persistence: persistence_str,
-                },
-                ApprovalVerdict::Denied { reason } => ApprovalHistoryOutcome::Denied {
-                    reason: reason.clone(),
-                },
-                ApprovalVerdict::TimedOut => ApprovalHistoryOutcome::TimedOut,
-            };
-            let entry = ApprovalHistoryEntry {
-                id: format!("ah_{}", rand::random::<u32>()),
-                request_id: request.id.clone(),
-                command: request.command.clone(),
-                normalized_command: request.normalized_command.clone(),
-                risk_level: format!("{:?}", request.risk_level).to_lowercase(),
-                matched_patterns: request.matched_patterns.clone(),
-                outcome: history_outcome,
-                resolved_at: chrono::Utc::now().to_rfc3339(),
-            };
-            let history = self.history.clone();
-            tokio::spawn(async move {
-                history.record(entry).await;
-            });
 
             Some(request)
         } else {
@@ -630,11 +545,43 @@ fn risk_gate_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approval::{ApprovalHistoryError, ApprovalHistoryLedger, ApprovalHistoryResult};
     use std::path::PathBuf;
 
+    #[derive(Debug)]
+    struct FailingHistoryLedger;
+
+    impl ApprovalHistoryLedger for FailingHistoryLedger {
+        fn list(
+            &self,
+            _limit: usize,
+            _offset: usize,
+        ) -> ApprovalHistoryResult<(Vec<ApprovalHistoryEntry>, usize)> {
+            Err(ApprovalHistoryError::Backend(
+                "test ledger unavailable".to_string(),
+            ))
+        }
+
+        fn get(&self, _id: &str) -> ApprovalHistoryResult<Option<ApprovalHistoryEntry>> {
+            Err(ApprovalHistoryError::Backend(
+                "test ledger unavailable".to_string(),
+            ))
+        }
+
+        fn append(&self, _entry: ApprovalHistoryEntry) -> ApprovalHistoryResult<()> {
+            Err(ApprovalHistoryError::Backend(
+                "test ledger unavailable".to_string(),
+            ))
+        }
+    }
+
     fn make_gate(config: ApprovalConfig) -> SmartApprovalGate {
-        let detector = Arc::new(DestructivePatternDetector::new(PathBuf::from("/tmp")));
-        SmartApprovalGate::new(detector, config, None)
+        let detector = Arc::new(DestructivePatternDetector::new(std::path::PathBuf::from(
+            "/tmp",
+        )));
+        let history: SharedApprovalHistoryLedger =
+            Arc::new(SqliteApprovalHistoryLedger::in_memory().expect("in-memory approval ledger"));
+        SmartApprovalGate::new(detector, config, history)
     }
 
     #[tokio::test]
@@ -892,5 +839,38 @@ mod tests {
     fn extract_command_fallback_to_raw() {
         let cmd = SmartApprovalGate::extract_command("just a raw command");
         assert_eq!(cmd, "just a raw command");
+    }
+
+    #[tokio::test]
+    async fn approved_action_fails_closed_when_history_receipt_cannot_persist() {
+        let history: SharedApprovalHistoryLedger = Arc::new(FailingHistoryLedger);
+        let gate = Arc::new(SmartApprovalGate::new(
+            Arc::new(DestructivePatternDetector::new(PathBuf::from("/tmp"))),
+            ApprovalConfig::default(),
+            history,
+        ));
+        let evaluating_gate = Arc::clone(&gate);
+        let awaiting = tokio::spawn(async move {
+            evaluating_gate
+                .evaluate("bash", r#"{"command":"rm -rf /tmp/cowd-ledger-failure"}"#)
+                .await
+        });
+        let request = loop {
+            if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        };
+        gate.resolve_approval(
+            &request.id,
+            ApprovalVerdict::Approved,
+            ApprovalPersistence::Once,
+        )
+        .await
+        .expect("pending approval resolves to a durable fail-closed verdict");
+        assert!(matches!(
+            awaiting.await.expect("approval task joins"),
+            ApprovalGateResult::Denied { .. }
+        ));
     }
 }

@@ -441,6 +441,19 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>>;
     fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64>;
     fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String>;
+    /// Return one newest-first page without materialising the whole stream.
+    ///
+    /// Administrative timelines (for example the cross-plane audit ledger)
+    /// must keep their paging boundary in the durable backend.  Pulling an
+    /// ever-growing immutable stream into a process and paging it afterwards
+    /// turns a read-only UI request into an unbounded allocation.
+    fn list_stream_page_desc(
+        &self,
+        stream_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String>;
+    fn stream_event_count(&self, stream_id: &str) -> Result<usize, String>;
     fn execution_events_for_session(
         &self,
         session_id: &str,
@@ -643,6 +656,19 @@ impl RuntimeEventStore {
 
     pub fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
         self.backend.list_stream(stream_id)
+    }
+
+    pub fn list_stream_page_desc(
+        &self,
+        stream_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        self.backend.list_stream_page_desc(stream_id, limit, offset)
+    }
+
+    pub fn stream_event_count(&self, stream_id: &str) -> Result<usize, String> {
+        self.backend.stream_event_count(stream_id)
     }
 
     pub fn execution_events_for_session(
@@ -1096,6 +1122,40 @@ impl SqliteRuntimeEventStore {
             params![stream_id],
         )
         .map_err(|error| error.to_string())
+    }
+
+    pub fn list_stream_page_desc(
+        &self,
+        stream_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.query_events(
+            &format!(
+                "{} WHERE stream_id = ?1 ORDER BY sequence DESC LIMIT ?2 OFFSET ?3",
+                event_select()
+            ),
+            params![stream_id, limit as i64, offset as i64],
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn stream_event_count(&self, stream_id: &str) -> Result<usize, String> {
+        let conn = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_events WHERE stream_id = ?1",
+                params![stream_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        usize::try_from(count).map_err(|_| "runtime stream event count overflow".to_string())
     }
 
     /// Resolve the canonical graph streams that produced terminal work for a
@@ -1635,6 +1695,19 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
 
     fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
         Self::list_stream(self, stream_id)
+    }
+
+    fn list_stream_page_desc(
+        &self,
+        stream_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        Self::list_stream_page_desc(self, stream_id, limit, offset)
+    }
+
+    fn stream_event_count(&self, stream_id: &str) -> Result<usize, String> {
+        Self::stream_event_count(self, stream_id)
     }
 
     fn execution_events_for_session(

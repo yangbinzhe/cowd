@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock, RwLock};
 use uuid::Uuid;
 
-const MAX_CROSS_PLANE_AUDIT_RECORDS: usize = 10_000;
 const MAX_CROSS_PLANE_EXECUTION_RECEIPTS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,7 +618,6 @@ pub struct CrossPlaneControlPlane {
 struct CrossPlaneControlState {
     identities: Vec<CrossPlaneIdentityBinding>,
     grants: Vec<CrossPlaneGrant>,
-    audit: Vec<CrossPlaneAuditRecord>,
     executions: Vec<CrossPlaneExecutionReceipt>,
 }
 
@@ -627,7 +625,6 @@ struct CrossPlaneControlState {
 pub struct CrossPlaneControlSnapshot {
     pub identities: Vec<CrossPlaneIdentityBinding>,
     pub grants: Vec<CrossPlaneGrant>,
-    pub audit: Vec<CrossPlaneAuditRecord>,
     #[serde(default)]
     pub executions: Vec<CrossPlaneExecutionReceipt>,
 }
@@ -652,7 +649,6 @@ impl CrossPlaneControlPlane {
         CrossPlaneControlSnapshot {
             identities: state.identities.clone(),
             grants: state.grants.clone(),
-            audit: state.audit.clone(),
             executions: state.executions.clone(),
         }
     }
@@ -661,7 +657,6 @@ impl CrossPlaneControlPlane {
         let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
         state.identities = snapshot.identities;
         state.grants = snapshot.grants;
-        state.audit = snapshot.audit;
         state.executions = snapshot.executions;
     }
 
@@ -782,26 +777,6 @@ impl CrossPlaneControlPlane {
     }
 
     #[must_use]
-    pub fn list_audit(&self, limit: usize, offset: usize) -> Vec<CrossPlaneAuditRecord> {
-        let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
-        let mut records = state.audit.clone();
-        records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        records.into_iter().skip(offset).take(limit).collect()
-    }
-
-    pub fn record_audit(&self, record: CrossPlaneAuditRecord) {
-        let mut state = self.inner.write().unwrap_or_else(|err| err.into_inner());
-        state.audit.push(record);
-        let overflow = state
-            .audit
-            .len()
-            .saturating_sub(MAX_CROSS_PLANE_AUDIT_RECORDS);
-        if overflow > 0 {
-            state.audit.drain(0..overflow);
-        }
-    }
-
-    #[must_use]
     pub fn list_executions(&self, limit: usize, offset: usize) -> Vec<CrossPlaneExecutionReceipt> {
         let state = self.inner.read().unwrap_or_else(|err| err.into_inner());
         let mut records = state.executions.clone();
@@ -887,15 +862,6 @@ impl CrossPlaneControlPlane {
     }
 
     #[must_use]
-    pub fn decide_and_audit(
-        &self,
-        action: CrossPlaneAction,
-        now: DateTime<Utc>,
-    ) -> CrossPlanePolicyDecision {
-        self.decide_and_audit_with_action(action, now).1
-    }
-
-    #[must_use]
     pub fn decide_with_action(
         &self,
         mut action: CrossPlaneAction,
@@ -942,75 +908,6 @@ impl CrossPlaneControlPlane {
         (action, decision, evidence)
     }
 
-    #[must_use]
-    pub fn decide_and_audit_with_action(
-        &self,
-        mut action: CrossPlaneAction,
-        now: DateTime<Utc>,
-    ) -> (CrossPlaneAction, CrossPlanePolicyDecision) {
-        let resolved_identity = self.resolve_action_identity(&mut action, now);
-        let active_grants = self.active_grants(now);
-        let engine = CrossPlanePolicyEngine::new(CrossPlanePolicyConfig::default())
-            .with_grants(active_grants.clone());
-        let decision = engine.decide(&action, now);
-        let consumed = self.consume_matched_grant_for_decision(&decision);
-        let evidence = CrossPlaneDecisionEvidence {
-            policy_version: "cross-plane.v1".to_string(),
-            evaluated_at: Some(now),
-            resolved_identity,
-            connector_context: None,
-            active_grants_before: active_grants.len(),
-            matched_grant_id: decision
-                .matched_grant
-                .as_ref()
-                .map(|grant| grant.id.clone()),
-            consumed_grant_id: consumed
-                .as_ref()
-                .map(|(grant_id, _remaining)| grant_id.clone()),
-            remaining_uses_after: consumed.as_ref().map(|(_grant_id, remaining)| *remaining),
-        };
-        self.record_audit(
-            CrossPlaneAuditRecord::new(
-                action.clone(),
-                decision.clone(),
-                format!("{:?}", decision.decision).to_lowercase(),
-                decision.reason.clone(),
-            )
-            .with_evidence(evidence),
-        );
-        (action, decision)
-    }
-
-    #[must_use]
-    pub fn decide_and_audit_with_connector_context(
-        &self,
-        action: CrossPlaneAction,
-        context: Option<ConnectorActionContext>,
-        now: DateTime<Utc>,
-    ) -> (
-        CrossPlaneAction,
-        CrossPlanePolicyDecision,
-        CrossPlaneDecisionEvidence,
-    ) {
-        let (action, decision, mut evidence) =
-            self.decide_with_connector_context(action, context, now);
-        let consumed = self.consume_matched_grant_for_decision(&decision);
-        evidence.consumed_grant_id = consumed
-            .as_ref()
-            .map(|(grant_id, _remaining)| grant_id.clone());
-        evidence.remaining_uses_after = consumed.as_ref().map(|(_grant_id, remaining)| *remaining);
-        self.record_audit(
-            CrossPlaneAuditRecord::new(
-                action.clone(),
-                decision.clone(),
-                format!("{:?}", decision.decision).to_lowercase(),
-                decision.reason.clone(),
-            )
-            .with_evidence(evidence.clone()),
-        );
-        (action, decision, evidence)
-    }
-
     fn resolve_action_identity(
         &self,
         action: &mut CrossPlaneAction,
@@ -1052,7 +949,11 @@ impl CrossPlaneControlPlane {
             .grants
             .iter_mut()
             .find(|stored| stored.id == grant.id)?;
-        let remaining = stored.remaining_uses.unwrap_or(1).saturating_sub(1);
+        let remaining_before = stored.remaining_uses.unwrap_or(1);
+        if remaining_before == 0 {
+            return None;
+        }
+        let remaining = remaining_before - 1;
         stored.remaining_uses = Some(remaining);
         Some((stored.id.clone(), remaining))
     }
@@ -1083,37 +984,15 @@ impl CrossPlaneControlPlane {
             .filter(|grant| grant.expires_at.is_none_or(|expires| expires > now))
             .filter(|grant| grant.remaining_uses != Some(0))
             .count();
-        let allowed_actions = state
-            .audit
-            .iter()
-            .filter(|record| record.decision.decision == PolicyDecisionKind::Allow)
-            .count();
-        let denied_actions = state
-            .audit
-            .iter()
-            .filter(|record| record.decision.decision == PolicyDecisionKind::Deny)
-            .count();
-        let approval_required_actions = state
-            .audit
-            .iter()
-            .filter(|record| {
-                matches!(
-                    record.decision.decision,
-                    PolicyDecisionKind::RequireSingleApproval
-                        | PolicyDecisionKind::RequirePersistentGrant
-                        | PolicyDecisionKind::RequireAdminApproval
-                )
-            })
-            .count();
         CrossPlaneSummary {
             verified_identities,
             claimed_identities,
             observed_identities,
             active_grants,
-            audit_records: state.audit.len(),
-            allowed_actions,
-            denied_actions,
-            approval_required_actions,
+            audit_records: 0,
+            allowed_actions: 0,
+            denied_actions: 0,
+            approval_required_actions: 0,
         }
     }
 }
@@ -1730,45 +1609,6 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_consumes_single_use_grant_and_audits_evidence() {
-        let control = CrossPlaneControlPlane::new();
-        let mut grant = CrossPlaneGrant::persistent("user:yi", "service.drive.download");
-        grant.grant_type = GrantType::SingleUse;
-        grant.remaining_uses = None;
-        let grant_id = grant.id.clone();
-        control.upsert_grant(grant);
-
-        let mut action = CrossPlaneAction::new("user:yi", "service.drive.download");
-        action.identity_trust = IdentityTrust::Verified;
-        action.risk = CrossPlaneRisk::High;
-
-        let first_decision = control.decide_and_audit(action.clone(), now());
-        let second_decision = control.decide_and_audit(action, now());
-
-        assert_eq!(first_decision.decision, PolicyDecisionKind::Allow);
-        assert_eq!(
-            second_decision.decision,
-            PolicyDecisionKind::RequireSingleApproval
-        );
-        assert_eq!(control.summary(now()).active_grants, 0);
-
-        let audit = control.list_audit(10, 0);
-        let first_record = audit
-            .iter()
-            .find(|record| record.evidence.consumed_grant_id.as_deref() == Some(&grant_id))
-            .expect("single-use grant consumption should be auditable");
-        assert_eq!(
-            first_record.evidence.policy_version,
-            "cross-plane.v1".to_string()
-        );
-        assert_eq!(
-            first_record.evidence.matched_grant_id.as_deref(),
-            Some(grant_id.as_str())
-        );
-        assert_eq!(first_record.evidence.remaining_uses_after, Some(0));
-    }
-
-    #[test]
     fn control_plane_resolves_cross_channel_identity_by_contact_key() {
         let control = CrossPlaneControlPlane::new();
         control.upsert_identity(CrossPlaneIdentityBinding::verified(
@@ -1836,15 +1676,14 @@ mod tests {
         action.identity_trust = IdentityTrust::Unknown;
         action.risk = CrossPlaneRisk::High;
 
-        let decision = control.decide_and_audit(action, now());
+        let (action, decision, evidence) =
+            control.decide_with_connector_context(action, None, now());
 
         assert_eq!(decision.decision, PolicyDecisionKind::Allow);
         assert_eq!(decision.reason, "matched_grant");
-        let audit = control.list_audit(10, 0);
-        assert_eq!(audit[0].action.actor_principal, "user:yi");
+        assert_eq!(action.actor_principal, "user:yi");
         assert_eq!(
-            audit[0]
-                .evidence
+            evidence
                 .resolved_identity
                 .as_ref()
                 .map(|resolved| resolved.match_kind.as_str()),
@@ -1867,11 +1706,10 @@ mod tests {
 
         assert_eq!(decision.decision, PolicyDecisionKind::Allow);
         assert_eq!(control.summary(now()).active_grants, 1);
-        assert!(control.list_audit(10, 0).is_empty());
     }
 
     #[test]
-    fn control_plane_audits_connector_evidence_fields() {
+    fn control_plane_connector_decision_returns_evidence_fields() {
         let control = CrossPlaneControlPlane::new();
         let mut action = CrossPlaneAction::new("user:yi", "service.mock.docs.read");
         action.identity_trust = IdentityTrust::Verified;
@@ -1893,7 +1731,7 @@ mod tests {
         };
 
         let (_action, decision, evidence) =
-            control.decide_and_audit_with_connector_context(action, Some(context), now());
+            control.decide_with_connector_context(action, Some(context), now());
 
         assert_eq!(decision.decision, PolicyDecisionKind::Allow);
         assert_eq!(
@@ -1903,8 +1741,7 @@ mod tests {
                 .map(|context| context.capability_id.as_str()),
             Some("service.mock.docs.read")
         );
-        let audit = control.list_audit(10, 0);
-        let connector = audit[0].evidence.connector_context.as_ref().unwrap();
+        let connector = evidence.connector_context.as_ref().unwrap();
         assert_eq!(
             connector.provider_account.as_deref(),
             Some("mock-docs-main")
@@ -2069,7 +1906,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_upserts_revokes_and_audits() {
+    fn control_plane_upserts_revokes_and_decides() {
         let control = CrossPlaneControlPlane::new();
         let binding = CrossPlaneIdentityBinding::verified("user:yi", "channel://chat/user/u1");
         let binding_id = binding.id.clone();
@@ -2083,43 +1920,14 @@ mod tests {
 
         let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
         action.identity_trust = IdentityTrust::Verified;
-        let decision = control.decide_and_audit(action, now());
+        let (_action, decision) = control.decide_with_action(action, now());
 
         assert_eq!(decision.decision, PolicyDecisionKind::Allow);
-        assert_eq!(control.list_audit(10, 0).len(), 1);
         assert_eq!(control.summary(now()).verified_identities, 1);
         assert_eq!(control.summary(now()).active_grants, 1);
         assert!(control.revoke_identity(&binding_id));
         assert!(control.revoke_grant(&grant_id));
         assert!(control.list_identities().is_empty());
         assert!(control.list_grants().is_empty());
-    }
-
-    #[test]
-    fn control_plane_audit_is_bounded_to_recent_records() {
-        let control = CrossPlaneControlPlane::new();
-        for idx in 0..(MAX_CROSS_PLANE_AUDIT_RECORDS + 3) {
-            let mut action = CrossPlaneAction::new("user:yi", "channel.chat.send_text");
-            action.session_id = Some(format!("session-{idx}"));
-            control.record_audit(CrossPlaneAuditRecord::new(
-                action,
-                CrossPlanePolicyDecision {
-                    decision: PolicyDecisionKind::Allow,
-                    reason: "test".to_string(),
-                    matched_grant: None,
-                    required_approval: None,
-                    degrade_to: None,
-                },
-                "allow",
-                "test",
-            ));
-        }
-
-        let snapshot = control.snapshot();
-        assert_eq!(snapshot.audit.len(), MAX_CROSS_PLANE_AUDIT_RECORDS);
-        assert_eq!(
-            snapshot.audit[0].action.session_id.as_deref(),
-            Some("session-3")
-        );
     }
 }

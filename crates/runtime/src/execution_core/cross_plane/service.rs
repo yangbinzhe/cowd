@@ -10,7 +10,9 @@ use thiserror::Error;
 
 use crate::cross_plane_policy::CrossPlaneControlSnapshot;
 use crate::runtime_event_store::RuntimeEventStoreError;
-use crate::runtime_event_store::RuntimeTransactionEventInput;
+use crate::runtime_event_store::{
+    AppendTransactionRequest, ExpectedStreamRevision, RuntimeTransactionEventInput,
+};
 use crate::{
     ConnectorActionContext, CrossPlaneAction, CrossPlaneAuditRecord, CrossPlaneControlPlane,
     CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome, CrossPlaneDispatchTarget,
@@ -20,6 +22,13 @@ use crate::{
 };
 
 const STREAM_ID: &str = "cross-plane:control";
+const AUDIT_STREAM_ID: &str = "cross-plane:audit";
+
+#[derive(Debug, Deserialize)]
+struct LegacyAuditProjection {
+    #[serde(default)]
+    audit: Vec<CrossPlaneAuditRecord>,
+}
 
 #[derive(Debug, Error)]
 pub enum CrossPlaneRuntimeError {
@@ -31,6 +40,8 @@ pub enum CrossPlaneRuntimeError {
     Query(String),
     #[error("cross-plane idempotency conflict: {0}")]
     IdempotencyConflict(String),
+    #[error("cross-plane single-use grant is no longer available: {0}")]
+    GrantUnavailable(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +70,14 @@ impl CrossPlaneRuntimeService {
             .latest_for_stream(STREAM_ID)
             .map_err(CrossPlaneRuntimeError::Query)?
         {
+            let legacy_audit =
+                serde_json::from_value::<LegacyAuditProjection>(event.payload.clone())
+                    .map_err(CrossPlaneRuntimeError::Serialization)?
+                    .audit;
             control.replace_snapshot(serde_json::from_value(event.payload)?);
+            if !legacy_audit.is_empty() {
+                backfill_legacy_audit(&event_store, &control, legacy_audit)?;
+            }
         }
         Ok(Self {
             control,
@@ -73,8 +91,33 @@ impl CrossPlaneRuntimeService {
         self.control.snapshot()
     }
     #[must_use]
-    pub fn summary(&self, now: DateTime<Utc>) -> crate::CrossPlaneSummary {
-        self.control.summary(now)
+    pub fn summary(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<crate::CrossPlaneSummary, CrossPlaneRuntimeError> {
+        let mut summary = self.control.summary(now);
+        let records = self.audit_records()?;
+        summary.audit_records = records.len();
+        summary.allowed_actions = records
+            .iter()
+            .filter(|record| record.decision.decision == crate::PolicyDecisionKind::Allow)
+            .count();
+        summary.denied_actions = records
+            .iter()
+            .filter(|record| record.decision.decision == crate::PolicyDecisionKind::Deny)
+            .count();
+        summary.approval_required_actions = records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.decision.decision,
+                    crate::PolicyDecisionKind::RequireSingleApproval
+                        | crate::PolicyDecisionKind::RequirePersistentGrant
+                        | crate::PolicyDecisionKind::RequireAdminApproval
+                )
+            })
+            .count();
+        Ok(summary)
     }
     #[must_use]
     pub fn list_grants(&self) -> Vec<CrossPlaneGrant> {
@@ -85,8 +128,23 @@ impl CrossPlaneRuntimeService {
         self.control.list_identities()
     }
     #[must_use]
-    pub fn list_audit(&self, limit: usize, offset: usize) -> Vec<CrossPlaneAuditRecord> {
-        self.control.list_audit(limit, offset)
+    pub fn list_audit(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<CrossPlaneAuditRecord>, usize), CrossPlaneRuntimeError> {
+        let records = self
+            .event_store
+            .list_stream_page_desc(AUDIT_STREAM_ID, limit.clamp(1, 500), offset)
+            .map_err(CrossPlaneRuntimeError::Query)?
+            .into_iter()
+            .map(|event| serde_json::from_value(event.payload).map_err(Into::into))
+            .collect::<Result<Vec<_>, CrossPlaneRuntimeError>>()?;
+        let total = self
+            .event_store
+            .stream_event_count(AUDIT_STREAM_ID)
+            .map_err(CrossPlaneRuntimeError::Query)?;
+        Ok((records, total))
     }
     #[must_use]
     pub fn list_executions(&self, limit: usize, offset: usize) -> Vec<CrossPlaneExecutionReceipt> {
@@ -181,7 +239,7 @@ impl CrossPlaneRuntimeService {
         receipt: CrossPlaneExecutionReceipt,
         consume_single_use_grant: bool,
     ) -> Result<(String, CrossPlaneExecutionReceipt), CrossPlaneRuntimeError> {
-        self.mutate_checked("execution_recorded", move |control| {
+        self.mutate_checked_with_audit("execution_recorded", move |control| {
             if let Some(existing) = receipt
                 .idempotency_key
                 .as_deref()
@@ -197,22 +255,37 @@ impl CrossPlaneRuntimeService {
                     )));
                 }
                 return Ok((
-                    existing.audit_record_id.clone().unwrap_or_default(),
-                    existing,
+                    (
+                        existing.audit_record_id.clone().unwrap_or_default(),
+                        existing,
+                    ),
+                    None,
                 ));
             }
             if consume_single_use_grant {
+                let matched_single_use_grant = receipt
+                    .decision
+                    .matched_grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.grant_type == crate::GrantType::SingleUse);
                 if let Some((grant_id, remaining_uses)) =
                     control.consume_matched_grant_for_decision(&receipt.decision)
                 {
                     audit.evidence.consumed_grant_id = Some(grant_id);
                     audit.evidence.remaining_uses_after = Some(remaining_uses);
+                } else if matched_single_use_grant {
+                    return Err(CrossPlaneRuntimeError::GrantUnavailable(
+                        receipt
+                            .decision
+                            .matched_grant
+                            .as_ref()
+                            .map_or_else(String::new, |grant| grant.id.clone()),
+                    ));
                 }
             }
             let audit_id = audit.id.clone();
-            control.record_audit(audit);
             control.record_execution(receipt.clone());
-            Ok((audit_id, receipt))
+            Ok(((audit_id, receipt), Some(audit)))
         })
     }
 
@@ -464,49 +537,152 @@ impl CrossPlaneRuntimeService {
         Ok(result)
     }
 
-    fn mutate_checked<T>(
+    fn mutate_checked_with_audit<T>(
         &self,
         kind: &str,
-        operation: impl FnOnce(&CrossPlaneControlPlane) -> Result<T, CrossPlaneRuntimeError>,
+        operation: impl FnOnce(
+            &CrossPlaneControlPlane,
+        )
+            -> Result<(T, Option<CrossPlaneAuditRecord>), CrossPlaneRuntimeError>,
     ) -> Result<T, CrossPlaneRuntimeError> {
         let _guard = self
             .mutation_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = self.control.snapshot();
-        let result = match operation(&self.control) {
+        let (result, audit) = match operation(&self.control) {
             Ok(result) => result,
             Err(error) => {
                 self.control.replace_snapshot(before);
                 return Err(error);
             }
         };
-        let revision = self.event_store.stream_revision(STREAM_ID)?;
-        let payload = serde_json::to_value(self.control.snapshot())?;
-        let append = self.event_store.append_batch_if_revision(
-            STREAM_ID,
-            revision,
-            format!("cross-plane:{kind}:{}", uuid::Uuid::new_v4()),
-            vec![RuntimeEventInput {
-                stream_id: STREAM_ID.to_string(),
-                scope: RuntimeEventScope::CrossPlane,
-                kind: kind.to_string(),
-                status: Some("committed".to_string()),
-                actor: Some("cross_plane_runtime".to_string()),
-                refs: vec![RuntimeEventRef {
-                    kind: "workspace".to_string(),
-                    id: STREAM_ID.to_string(),
-                }],
-                payload,
-            }
-            .into()],
-        );
+        let Some(audit) = audit else {
+            return Ok(result);
+        };
+        let control_revision = self.event_store.stream_revision(STREAM_ID)?;
+        let audit_revision = self.event_store.stream_revision(AUDIT_STREAM_ID)?;
+        let control_payload = serde_json::to_value(self.control.snapshot())?;
+        let append = self
+            .event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("cross-plane:{kind}:{}", audit.id),
+                expected_streams: vec![
+                    ExpectedStreamRevision {
+                        stream_id: STREAM_ID.to_string(),
+                        expected_revision: control_revision,
+                    },
+                    ExpectedStreamRevision {
+                        stream_id: AUDIT_STREAM_ID.to_string(),
+                        expected_revision: audit_revision,
+                    },
+                ],
+                events: vec![
+                    RuntimeEventInput {
+                        stream_id: STREAM_ID.to_string(),
+                        scope: RuntimeEventScope::CrossPlane,
+                        kind: kind.to_string(),
+                        status: Some("committed".to_string()),
+                        actor: Some("cross_plane_runtime".to_string()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "workspace".to_string(),
+                            id: STREAM_ID.to_string(),
+                        }],
+                        payload: control_payload,
+                    }
+                    .into(),
+                    RuntimeTransactionEventInput {
+                        event: audit_event_input(&audit)?,
+                        idempotency_key: Some(format!("audit:{}", audit.id)),
+                        schema_version: 1,
+                    },
+                ],
+            });
         if let Err(error) = append {
             self.control.replace_snapshot(before);
             return Err(error.into());
         }
         Ok(result)
     }
+
+    fn audit_records(&self) -> Result<Vec<CrossPlaneAuditRecord>, CrossPlaneRuntimeError> {
+        self.event_store
+            .list_stream(AUDIT_STREAM_ID)
+            .map_err(CrossPlaneRuntimeError::Query)?
+            .into_iter()
+            .map(|event| serde_json::from_value(event.payload).map_err(Into::into))
+            .collect()
+    }
+}
+
+fn audit_event_input(
+    audit: &CrossPlaneAuditRecord,
+) -> Result<RuntimeEventInput, CrossPlaneRuntimeError> {
+    Ok(RuntimeEventInput {
+        stream_id: AUDIT_STREAM_ID.to_string(),
+        scope: RuntimeEventScope::CrossPlane,
+        kind: "cross_plane.audit_recorded".to_string(),
+        status: Some(audit.result.clone()),
+        actor: Some(audit.action.actor_principal.clone()),
+        refs: vec![
+            RuntimeEventRef {
+                kind: "audit_record".to_string(),
+                id: audit.id.clone(),
+            },
+            RuntimeEventRef {
+                kind: "capability".to_string(),
+                id: audit.action.requested_capability.clone(),
+            },
+        ],
+        payload: serde_json::to_value(audit)?,
+    })
+}
+
+fn backfill_legacy_audit(
+    event_store: &RuntimeEventStore,
+    control: &CrossPlaneControlPlane,
+    legacy_audit: Vec<CrossPlaneAuditRecord>,
+) -> Result<(), CrossPlaneRuntimeError> {
+    let control_revision = event_store.stream_revision(STREAM_ID)?;
+    let audit_revision = event_store.stream_revision(AUDIT_STREAM_ID)?;
+    let mut events = Vec::with_capacity(legacy_audit.len() + 1);
+    events.push(
+        RuntimeEventInput {
+            stream_id: STREAM_ID.to_string(),
+            scope: RuntimeEventScope::CrossPlane,
+            kind: "cross_plane.audit_ledger_backfilled".to_string(),
+            status: Some("committed".to_string()),
+            actor: Some("cross_plane_runtime".to_string()),
+            refs: vec![RuntimeEventRef {
+                kind: "workspace".to_string(),
+                id: STREAM_ID.to_string(),
+            }],
+            payload: serde_json::to_value(control.snapshot())?,
+        }
+        .into(),
+    );
+    for audit in &legacy_audit {
+        events.push(RuntimeTransactionEventInput {
+            event: audit_event_input(audit)?,
+            idempotency_key: Some(format!("legacy-audit:{}", audit.id)),
+            schema_version: 1,
+        });
+    }
+    event_store.append_transaction(AppendTransactionRequest {
+        transaction_id: format!("cross-plane:audit-backfill:{control_revision}"),
+        expected_streams: vec![
+            ExpectedStreamRevision {
+                stream_id: STREAM_ID.to_string(),
+                expected_revision: control_revision,
+            },
+            ExpectedStreamRevision {
+                stream_id: AUDIT_STREAM_ID.to_string(),
+                expected_revision: audit_revision,
+            },
+        ],
+        events,
+    })?;
+    Ok(())
 }
 
 fn dispatch_key_digest(idempotency_key: &str) -> String {
@@ -593,8 +769,84 @@ mod tests {
         let (audit, receipt) = build();
         let second = service.record_action_execution(audit, receipt).unwrap();
         assert_eq!(first.1.id, second.1.id);
-        assert_eq!(service.list_audit(10, 0).len(), 1);
+        assert_eq!(service.list_audit(10, 0).unwrap().1, 1);
         assert_eq!(service.list_executions(10, 0).len(), 1);
+    }
+
+    #[test]
+    fn immutable_audit_timeline_pages_in_the_durable_store() {
+        let service = CrossPlaneRuntimeService::open(Arc::new(
+            RuntimeEventStore::try_open_in_memory().unwrap(),
+        ))
+        .unwrap();
+        for index in 0..3 {
+            let action = CrossPlaneAction::new("alice", format!("channel.send.{index}"));
+            let (_, decision, evidence) =
+                service.decide_with_connector_context(action.clone(), None, Utc::now());
+            let audit = CrossPlaneAuditRecord::new(
+                action.clone(),
+                decision.clone(),
+                "planned",
+                format!("page fixture {index}"),
+            )
+            .with_evidence(evidence);
+            let receipt = CrossPlaneExecutionReceipt::new(
+                Some(format!("page-key-{index}")),
+                "commit",
+                "planned",
+                "not_started",
+                action,
+                decision,
+                Vec::new(),
+                Some(audit.id.clone()),
+            );
+            service.record_action_execution(audit, receipt).unwrap();
+        }
+
+        let (first_page, total) = service.list_audit(1, 0).unwrap();
+        let (second_page, repeated_total) = service.list_audit(1, 1).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(repeated_total, 3);
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(second_page.len(), 1);
+        assert_ne!(first_page[0].id, second_page[0].id);
+    }
+
+    #[test]
+    fn legacy_snapshot_audit_is_backfilled_once_into_immutable_stream() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let action = CrossPlaneAction::new("alice", "channel.send");
+        let decision = crate::CrossPlanePolicyEngine::new(crate::CrossPlanePolicyConfig::default())
+            .decide(&action, Utc::now());
+        let audit = CrossPlaneAuditRecord::new(action, decision, "planned", "legacy snapshot");
+        store
+            .append(RuntimeEventInput {
+                stream_id: STREAM_ID.to_string(),
+                scope: RuntimeEventScope::CrossPlane,
+                kind: "legacy_snapshot".to_string(),
+                status: Some("committed".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({
+                    "identities": [],
+                    "grants": [],
+                    "audit": [audit],
+                    "executions": [],
+                }),
+            })
+            .unwrap();
+        let service = CrossPlaneRuntimeService::open(Arc::clone(&store)).unwrap();
+        assert_eq!(service.list_audit(10, 0).unwrap().1, 1);
+        let latest = store.latest_for_stream(STREAM_ID).unwrap().unwrap();
+        assert!(latest.payload.get("audit").is_none());
+        assert_eq!(
+            CrossPlaneRuntimeService::open(store)
+                .unwrap()
+                .list_audit(10, 0)
+                .unwrap()
+                .1,
+            1
+        );
     }
 
     #[test]
@@ -633,7 +885,7 @@ mod tests {
             service.record_action_execution(audit, receipt),
             Err(CrossPlaneRuntimeError::IdempotencyConflict(_))
         ));
-        assert_eq!(service.list_audit(10, 0).len(), 1);
+        assert_eq!(service.list_audit(10, 0).unwrap().1, 1);
         assert_eq!(service.list_executions(10, 0).len(), 1);
         let owner = service
             .find_execution_by_idempotency_key("shared-atomic-key")
@@ -706,13 +958,81 @@ mod tests {
                 .and_then(|entry| entry.remaining_uses),
             Some(0)
         );
-        assert_eq!(service.list_audit(10, 0).len(), 1);
-        let audit = service.list_audit(10, 0).pop().unwrap();
+        assert_eq!(service.list_audit(10, 0).unwrap().1, 1);
+        let audit = service.list_audit(10, 0).unwrap().0.pop().unwrap();
         assert_eq!(
             audit.evidence.consumed_grant_id.as_deref(),
             Some(grant_id.as_str())
         );
         assert_eq!(audit.evidence.remaining_uses_after, Some(0));
+    }
+
+    #[test]
+    fn competing_completed_effects_cannot_reuse_a_single_use_grant() {
+        let service = Arc::new(
+            CrossPlaneRuntimeService::open(Arc::new(
+                RuntimeEventStore::try_open_in_memory().unwrap(),
+            ))
+            .unwrap(),
+        );
+        let mut grant = CrossPlaneGrant::persistent("alice", "channel.send");
+        grant.grant_type = crate::GrantType::SingleUse;
+        service.upsert_grant(grant).unwrap();
+
+        let mut action = CrossPlaneAction::new("alice", "channel.send");
+        action.identity_trust = crate::IdentityTrust::Verified;
+        action.risk = harness_contract::policy::CrossPlaneRisk::High;
+        let (action, decision, evidence) =
+            service.decide_with_connector_context(action, None, Utc::now());
+        assert_eq!(decision.decision, crate::PolicyDecisionKind::Allow);
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let handles = (0..2)
+            .map(|index| {
+                let service = Arc::clone(&service);
+                let barrier = Arc::clone(&barrier);
+                let action = action.clone();
+                let decision = decision.clone();
+                let evidence = evidence.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let audit = CrossPlaneAuditRecord::new(
+                        action.clone(),
+                        decision.clone(),
+                        "executed",
+                        format!("competing side effect {index}"),
+                    )
+                    .with_evidence(evidence);
+                    let receipt = CrossPlaneExecutionReceipt::new(
+                        Some(format!("competing-effect-{index}")),
+                        "commit",
+                        "executed",
+                        "sent",
+                        action,
+                        decision,
+                        Vec::new(),
+                        Some(audit.id.clone()),
+                    );
+                    service.record_completed_effect_execution(audit, receipt)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(CrossPlaneRuntimeError::GrantUnavailable(_))))
+                .count(),
+            1
+        );
+        assert_eq!(service.list_audit(10, 0).unwrap().1, 1);
+        assert_eq!(service.list_executions(10, 0).len(), 1);
     }
 
     #[test]

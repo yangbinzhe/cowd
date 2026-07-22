@@ -855,7 +855,7 @@ fn test_human_principal() -> runtime::VerifiedPrincipal {
 pub mod test_support {
     use std::{path::PathBuf, sync::Arc, time::Instant};
 
-    use approval::FileApprovalRepository;
+    use approval::{SharedApprovalHistoryLedger, SqliteApprovalHistoryLedger};
     use axum::Router;
     use runtime::{
         approval_gate::SmartApprovalGate, permission_enforcer::DestructivePatternDetector,
@@ -938,22 +938,21 @@ pub mod test_support {
                     workspace_root.clone(),
                 ))),
             );
+            let approval_ledger: SharedApprovalHistoryLedger = Arc::new(
+                SqliteApprovalHistoryLedger::in_memory().map_err(|error| error.to_string())?,
+            );
             let approval_gate = Arc::new(SmartApprovalGate::new(
                 Arc::new(DestructivePatternDetector::new(workspace_root.clone())),
                 ApprovalConfig::default(),
-                None,
+                Arc::clone(&approval_ledger),
             ));
-            let approval_repository = FileApprovalRepository::new(
-                root.join("approval-history.json"),
-                root.join("always-approved.json"),
-            );
             let services = Arc::new(GatewayServices::new_with_config_home(
                 runtime,
                 task_kernel,
                 Arc::new(crate::surface_host::SurfaceHost::default()),
                 None,
                 approval_gate,
-                approval_repository,
+                approval_ledger,
                 Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
                     runtime::session_lifecycle::SessionLifecycleConfig::default(),
                 )),
@@ -1373,7 +1372,10 @@ pub(crate) mod tests {
     };
     use memory::config::{BudgetConfig, StoreConfig};
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
-    use runtime::permission_enforcer::DestructivePatternDetector;
+    use runtime::approval_gate::ApprovalGateResult;
+    use runtime::permission_enforcer::{
+        ApprovalPersistence, ApprovalVerdict, DestructivePatternDetector,
+    };
     use runtime::{ContextProfile, ResumeContextSource};
     use sha2::Digest;
     use std::collections::HashMap;
@@ -1682,19 +1684,17 @@ pub(crate) mod tests {
                 tool_workspace_root,
             ))),
         );
-        let approval_dir =
-            std::env::temp_dir().join(format!("cowd-api-approval-{}", uuid::Uuid::new_v4()));
-        let approval_repository = approval::FileApprovalRepository::new(
-            approval_dir.join("approval_history.json"),
-            approval_dir.join("always_approved.json"),
+        let approval_ledger: approval::SharedApprovalHistoryLedger = Arc::new(
+            approval::SqliteApprovalHistoryLedger::in_memory()
+                .expect("in-memory approval history ledger"),
         );
         Arc::new(crate::services::GatewayServices::new_with_config_home(
             runtime,
             task_kernel,
             surface_host.unwrap_or_else(|| Arc::new(crate::surface_host::SurfaceHost::default())),
             None,
-            test_approval_gate(),
-            approval_repository,
+            test_approval_gate(Arc::clone(&approval_ledger)),
+            approval_ledger,
             Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
                 runtime::session_lifecycle::SessionLifecycleConfig::default(),
             )),
@@ -1938,11 +1938,11 @@ pub(crate) mod tests {
         })
     }
 
-    fn test_approval_gate() -> Arc<SmartApprovalGate> {
+    fn test_approval_gate(ledger: approval::SharedApprovalHistoryLedger) -> Arc<SmartApprovalGate> {
         Arc::new(SmartApprovalGate::new(
             Arc::new(DestructivePatternDetector::new(std::env::temp_dir())),
             ApprovalConfig::default(),
-            None,
+            ledger,
         ))
     }
 
@@ -11678,6 +11678,72 @@ providers:
                 .status,
             runtime::GlobalApprovalStatus::Approved
         );
+    }
+
+    #[tokio::test]
+    async fn approval_history_route_reads_the_shared_durable_gate_ledger() {
+        let ledger: approval::SharedApprovalHistoryLedger = Arc::new(
+            approval::SqliteApprovalHistoryLedger::in_memory()
+                .expect("in-memory approval decision ledger"),
+        );
+        let gate = test_approval_gate(Arc::clone(&ledger));
+        let state = test_state_with_approval_gate(Arc::clone(&gate));
+        let evaluating_gate = Arc::clone(&gate);
+        let waiting = tokio::spawn(async move {
+            evaluating_gate
+                .evaluate("bash", r#"{"command":"rm -rf /tmp/cowd-history-route"}"#)
+                .await
+        });
+        let request = loop {
+            if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
+                break request;
+            }
+            tokio::task::yield_now().await;
+        };
+        gate.resolve_approval(
+            &request.id,
+            ApprovalVerdict::Approved,
+            ApprovalPersistence::Once,
+        )
+        .await
+        .expect("gate approval resolves");
+        assert!(matches!(
+            waiting.await.expect("approval task joins"),
+            ApprovalGateResult::Approved { .. }
+        ));
+
+        let app = api_router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/approval/history?limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let history: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let decision = history
+            .as_array()
+            .expect("approval history is an array")
+            .iter()
+            .find(|entry| entry["request_id"] == request.id)
+            .expect("durable gate decision is returned by history route");
+        assert_eq!(decision["source"], "approval.decision_ledger");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/approval/{}", request.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

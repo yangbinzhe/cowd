@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use approval::FileApprovalRepository;
+use approval::SharedApprovalHistoryLedger;
 use runtime::approval_gate::SmartApprovalGate;
 
 use super::*;
@@ -18,7 +18,7 @@ impl GatewayServices {
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
-        approval_repository: FileApprovalRepository,
+        approval_ledger: SharedApprovalHistoryLedger,
     ) -> Self {
         let resource_lifecycle =
             Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
@@ -30,7 +30,7 @@ impl GatewayServices {
             surface_host,
             memory_manager,
             approval_gate,
-            approval_repository,
+            approval_ledger,
             resource_lifecycle,
             ::runtime::cowd_dirs::config_home_dir(),
         )
@@ -42,7 +42,7 @@ impl GatewayServices {
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
-        approval_repository: FileApprovalRepository,
+        approval_ledger: SharedApprovalHistoryLedger,
         resource_lifecycle: Arc<runtime::session_lifecycle::SessionLifecycleManager>,
         config_home: impl AsRef<std::path::Path>,
     ) -> Self {
@@ -57,7 +57,7 @@ impl GatewayServices {
             surface_host,
             memory_manager,
             approval_gate,
-            approval_repository,
+            approval_ledger,
             session_manager,
             config_home,
             runtime::GatewayCapacityConfig::default(),
@@ -71,7 +71,7 @@ impl GatewayServices {
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
-        approval_repository: FileApprovalRepository,
+        approval_ledger: SharedApprovalHistoryLedger,
         session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
         config_home: impl AsRef<std::path::Path>,
         capacity_config: runtime::GatewayCapacityConfig,
@@ -102,7 +102,7 @@ impl GatewayServices {
             session: SessionService::with_runtime_boundaries(session_kernel, lifecycle_kernel),
             task,
             memory: MemoryService::with_manager(memory_manager),
-            approval: ApprovalService::with_gate_and_repository(approval_gate, approval_repository)
+            approval: ApprovalService::with_gate_and_ledger(approval_gate, approval_ledger)
                 .with_runtime_services(Arc::clone(&runtime_services)),
             cross_plane: CrossPlaneService::new(Arc::clone(&runtime_services)),
             mission: MissionService::new()
@@ -219,16 +219,9 @@ impl GatewayServices {
 
     #[cfg(test)]
     pub(crate) fn with_approval_for_tests(approval_gate: Arc<SmartApprovalGate>) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "cowd-approval-service-test-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let repository = FileApprovalRepository::new(
-            dir.join("approval_history.json"),
-            dir.join("always_approved.json"),
-        );
+        let ledger = approval_gate.history().clone();
         Self {
-            approval: ApprovalService::with_gate_and_repository(approval_gate, repository),
+            approval: ApprovalService::with_gate_and_ledger(approval_gate, ledger),
             ..Self::baseline()
         }
     }

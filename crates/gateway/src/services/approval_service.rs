@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use approval::{ApprovalRepository, FileApprovalRepository};
+use approval::SharedApprovalHistoryLedger;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::policy::RiskGateReceipt;
 use runtime::{approval_gate::SmartApprovalGate, ApprovalConfig};
@@ -12,7 +12,7 @@ pub(crate) struct ApprovalService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     gate: Option<Arc<SmartApprovalGate>>,
-    repository: Option<FileApprovalRepository>,
+    ledger: Option<SharedApprovalHistoryLedger>,
     runtime_services: Option<Arc<runtime::RuntimeServices>>,
 }
 
@@ -22,7 +22,7 @@ impl ApprovalService {
             label: "approval",
             owner: "0.9.296 Approval service boundary",
             gate: None,
-            repository: None,
+            ledger: None,
             runtime_services: None,
         }
     }
@@ -41,13 +41,13 @@ impl ApprovalService {
             .ok_or_else(|| "runtime services are not configured".to_string())
     }
 
-    pub(crate) fn with_gate_and_repository(
+    pub(crate) fn with_gate_and_ledger(
         gate: Arc<SmartApprovalGate>,
-        repository: FileApprovalRepository,
+        ledger: SharedApprovalHistoryLedger,
     ) -> Self {
         Self {
             gate: Some(gate),
-            repository: Some(repository),
+            ledger: Some(ledger),
             ..Self::new()
         }
     }
@@ -148,48 +148,21 @@ impl ApprovalService {
                     .filter_map(|request| serde_json::to_value(request).ok()),
             );
         }
-        if let Some(repository) = &self.repository {
-            if let Ok((history, _total)) = repository.list_history(limit.saturating_add(offset), 0)
-            {
-                if !history.is_empty() {
-                    combined.extend(
-                        history
-                            .into_iter()
-                            .filter_map(|entry| serde_json::to_value(entry).ok()),
-                    );
-                }
+        if let Some(ledger) = &self.ledger {
+            match ledger.list(limit.saturating_add(offset).max(1), 0) {
+                Ok((history, _total)) => combined.extend(history.into_iter().filter_map(|entry| {
+                    serde_json::to_value(entry).ok().map(|mut value| {
+                        value["source"] =
+                            serde_json::Value::String("approval.decision_ledger".to_string());
+                        value
+                    })
+                })),
+                Err(error) => tracing::error!(%error, "approval decision history query failed"),
             }
         }
-        if combined.is_empty() {
-            combined.extend(
-                match &self.gate {
-                    Some(gate) => {
-                        gate.history()
-                            .list_history(limit.saturating_add(offset), 0)
-                            .await
-                            .0
-                    }
-                    None => Vec::new(),
-                }
-                .into_iter()
-                .filter_map(|entry| serde_json::to_value(entry).ok()),
-            );
-        }
         combined.sort_by(|left, right| {
-            let left_time = left
-                .get("resolved_at_ms")
-                .and_then(serde_json::Value::as_u64)
-                .or_else(|| left.get("timestamp_ms").and_then(serde_json::Value::as_u64))
-                .unwrap_or_default();
-            let right_time = right
-                .get("resolved_at_ms")
-                .and_then(serde_json::Value::as_u64)
-                .or_else(|| {
-                    right
-                        .get("timestamp_ms")
-                        .and_then(serde_json::Value::as_u64)
-                })
-                .unwrap_or_default();
+            let left_time = approval_history_timestamp(left);
+            let right_time = approval_history_timestamp(right);
             right_time.cmp(&left_time)
         });
         serde_json::Value::Array(combined.into_iter().skip(offset).take(limit).collect())
@@ -215,24 +188,13 @@ impl ApprovalService {
                 return serde_json::to_value(request).ok();
             }
         }
-        if let Some(repository) = &self.repository {
-            if let Ok((history, _)) = repository.list_history(usize::MAX, 0) {
-                if let Some(entry) = history
-                    .into_iter()
-                    .find(|entry| entry.id == id || entry.request_id == id)
-                {
-                    return serde_json::to_value(entry).ok();
-                }
-            }
-        }
-        if let Some(gate) = &self.gate {
-            let (history, _) = gate.history().list_history(usize::MAX, 0).await;
-            return history
-                .into_iter()
-                .find(|entry| entry.id == id || entry.request_id == id)
-                .and_then(|entry| serde_json::to_value(entry).ok());
-        }
-        None
+        self.ledger.as_ref().and_then(|ledger| {
+            ledger
+                .get(id)
+                .ok()
+                .flatten()
+                .and_then(|entry| serde_json::to_value(entry).ok())
+        })
     }
 
     pub(crate) async fn respond(
@@ -370,6 +332,27 @@ impl ApprovalService {
             .ok_or_else(|| "approval gate not configured".to_string())?;
         Ok(gate.policy_receipt(tool_name, input).await)
     }
+}
+
+fn approval_history_timestamp(value: &serde_json::Value) -> i64 {
+    value
+        .get("resolved_at_ms")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            value
+                .get("timestamp_ms")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .map_or_else(
+            || {
+                value
+                    .get("resolved_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+                    .map_or(0, |timestamp| timestamp.timestamp_millis())
+            },
+            |timestamp| timestamp.min(i64::MAX as u64) as i64,
+        )
 }
 
 fn approval_visible_to(
