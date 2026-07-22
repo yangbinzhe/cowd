@@ -11564,7 +11564,7 @@ providers:
                 "cargo test -p runtime context_runtime",
             )
             .unwrap();
-        let task = kernel.current().unwrap();
+        let task = kernel.current().unwrap().unwrap();
 
         let packet = message_routes::task_resume_context_packet("session-task", &task);
 

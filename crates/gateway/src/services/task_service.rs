@@ -65,11 +65,11 @@ impl TaskService {
     }
 
     pub(crate) fn list_records(&self) -> Result<Vec<TaskRecord>, String> {
-        Ok(self.kernel()?.list())
+        self.kernel()?.list()
     }
 
     pub(crate) fn current(&self) -> Result<Option<TaskRecord>, String> {
-        Ok(self.kernel()?.current())
+        self.kernel()?.current()
     }
 
     fn runtime_services(&self) -> Result<&Arc<runtime::RuntimeServices>, String> {
@@ -94,7 +94,7 @@ impl TaskService {
         &self,
         task_id: &str,
     ) -> Result<Option<ExecutionGraphProjection>, String> {
-        let Some(cached) = self.kernel()?.execution_graph(task_id) else {
+        let Some(cached) = self.kernel()?.execution_graph(task_id)? else {
             return Ok(None);
         };
         let projection = self
@@ -117,7 +117,7 @@ impl TaskService {
         if nodes.is_empty() {
             return Err("execution graph requires at least one node".to_string());
         }
-        if self.kernel()?.execution_graph(task_id).is_some() {
+        if self.kernel()?.execution_graph(task_id)?.is_some() {
             return Err(format!(
                 "task {task_id} already has an execution graph; use RuntimeHost commands"
             ));

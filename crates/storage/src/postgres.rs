@@ -317,7 +317,16 @@ pub struct PostgresMigrationReport {
 }
 
 fn ensure_migration_ledger(connection: &mut Client) -> Result<(), StorageError> {
-    connection.batch_execute(
+    // Independent durable domains may initialize concurrently during process
+    // composition. PostgreSQL can race on catalog insertion even for
+    // `CREATE TABLE IF NOT EXISTS`, so serialize only this tiny ledger setup;
+    // each domain's actual migration retains its own transaction-scoped lock.
+    let mut transaction = connection.transaction()?;
+    transaction.query_one(
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        &[&"cowd-storage:migration-ledger"],
+    )?;
+    transaction.batch_execute(
         "CREATE TABLE IF NOT EXISTS cowd_schema_migrations (
             id TEXT PRIMARY KEY,
             domain TEXT NOT NULL,
@@ -327,6 +336,7 @@ fn ensure_migration_ledger(connection: &mut Client) -> Result<(), StorageError> 
             applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );",
     )?;
+    transaction.commit()?;
     Ok(())
 }
 

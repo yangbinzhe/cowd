@@ -92,6 +92,23 @@ if [[ "${1:-}" == "--v569-runtime-postgres" ]]; then
   exit "$fail"
 fi
 
+if [[ "${1:-}" == "--v570-task-postgres" ]]; then
+  # V570 moves Task lifecycle authority out of the process-local Vec/Mutex and
+  # behind the Runtime task backend port. PostgreSQL remains an explicitly
+  # composed adapter, never a deployment-wide backend toggle.
+  check_empty "V570 runtime task must not retain in-memory authority or full-table rewrite" \
+    bash -c 'awk "/#\[cfg\(test\)\]/{exit} {print}" crates/runtime/src/mission/task.rs | rg -n "Mutex<TaskStore>|struct TaskStore[[:space:]\{]|fn persist\(|DELETE FROM tasks" || true'
+  check_empty "V570 runtime normal dependency tree must not include PostgreSQL driver" \
+    bash -c 'cargo tree -p runtime --edges normal 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
+  check_empty "V570 Gateway normal dependency tree must not include PostgreSQL driver" \
+    bash -c 'cargo tree -p gateway --edges normal 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
+  check_empty "V570 task adapter and explicit Gateway composition must exist" \
+    bash -c 'missing=""; rg -q "pub struct PostgresTaskStore" crates/runtime-postgres/src/lib.rs || missing="$missing postgres-task"; rg -q "pub trait TaskStoreBackend" crates/runtime/src/mission/task.rs || missing="$missing task-port"; rg -q "from_runtime_kernel" crates/gateway/src/kernel/task_kernel.rs || missing="$missing gateway-injection"; if [[ -n "$missing" ]]; then echo "$missing"; fi'
+  check_empty "V570 global PostgreSQL switch must remain unavailable" \
+    rg -n 'StorageBackendKind::Postgres|control_plane_backend.*postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
+  exit "$fail"
+fi
+
 check_empty "cli business command names" \
   rg -n "\\b(run|chat|prompt|mcp serve)\\b" crates/cli/src/main.rs --glob '*.rs'
 

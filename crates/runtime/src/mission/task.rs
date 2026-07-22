@@ -6,7 +6,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -113,21 +113,228 @@ pub struct TaskRecord {
     pub strategy: Option<StrategyDecision>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct TaskStore {
-    tasks: Vec<TaskRecord>,
+/// Complete persistence contract for the Task control plane.
+///
+/// The updater executes inside the backend's transaction for one task. A
+/// backend must either commit the returned record as one unit or leave the
+/// prior record unchanged. This keeps lifecycle decisions in `TaskKernel`
+/// while letting SQLite and PostgreSQL enforce their own locking semantics.
+pub trait TaskStoreBackend: std::fmt::Debug + Send + Sync {
+    fn list(&self) -> Result<Vec<TaskRecord>, String>;
+
+    fn get(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
+        Ok(self.list()?.into_iter().find(|task| task.id == task_id))
+    }
+
+    fn current(&self) -> Result<Option<TaskRecord>, String> {
+        Ok(self.list()?.into_iter().rev().find(|task| {
+            matches!(
+                task.status,
+                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Reviewing
+            )
+        }))
+    }
+
+    fn update_task(
+        &self,
+        task_id: &str,
+        updater: &mut dyn FnMut(Option<TaskRecord>) -> Result<TaskRecord, String>,
+    ) -> Result<TaskRecord, String>;
+
+    fn export_migration_snapshot(&self) -> Result<TaskStoreSnapshot, String> {
+        let snapshot = TaskStoreSnapshot {
+            tasks: self.list()?,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn import_migration_snapshot(&self, _snapshot: &TaskStoreSnapshot) -> Result<(), String> {
+        Err("task backend does not support migration import".to_string())
+    }
+}
+
+/// Backend-neutral Task control-plane data used only for explicit one-time
+/// backend migration. It is deliberately a whole-record snapshot because the
+/// task record itself is the stable Gateway/TUI projection contract.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskStoreSnapshot {
+    pub tasks: Vec<TaskRecord>,
+}
+
+impl TaskStoreSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut ids = std::collections::BTreeSet::new();
+        for task in &self.tasks {
+            if task.id.trim().is_empty() {
+                return Err("task migration snapshot contains an empty task id".to_string());
+            }
+            if !ids.insert(&task.id) {
+                return Err(format!(
+                    "task migration snapshot contains duplicate task id `{}`",
+                    task.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn canonical_digest(&self) -> Result<String, String> {
+        self.validate()?;
+        let mut canonical = self.clone();
+        canonical
+            .tasks
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        let payload = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
+        use sha2::{Digest, Sha256};
+        Ok(format!("{:x}", Sha256::digest(payload)))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SqliteTaskStore {
+    executor: SqliteExecutor,
+}
+
+impl SqliteTaskStore {
+    fn new(executor: SqliteExecutor) -> Result<Self, String> {
+        let connection = executor.checkout().map_err(|error| error.to_string())?;
+        ensure_schema_connection(&connection)?;
+        Ok(Self { executor })
+    }
+}
+
+impl TaskStoreBackend for SqliteTaskStore {
+    fn list(&self) -> Result<Vec<TaskRecord>, String> {
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        load_tasks_connection(&connection)
+    }
+
+    fn get(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        load_task_connection(&connection, task_id)
+    }
+
+    fn current(&self) -> Result<Option<TaskRecord>, String> {
+        let connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let record_json = connection
+            .query_row(
+                "SELECT record_json FROM tasks
+                 WHERE status IN ('pending', 'running', 'reviewing')
+                 ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        record_json
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    fn update_task(
+        &self,
+        task_id: &str,
+        updater: &mut dyn FnMut(Option<TaskRecord>) -> Result<TaskRecord, String>,
+    ) -> Result<TaskRecord, String> {
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let current = transaction
+            .query_row(
+                "SELECT record_json FROM tasks WHERE id = ?1",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|record_json| {
+                serde_json::from_str::<TaskRecord>(&record_json).map_err(|error| error.to_string())
+            })
+            .transpose()?;
+        let next = updater(current)?;
+        validate_updated_task(task_id, &next)?;
+        transaction
+            .execute(
+                "INSERT INTO tasks (id, status, created_at_ms, updated_at_ms, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    status=excluded.status,
+                    created_at_ms=excluded.created_at_ms,
+                    updated_at_ms=excluded.updated_at_ms,
+                    record_json=excluded.record_json",
+                params![
+                    next.id,
+                    next.status.as_str(),
+                    next.created_at_ms as i64,
+                    next.updated_at_ms as i64,
+                    serde_json::to_string(&next).map_err(|error| error.to_string())?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(next)
+    }
+
+    fn import_migration_snapshot(&self, snapshot: &TaskStoreSnapshot) -> Result<(), String> {
+        snapshot.validate()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let existing: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if existing != 0 {
+            return Err("task migration target must be empty".to_string());
+        }
+        let mut statement = transaction
+            .prepare(
+                "INSERT INTO tasks (id, status, created_at_ms, updated_at_ms, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )
+            .map_err(|error| error.to_string())?;
+        for task in &snapshot.tasks {
+            statement
+                .execute(params![
+                    task.id,
+                    task.status.as_str(),
+                    task.created_at_ms as i64,
+                    task.updated_at_ms as i64,
+                    serde_json::to_string(task).map_err(|error| error.to_string())?,
+                ])
+                .map_err(|error| error.to_string())?;
+        }
+        drop(statement);
+        transaction.commit().map_err(|error| error.to_string())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct TaskKernel {
-    executor: SqliteExecutor,
-    store: Arc<Mutex<TaskStore>>,
+    backend: Arc<dyn TaskStoreBackend>,
 }
 
 impl TaskKernel {
     pub fn open(path: PathBuf) -> Result<Self, String> {
         let path = normalize_task_db_path(path);
-        let handle = StorageHandle::sqlite("tasks", path.clone(), "task", "task_executor");
+        let handle = StorageHandle::sqlite("tasks", path, "task", "task_executor");
         Self::from_executor(SqliteExecutor::for_handle(&handle).map_err(|error| error.to_string())?)
     }
 
@@ -136,32 +343,22 @@ impl TaskKernel {
     }
 
     fn from_executor(executor: SqliteExecutor) -> Result<Self, String> {
-        let connection = executor.checkout().map_err(|error| error.to_string())?;
-        ensure_schema_connection(&connection)?;
-        let store = load_store_connection(&connection)?;
-        Ok(Self {
+        Ok(Self::from_backend(Arc::new(SqliteTaskStore::new(
             executor,
-            store: Arc::new(Mutex::new(store)),
-        })
+        )?)))
     }
 
     #[must_use]
-    pub fn list(&self) -> Vec<TaskRecord> {
-        self.store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tasks
-            .clone()
+    pub fn from_backend(backend: Arc<dyn TaskStoreBackend>) -> Self {
+        Self { backend }
     }
 
-    #[must_use]
-    pub fn current(&self) -> Option<TaskRecord> {
-        self.list().into_iter().rev().find(|task| {
-            matches!(
-                task.status,
-                TaskStatus::Pending | TaskStatus::Running | TaskStatus::Reviewing
-            )
-        })
+    pub fn list(&self) -> Result<Vec<TaskRecord>, String> {
+        self.backend.list()
+    }
+
+    pub fn current(&self) -> Result<Option<TaskRecord>, String> {
+        self.backend.current()
     }
 
     pub fn start_goal(
@@ -206,13 +403,13 @@ impl TaskKernel {
             execution_graph: None,
             strategy: None,
         };
-        self.store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tasks
-            .push(task.clone());
-        self.persist()?;
-        Ok(task)
+        let task_id = task.id.clone();
+        self.backend.update_task(&task_id, &mut |current| {
+            if current.is_some() {
+                return Err(format!("generated task id {task_id} already exists"));
+            }
+            Ok(task.clone())
+        })
     }
 
     pub fn start_goal_idempotent(
@@ -225,32 +422,6 @@ impl TaskKernel {
         let objective = objective.into();
         if task_id.is_empty() || objective.trim().is_empty() {
             return Err("task id and objective are required".to_string());
-        }
-        let mut conn = self
-            .executor
-            .checkout()
-            .map_err(|error| error.to_string())?;
-        let transaction = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        if let Some(json) = transaction
-            .query_row(
-                "SELECT record_json FROM tasks WHERE id = ?1",
-                params![task_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-        {
-            let existing =
-                serde_json::from_str::<TaskRecord>(&json).map_err(|error| error.to_string())?;
-            if existing.objective != objective || existing.yolo_mode != yolo_mode {
-                return Err(format!(
-                    "task id {task_id} is already bound to another governed objective"
-                ));
-            }
-            transaction.commit().map_err(|error| error.to_string())?;
-            return Ok(existing);
         }
         let now = now_ms();
         let task = TaskRecord {
@@ -284,28 +455,17 @@ impl TaskKernel {
             execution_graph: None,
             strategy: None,
         };
-        transaction
-            .execute(
-                "INSERT INTO tasks (id, status, created_at_ms, updated_at_ms, record_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    task.id,
-                    task.status.as_str(),
-                    task.created_at_ms as i64,
-                    task.updated_at_ms as i64,
-                    serde_json::to_string(&task).map_err(|error| error.to_string())?,
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        transaction.commit().map_err(|error| error.to_string())?;
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !store.tasks.iter().any(|existing| existing.id == task.id) {
-            store.tasks.push(task.clone());
-        }
-        Ok(task)
+        self.backend.update_task(task_id, &mut |current| {
+            if let Some(existing) = current {
+                if existing.objective != task.objective || existing.yolo_mode != task.yolo_mode {
+                    return Err(format!(
+                        "task id {task_id} is already bound to another governed objective"
+                    ));
+                }
+                return Ok(existing);
+            }
+            Ok(task.clone())
+        })
     }
 
     pub fn attach_strategy(
@@ -313,27 +473,17 @@ impl TaskKernel {
         task_id: &str,
         strategy: StrategyDecision,
     ) -> Result<TaskRecord, String> {
-        let now = now_ms();
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let task = store
-            .tasks
-            .iter_mut()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| format!("task {task_id} not found"))?;
-        task.strategy = Some(strategy);
-        task.updated_at_ms = now;
-        task.audit.push(TaskAuditEvent {
-            event_type: "strategy_attached".to_string(),
-            message: "strategy decision attached".to_string(),
-            created_at_ms: now,
-        });
-        let updated = task.clone();
-        drop(store);
-        self.persist()?;
-        Ok(updated)
+        self.update_existing(task_id, move |task| {
+            let now = now_ms();
+            task.strategy = Some(strategy.clone());
+            task.updated_at_ms = now;
+            task.audit.push(TaskAuditEvent {
+                event_type: "strategy_attached".to_string(),
+                message: "strategy decision attached".to_string(),
+                created_at_ms: now,
+            });
+            Ok(())
+        })
     }
 
     pub fn transition(
@@ -343,28 +493,19 @@ impl TaskKernel {
         phase: Option<String>,
         message: impl Into<String>,
     ) -> Result<TaskRecord, String> {
-        let now = now_ms();
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let task = store
-            .tasks
-            .iter_mut()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| format!("task {task_id} not found"))?;
-        task.status = status;
-        task.current_phase = phase;
-        task.updated_at_ms = now;
-        task.audit.push(TaskAuditEvent {
-            event_type: format!("{:?}", status).to_lowercase(),
-            message: message.into(),
-            created_at_ms: now,
-        });
-        let updated = task.clone();
-        drop(store);
-        self.persist()?;
-        Ok(updated)
+        let message = message.into();
+        self.update_existing(task_id, move |task| {
+            let now = now_ms();
+            task.status = status;
+            task.current_phase = phase.clone();
+            task.updated_at_ms = now;
+            task.audit.push(TaskAuditEvent {
+                event_type: format!("{:?}", status).to_lowercase(),
+                message: message.clone(),
+                created_at_ms: now,
+            });
+            Ok(())
+        })
     }
 
     pub fn start_phase(
@@ -386,40 +527,30 @@ impl TaskKernel {
             return Err("phase objective is required".to_string());
         }
 
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let task = store
-            .tasks
-            .iter_mut()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| format!("task {task_id} not found"))?;
-        task.status = TaskStatus::Running;
-        task.current_phase = Some(name.clone());
-        task.updated_at_ms = now;
-        task.phases.push(TaskPhaseRecord {
-            id: format!("phase-{}", uuid::Uuid::new_v4()),
-            name: name.clone(),
-            objective,
-            plan,
-            acceptance,
-            test_commands,
-            artifacts: Vec::new(),
-            review_result: None,
-            status: TaskPhaseStatus::Running,
-            created_at_ms: now,
-            updated_at_ms: now,
-        });
-        task.audit.push(TaskAuditEvent {
-            event_type: "phase_started".to_string(),
-            message: format!("phase started: {name}"),
-            created_at_ms: now,
-        });
-        let updated = task.clone();
-        drop(store);
-        self.persist()?;
-        Ok(updated)
+        self.update_existing(task_id, move |task| {
+            task.status = TaskStatus::Running;
+            task.current_phase = Some(name.clone());
+            task.updated_at_ms = now;
+            task.phases.push(TaskPhaseRecord {
+                id: format!("phase-{}", uuid::Uuid::new_v4()),
+                name: name.clone(),
+                objective: objective.clone(),
+                plan: plan.clone(),
+                acceptance: acceptance.clone(),
+                test_commands: test_commands.clone(),
+                artifacts: Vec::new(),
+                review_result: None,
+                status: TaskPhaseStatus::Running,
+                created_at_ms: now,
+                updated_at_ms: now,
+            });
+            task.audit.push(TaskAuditEvent {
+                event_type: "phase_started".to_string(),
+                message: format!("phase started: {name}"),
+                created_at_ms: now,
+            });
+            Ok(())
+        })
     }
 
     pub fn record_phase_artifact(
@@ -441,37 +572,28 @@ impl TaskKernel {
             return Err("artifact value is required".to_string());
         }
 
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let task = store
-            .tasks
-            .iter_mut()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| format!("task {task_id} not found"))?;
-        let phase = task
-            .phases
-            .iter_mut()
-            .find(|phase| phase.id == phase_id)
-            .ok_or_else(|| format!("phase {phase_id} not found"))?;
-        phase.artifacts.push(TaskPhaseArtifact {
-            kind,
-            label: label.clone(),
-            value,
-            created_at_ms: now,
-        });
-        phase.updated_at_ms = now;
-        task.updated_at_ms = now;
-        task.audit.push(TaskAuditEvent {
-            event_type: "phase_artifact".to_string(),
-            message: format!("phase artifact recorded: {label}"),
-            created_at_ms: now,
-        });
-        let updated = task.clone();
-        drop(store);
-        self.persist()?;
-        Ok(updated)
+        let phase_id = phase_id.to_string();
+        self.update_existing(task_id, move |task| {
+            let phase = task
+                .phases
+                .iter_mut()
+                .find(|phase| phase.id == phase_id)
+                .ok_or_else(|| format!("phase {phase_id} not found"))?;
+            phase.artifacts.push(TaskPhaseArtifact {
+                kind: kind.clone(),
+                label: label.clone(),
+                value: value.clone(),
+                created_at_ms: now,
+            });
+            phase.updated_at_ms = now;
+            task.updated_at_ms = now;
+            task.audit.push(TaskAuditEvent {
+                event_type: "phase_artifact".to_string(),
+                message: format!("phase artifact recorded: {label}"),
+                created_at_ms: now,
+            });
+            Ok(())
+        })
     }
 
     pub fn review_phase(
@@ -487,43 +609,34 @@ impl TaskKernel {
             return Err("review result is required".to_string());
         }
 
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let task = store
-            .tasks
-            .iter_mut()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| format!("task {task_id} not found"))?;
-        let phase = task
-            .phases
-            .iter_mut()
-            .find(|phase| phase.id == phase_id)
-            .ok_or_else(|| format!("phase {phase_id} not found"))?;
-        phase.review_result = Some(result.clone());
-        phase.status = if completed {
-            TaskPhaseStatus::Completed
-        } else {
-            TaskPhaseStatus::Reviewing
-        };
-        phase.updated_at_ms = now;
-        task.status = if completed {
-            TaskStatus::Reviewing
-        } else {
-            TaskStatus::Running
-        };
-        task.current_phase = Some(phase.name.clone());
-        task.updated_at_ms = now;
-        task.audit.push(TaskAuditEvent {
-            event_type: "phase_reviewed".to_string(),
-            message: result,
-            created_at_ms: now,
-        });
-        let updated = task.clone();
-        drop(store);
-        self.persist()?;
-        Ok(updated)
+        let phase_id = phase_id.to_string();
+        self.update_existing(task_id, move |task| {
+            let phase = task
+                .phases
+                .iter_mut()
+                .find(|phase| phase.id == phase_id)
+                .ok_or_else(|| format!("phase {phase_id} not found"))?;
+            phase.review_result = Some(result.clone());
+            phase.status = if completed {
+                TaskPhaseStatus::Completed
+            } else {
+                TaskPhaseStatus::Reviewing
+            };
+            phase.updated_at_ms = now;
+            task.status = if completed {
+                TaskStatus::Reviewing
+            } else {
+                TaskStatus::Running
+            };
+            task.current_phase = Some(phase.name.clone());
+            task.updated_at_ms = now;
+            task.audit.push(TaskAuditEvent {
+                event_type: "phase_reviewed".to_string(),
+                message: result.clone(),
+                created_at_ms: now,
+            });
+            Ok(())
+        })
     }
 
     pub fn record_failure(
@@ -533,31 +646,21 @@ impl TaskKernel {
     ) -> Result<TaskRecord, String> {
         let reason = reason.into();
         let now = now_ms();
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let task = store
-            .tasks
-            .iter_mut()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| format!("task {task_id} not found"))?;
-        task.failure_count += 1;
-        task.updated_at_ms = now;
-        if task.failure_count >= 3 {
-            task.status = TaskStatus::Blocked;
-            task.blocker_reason = Some(reason.clone());
-            task.current_phase = Some("blocked".to_string());
-        }
-        task.audit.push(TaskAuditEvent {
-            event_type: "failure".to_string(),
-            message: reason,
-            created_at_ms: now,
-        });
-        let updated = task.clone();
-        drop(store);
-        self.persist()?;
-        Ok(updated)
+        self.update_existing(task_id, move |task| {
+            task.failure_count += 1;
+            task.updated_at_ms = now;
+            if task.failure_count >= 3 {
+                task.status = TaskStatus::Blocked;
+                task.blocker_reason = Some(reason.clone());
+                task.current_phase = Some("blocked".to_string());
+            }
+            task.audit.push(TaskAuditEvent {
+                event_type: "failure".to_string(),
+                message: reason.clone(),
+                created_at_ms: now,
+            });
+            Ok(())
+        })
     }
 
     /// Cache a read-only projection produced by the canonical execution store.
@@ -570,83 +673,64 @@ impl TaskKernel {
         task_id: &str,
         projection: ExecutionGraphProjection,
     ) -> Result<TaskRecord, String> {
-        let now = now_ms();
-        let mut store = self
-            .store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let task = store
-            .tasks
-            .iter_mut()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| format!("task {task_id} not found"))?;
-        task.execution_graph = Some(projection);
-        task.updated_at_ms = now;
-        task.audit.push(TaskAuditEvent {
-            event_type: "execution_graph_projected".to_string(),
-            message: "execution graph projection refreshed".to_string(),
-            created_at_ms: now,
-        });
-        let updated = task.clone();
-        drop(store);
-        self.persist()?;
-        Ok(updated)
+        self.update_existing(task_id, move |task| {
+            let now = now_ms();
+            task.execution_graph = Some(projection.clone());
+            task.updated_at_ms = now;
+            task.audit.push(TaskAuditEvent {
+                event_type: "execution_graph_projected".to_string(),
+                message: "execution graph projection refreshed".to_string(),
+                created_at_ms: now,
+            });
+            Ok(())
+        })
     }
 
     #[must_use]
-    pub fn execution_graph(&self, task_id: &str) -> Option<ExecutionGraphProjection> {
-        self.list()
-            .into_iter()
-            .find(|task| task.id == task_id)
-            .and_then(|task| task.execution_graph)
+    pub fn execution_graph(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<ExecutionGraphProjection>, String> {
+        Ok(self
+            .backend
+            .get(task_id)?
+            .and_then(|task| task.execution_graph))
     }
 
-    #[must_use]
-    pub fn execution_graphs(&self) -> Vec<ExecutionGraphProjection> {
-        self.list()
+    pub fn execution_graphs(&self) -> Result<Vec<ExecutionGraphProjection>, String> {
+        Ok(self
+            .list()?
             .into_iter()
             .filter_map(|task| task.execution_graph)
-            .collect()
+            .collect())
     }
 
-    fn persist(&self) -> Result<(), String> {
-        let store = {
-            let store = self
-                .store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            store.tasks.clone()
-        };
-        let mut conn = self
-            .executor
-            .checkout()
-            .map_err(|error| error.to_string())?;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| error.to_string())?;
-        tx.execute("DELETE FROM tasks", [])
-            .map_err(|e| e.to_string())?;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO tasks (id, status, created_at_ms, updated_at_ms, record_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                )
-                .map_err(|e| e.to_string())?;
-            for task in &store {
-                let record_json = serde_json::to_string(task).map_err(|e| e.to_string())?;
-                stmt.execute(params![
-                    task.id.as_str(),
-                    task.status.as_str(),
-                    task.created_at_ms as i64,
-                    task.updated_at_ms as i64,
-                    record_json,
-                ])
-                .map_err(|e| e.to_string())?;
-            }
-        }
-        tx.commit().map_err(|e| e.to_string())
+    pub fn export_migration_snapshot(&self) -> Result<TaskStoreSnapshot, String> {
+        self.backend.export_migration_snapshot()
     }
+
+    pub fn import_migration_snapshot(&self, snapshot: &TaskStoreSnapshot) -> Result<(), String> {
+        self.backend.import_migration_snapshot(snapshot)
+    }
+
+    fn update_existing(
+        &self,
+        task_id: &str,
+        mut mutation: impl FnMut(&mut TaskRecord) -> Result<(), String>,
+    ) -> Result<TaskRecord, String> {
+        self.backend.update_task(task_id, &mut |current| {
+            let mut task = current.ok_or_else(|| format!("task {task_id} not found"))?;
+            mutation(&mut task)?;
+            Ok(task)
+        })
+    }
+}
+
+fn validate_updated_task(task_id: &str, task: &TaskRecord) -> Result<(), String> {
+    if task_id.trim().is_empty() || task.id.trim().is_empty() || task.id != task_id {
+        return Err("task backend updater returned a record for another task id".to_string());
+    }
+    Ok(())
 }
 
 fn normalize_task_db_path(path: PathBuf) -> PathBuf {
@@ -666,12 +750,14 @@ fn ensure_schema_connection(conn: &rusqlite::Connection) -> Result<(), String> {
             record_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_tasks_status_updated
-            ON tasks(status, updated_at_ms DESC);",
+            ON tasks(status, updated_at_ms DESC);
+        CREATE INDEX IF NOT EXISTS idx_tasks_status_created
+            ON tasks(status, created_at_ms DESC, id DESC);",
     )
     .map_err(|e| e.to_string())
 }
 
-fn load_store_connection(conn: &rusqlite::Connection) -> Result<TaskStore, String> {
+fn load_tasks_connection(conn: &rusqlite::Connection) -> Result<Vec<TaskRecord>, String> {
     let mut stmt = conn
         .prepare("SELECT record_json FROM tasks ORDER BY created_at_ms ASC, id ASC")
         .map_err(|e| e.to_string())?;
@@ -683,7 +769,24 @@ fn load_store_connection(conn: &rusqlite::Connection) -> Result<TaskStore, Strin
         let raw = row.map_err(|e| e.to_string())?;
         tasks.push(serde_json::from_str::<TaskRecord>(&raw).map_err(|e| e.to_string())?);
     }
-    Ok(TaskStore { tasks })
+    Ok(tasks)
+}
+
+fn load_task_connection(
+    conn: &rusqlite::Connection,
+    task_id: &str,
+) -> Result<Option<TaskRecord>, String> {
+    let record_json = conn
+        .query_row(
+            "SELECT record_json FROM tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    record_json
+        .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+        .transpose()
 }
 
 fn now_ms() -> u64 {
@@ -723,7 +826,10 @@ mod tests {
         let task = kernel.start_goal("Ship v0.9.329", true).unwrap();
 
         let restored = TaskKernel::open_storage_handle(&handle).unwrap();
-        let current = restored.current().expect("current task should restore");
+        let current = restored
+            .current()
+            .expect("task backend should read")
+            .expect("current task should restore");
         assert_eq!(current.id, task.id);
         assert_eq!(current.status, TaskStatus::Running);
         assert!(current.yolo_mode);
@@ -825,10 +931,56 @@ mod tests {
         let restored = TaskKernel::open_storage_handle(&handle).unwrap();
         let graph = restored
             .execution_graph(&task.id)
+            .expect("task backend should read")
             .expect("graph should restore");
         assert_eq!(graph.graph_id, "graph-1");
-        assert_eq!(restored.execution_graphs().len(), 1);
+        assert_eq!(
+            restored
+                .execution_graphs()
+                .expect("task backend should read")
+                .len(),
+            1
+        );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_snapshot_round_trip_preserves_digest_and_rejects_nonempty_target() {
+        let source_handle = temp_handle("snapshot-source");
+        let source_path = source_handle.path.clone();
+        let source = TaskKernel::open_storage_handle(&source_handle).unwrap();
+        let task = source
+            .start_goal_idempotent("task-snapshot", "Migrate task control plane", true)
+            .unwrap();
+        source
+            .start_phase(
+                &task.id,
+                "verification",
+                "prove task migration",
+                vec!["copy snapshot".to_string()],
+                vec!["digest equality".to_string()],
+                vec!["cargo test -p runtime task::tests".to_string()],
+            )
+            .unwrap();
+        let snapshot = source.export_migration_snapshot().unwrap();
+        let source_digest = snapshot.canonical_digest().unwrap();
+
+        let target_handle = temp_handle("snapshot-target");
+        let target_path = target_handle.path.clone();
+        let target = TaskKernel::open_storage_handle(&target_handle).unwrap();
+        target.import_migration_snapshot(&snapshot).unwrap();
+        assert_eq!(
+            target
+                .export_migration_snapshot()
+                .unwrap()
+                .canonical_digest()
+                .unwrap(),
+            source_digest
+        );
+        assert!(target.import_migration_snapshot(&snapshot).is_err());
+
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
     }
 }

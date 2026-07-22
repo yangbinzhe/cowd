@@ -32,11 +32,19 @@ impl TaskKernel {
         })
     }
 
-    pub(crate) fn list(&self) -> Vec<TaskRecord> {
+    /// Product composition may supply a fully constructed Runtime task facade.
+    /// The Gateway remains storage-driver agnostic and only forwards domain
+    /// operations through this boundary.
+    #[must_use]
+    pub(crate) fn from_runtime_kernel(inner: runtime::task::TaskKernel) -> Self {
+        Self { inner }
+    }
+
+    pub(crate) fn list(&self) -> Result<Vec<TaskRecord>, String> {
         self.inner.list()
     }
 
-    pub(crate) fn current(&self) -> Option<TaskRecord> {
+    pub(crate) fn current(&self) -> Result<Option<TaskRecord>, String> {
         self.inner.current()
     }
 
@@ -112,11 +120,14 @@ impl TaskKernel {
         self.inner.record_failure(task_id, reason)
     }
 
-    pub(crate) fn execution_graphs(&self) -> Vec<ExecutionGraphProjection> {
+    pub(crate) fn execution_graphs(&self) -> Result<Vec<ExecutionGraphProjection>, String> {
         self.inner.execution_graphs()
     }
 
-    pub(crate) fn execution_graph(&self, task_id: &str) -> Option<ExecutionGraphProjection> {
+    pub(crate) fn execution_graph(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<ExecutionGraphProjection>, String> {
         self.inner.execution_graph(task_id)
     }
 
@@ -149,7 +160,10 @@ mod tests {
         let task = kernel.start_goal("Ship v0.9.476", true).unwrap();
 
         let restored = TaskKernel::open(path.clone()).unwrap();
-        let current = restored.current().expect("current task should restore");
+        let current = restored
+            .current()
+            .expect("task backend should read")
+            .expect("current task should restore");
         assert_eq!(current.id, task.id);
         assert_eq!(current.status, TaskStatus::Running);
         assert!(current.yolo_mode);
@@ -167,8 +181,32 @@ mod tests {
 
         assert!(db_path.is_file());
         assert!(!legacy_path.exists());
-        assert_eq!(TaskKernel::open(legacy_path).unwrap().list().len(), 1);
+        assert_eq!(
+            TaskKernel::open(legacy_path).unwrap().list().unwrap().len(),
+            1
+        );
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn gateway_wrapper_accepts_an_explicit_runtime_task_facade() {
+        let path = temp_path("injected-runtime-facade");
+        let runtime_kernel = runtime::task::TaskKernel::open(path.clone()).unwrap();
+        let task = runtime_kernel
+            .start_goal_idempotent("task-injected", "explicit backend composition", false)
+            .unwrap();
+        let gateway_kernel = TaskKernel::from_runtime_kernel(runtime_kernel);
+        assert_eq!(
+            gateway_kernel
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == task.id)
+                .expect("Gateway wrapper sees Runtime task facade")
+                .objective,
+            "explicit backend composition"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -7,7 +7,7 @@
         clippy::unreachable
     )
 )]
-//! PostgreSQL adapter for the Runtime durable event ledger.
+//! PostgreSQL adapters for Runtime durable domains.
 //!
 //! This crate owns PostgreSQL SQL and depends on the Runtime backend contract.
 //! The `runtime` crate itself remains free of PostgreSQL drivers.
@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use postgres::{GenericClient, Row, Transaction};
+use runtime::task::{TaskKernel, TaskRecord, TaskStoreBackend, TaskStoreSnapshot};
 use runtime::{
     AppendTransactionReceipt, AppendTransactionRequest, CommittedEventBatch,
     CommittedStreamRevision, DurableRuntimeEvent, ExpectedStreamRevision,
@@ -36,6 +37,7 @@ use storage::{
 };
 
 const RUNTIME_EVENT_DOMAIN: &str = "runtime_event";
+const TASK_DOMAIN: &str = "runtime_task";
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 const EVENT_COLUMNS: &str =
@@ -123,6 +125,24 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
             ON runtime_session_outbox(status, next_attempt_at, claim_expires_at, commit_cursor)",
         "CREATE INDEX IF NOT EXISTS idx_runtime_consumed_decision_leases_review
             ON runtime_consumed_decision_leases(review_id, action)",
+    ],
+}];
+
+const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
+    id: "runtime_task.0001.initial",
+    domain: TASK_DOMAIN,
+    version: 1,
+    description: "create durable task control-plane records",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS runtime_tasks (
+            task_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            created_at_ms BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL,
+            record_json JSONB NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_runtime_tasks_status_created
+            ON runtime_tasks(status, created_at_ms DESC, task_id DESC)",
     ],
 }];
 
@@ -1557,6 +1577,257 @@ fn to_i64(value: u64, field: &str) -> RuntimeEventStoreResult<i64> {
     })
 }
 
+/// Complete PostgreSQL implementation of the Task control-plane backend.
+///
+/// The store locks only the task being updated. Independent task lifecycles
+/// can therefore use separate PostgreSQL connections concurrently; task-level
+/// transitions remain atomic even across gateway processes.
+#[derive(Clone, Debug)]
+pub struct PostgresTaskStore {
+    executor: PostgresExecutor,
+}
+
+/// Immutable proof written only after an explicit quiesced task copy reaches
+/// canonical digest equality. It intentionally carries no backend URL/path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskMigrationManifest {
+    pub domain: String,
+    pub source_digest: String,
+    pub target_digest: String,
+    pub task_count: usize,
+}
+
+impl PostgresTaskStore {
+    pub fn new(executor: PostgresExecutor) -> Result<Self, String> {
+        executor
+            .apply_migrations(TASK_DOMAIN, TASK_MIGRATIONS)
+            .map_err(|error| error.to_string())?;
+        Ok(Self { executor })
+    }
+
+    pub fn connect(
+        config: PostgresConnectionConfig,
+        resolver: &dyn SecretRefResolver,
+    ) -> Result<Self, String> {
+        Self::new(PostgresExecutor::connect(config, resolver).map_err(|error| error.to_string())?)
+    }
+
+    #[must_use]
+    pub fn executor(&self) -> &PostgresExecutor {
+        &self.executor
+    }
+
+    #[must_use]
+    pub fn into_task_kernel(self) -> TaskKernel {
+        TaskKernel::from_backend(Arc::new(self))
+    }
+}
+
+impl TaskStoreBackend for PostgresTaskStore {
+    fn list(&self) -> Result<Vec<TaskRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let rows = connection
+            .query(
+                "SELECT record_json FROM runtime_tasks ORDER BY created_at_ms ASC, task_id ASC",
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.iter().map(task_record_from_row).collect()
+    }
+
+    fn get(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        connection
+            .query_opt(
+                "SELECT record_json FROM runtime_tasks WHERE task_id=$1",
+                &[&task_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| task_record_from_row(&row))
+            .transpose()
+    }
+
+    fn current(&self) -> Result<Option<TaskRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        connection
+            .query_opt(
+                "SELECT record_json FROM runtime_tasks
+                 WHERE status IN ('pending', 'running', 'reviewing')
+                 ORDER BY created_at_ms DESC, task_id DESC LIMIT 1",
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| task_record_from_row(&row))
+            .transpose()
+    }
+
+    fn update_task(
+        &self,
+        task_id: &str,
+        updater: &mut dyn FnMut(Option<TaskRecord>) -> Result<TaskRecord, String>,
+    ) -> Result<TaskRecord, String> {
+        if task_id.trim().is_empty() {
+            return Err("task id is required".to_string());
+        }
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let lock_key = format!("cowd-runtime-task:{task_id}");
+        transaction
+            .query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                &[&lock_key],
+            )
+            .map_err(|error| error.to_string())?;
+        let current = transaction
+            .query_opt(
+                "SELECT record_json FROM runtime_tasks WHERE task_id=$1 FOR UPDATE",
+                &[&task_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| task_record_from_row(&row))
+            .transpose()?;
+        let next = updater(current)?;
+        validate_task_update(task_id, &next)?;
+        let record_json = serde_json::to_value(&next).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO runtime_tasks
+                    (task_id, status, created_at_ms, updated_at_ms, record_json)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT(task_id) DO UPDATE SET
+                    status=EXCLUDED.status,
+                    created_at_ms=EXCLUDED.created_at_ms,
+                    updated_at_ms=EXCLUDED.updated_at_ms,
+                    record_json=EXCLUDED.record_json",
+                &[
+                    &next.id,
+                    &next.status.as_str(),
+                    &task_time_i64(next.created_at_ms, "created_at_ms")?,
+                    &task_time_i64(next.updated_at_ms, "updated_at_ms")?,
+                    &record_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(next)
+    }
+
+    fn import_migration_snapshot(&self, snapshot: &TaskStoreSnapshot) -> Result<(), String> {
+        snapshot.validate()?;
+        let mut connection = self
+            .executor
+            .checkout()
+            .map_err(|error| error.to_string())?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .batch_execute("LOCK TABLE runtime_tasks IN EXCLUSIVE MODE")
+            .map_err(|error| error.to_string())?;
+        let existing: i64 = transaction
+            .query_one("SELECT COUNT(*) FROM runtime_tasks", &[])
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if existing != 0 {
+            return Err("task migration target must be empty".to_string());
+        }
+        for task in &snapshot.tasks {
+            let record_json = serde_json::to_value(task).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_tasks
+                        (task_id, status, created_at_ms, updated_at_ms, record_json)
+                     VALUES ($1, $2, $3, $4, $5)",
+                    &[
+                        &task.id,
+                        &task.status.as_str(),
+                        &task_time_i64(task.created_at_ms, "created_at_ms")?,
+                        &task_time_i64(task.updated_at_ms, "updated_at_ms")?,
+                        &record_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())
+    }
+}
+
+/// Copy a quiesced Task control plane exactly once, prove canonical digest
+/// equality, then atomically write a backend-neutral cutover manifest.
+pub fn copy_quiesced_task_kernel(
+    source: &TaskKernel,
+    target: &TaskKernel,
+    manifest_path: impl AsRef<Path>,
+) -> Result<TaskMigrationManifest, String> {
+    let snapshot = source.export_migration_snapshot()?;
+    snapshot.validate()?;
+    let source_digest = snapshot.canonical_digest()?;
+    target.import_migration_snapshot(&snapshot)?;
+    let target_snapshot = target.export_migration_snapshot()?;
+    let target_digest = target_snapshot.canonical_digest()?;
+    if source_digest != target_digest {
+        return Err("task migration digest mismatch".to_string());
+    }
+    let manifest = TaskMigrationManifest {
+        domain: TASK_DOMAIN.to_string(),
+        source_digest,
+        target_digest,
+        task_count: snapshot.tasks.len(),
+    };
+    write_task_migration_manifest(manifest_path.as_ref(), &manifest)?;
+    Ok(manifest)
+}
+
+fn task_record_from_row(row: &Row) -> Result<TaskRecord, String> {
+    let record_json: Value = row.try_get(0).map_err(|error| error.to_string())?;
+    serde_json::from_value(record_json).map_err(|error| error.to_string())
+}
+
+fn validate_task_update(task_id: &str, task: &TaskRecord) -> Result<(), String> {
+    if task.id.trim().is_empty() || task.id != task_id {
+        return Err("task backend updater returned a record for another task id".to_string());
+    }
+    Ok(())
+}
+
+fn task_time_i64(value: u64, field: &str) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("task `{field}` exceeds i64"))
+}
+
+fn write_task_migration_manifest(
+    manifest_path: &Path,
+    manifest: &TaskMigrationManifest,
+) -> Result<(), String> {
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary_path = PathBuf::from(format!(
+        "{}.{}.tmp",
+        manifest_path.display(),
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(
+        &temporary_path,
+        serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::rename(temporary_path, manifest_path).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -1830,5 +2101,127 @@ mod tests {
             .expect("read composed event")
             .iter()
             .any(|event| event.kind == "task.started"));
+    }
+
+    #[test]
+    fn postgres_task_store_preserves_migration_restart_and_per_task_concurrency() {
+        let url = match std::env::var("COWD_TEST_POSTGRES_URL") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => {
+                eprintln!("skipping real PostgreSQL task test: COWD_TEST_POSTGRES_URL is not set");
+                return;
+            }
+        };
+        let temp = tempfile::tempdir().expect("temporary task migration root");
+        let source_path = temp.path().join("source-tasks.db");
+        let source = TaskKernel::open(source_path).expect("SQLite task source opens");
+        let source_task = source
+            .start_goal_idempotent("task-pg-migration", "Migrate the task control plane", true)
+            .expect("source task starts");
+        let phase = source
+            .start_phase(
+                &source_task.id,
+                "postgres-verification",
+                "prove target preserves the task record",
+                vec!["copy task snapshot".to_string()],
+                vec!["digest equality".to_string()],
+                vec!["real PostgreSQL task test".to_string()],
+            )
+            .expect("source phase starts");
+        let phase_id = phase.phases.last().expect("phase exists").id.clone();
+        source
+            .record_phase_artifact(
+                &source_task.id,
+                &phase_id,
+                "evidence",
+                "migration",
+                "source snapshot is canonical",
+            )
+            .expect("source artifact persists");
+
+        let resolver = StaticSecretRefResolver::new([("task.pg".to_string(), url.clone())]);
+        let pg_store = PostgresTaskStore::connect(
+            PostgresConnectionConfig::new("runtime-task-test", "task.pg", "cowd-v570-test"),
+            &resolver,
+        )
+        .expect("postgres task store opens");
+        let executor = pg_store.executor().clone();
+        let target = Arc::new(pg_store.into_task_kernel());
+        let manifest_path = temp.path().join("task-migration-manifest.json");
+        let manifest = copy_quiesced_task_kernel(&source, target.as_ref(), &manifest_path)
+            .expect("quiesced SQLite to PostgreSQL copy succeeds");
+        assert_eq!(manifest.source_digest, manifest.target_digest);
+        assert_eq!(manifest.task_count, 1);
+        assert!(manifest_path.is_file());
+        assert_eq!(
+            source
+                .export_migration_snapshot()
+                .expect("source snapshot")
+                .canonical_digest()
+                .expect("source digest"),
+            target
+                .export_migration_snapshot()
+                .expect("target snapshot")
+                .canonical_digest()
+                .expect("target digest")
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let target = Arc::clone(&target);
+                thread::spawn(move || {
+                    barrier.wait();
+                    target.start_goal_idempotent(
+                        "task-pg-concurrent",
+                        "one governed concurrent task",
+                        true,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("task worker joins"))
+            .collect::<Vec<_>>();
+        assert!(results.iter().all(Result::is_ok));
+        let concurrent = target
+            .list()
+            .expect("target task list")
+            .into_iter()
+            .find(|task| task.id == "task-pg-concurrent")
+            .expect("one concurrent task persists");
+        assert_eq!(concurrent.objective, "one governed concurrent task");
+        assert!(target
+            .start_goal_idempotent("task-pg-concurrent", "a conflicting objective", true,)
+            .is_err());
+
+        let reopened_resolver = StaticSecretRefResolver::new([("task.pg".to_string(), url)]);
+        let reopened = PostgresTaskStore::connect(
+            PostgresConnectionConfig::new(
+                "runtime-task-reopen-test",
+                "task.pg",
+                "cowd-v570-reopen-test",
+            ),
+            &reopened_resolver,
+        )
+        .expect("postgres task store reopens")
+        .into_task_kernel();
+        let restored = reopened
+            .list()
+            .expect("reopened task list")
+            .into_iter()
+            .find(|task| task.id == source_task.id)
+            .expect("migrated task survives reopen");
+        assert!(restored
+            .phases
+            .iter()
+            .any(|candidate| candidate.id == phase_id && !candidate.artifacts.is_empty()));
+        assert!(
+            copy_quiesced_task_kernel(&source, &reopened, temp.path().join("rejected.json"))
+                .is_err()
+        );
+        assert!(executor.health().metrics.checkout_count > 0);
     }
 }

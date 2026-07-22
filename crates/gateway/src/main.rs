@@ -3206,7 +3206,7 @@ pub(crate) fn ensure_yolo_task(
     }
     let kernel =
         gateway_storage::GatewayStorage::open_task_kernel(runtime::cowd_dirs::config_home_dir())?;
-    if let Some(current) = kernel.current() {
+    if let Some(current) = kernel.current()? {
         return Ok(Some(current));
     }
     kernel.start_goal(objective, true).map(Some)
