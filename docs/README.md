@@ -17,6 +17,10 @@ Application architecture:
 - `architecture/application-development-and-product-composition.md` - multi-App ownership, source locking, development/release modes, product composition, and acceptance rules.
 - `architecture/app-activation-and-build.md` - current unified runtime enablement and build behavior for compiled Apps.
 
+Storage operations:
+
+- `architecture/storage-governance.md` - V581 process-wide SQLite/PostgreSQL selection, shared pool and stable port boundaries, App-owned schemas and migration hooks, and the fail-closed `plan → migrate → verify → cutover` procedure.
+
 Gateway operations:
 
 - `operator/gateway-lifecycle.md` - safe Gateway start/stop/restart, binary replacement, authorization-state migration, and single-instance verification.

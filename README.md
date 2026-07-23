@@ -1,8 +1,8 @@
 # Cowd — Rust 原生 AI Harness 内核
 
-> 核心版本：`v0.9.438` | Rust 2021 Edition | 22 crates | MIT
+> 核心版本：`v0.9.581` | Rust 2021 Edition | MIT
 
-📊 **[交互式能力全景 Dashboard →](docs/capability-dashboard.html)** — 7 面板 · 4 张 SVG 架构图 · 20 张特性卡片 · 18 域模块归属图 · 全中文
+📊 **[历史 v0.9.438 能力全景 Dashboard →](docs/capability-dashboard.html)** — 作为阶段快照保留；当前能力以本文与 `docs/` 活跃文档为准
 
 ---
 
@@ -14,7 +14,7 @@
                                 │  CLI ──── TUI ──── WebUI ─── Channel │
                                 │ (极薄)  (终端面)  (cowd-edge) (飞书/邮件/企微/微信) │
                                 └──────────────┬──────────────────────┘
-                                               │ HTTP/SSE / JSONL
+                                               │ HTTP/SSE / UDS·H2
                                                ▼
         ┌──────────────────────────────────────────────────────────────────┐
         │                     Gateway (统一后台入口)                         │
@@ -63,7 +63,7 @@
     │   │ MFG / future│  │  · LSP/file  │  │  DeepSeek/Qwen)  │   │
     │   └─────────────┘  └──────────────┘  └──────────────────┘   │
     │                                                              │
-    │   底层存储: storage (SQLite·WAL·Migration·Health)              │
+    │   底层存储: storage (SQLite·PostgreSQL·Migration·Health)        │
     └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -72,7 +72,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ Entry 层         cli · gateway · tui · surface                      │
-│                   极薄入口 · 统一后台 · 终端面 · JSONL 协议           │
+│                   极薄入口 · 统一后台 · 终端面 · Edge 协议            │
 ├─────────────────────────────────────────────────────────────────────┤
 │ AI Harness 层    harness-contract · harness-eval · runtime          │
 │                   · session · approval · model-protocol · provider  │
@@ -99,7 +99,7 @@
         │
         ▼
 ┌──────────────────────┐
-│  Surface Ingress      │  JSONL sidecar → Gateway SurfaceHost
+│  Surface Ingress      │  Managed Edge → Gateway SurfaceHost
 │  → 写入持久 inbox     │  status: received
 └──────────┬───────────┘
            ▼
@@ -157,12 +157,12 @@
 | **会话管理** | 多 session 并行、切换、后台运行、暂停/关闭、检查点/恢复；持久化连接池并发访问 | ✅ 生产就绪（V564 已消除全局存储锁） | `session_execution` · `SessionExecutionPlane` · `UnifiedSessionStore` |
 | **上下文工程** | 动态预算分配、硬容量预检、语义检查点压缩、记忆召回、知识激活、证据规划 | ✅ 生产就绪 | `context_runtime` · `budget_policy` · `compact` |
 | **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` · `CognitiveContextManager` |
-| **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + SQLite 持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
+| **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + 后端中立持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
 | **多 Agent 协作** | Team 模板 → role task 生成 → agent mailbox 投递 → event bus 同步 | 🔶 基础完成 | `team_runtime` · `agent_lifecycle` · `collaboration_template` |
 | **Agent 讨论** | 多 agent 讨论引擎、共识方法、联合问题求解管道 | 🔶 基础完成 | `agent_discussion` · `joint_problem_solving` |
 | **托管执行(Steward)** | Autonomy profile 驱动、tick调度、决策账本、handoff | 🔶 基础完成 | `steward_runtime` · `steward_scheduler` |
 | **可靠消息投递** | Inbox→Outbox→DLQ 完整状态机、重试/backoff、operator 修复入口 | ✅ 生产就绪 | `SurfaceHost` · `message_store` · `ledger` |
-| **Surface 协议** | JSONL sidecar、surface.json manifest、managed/static lifecycle | ✅ 生产就绪 | `surface` · `SurfaceManifest` · `surface.json` |
+| **Surface 协议** | `surface.json` manifest、UDS/H2 managed 与 static/OneShot lifecycle | ✅ 生产就绪 | `surface` · `SurfaceManifest` · `surface.json` |
 | **事件账本 & 恢复** | 覆盖 mission/session/team/agent/tool/recovery 的事件存储+回放 | ✅ 基础完成 | `runtime_event_store` · `recovery` · `recovery_recipes` |
 | **跨面治理(Policy)** | 跨入口身份绑定、授权、风险审计、信任解析、自治预算 | ✅ 生产就绪 | `cross_plane_policy` · `trust_resolver` · `autonomy_profile` |
 | **权限 & 审批** | PermissionMode(plan/acceptEdits/dontAsk) + SmartApprovalGate + solo模式 | ✅ 生产就绪 | `permissions` · `approval_gate` · `global_approval_queue` |
@@ -200,7 +200,7 @@ runtime 架构域全景
   RealityBridge ─── 结构化数据合约(实体/事实源映射)                      (1 模块)
   Skill         ─── 运行时技能激活、选择、记忆集成                       (1+3 模块)
   Infrastructure─── 配置、MCP、钩子、沙盒、波浪、远程、事件、插件       (41 模块)
-  Persistence   ─── 异步存储协议(SQLite/Cache)                           (1+2 模块)
+  Persistence   ─── 异步存储端口(SQLite/PostgreSQL/Cache)                (1+2 模块)
   StructuredData─── 实体/事实源映射与对账                                 (1 模块)
 ```
 
@@ -413,7 +413,7 @@ SurfaceMessageSnapshot = active_inbox + terminal_inbox + active_outbox + dead_le
 
 ---
 
-Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.438`。
+Cowd 是 Rust 原生的 AI Harness 核心仓库。当前核心版本：`0.9.581`。
 
 本仓库的目标不是实现一个单一聊天 CLI，而是建设一个可长期演进的 AI Harness 内核：统一承载模型调用、会话、上下文、记忆、事实、工具、技能、审批、任务推进、运行时治理和 surface 投影。CLI、TUI、WebUI、外部渠道都只是这个内核能力的不同入口和呈现方式。
 
@@ -462,7 +462,7 @@ Fact/application layer
 ### 1.2 第一原则
 
 - Runtime 不持有 channel，也不链接任何平台 SDK。
-- Gateway 是唯一后端服务入口，负责 surface 发现、静态资源转发、callback 转发、health、events 和 JSONL sidecar 调度。
+- Gateway 是唯一后端服务入口，负责 Edge 发现、静态资源转发、callback、health、events 和 managed sidecar 生命周期。
 - TUI 和 WebUI 都只通过 Gateway HTTP/SSE API 使用核心能力。
 - CLI 不做交互 UI，不承载业务执行器，只负责轻量命令、配置、诊断和 Gateway 启动。
 - 默认开发/debug 构建不带 TUI，TUI 与 Gateway 分开开发。
@@ -524,7 +524,7 @@ migration hook 和全局 evidence envelope。
 crates/cli        极薄 CLI 入口，默认 debug 不编译 TUI
 crates/gateway    HTTP/SSE 服务入口，负责 RuntimeHost 与 SurfaceHost
 crates/runtime    AI Harness 运行时核心，不依赖 channel/surface SDK
-crates/surface    Edge JSONL 协议与 manifest 合同（底层协议名仍为 cowd.surface.v1）
+crates/surface    Edge 生命周期、传输与 manifest 合同（底层协议名仍为 cowd.surface.v1）
 crates/tui        core 仓内唯一 UI surface，full 构建才进入 cowd
 ```
 
@@ -543,7 +543,9 @@ cowd-edge
   crates/edge-adapters           平台适配实现和 sidecar 二进制
 ```
 
-WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进入 core workspace。它们通过 `surface.json` 和 JSONL sidecar 协议被 Gateway 发现和调用。
+WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进入 core workspace。Gateway 通过
+`surface.json` 发现它们；managed Edge 使用私有 UDS 上的 authenticated HTTP/2，stdio JSONL
+只保留给一次一请求的 OneShot 单元。
 
 ---
 
@@ -556,7 +558,7 @@ WebUI、飞书、邮件、企微、微信 iLink 与数据源 connector 不再进
 | `crates/cli` | 极薄命令入口。默认构建不带 TUI，不依赖 runtime/memory。 |
 | `crates/gateway` | 后台服务入口。承载 HTTP/SSE API、RuntimeHost、SurfaceHost 和服务编排。 |
 | `crates/tui` | 终端 surface。只在 `--features full` 或显式选择时构建。 |
-| `crates/surface` | Surface manifest、JSONL frame、静态资源、callback、health 合同。 |
+| `crates/surface` | Surface manifest、managed/OneShot 传输、静态资源、callback、health 合同。 |
 
 ### 3.2 AI Harness 层
 
@@ -634,7 +636,7 @@ Memory 更偏知识、经验、语义关联和上下文召回。Matrix 更偏结
 | `crates/product-apps` | 由 `apps/catalog.toml` 生成的唯一 Cowd 产品组合入口；只聚合外部 App 的静态贡献。 |
 | 外部 `cowd-app-<id>-bundle` | 由对应 App 仓库拥有的组成适配层；MFG 是首个真实 bundle。 |
 | 后续 `app-<id>` | 遵守同一来源锁定、所有权、feature、配置启停与界面投影规约的领域 App。 |
-| `crates/storage` | 通用 SQLite/存储基础。 |
+| `crates/storage` | SQLite/PostgreSQL 后端执行器、连接池与迁移合同。 |
 | `crates/model-protocol::telemetry` | provider/runtime 共享的事件和遥测基础类型。 |
 
 App 的业务代码可在独立仓库中开发；Cowd 通过受审核的 catalog/source lock、外部 `app-<id>-bundle` 与 `AppRegistry` 将其纳入产品。MFG 不是 App 框架的例外，也不是其他业务 App 的模板外特权。
@@ -655,7 +657,7 @@ Gateway 是所有 UI 和外部 surface 使用 core 能力的后端服务入口�
 - 发现 surface manifest。
 - 托管 WebUI 静态资源。
 - 转发 surface callback/webhook/OAuth redirect。
-- 管理 JSONL sidecar 生命周期。
+- 管理 managed Edge 生命周期、认证传输和 OneShot 单元。
 - 收集 surface health/events。
 - 将外部渠道的 ingress/egress 接入 Gateway 服务边界。
 
@@ -1072,7 +1074,8 @@ model-protocol
 
 - TUI 不直接依赖 Gateway 内部 crate、runtime、provider、memory、channel，只通过 Gateway HTTP/SSE 使用能力。
 - Runtime 不依赖 `channel` 和 `surface`，也不链接飞书、邮件、企微、WebUI 等平台 SDK。
-- 非 TUI surface 不再进入 core workspace，外部 surface 通过 `surface.json` 和 JSONL sidecar 与 Gateway 连接。
+- 非 TUI surface 不再进入 core workspace；Gateway 通过 `surface.json` 发现外部 surface，并以
+  UDS/H2 托管 managed Edge，stdio JSONL 仅用于 OneShot。
 - Matrix 和 Memory 没有互相直接吞并，二者通过 `fact-kernel` 保持事实语义边界。
 - Gateway 作为后台服务聚合边界，集中承接 Runtime、Reality Core、Skill、Tool、Surface 与已注册 App 的 API 暴露；MFG 只是当前参考 App。
 - Tools 已经从 `runtime` 和 `provider` 中解耦，只保留工具 schema、权限需求、纯执行支撑和工具局部治理能力。
@@ -1174,7 +1177,7 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 版本标签：`v0.9.438`。
+- 当前阶段版本标签：`v0.9.581`。
 
 ### 11.2 是否达到当前阶段目标
 
