@@ -183,6 +183,8 @@ pub enum KnowledgeStoreError {
     Sqlite(#[from] rusqlite::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("backend error: {0}")]
+    Backend(String),
 }
 
 pub trait KnowledgeStore: Send + Sync {

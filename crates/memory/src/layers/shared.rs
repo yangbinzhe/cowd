@@ -340,8 +340,26 @@ use crate::types::MemoryMeta;
 /// A no-op store used when the `SharedLayer` is disabled.
 struct NoopStore;
 
+impl NoopStore {
+    fn unavailable<T>() -> crate::store::Result<T> {
+        Err(crate::MemoryError::CapabilityUnavailable {
+            capability: "shared_memory_store".to_string(),
+            details: "shared layer is disabled".to_string(),
+        })
+    }
+}
+
 #[async_trait]
 impl crate::store::MemoryStore for NoopStore {
+    fn capabilities(&self) -> crate::store::MemoryStoreCapabilities {
+        crate::store::MemoryStoreCapabilities {
+            backend: "disabled",
+            full_text_search: false,
+            lexical_fallback: false,
+            vector_search: false,
+            code_index: false,
+        }
+    }
     async fn insert(&self, entry: &MemoryEntry) -> crate::store::Result<MemoryId> {
         Ok(entry.id)
     }
@@ -359,7 +377,15 @@ impl crate::store::MemoryStore for NoopStore {
         _query: &str,
         _limit: usize,
     ) -> crate::store::Result<Vec<MemoryEntry>> {
-        Ok(Vec::new())
+        Self::unavailable()
+    }
+    async fn search_fts_scoped(
+        &self,
+        _query: &str,
+        _scope: &crate::project_scope::MemoryScope,
+        _limit: usize,
+    ) -> crate::store::Result<Vec<MemoryEntry>> {
+        Self::unavailable()
     }
     async fn search_fts_advanced(
         &self,
@@ -379,10 +405,10 @@ impl crate::store::MemoryStore for NoopStore {
         _embedding: &[f32],
         _limit: usize,
     ) -> crate::store::Result<Vec<MemoryEntry>> {
-        Ok(Vec::new())
+        Self::unavailable()
     }
     async fn search_by_layer(&self, _layer: MemoryLayer) -> crate::store::Result<Vec<MemoryEntry>> {
-        Ok(Vec::new())
+        Self::unavailable()
     }
     async fn search_by_category(
         &self,
@@ -401,6 +427,12 @@ impl crate::store::MemoryStore for NoopStore {
     }
     async fn list_all(&self) -> crate::store::Result<Vec<MemoryEntry>> {
         Ok(Vec::new())
+    }
+
+    async fn legacy_scope_migration_reports(
+        &self,
+    ) -> crate::store::Result<Vec<crate::store::sqlite::LegacyScopeMigrationReport>> {
+        Self::unavailable()
     }
 
     async fn save_entities(&self, _entities: &[Entity]) -> crate::store::Result<()> {
@@ -442,6 +474,79 @@ impl crate::store::MemoryStore for NoopStore {
         _query: &str,
     ) -> crate::store::Result<Vec<crate::store::VerbatimEntry>> {
         Ok(Vec::new())
+    }
+    async fn list_verbatim_entries(
+        &self,
+    ) -> crate::store::Result<Vec<crate::store::VerbatimEntry>> {
+        Self::unavailable()
+    }
+
+    async fn insert_symbol(
+        &self,
+        _symbol: &crate::code_indexer::CodeSymbol,
+    ) -> crate::store::Result<()> {
+        Self::unavailable()
+    }
+    async fn search_symbols(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> crate::store::Result<Vec<crate::code_indexer::CodeSymbol>> {
+        Self::unavailable()
+    }
+    async fn insert_edge(
+        &self,
+        _edge: &crate::code_indexer::SymbolEdge,
+    ) -> crate::store::Result<()> {
+        Self::unavailable()
+    }
+    async fn get_callers(
+        &self,
+        _symbol_id: &str,
+    ) -> crate::store::Result<Vec<crate::code_indexer::CodeSymbol>> {
+        Self::unavailable()
+    }
+    async fn get_callees(
+        &self,
+        _symbol_id: &str,
+    ) -> crate::store::Result<Vec<crate::code_indexer::CodeSymbol>> {
+        Self::unavailable()
+    }
+    async fn list_all_symbols(&self) -> crate::store::Result<Vec<crate::code_indexer::CodeSymbol>> {
+        Self::unavailable()
+    }
+    async fn list_all_edges(&self) -> crate::store::Result<Vec<crate::code_indexer::SymbolEdge>> {
+        Self::unavailable()
+    }
+    async fn link_symbol_to_memory(
+        &self,
+        _symbol_id: &str,
+        _memory_id: &MemoryId,
+        _turn_index: Option<i32>,
+        _reference_type: &str,
+        _timestamp: i64,
+    ) -> crate::store::Result<()> {
+        Self::unavailable()
+    }
+    async fn find_memories_by_symbol(
+        &self,
+        _symbol_name: &str,
+    ) -> crate::store::Result<Vec<MemoryId>> {
+        Self::unavailable()
+    }
+    async fn list_symbol_memory_references(
+        &self,
+    ) -> crate::store::Result<Vec<crate::store::SymbolMemoryReference>> {
+        Self::unavailable()
+    }
+    async fn kv_put(&self, _key: &str, _value: &str) -> crate::store::Result<()> {
+        Self::unavailable()
+    }
+    async fn kv_get(&self, _key: &str) -> crate::store::Result<Option<String>> {
+        Self::unavailable()
+    }
+    async fn list_key_values(&self) -> crate::store::Result<Vec<crate::store::MemoryKeyValue>> {
+        Self::unavailable()
     }
 }
 

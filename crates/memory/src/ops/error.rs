@@ -20,6 +20,9 @@ pub enum MemoryError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("capability `{capability}` is unavailable: {details}")]
+    CapabilityUnavailable { capability: String, details: String },
+
     #[error("context window exceeded: used {used} / {total} tokens")]
     ContextExceeded { used: u64, total: u64 },
 

@@ -18,7 +18,6 @@ use chrono::{DateTime, Utc};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -29,12 +28,19 @@ use crate::{
     entity::{Entity, Triple},
     error::MemoryError,
     project_scope::MemoryScope,
-    store::{FtsSearchOptions, FtsSearchResult, MemoryStore, Result, VerbatimEntry},
+    store::{
+        FtsSearchOptions, FtsSearchResult, MemoryKeyValue, MemoryStore, MemoryStoreCapabilities,
+        Result, SymbolMemoryReference, VerbatimEntry,
+    },
     types::{
         AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemoryMeta,
         MemorySource, Priority, Relation,
     },
 };
+
+// Kept as a compatibility re-export for callers that used the old adapter
+// path. The DTO itself belongs to the backend-neutral MemoryStore port.
+pub use crate::store::LegacyScopeMigrationReport;
 
 // ---------------------------------------------------------------------------
 // Sentinel path for in-memory databases
@@ -302,17 +308,6 @@ fn parse_persisted_scope(raw_scope: Option<&str>, memory_id: &str) -> MemoryScop
     raw_scope
         .and_then(|scope| scope.parse::<MemoryScope>().ok())
         .unwrap_or_else(|| MemoryScope::LegacyUnresolvedAgent(format!("unclassified:{memory_id}")))
-}
-
-/// A durable record of an old scope that Runtime intentionally keeps outside
-/// every cognitive lease until an operator explicitly classifies it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LegacyScopeMigrationReport {
-    pub memory_id: String,
-    pub raw_scope: Option<String>,
-    pub held_scope: String,
-    pub reason: String,
-    pub migrated_at: String,
 }
 
 fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryMeta> {
@@ -2329,6 +2324,15 @@ impl SqliteStore {
 
 #[async_trait]
 impl MemoryStore for SqliteStore {
+    fn capabilities(&self) -> MemoryStoreCapabilities {
+        MemoryStoreCapabilities {
+            backend: "sqlite",
+            full_text_search: true,
+            lexical_fallback: true,
+            vector_search: false,
+            code_index: true,
+        }
+    }
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId> {
         let store = self.clone();
         let entry = entry.clone();
@@ -2464,10 +2468,13 @@ impl MemoryStore for SqliteStore {
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 
-    /// Vector search is not supported by this backend; always returns an empty
-    /// list.  Use a dedicated `VectorIndex` backend for ANN queries.
+    /// SQLite keeps durable embedding payloads but has no configured ANN
+    /// accelerator. Report that explicitly rather than pretending no matches.
     async fn search_vector(&self, _embedding: &[f32], _limit: usize) -> Result<Vec<MemoryEntry>> {
-        Ok(Vec::new())
+        Err(MemoryError::CapabilityUnavailable {
+            capability: "vector_search".to_string(),
+            details: "SQLite durable store has no configured ANN index".to_string(),
+        })
     }
 
     async fn search_by_layer(&self, layer: MemoryLayer) -> Result<Vec<MemoryEntry>> {
@@ -2693,6 +2700,34 @@ impl MemoryStore for SqliteStore {
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 
+    async fn list_verbatim_entries(&self) -> Result<Vec<VerbatimEntry>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut statement = conn
+                .prepare(
+                    "SELECT id, content, source, layer, timestamp \
+                     FROM verbatim_entries ORDER BY timestamp, id",
+                )
+                .map_err(sql_err)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(VerbatimEntry {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                        source: row.get(2)?,
+                        layer: row.get(3)?,
+                        timestamp: row.get(4)?,
+                    })
+                })
+                .map_err(sql_err)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sql_err)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
     // -------------------------------------------------------------------
     // Code symbol persistence (async MemoryStore trait)
     // -------------------------------------------------------------------
@@ -2810,6 +2845,43 @@ impl MemoryStore for SqliteStore {
         .map_err(|e| MemoryError::Store(e.to_string()))?
     }
 
+    async fn list_symbol_memory_references(&self) -> Result<Vec<SymbolMemoryReference>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut statement = conn
+                .prepare(
+                    "SELECT symbol_id, memory_id, turn_index, reference_type, timestamp \
+                     FROM symbol_references \
+                     ORDER BY timestamp, symbol_id, memory_id, reference_type",
+                )
+                .map_err(sql_err)?;
+            let rows = statement
+                .query_map([], |row| {
+                    let memory_id = row.get::<_, String>(1)?;
+                    let parsed = Uuid::parse_str(&memory_id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    Ok(SymbolMemoryReference {
+                        symbol_id: row.get(0)?,
+                        memory_id: parsed,
+                        turn_index: row.get(2)?,
+                        reference_type: row.get(3)?,
+                        timestamp: row.get(4)?,
+                    })
+                })
+                .map_err(sql_err)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sql_err)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
+    }
+
     // -------------------------------------------------------------------
     // Key-value store (generic persistence)
     // -------------------------------------------------------------------
@@ -2848,6 +2920,28 @@ impl MemoryStore for SqliteStore {
         })
         .await
         .map_err(|e| MemoryError::Store(e.to_string()))?
+    }
+
+    async fn list_key_values(&self) -> Result<Vec<MemoryKeyValue>> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.conn()?;
+            let mut statement = conn
+                .prepare("SELECT key, value FROM kv_store ORDER BY key")
+                .map_err(sql_err)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(MemoryKeyValue {
+                        key: row.get(0)?,
+                        value: row.get(1)?,
+                    })
+                })
+                .map_err(sql_err)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sql_err)
+        })
+        .await
+        .map_err(|error| MemoryError::Store(error.to_string()))?
     }
 }
 

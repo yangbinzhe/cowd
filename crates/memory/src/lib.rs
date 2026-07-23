@@ -13,7 +13,8 @@
 //! # Architecture
 //!
 //! The memory system is organised into five layers (L0–L4), backed by a
-//! unified `MemoryStore` trait with a SQLite implementation.  A compression
+//! unified `MemoryStore` trait with SQLite and separately composed backend
+//! adapters. A compression
 //! pipeline with three stages keeps the context window manageable, while a
 //! background extractor automatically captures knowledge from the
 //! conversation stream.
@@ -227,6 +228,7 @@ pub use store::session::{
     SessionSearchResult, SessionSnapshot,
 };
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
+pub use store::{FtsSearchOptions, FtsSearchResult, MemoryStore, MemoryStoreCapabilities};
 pub use temporal_graph::{temporal_relation, TimeRange};
 pub use tiered_store::{
     CompressionAlgo, StorageTier, TieredSessionStore, TieredSessionStoreConfig,

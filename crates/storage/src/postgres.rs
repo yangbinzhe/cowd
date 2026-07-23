@@ -136,8 +136,24 @@ struct PostgresExecutorCounters {
 
 struct PostgresExecutorInner {
     config: PostgresConnectionConfig,
-    pool: Pool<PostgresConnectionManager<NoTls>>,
+    // `postgres::Client::drop` drives its private Tokio runtime. Dropping the
+    // final r2d2 pool handle from an application Tokio worker would therefore
+    // panic with a nested-runtime error. Keep the pool movable so final close
+    // can run on a plain OS thread.
+    pool: Option<Pool<PostgresConnectionManager<NoTls>>>,
     counters: PostgresExecutorCounters,
+}
+
+impl Drop for PostgresExecutorInner {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.take() else {
+            return;
+        };
+        // Pool teardown is rare (process/test shutdown) and must not inherit a
+        // caller's async-runtime context. Joining also guarantees all clients
+        // are closed before the logical executor disappears.
+        let _ = std::thread::spawn(move || drop(pool)).join();
+    }
 }
 
 /// A bounded synchronous PostgreSQL executor.  Pool checkout is the only
@@ -196,7 +212,7 @@ impl PostgresExecutor {
         Ok(Self {
             inner: Arc::new(PostgresExecutorInner {
                 config,
-                pool,
+                pool: Some(pool),
                 counters: PostgresExecutorCounters::default(),
             }),
         })
@@ -206,7 +222,12 @@ impl PostgresExecutor {
         &self,
     ) -> Result<PooledConnection<PostgresConnectionManager<NoTls>>, StorageError> {
         let started = Instant::now();
-        let result = self.inner.pool.get();
+        let result = self
+            .inner
+            .pool
+            .as_ref()
+            .ok_or_else(|| StorageError::Other("postgres pool is closed".to_string()))?
+            .get();
         self.inner
             .counters
             .checkout_count

@@ -16,6 +16,7 @@ members = [
     "crates/matrix/repository",
     "crates/mcp",
     "crates/memory",
+    "crates/memory-postgres",
     "crates/model-protocol",
     "crates/plugins",
     "crates/provider",
@@ -52,6 +53,7 @@ default-members = [
     "crates/matrix/repository",
     "crates/mcp",
     "crates/memory",
+    "crates/memory-postgres",
     "crates/model-protocol",
     "crates/plugins",
     "crates/provider",
@@ -71,7 +73,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.577"
+version = "0.9.578"
 edition = "2021"
 license = "MIT"
 publish = false

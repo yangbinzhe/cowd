@@ -6,6 +6,7 @@
 //!
 //! Supports Rust, Python, TypeScript/TSX, Go, and Java.
 
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "code-index")]
 use std::collections::HashMap;
 #[cfg(feature = "code-index")]
@@ -59,7 +60,7 @@ impl IndexLanguage {
 }
 
 /// Kind of a code symbol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolKind {
     Function,
     Method,
@@ -104,7 +105,7 @@ impl SymbolKind {
 }
 
 /// A code symbol extracted from source code.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeSymbol {
     pub id: String,
     pub name: String,
@@ -116,7 +117,7 @@ pub struct CodeSymbol {
 }
 
 /// Edge type between code symbols.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolEdgeType {
     Calls,
     Imports,
@@ -136,7 +137,7 @@ impl SymbolEdgeType {
 }
 
 /// An edge connecting two code symbols.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolEdge {
     pub source_id: String,
     pub target_id: String,

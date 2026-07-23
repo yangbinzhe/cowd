@@ -1,7 +1,8 @@
 //! `MemoryStore` trait – the unified storage abstraction.
 //!
-//! All concrete backends (`SQLite`, blob FS, vector index) implement this trait
-//! so that higher-level layers can remain backend-agnostic.
+//! All selected durable backends implement this trait so higher-level layers
+//! remain backend-agnostic. Rebuildable blob/vector accelerators are separate
+//! capabilities rather than partial `MemoryStore` implementations.
 
 use async_trait::async_trait;
 
@@ -46,9 +47,56 @@ pub struct FtsSearchResult {
     pub keywords: Vec<(String, i64)>,
 }
 
+/// Runtime-readable capability verdict. A disabled accelerator must never be
+/// represented as an empty successful search result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryStoreCapabilities {
+    pub backend: &'static str,
+    pub full_text_search: bool,
+    pub lexical_fallback: bool,
+    pub vector_search: bool,
+    pub code_index: bool,
+}
+
+/// A durable report for a historical scope that was deliberately kept out of
+/// normal recall until an operator classifies it.  This is a port DTO rather
+/// than a SQLite implementation detail because it must survive a backend
+/// cutover unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LegacyScopeMigrationReport {
+    pub memory_id: String,
+    pub raw_scope: Option<String>,
+    pub held_scope: String,
+    pub reason: String,
+    pub migrated_at: String,
+}
+
+/// A durable code-to-memory recall association.  Listing these records is
+/// required for a verifiable, quiesced backend migration; `find_*` alone is
+/// insufficient because it loses turn, reference type, and ordering truth.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolMemoryReference {
+    pub symbol_id: String,
+    pub memory_id: MemoryId,
+    pub turn_index: Option<i32>,
+    pub reference_type: Option<String>,
+    pub timestamp: i64,
+}
+
+/// A durable auxiliary key/value record.  This is intentionally enumerable
+/// only through the storage port so a migration cannot silently drop Closet,
+/// Seed, or other auxiliary state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryKeyValue {
+    pub key: String,
+    pub value: String,
+}
+
 /// The primary storage trait that all backends must implement.
 #[async_trait]
 pub trait MemoryStore: Send + Sync {
+    /// Return the selected store's durable/rebuildable capability verdict.
+    fn capabilities(&self) -> MemoryStoreCapabilities;
     /// Persist a new memory entry and return its assigned ID.
     async fn insert(&self, entry: &MemoryEntry) -> Result<MemoryId>;
 
@@ -71,10 +119,7 @@ pub trait MemoryStore: Send + Sync {
         query: &str,
         scope: &MemoryScope,
         limit: usize,
-    ) -> Result<Vec<MemoryEntry>> {
-        let _ = scope;
-        self.search_fts(query, limit).await
-    }
+    ) -> Result<Vec<MemoryEntry>>;
 
     /// Advanced FTS search with filtering and snippets.
     async fn search_fts_advanced(
@@ -103,14 +148,9 @@ pub trait MemoryStore: Send + Sync {
     async fn list_all(&self) -> Result<Vec<MemoryEntry>>;
 
     /// Return historical scope records that were deliberately held during a
-    /// contract migration. Backends without durable scope migration support
-    /// expose an empty report rather than pretending those records are
-    /// recallable.
-    async fn legacy_scope_migration_reports(
-        &self,
-    ) -> Result<Vec<sqlite::LegacyScopeMigrationReport>> {
-        Ok(Vec::new())
-    }
+    /// contract migration. Selected durable backends must implement this
+    /// explicitly so cutover cannot silently omit held records.
+    async fn legacy_scope_migration_reports(&self) -> Result<Vec<LegacyScopeMigrationReport>>;
 
     // -----------------------------------------------------------------------
     // Knowledge-graph persistence
@@ -150,58 +190,34 @@ pub trait MemoryStore: Send + Sync {
     /// The caller should include `%` wildcards (e.g. `"%keyword%"`).
     async fn search_verbatim_by_content(&self, query: &str) -> Result<Vec<VerbatimEntry>>;
 
+    /// Enumerate every durable verbatim entry for a quiesced migration. This
+    /// is intentionally separate from request-path content search.
+    async fn list_verbatim_entries(&self) -> Result<Vec<VerbatimEntry>>;
+
     // -----------------------------------------------------------------------
     // Code symbol persistence (Phase 1: code indexer storage)
     // -----------------------------------------------------------------------
 
     /// Persist a code symbol extracted from source code.
-    async fn insert_symbol(&self, _sym: &CodeSymbol) -> Result<()> {
-        Err(MemoryError::Store(
-            "code symbol storage not supported by this backend".into(),
-        ))
-    }
+    async fn insert_symbol(&self, sym: &CodeSymbol) -> Result<()>;
 
     /// Full-text search across indexed code symbols.
-    async fn search_symbols(&self, _query: &str, _limit: usize) -> Result<Vec<CodeSymbol>> {
-        Err(MemoryError::Store(
-            "code symbol search not supported by this backend".into(),
-        ))
-    }
+    async fn search_symbols(&self, query: &str, limit: usize) -> Result<Vec<CodeSymbol>>;
 
     /// Persist a code edge (call/import/extends/implements) between two symbols.
-    async fn insert_edge(&self, _edge: &SymbolEdge) -> Result<()> {
-        Err(MemoryError::Store(
-            "code edge storage not supported by this backend".into(),
-        ))
-    }
+    async fn insert_edge(&self, edge: &SymbolEdge) -> Result<()>;
 
     /// Find all symbols that call the given symbol (callers / upstream).
-    async fn get_callers(&self, _symbol_id: &str) -> Result<Vec<CodeSymbol>> {
-        Err(MemoryError::Store(
-            "code symbol callers not supported by this backend".into(),
-        ))
-    }
+    async fn get_callers(&self, symbol_id: &str) -> Result<Vec<CodeSymbol>>;
 
     /// Find all symbols called by the given symbol (callees / downstream).
-    async fn get_callees(&self, _symbol_id: &str) -> Result<Vec<CodeSymbol>> {
-        Err(MemoryError::Store(
-            "code symbol callees not supported by this backend".into(),
-        ))
-    }
+    async fn get_callees(&self, symbol_id: &str) -> Result<Vec<CodeSymbol>>;
 
     /// List all code symbols in the index (no filtering).
-    async fn list_all_symbols(&self) -> Result<Vec<CodeSymbol>> {
-        Err(MemoryError::Store(
-            "code symbol listing not supported by this backend".into(),
-        ))
-    }
+    async fn list_all_symbols(&self) -> Result<Vec<CodeSymbol>>;
 
     /// List all code edges in the index (no filtering).
-    async fn list_all_edges(&self) -> Result<Vec<SymbolEdge>> {
-        Err(MemoryError::Store(
-            "code edge listing not supported by this backend".into(),
-        ))
-    }
+    async fn list_all_edges(&self) -> Result<Vec<SymbolEdge>>;
 
     // -----------------------------------------------------------------------
     // Symbol ↔ memory linking (Phase 2: L3 deep recall integration)
@@ -219,21 +235,17 @@ pub trait MemoryStore: Send + Sync {
         _turn_index: Option<i32>,
         _reference_type: &str,
         _timestamp: i64,
-    ) -> Result<()> {
-        Err(MemoryError::Store(
-            "symbol↔memory linking not supported by this backend".into(),
-        ))
-    }
+    ) -> Result<()>;
 
     /// Find all memory entries that reference a given code symbol.
     ///
     /// Searches the `symbol_references` table for all memory IDs
     /// linked to `symbol_name` (matched case-insensitively).
-    async fn find_memories_by_symbol(&self, _symbol_name: &str) -> Result<Vec<MemoryId>> {
-        Err(MemoryError::Store(
-            "symbol↔memory lookup not supported by this backend".into(),
-        ))
-    }
+    async fn find_memories_by_symbol(&self, symbol_name: &str) -> Result<Vec<MemoryId>>;
+
+    /// Enumerate every durable symbol-to-memory association for a quiesced
+    /// migration. This is not a normal recall API.
+    async fn list_symbol_memory_references(&self) -> Result<Vec<SymbolMemoryReference>>;
 
     // -----------------------------------------------------------------------
     // Key-value store (for Closet, Seeds, and auxiliary persistence)
@@ -241,16 +253,12 @@ pub trait MemoryStore: Send + Sync {
 
     /// Store a key-value pair. Replaces existing value if key exists.
     /// Used by Closet index, Seed registry, and other auxiliary data.
-    async fn kv_put(&self, _key: &str, _value: &str) -> Result<()> {
-        Err(MemoryError::Store(
-            "kv store not supported by this backend".into(),
-        ))
-    }
+    async fn kv_put(&self, key: &str, value: &str) -> Result<()>;
 
     /// Retrieve a value by key. Returns None if key does not exist.
-    async fn kv_get(&self, _key: &str) -> Result<Option<String>> {
-        Err(MemoryError::Store(
-            "kv store not supported by this backend".into(),
-        ))
-    }
+    async fn kv_get(&self, key: &str) -> Result<Option<String>>;
+
+    /// Enumerate all durable auxiliary values for a quiesced migration. This
+    /// is not intended for request-path cache access.
+    async fn list_key_values(&self) -> Result<Vec<MemoryKeyValue>>;
 }
