@@ -69,6 +69,8 @@ mod runtime_host;
 mod runtime_protocol;
 #[path = "runtime/runtime_service.rs"]
 mod runtime_service;
+#[path = "infrastructure/selected_storage.rs"]
+mod selected_storage;
 mod server;
 mod services;
 #[path = "kernel/session_kernel.rs"]
@@ -79,6 +81,8 @@ mod session_lifecycle_kernel;
 mod session_runtime_bridge;
 #[path = "static/skill_static.rs"]
 mod skill_static;
+#[path = "infrastructure/storage_cutover.rs"]
+mod storage_cutover;
 #[path = "core/suggestions.rs"]
 mod suggestions;
 mod surface_host;
@@ -88,6 +92,17 @@ mod task_kernel;
 mod unified_session_manager;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
+
+/// Operator-only storage cutover entry used by the thin CLI binary.
+pub fn storage_entry(args: &[String]) -> std::process::ExitCode {
+    match storage_cutover::run(args) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("storage command failed: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
 
 /// Feature-gated black-box integration harness. This intentionally exposes
 /// only a fully assembled API router, never Gateway internals or mutation

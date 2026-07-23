@@ -128,6 +128,8 @@ pub struct RuntimeServicesBuilder {
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     session_store: Option<Arc<memory::UnifiedSessionStore>>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
+    reality_recall_port: Option<Arc<RealityRecallPort>>,
+    knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
     skill_catalog: crate::RuntimeSkillCatalog,
     mission_schedule_policy: crate::MissionSchedulePolicy,
@@ -397,6 +399,25 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Install the process-selected Fact/Matrix recall port. Runtime owns its
+    /// use during prompt assembly but never chooses the physical backend.
+    #[must_use]
+    pub fn reality_recall_port(mut self, port: Arc<RealityRecallPort>) -> Self {
+        self.reality_recall_port = Some(port);
+        self
+    }
+
+    /// Install the selected durable Knowledge fabric once at startup. Turn
+    /// construction clones this adapter and never reopens a database.
+    #[must_use]
+    pub fn knowledge_activation(
+        mut self,
+        activation: crate::knowledge_activation::KnowledgeActivationRuntime,
+    ) -> Self {
+        self.knowledge_activation = Some(activation);
+        self
+    }
+
     /// Inject a trusted evaluator at the composition root. Runtime owns the
     /// immutable comparison contract; evaluator implementations belong to
     /// `harness-eval` or another explicitly trusted adapter.
@@ -497,6 +518,8 @@ impl RuntimeServicesBuilder {
             self.provider_registry,
             self.tool_execution_host,
             self.memory_manager,
+            self.reality_recall_port,
+            self.knowledge_activation,
             self.evolution_eval_runner,
             self.skill_catalog,
             self.mission_schedule_policy,
@@ -575,6 +598,7 @@ pub struct RuntimeServices {
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
     skill_catalog: Arc<RwLock<crate::RuntimeSkillCatalog>>,
     reality_recall_port: Arc<RealityRecallPort>,
+    knowledge_activation: crate::knowledge_activation::KnowledgeActivationRuntime,
     session_dispatch_executor: Arc<crate::session_execution::SessionDispatchNodeExecutor>,
     session_input_router: OnceLock<Arc<SessionInputRouter>>,
 }
@@ -595,6 +619,8 @@ impl RuntimeServices {
             tool_execution_host: None,
             session_store: None,
             memory_manager: None,
+            reality_recall_port: None,
+            knowledge_activation: None,
             evolution_eval_runner: None,
             skill_catalog: crate::RuntimeSkillCatalog::default(),
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
@@ -633,6 +659,8 @@ impl RuntimeServices {
             None,
             None,
             None,
+            None,
+            None,
             crate::RuntimeSkillCatalog::default(),
             crate::MissionSchedulePolicy::default(),
             definition_registry,
@@ -666,6 +694,8 @@ impl RuntimeServices {
         provider_registry: Arc<crate::ProviderRegistry>,
         tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
         memory_manager: Option<Arc<memory::CognitiveContextManager>>,
+        reality_recall_port: Option<Arc<RealityRecallPort>>,
+        knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
         evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
         skill_catalog: crate::RuntimeSkillCatalog,
         mission_schedule_policy: crate::MissionSchedulePolicy,
@@ -828,7 +858,14 @@ impl RuntimeServices {
             memory_manager,
             evolution_eval_runner,
             skill_catalog: Arc::new(RwLock::new(skill_catalog)),
-            reality_recall_port: Arc::new(RealityRecallPort::for_config_home(cowd_home)),
+            reality_recall_port: reality_recall_port
+                .unwrap_or_else(|| Arc::new(RealityRecallPort::for_config_home(&cowd_home))),
+            knowledge_activation: knowledge_activation.unwrap_or_else(|| {
+                crate::knowledge_activation::KnowledgeActivationRuntime::for_config_home(&cowd_home)
+                    .unwrap_or_else(|_| {
+                        crate::knowledge_activation::KnowledgeActivationRuntime::new()
+                    })
+            }),
             session_dispatch_executor,
             session_input_router: OnceLock::new(),
         })
@@ -896,6 +933,11 @@ impl RuntimeServices {
     #[must_use]
     pub fn reality_recall_port(&self) -> &Arc<RealityRecallPort> {
         &self.reality_recall_port
+    }
+
+    #[must_use]
+    pub fn knowledge_activation(&self) -> crate::knowledge_activation::KnowledgeActivationRuntime {
+        self.knowledge_activation.clone()
     }
 
     /// Runtime-owned, scope-qualified Agent and Team Definition registry.

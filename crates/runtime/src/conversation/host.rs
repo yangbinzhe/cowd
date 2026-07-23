@@ -141,6 +141,7 @@ where
             &config.feature_config,
         )
         .with_model_context_window(model_context_window)
+        .with_knowledge_activation(services.knowledge_activation())
         .with_explicit_team_escalation(root_provider_owner)
         .with_runtime_event_store(Arc::clone(services.event_store()))
         .with_skill_profiles(config.skill_profiles)

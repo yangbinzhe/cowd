@@ -23,6 +23,10 @@ fn main() -> std::process::ExitCode {
         return auth_profile_entry(&args[1..]);
     }
 
+    if matches!(first_arg, Some("storage")) {
+        return gateway::storage_entry(&args[1..]);
+    }
+
     if should_open_tui(&args) || matches!(first_arg, Some("tui")) {
         return open_tui();
     }

@@ -40,6 +40,11 @@ impl TaskKernel {
         Self { inner }
     }
 
+    #[must_use]
+    pub(crate) fn runtime_kernel(&self) -> runtime::task::TaskKernel {
+        self.inner.clone()
+    }
+
     pub(crate) fn list(&self) -> Result<Vec<TaskRecord>, String> {
         self.inner.list()
     }

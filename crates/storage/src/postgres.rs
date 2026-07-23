@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use postgres::{Client, Config, NoTls};
+use postgres::{
+    types::ToSql, Config, Error as PostgresError, NoTls, Row, Statement, ToStatement, Transaction,
+};
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -162,6 +164,255 @@ impl Drop for PostgresExecutorInner {
 #[derive(Clone)]
 pub struct PostgresExecutor {
     inner: Arc<PostgresExecutorInner>,
+    search_path: Option<Arc<str>>,
+}
+
+/// A checked-out connection whose synchronous driver calls are safe from both
+/// ordinary threads and Tokio workers. The `postgres` crate owns a private
+/// Tokio runtime per connection; every driver operation therefore has to run
+/// inside `block_in_place` when Cowd calls a synchronous storage port from an
+/// async Gateway task.
+pub struct PostgresConnection {
+    inner: Option<PooledConnection<PostgresConnectionManager<NoTls>>>,
+}
+
+/// Transaction counterpart to [`PostgresConnection`]. Keeping this wrapper in
+/// the storage foundation prevents every domain adapter from inventing its own
+/// async/sync bridge.
+pub struct PostgresTransaction<'a> {
+    inner: Option<Transaction<'a>>,
+}
+
+/// Minimal backend-neutral SQL client surface used by domain helpers that work
+/// with either a checked-out connection or a transaction.
+pub trait PostgresClient {
+    fn execute<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<u64, PostgresError>
+    where
+        T: ?Sized + ToStatement + Sync;
+
+    fn query<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<Row>, PostgresError>
+    where
+        T: ?Sized + ToStatement + Sync;
+
+    fn query_one<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Row, PostgresError>
+    where
+        T: ?Sized + ToStatement + Sync;
+
+    fn query_opt<T>(
+        &mut self,
+        query: &T,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<Row>, PostgresError>
+    where
+        T: ?Sized + ToStatement + Sync;
+
+    fn prepare(&mut self, query: &str) -> Result<Statement, PostgresError>;
+
+    fn batch_execute(&mut self, query: &str) -> Result<(), PostgresError>;
+}
+
+fn in_postgres_driver_context<F, T>(operation: F) -> T
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return operation();
+    };
+    match handle.runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(operation),
+        tokio::runtime::RuntimeFlavor::CurrentThread => {
+            std::thread::scope(|scope| match scope.spawn(operation).join() {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            })
+        }
+        _ => operation(),
+    }
+}
+
+macro_rules! impl_postgres_client {
+    ($type:ty) => {
+        impl PostgresClient for $type {
+            fn execute<Q>(
+                &mut self,
+                query: &Q,
+                params: &[&(dyn ToSql + Sync)],
+            ) -> Result<u64, PostgresError>
+            where
+                Q: ?Sized + ToStatement + Sync,
+            {
+                in_postgres_driver_context(|| self.driver_mut().execute(query, params))
+            }
+
+            fn query<Q>(
+                &mut self,
+                query: &Q,
+                params: &[&(dyn ToSql + Sync)],
+            ) -> Result<Vec<Row>, PostgresError>
+            where
+                Q: ?Sized + ToStatement + Sync,
+            {
+                in_postgres_driver_context(|| self.driver_mut().query(query, params))
+            }
+
+            fn query_one<Q>(
+                &mut self,
+                query: &Q,
+                params: &[&(dyn ToSql + Sync)],
+            ) -> Result<Row, PostgresError>
+            where
+                Q: ?Sized + ToStatement + Sync,
+            {
+                in_postgres_driver_context(|| self.driver_mut().query_one(query, params))
+            }
+
+            fn query_opt<Q>(
+                &mut self,
+                query: &Q,
+                params: &[&(dyn ToSql + Sync)],
+            ) -> Result<Option<Row>, PostgresError>
+            where
+                Q: ?Sized + ToStatement + Sync,
+            {
+                in_postgres_driver_context(|| self.driver_mut().query_opt(query, params))
+            }
+
+            fn prepare(&mut self, query: &str) -> Result<Statement, PostgresError> {
+                in_postgres_driver_context(|| self.driver_mut().prepare(query))
+            }
+
+            fn batch_execute(&mut self, query: &str) -> Result<(), PostgresError> {
+                in_postgres_driver_context(|| self.driver_mut().batch_execute(query))
+            }
+        }
+
+        impl $type {
+            pub fn execute<Q>(
+                &mut self,
+                query: &Q,
+                params: &[&(dyn ToSql + Sync)],
+            ) -> Result<u64, PostgresError>
+            where
+                Q: ?Sized + ToStatement + Sync,
+            {
+                PostgresClient::execute(self, query, params)
+            }
+
+            pub fn query<Q>(
+                &mut self,
+                query: &Q,
+                params: &[&(dyn ToSql + Sync)],
+            ) -> Result<Vec<Row>, PostgresError>
+            where
+                Q: ?Sized + ToStatement + Sync,
+            {
+                PostgresClient::query(self, query, params)
+            }
+
+            pub fn query_one<Q>(
+                &mut self,
+                query: &Q,
+                params: &[&(dyn ToSql + Sync)],
+            ) -> Result<Row, PostgresError>
+            where
+                Q: ?Sized + ToStatement + Sync,
+            {
+                PostgresClient::query_one(self, query, params)
+            }
+
+            pub fn query_opt<Q>(
+                &mut self,
+                query: &Q,
+                params: &[&(dyn ToSql + Sync)],
+            ) -> Result<Option<Row>, PostgresError>
+            where
+                Q: ?Sized + ToStatement + Sync,
+            {
+                PostgresClient::query_opt(self, query, params)
+            }
+
+            pub fn prepare(&mut self, query: &str) -> Result<Statement, PostgresError> {
+                PostgresClient::prepare(self, query)
+            }
+
+            pub fn batch_execute(&mut self, query: &str) -> Result<(), PostgresError> {
+                PostgresClient::batch_execute(self, query)
+            }
+        }
+    };
+}
+
+impl PostgresConnection {
+    fn driver_mut(&mut self) -> &mut postgres::Client {
+        self.inner
+            .as_deref_mut()
+            .expect("PostgresConnection driver is available until drop")
+    }
+
+    pub fn transaction(&mut self) -> Result<PostgresTransaction<'_>, PostgresError> {
+        in_postgres_driver_context(|| self.driver_mut().transaction()).map(|transaction| {
+            PostgresTransaction {
+                inner: Some(transaction),
+            }
+        })
+    }
+}
+
+impl_postgres_client!(PostgresConnection);
+
+impl Drop for PostgresConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.inner.take() {
+            in_postgres_driver_context(|| drop(connection));
+        }
+    }
+}
+
+impl<'a> PostgresTransaction<'a> {
+    fn driver_mut(&mut self) -> &mut Transaction<'a> {
+        self.inner
+            .as_mut()
+            .expect("PostgresTransaction driver is available until commit or drop")
+    }
+
+    pub fn commit(mut self) -> Result<(), PostgresError> {
+        let transaction = self
+            .inner
+            .take()
+            .expect("PostgresTransaction can only be committed once");
+        in_postgres_driver_context(|| transaction.commit())
+    }
+
+    pub fn rollback(mut self) -> Result<(), PostgresError> {
+        let transaction = self
+            .inner
+            .take()
+            .expect("PostgresTransaction can only be rolled back once");
+        in_postgres_driver_context(|| transaction.rollback())
+    }
+}
+
+impl_postgres_client!(PostgresTransaction<'_>);
+
+impl Drop for PostgresTransaction<'_> {
+    fn drop(&mut self) {
+        if let Some(transaction) = self.inner.take() {
+            in_postgres_driver_context(|| drop(transaction));
+        }
+    }
 }
 
 impl fmt::Debug for PostgresExecutor {
@@ -170,6 +421,10 @@ impl fmt::Debug for PostgresExecutor {
             .debug_struct("PostgresExecutor")
             .field("logical_identity", &self.inner.config.logical_identity)
             .field("application_name", &self.inner.config.application_name)
+            .field(
+                "search_path",
+                &self.search_path.as_deref().unwrap_or("public"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -215,9 +470,37 @@ impl PostgresExecutor {
                 pool: Some(pool),
                 counters: PostgresExecutorCounters::default(),
             }),
+            search_path: None,
         })
     }
 
+    /// Return a capability-scoped view over the same bounded pool. Every
+    /// checkout explicitly establishes this schema; unscoped checkouts reset
+    /// to `public`, so pooled connections cannot leak APP search paths.
+    pub fn scoped_namespace(&self, namespace: &str) -> Result<Self, StorageError> {
+        if namespace.is_empty()
+            || namespace.len() > 63
+            || !namespace
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            || !namespace
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_lowercase)
+        {
+            return Err(StorageError::Other(format!(
+                "invalid PostgreSQL namespace `{namespace}`"
+            )));
+        }
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+            search_path: Some(Arc::from(namespace)),
+        })
+    }
+
+    /// Compatibility checkout for external APPs compiled against the V581
+    /// contract checkpoint. Production domain adapters use
+    /// [`Self::checkout_runtime`] so every query is async-runtime safe.
     pub fn checkout(
         &self,
     ) -> Result<PooledConnection<PostgresConnectionManager<NoTls>>, StorageError> {
@@ -236,7 +519,7 @@ impl PostgresExecutor {
             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        result.map_err(|error| {
+        let mut connection = result.map_err(|error| {
             self.inner
                 .counters
                 .checkout_timeout_count
@@ -245,6 +528,22 @@ impl PostgresExecutor {
                 "postgres pool checkout failed for `{}`: {error}",
                 self.inner.config.logical_identity
             ))
+        })?;
+        let search_path = self.search_path.as_deref().unwrap_or("public");
+        connection
+            .batch_execute(&format!("SET search_path TO \"{search_path}\", public"))
+            .map_err(|error| {
+                StorageError::Other(format!(
+                    "postgres search_path initialization failed for `{}`: {error}",
+                    self.inner.config.logical_identity
+                ))
+            })?;
+        Ok(connection)
+    }
+
+    pub fn checkout_runtime(&self) -> Result<PostgresConnection, StorageError> {
+        self.checkout().map(|connection| PostgresConnection {
+            inner: Some(connection),
         })
     }
 
@@ -283,7 +582,7 @@ impl PostgresExecutor {
                 "postgres migration domain must not be empty".to_string(),
             ));
         }
-        let mut connection = self.checkout()?;
+        let mut connection = self.checkout_runtime()?;
         ensure_migration_ledger(&mut connection)?;
         let mut reports = Vec::with_capacity(specs.len());
         for spec in specs {
@@ -337,7 +636,7 @@ pub struct PostgresMigrationReport {
     pub description: String,
 }
 
-fn ensure_migration_ledger(connection: &mut Client) -> Result<(), StorageError> {
+fn ensure_migration_ledger(connection: &mut PostgresConnection) -> Result<(), StorageError> {
     // Independent durable domains may initialize concurrently during process
     // composition. PostgreSQL can race on catalog insertion even for
     // `CREATE TABLE IF NOT EXISTS`, so serialize only this tiny ledger setup;
@@ -362,7 +661,7 @@ fn ensure_migration_ledger(connection: &mut Client) -> Result<(), StorageError> 
 }
 
 fn apply_migration(
-    connection: &mut Client,
+    connection: &mut PostgresConnection,
     spec: &PostgresMigrationSpec,
 ) -> Result<PostgresMigrationReport, StorageError> {
     let checksum = spec.checksum();

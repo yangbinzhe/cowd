@@ -63,7 +63,7 @@ pub(crate) use mission_service::{
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
-pub(crate) use registry::{broker_backed_app_registry, enabled_app_descriptors};
+pub(crate) use registry::{broker_backed_app_registry_with_storage, enabled_app_descriptors};
 pub(crate) use runtime_event_service::RuntimeEventService;
 pub(crate) use session_service::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,
@@ -111,6 +111,7 @@ pub(crate) struct ConnectorService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     resource_directory_factory: Arc<dyn connector::ResourceDirectoryFactory>,
+    resource_directory_handle: Option<storage::StorageHandle>,
 }
 
 impl ConnectorService {
@@ -119,17 +120,19 @@ impl ConnectorService {
             label: "connector",
             owner: "0.9.315 Connector service boundary",
             resource_directory_factory: Arc::new(connector::SqliteResourceDirectoryFactory),
+            resource_directory_handle: None,
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn with_resource_directory_factory(
         factory: Arc<dyn connector::ResourceDirectoryFactory>,
+        handle: storage::StorageHandle,
     ) -> Self {
         Self {
             label: "connector",
             owner: "0.9.567 Connector durable port",
             resource_directory_factory: factory,
+            resource_directory_handle: Some(handle),
         }
     }
 
@@ -429,13 +432,17 @@ impl GrowthService {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_ledger_for_tests(ledger: Arc<dyn fact_kernel::FactLedger>) -> Self {
+    pub(crate) fn with_ledger(ledger: Arc<dyn fact_kernel::FactLedger>) -> Self {
         Self {
             label: "growth",
             owner: "0.9.573 Growth service boundary",
             ledger,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_ledger_for_tests(ledger: Arc<dyn fact_kernel::FactLedger>) -> Self {
+        Self::with_ledger(ledger)
     }
 
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
@@ -560,6 +567,9 @@ impl AgentService {
 
 #[derive(Clone)]
 pub(crate) struct GatewayServices {
+    /// Immutable process-wide durable backend composition retained for health
+    /// and APP provisioning. Business services consume only its typed ports.
+    pub(crate) selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
     /// Product-composed APP catalogue. The core host only consumes its generic
     /// descriptors and routers; it never imports an APP implementation.
     pub(crate) app_registry: Arc<cowd_app_host::AppRegistry>,

@@ -665,44 +665,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
 
-    // 1. Initialise shared state
-    let sessions = Arc::new(ActiveSessions::default());
-    let unified_store = crate::get_unified_store().ok().map(Arc::new);
-
-    let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
-        Some(mem_cfg) => {
-            tracing::info!("initialising memory manager...");
-            match CognitiveContextManager::new_with_workspace_and_session_store(
-                mem_cfg.clone(),
-                None,
-                unified_store.clone(),
-            )
-            .await
-            {
-                Ok(manager) => Some(Arc::new(manager)),
-                Err(err) => {
-                    tracing::error!(error = %err, "memory manager initialisation failed");
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-
-    let event_bus = SessionEventBus::new();
-    let lease_registry = Arc::new(SessionLeaseRegistry::default());
-    let lifecycle_kernel = Arc::new(
-        unified_store
-            .as_ref()
-            .map_or_else(SessionLifecycleKernel::new, |store| {
-                SessionLifecycleKernel::with_store(Arc::clone(store))
-            }),
-    );
-    let session_kernel = Arc::new(SessionKernel::new(
-        sessions.clone(),
-        unified_store.clone(),
-        event_bus.clone(),
-    ));
+    // 1. Resolve configuration and compose every durable owner exactly once.
     let approval_dir = std::env::var_os("COWD_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -712,18 +675,59 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let config_load =
-        runtime::ConfigLoader::new(&workspace_root, &approval_dir).load_with_diagnostics();
-    let (runtime_config, config_diagnostics) = config_load.map_or_else(
-        |error| {
-            tracing::warn!(%error, "failed to load runtime config for MCP service");
-            (RuntimeConfig::empty(), Vec::new())
-        },
-        |loaded| (loaded.config, loaded.diagnostics),
-    );
+    let loaded = runtime::ConfigLoader::new(&workspace_root, &approval_dir)
+        .load_with_diagnostics()
+        .map_err(|error| format!("failed to load runtime configuration: {error}"))?;
+    let runtime_config = loaded.config;
+    let config_diagnostics = loaded.diagnostics;
     for diagnostic in &config_diagnostics {
         tracing::warn!(code = %diagnostic.code, message = %diagnostic.message, "runtime config diagnostic");
     }
+    let selected_storage = Arc::new(
+        crate::selected_storage::SelectedStorageTopology::compose_for_runtime(
+            runtime_config.storage(),
+            runtime_config.apps(),
+            &approval_dir,
+            &workspace_root,
+        )
+        .map_err(|error| format!("failed to compose selected storage topology: {error}"))?,
+    );
+    tracing::info!(
+        backend = selected_storage.backend_label(),
+        health = %selected_storage.health_projection(),
+        "selected storage topology is ready"
+    );
+    let sessions = Arc::new(ActiveSessions::default());
+    let unified_store = Some(Arc::clone(&selected_storage.session_store));
+    let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
+        Some(mem_cfg) => {
+            tracing::info!("initialising memory manager over selected storage...");
+            let sqlite_auxiliaries =
+                selected_storage.backend == runtime::StorageBackendSelection::Sqlite;
+            Some(Arc::new(
+                CognitiveContextManager::new_with_selected_store_and_auxiliaries(
+                    mem_cfg.clone(),
+                    Some(workspace_root.clone()),
+                    unified_store.clone(),
+                    Arc::clone(&selected_storage.memory_store),
+                    sqlite_auxiliaries,
+                )
+                .await
+                .map_err(|error| format!("memory manager initialization failed: {error}"))?,
+            ))
+        }
+        None => None,
+    };
+    let event_bus = SessionEventBus::new();
+    let lease_registry = Arc::new(SessionLeaseRegistry::default());
+    let lifecycle_kernel = Arc::new(SessionLifecycleKernel::with_store(Arc::clone(
+        &selected_storage.session_store,
+    )));
+    let session_kernel = Arc::new(SessionKernel::new(
+        sessions.clone(),
+        unified_store.clone(),
+        event_bus.clone(),
+    ));
     // Authentication starts before the concrete HTTP host exists.  It uses
     // exactly the same enabled-APP set that will later build AppRegistry, so
     // a disabled APP cannot remain present in the broker's capability
@@ -761,29 +765,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     }
     let runtime_mcp_service =
         Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config).await);
-    let storage_registry = storage::StorageRegistry::default_for_config_home(&approval_dir);
-    storage_registry
-        .ensure_directories()
-        .map_err(|e| format!("failed to initialize storage layout: {e}"))?;
-    let approval_endpoint = storage_registry
-        .endpoint(&storage::StorageDomainId::Approval)
-        .map_err(|error| error.to_string())?;
-    let legacy_history_endpoint = storage_registry
-        .endpoint(&storage::StorageDomainId::ApprovalHistory)
-        .map_err(|error| error.to_string())?;
-    let approval_ledger = approval::SqliteApprovalHistoryLedger::open(approval_endpoint)
-        .map_err(|error| format!("failed to initialize approval decision ledger: {error}"))?;
-    if approval_ledger
-        .export_migration_snapshot()
-        .map_err(|error| format!("failed to inspect approval decision ledger: {error}"))?
-        .entries
-        .is_empty()
-    {
-        approval_ledger
-            .import_legacy_json(legacy_history_endpoint.as_handle().path)
-            .map_err(|error| format!("failed to import legacy approval history: {error}"))?;
-    }
-    let approval_ledger: approval::SharedApprovalHistoryLedger = Arc::new(approval_ledger);
+    let approval_ledger = Arc::clone(&selected_storage.approval_ledger);
     let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
         Arc::new(
             runtime::permission_enforcer::DestructivePatternDetector::new(approval_dir.clone()),
@@ -806,10 +788,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     }
     let profile_id = profile_manager.active_id();
-    let task_kernel = Arc::new(
-        crate::gateway_storage::GatewayStorage::open_task_kernel(&approval_dir)
-            .map_err(|e| format!("failed to initialize task kernel: {e}"))?,
-    );
+    let task_kernel = Arc::clone(&selected_storage.task_kernel);
 
     // Spawn background session cleanup (idle/expired session reaper)
     let lifecycle_config = SessionLifecycleConfig {
@@ -832,10 +811,13 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     );
     emit_startup_diagnostics(&startup_diagnostics);
 
-    let surface_host = Arc::new(crate::surface_host::SurfaceHost::default_for_with_configs(
-        &approval_dir,
-        config.surface_runtime_configs.clone(),
-    ));
+    let surface_host = Arc::new(
+        crate::surface_host::SurfaceHost::with_configs_and_message_store(
+            crate::surface_host::default_surface_roots(&approval_dir),
+            config.surface_runtime_configs.clone(),
+            Arc::clone(&selected_storage.surface_messages),
+        ),
+    );
     if let Some(webui_dir) = static_webui.configured_path.as_deref() {
         if static_webui.available {
             surface_host.register_webui_static_resource(webui_dir);
@@ -890,6 +872,19 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
             .provider_registry(Arc::clone(&provider_registry))
             .tool_execution_host(runtime_tool_host)
+            .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
+            .reality_recall_port(Arc::new(
+                runtime::RealityRecallPort::with_fact_and_matrix_store(
+                    &approval_dir,
+                    Arc::clone(&selected_storage.fact_ledger),
+                    Arc::clone(&selected_storage.matrix_store),
+                ),
+            ))
+            .knowledge_activation(
+                runtime::knowledge_activation::KnowledgeActivationRuntime::with_fabric(
+                    selected_storage.knowledge_fabric.clone(),
+                ),
+            )
             .evolution_eval_runner(evolution_eval_runner)
             .mission_schedule_policy(
                 runtime_config
@@ -984,12 +979,15 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Arc::clone(&session_manager),
         &approval_dir,
         capacity_config,
-    );
-    let app_registry = crate::services::broker_backed_app_registry(
-        &approval_dir,
+    )
+    .with_selected_storage(Arc::clone(&selected_storage));
+    let app_registry = crate::services::broker_backed_app_registry_with_storage(
         services.app_host_context(),
         runtime_config.apps(),
-    );
+        selected_storage.registry.clone(),
+        selected_storage.app_topology.clone(),
+    )
+    .map_err(|error| format!("failed to provision enabled APP storage: {error}"))?;
     let services = Arc::new(services.with_app_registry(app_registry));
     let _cleanup_handle =
         spawn_session_cleanup_task(Arc::clone(&session_manager), Duration::from_secs(300));

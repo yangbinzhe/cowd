@@ -23,6 +23,8 @@ use super::{GatewayMatrixRepositoryError, ServiceEnvelope};
 pub(crate) struct MatrixService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    pub(crate) selected_store: Option<std::sync::Arc<dyn matrix_repository::MatrixStore>>,
+    selected_endpoint: Option<storage::StorageEndpoint>,
 }
 
 impl MatrixService {
@@ -30,6 +32,20 @@ impl MatrixService {
         Self {
             label: "matrix",
             owner: "0.9.297 Matrix core boundary",
+            selected_store: None,
+            selected_endpoint: None,
+        }
+    }
+
+    pub(crate) fn with_store(
+        store: std::sync::Arc<dyn matrix_repository::MatrixStore>,
+        endpoint: storage::StorageEndpoint,
+    ) -> Self {
+        Self {
+            label: "matrix",
+            owner: "0.9.581 selected Matrix storage boundary",
+            selected_store: Some(store),
+            selected_endpoint: Some(endpoint),
         }
     }
 
@@ -47,10 +63,16 @@ impl MatrixService {
         &self,
         config_home: impl AsRef<Path>,
     ) -> Result<serde_json::Value, GatewayMatrixRepositoryError> {
-        let registry = storage::StorageRegistry::default_for_config_home(config_home);
-        let endpoint = registry
-            .endpoint(&storage::StorageDomainId::Matrix)
-            .map_err(|error| GatewayMatrixRepositoryError::Backend(error.to_string()))?;
+        let fallback;
+        let endpoint = if let Some(endpoint) = self.selected_endpoint.as_ref() {
+            endpoint
+        } else {
+            fallback = storage::StorageRegistry::default_for_config_home(config_home)
+                .endpoint(&storage::StorageDomainId::Matrix)
+                .cloned()
+                .map_err(|error| GatewayMatrixRepositoryError::Backend(error.to_string()))?;
+            &fallback
+        };
         Ok(serde_json::json!({
             "logical_id": endpoint.logical_id(),
             "backend": endpoint.backend,

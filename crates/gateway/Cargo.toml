@@ -12,23 +12,27 @@ path = "src/main.rs"
 
 [dependencies]
 harness-contract = { path = "../harness-contract" }
-cowd-product-apps = { path = "../product-apps", default-features = false }
+cowd-product-apps = { path = "../product-apps", default-features = false, features = ["app-postgres"] }
 cowd-app-host = { path = "../app-host" }
 cowd-app-sdk = { path = "../app-sdk" }
 auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }
 fact-kernel = { path = "../fact-kernel" }
 fact-sqlite = { path = "../fact-sqlite" }
+fact-postgres = { path = "../fact-postgres" }
 model-protocol = { path = "../model-protocol" }
-storage = { path = "../storage" }
+storage = { path = "../storage", features = ["storage-postgres"] }
 surface = { path = "../surface" }
+surface-postgres = { path = "../surface-postgres" }
 approval = { path = "../approval" }
 axum = { version = "0.7", features = ["multipart"] }
 base64 = "0.22"
 bytes = "1"
 memory = { path = "../memory" }
+memory-postgres = { path = "../memory-postgres" }
 chrono = { version = "0.4", features = ["serde"] }
 connector = { path = "../connector" }
+connector-postgres = { path = "../connector-postgres" }
 skill = { path = "../skill/service" }
 futures = "0.3"
 http-body-util = "0.1"
@@ -40,6 +44,7 @@ r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 reqwest.workspace = true
 runtime = { path = "../runtime" }
+runtime-postgres = { path = "../runtime-postgres" }
 sandbox-launcher = { path = "../sandbox-launcher" }
 plugins = { path = "../plugins" }
 provider = { path = "../provider" }
@@ -48,6 +53,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 schemars.workspace = true
 session = { path = "../session" }
+session-postgres = { path = "../session-postgres" }
 mcp = { path = "../mcp" }
 matrix-core = { path = "../matrix/core" }
 matrix-repository = { path = "../matrix/repository" }
@@ -107,7 +113,7 @@ required-features = ["test-support"]
 unsafe_code = "allow"
 
 [dev-dependencies]
-app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "335f50b645376385d3a1cbe4d73d9c565c4e0825" }
+app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "835e21da126376230ff748a723bc967aa0b78b9e" }
 auth-broker = { path = "../auth-broker", features = ["test-support"] }
 runtime = { path = "../runtime", features = ["test-fixtures"] }
 serde_json.workspace = true

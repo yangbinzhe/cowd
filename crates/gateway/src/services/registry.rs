@@ -130,6 +130,7 @@ impl GatewayServices {
         ));
         let task = TaskService::new();
         Self {
+            selected_storage: None,
             app_registry: Arc::new(embedded_app_registry(
                 config_home,
                 app_host_binding.context(),
@@ -172,6 +173,31 @@ impl GatewayServices {
     #[must_use]
     pub(crate) fn with_app_registry(mut self, app_registry: cowd_app_host::AppRegistry) -> Self {
         self.app_registry = Arc::new(app_registry);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_selected_storage(
+        mut self,
+        topology: Arc<crate::selected_storage::SelectedStorageTopology>,
+    ) -> Self {
+        self.memory = MemoryService::with_manager_and_knowledge(
+            self.memory.manager(),
+            topology.knowledge_fabric.clone(),
+        );
+        self.growth = GrowthService::with_ledger(Arc::clone(&topology.fact_ledger));
+        let matrix_endpoint = topology
+            .registry
+            .endpoint(&storage::StorageDomainId::Matrix)
+            .expect("selected Matrix endpoint")
+            .clone();
+        self.matrix =
+            MatrixService::with_store(Arc::clone(&topology.matrix_store), matrix_endpoint);
+        self.connector = ConnectorService::with_resource_directory_factory(
+            Arc::clone(&topology.connector_factory),
+            topology.connector_handle.clone(),
+        );
+        self.selected_storage = Some(topology);
         self
     }
 
@@ -460,6 +486,23 @@ pub(crate) fn broker_backed_app_registry(
     registry
 }
 
+pub(crate) fn broker_backed_app_registry_with_storage(
+    host_context: cowd_app_sdk::CowdAppContext,
+    apps: &runtime::AppsConfig,
+    storage_registry: storage::StorageRegistry,
+    topology: cowd_product_apps::AppStorageTopology,
+) -> Result<cowd_app_host::AppRegistry, cowd_product_apps::ProductAppRegistrationError> {
+    let mut registry = cowd_app_host::AppRegistry::default();
+    cowd_product_apps::register_enabled_with_storage(
+        &mut registry,
+        host_context,
+        storage_registry,
+        topology,
+        &|app_id| apps.is_enabled(app_id),
+    )?;
+    Ok(registry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,7 +543,7 @@ mod tests {
             endpoint.domain == storage::StorageDomainId::app("mfg", "primary")
         }));
         let projection = serde_json::to_string(&registered).expect("registry projection");
-        assert!(projection.contains("335f50b645376385d3a1cbe4d73d9c565c4e0825"));
+        assert!(projection.contains("835e21da126376230ff748a723bc967aa0b78b9e"));
         assert!(!projection.contains(".sqlite"));
         assert!(!projection.contains(config_home.to_string_lossy().as_ref()));
         let _ = std::fs::remove_dir_all(config_home);

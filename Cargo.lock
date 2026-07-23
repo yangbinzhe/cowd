@@ -381,8 +381,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-adapter"
-version = "0.9.580"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
+version = "0.9.581"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=835e21da126376230ff748a723bc967aa0b78b9e#835e21da126376230ff748a723bc967aa0b78b9e"
 dependencies = [
  "async-trait",
  "axum",
@@ -407,8 +407,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-bundle"
-version = "0.9.580"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
+version = "0.9.581"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=835e21da126376230ff748a723bc967aa0b78b9e#835e21da126376230ff748a723bc967aa0b78b9e"
 dependencies = [
  "async-trait",
  "cowd-app-host",
@@ -420,8 +420,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-contract"
-version = "0.9.580"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
+version = "0.9.581"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=835e21da126376230ff748a723bc967aa0b78b9e#835e21da126376230ff748a723bc967aa0b78b9e"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -433,8 +433,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-core"
-version = "0.9.580"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
+version = "0.9.581"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=835e21da126376230ff748a723bc967aa0b78b9e#835e21da126376230ff748a723bc967aa0b78b9e"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
@@ -455,8 +455,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-tui"
-version = "0.9.580"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
+version = "0.9.581"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=835e21da126376230ff748a723bc967aa0b78b9e#835e21da126376230ff748a723bc967aa0b78b9e"
 dependencies = [
  "chrono",
  "cowd-app-host",
@@ -985,11 +985,13 @@ dependencies = [
  "bytes",
  "chrono",
  "connector",
+ "connector-postgres",
  "cowd-app-host",
  "cowd-app-mfg-core",
  "cowd-app-sdk",
  "cowd-product-apps",
  "fact-kernel",
+ "fact-postgres",
  "fact-sqlite",
  "futures",
  "harness-contract",
@@ -1002,6 +1004,7 @@ dependencies = [
  "matrix-repository",
  "mcp",
  "memory",
+ "memory-postgres",
  "model-protocol",
  "plugins",
  "provider",
@@ -1009,6 +1012,7 @@ dependencies = [
  "r2d2_sqlite",
  "reqwest",
  "runtime",
+ "runtime-postgres",
  "rusqlite",
  "sandbox-launcher",
  "schemars",
@@ -1017,6 +1021,7 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "session",
+ "session-postgres",
  "sha2 0.10.9",
  "skill",
  "storage",
@@ -3008,6 +3013,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

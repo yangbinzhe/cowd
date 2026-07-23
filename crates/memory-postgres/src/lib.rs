@@ -18,11 +18,12 @@ use memory::{
     },
     MemoryCategory, MemoryEntry, MemoryError, MemoryId, MemoryLayer, MemoryMeta,
 };
-use postgres::{types::ToSql, GenericClient, Row};
+use postgres::{types::ToSql, Row};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use storage::{
-    PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec, SecretRefResolver,
+    PostgresClient, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
+    PostgresTransaction, SecretRefResolver,
 };
 
 const MEMORY_DOMAIN: &str = "memory";
@@ -290,7 +291,10 @@ impl PostgresMemoryStore {
     }
 
     fn entries(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> MemoryResult<Vec<MemoryEntry>> {
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         connection
             .query(sql, params)
             .map_err(postgres_memory_error)?
@@ -300,7 +304,10 @@ impl PostgresMemoryStore {
     }
 
     fn symbols(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> MemoryResult<Vec<CodeSymbol>> {
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         connection
             .query(sql, params)
             .map_err(postgres_memory_error)?
@@ -310,13 +317,19 @@ impl PostgresMemoryStore {
     }
 
     fn upsert_entry(&self, entry: &MemoryEntry) -> MemoryResult<()> {
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
-        write_entry(&mut *connection, entry, true)
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
+        write_entry(&mut connection, entry, true)
     }
 
     fn update_entry(&self, entry: &MemoryEntry) -> MemoryResult<()> {
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
-        write_entry(&mut *connection, entry, false)
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
+        write_entry(&mut connection, entry, false)
     }
 
     fn search_memory(
@@ -358,7 +371,10 @@ impl PostgresMemoryStore {
         }
         let category = category.map(|value| enum_label(&value)).transpose()?;
         let layer = layer.map(|value| enum_label(&value)).transpose()?;
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         let count: i64 = connection
             .query_one(
                 "SELECT count(*) FROM memory_entries
@@ -394,7 +410,10 @@ impl PostgresMemoryStore {
                 )))
             }
         };
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
         transaction
             .execute(delete_sql, &[])
@@ -421,7 +440,10 @@ impl PostgresMemoryStore {
                 )))
             }
         };
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         connection
             .query(sql, &[])
             .map_err(postgres_memory_error)?
@@ -434,7 +456,10 @@ impl PostgresMemoryStore {
     }
 
     fn replace_triples(&self, triples: &[Triple]) -> MemoryResult<()> {
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
         transaction
             .execute("DELETE FROM memory_triples", &[])
@@ -455,7 +480,10 @@ impl PostgresMemoryStore {
     fn upsert_symbol(&self, symbol: &CodeSymbol) -> MemoryResult<()> {
         let line = i64::try_from(symbol.line)
             .map_err(|_| MemoryError::Store("code symbol line overflow".to_string()))?;
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         connection
             .execute(
                 "INSERT INTO memory_code_symbols(id,name,kind,file_path,line,signature,doc,project_scope)
@@ -478,7 +506,10 @@ impl PostgresMemoryStore {
     }
 
     pub fn migration_snapshot(&self) -> MemoryResult<MemoryMigrationSnapshot> {
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         let entries = connection
             .query("SELECT payload FROM memory_entries ORDER BY id", &[])
             .map_err(postgres_memory_error)?
@@ -495,8 +526,8 @@ impl PostgresMemoryStore {
             .iter()
             .map(row_to_legacy_scope_report)
             .collect::<MemoryResult<Vec<_>>>()?;
-        let entities = json_rows_from_client(&mut *connection, "memory_entities")?;
-        let triples = json_rows_from_client(&mut *connection, "memory_triples")?;
+        let entities = json_rows_from_client(&mut connection, "memory_entities")?;
+        let triples = json_rows_from_client(&mut connection, "memory_triples")?;
         let verbatim = connection
             .query(
                 "SELECT id,content,source,layer,timestamp FROM memory_verbatim ORDER BY timestamp,id",
@@ -589,7 +620,10 @@ impl PostgresMemoryStore {
             ));
         }
 
-        let mut connection = self.executor.checkout().map_err(storage_memory_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_memory_error)?;
         let mut transaction = connection.transaction().map_err(postgres_memory_error)?;
         for table in [
             "memory_symbol_references",
@@ -688,7 +722,10 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let id = id.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store
+                .executor
+                .checkout_runtime()
+                .map_err(storage_memory_error)?;
             let row = connection
                 .query_opt("SELECT payload FROM memory_entries WHERE id=$1", &[&id])
                 .map_err(postgres_memory_error)?;
@@ -715,7 +752,10 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let id = id.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store
+                .executor
+                .checkout_runtime()
+                .map_err(storage_memory_error)?;
             connection
                 .execute("DELETE FROM memory_entries WHERE id=$1", &[&id])
                 .map_err(postgres_memory_error)?;
@@ -809,7 +849,10 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let id = id.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store
+                .executor
+                .checkout_runtime()
+                .map_err(storage_memory_error)?;
             connection
                 .query_opt("SELECT payload FROM memory_entries WHERE id=$1", &[&id])
                 .map_err(postgres_memory_error)?
@@ -853,7 +896,7 @@ impl MemoryStore for PostgresMemoryStore {
     ) -> MemoryResult<Vec<LegacyScopeMigrationReport>> {
         let store = self.clone();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.query("SELECT memory_id,raw_scope,held_scope,reason,migrated_at FROM memory_scope_migration_reports ORDER BY memory_id", &[]).map_err(postgres_memory_error)?.iter().map(row_to_legacy_scope_report).collect()
         }).await
     }
@@ -897,7 +940,7 @@ impl MemoryStore for PostgresMemoryStore {
         let source = source.to_string();
         let timestamp = timestamp.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.execute("INSERT INTO memory_verbatim(id,content,source,layer,timestamp) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET content=EXCLUDED.content,source=EXCLUDED.source,layer=EXCLUDED.layer,timestamp=EXCLUDED.timestamp", &[&id,&content,&source,&layer,&timestamp]).map_err(postgres_memory_error)?;
             Ok(())
         }).await
@@ -906,7 +949,10 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let id = id.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store
+                .executor
+                .checkout_runtime()
+                .map_err(storage_memory_error)?;
             connection
                 .query_opt(
                     "SELECT id,content,source,layer,timestamp FROM memory_verbatim WHERE id=$1",
@@ -922,14 +968,14 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let query = query.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.query("SELECT id,content,source,layer,timestamp FROM memory_verbatim WHERE content LIKE $1 ORDER BY timestamp DESC", &[&query]).map_err(postgres_memory_error)?.iter().map(row_to_verbatim).collect()
         }).await
     }
     async fn list_verbatim_entries(&self) -> MemoryResult<Vec<VerbatimEntry>> {
         let store = self.clone();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.query("SELECT id,content,source,layer,timestamp FROM memory_verbatim ORDER BY timestamp,id", &[]).map_err(postgres_memory_error)?.iter().map(row_to_verbatim).collect()
         }).await
     }
@@ -947,7 +993,7 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let edge = edge.clone();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.execute("INSERT INTO memory_code_edges(source_id,target_id,edge_type,file_path) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING", &[&edge.source_id,&edge.target_id,&edge.edge_type.as_str(),&edge.file_path]).map_err(postgres_memory_error)?;
             Ok(())
         }).await
@@ -975,7 +1021,7 @@ impl MemoryStore for PostgresMemoryStore {
     async fn list_all_edges(&self) -> MemoryResult<Vec<SymbolEdge>> {
         let store = self.clone();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.query("SELECT source_id,target_id,edge_type,file_path FROM memory_code_edges ORDER BY source_id,target_id,edge_type,file_path", &[]).map_err(postgres_memory_error)?.iter().map(row_to_edge).collect()
         }).await
     }
@@ -992,7 +1038,7 @@ impl MemoryStore for PostgresMemoryStore {
         let memory_id = memory_id.to_string();
         let reference_type = reference_type.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.execute("INSERT INTO memory_symbol_references(symbol_id,memory_id,turn_index,reference_type,timestamp) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING", &[&symbol_id,&memory_id,&turn_index,&reference_type,&timestamp]).map_err(postgres_memory_error)?;
             Ok(())
         }).await
@@ -1002,14 +1048,14 @@ impl MemoryStore for PostgresMemoryStore {
         let symbol_name = symbol_name.to_string();
         run_memory_blocking(move || {
             let pattern = format!("%{}%", symbol_name.to_ascii_lowercase());
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.query("SELECT memory_id FROM memory_symbol_references WHERE lower(symbol_id) LIKE $1 OR symbol_id=$2 GROUP BY memory_id ORDER BY max(timestamp) DESC,memory_id", &[&pattern,&symbol_name]).map_err(postgres_memory_error)?.iter().map(|row| uuid::Uuid::parse_str(&row.try_get::<_,String>(0).map_err(postgres_memory_error)?).map_err(|error| MemoryError::Store(format!("invalid symbol reference memory id: {error}")))).collect()
         }).await
     }
     async fn list_symbol_memory_references(&self) -> MemoryResult<Vec<SymbolMemoryReference>> {
         let store = self.clone();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.query("SELECT symbol_id,memory_id,turn_index,reference_type,timestamp FROM memory_symbol_references ORDER BY timestamp,symbol_id,memory_id,reference_type", &[]).map_err(postgres_memory_error)?.iter().map(row_to_symbol_reference).collect()
         }).await
     }
@@ -1018,7 +1064,7 @@ impl MemoryStore for PostgresMemoryStore {
         let key = key.to_string();
         let value = value.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store.executor.checkout_runtime().map_err(storage_memory_error)?;
             connection.execute("INSERT INTO memory_kv(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", &[&key,&value]).map_err(postgres_memory_error)?;
             Ok(())
         }).await
@@ -1027,7 +1073,10 @@ impl MemoryStore for PostgresMemoryStore {
         let store = self.clone();
         let key = key.to_string();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store
+                .executor
+                .checkout_runtime()
+                .map_err(storage_memory_error)?;
             connection
                 .query_opt("SELECT value FROM memory_kv WHERE key=$1", &[&key])
                 .map_err(postgres_memory_error)?
@@ -1039,7 +1088,10 @@ impl MemoryStore for PostgresMemoryStore {
     async fn list_key_values(&self) -> MemoryResult<Vec<MemoryKeyValue>> {
         let store = self.clone();
         run_memory_blocking(move || {
-            let mut connection = store.executor.checkout().map_err(storage_memory_error)?;
+            let mut connection = store
+                .executor
+                .checkout_runtime()
+                .map_err(storage_memory_error)?;
             connection
                 .query("SELECT key,value FROM memory_kv ORDER BY key", &[])
                 .map_err(postgres_memory_error)?
@@ -1132,7 +1184,10 @@ impl PostgresKnowledgeStore {
             ));
         }
 
-        let mut connection = self.executor.checkout().map_err(storage_knowledge_error)?;
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(storage_knowledge_error)?;
         let mut transaction = connection.transaction().map_err(postgres_knowledge_error)?;
         for table in [
             "knowledge_usage",
@@ -1208,7 +1263,10 @@ impl KnowledgeStore for PostgresKnowledgeStore {
         let receipt = receipt.clone();
         run_driver_sync(
             move || {
-                let mut connection = store.executor.checkout().map_err(storage_knowledge_error)?;
+                let mut connection = store
+                    .executor
+                    .checkout_runtime()
+                    .map_err(storage_knowledge_error)?;
                 let mut tx = connection.transaction().map_err(postgres_knowledge_error)?;
                 upsert_knowledge_json(
                     &mut tx,
@@ -1252,7 +1310,10 @@ impl KnowledgeStore for PostgresKnowledgeStore {
         let signal = signal.clone();
         run_driver_sync(
             move || {
-                let mut connection = store.executor.checkout().map_err(storage_knowledge_error)?;
+                let mut connection = store
+                    .executor
+                    .checkout_runtime()
+                    .map_err(storage_knowledge_error)?;
                 connection.execute("INSERT INTO knowledge_usage(signal_id,pack_id,session_id,occurred_at,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(signal_id) DO UPDATE SET pack_id=EXCLUDED.pack_id,session_id=EXCLUDED.session_id,occurred_at=EXCLUDED.occurred_at,payload=EXCLUDED.payload", &[&signal.signal_id,&signal.pack_id,&signal.session_id,&signal.occurred_at.to_rfc3339(),&serde_json::to_value(&signal).map_err(json_knowledge_error)?]).map_err(postgres_knowledge_error)?;
                 Ok(())
             },
@@ -1267,18 +1328,21 @@ impl KnowledgeStore for PostgresKnowledgeStore {
         let store = self.clone();
         run_driver_sync(
             move || {
-                let mut connection = store.executor.checkout().map_err(storage_knowledge_error)?;
+                let mut connection = store
+                    .executor
+                    .checkout_runtime()
+                    .map_err(storage_knowledge_error)?;
                 Ok(KnowledgeSnapshot {
-                    corpus: knowledge_rows(&mut *connection, "knowledge_corpus", "corpus_id")?,
-                    packs: knowledge_rows(&mut *connection, "knowledge_pack", "pack_id")?,
-                    canon: knowledge_rows(&mut *connection, "knowledge_canon", "canon_id")?,
+                    corpus: knowledge_rows(&mut connection, "knowledge_corpus", "corpus_id")?,
+                    packs: knowledge_rows(&mut connection, "knowledge_pack", "pack_id")?,
+                    canon: knowledge_rows(&mut connection, "knowledge_canon", "canon_id")?,
                     conflicts: knowledge_rows(
-                        &mut *connection,
+                        &mut connection,
                         "knowledge_conflict",
                         "conflict_id",
                     )?,
-                    chunks: knowledge_rows(&mut *connection, "knowledge_chunk", "chunk_id")?,
-                    usage: knowledge_rows(&mut *connection, "knowledge_usage", "signal_id")?,
+                    chunks: knowledge_rows(&mut connection, "knowledge_chunk", "chunk_id")?,
+                    usage: knowledge_rows(&mut connection, "knowledge_usage", "signal_id")?,
                 })
             },
             || {
@@ -1474,7 +1538,7 @@ fn row_to_legacy_scope_report(row: &Row) -> MemoryResult<LegacyScopeMigrationRep
 }
 
 fn json_rows_from_client<T: DeserializeOwned>(
-    client: &mut impl GenericClient,
+    client: &mut impl PostgresClient,
     table: &str,
 ) -> MemoryResult<Vec<T>> {
     let sql = match table {
@@ -1497,7 +1561,7 @@ fn json_rows_from_client<T: DeserializeOwned>(
         .collect()
 }
 
-fn write_symbol(client: &mut impl GenericClient, symbol: &CodeSymbol) -> MemoryResult<()> {
+fn write_symbol(client: &mut impl PostgresClient, symbol: &CodeSymbol) -> MemoryResult<()> {
     let line = i64::try_from(symbol.line)
         .map_err(|_| MemoryError::Store("code symbol line overflow".to_string()))?;
     client
@@ -1522,7 +1586,7 @@ fn write_symbol(client: &mut impl GenericClient, symbol: &CodeSymbol) -> MemoryR
 }
 
 fn write_entry(
-    client: &mut impl GenericClient,
+    client: &mut impl PostgresClient,
     entry: &MemoryEntry,
     upsert: bool,
 ) -> MemoryResult<()> {
@@ -1761,7 +1825,7 @@ fn json_knowledge_error(error: serde_json::Error) -> KnowledgeStoreError {
 
 #[allow(clippy::too_many_arguments)]
 fn upsert_knowledge_json<T: Serialize>(
-    transaction: &mut postgres::Transaction<'_>,
+    transaction: &mut PostgresTransaction<'_>,
     table: &str,
     _key_column: &str,
     id: &str,
@@ -1802,7 +1866,7 @@ fn upsert_knowledge_json<T: Serialize>(
 }
 
 fn knowledge_rows<T: DeserializeOwned>(
-    connection: &mut impl GenericClient,
+    connection: &mut impl PostgresClient,
     table: &str,
     _key_column: &str,
 ) -> Result<Vec<T>, KnowledgeStoreError> {

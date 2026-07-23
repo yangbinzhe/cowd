@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use storage::{
-    PostgresExecutor, PostgresMigrationSpec, SqliteExecutor, StorageBackendKind, StorageEndpoint,
+    PostgresConnection, PostgresExecutor, PostgresMigrationSpec, PostgresTransaction,
+    SqliteExecutor, StorageBackendKind, StorageEndpoint,
 };
 use thiserror::Error;
 
@@ -322,9 +323,9 @@ impl PostgresApprovalHistoryLedger {
 
     fn with_connection<T>(
         &self,
-        operation: impl FnOnce(&mut postgres::Client) -> ApprovalHistoryResult<T>,
+        operation: impl FnOnce(&mut PostgresConnection) -> ApprovalHistoryResult<T>,
     ) -> ApprovalHistoryResult<T> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         operation(&mut connection)
     }
 
@@ -495,7 +496,7 @@ fn export_sqlite_snapshot(
 }
 
 fn export_postgres_snapshot(
-    transaction: &mut postgres::Transaction<'_>,
+    transaction: &mut PostgresTransaction<'_>,
 ) -> ApprovalHistoryResult<ApprovalHistoryMigrationSnapshot> {
     let rows = transaction.query(
         "SELECT payload FROM approval_history_entry ORDER BY resolved_at ASC, id ASC",
@@ -625,7 +626,7 @@ mod tests {
         assert_eq!(reopened.list(10, 0).unwrap().1, 2);
         target
             .executor()
-            .checkout()
+            .checkout_runtime()
             .unwrap()
             .batch_execute("TRUNCATE TABLE approval_history_entry")
             .unwrap();

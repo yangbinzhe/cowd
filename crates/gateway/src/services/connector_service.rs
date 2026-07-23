@@ -109,6 +109,9 @@ impl ConnectorService {
         &self,
         workspace_root: impl AsRef<Path>,
     ) -> storage::StorageHandle {
+        if let Some(handle) = self.resource_directory_handle.as_ref() {
+            return handle.clone();
+        }
         let workspace_root = workspace_root.as_ref();
         let scope = storage::StorageScope::workspace_for_root(workspace_root);
         storage::StorageRegistry::default_for_config_home(workspace_root.join(".cowd"))

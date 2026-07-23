@@ -8,6 +8,9 @@ impl crate::services::MatrixService {
         &self,
         config_home: impl AsRef<std::path::Path>,
     ) -> Result<Arc<dyn matrix_repository::MatrixStore>, matrix_repository::MatrixStoreError> {
+        if let Some(store) = self.selected_store.as_ref() {
+            return Ok(Arc::clone(store));
+        }
         let registry = storage::StorageRegistry::default_for_config_home(config_home);
         let endpoint = registry
             .endpoint(&storage::StorageDomainId::Matrix)

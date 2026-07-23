@@ -40,6 +40,7 @@ pub(crate) struct StorageGatewaySnapshot {
     pub(crate) migrations: Vec<storage::StorageMigration>,
     pub(crate) locks: Vec<StorageLockDiagnostics>,
     pub(crate) executors: Vec<storage::SqliteExecutorHealth>,
+    pub(crate) postgres: Option<storage::PostgresExecutorHealth>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,10 +65,15 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         event_bus: true,
         session_kernel: true,
     };
-    let mut storage_registry = StorageRegistry::default_for_config_home(&state.config_home)
-        .with_workspace(&state.workspace_root)
-        .and_then(StorageRegistry::with_surface_messages)
-        .expect("gateway storage endpoint registration must not collide");
+    let mut storage_registry = state.services.selected_storage.as_ref().map_or_else(
+        || {
+            StorageRegistry::default_for_config_home(&state.config_home)
+                .with_workspace(&state.workspace_root)
+                .and_then(StorageRegistry::with_surface_messages)
+                .expect("gateway storage endpoint registration must not collide")
+        },
+        |selected| selected.registry.clone(),
+    );
     for endpoint in state.services.app_registry.storage_endpoints() {
         storage_registry
             .register_endpoint(endpoint)
@@ -86,6 +92,12 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
             })
             .collect(),
         executors: storage::StorageRuntime::global().sqlite_health(),
+        postgres: state
+            .services
+            .selected_storage
+            .as_ref()
+            .and_then(|selected| selected.postgres_executor.as_ref())
+            .map(storage::PostgresExecutor::health),
     };
     let status = if runtime.session_kernel && runtime.event_bus {
         "healthy"

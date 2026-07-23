@@ -65,20 +65,32 @@ impl WorkspaceService {
         workspace_root: &Path,
         config_home: &Path,
         profile_id: Option<&str>,
+        selected_session: Option<&storage::StorageEndpoint>,
     ) -> serde_json::Value {
         let workspace_canonical = workspace_root.canonicalize().ok();
+        let fallback;
+        let session = if let Some(endpoint) = selected_session {
+            endpoint
+        } else {
+            fallback = storage::StorageRegistry::default_for_config_home(config_home)
+                .endpoint(&storage::StorageDomainId::Session)
+                .expect("session endpoint is part of the default Cowd storage inventory")
+                .clone();
+            &fallback
+        };
         serde_json::json!({
             "workspace_root": workspace_root.display().to_string(),
             "workspace_canonical": workspace_canonical.map(|path| path.display().to_string()),
             "profile_id": profile_id,
             "config_home": config_home.display().to_string(),
-            "sessions_db": storage::StorageRegistry::default_for_config_home(config_home)
-                .endpoint(&storage::StorageDomainId::Session)
-                .expect("session endpoint is part of the default Cowd storage inventory")
-                .as_handle()
-                .path
-                .display()
-                .to_string(),
+            "sessions_db": (!session.path.as_os_str().is_empty())
+                .then(|| session.path.display().to_string()),
+            "session_storage": {
+                "logical_id": session.logical_id(),
+                "backend": session.backend,
+                "scope": session.scope,
+                "migration": session.migration,
+            },
             "memory_dir": config_home.join("memory").display().to_string(),
         })
     }

@@ -10,6 +10,7 @@ r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 postgres = { version = "0.19", optional = true }
 r2d2_postgres = { version = "0.18", optional = true }
+tokio = { workspace = true, optional = true }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
@@ -17,7 +18,7 @@ sha2 = "0.10"
 thiserror = "2"
 
 [features]
-storage-postgres = ["dep:postgres", "dep:r2d2_postgres"]
+storage-postgres = ["dep:postgres", "dep:r2d2_postgres", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"

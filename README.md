@@ -494,6 +494,23 @@ Gateway AppRegistry ──> API / Skill / Auth / OpenAPI / AI tools / TUI / WebU
 完整规范见 [通用 App 开发与产品组合规范](docs/architecture/application-development-and-product-composition.md) 与 [当前 App 启停和构建说明](docs/architecture/app-activation-and-build.md)。
 Gateway 的安全启动、二进制替换和运行核验见 [Gateway 生命周期运行手册](docs/operator/gateway-lifecycle.md)。
 
+### 1.4 全域存储选择与可证明切换
+
+Gateway 在启动时只创建一个 `SelectedStorageTopology`：SQLite 是默认本地后端；选择
+PostgreSQL 时，Session、Memory、Knowledge、Runtime Event、Task、Fact/Growth、Matrix、
+Approval、Surface Message、Connector Directory 与启用 App 全部消费同一个有界连接池上的
+已选择 port。业务 service、Runtime turn 和 App 不得再自行打开业务 SQLite。
+
+PostgreSQL 不做隐式迁移、双写或失败回退。运维人员在 Gateway 停止时依次执行
+`cowd storage plan|migrate|verify|cutover`；只有逐域 canonical digest、目标身份、Cowd 版本、
+工作区、App source lock 与 enabled App 集合全部匹配的 active manifest 才允许生产启动。
+凭据只通过配置中的 `secretRef` 在进程边界解析，URL 不进入 projection、health 或证据文件。
+App 的表、快照和迁移由 App 自己拥有；Cowd 只提供通用 lease、独立 PostgreSQL schema、
+migration hook 和全局 evidence envelope。
+
+配置、迁移命令、失败边界和 App 存储所有权详见
+[存储治理与 PostgreSQL cutover](docs/architecture/storage-governance.md)。
+
 ---
 
 ## 2. 仓库边界

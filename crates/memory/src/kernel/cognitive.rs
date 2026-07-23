@@ -59,7 +59,7 @@ use crate::{
     state_rebuilder::StateRebuilder,
     store::sqlite::SqliteStore,
     store::vector::VectorIndex,
-    store::{FtsSearchOptions, FtsSearchResult},
+    store::{FtsSearchOptions, FtsSearchResult, MemoryStore},
     tool_sandbox::ToolOutputSandbox,
     types::{
         Blocker, Decision, DecisionEntry, HandoffData, MatchedKeyword, MemoryCategory, MemoryEntry,
@@ -264,10 +264,60 @@ impl CognitiveContextManager {
         workspace_root: Option<PathBuf>,
         session_store: Option<Arc<UnifiedSessionStore>>,
     ) -> Result<Self> {
-        // Build the orchestrator (opens SQLite, wires all layers).
-        let orchestrator = Arc::new(
-            MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone()).await?,
-        );
+        Self::new_with_storage_selection(config, workspace_root, session_store, None, true).await
+    }
+
+    /// Initialise the complete cognitive runtime over a host-selected durable
+    /// Memory port. The relational backend is already chosen at the process
+    /// composition root, so this constructor never infers or opens SQLite.
+    /// Rebuildable vector/audit artifacts remain file based; the maintenance
+    /// queue is in memory because its durable truth belongs to `MemoryStore`.
+    pub async fn new_with_selected_store(
+        config: MemoryConfig,
+        workspace_root: Option<PathBuf>,
+        session_store: Option<Arc<UnifiedSessionStore>>,
+        store: Arc<dyn MemoryStore>,
+    ) -> Result<Self> {
+        Self::new_with_storage_selection(config, workspace_root, session_store, Some(store), false)
+            .await
+    }
+
+    /// Variant used by a composition root that selected SQLite and therefore
+    /// may retain the existing SQLite-backed maintenance/vector auxiliaries.
+    /// PostgreSQL composition passes `false` so no business SQLite is opened.
+    pub async fn new_with_selected_store_and_auxiliaries(
+        config: MemoryConfig,
+        workspace_root: Option<PathBuf>,
+        session_store: Option<Arc<UnifiedSessionStore>>,
+        store: Arc<dyn MemoryStore>,
+        sqlite_auxiliaries: bool,
+    ) -> Result<Self> {
+        Self::new_with_storage_selection(
+            config,
+            workspace_root,
+            session_store,
+            Some(store),
+            sqlite_auxiliaries,
+        )
+        .await
+    }
+
+    async fn new_with_storage_selection(
+        config: MemoryConfig,
+        workspace_root: Option<PathBuf>,
+        session_store: Option<Arc<UnifiedSessionStore>>,
+        selected_store: Option<Arc<dyn MemoryStore>>,
+        sqlite_auxiliaries: bool,
+    ) -> Result<Self> {
+        let orchestrator = Arc::new(match selected_store {
+            Some(store) => {
+                MemoryOrchestrator::from_store(config.clone(), store, workspace_root.clone())?
+            }
+            None => {
+                MemoryOrchestrator::init_with_workspace(config.clone(), workspace_root.clone())
+                    .await?
+            }
+        });
 
         // Build the vector index with persistence support.
         // Use VectorIndex::load to restore previously persisted vectors.
@@ -275,7 +325,9 @@ impl CognitiveContextManager {
         // falling back to the store default only when the index is empty.
         let dimension = config.store.vector.dimension as u32;
         let persist_path = config.store.blob_dir.join("vector_index.json");
-        let vector_sqlite_store = SqliteStore::open(&config.store).ok();
+        let vector_sqlite_store = sqlite_auxiliaries
+            .then(|| SqliteStore::open(&config.store).ok())
+            .flatten();
         let vector_index = Mutex::new(
             VectorIndex::load_with_store(persist_path, dimension, vector_sqlite_store)
                 .map_err(|e| MemoryError::Store(format!("load vector index: {e}")))?,
@@ -517,15 +569,19 @@ impl CognitiveContextManager {
             }
         };
 
-        let maintenance_queue = match MaintenanceQueue::open_sqlite(&config.store.sqlite_path) {
-            Ok(queue) => queue,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "memory maintenance: durable queue unavailable, using in-memory fallback"
-                );
-                MaintenanceQueue::new()
+        let maintenance_queue = if sqlite_auxiliaries {
+            match MaintenanceQueue::open_sqlite(&config.store.sqlite_path) {
+                Ok(queue) => queue,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "memory maintenance: durable queue unavailable, using in-memory fallback"
+                    );
+                    MaintenanceQueue::new()
+                }
             }
+        } else {
+            MaintenanceQueue::new()
         };
 
         Ok(Self {

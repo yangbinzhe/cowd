@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "storage-postgres")]
 pub use postgres::{
-    PostgresConnectionConfig, PostgresExecutor, PostgresExecutorHealth, PostgresExecutorMetrics,
-    PostgresMigrationReport, PostgresMigrationSpec, ResolvedPostgresUrl, SecretRefResolver,
+    PostgresClient, PostgresConnection, PostgresConnectionConfig, PostgresExecutor,
+    PostgresExecutorHealth, PostgresExecutorMetrics, PostgresMigrationReport,
+    PostgresMigrationSpec, PostgresTransaction, ResolvedPostgresUrl, SecretRefResolver,
     StaticSecretRefResolver,
 };
 use rusqlite::OptionalExtension;

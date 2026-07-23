@@ -12,10 +12,11 @@ use fact_kernel::{
     GrowthPromotionRecord,
 };
 use harness_contract::growth::GrowthEvent;
-use postgres::{GenericClient, Row};
+use postgres::Row;
 use serde::{Deserialize, Serialize};
 use storage::{
-    PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec, SecretRefResolver,
+    PostgresClient, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
+    SecretRefResolver,
 };
 
 const FACT_LEDGER_DOMAIN: &str = "fact";
@@ -110,7 +111,7 @@ impl FactLedger for PostgresFactLedger {
     fn upsert_fact(&self, fact: FactRecord) -> FactLedgerResult<FactRecord> {
         let payload = serde_json::to_value(&fact).map_err(json_error)?;
         self.executor
-            .checkout()
+            .checkout_runtime()
             .map_err(storage_error)?
             .execute(
                 "INSERT INTO fact_records(fact_id, fact_type, status, payload, updated_at)
@@ -134,7 +135,7 @@ impl FactLedger for PostgresFactLedger {
 
     fn get_fact(&self, fact_id: &str) -> FactLedgerResult<Option<FactRecord>> {
         self.executor
-            .checkout()
+            .checkout_runtime()
             .map_err(storage_error)?
             .query_opt(
                 "SELECT payload FROM fact_records WHERE fact_id=$1",
@@ -147,7 +148,7 @@ impl FactLedger for PostgresFactLedger {
 
     fn list_facts(&self) -> FactLedgerResult<Vec<FactRecord>> {
         list_json(
-            &mut *self.executor.checkout().map_err(storage_error)?,
+            &mut self.executor.checkout_runtime().map_err(storage_error)?,
             "SELECT payload FROM fact_records ORDER BY updated_at DESC, fact_id ASC",
         )
     }
@@ -155,7 +156,7 @@ impl FactLedger for PostgresFactLedger {
     fn upsert_evidence(&self, evidence: EvidencePacket) -> FactLedgerResult<EvidencePacket> {
         let payload = serde_json::to_value(&evidence).map_err(json_error)?;
         self.executor
-            .checkout()
+            .checkout_runtime()
             .map_err(storage_error)?
             .execute(
                 "INSERT INTO fact_evidence(evidence_id, source_kind, payload, collected_at)
@@ -177,7 +178,7 @@ impl FactLedger for PostgresFactLedger {
 
     fn get_evidence(&self, evidence_id: &str) -> FactLedgerResult<Option<EvidencePacket>> {
         self.executor
-            .checkout()
+            .checkout_runtime()
             .map_err(storage_error)?
             .query_opt(
                 "SELECT payload FROM fact_evidence WHERE evidence_id=$1",
@@ -190,7 +191,7 @@ impl FactLedger for PostgresFactLedger {
 
     fn list_evidence(&self) -> FactLedgerResult<Vec<EvidencePacket>> {
         list_json(
-            &mut *self.executor.checkout().map_err(storage_error)?,
+            &mut self.executor.checkout_runtime().map_err(storage_error)?,
             "SELECT payload FROM fact_evidence ORDER BY collected_at DESC, evidence_id ASC",
         )
     }
@@ -198,7 +199,7 @@ impl FactLedger for PostgresFactLedger {
     fn record_growth_event(&self, event: GrowthEvent) -> FactLedgerResult<()> {
         let payload = serde_json::to_value(&event).map_err(json_error)?;
         self.executor
-            .checkout()
+            .checkout_runtime()
             .map_err(storage_error)?
             .execute(
                 "INSERT INTO growth_events(event_id, session_id, source_event_kind, payload, created_at)
@@ -221,7 +222,7 @@ impl FactLedger for PostgresFactLedger {
 
     fn list_growth_events(&self) -> FactLedgerResult<Vec<GrowthEvent>> {
         list_json(
-            &mut *self.executor.checkout().map_err(storage_error)?,
+            &mut self.executor.checkout_runtime().map_err(storage_error)?,
             "SELECT payload FROM growth_events ORDER BY created_at DESC, event_id ASC",
         )
     }
@@ -232,7 +233,7 @@ impl FactLedger for PostgresFactLedger {
             .map_err(|error| FactLedgerError::backend(error.to_string()))?
             .with_timezone(&Utc);
         self.executor
-            .checkout()
+            .checkout_runtime()
             .map_err(storage_error)?
             .execute(
                 "INSERT INTO growth_promotions(
@@ -265,7 +266,7 @@ impl FactLedger for PostgresFactLedger {
 
     fn list_growth_promotions(&self) -> FactLedgerResult<Vec<GrowthPromotionRecord>> {
         list_json(
-            &mut *self.executor.checkout().map_err(storage_error)?,
+            &mut self.executor.checkout_runtime().map_err(storage_error)?,
             "SELECT payload FROM growth_promotions ORDER BY created_at DESC, id ASC",
         )
     }
@@ -276,7 +277,7 @@ impl FactLedger for PostgresFactLedger {
 
     fn import_snapshot(&self, snapshot: &FactLedgerSnapshot) -> FactLedgerResult<()> {
         snapshot.validate()?;
-        let mut connection = self.executor.checkout().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut tx = connection.transaction().map_err(postgres_error)?;
         for fact in snapshot.facts.iter().cloned() {
             upsert_fact_in(&mut tx, fact)?;
@@ -298,7 +299,7 @@ impl FactLedger for PostgresFactLedger {
         &self,
         batch: fact_kernel::FactGrowthBatch,
     ) -> FactLedgerResult<()> {
-        let mut connection = self.executor.checkout().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut tx = connection.transaction().map_err(postgres_error)?;
         record_growth_event_in(&mut tx, batch.event)?;
         upsert_evidence_in(&mut tx, batch.evidence)?;
@@ -313,7 +314,7 @@ impl FactLedger for PostgresFactLedger {
     }
 }
 
-fn upsert_fact_in(client: &mut impl GenericClient, fact: FactRecord) -> FactLedgerResult<()> {
+fn upsert_fact_in(client: &mut impl PostgresClient, fact: FactRecord) -> FactLedgerResult<()> {
     let payload = serde_json::to_value(&fact).map_err(json_error)?;
     client
         .execute(
@@ -328,7 +329,7 @@ fn upsert_fact_in(client: &mut impl GenericClient, fact: FactRecord) -> FactLedg
 }
 
 fn upsert_evidence_in(
-    client: &mut impl GenericClient,
+    client: &mut impl PostgresClient,
     evidence: EvidencePacket,
 ) -> FactLedgerResult<()> {
     let payload = serde_json::to_value(&evidence).map_err(json_error)?;
@@ -350,7 +351,7 @@ fn upsert_evidence_in(
 }
 
 fn record_growth_event_in(
-    client: &mut impl GenericClient,
+    client: &mut impl PostgresClient,
     event: GrowthEvent,
 ) -> FactLedgerResult<()> {
     let payload = serde_json::to_value(&event).map_err(json_error)?;
@@ -373,7 +374,7 @@ fn record_growth_event_in(
 }
 
 fn record_growth_promotion_in(
-    client: &mut impl GenericClient,
+    client: &mut impl PostgresClient,
     record: GrowthPromotionRecord,
 ) -> FactLedgerResult<()> {
     let payload = serde_json::to_value(&record).map_err(json_error)?;
@@ -403,7 +404,7 @@ fn record_growth_promotion_in(
     Ok(())
 }
 
-fn list_json<T>(client: &mut impl GenericClient, sql: &str) -> FactLedgerResult<Vec<T>>
+fn list_json<T>(client: &mut impl PostgresClient, sql: &str) -> FactLedgerResult<Vec<T>>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -535,7 +536,7 @@ mod tests {
     fn clear(ledger: &PostgresFactLedger) {
         ledger
             .executor()
-            .checkout()
+            .checkout_runtime()
             .unwrap()
             .batch_execute(
                 "TRUNCATE TABLE growth_promotions, growth_events, fact_evidence, fact_records",

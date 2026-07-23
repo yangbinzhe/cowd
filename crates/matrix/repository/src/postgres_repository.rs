@@ -23,11 +23,11 @@ use matrix_core::{
     MatrixSourcePackValidation, MatrixSourceSnapshot, MatrixSourceSnapshotApplyReport,
     MatrixSourceSnapshotInput, MatrixSourceSnapshotPlan,
 };
-use postgres::GenericClient;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use storage::{
-    PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec, SecretRefResolver,
+    PostgresClient, PostgresConnection, PostgresConnectionConfig, PostgresExecutor,
+    PostgresMigrationSpec, PostgresTransaction, SecretRefResolver,
 };
 
 use crate::migration::{canonicalize_payload, MATRIX_MIGRATION_TABLES};
@@ -345,9 +345,9 @@ impl PostgresMatrixRepository {
 
     fn with_connection<T>(
         &self,
-        operation: impl FnOnce(&mut postgres::Client) -> MatrixStoreResult<T>,
+        operation: impl FnOnce(&mut PostgresConnection) -> MatrixStoreResult<T>,
     ) -> MatrixStoreResult<T> {
-        let mut connection = self.executor.checkout().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         operation(&mut connection)
     }
 
@@ -386,9 +386,9 @@ impl PostgresMatrixRepository {
 
     fn with_transaction<T>(
         &self,
-        operation: impl FnOnce(&mut postgres::Transaction<'_>) -> MatrixStoreResult<T>,
+        operation: impl FnOnce(&mut PostgresTransaction<'_>) -> MatrixStoreResult<T>,
     ) -> MatrixStoreResult<T> {
-        let mut connection = self.executor.checkout().map_err(storage_error)?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let value = operation(&mut transaction)?;
         transaction.commit().map_err(postgres_error)?;
@@ -1759,14 +1759,14 @@ fn json_error(error: serde_json::Error) -> MatrixStoreError {
     MatrixStoreError::Backend(error.to_string())
 }
 
-fn scalar_i64<C: GenericClient>(client: &mut C, sql: &str) -> MatrixStoreResult<i64> {
+fn scalar_i64<C: PostgresClient>(client: &mut C, sql: &str) -> MatrixStoreResult<i64> {
     client
         .query_one(sql, &[])
         .map(|row| row.get(0))
         .map_err(postgres_error)
 }
 
-fn count_table<C: GenericClient>(client: &mut C, table: &str) -> MatrixStoreResult<u64> {
+fn count_table<C: PostgresClient>(client: &mut C, table: &str) -> MatrixStoreResult<u64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     client
         .query_one(&sql, &[])
@@ -1774,7 +1774,7 @@ fn count_table<C: GenericClient>(client: &mut C, table: &str) -> MatrixStoreResu
         .map_err(postgres_error)
 }
 
-fn write_json<C: GenericClient, T: Serialize>(
+fn write_json<C: PostgresClient, T: Serialize>(
     client: &mut C,
     table: &str,
     id: &str,
@@ -1791,7 +1791,7 @@ fn write_json<C: GenericClient, T: Serialize>(
     Ok(())
 }
 
-fn read_json<C: GenericClient, T: DeserializeOwned>(
+fn read_json<C: PostgresClient, T: DeserializeOwned>(
     client: &mut C,
     table: &str,
     id: &str,
@@ -1804,7 +1804,7 @@ fn read_json<C: GenericClient, T: DeserializeOwned>(
         .transpose()
 }
 
-fn list_json<C: GenericClient, T: DeserializeOwned>(
+fn list_json<C: PostgresClient, T: DeserializeOwned>(
     client: &mut C,
     table: &str,
     limit: usize,
@@ -1818,7 +1818,7 @@ fn list_json<C: GenericClient, T: DeserializeOwned>(
         .collect()
 }
 
-fn list_json_ordered<C: GenericClient, T: DeserializeOwned>(
+fn list_json_ordered<C: PostgresClient, T: DeserializeOwned>(
     client: &mut C,
     table: &str,
     order_by: &str,
@@ -1833,7 +1833,7 @@ fn list_json_ordered<C: GenericClient, T: DeserializeOwned>(
         .collect()
 }
 
-fn export_json_records<C: GenericClient>(
+fn export_json_records<C: PostgresClient>(
     client: &mut C,
     table: &str,
 ) -> MatrixStoreResult<BTreeMap<String, Value>> {
@@ -1848,7 +1848,7 @@ fn export_json_records<C: GenericClient>(
         .collect()
 }
 
-fn export_migration_json_records<C: GenericClient>(
+fn export_migration_json_records<C: PostgresClient>(
     client: &mut C,
     table: &str,
 ) -> MatrixStoreResult<BTreeMap<String, Value>> {
@@ -1866,7 +1866,7 @@ fn export_migration_json_records<C: GenericClient>(
         .collect()
 }
 
-fn export_revisions<C: GenericClient>(client: &mut C) -> MatrixStoreResult<BTreeMap<String, u64>> {
+fn export_revisions<C: PostgresClient>(client: &mut C) -> MatrixStoreResult<BTreeMap<String, u64>> {
     let rows = client
         .query(
             "SELECT resource_kind, resource_id, revision \
@@ -1937,7 +1937,7 @@ fn logical_postgres_resource_id(resource_kind: &str, resource_id: &str) -> Strin
         .unwrap_or_else(|| resource_id.to_string())
 }
 
-fn resource_revision<C: GenericClient>(
+fn resource_revision<C: PostgresClient>(
     client: &mut C,
     resource_kind: &str,
     resource_id: &str,
@@ -1951,7 +1951,7 @@ fn resource_revision<C: GenericClient>(
         .map(|row| row.map_or(1, |row| row.get::<_, i64>(0) as u64))
 }
 
-fn prepare_revision<C: GenericClient>(
+fn prepare_revision<C: PostgresClient>(
     client: &mut C,
     resource_kind: &str,
     resource_id: &str,
@@ -1991,7 +1991,7 @@ fn prepare_revision<C: GenericClient>(
     Ok((actual, revision, !exists))
 }
 
-fn persist_revision<C: GenericClient>(
+fn persist_revision<C: PostgresClient>(
     client: &mut C,
     resource_kind: &str,
     resource_id: &str,
@@ -2008,7 +2008,7 @@ fn persist_revision<C: GenericClient>(
     Ok(())
 }
 
-fn find_entity_by_canonical<C: GenericClient>(
+fn find_entity_by_canonical<C: PostgresClient>(
     client: &mut C,
     entity_type: &str,
     canonical_key: &str,
@@ -2023,7 +2023,7 @@ fn find_entity_by_canonical<C: GenericClient>(
         .transpose()
 }
 
-fn save_entity<C: GenericClient>(
+fn save_entity<C: PostgresClient>(
     client: &mut C,
     entity: &MatrixEntity,
     existing: Option<MatrixEntity>,
@@ -2040,7 +2040,7 @@ fn save_entity<C: GenericClient>(
     Ok(entity)
 }
 
-fn replace_entity_source_keys<C: GenericClient>(
+fn replace_entity_source_keys<C: PostgresClient>(
     client: &mut C,
     entity: &MatrixEntity,
 ) -> MatrixStoreResult<()> {
@@ -2081,7 +2081,7 @@ fn merge_source_keys(
         .collect()
 }
 
-fn find_relation_by_key<C: GenericClient>(
+fn find_relation_by_key<C: PostgresClient>(
     client: &mut C,
     relation_type: &str,
     from_entity_id: &str,
@@ -2097,7 +2097,7 @@ fn find_relation_by_key<C: GenericClient>(
         .transpose()
 }
 
-fn save_relation<C: GenericClient>(
+fn save_relation<C: PostgresClient>(
     client: &mut C,
     relation: &MatrixRelation,
     existing: Option<MatrixRelation>,
@@ -2112,7 +2112,7 @@ fn save_relation<C: GenericClient>(
     Ok(relation)
 }
 
-fn build_impact_trace<C: GenericClient>(
+fn build_impact_trace<C: PostgresClient>(
     client: &mut C,
     root_entity_id: &str,
     max_depth: usize,
@@ -2181,7 +2181,7 @@ fn build_impact_trace<C: GenericClient>(
     })
 }
 
-fn find_metric_dependency_by_key<C: GenericClient>(
+fn find_metric_dependency_by_key<C: PostgresClient>(
     client: &mut C,
     upstream_metric_id: &str,
     downstream_metric_id: &str,
@@ -2197,7 +2197,7 @@ fn find_metric_dependency_by_key<C: GenericClient>(
         .transpose()
 }
 
-fn save_metric_dependency<C: GenericClient>(
+fn save_metric_dependency<C: PostgresClient>(
     client: &mut C,
     dependency: &MatrixMetricDependency,
     existing: Option<MatrixMetricDependency>,
@@ -2217,7 +2217,7 @@ fn save_metric_dependency<C: GenericClient>(
     Ok(dependency)
 }
 
-fn all_json<C: GenericClient, T: DeserializeOwned>(
+fn all_json<C: PostgresClient, T: DeserializeOwned>(
     client: &mut C,
     table: &str,
 ) -> MatrixStoreResult<Vec<T>> {
@@ -2230,7 +2230,7 @@ fn all_json<C: GenericClient, T: DeserializeOwned>(
         .collect()
 }
 
-fn metric_lineage<C: GenericClient>(
+fn metric_lineage<C: PostgresClient>(
     client: &mut C,
     metric_id: &str,
     max_depth: usize,
@@ -2279,7 +2279,7 @@ fn metric_lineage<C: GenericClient>(
     })
 }
 
-fn metrics_affected_by_fact_type<C: GenericClient>(
+fn metrics_affected_by_fact_type<C: PostgresClient>(
     client: &mut C,
     fact_type: &str,
 ) -> MatrixStoreResult<Vec<String>> {
@@ -2298,7 +2298,7 @@ fn metrics_affected_by_fact_type<C: GenericClient>(
     Ok(metric_ids)
 }
 
-fn metric_ids_for_fact_type<C: GenericClient>(
+fn metric_ids_for_fact_type<C: PostgresClient>(
     client: &mut C,
     fact_type: &str,
 ) -> MatrixStoreResult<Vec<String>> {
@@ -2312,7 +2312,7 @@ fn metric_ids_for_fact_type<C: GenericClient>(
     Ok(metric_ids)
 }
 
-fn latest_metric_state_for_metric<C: GenericClient>(
+fn latest_metric_state_for_metric<C: PostgresClient>(
     client: &mut C,
     metric_id: &str,
 ) -> MatrixStoreResult<Option<MatrixMetricState>> {
@@ -2326,7 +2326,7 @@ fn latest_metric_state_for_metric<C: GenericClient>(
         .transpose()
 }
 
-fn latest_metric_state<C: GenericClient>(
+fn latest_metric_state<C: PostgresClient>(
     client: &mut C,
     metric_id: &str,
     entity_scope: &str,
@@ -2342,7 +2342,7 @@ fn latest_metric_state<C: GenericClient>(
         .transpose()
 }
 
-fn states_for_metric<C: GenericClient>(
+fn states_for_metric<C: PostgresClient>(
     client: &mut C,
     metric_id: &str,
 ) -> MatrixStoreResult<Vec<MatrixMetricState>> {
@@ -2379,7 +2379,7 @@ fn numeric_measure_sum(value: &Value) -> f64 {
     }
 }
 
-fn recompute_metrics<C: GenericClient>(
+fn recompute_metrics<C: PostgresClient>(
     client: &mut C,
     metric_filter: Option<&BTreeSet<String>>,
 ) -> MatrixStoreResult<MatrixMetricRecomputeResult> {
@@ -2531,7 +2531,7 @@ fn attention_from_change(
     }
 }
 
-fn source_pack_delta_plan<C: GenericClient>(
+fn source_pack_delta_plan<C: PostgresClient>(
     client: &mut C,
     source_pack: &MatrixSourcePack,
 ) -> MatrixStoreResult<MatrixSourceDeltaPlan> {
@@ -2575,7 +2575,7 @@ fn source_kind_for_access_mode(access_mode: &str) -> MatrixSourceKind {
     }
 }
 
-fn read_scenario_result_for_run<C: GenericClient>(
+fn read_scenario_result_for_run<C: PostgresClient>(
     client: &mut C,
     run_id: &str,
 ) -> MatrixStoreResult<Option<MatrixScenarioResult>> {

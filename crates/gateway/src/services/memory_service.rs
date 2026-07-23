@@ -14,6 +14,7 @@ pub(crate) struct MemoryService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     manager: Option<Arc<GatewayMemoryManager>>,
+    knowledge: Option<memory::KnowledgeFabric>,
 }
 
 impl MemoryService {
@@ -22,12 +23,24 @@ impl MemoryService {
             label: "memory",
             owner: "0.9.380 GatewayServices",
             manager: None,
+            knowledge: None,
         }
     }
 
     pub(crate) fn with_manager(manager: Option<Arc<GatewayMemoryManager>>) -> Self {
         Self {
             manager,
+            ..Self::new()
+        }
+    }
+
+    pub(crate) fn with_manager_and_knowledge(
+        manager: Option<Arc<GatewayMemoryManager>>,
+        knowledge: memory::KnowledgeFabric,
+    ) -> Self {
+        Self {
+            manager,
+            knowledge: Some(knowledge),
             ..Self::new()
         }
     }
@@ -370,7 +383,7 @@ impl MemoryService {
         }
     }
 
-    pub(crate) async fn knowledge_projection(&self, config_home: &Path) -> serde_json::Value {
+    pub(crate) async fn knowledge_projection(&self, _config_home: &Path) -> serde_json::Value {
         let Some(_mgr) = self.manager() else {
             return serde_json::json!({
                 "enabled": false,
@@ -402,10 +415,10 @@ impl MemoryService {
             .iter()
             .filter(|entry| is_knowledge_memory_entry(entry))
             .count();
-        let durable_fabric = memory::durable_knowledge_fabric_for_config_home(config_home);
+        let durable_fabric = self.knowledge.as_ref();
         let (capability_status, projection_mode, durable, degraded, degraded_reason, projection) =
             match durable_fabric {
-                Ok(fabric) => (
+                Some(fabric) => (
                     RealityCapabilityStatus::EnabledAndWired.as_str(),
                     "durable_knowledge_store",
                     true,
@@ -413,12 +426,12 @@ impl MemoryService {
                     serde_json::Value::Null,
                     fabric.projection(),
                 ),
-                Err(error) => (
+                None => (
                     RealityCapabilityStatus::Degraded.as_str(),
                     "durable_knowledge_store_unavailable",
                     false,
                     true,
-                    serde_json::json!(error.to_string()),
+                    serde_json::json!("selected Knowledge store is unavailable"),
                     serde_json::Value::Null,
                 ),
             };
@@ -430,7 +443,7 @@ impl MemoryService {
             "durable": durable,
             "degraded": degraded,
             "degraded_reason": degraded_reason,
-            "source": "knowledge.sqlite",
+            "source": "selected_storage_topology",
             "import_candidate_count": import_candidate_count,
             "projection": projection,
         })

@@ -254,10 +254,11 @@ fn provision_requirement(
         #[cfg(feature = "app-postgres")]
         (storage::StorageBackendKind::Postgres, AppStorageTopology::Postgres { executor }) => {
             provision_postgres_namespace(executor.clone(), provision.namespace.clone())?;
+            let scoped_executor = executor.scoped_namespace(&provision.namespace)?;
             Ok(AppStorageLease::postgres(
                 endpoint,
                 provision,
-                executor.clone(),
+                scoped_executor,
             ))
         }
         (storage::StorageBackendKind::Postgres, _) => {

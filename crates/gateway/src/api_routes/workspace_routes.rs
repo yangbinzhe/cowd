@@ -92,11 +92,23 @@ fn default_attachment_kind() -> String {
 }
 
 async fn workspace_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.services.workspace.overview(
-        &state.workspace_root,
-        &state.config_home,
-        Some(state.profile_id.as_str()),
-    ))
+    Json(
+        state.services.workspace.overview(
+            &state.workspace_root,
+            &state.config_home,
+            Some(state.profile_id.as_str()),
+            state
+                .services
+                .selected_storage
+                .as_ref()
+                .and_then(|selected| {
+                    selected
+                        .registry
+                        .endpoint(&storage::StorageDomainId::Session)
+                        .ok()
+                }),
+        ),
+    )
 }
 
 async fn workspaces_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

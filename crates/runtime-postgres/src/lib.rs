@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use postgres::{GenericClient, Row, Transaction};
+use postgres::Row;
 use runtime::task::{TaskKernel, TaskRecord, TaskStoreBackend, TaskStoreSnapshot};
 use runtime::{
     AppendTransactionReceipt, AppendTransactionRequest, CommittedEventBatch,
@@ -32,8 +32,8 @@ use runtime::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use storage::{
-    PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec, SecretRefResolver,
-    StorageError,
+    PostgresClient, PostgresConnection, PostgresConnectionConfig, PostgresExecutor,
+    PostgresMigrationSpec, PostgresTransaction, SecretRefResolver, StorageError,
 };
 
 const RUNTIME_EVENT_DOMAIN: &str = "runtime_event";
@@ -194,7 +194,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         validate_event(&input).map_err(|error| error.to_string())?;
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         let mut tx = connection
             .transaction()
@@ -235,7 +235,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let mut tx = pg(connection.transaction())?;
         let receipt = append_transaction_in_tx(&mut tx, &request, None)?;
         pg(tx.commit())?;
@@ -247,7 +247,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: SessionTerminalInput,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let mut tx = pg(connection.transaction())?;
         let receipt = append_transaction_in_tx(&mut tx, &request, Some(&terminal))?;
         pg(tx.commit())?;
@@ -273,7 +273,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             scope,
             evidence_digest,
         )?;
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let mut tx = pg(connection.transaction())?;
         let inserted = pg(tx.execute(
             "INSERT INTO runtime_consumed_decision_leases
@@ -312,7 +312,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             lease.scope(),
             lease.evidence_digest(),
         )?;
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let mut tx = pg(connection.transaction())?;
         let receipt = append_transaction_in_tx(&mut tx, &request, None)?;
         let inserted = pg(tx.execute(
@@ -386,7 +386,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         if max_commits == 0 {
             return Ok(Vec::new());
         }
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
             "SELECT commit_cursor, transaction_id FROM runtime_commits
              WHERE commit_cursor>$1 ORDER BY commit_cursor ASC LIMIT $2",
@@ -401,7 +401,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             let transaction_id: String = pg(row.try_get(1))?;
             batches.push(CommittedEventBatch {
                 commit_cursor,
-                events: load_transaction_events(&mut *connection, &transaction_id)?,
+                events: load_transaction_events(&mut connection, &transaction_id)?,
                 transaction_id,
             });
         }
@@ -413,7 +413,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         stream_id: &str,
         idempotency_key: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeEventRecord>> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         pg(connection.query_opt(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 AND idempotency_key=$2"),
             &[&stream_id, &idempotency_key],
@@ -423,14 +423,14 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     }
 
     fn stream_revision(&self, stream_id: &str) -> RuntimeEventStoreResult<u64> {
-        let mut connection = self.executor.checkout()?;
-        stream_head(&mut *connection, stream_id)
+        let mut connection = self.executor.checkout_runtime()?;
+        stream_head(&mut connection, stream_id)
     }
 
     fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         pg(connection.query(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 ORDER BY sequence ASC"),
@@ -451,7 +451,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         }
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
         let offset = to_i64(offset as u64, "offset").map_err(|error| error.to_string())?;
@@ -466,7 +466,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     fn stream_event_count(&self, stream_id: &str) -> Result<usize, String> {
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         let count: i64 = pg(connection.query_one(
             "SELECT COUNT(*) FROM runtime_events WHERE stream_id=$1",
@@ -545,7 +545,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         pg(connection.query(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE scope=$1 ORDER BY commit_cursor DESC, transaction_index DESC LIMIT $2"),
@@ -559,7 +559,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         &self,
         scope: RuntimeEventScope,
     ) -> RuntimeEventStoreResult<Vec<String>> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
             "SELECT stream_id FROM runtime_events WHERE scope=$1
              GROUP BY stream_id ORDER BY MAX(commit_cursor) ASC, stream_id ASC",
@@ -571,7 +571,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     fn all_events(&self, limit: usize) -> Result<Vec<DurableRuntimeEvent>, String> {
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         pg(connection.query(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events ORDER BY commit_cursor DESC, transaction_index DESC LIMIT $1"),
@@ -584,7 +584,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     fn latest_for_stream(&self, stream_id: &str) -> Result<Option<DurableRuntimeEvent>, String> {
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         pg(connection.query_opt(
             &format!("SELECT {EVENT_COLUMNS} FROM runtime_events WHERE stream_id=$1 ORDER BY sequence DESC LIMIT 1"),
@@ -602,7 +602,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         commit_cursor: u64,
         payload_ref: &str,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let mut tx = pg(connection.transaction())?;
         insert_terminal_in_tx(
             &mut tx,
@@ -632,7 +632,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             return Ok(Vec::new());
         }
         let expires = now_ms.saturating_add(lease_ms);
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let mut tx = pg(connection.transaction())?;
         let rows = pg(tx.query(
             "WITH candidates AS (
@@ -671,8 +671,8 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         &self,
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
-        let mut connection = self.executor.checkout()?;
-        query_runtime_session_outbox(&mut *connection, terminal_id)
+        let mut connection = self.executor.checkout_runtime()?;
+        query_runtime_session_outbox(&mut connection, terminal_id)
     }
 
     fn materialized_session_terminals_after(
@@ -681,7 +681,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         after_commit_cursor: u64,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
@@ -698,7 +698,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     }
 
     fn session_terminal_health(&self) -> RuntimeEventStoreResult<RuntimeSessionOutboxHealth> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
             "SELECT status, COUNT(*) FROM runtime_session_outbox GROUP BY status",
             &[],
@@ -723,7 +723,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         &self,
         limit: usize,
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
             "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
@@ -747,7 +747,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 "manual terminal retry requires actor and reason".to_string(),
             ));
         }
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let changed = pg(connection.execute(
             "UPDATE runtime_session_outbox SET status='retry_scheduled', next_attempt_at=$1,
              claim_owner=NULL, claim_expires_at=NULL, failure_class=NULL, last_error=$2,
@@ -763,7 +763,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 "terminal `{terminal_id}` is not blocked"
             )));
         }
-        query_runtime_session_outbox(&mut *connection, terminal_id)?.ok_or_else(|| {
+        query_runtime_session_outbox(&mut connection, terminal_id)?.ok_or_else(|| {
             RuntimeEventStoreError::Corrupt(format!("terminal `{terminal_id}` vanished"))
         })
     }
@@ -814,16 +814,16 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     }
 
     fn export_migration_snapshot(&self) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot> {
-        let mut connection = self.executor.checkout()?;
-        export_postgres_migration_snapshot(&mut *connection)
+        let mut connection = self.executor.checkout_runtime()?;
+        export_postgres_migration_snapshot(&mut connection)
     }
 
     fn import_migration_snapshot(
         &self,
         snapshot: &RuntimeEventStoreSnapshot,
     ) -> RuntimeEventStoreResult<()> {
-        let mut connection = self.executor.checkout()?;
-        import_postgres_migration_snapshot(&mut *connection, snapshot)
+        let mut connection = self.executor.checkout_runtime()?;
+        import_postgres_migration_snapshot(&mut connection, snapshot)
     }
 }
 
@@ -839,7 +839,7 @@ impl PostgresRuntimeEventStore {
         retry_at_ms: Option<u64>,
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        let mut connection = self.executor.checkout()?;
+        let mut connection = self.executor.checkout_runtime()?;
         let (failure_class, last_error) = failure.unzip();
         let row = pg(connection.query_opt(
             "UPDATE runtime_session_outbox SET status=$1, next_attempt_at=$2,
@@ -866,7 +866,7 @@ impl PostgresRuntimeEventStore {
         if let Some(row) = row {
             return row_to_runtime_session_outbox(&row);
         }
-        let actual = query_runtime_session_outbox(&mut *connection, terminal_id)?
+        let actual = query_runtime_session_outbox(&mut connection, terminal_id)?
             .map_or(0, |record| record.revision);
         Err(RuntimeEventStoreError::StaleRevision {
             stream_id: format!("terminal:{terminal_id}"),
@@ -925,7 +925,7 @@ fn write_migration_manifest(
 }
 
 fn export_postgres_migration_snapshot(
-    connection: &mut postgres::Client,
+    connection: &mut PostgresConnection,
 ) -> RuntimeEventStoreResult<RuntimeEventStoreSnapshot> {
     let commits = pg(connection.query(
         "SELECT commit_cursor, transaction_id, request_hash, created_at_ms
@@ -1016,7 +1016,7 @@ fn export_postgres_migration_snapshot(
 }
 
 fn import_postgres_migration_snapshot(
-    connection: &mut postgres::Client,
+    connection: &mut PostgresConnection,
     snapshot: &RuntimeEventStoreSnapshot,
 ) -> RuntimeEventStoreResult<()> {
     snapshot.validate()?;
@@ -1181,7 +1181,7 @@ fn canonical_snapshot(snapshot: &RuntimeEventStoreSnapshot) -> RuntimeEventStore
 }
 
 fn append_transaction_in_tx(
-    tx: &mut Transaction<'_>,
+    tx: &mut PostgresTransaction<'_>,
     request: &AppendTransactionRequest,
     terminal: Option<&SessionTerminalInput>,
 ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
@@ -1325,7 +1325,7 @@ fn append_transaction_in_tx(
 }
 
 fn insert_terminal_in_tx(
-    tx: &mut Transaction<'_>,
+    tx: &mut PostgresTransaction<'_>,
     terminal: &SessionTerminalInput,
     commit_cursor: u64,
 ) -> RuntimeEventStoreResult<()> {
@@ -1360,7 +1360,7 @@ fn insert_terminal_in_tx(
 }
 
 fn load_receipt(
-    client: &mut impl GenericClient,
+    client: &mut impl PostgresClient,
     transaction_id: &str,
     duplicate: bool,
 ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
@@ -1402,7 +1402,7 @@ fn load_receipt(
 }
 
 fn load_transaction_events(
-    client: &mut impl GenericClient,
+    client: &mut impl PostgresClient,
     transaction_id: &str,
 ) -> RuntimeEventStoreResult<Vec<RuntimeEventRecord>> {
     let rows = pg(client.query(
@@ -1412,7 +1412,7 @@ fn load_transaction_events(
     rows_to_events(rows)
 }
 
-fn stream_head(client: &mut impl GenericClient, stream_id: &str) -> RuntimeEventStoreResult<u64> {
+fn stream_head(client: &mut impl PostgresClient, stream_id: &str) -> RuntimeEventStoreResult<u64> {
     pg(client.query_opt(
         "SELECT revision FROM runtime_stream_heads WHERE stream_id=$1",
         &[&stream_id],
@@ -1423,7 +1423,7 @@ fn stream_head(client: &mut impl GenericClient, stream_id: &str) -> RuntimeEvent
 }
 
 fn query_runtime_session_outbox(
-    client: &mut impl GenericClient,
+    client: &mut impl PostgresClient,
     terminal_id: &str,
 ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
     pg(client.query_opt(
@@ -1664,7 +1664,7 @@ impl TaskStoreBackend for PostgresTaskStore {
     fn list(&self) -> Result<Vec<TaskRecord>, String> {
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         let rows = connection
             .query(
@@ -1678,7 +1678,7 @@ impl TaskStoreBackend for PostgresTaskStore {
     fn get(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         connection
             .query_opt(
@@ -1693,7 +1693,7 @@ impl TaskStoreBackend for PostgresTaskStore {
     fn current(&self) -> Result<Option<TaskRecord>, String> {
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         connection
             .query_opt(
@@ -1717,7 +1717,7 @@ impl TaskStoreBackend for PostgresTaskStore {
         }
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         let mut transaction = connection
             .transaction()
@@ -1767,7 +1767,7 @@ impl TaskStoreBackend for PostgresTaskStore {
         snapshot.validate()?;
         let mut connection = self
             .executor
-            .checkout()
+            .checkout_runtime()
             .map_err(|error| error.to_string())?;
         let mut transaction = connection
             .transaction()

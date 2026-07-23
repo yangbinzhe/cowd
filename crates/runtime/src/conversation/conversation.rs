@@ -1288,6 +1288,9 @@ pub struct ConversationRuntime<C, T> {
         crate::RealityRecallPort,
         harness_contract::agent::AgentBindingSnapshot,
     )>,
+    /// Startup-selected Knowledge adapter. It is cloned from RuntimeServices;
+    /// turns never reopen a backend or infer one from the config directory.
+    knowledge_activation: Option<KnowledgeActivationRuntime>,
     /// Latest lease-filtered Fact/Matrix recall report, retained for runtime
     /// audit and projections without turning Gateway into a context assembler.
     last_reality_recall_report: std::sync::Mutex<Option<crate::RealityRecallReport>>,
@@ -1590,6 +1593,7 @@ where
             memory_manager,
             memory_status,
             reality_recall: None,
+            knowledge_activation: None,
             last_reality_recall_report: std::sync::Mutex::new(None),
             tool_callback: None,
             session_store: None,
@@ -3287,6 +3291,12 @@ where
         binding: harness_contract::agent::AgentBindingSnapshot,
     ) -> Self {
         self.reality_recall = Some((port, binding));
+        self
+    }
+
+    #[must_use]
+    pub fn with_knowledge_activation(mut self, activation: KnowledgeActivationRuntime) -> Self {
+        self.knowledge_activation = Some(activation);
         self
     }
 
@@ -6066,20 +6076,14 @@ where
                         context_item
                     })
                     .collect::<Vec<_>>();
-                let knowledge_activation = match KnowledgeActivationRuntime::for_config_home(
-                    crate::cowd_dirs::config_home_dir(),
-                ) {
-                    Ok(runtime) => runtime.activate_from_packet(
+                let knowledge_activation = self.knowledge_activation.as_ref().and_then(|runtime| {
+                    runtime.activate_from_packet(
                         &session_id,
                         user_input,
                         &format!("{:?}", self.context_profile()),
                         &packet,
-                    ),
-                    Err(error) => {
-                        tracing::warn!(%error, "durable knowledge activation unavailable");
-                        None
-                    }
-                };
+                    )
+                });
                 let omissions = packet
                     .omitted
                     .iter()

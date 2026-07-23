@@ -58,6 +58,7 @@ Cowd 二进制 + WebUI static assets                ├─ OpenAPI / AI tools / 
 | `apps/catalog.toml`、来源锁与校验 | 已实现 | catalog 只接受显式条目、full SHA 与一致的 bundle/WebUI identity |
 | 新 App 本地 path override | 未实现通用工具 | `apps.local.toml` + xtask 生成，不进入发行提交 |
 | 新 App 静态产品接入 | 已实现 | `xtask apps sync/verify` 生成 bundle dependency、feature 与前端元数据 |
+| App relational storage migration hook | 已实现 | App 自己提供 canonical copy/digest；Cowd 只编排通用 hook 和 evidence |
 | Core / 单 App / full 可选二进制 | 已实现 | optional Cargo dependency + feature 传播 + 定向构建门 |
 
 ## 3. 唯一所有权
@@ -137,6 +138,11 @@ Cargo 在**构建期**依据审核后的 `git + rev` 拉取或复用缓存中的
 6. **接入界面**：WebUI 构建时纳入该 App contribution，运行时依据 Gateway manifest 注册；TUI 同样依据 `/api/apps` 过滤已编译 contribution。两端不得自行决定 App 启停。
 7. **声明配置**：默认配置提供 `apps.<id>.enabled`；禁用必须移除全部 App 对外合同，不得只隐藏菜单。
 8. **验收**：覆盖启用、禁用、无授权、路由拒绝、Skill/AI tool 不发布、TUI/WebUI 不显示、重新启用恢复；证明领域依赖没有反向进入 Runtime。
+9. **存储迁移**：声明 relational storage requirement 的 App 必须通过
+   `StaticAppProduct::with_storage_migrator` 注册自身迁移 hook。App 只消费宿主发放的
+   source/target lease，在自己的仓库内完成 canonical export/import/re-read/digest；不得把
+   App schema、DTO 或 SQL 放进 Cowd。PostgreSQL lease 由宿主限定到独立 schema；启用 App
+   缺 hook、目标非空不一致或 source/target digest 不同都必须阻止全局 cutover。
 
 Cowd 的稳定目录为：
 
@@ -185,5 +191,6 @@ cargo build -p cli --features full
 - 不允许 TUI/WebUI 因静态包中存在 App 代码而绕过 Gateway 实际启用状态。
 - 不允许“禁用”仅删除导航但保留 API、Skill、AI tool 或授权能力。
 - 不允许业务实现扩散到 Gateway、Runtime、TUI、WebUI 多处；App bundle 以外的层只保留通用宿主与合同。
+- 不允许 App 直接解析 PostgreSQL URL、选择主数据库 schema，或绕过宿主 lease 创建第二个连接池。
 
 这些约束换来可复现构建、可审计来源、可回滚版本、按产品裁剪体积和统一能力治理。新增 App 的机械成本应通过 catalog、生成工具和本地 override 降低，而不是牺牲运行期供应链边界。

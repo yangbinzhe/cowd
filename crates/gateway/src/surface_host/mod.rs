@@ -21,7 +21,7 @@ mod supervisor;
 mod types;
 
 pub(crate) use ingress::spawn_surface_ingress_dispatcher;
-use message_store::SqliteSurfaceMessageStore;
+pub(crate) use message_store::SqliteSurfaceMessageStore;
 pub(crate) use message_store::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
     SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
@@ -78,7 +78,7 @@ impl SurfaceHost {
         )
     }
 
-    fn with_configs_and_message_store(
+    pub(crate) fn with_configs_and_message_store(
         roots: Vec<PathBuf>,
         configs: BTreeMap<String, serde_json::Value>,
         messages: Arc<dyn SurfaceMessageLedger>,
@@ -107,15 +107,7 @@ impl SurfaceHost {
         config_home: &Path,
         configs: BTreeMap<String, serde_json::Value>,
     ) -> Self {
-        let install_root = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-            .map(|root| edge_manifest_roots(&root));
-        let mut roots = Vec::new();
-        if let Some(mut install_roots) = install_root {
-            roots.append(&mut install_roots);
-        }
-        roots.extend(edge_manifest_roots(config_home));
+        let roots = default_surface_roots(config_home);
         let message_root = SqliteSurfaceMessageStore::default_root(config_home);
         let storage = storage::StorageRegistry::default_for_config_home(config_home)
             .with_surface_message_root(&message_root)
@@ -137,6 +129,19 @@ impl SurfaceHost {
     pub(crate) fn message_store_root(&self) -> PathBuf {
         self.messages.diagnostic_root()
     }
+}
+
+pub(crate) fn default_surface_roots(config_home: &Path) -> Vec<PathBuf> {
+    let install_root = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .map(|root| edge_manifest_roots(&root));
+    let mut roots = Vec::new();
+    if let Some(mut install_roots) = install_root {
+        roots.append(&mut install_roots);
+    }
+    roots.extend(edge_manifest_roots(config_home));
+    roots
 }
 
 fn edge_manifest_roots(root: &Path) -> Vec<PathBuf> {
