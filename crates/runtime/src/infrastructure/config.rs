@@ -605,8 +605,49 @@ pub struct RuntimeFeatureConfig {
     compression: CompressionConfig,
     gateway: GatewayConfig,
     apps: AppsConfig,
+    storage: StorageTopologyConfig,
     gate_auto_fix: GateAutoFixConfig,
     runtime_control: RuntimeControlConfig,
+}
+
+/// Process-wide durable backend selection.  Credentials are deliberately
+/// represented only by a secret reference; the resolved PostgreSQL URL never
+/// enters Runtime configuration projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackendSelection {
+    #[default]
+    Sqlite,
+    Postgres,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostgresTopologyConfig {
+    pub logical_identity: String,
+    pub secret_ref: String,
+    pub max_connections: u32,
+    pub min_idle_connections: Option<u32>,
+    pub checkout_timeout_ms: u64,
+}
+
+impl Default for PostgresTopologyConfig {
+    fn default() -> Self {
+        Self {
+            logical_identity: "cowd-primary".to_string(),
+            secret_ref: String::new(),
+            max_connections: 16,
+            min_idle_connections: Some(2),
+            checkout_timeout_ms: 5_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageTopologyConfig {
+    pub backend: StorageBackendSelection,
+    pub postgres: Option<PostgresTopologyConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1032,6 +1073,7 @@ impl ConfigLoader {
             compression: parse_optional_compression_config(&merged_value)?,
             gateway: parse_optional_gateway_config(&merged_value)?,
             apps: parse_optional_apps_config(&merged_value)?,
+            storage: parse_optional_storage_config(&merged_value)?,
             gate_auto_fix: parse_optional_gate_auto_fix_config(&merged_value)?,
             runtime_control: parse_optional_runtime_control_config(&merged_value)?,
         };
@@ -1183,6 +1225,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn apps(&self) -> &AppsConfig {
         &self.feature_config.apps
+    }
+
+    #[must_use]
+    pub fn storage(&self) -> &StorageTopologyConfig {
+        &self.feature_config.storage
     }
 
     #[must_use]
@@ -1381,6 +1428,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn gateway(&self) -> &GatewayConfig {
         &self.gateway
+    }
+
+    #[must_use]
+    pub fn storage(&self) -> &StorageTopologyConfig {
+        &self.storage
     }
 
     #[must_use]
@@ -2431,6 +2483,91 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
     Ok(AppsConfig { entries })
 }
 
+fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConfig, ConfigError> {
+    let Some(root) = root.as_object() else {
+        return Ok(StorageTopologyConfig::default());
+    };
+    let Some(value) = root.get("storage") else {
+        return Ok(StorageTopologyConfig::default());
+    };
+    let storage = expect_object(value, "merged settings.storage")?;
+    let backend =
+        match optional_string(storage, "backend", "merged settings.storage")?.unwrap_or("sqlite") {
+            "sqlite" => StorageBackendSelection::Sqlite,
+            "postgres" => StorageBackendSelection::Postgres,
+            other => {
+                return Err(ConfigError::Parse(format!(
+                    "merged settings.storage.backend must be sqlite or postgres, got {other}"
+                )))
+            }
+        };
+    let postgres = storage
+        .get("postgres")
+        .map(|value| {
+            let value = expect_object(value, "merged settings.storage.postgres")?;
+            let defaults = PostgresTopologyConfig::default();
+            let logical_identity = optional_string(
+                value,
+                "logicalIdentity",
+                "merged settings.storage.postgres",
+            )?
+            .unwrap_or(defaults.logical_identity.as_str())
+            .trim()
+            .to_string();
+            let secret_ref = optional_string(
+                value,
+                "secretRef",
+                "merged settings.storage.postgres",
+            )?
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+            let max_connections = optional_u32(
+                value,
+                "maxConnections",
+                "merged settings.storage.postgres",
+            )?
+            .unwrap_or(defaults.max_connections);
+            let min_idle_connections = optional_u32(
+                value,
+                "minIdleConnections",
+                "merged settings.storage.postgres",
+            )?
+            .or(defaults.min_idle_connections);
+            let checkout_timeout_ms = optional_u64(
+                value,
+                "checkoutTimeoutMs",
+                "merged settings.storage.postgres",
+            )?
+            .unwrap_or(defaults.checkout_timeout_ms);
+            if logical_identity.is_empty()
+                || secret_ref.is_empty()
+                || max_connections == 0
+                || max_connections > 256
+                || min_idle_connections.is_some_and(|minimum| minimum > max_connections)
+                || !(100..=120_000).contains(&checkout_timeout_ms)
+            {
+                return Err(ConfigError::Parse(
+                    "merged settings.storage.postgres requires a non-empty logicalIdentity/secretRef, maxConnections 1..256, minIdleConnections <= maxConnections, and checkoutTimeoutMs 100..120000".to_string(),
+                ));
+            }
+            Ok(PostgresTopologyConfig {
+                logical_identity,
+                secret_ref,
+                max_connections,
+                min_idle_connections,
+                checkout_timeout_ms,
+            })
+        })
+        .transpose()?;
+    if backend == StorageBackendSelection::Postgres && postgres.is_none() {
+        return Err(ConfigError::Parse(
+            "merged settings.storage.postgres is required when backend=postgres".to_string(),
+        ));
+    }
+    Ok(StorageTopologyConfig { backend, postgres })
+}
+
 fn parse_optional_gate_auto_fix_config(root: &JsonValue) -> Result<GateAutoFixConfig, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(GateAutoFixConfig::default());
@@ -3258,9 +3395,10 @@ mod tests {
     use super::{
         deep_merge_objects, parse_optional_compression_config,
         parse_optional_context_budget_config, parse_optional_model_context_windows,
-        parse_permission_mode_label, redact_serde_json, ConfigLoader, ConfigSource, DomainProfile,
-        McpServerConfig, McpTransport, ProviderProtocol, ResolvedPermissionMode, RuntimeConfig,
-        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
+        parse_optional_storage_config, parse_permission_mode_label, redact_serde_json,
+        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport, ProviderProtocol,
+        ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+        RuntimePluginConfig, SessionCompactConfig, StorageBackendSelection,
         COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
@@ -4665,5 +4803,30 @@ gateway:
             .expect_err("sub-1024 context window must fail validation")
             .to_string()
             .contains("at least 1024"));
+    }
+
+    #[test]
+    fn storage_topology_defaults_to_sqlite_and_postgres_is_strict() {
+        let defaults = parse_optional_storage_config(&JsonValue::parse("{}").unwrap()).unwrap();
+        assert_eq!(defaults.backend, StorageBackendSelection::Sqlite);
+        assert!(defaults.postgres.is_none());
+
+        let postgres = JsonValue::parse(
+            r#"{"storage":{"backend":"postgres","postgres":{"logicalIdentity":"cowd-test","secretRef":"env:COWD_TEST_POSTGRES_URL","maxConnections":24,"minIdleConnections":3,"checkoutTimeoutMs":2500}}}"#,
+        )
+        .unwrap();
+        let selected = parse_optional_storage_config(&postgres).unwrap();
+        assert_eq!(selected.backend, StorageBackendSelection::Postgres);
+        let postgres = selected.postgres.unwrap();
+        assert_eq!(postgres.secret_ref, "env:COWD_TEST_POSTGRES_URL");
+        assert_eq!(postgres.max_connections, 24);
+
+        let missing = JsonValue::parse(r#"{"storage":{"backend":"postgres"}}"#).unwrap();
+        assert!(parse_optional_storage_config(&missing).is_err());
+        let invalid = JsonValue::parse(
+            r#"{"storage":{"backend":"postgres","postgres":{"logicalIdentity":"cowd","secretRef":"env:X","maxConnections":0}}}"#,
+        )
+        .unwrap();
+        assert!(parse_optional_storage_config(&invalid).is_err());
     }
 }

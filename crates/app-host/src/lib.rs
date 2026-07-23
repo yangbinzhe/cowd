@@ -548,6 +548,59 @@ pub struct AppStorageLeases {
     leases: BTreeMap<(String, cowd_app_sdk::AppStorageScope), AppStorageLease>,
 }
 
+/// Canonical proof returned by one APP-owned storage migration.  Cowd owns
+/// orchestration and activation, while the APP remains the only component
+/// that understands its schema and record counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStorageDomainMigrationEvidence {
+    pub domain: String,
+    pub source_digest: String,
+    pub target_digest: String,
+    #[serde(default)]
+    pub record_counts: BTreeMap<String, u64>,
+}
+
+impl AppStorageDomainMigrationEvidence {
+    pub fn validate(&self) -> Result<(), AppRegistryError> {
+        if self.domain.trim().is_empty()
+            || self.source_digest.trim().is_empty()
+            || self.source_digest != self.target_digest
+        {
+            return Err(AppRegistryError::InvalidStorageMigrationEvidence(
+                self.domain.clone(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStorageMigrationEvidence {
+    pub app_id: AppId,
+    pub contract_version: u32,
+    pub domains: Vec<AppStorageDomainMigrationEvidence>,
+}
+
+impl AppStorageMigrationEvidence {
+    pub fn validate_for(&self, app_id: &AppId) -> Result<(), AppRegistryError> {
+        if &self.app_id != app_id || self.contract_version == 0 || self.domains.is_empty() {
+            return Err(AppRegistryError::InvalidStorageMigrationEvidence(
+                app_id.to_string(),
+            ));
+        }
+        let mut domains = BTreeMap::new();
+        for evidence in &self.domains {
+            evidence.validate()?;
+            if domains.insert(evidence.domain.clone(), ()).is_some() {
+                return Err(AppRegistryError::InvalidStorageMigrationEvidence(
+                    evidence.domain.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl AppStorageLeases {
     pub fn new(app_id: AppId, leases: Vec<AppStorageLease>) -> Result<Self, AppRegistryError> {
         let mut indexed = BTreeMap::new();
@@ -1018,6 +1071,10 @@ pub enum AppRegistryError {
     InvalidArtifactPath(String),
     #[error("application artifact I/O failed: {0}")]
     StorageIo(String),
+    #[error("application storage migration failed: {0}")]
+    StorageMigration(String),
+    #[error("application storage migration evidence is invalid for {0}")]
+    InvalidStorageMigrationEvidence(String),
 }
 
 impl From<std::io::Error> for AppRegistryError {
@@ -1038,6 +1095,12 @@ pub struct StaticAppProduct {
     register: fn(&mut AppRegistry, AppProductContext) -> Result<(), AppRegistryError>,
     tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
     storage_requirements: fn() -> Vec<AppStorageRequirement>,
+    storage_migrator: Option<
+        fn(
+            &AppStorageLeases,
+            &AppStorageLeases,
+        ) -> Result<AppStorageMigrationEvidence, AppRegistryError>,
+    >,
     source_lock: Option<StaticAppSourceLock>,
 }
 
@@ -1076,8 +1139,21 @@ impl StaticAppProduct {
             register,
             tui_surface,
             storage_requirements,
+            storage_migrator: None,
             source_lock: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_storage_migrator(
+        mut self,
+        migrator: fn(
+            &AppStorageLeases,
+            &AppStorageLeases,
+        ) -> Result<AppStorageMigrationEvidence, AppRegistryError>,
+    ) -> Self {
+        self.storage_migrator = Some(migrator);
+        self
     }
 
     #[must_use]
@@ -1119,6 +1195,27 @@ impl StaticAppProduct {
         AppStorageContract::new(self.app_id(), self.storage_requirements())
     }
 
+    pub fn migrate_storage(
+        self,
+        source: &AppStorageLeases,
+        target: &AppStorageLeases,
+    ) -> Result<AppStorageMigrationEvidence, AppRegistryError> {
+        let app_id = self.app_id();
+        let migrator = self.storage_migrator.ok_or_else(|| {
+            AppRegistryError::StorageMigration(format!(
+                "application {app_id} has durable storage but no migration hook"
+            ))
+        })?;
+        let evidence = migrator(source, target)?;
+        evidence.validate_for(&app_id)?;
+        Ok(evidence)
+    }
+
+    #[must_use]
+    pub const fn has_storage_migrator(self) -> bool {
+        self.storage_migrator.is_some()
+    }
+
     #[must_use]
     pub fn source_lock(self) -> Option<AppSourceLock> {
         self.source_lock.map(StaticAppSourceLock::owned)
@@ -1134,6 +1231,43 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn static_descriptor() -> AppDescriptor {
+        FixtureApp {
+            id: "fixture",
+            path: "/api/apps/fixture",
+            capability: "fixture.read",
+        }
+        .descriptor()
+    }
+
+    fn static_register(
+        _registry: &mut AppRegistry,
+        _context: AppProductContext,
+    ) -> Result<(), AppRegistryError> {
+        Ok(())
+    }
+
+    fn static_requirements() -> Vec<AppStorageRequirement> {
+        Vec::new()
+    }
+
+    fn static_migrate(
+        source: &AppStorageLeases,
+        target: &AppStorageLeases,
+    ) -> Result<AppStorageMigrationEvidence, AppRegistryError> {
+        assert_eq!(source.app_id(), target.app_id());
+        Ok(AppStorageMigrationEvidence {
+            app_id: source.app_id().clone(),
+            contract_version: 1,
+            domains: vec![AppStorageDomainMigrationEvidence {
+                domain: "primary".to_string(),
+                source_digest: "same-digest".to_string(),
+                target_digest: "same-digest".to_string(),
+                record_counts: BTreeMap::new(),
+            }],
+        })
+    }
 
     struct FixtureApp {
         id: &'static str,
@@ -1497,5 +1631,28 @@ mod tests {
                 );
             })
             .expect("render external panel");
+    }
+
+    #[test]
+    fn app_storage_migration_hook_is_explicit_and_evidence_is_validated() {
+        let app_id = AppId::parse("fixture").unwrap();
+        let source = AppStorageLeases::new(app_id.clone(), Vec::new()).unwrap();
+        let target = AppStorageLeases::new(app_id, Vec::new()).unwrap();
+        let product = StaticAppProduct::new_provisioned(
+            static_descriptor,
+            static_register,
+            None,
+            static_requirements,
+        );
+        assert!(!product.has_storage_migrator());
+        assert!(matches!(
+            product.migrate_storage(&source, &target),
+            Err(AppRegistryError::StorageMigration(_))
+        ));
+
+        let product = product.with_storage_migrator(static_migrate);
+        let evidence = product.migrate_storage(&source, &target).unwrap();
+        assert_eq!(evidence.app_id.as_str(), "fixture");
+        assert_eq!(evidence.domains[0].source_digest, "same-digest");
     }
 }

@@ -371,9 +371,10 @@ pub use config::{
     GatewayCapacityConfig, GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig,
     McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
     McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
-    PlatformConfig as GatewayPlatformConfig, ResolvedPermissionMode, RuntimeConfig,
-    RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
-    RuntimePluginConfig, ScopedMcpServerConfig, SessionResetPolicy, COWD_SETTINGS_SCHEMA_NAME,
+    PlatformConfig as GatewayPlatformConfig, PostgresTopologyConfig, ResolvedPermissionMode,
+    RuntimeConfig, RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig, SessionResetPolicy,
+    StorageBackendSelection, StorageTopologyConfig, COWD_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

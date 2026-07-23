@@ -11,7 +11,7 @@ use std::{
 
 use cowd_app_host::{
     AppProductContext, AppRegistry, AppRegistryError, AppStorageLease, AppStorageLeases,
-    StaticAppProduct, TuiAppSurfaceContribution,
+    AppStorageMigrationEvidence, StaticAppProduct, TuiAppSurfaceContribution,
 };
 use cowd_app_sdk::{
     AppDescriptor, AppStorageBackend, AppStorageProvision, AppStorageReadiness,
@@ -70,9 +70,42 @@ pub struct AppStorageProvisioning {
 }
 
 impl AppStorageProvisioning {
-    fn leases_for(&self, app_id: &str) -> Option<AppStorageLeases> {
+    pub fn leases_for(&self, app_id: &str) -> Option<AppStorageLeases> {
         self.leases.get(app_id).cloned()
     }
+}
+
+/// Provision both sides of a maintenance-window cutover and let each enabled
+/// APP migrate only its own schemas.  The product catalogue remains generic:
+/// no application id or DTO appears in this orchestration path.
+pub fn migrate_enabled_storage(
+    source_registry: storage::StorageRegistry,
+    source_topology: AppStorageTopology,
+    target_registry: storage::StorageRegistry,
+    target_topology: AppStorageTopology,
+    is_enabled: &dyn Fn(&str) -> bool,
+) -> Result<Vec<AppStorageMigrationEvidence>, ProductAppRegistrationError> {
+    let products = compiled_products()
+        .into_iter()
+        .filter(|product| is_enabled(product.app_id().as_str()))
+        .collect::<Vec<_>>();
+    let source = provision_products(&products, source_registry, &source_topology)?;
+    let target = provision_products(&products, target_registry, &target_topology)?;
+    products
+        .into_iter()
+        .map(|product| {
+            let app_id = product.app_id();
+            let source = source.leases_for(app_id.as_str()).ok_or_else(|| {
+                AppStorageResolutionError::IncompleteProvision(app_id.to_string())
+            })?;
+            let target = target.leases_for(app_id.as_str()).ok_or_else(|| {
+                AppStorageResolutionError::IncompleteProvision(app_id.to_string())
+            })?;
+            product
+                .migrate_storage(&source, &target)
+                .map_err(ProductAppRegistrationError::from)
+        })
+        .collect()
 }
 
 fn resolve_backend(
