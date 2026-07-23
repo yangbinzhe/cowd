@@ -613,7 +613,7 @@ mod tests {
             endpoint.domain == storage::StorageDomainId::app("mfg", "primary")
         }));
         let projection = serde_json::to_string(&registered).expect("registry projection");
-        assert!(projection.contains("dde370bddfbab25522f268b4f37a3b73829f8294"));
+        assert!(projection.contains("41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4"));
         assert!(!projection.contains(".sqlite"));
         assert!(!projection.contains(config_home.to_string_lossy().as_ref()));
         let _ = std::fs::remove_dir_all(config_home);

@@ -382,7 +382,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-adapter"
 version = "0.9.581"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=dde370bddfbab25522f268b4f37a3b73829f8294#dde370bddfbab25522f268b4f37a3b73829f8294"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4#41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4"
 dependencies = [
  "async-trait",
  "axum",
@@ -408,7 +408,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-bundle"
 version = "0.9.581"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=dde370bddfbab25522f268b4f37a3b73829f8294#dde370bddfbab25522f268b4f37a3b73829f8294"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4#41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4"
 dependencies = [
  "async-trait",
  "cowd-app-host",
@@ -421,7 +421,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-contract"
 version = "0.9.581"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=dde370bddfbab25522f268b4f37a3b73829f8294#dde370bddfbab25522f268b4f37a3b73829f8294"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4#41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -434,7 +434,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-core"
 version = "0.9.581"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=dde370bddfbab25522f268b4f37a3b73829f8294#dde370bddfbab25522f268b4f37a3b73829f8294"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4#41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
@@ -455,7 +455,7 @@ dependencies = [
 [[package]]
 name = "cowd-app-mfg-tui"
 version = "0.9.581"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=dde370bddfbab25522f268b4f37a3b73829f8294#dde370bddfbab25522f268b4f37a3b73829f8294"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4#41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4"
 dependencies = [
  "chrono",
  "cowd-app-host",
