@@ -473,5 +473,36 @@ mod tests {
         assert!(enabled_app_descriptors(&apps).is_empty());
         assert!(registry.apps().is_empty());
         assert!(registry.skills().is_empty());
+        assert!(registry.storage_endpoints().is_empty());
+    }
+
+    #[test]
+    fn enabled_app_registry_owns_source_storage_and_surface_truth_together() {
+        let apps = runtime::AppsConfig::default();
+        let binding = GatewayAppHostBinding::new();
+        let config_home =
+            std::env::temp_dir().join(format!("cowd-v579-registry-{}", std::process::id()));
+        let registry = broker_backed_app_registry(&config_home, binding.context(), &apps);
+        let registered = registry.apps();
+        let mfg = registered
+            .iter()
+            .find(|app| app.descriptor.id.as_str() == "mfg")
+            .expect("enabled MFG descriptor");
+        assert!(mfg.source_lock.is_some());
+        let storage = mfg.storage.as_ref().expect("MFG storage contract");
+        assert_eq!(storage.contract.migration_owner.as_str(), "mfg");
+        assert_eq!(storage.provisions.len(), 1);
+        assert_eq!(
+            storage.provisions[0].backend,
+            cowd_app_sdk::AppStorageBackend::Sqlite
+        );
+        assert!(registry.storage_endpoints().iter().any(|endpoint| {
+            endpoint.domain == storage::StorageDomainId::app("mfg", "primary")
+        }));
+        let projection = serde_json::to_string(&registered).expect("registry projection");
+        assert!(projection.contains("db13d02e611840b95160c8a4effb383c0835e399"));
+        assert!(!projection.contains(".sqlite"));
+        assert!(!projection.contains(config_home.to_string_lossy().as_ref()));
+        let _ = std::fs::remove_dir_all(config_home);
     }
 }

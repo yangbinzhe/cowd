@@ -2952,6 +2952,11 @@ pub(crate) mod tests {
             .iter()
             .any(|item| item["domain"]["kind"] == "connector_directory"));
         assert!(endpoints.iter().any(|item| item["id"] == "tasks"));
+        assert!(endpoints.iter().any(|item| {
+            item["domain"]["kind"] == "app"
+                && item["domain"]["app_id"] == "mfg"
+                && item["domain"]["domain"] == "primary"
+        }));
         assert!(
             json["storage"]["locks"].as_array().unwrap().len() >= 7,
             "storage lock list should include all core sqlite domains"
@@ -3088,6 +3093,9 @@ pub(crate) mod tests {
             json["control_channel"],
             "runtime host local control channel"
         );
+        assert!(json["enabled_app_ids"]
+            .as_array()
+            .is_some_and(|apps| apps.iter().any(|app| app == "mfg")));
     }
 
     #[tokio::test]
@@ -3827,6 +3835,40 @@ pub(crate) mod tests {
             .expect("registered MFG app is projected generically");
         assert_eq!(application["layer"], "application");
         assert_eq!(application["owner_module"], "app:mfg");
+    }
+
+    #[tokio::test]
+    async fn app_catalogue_projects_source_and_storage_contract_without_physical_location() {
+        let app = api_router(test_state());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+        let mfg = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|app| app["descriptor"]["id"] == "mfg")
+            .expect("registered MFG app");
+        assert_eq!(mfg["storage"]["contract"]["contract_version"], 1);
+        assert_eq!(mfg["storage"]["contract"]["migration_owner"], "mfg");
+        assert_eq!(mfg["storage"]["provisions"][0]["backend"], "sqlite");
+        assert_eq!(
+            mfg["source_lock"]["revision"],
+            "db13d02e611840b95160c8a4effb383c0835e399"
+        );
+        assert!(!body_text.contains(".sqlite"));
+        assert!(!body_text.contains("postgres://"));
+        assert!(!body_text.contains("secret_ref"));
     }
 
     #[tokio::test]

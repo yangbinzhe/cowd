@@ -260,6 +260,46 @@ impl StorageEndpoint {
             StorageScope::App { app_id } => format!("{}@app:{app_id}", self.domain.logical_name()),
         }
     }
+
+    /// Deterministic PostgreSQL schema owned by one APP storage endpoint.
+    /// The hash includes scope, so the same domain in separate workspaces
+    /// cannot collide.  No deployment secret participates in the name.
+    pub fn app_postgres_namespace(&self) -> Result<String, StorageError> {
+        let StorageDomainId::App { app_id, domain } = &self.domain else {
+            return Err(StorageError::Other(format!(
+                "storage endpoint `{}` is not an application domain",
+                self.logical_id()
+            )));
+        };
+        if self.backend != StorageBackendKind::Postgres {
+            return Err(StorageError::Other(format!(
+                "storage endpoint `{}` is not postgres-backed",
+                self.logical_id()
+            )));
+        }
+        let mut digest = Sha256::new();
+        digest.update(self.logical_id().as_bytes());
+        let hash = format!("{:x}", digest.finalize());
+        let segment = |value: &str| {
+            value
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_lowercase() || character.is_ascii_digit() {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .take(20)
+                .collect::<String>()
+        };
+        Ok(format!(
+            "cowd_app_{}_{}_{}",
+            segment(app_id),
+            segment(domain),
+            &hash[..12]
+        ))
+    }
 }
 
 fn endpoint_from_handle(handle: &StorageHandle) -> StorageEndpoint {
@@ -572,11 +612,46 @@ impl StorageRegistry {
     /// location convention. The host never needs to know an APP's schema;
     /// it only provides a stable owner/scope/location envelope.
     pub fn with_app_sqlite(
-        mut self,
+        self,
         app_id: impl AsRef<str>,
         domain: impl AsRef<str>,
         migration: impl Into<String>,
     ) -> Result<Self, StorageError> {
+        let app_id = app_id.as_ref();
+        self.with_app_storage(
+            app_id,
+            domain,
+            StorageScope::App {
+                app_id: app_id.to_string(),
+            },
+            StorageBackendKind::Sqlite,
+            migration,
+        )
+    }
+
+    /// Register one host-resolved APP endpoint.  The APP supplies only its
+    /// logical domain and migration identity; the host supplies backend,
+    /// scope and physical topology.
+    pub fn with_app_storage(
+        mut self,
+        app_id: impl AsRef<str>,
+        domain: impl AsRef<str>,
+        scope: StorageScope,
+        backend: StorageBackendKind,
+        migration: impl Into<String>,
+    ) -> Result<Self, StorageError> {
+        self.register_app_storage(app_id, domain, scope, backend, migration)?;
+        Ok(self)
+    }
+
+    pub fn register_app_storage(
+        &mut self,
+        app_id: impl AsRef<str>,
+        domain: impl AsRef<str>,
+        scope: StorageScope,
+        backend: StorageBackendKind,
+        migration: impl Into<String>,
+    ) -> Result<(), StorageError> {
         let app_id = app_id.as_ref();
         let domain = domain.as_ref();
         if !is_storage_segment(app_id) || !is_storage_segment(domain) {
@@ -584,20 +659,44 @@ impl StorageRegistry {
                 "invalid app storage identity `{app_id}:{domain}`"
             )));
         }
-        self.register_endpoint(StorageEndpoint::sqlite(
-            StorageDomainId::app(app_id, domain),
+        match &scope {
             StorageScope::App {
-                app_id: app_id.to_string(),
-            },
-            self.layout
+                app_id: scoped_app_id,
+            } if scoped_app_id == app_id => {}
+            StorageScope::Workspace { .. } => {}
+            _ => {
+                return Err(StorageError::Other(format!(
+                    "invalid scope for app storage identity `{app_id}:{domain}`"
+                )))
+            }
+        }
+        let scoped_root = match &scope {
+            StorageScope::App { .. } => self.layout.root.join("apps").join(app_id),
+            StorageScope::Workspace { key } => self
+                .layout
                 .root
+                .join("workspaces")
+                .join(key)
                 .join("apps")
-                .join(app_id)
-                .join(format!("{domain}.sqlite")),
+                .join(app_id),
+            StorageScope::Global => unreachable!("global APP scope was rejected above"),
+        };
+        let path = match backend {
+            StorageBackendKind::Sqlite => scoped_root.join(format!("{domain}.sqlite")),
+            StorageBackendKind::Postgres => PathBuf::new(),
+            StorageBackendKind::FileJson => scoped_root.join(format!("{domain}.json")),
+            StorageBackendKind::Directory => scoped_root.join(domain),
+            StorageBackendKind::BlobDirectory => scoped_root.join(format!("{domain}.blobs")),
+        };
+        self.register_endpoint(StorageEndpoint::new(
+            StorageDomainId::app(app_id, domain),
+            scope,
+            backend,
+            path,
             app_id,
             migration,
         ))?;
-        Ok(self)
+        Ok(())
     }
 
     pub fn with_workspace(
@@ -1288,6 +1387,70 @@ mod tests {
         assert!(registry
             .with_app_sqlite("mfg", "primary", "duplicate")
             .is_err());
+    }
+
+    #[test]
+    fn generic_app_endpoints_cover_postgres_workspace_and_artifacts() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_scope = StorageScope::workspace_for_root(workspace.path());
+        let registry = StorageRegistry::default_for_config_home("/tmp/cowd-app-storage")
+            .with_app_storage(
+                "fixture",
+                "primary",
+                StorageScope::App {
+                    app_id: "fixture".to_string(),
+                },
+                StorageBackendKind::Postgres,
+                "fixture_primary_v1",
+            )
+            .unwrap()
+            .with_app_storage(
+                "fixture",
+                "primary",
+                workspace_scope.clone(),
+                StorageBackendKind::Postgres,
+                "fixture_workspace_primary_v1",
+            )
+            .unwrap()
+            .with_app_storage(
+                "fixture",
+                "workspace-cache",
+                workspace_scope.clone(),
+                StorageBackendKind::Directory,
+                "fixture_workspace_v1",
+            )
+            .unwrap();
+        let postgres = registry
+            .endpoint_in_scope(
+                &StorageDomainId::app("fixture", "primary"),
+                &StorageScope::App {
+                    app_id: "fixture".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(postgres.path.as_os_str().is_empty());
+        let namespace = postgres.app_postgres_namespace().unwrap();
+        assert!(namespace.starts_with("cowd_app_fixture_primary_"));
+        assert!(namespace.len() <= 63);
+        let workspace_postgres = registry
+            .endpoint_in_scope(
+                &StorageDomainId::app("fixture", "primary"),
+                &workspace_scope,
+            )
+            .unwrap();
+        assert_ne!(
+            namespace,
+            workspace_postgres.app_postgres_namespace().unwrap()
+        );
+
+        let artifact = registry
+            .endpoint_in_scope(
+                &StorageDomainId::app("fixture", "workspace-cache"),
+                &workspace_scope,
+            )
+            .unwrap();
+        assert_eq!(artifact.backend, StorageBackendKind::Directory);
+        assert!(artifact.path.ends_with("apps/fixture/workspace-cache"));
     }
 
     #[test]

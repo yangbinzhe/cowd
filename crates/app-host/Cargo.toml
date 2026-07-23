@@ -12,7 +12,12 @@ crossterm = "0.28"
 ratatui = "0.29"
 serde.workspace = true
 serde_json.workspace = true
+storage = { path = "../storage" }
 thiserror = "2"
+
+[features]
+default = []
+app-postgres = ["storage/storage-postgres"]
 
 [lints]
 workspace = true

@@ -6,13 +6,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use axum::Router;
 use cowd_app_sdk::{
     AppContractError, AppDescriptor, AppHealth, AppHttpContract, AppId, AppRouteMetadata,
-    AppSkillDescriptor, AppStorageRequirement, CapabilityApp, CowdAppContext,
+    AppSkillDescriptor, AppSourceLock, AppStorageContract, AppStorageProvision,
+    AppStorageRequirement, CapabilityApp, CowdAppContext,
 };
 use crossterm::event::KeyEvent;
 use ratatui::{
@@ -376,6 +380,254 @@ pub struct RegisteredApp {
     pub health: AppHealth,
     pub http_registered: bool,
     pub tui_registered: bool,
+    pub source_lock: Option<AppSourceLock>,
+    pub storage: Option<AppStorageRegistration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStorageRegistration {
+    pub contract: AppStorageContract,
+    pub provisions: Vec<AppStorageProvision>,
+}
+
+#[derive(Clone)]
+enum AppStorageResource {
+    Sqlite(storage::SqliteExecutor),
+    #[cfg(feature = "app-postgres")]
+    Postgres(storage::PostgresExecutor),
+    Artifact(AppArtifactLease),
+}
+
+/// A host-owned artifact root.  APP code can perform bounded relative I/O but
+/// cannot inspect or replace the physical root chosen by the deployment.
+#[derive(Clone)]
+pub struct AppArtifactLease {
+    endpoint: storage::StorageEndpoint,
+}
+
+impl AppArtifactLease {
+    fn new(endpoint: storage::StorageEndpoint) -> Self {
+        Self { endpoint }
+    }
+
+    fn resolved_path(&self, relative: &std::path::Path) -> Result<PathBuf, AppRegistryError> {
+        use std::path::Component;
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+        {
+            return Err(AppRegistryError::InvalidArtifactPath(
+                self.endpoint.logical_id(),
+            ));
+        }
+        match self.endpoint.backend {
+            storage::StorageBackendKind::FileJson => {
+                if relative.as_os_str().is_empty() || relative == std::path::Path::new(".") {
+                    Ok(self.endpoint.path.clone())
+                } else {
+                    Err(AppRegistryError::InvalidArtifactPath(
+                        self.endpoint.logical_id(),
+                    ))
+                }
+            }
+            storage::StorageBackendKind::Directory | storage::StorageBackendKind::BlobDirectory => {
+                Ok(self.endpoint.path.join(relative))
+            }
+            _ => Err(AppRegistryError::InvalidArtifactPath(
+                self.endpoint.logical_id(),
+            )),
+        }
+    }
+
+    pub fn read(&self, relative: impl AsRef<std::path::Path>) -> Result<Vec<u8>, AppRegistryError> {
+        Ok(std::fs::read(self.resolved_path(relative.as_ref())?)?)
+    }
+
+    pub fn write(
+        &self,
+        relative: impl AsRef<std::path::Path>,
+        value: &[u8],
+    ) -> Result<(), AppRegistryError> {
+        let target = self.resolved_path(relative.as_ref())?;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        static ARTIFACT_WRITE_NONCE: AtomicU64 = AtomicU64::new(1);
+        let temporary = target.with_extension(format!(
+            "cowd-tmp-{}-{}",
+            std::process::id(),
+            ARTIFACT_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&temporary, value)?;
+        std::fs::rename(temporary, target)?;
+        Ok(())
+    }
+}
+
+/// One ready, host-provisioned storage capability.  Its public metadata is
+/// path-free; engine access is limited to the selected bounded executor.
+#[derive(Clone)]
+pub struct AppStorageLease {
+    endpoint: storage::StorageEndpoint,
+    provision: AppStorageProvision,
+    resource: AppStorageResource,
+}
+
+impl AppStorageLease {
+    #[must_use]
+    pub fn sqlite(
+        endpoint: storage::StorageEndpoint,
+        provision: AppStorageProvision,
+        executor: storage::SqliteExecutor,
+    ) -> Self {
+        Self {
+            endpoint,
+            provision,
+            resource: AppStorageResource::Sqlite(executor),
+        }
+    }
+
+    #[must_use]
+    #[cfg(feature = "app-postgres")]
+    pub fn postgres(
+        endpoint: storage::StorageEndpoint,
+        provision: AppStorageProvision,
+        executor: storage::PostgresExecutor,
+    ) -> Self {
+        Self {
+            endpoint,
+            provision,
+            resource: AppStorageResource::Postgres(executor),
+        }
+    }
+
+    #[must_use]
+    pub fn artifact(endpoint: storage::StorageEndpoint, provision: AppStorageProvision) -> Self {
+        Self {
+            resource: AppStorageResource::Artifact(AppArtifactLease::new(endpoint.clone())),
+            endpoint,
+            provision,
+        }
+    }
+
+    #[must_use]
+    pub fn provision(&self) -> &AppStorageProvision {
+        &self.provision
+    }
+
+    #[must_use]
+    pub fn sqlite_executor(&self) -> Option<&storage::SqliteExecutor> {
+        match &self.resource {
+            AppStorageResource::Sqlite(executor) => Some(executor),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    #[cfg(feature = "app-postgres")]
+    pub fn postgres_executor(&self) -> Option<&storage::PostgresExecutor> {
+        match &self.resource {
+            AppStorageResource::Postgres(executor) => Some(executor),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn artifact_lease(&self) -> Option<&AppArtifactLease> {
+        match &self.resource {
+            AppStorageResource::Artifact(lease) => Some(lease),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AppStorageLeases {
+    app_id: AppId,
+    leases: BTreeMap<(String, cowd_app_sdk::AppStorageScope), AppStorageLease>,
+}
+
+impl AppStorageLeases {
+    pub fn new(app_id: AppId, leases: Vec<AppStorageLease>) -> Result<Self, AppRegistryError> {
+        let mut indexed = BTreeMap::new();
+        for lease in leases {
+            let key = (
+                lease.provision.domain.clone(),
+                lease.provision.scope.clone(),
+            );
+            if indexed.insert(key, lease).is_some() {
+                return Err(AppRegistryError::DuplicateStorageLease(app_id));
+            }
+        }
+        Ok(Self {
+            app_id,
+            leases: indexed,
+        })
+    }
+
+    #[must_use]
+    pub fn app_id(&self) -> &AppId {
+        &self.app_id
+    }
+
+    #[must_use]
+    pub fn get(
+        &self,
+        domain: &str,
+        scope: &cowd_app_sdk::AppStorageScope,
+    ) -> Option<&AppStorageLease> {
+        self.leases.get(&(domain.to_string(), scope.clone()))
+    }
+
+    #[must_use]
+    pub fn provisions(&self) -> Vec<AppStorageProvision> {
+        self.leases
+            .values()
+            .map(|lease| lease.provision.clone())
+            .collect()
+    }
+
+    fn endpoints(&self) -> Vec<storage::StorageEndpoint> {
+        self.leases
+            .values()
+            .map(|lease| lease.endpoint.clone())
+            .collect()
+    }
+}
+
+/// Complete, app-scoped product registration context.  New APP code has no
+/// config-home accessor and therefore cannot derive an undeclared DB path.
+#[derive(Clone)]
+pub struct AppProductContext {
+    host: CowdAppContext,
+    storage: AppStorageLeases,
+    legacy_config_home: PathBuf,
+}
+
+impl AppProductContext {
+    #[must_use]
+    pub fn new(
+        host: CowdAppContext,
+        storage: AppStorageLeases,
+        legacy_config_home: PathBuf,
+    ) -> Self {
+        Self {
+            host,
+            storage,
+            legacy_config_home,
+        }
+    }
+
+    #[must_use]
+    pub fn host(&self) -> &CowdAppContext {
+        &self.host
+    }
+
+    #[must_use]
+    pub fn storage(&self) -> &AppStorageLeases {
+        &self.storage
+    }
 }
 
 /// Startup-only registry. It is intentionally immutable after construction:
@@ -388,6 +640,7 @@ pub struct AppRegistry {
     tui: BTreeMap<AppId, TuiAppContribution>,
     skills: BTreeMap<AppId, Vec<AppSkillDescriptor>>,
     quality_checks: BTreeMap<AppId, Vec<AppQualityCheck>>,
+    storage_leases: BTreeMap<AppId, AppStorageLeases>,
 }
 
 impl AppRegistry {
@@ -447,9 +700,79 @@ impl AppRegistry {
                 health,
                 http_registered,
                 tui_registered,
+                source_lock: None,
+                storage: None,
             },
         );
         Ok(())
+    }
+
+    pub fn attach_product_contract(
+        &mut self,
+        app_id: &AppId,
+        source_lock: Option<AppSourceLock>,
+        contract: AppStorageContract,
+        leases: AppStorageLeases,
+    ) -> Result<(), AppRegistryError> {
+        let app = self
+            .apps
+            .get_mut(app_id)
+            .ok_or_else(|| AppRegistryError::UnknownApp(app_id.clone()))?;
+        if app.storage.is_some() || self.storage_leases.contains_key(app_id) {
+            return Err(AppRegistryError::DuplicateStorageContract(app_id.clone()));
+        }
+        contract.validate_for(app_id)?;
+        let provisions = leases.provisions();
+        if leases.app_id() != app_id || provisions.len() != contract.requirements.len() {
+            return Err(AppRegistryError::IncompleteStorageProvision(app_id.clone()));
+        }
+        for requirement in &contract.requirements {
+            let Some(provision) = provisions.iter().find(|provision| {
+                provision.domain == requirement.domain && provision.scope == requirement.scope
+            }) else {
+                return Err(AppRegistryError::IncompleteStorageProvision(app_id.clone()));
+            };
+            let backend_matches = match requirement.backend {
+                cowd_app_sdk::AppStorageBackend::Relational => matches!(
+                    provision.backend,
+                    cowd_app_sdk::AppStorageBackend::Sqlite
+                        | cowd_app_sdk::AppStorageBackend::Postgres
+                ),
+                _ => provision.backend == requirement.backend,
+            };
+            let capabilities_match = requirement
+                .required_capabilities()
+                .iter()
+                .all(|required| provision.capabilities.contains(required));
+            if !backend_matches
+                || !capabilities_match
+                || provision.logical_id.trim().is_empty()
+                || provision.namespace.trim().is_empty()
+                || provision.migration != requirement.migration
+                || provision.migration_owner != *app_id
+                || provision.readiness != cowd_app_sdk::AppStorageReadiness::Ready
+            {
+                return Err(AppRegistryError::IncompleteStorageProvision(app_id.clone()));
+            }
+        }
+        if let Some(source_lock) = &source_lock {
+            source_lock.validate(app_id)?;
+        }
+        app.source_lock = source_lock;
+        app.storage = Some(AppStorageRegistration {
+            contract,
+            provisions,
+        });
+        self.storage_leases.insert(app_id.clone(), leases);
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn storage_endpoints(&self) -> Vec<storage::StorageEndpoint> {
+        self.storage_leases
+            .values()
+            .flat_map(AppStorageLeases::endpoints)
+            .collect()
     }
 
     #[must_use]
@@ -686,6 +1009,22 @@ pub enum AppRegistryError {
     DuplicateSkill { app_id: AppId, skill_id: String },
     #[error("invalid TUI contribution for app {app_id}: {reason}")]
     InvalidTuiContribution { app_id: AppId, reason: String },
+    #[error("duplicate storage contract for application {0}")]
+    DuplicateStorageContract(AppId),
+    #[error("duplicate storage lease for application {0}")]
+    DuplicateStorageLease(AppId),
+    #[error("incomplete storage provision for application {0}")]
+    IncompleteStorageProvision(AppId),
+    #[error("invalid artifact path for storage endpoint {0}")]
+    InvalidArtifactPath(String),
+    #[error("application artifact I/O failed: {0}")]
+    StorageIo(String),
+}
+
+impl From<std::io::Error> for AppRegistryError {
+    fn from(error: std::io::Error) -> Self {
+        Self::StorageIo(error.to_string())
+    }
 }
 
 /// A reviewed, compile-time linked application product contribution.
@@ -697,17 +1036,42 @@ pub enum AppRegistryError {
 #[derive(Clone, Copy)]
 pub struct StaticAppProduct {
     descriptor: fn() -> AppDescriptor,
-    register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
+    register: StaticAppRegister,
     tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
     storage_requirements: fn() -> Vec<AppStorageRequirement>,
+    source_lock: Option<StaticAppSourceLock>,
+}
+
+#[derive(Clone, Copy)]
+enum StaticAppRegister {
+    Legacy(fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>),
+    Provisioned(fn(&mut AppRegistry, AppProductContext) -> Result<(), AppRegistryError>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticAppSourceLock {
+    pub git: &'static str,
+    pub revision: &'static str,
+}
+
+impl StaticAppSourceLock {
+    #[must_use]
+    pub const fn new(git: &'static str, revision: &'static str) -> Self {
+        Self { git, revision }
+    }
+
+    fn owned(self) -> AppSourceLock {
+        AppSourceLock {
+            git: self.git.to_string(),
+            revision: self.revision.to_string(),
+        }
+    }
 }
 
 impl StaticAppProduct {
-    /// A reviewed static product must declare its durable-storage contract.
-    ///
-    /// Stateless APPs return an empty vector. Requiring this declaration in
-    /// the sole constructor prevents a product from silently bypassing the
-    /// host-owned storage inventory.
+    /// Transitional constructor for the source-locked pre-provisioning APP.
+    /// New APPs must use [`Self::new_provisioned`]. V580 removes this entry
+    /// after the external MFG bundle consumes `AppProductContext` directly.
     #[must_use]
     pub const fn new(
         descriptor: fn() -> AppDescriptor,
@@ -717,10 +1081,35 @@ impl StaticAppProduct {
     ) -> Self {
         Self {
             descriptor,
-            register,
+            register: StaticAppRegister::Legacy(register),
             tui_surface,
             storage_requirements,
+            source_lock: None,
         }
+    }
+
+    /// Constructor for applications that consume only host-provisioned
+    /// storage leases.  This is the required entry point for new APPs.
+    #[must_use]
+    pub const fn new_provisioned(
+        descriptor: fn() -> AppDescriptor,
+        register: fn(&mut AppRegistry, AppProductContext) -> Result<(), AppRegistryError>,
+        tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
+        storage_requirements: fn() -> Vec<AppStorageRequirement>,
+    ) -> Self {
+        Self {
+            descriptor,
+            register: StaticAppRegister::Provisioned(register),
+            tui_surface,
+            storage_requirements,
+            source_lock: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_source_lock(mut self, source_lock: StaticAppSourceLock) -> Self {
+        self.source_lock = Some(source_lock);
+        self
     }
 
     #[must_use]
@@ -736,10 +1125,14 @@ impl StaticAppProduct {
     pub fn register(
         self,
         registry: &mut AppRegistry,
-        config_home: PathBuf,
-        context: CowdAppContext,
+        context: AppProductContext,
     ) -> Result<(), AppRegistryError> {
-        (self.register)(registry, config_home, context)
+        match self.register {
+            StaticAppRegister::Legacy(register) => {
+                register(registry, context.legacy_config_home, context.host)
+            }
+            StaticAppRegister::Provisioned(register) => register(registry, context),
+        }
     }
 
     #[must_use]
@@ -750,6 +1143,16 @@ impl StaticAppProduct {
     #[must_use]
     pub fn storage_requirements(self) -> Vec<AppStorageRequirement> {
         (self.storage_requirements)()
+    }
+
+    #[must_use]
+    pub fn storage_contract(self) -> AppStorageContract {
+        AppStorageContract::new(self.app_id(), self.storage_requirements())
+    }
+
+    #[must_use]
+    pub fn source_lock(self) -> Option<AppSourceLock> {
+        self.source_lock.map(StaticAppSourceLock::owned)
     }
 }
 
@@ -843,6 +1246,71 @@ mod tests {
         assert_eq!(registry.apps().len(), 1);
         assert_eq!(registry.tui().len(), 1);
         let _router = registry.into_http_router();
+    }
+
+    #[test]
+    fn registry_accepts_only_complete_ready_path_free_storage_contracts() {
+        let mut registry = AppRegistry::default();
+        registry
+            .register(fixture("fixture", "/api/apps/fixture/ping", "fixture.read"))
+            .expect("register fixture");
+        let app_id = AppId::parse("fixture").expect("fixture id");
+        let scope = cowd_app_sdk::AppStorageScope::App;
+        let endpoint = storage::StorageEndpoint::sqlite(
+            storage::StorageDomainId::app("fixture", "primary"),
+            storage::StorageScope::App {
+                app_id: "fixture".to_string(),
+            },
+            std::env::temp_dir().join(format!(
+                "cowd-app-host-fixture-{}.sqlite",
+                std::process::id()
+            )),
+            "fixture",
+            "fixture_primary_v1",
+        );
+        let executor = storage::SqliteExecutor::for_endpoint(&endpoint).expect("SQLite lease");
+        let provision = cowd_app_sdk::AppStorageProvision {
+            domain: "primary".to_string(),
+            scope: scope.clone(),
+            backend: cowd_app_sdk::AppStorageBackend::Sqlite,
+            logical_id: endpoint.logical_id(),
+            namespace: endpoint.logical_id(),
+            migration: "fixture_primary_v1".to_string(),
+            migration_owner: app_id.clone(),
+            capabilities: cowd_app_sdk::AppStorageRequirement {
+                domain: "primary".to_string(),
+                backend: cowd_app_sdk::AppStorageBackend::Sqlite,
+                scope: scope.clone(),
+                migration: "fixture_primary_v1".to_string(),
+            }
+            .required_capabilities(),
+            readiness: cowd_app_sdk::AppStorageReadiness::Ready,
+        };
+        let leases = AppStorageLeases::new(
+            app_id.clone(),
+            vec![AppStorageLease::sqlite(endpoint, provision, executor)],
+        )
+        .expect("indexed lease");
+        let requirement = cowd_app_sdk::AppStorageRequirement {
+            domain: "primary".to_string(),
+            backend: cowd_app_sdk::AppStorageBackend::Sqlite,
+            scope,
+            migration: "fixture_primary_v1".to_string(),
+        };
+        registry
+            .attach_product_contract(
+                &app_id,
+                Some(cowd_app_sdk::AppSourceLock {
+                    git: "https://example.invalid/fixture".to_string(),
+                    revision: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                }),
+                cowd_app_sdk::AppStorageContract::new(app_id.clone(), vec![requirement]),
+                leases,
+            )
+            .expect("complete contract");
+        let projection = serde_json::to_string(&registry.apps()).expect("registry JSON");
+        assert!(!projection.contains(".sqlite"));
+        assert!(!projection.contains(std::env::temp_dir().to_string_lossy().as_ref()));
     }
 
     #[test]

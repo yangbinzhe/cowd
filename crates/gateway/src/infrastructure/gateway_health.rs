@@ -1,5 +1,4 @@
 use serde::Serialize;
-use std::collections::BTreeSet;
 use storage::{SqlitePragmaConfig, StorageHealth, StorageLockDiagnostics, StorageRegistry};
 
 use crate::api_routes::AppState;
@@ -65,23 +64,15 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         event_bus: true,
         session_kernel: true,
     };
-    let enabled_apps = state
-        .services
-        .app_registry
-        .apps()
-        .into_iter()
-        .map(|app| app.descriptor.id.to_string())
-        .collect::<BTreeSet<_>>();
-    let storage_registry = StorageRegistry::default_for_config_home(&state.config_home)
+    let mut storage_registry = StorageRegistry::default_for_config_home(&state.config_home)
         .with_workspace(&state.workspace_root)
         .and_then(StorageRegistry::with_surface_messages)
-        .and_then(|registry| {
-            cowd_product_apps::registry_with_enabled_app_storage(registry, &|app_id| {
-                enabled_apps.contains(app_id)
-            })
-            .map_err(|error| storage::StorageError::Other(error.to_string()))
-        })
         .expect("gateway storage endpoint registration must not collide");
+    for endpoint in state.services.app_registry.storage_endpoints() {
+        storage_registry
+            .register_endpoint(endpoint)
+            .expect("provisioned APP endpoint must remain unique in Gateway health");
+    }
     let pragma = SqlitePragmaConfig::default();
     let storage = StorageGatewaySnapshot {
         registry: storage_registry.health(),

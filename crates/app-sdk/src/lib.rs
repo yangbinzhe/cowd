@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const SDK_API_VERSION: u32 = 1;
+pub const APP_STORAGE_CONTRACT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -131,7 +132,11 @@ impl AppDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppStorageBackend {
+    /// The application ships adapters for both supported relational engines;
+    /// the host may resolve this requirement to SQLite or PostgreSQL.
+    Relational,
     Sqlite,
+    Postgres,
     FileJson,
     Directory,
     BlobDirectory,
@@ -171,6 +176,119 @@ impl AppStorageRequirement {
         }
         Ok(())
     }
+
+    /// Capabilities implied by this requirement.  These values are stable
+    /// contract facts, not a claim that a particular endpoint is ready.
+    #[must_use]
+    pub fn required_capabilities(&self) -> Vec<String> {
+        let capabilities: &[&str] = match self.backend {
+            AppStorageBackend::Relational => &["relational", "transactions", "schema_migrations"],
+            AppStorageBackend::Sqlite => {
+                &["relational", "transactions", "schema_migrations", "sqlite"]
+            }
+            AppStorageBackend::Postgres => &[
+                "relational",
+                "transactions",
+                "schema_migrations",
+                "postgres",
+                "connection_pool",
+            ],
+            AppStorageBackend::FileJson => &["artifact", "atomic_replace", "json"],
+            AppStorageBackend::Directory => &["artifact", "directory"],
+            AppStorageBackend::BlobDirectory => &["artifact", "blob_directory"],
+        };
+        capabilities
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect()
+    }
+}
+
+/// Validated storage contract attached to one reviewed APP descriptor.
+///
+/// `migration_owner` is deliberately the APP id rather than a crate or host
+/// service name: the host provisions topology, while the APP owns schema
+/// meaning and migration code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStorageContract {
+    pub contract_version: u32,
+    pub migration_owner: AppId,
+    pub requirements: Vec<AppStorageRequirement>,
+}
+
+impl AppStorageContract {
+    #[must_use]
+    pub fn new(migration_owner: AppId, requirements: Vec<AppStorageRequirement>) -> Self {
+        Self {
+            contract_version: APP_STORAGE_CONTRACT_VERSION,
+            migration_owner,
+            requirements,
+        }
+    }
+
+    pub fn validate_for(&self, app_id: &AppId) -> Result<(), AppContractError> {
+        if self.contract_version != APP_STORAGE_CONTRACT_VERSION || self.migration_owner != *app_id
+        {
+            return Err(AppContractError::InvalidStorageContract {
+                app_id: app_id.clone(),
+                reason: "contract version or migration owner does not match the application"
+                    .to_string(),
+            });
+        }
+        let mut identities = BTreeSet::new();
+        for requirement in &self.requirements {
+            requirement.validate(app_id)?;
+            if !identities.insert((requirement.domain.as_str(), &requirement.scope)) {
+                return Err(AppContractError::InvalidStorageContract {
+                    app_id: app_id.clone(),
+                    reason: format!(
+                        "duplicate storage domain/scope `{}` / {:?}",
+                        requirement.domain, requirement.scope
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Non-secret immutable source identity supplied by the product catalogue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSourceLock {
+    pub git: String,
+    pub revision: String,
+}
+
+impl AppSourceLock {
+    pub fn validate(&self, app_id: &AppId) -> Result<(), AppContractError> {
+        let revision_valid = (7..=64).contains(&self.revision.len())
+            && self.revision.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if self.git.trim().is_empty() || !revision_valid {
+            return Err(AppContractError::InvalidSourceLock(app_id.clone()));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppStorageReadiness {
+    Ready,
+    Unavailable { reason: String },
+}
+
+/// Public, path-free projection of one host-provisioned storage lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStorageProvision {
+    pub domain: String,
+    pub scope: AppStorageScope,
+    pub backend: AppStorageBackend,
+    pub logical_id: String,
+    pub namespace: String,
+    pub migration: String,
+    pub migration_owner: AppId,
+    pub capabilities: Vec<String>,
+    pub readiness: AppStorageReadiness,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,6 +755,10 @@ pub enum AppContractError {
     InvalidHttpContract { app_id: AppId, reason: String },
     #[error("invalid storage requirement `{domain}` for app {app_id}")]
     InvalidStorageRequirement { app_id: AppId, domain: String },
+    #[error("invalid storage contract for app {app_id}: {reason}")]
+    InvalidStorageContract { app_id: AppId, reason: String },
+    #[error("invalid source lock for app {0}")]
+    InvalidSourceLock(AppId),
     #[error("app {app_id} requires SDK API {actual}, host supports {expected}")]
     UnsupportedSdkApi {
         app_id: AppId,
@@ -696,6 +818,52 @@ mod tests {
         }
         .validate(&app_id)
         .is_err());
+    }
+
+    #[test]
+    fn storage_contract_rejects_duplicate_domain_scope_and_wrong_owner() {
+        let app_id = AppId::parse("fixture").expect("fixture app id");
+        let requirement = AppStorageRequirement {
+            domain: "primary".to_string(),
+            backend: AppStorageBackend::Relational,
+            scope: AppStorageScope::App,
+            migration: "fixture_primary_v1".to_string(),
+        };
+        let duplicate = AppStorageContract::new(
+            app_id.clone(),
+            vec![requirement.clone(), requirement.clone()],
+        );
+        assert!(matches!(
+            duplicate.validate_for(&app_id),
+            Err(AppContractError::InvalidStorageContract { .. })
+        ));
+
+        let wrong_owner = AppStorageContract::new(
+            AppId::parse("another").expect("another id"),
+            vec![requirement],
+        );
+        assert!(wrong_owner.validate_for(&app_id).is_err());
+    }
+
+    #[test]
+    fn provision_projection_is_path_and_secret_free() {
+        let app_id = AppId::parse("fixture").expect("fixture app id");
+        let projection = AppStorageProvision {
+            domain: "primary".to_string(),
+            scope: AppStorageScope::App,
+            backend: AppStorageBackend::Postgres,
+            logical_id: "app:fixture:primary@app:fixture".to_string(),
+            namespace: "cowd_app_fixture_0123456789ab".to_string(),
+            migration: "fixture_primary_v1".to_string(),
+            migration_owner: app_id,
+            capabilities: vec!["relational".to_string(), "postgres".to_string()],
+            readiness: AppStorageReadiness::Ready,
+        };
+        let json = serde_json::to_string(&projection).expect("serialize provision");
+        assert!(!json.contains("postgres://"));
+        assert!(!json.contains(".sqlite"));
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("path"));
     }
 
     #[test]
