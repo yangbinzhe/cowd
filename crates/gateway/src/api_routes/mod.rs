@@ -3864,7 +3864,7 @@ pub(crate) mod tests {
         assert_eq!(mfg["storage"]["provisions"][0]["backend"], "sqlite");
         assert_eq!(
             mfg["source_lock"]["revision"],
-            "41ad19abc0c7e7a2f458c9da3c01be0e7095a9d4"
+            "cf7a13b5bcf233f8033190e4a2b017206805aa7b"
         );
         assert!(!body_text.contains(".sqlite"));
         assert!(!body_text.contains("postgres://"));
