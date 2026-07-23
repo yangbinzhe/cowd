@@ -969,7 +969,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
-    let services = crate::services::GatewayServices::new_with_session_manager(
+    let services = crate::services::GatewayServices::new_with_session_manager_and_storage(
         Arc::clone(&runtime_service),
         task_kernel.clone(),
         surface_host.clone(),
@@ -979,8 +979,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Arc::clone(&session_manager),
         &approval_dir,
         capacity_config,
-    )
-    .with_selected_storage(Arc::clone(&selected_storage));
+        Arc::clone(&selected_storage),
+    );
     let app_registry = crate::services::broker_backed_app_registry_with_storage(
         services.app_host_context(),
         runtime_config.apps(),

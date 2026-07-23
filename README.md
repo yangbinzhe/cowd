@@ -507,6 +507,9 @@ PostgreSQL 不做隐式迁移、双写或失败回退。运维人员在 Gateway 
 凭据只通过配置中的 `secretRef` 在进程边界解析，URL 不进入 projection、health 或证据文件。
 App 的表、快照和迁移由 App 自己拥有；Cowd 只提供通用 lease、独立 PostgreSQL schema、
 migration hook 和全局 evidence envelope。
+同步 PostgreSQL 驱动通过运行时安全连接包装进入 Tokio，生产 service 直接从所选拓扑组装，
+不会先打开 SQLite baseline 再覆盖；App readiness 统一来自 `AppRegistry`，不把 MFG 或任何
+未来 App 硬编码为 core service。
 
 配置、迁移命令、失败边界和 App 存储所有权详见
 [存储治理与 PostgreSQL cutover](docs/architecture/storage-governance.md)。

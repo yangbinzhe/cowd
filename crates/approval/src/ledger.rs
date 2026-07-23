@@ -608,7 +608,7 @@ mod tests {
         .unwrap();
         target
             .executor()
-            .checkout()
+            .checkout_runtime()
             .unwrap()
             .batch_execute("TRUNCATE TABLE approval_history_entry")
             .unwrap();

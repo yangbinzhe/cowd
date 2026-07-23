@@ -3409,7 +3409,7 @@ mod tests {
         .unwrap();
         target
             .executor()
-            .checkout()
+            .checkout_runtime()
             .unwrap()
             .batch_execute(
                 "TRUNCATE TABLE surface_delivery_event, surface_ingress_frame, surface_outbox, \

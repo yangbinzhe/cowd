@@ -1672,7 +1672,7 @@ mod tests {
             .into_iter()
             .filter(|registered| registered.app_id.as_str() == "mfg" && registered.route.active)
             .collect::<Vec<_>>();
-        assert_eq!(active.len(), 104);
+        assert_eq!(active.len(), 105);
 
         for registered in active {
             let route = registered.route;

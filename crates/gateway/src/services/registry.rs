@@ -76,6 +76,60 @@ impl GatewayServices {
         config_home: impl AsRef<std::path::Path>,
         capacity_config: runtime::GatewayCapacityConfig,
     ) -> Self {
+        Self::new_with_session_manager_inner(
+            runtime,
+            task_kernel,
+            surface_host,
+            memory_manager,
+            approval_gate,
+            approval_ledger,
+            session_manager,
+            config_home,
+            capacity_config,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_session_manager_and_storage(
+        runtime: Arc<RuntimeService>,
+        task_kernel: Arc<TaskKernel>,
+        surface_host: Arc<crate::surface_host::SurfaceHost>,
+        memory_manager: Option<Arc<GatewayMemoryManager>>,
+        approval_gate: Arc<SmartApprovalGate>,
+        approval_ledger: SharedApprovalHistoryLedger,
+        session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
+        config_home: impl AsRef<std::path::Path>,
+        capacity_config: runtime::GatewayCapacityConfig,
+        selected_storage: Arc<crate::selected_storage::SelectedStorageTopology>,
+    ) -> Self {
+        Self::new_with_session_manager_inner(
+            runtime,
+            task_kernel,
+            surface_host,
+            memory_manager,
+            approval_gate,
+            approval_ledger,
+            session_manager,
+            config_home,
+            capacity_config,
+            Some(selected_storage),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_session_manager_inner(
+        runtime: Arc<RuntimeService>,
+        task_kernel: Arc<TaskKernel>,
+        surface_host: Arc<crate::surface_host::SurfaceHost>,
+        memory_manager: Option<Arc<GatewayMemoryManager>>,
+        approval_gate: Arc<SmartApprovalGate>,
+        approval_ledger: SharedApprovalHistoryLedger,
+        session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
+        config_home: impl AsRef<std::path::Path>,
+        capacity_config: runtime::GatewayCapacityConfig,
+        selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
+    ) -> Self {
         let config_home = config_home.as_ref().to_path_buf();
         let app_host_binding = GatewayAppHostBinding::new();
         let command_host_runtime = Arc::clone(&runtime);
@@ -88,11 +142,41 @@ impl GatewayServices {
             crate::gateway_capacity::GatewayCapacityConfig::resolve(&capacity_config),
             Arc::clone(runtime_services.resource_manager()),
         );
+        let (app_registry, memory, connector, growth, matrix) =
+            if let Some(topology) = selected_storage.as_ref() {
+                let matrix_endpoint = topology
+                    .registry
+                    .endpoint(&storage::StorageDomainId::Matrix)
+                    .expect("selected Matrix endpoint")
+                    .clone();
+                (
+                    Arc::new(cowd_app_host::AppRegistry::default()),
+                    MemoryService::with_manager_and_knowledge(
+                        memory_manager,
+                        topology.knowledge_fabric.clone(),
+                    ),
+                    ConnectorService::with_resource_directory_factory(
+                        Arc::clone(&topology.connector_factory),
+                        topology.connector_handle.clone(),
+                    ),
+                    GrowthService::with_ledger(Arc::clone(&topology.fact_ledger)),
+                    MatrixService::with_store(Arc::clone(&topology.matrix_store), matrix_endpoint),
+                )
+            } else {
+                (
+                    Arc::new(embedded_app_registry(
+                        &config_home,
+                        app_host_binding.context(),
+                    )),
+                    MemoryService::with_manager(memory_manager),
+                    ConnectorService::new(),
+                    GrowthService::new_for_config_home(&config_home),
+                    MatrixService::new(),
+                )
+            };
         Self {
-            app_registry: Arc::new(embedded_app_registry(
-                &config_home,
-                app_host_binding.context(),
-            )),
+            selected_storage,
+            app_registry,
             app_host_binding,
             runtime: Some(runtime),
             session_manager: Some(session_manager),
@@ -101,14 +185,29 @@ impl GatewayServices {
             slash: SlashController::new(Some(command_host_runtime), task.clone()),
             session: SessionService::with_runtime_boundaries(session_kernel, lifecycle_kernel),
             task,
-            memory: MemoryService::with_manager(memory_manager),
+            memory,
             approval: ApprovalService::with_gate_and_ledger(approval_gate, approval_ledger)
                 .with_runtime_services(Arc::clone(&runtime_services)),
+            context: ContextService::new(),
+            connector,
             cross_plane: CrossPlaneService::new(Arc::clone(&runtime_services)),
+            tool: ToolService::new(),
+            system: SystemService::new(),
+            audit: AuditService::new(),
+            harness_eval: HarnessEvalService::new(),
+            evolution: EvolutionService::new(),
+            provider: ProviderService::new(),
+            reality: RealityService::new(),
+            growth,
+            workspace: WorkspaceService::new(),
+            skill: SkillService::new(),
+            agent: AgentService::new(),
+            matrix,
             mission: MissionService::new()
                 .with_runtime_port(runtime::MissionRuntimePort::new(runtime_services)),
             capacity,
-            ..Self::baseline_with_config_home(&config_home)
+            owner: "0.9.581 GatewayServices selected composition",
+            boundary_status: "0620_final_boundary",
         }
     }
 
@@ -173,31 +272,6 @@ impl GatewayServices {
     #[must_use]
     pub(crate) fn with_app_registry(mut self, app_registry: cowd_app_host::AppRegistry) -> Self {
         self.app_registry = Arc::new(app_registry);
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_selected_storage(
-        mut self,
-        topology: Arc<crate::selected_storage::SelectedStorageTopology>,
-    ) -> Self {
-        self.memory = MemoryService::with_manager_and_knowledge(
-            self.memory.manager(),
-            topology.knowledge_fabric.clone(),
-        );
-        self.growth = GrowthService::with_ledger(Arc::clone(&topology.fact_ledger));
-        let matrix_endpoint = topology
-            .registry
-            .endpoint(&storage::StorageDomainId::Matrix)
-            .expect("selected Matrix endpoint")
-            .clone();
-        self.matrix =
-            MatrixService::with_store(Arc::clone(&topology.matrix_store), matrix_endpoint);
-        self.connector = ConnectorService::with_resource_directory_factory(
-            Arc::clone(&topology.connector_factory),
-            topology.connector_handle.clone(),
-        );
-        self.selected_storage = Some(topology);
         self
     }
 
@@ -418,10 +492,6 @@ impl GatewayServices {
             ("agent", "list"),
             ("agent", "task_projection"),
             ("matrix", "health"),
-            ("mfg", "health"),
-            ("mfg", "incident"),
-            ("mfg", "analysis"),
-            ("mfg", "skill_run"),
             ("mission", "projection"),
             ("mission", "session_control"),
             ("mission", "approval_projection"),
@@ -543,7 +613,7 @@ mod tests {
             endpoint.domain == storage::StorageDomainId::app("mfg", "primary")
         }));
         let projection = serde_json::to_string(&registered).expect("registry projection");
-        assert!(projection.contains("835e21da126376230ff748a723bc967aa0b78b9e"));
+        assert!(projection.contains("dde370bddfbab25522f268b4f37a3b73829f8294"));
         assert!(!projection.contains(".sqlite"));
         assert!(!projection.contains(config_home.to_string_lossy().as_ref()));
         let _ = std::fs::remove_dir_all(config_home);

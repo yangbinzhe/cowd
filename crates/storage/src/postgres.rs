@@ -498,10 +498,7 @@ impl PostgresExecutor {
         })
     }
 
-    /// Compatibility checkout for external APPs compiled against the V581
-    /// contract checkpoint. Production domain adapters use
-    /// [`Self::checkout_runtime`] so every query is async-runtime safe.
-    pub fn checkout(
+    fn checkout_raw(
         &self,
     ) -> Result<PooledConnection<PostgresConnectionManager<NoTls>>, StorageError> {
         let started = Instant::now();
@@ -542,7 +539,7 @@ impl PostgresExecutor {
     }
 
     pub fn checkout_runtime(&self) -> Result<PostgresConnection, StorageError> {
-        self.checkout().map(|connection| PostgresConnection {
+        in_postgres_driver_context(|| self.checkout_raw()).map(|connection| PostgresConnection {
             inner: Some(connection),
         })
     }

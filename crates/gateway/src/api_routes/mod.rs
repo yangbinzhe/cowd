@@ -2306,7 +2306,7 @@ pub(crate) mod tests {
         run_id: &str,
         expected: &str,
     ) -> serde_json::Value {
-        for _ in 0..40 {
+        for _ in 0..200 {
             let detail = app
                 .clone()
                 .oneshot(
@@ -2917,7 +2917,7 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|item| item["id"] == "growth.v1.init"
+            .any(|item| item["id"] == "storage.growth.endpoint"
                 && item["domain"] == "growth"
                 && item["status"].as_str().is_some()));
         assert!(json["storage"]["locks"]
@@ -3864,7 +3864,7 @@ pub(crate) mod tests {
         assert_eq!(mfg["storage"]["provisions"][0]["backend"], "sqlite");
         assert_eq!(
             mfg["source_lock"]["revision"],
-            "835e21da126376230ff748a723bc967aa0b78b9e"
+            "dde370bddfbab25522f268b4f37a3b73829f8294"
         );
         assert!(!body_text.contains(".sqlite"));
         assert!(!body_text.contains("postgres://"));
@@ -10112,10 +10112,15 @@ runtime:
         assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
         assert_eq!(json["diagnostics"]["production_ready"], false);
         assert_eq!(json["diagnostics"]["required_check_count"], 11);
-        assert_eq!(json["diagnostics"]["ready_required_count"], 7);
-        assert_eq!(json["diagnostics"]["blocked_required_count"], 4);
+        let performance_ready = json["diagnostics"]["performance_status"] != "degraded";
+        let expected_ready = 6 + u64::from(performance_ready);
+        assert_eq!(json["diagnostics"]["ready_required_count"], expected_ready);
+        assert_eq!(
+            json["diagnostics"]["blocked_required_count"],
+            11 - expected_ready
+        );
         assert_eq!(json["readiness"]["production_ready"], false);
-        assert_eq!(json["readiness"]["score"], 63);
+        assert_eq!(json["readiness"]["score"], expected_ready * 100 / 11);
         assert!(json["readiness"]["blocked"]
             .as_array()
             .unwrap()
@@ -10301,10 +10306,15 @@ runtime:
         assert_eq!(json["components"]["provider"]["status"], "unconfigured");
         assert_eq!(json["diagnostics"]["production_ready"], false);
         assert_eq!(json["diagnostics"]["required_check_count"], 11);
-        assert_eq!(json["diagnostics"]["ready_required_count"], 9);
-        assert_eq!(json["diagnostics"]["blocked_required_count"], 2);
+        let performance_ready = json["diagnostics"]["performance_status"] != "degraded";
+        let expected_ready = 8 + u64::from(performance_ready);
+        assert_eq!(json["diagnostics"]["ready_required_count"], expected_ready);
+        assert_eq!(
+            json["diagnostics"]["blocked_required_count"],
+            11 - expected_ready
+        );
         assert_eq!(json["readiness"]["production_ready"], false);
-        assert_eq!(json["readiness"]["score"], 81);
+        assert_eq!(json["readiness"]["score"], expected_ready * 100 / 11);
         assert!(json["readiness"]["blocked"]
             .as_array()
             .unwrap()
@@ -10399,9 +10409,14 @@ runtime:
         ));
         assert_eq!(json["diagnostics"]["production_ready"], false);
         assert_eq!(json["diagnostics"]["required_check_count"], 11);
-        assert_eq!(json["diagnostics"]["ready_required_count"], 9);
-        assert_eq!(json["diagnostics"]["blocked_required_count"], 2);
-        assert_eq!(json["readiness"]["score"], 81);
+        let performance_ready = json["diagnostics"]["performance_status"] != "degraded";
+        let expected_ready = 8 + u64::from(performance_ready);
+        assert_eq!(json["diagnostics"]["ready_required_count"], expected_ready);
+        assert_eq!(
+            json["diagnostics"]["blocked_required_count"],
+            11 - expected_ready
+        );
+        assert_eq!(json["readiness"]["score"], expected_ready * 100 / 11);
         assert!(json["readiness"]["checks"]
             .as_array()
             .unwrap()

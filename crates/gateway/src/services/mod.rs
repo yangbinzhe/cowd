@@ -849,7 +849,6 @@ mod tests {
                 "skill",
                 "agent",
                 "matrix",
-                "mfg",
                 "mission",
             ]
         );

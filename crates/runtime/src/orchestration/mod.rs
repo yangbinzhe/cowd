@@ -1294,7 +1294,7 @@ mod tests {
             .register_backend(Arc::new(CompletedProtocolBackend {
                 objectives: Arc::clone(&objectives),
             }));
-        let objective = "全面审视 crates/runtime、crates/gateway、surfaces/webui 三个独立责任域的策略事件接线、权限边界和用户可见状态，分别给出证据后综合。";
+        let objective = "这是复杂架构审查，必须实际启动一个多 Agent 协作团队，分别审视 crates/runtime、crates/gateway、surfaces/webui 的策略事件接线、权限边界和用户可见状态，再交叉验证并综合证据。";
         let mut decision = crate::execution_core::build_runtime_execution_decision(objective, None);
         assert_eq!(
             decision.strategy.selected_candidate,

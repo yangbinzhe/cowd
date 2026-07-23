@@ -708,8 +708,7 @@ fn message_connector_contracts_drive_gateway_surface_readiness() {
         "message connector contract must not expose Feishu document operations as built-in capability"
     );
 
-    let gateway_services_source = read_repo("crates/gateway/src/services/mod.rs");
-    let gateway_services = production_part(&gateway_services_source);
+    let gateway_services = read_repo("crates/gateway/src/services/mod.rs");
     let surface_service_source = read_repo("crates/gateway/src/services/surface_service.rs");
     let surface_service = production_part(&surface_service_source);
     let api_state_source = read_repo("crates/gateway/src/api_routes/mod.rs");
@@ -751,7 +750,6 @@ fn message_connector_contracts_drive_gateway_surface_readiness() {
 
     for source_path in [
         "crates/gateway/src/api_routes/message_connector_routes.rs",
-        "crates/gateway/src/api_routes/mfg_routes.rs",
         "crates/gateway/src/infrastructure/gateway_health.rs",
     ] {
         let source = production_part(&read_repo(source_path)).to_string();
@@ -846,8 +844,7 @@ fn fact_kernel_is_consumed_by_memory_and_matrix_engines() {
 
 #[test]
 fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
-    let runtime_approval =
-        production_part(&read_repo("crates/runtime/src/approval/approval_gate.rs")).to_string();
+    let runtime_approval = read_repo("crates/runtime/src/approval/approval_gate.rs");
     assert!(
         runtime_approval.contains("use harness_contract::policy::{"),
         "runtime approval gate must consume harness-contract policy contracts"
@@ -944,19 +941,22 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     );
     let growth_service =
         production_part(&read_repo("crates/gateway/src/services/growth_service.rs")).to_string();
+    let service_composition = read_repo("crates/gateway/src/services/mod.rs");
+    let fact_sqlite = production_part(&read_repo("crates/fact-sqlite/src/lib.rs")).to_string();
     let storage_source = production_part(&read_repo("crates/storage/src/lib.rs")).to_string();
     assert!(
         storage_source.contains("(\"growth\".to_string(), root.join(\"growth.sqlite\"))")
-            && growth_service.contains("StorageRegistry::default_for_config_home")
-            && growth_service.contains("StorageDomainId::Growth")
-            && growth_service.contains("MigrationRunner::run_sqlite_domain")
-            && growth_service.contains("growth_storage_migrations")
-            && growth_service.contains("growth_events")
-            && growth_service.contains("growth_promotions")
+            && service_composition.contains("StorageRegistry::default_for_config_home")
+            && service_composition.contains("StorageDomainId::Growth")
+            && service_composition.contains("pub(crate) fn with_ledger(")
+            && fact_sqlite.contains("MigrationRunner::run_sqlite_domain")
+            && fact_sqlite.contains("growth_events")
+            && fact_sqlite.contains("growth_promotions")
             && growth_service.contains("promote_event_to_memory")
             && growth_service.contains("promote_event_to_matrix")
-            && growth_service.contains("promote_event_to_fact_kernel"),
-        "GrowthService must use registered storage and own memory/matrix/fact promotion pipeline"
+            && growth_service.contains("promote_event_to_fact_kernel")
+            && !growth_service.contains("rusqlite"),
+        "GrowthService must consume an injected FactLedger while the backend crate owns SQL and migrations"
     );
     assert!(
         growth_service.contains("growth_memory_slot_key")
@@ -969,10 +969,10 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
     ))
     .to_string();
     assert!(
-        gateway_health.contains("growth_storage_migrations")
-            && gateway_health.contains("inspect_growth_migrations")
-            && gateway_health.contains("MigrationRunner::inspect_sqlite_domain"),
-        "Gateway health must expose real Growth schema migration status, not only storage registry layout"
+        gateway_health.contains("state.services.selected_storage")
+            && gateway_health.contains("MigrationRunner::from_registry")
+            && gateway_health.contains("PostgresExecutor::health"),
+        "Gateway health must project the selected topology, registered migrations, and shared PostgreSQL pool"
     );
 
     let task_service =
@@ -1343,7 +1343,7 @@ fn entry_boundary_crates_exist_as_migration_targets() {
     let cli_main = read_repo("crates/cli/src/main.rs");
     assert!(cli_manifest.contains("name = \"cli\""));
     assert!(
-        cli_dependencies.contains("gateway = { path = \"../gateway\" }"),
+        cli_dependencies.contains("gateway = { path = \"../gateway\""),
         "cli must depend on gateway only for backend management commands"
     );
     assert!(
@@ -1376,9 +1376,11 @@ fn entry_boundary_crates_exist_as_migration_targets() {
         !cli_main.contains("gateway::main_entry()"),
         "cli must not fall back into gateway's historical full CLI parser"
     );
+    assert!(!cli_manifest.contains("memory = "));
     assert!(
-        !cli_manifest.contains("runtime = ") && !cli_manifest.contains("memory = "),
-        "cli must not depend on runtime or memory, including dev-dependencies"
+        cli_dependencies.contains("runtime = { path = \"../runtime\" }")
+            && cli_main.contains("runtime::cowd_dirs::prepend_user_tool_bins_to_path"),
+        "CLI runtime dependency must remain limited to the shared process-directory bootstrap"
     );
     assert!(!cli_dependencies.contains("ratatui"));
     assert!(!cli_dependencies.contains("axum"));
@@ -1661,7 +1663,8 @@ fn surface_is_gateway_owned_and_runtime_host_uses_runtime_service_turns() {
     assert!(
         (runtime_host.contains("GatewayServices::new(")
             || runtime_host.contains("GatewayServices::new_with_config_home(")
-            || runtime_host.contains("GatewayServices::new_with_session_manager("))
+            || runtime_host.contains("GatewayServices::new_with_session_manager(")
+            || runtime_host.contains("GatewayServices::new_with_session_manager_and_storage("))
             && runtime_host.contains("RuntimeService::new(")
             && runtime_host.contains(".with_approval_gate("),
         "runtime host must register an approval-wired RuntimeService through GatewayServices"
@@ -1816,7 +1819,6 @@ fn v3_removed_execution_owners_cannot_reappear_in_production() {
         "crates/runtime/src",
         "crates/gateway/src",
         "crates/harness-contract/src",
-        "crates/app-mfg/src",
     ]);
     let forbidden = [
         ("WorkGraph", "legacy work graph contract"),
@@ -1868,6 +1870,10 @@ fn v3_removed_execution_owners_cannot_reappear_in_production() {
     assert!(
         !repo_root().join("crates/runtime/src/persistence").exists(),
         "dead runtime persistence facade must be deleted"
+    );
+    assert!(
+        !repo_root().join("crates/app-mfg").exists(),
+        "MFG implementation must remain external instead of returning to Cowd core"
     );
     assert!(
         !repo_root()
@@ -2396,9 +2402,7 @@ fn api_route_direct_dependencies_are_closed() {
         "api_routes/cross_plane_routes.rs",
         "api_routes/growth_routes.rs",
         "api_routes/matrix_routes.rs",
-        "api_routes/mfg_routes.rs",
         "api_routes/matrix_outcomes.rs",
-        "api_routes/mfg_outcomes.rs",
         "api_routes/memory_routes.rs",
         "api_routes/message_routes.rs",
         "api_routes/profile_routes.rs",
@@ -2410,6 +2414,15 @@ fn api_route_direct_dependencies_are_closed() {
         "api_routes/task_routes.rs",
         "api_routes/workspace_routes.rs",
     ];
+    for retired in ["api_routes/mfg_routes.rs", "api_routes/mfg_outcomes.rs"] {
+        assert!(
+            !repo_root()
+                .join("crates/gateway/src")
+                .join(retired)
+                .exists(),
+            "external APP routes must not return to Gateway source: {retired}"
+        );
+    }
     for file in scanned_files {
         let source = read_repo(&format!("crates/gateway/src/{file}"));
         for dependency in [

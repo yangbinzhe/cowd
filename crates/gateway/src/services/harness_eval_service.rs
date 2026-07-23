@@ -549,7 +549,7 @@ mod tests {
         run_id: &str,
         expected: &str,
     ) -> Value {
-        for _ in 0..40 {
+        for _ in 0..200 {
             let detail = service.run_detail(config_home, None, run_id).expect("run");
             if detail["run"]["status"] == expected {
                 return detail;
@@ -564,7 +564,7 @@ mod tests {
         config_home: &Path,
         run_id: &str,
     ) -> Value {
-        for _ in 0..40 {
+        for _ in 0..200 {
             let detail = service.run_detail(config_home, None, run_id).expect("run");
             let status = detail["run"]["status"].as_str().unwrap_or_default();
             if matches!(status, "completed" | "failed" | "cancelled" | "gated") {

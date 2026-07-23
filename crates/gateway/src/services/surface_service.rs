@@ -38,8 +38,9 @@ impl SurfaceService {
 
     pub(crate) fn with_host(host: Arc<SurfaceHost>) -> Self {
         Self {
+            label: "surface",
+            owner: "0.9.581 selected Surface service boundary",
             host,
-            ..Self::new()
         }
     }
 

@@ -52,6 +52,12 @@ truth. A PostgreSQL App lease receives a validated, schema-scoped executor. Ever
 sets its `search_path` explicitly, so an App schema cannot leak into core or another App through a
 reused connection.
 
+`PostgresExecutor` 只公开运行时安全的连接包装，不把同步驱动连接直接交给 async 调用方：
+多线程 Tokio worker 使用 `block_in_place`，current-thread runtime 使用有界 OS 线程桥接。
+生产 Gateway 也直接从 `SelectedStorageTopology` 组装 service，不先构造 SQLite baseline 再覆盖，
+因此选择 PostgreSQL 后不会暗中创建第二套业务 SQLite executor。通用 App 的健康、路由和能力
+由 `AppRegistry` 验证，核心 service readiness 不硬编码任何具体 App 名称。
+
 ## Offline cutover
 
 Gateway 必须停止，且四步必须使用同一份配置、工作区和已编译产品：
