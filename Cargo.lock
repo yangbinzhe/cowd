@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "approval"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "postgres",
  "rusqlite",
@@ -77,7 +77,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-broker"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "base64",
  "cowd-app-sdk",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "auth-broker",
  "cowd-app-sdk",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -341,7 +341,7 @@ dependencies = [
 
 [[package]]
 name = "connector-postgres"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "connector",
@@ -367,7 +367,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-app-host"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "axum",
  "cowd-app-sdk",
@@ -381,8 +381,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-adapter"
-version = "0.9.565-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=db13d02e611840b95160c8a4effb383c0835e399#db13d02e611840b95160c8a4effb383c0835e399"
+version = "0.9.580"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
 dependencies = [
  "async-trait",
  "axum",
@@ -398,6 +398,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "storage",
  "thiserror",
  "tokio",
  "tracing",
@@ -406,20 +407,21 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-bundle"
-version = "0.9.565-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=db13d02e611840b95160c8a4effb383c0835e399#db13d02e611840b95160c8a4effb383c0835e399"
+version = "0.9.580"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
 dependencies = [
  "async-trait",
  "cowd-app-host",
  "cowd-app-mfg-adapter",
+ "cowd-app-mfg-core",
  "cowd-app-mfg-tui",
  "cowd-app-sdk",
 ]
 
 [[package]]
 name = "cowd-app-mfg-contract"
-version = "0.9.565-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=db13d02e611840b95160c8a4effb383c0835e399#db13d02e611840b95160c8a4effb383c0835e399"
+version = "0.9.580"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -431,13 +433,16 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-core"
-version = "0.9.565-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=db13d02e611840b95160c8a4effb383c0835e399#db13d02e611840b95160c8a4effb383c0835e399"
+version = "0.9.580"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
 dependencies = [
  "chrono",
  "cowd-app-mfg-contract",
  "matrix-core",
- "matrix-repository",
+ "postgres",
+ "r2d2",
+ "r2d2_postgres",
+ "r2d2_sqlite",
  "rusqlite",
  "schemars",
  "serde",
@@ -450,8 +455,8 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-mfg-tui"
-version = "0.9.565-dev"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=db13d02e611840b95160c8a4effb383c0835e399#db13d02e611840b95160c8a4effb383c0835e399"
+version = "0.9.580"
+source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=335f50b645376385d3a1cbe4d73d9c565c4e0825#335f50b645376385d3a1cbe4d73d9c565c4e0825"
 dependencies = [
  "chrono",
  "cowd-app-host",
@@ -468,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-sdk"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "async-trait",
  "serde",
@@ -478,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "cowd-product-apps"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "async-trait",
  "cowd-app-host",
@@ -750,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -762,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "fact-postgres"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -778,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "fact-sqlite"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -970,7 +975,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "approval",
  "async-trait",
@@ -1104,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "harness-contract"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "serde",
@@ -1116,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "harness-eval"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "async-trait",
  "fact-kernel",
@@ -1665,7 +1670,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -1678,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -1695,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "serde",
  "serde_json",
@@ -1720,7 +1725,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memory"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1754,7 +1759,7 @@ dependencies = [
 
 [[package]]
 name = "memory-postgres"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1827,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "lru",
  "serde",
@@ -2051,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "serde",
  "serde_json",
@@ -2138,7 +2143,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "model-protocol",
  "reqwest",
@@ -2475,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "approval",
  "async-trait",
@@ -2520,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-postgres"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "postgres",
  "runtime",
@@ -2642,7 +2647,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-launcher"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "landlock",
  "libc",
@@ -2827,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "memory",
  "serde",
@@ -2838,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "session-postgres"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "memory",
@@ -2939,7 +2944,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "harness-contract",
  "regex",
@@ -2991,7 +2996,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "postgres",
  "r2d2",
@@ -3058,7 +3063,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3071,7 +3076,7 @@ dependencies = [
 
 [[package]]
 name = "surface-postgres"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3382,7 +3387,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "base64",
  "flate2",
@@ -3625,7 +3630,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "chrono",
  "cowd-app-host",
@@ -4237,7 +4242,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.579"
+version = "0.9.580"
 dependencies = [
  "toml",
 ]

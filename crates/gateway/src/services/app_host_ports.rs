@@ -34,6 +34,7 @@ use surface::SurfaceSendRequest;
 
 use crate::api_routes::{connector_routes::connector_snapshot, AppState};
 
+use super::matrix_app_reality;
 use super::GatewayCrossPlaneExecutor;
 
 /// Closed intent name for a policy-gated, durable cross-plane message
@@ -54,6 +55,10 @@ pub(crate) const REALITY_RECOMPUTE_METRICS_INTENT_V1: &str = "cowd.reality.recom
 /// job identifier; Gateway keeps the state transition and metric recompute
 /// authority behind the verified request-principal binding.
 pub(crate) const REALITY_RUN_COMPUTE_JOB_INTENT_V1: &str = "cowd.reality.run_compute_job.v1";
+/// Versioned, bounded Matrix operation envelope for an APP that owns a
+/// product projection while Gateway owns the selected Reality backend.
+pub(crate) const REALITY_MATRIX_OPERATION_INTENT_V1: &str =
+    matrix_app_reality::MATRIX_OPERATION_INTENT_V1;
 /// Closed, application-neutral append-only session-domain-event effect.
 /// The application supplies data only; Gateway owns the verified-principal
 /// binding, session lifecycle and durable event allocation.
@@ -839,6 +844,40 @@ impl RealityPort for GatewayAppHostBinding {
         let state = self.state()?;
         let _principal = self.verified_principal(context)?;
         match intent.kind.as_str() {
+            REALITY_MATRIX_OPERATION_INTENT_V1 => {
+                let request = RealityMatrixOperationIntentV1::parse(intent.payload)?;
+                let matrix = state.services.matrix.clone();
+                let config_home = state.config_home.clone();
+                let operation = request.operation;
+                let input = request.input;
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let store = matrix
+                        .store(&config_home)
+                        .map_err(matrix_app_reality::MatrixAppRealityError::from)?;
+                    matrix_app_reality::dispatch(store.as_ref(), &operation, &input)
+                })
+                .await
+                .map_err(|error| {
+                    AppHostError::Unavailable(format!(
+                        "Reality Matrix operation worker failed: {error}"
+                    ))
+                })?;
+                let payload = match outcome {
+                    Ok(result) => serde_json::json!({"result": result}),
+                    Err(error) => serde_json::json!({
+                        "error": {
+                            "code": error.code(),
+                            "message": error.to_string(),
+                        }
+                    }),
+                };
+                Ok(HostReceipt {
+                    id: format!("reality:matrix-operation:{}", context.request_id),
+                    status: "completed".to_string(),
+                    replayed: false,
+                    payload,
+                })
+            }
             REALITY_RECOMPUTE_METRICS_INTENT_V1 => {
                 if !intent.payload.is_null()
                     && intent
@@ -913,6 +952,43 @@ impl RealityPort for GatewayAppHostBinding {
 #[serde(deny_unknown_fields)]
 struct RealityRunComputeJobIntentV1 {
     job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RealityMatrixOperationIntentV1 {
+    operation: String,
+    input: serde_json::Value,
+}
+
+impl RealityMatrixOperationIntentV1 {
+    fn parse(payload: serde_json::Value) -> Result<Self, AppHostError> {
+        let encoded_len = serde_json::to_vec(&payload)
+            .map_err(|error| {
+                AppHostError::Denied(format!("Matrix operation payload is invalid: {error}"))
+            })?
+            .len();
+        if encoded_len > 4 * 1024 * 1024 {
+            return Err(AppHostError::Denied(
+                "Matrix operation payload exceeds the 4 MiB host boundary".to_string(),
+            ));
+        }
+        let request: Self = serde_json::from_value(payload).map_err(|error| {
+            AppHostError::Denied(format!(
+                "Matrix operation intent must contain only operation and object input: {error}"
+            ))
+        })?;
+        if request.operation.is_empty()
+            || request.operation.len() > 96
+            || !request.input.is_object()
+            || !matrix_app_reality::supports(&request.operation)
+        {
+            return Err(AppHostError::Denied(
+                "Matrix operation is unknown or has an invalid bounded envelope".to_string(),
+            ));
+        }
+        Ok(request)
+    }
 }
 
 #[async_trait]

@@ -25,6 +25,7 @@ mod error;
 mod evolution_service;
 mod growth_service;
 mod harness_eval_service;
+mod matrix_app_reality;
 mod matrix_service;
 mod memory_service;
 mod mission_service;

@@ -277,7 +277,6 @@ fn provision_products(
 /// projections, so disabled products cannot leave a storage-only surface.
 pub fn register_enabled_with_storage(
     app_registry: &mut AppRegistry,
-    config_home: &Path,
     context: CowdAppContext,
     storage_registry: storage::StorageRegistry,
     topology: AppStorageTopology,
@@ -287,20 +286,12 @@ pub fn register_enabled_with_storage(
         .into_iter()
         .filter(|product| is_enabled(product.app_id().as_str()))
         .collect::<Vec<_>>();
-    register_products_with_storage(
-        products,
-        app_registry,
-        config_home,
-        context,
-        storage_registry,
-        topology,
-    )
+    register_products_with_storage(products, app_registry, context, storage_registry, topology)
 }
 
 fn register_products_with_storage(
     products: Vec<StaticAppProduct>,
     app_registry: &mut AppRegistry,
-    config_home: &Path,
     context: CowdAppContext,
     storage_registry: storage::StorageRegistry,
     topology: AppStorageTopology,
@@ -313,7 +304,7 @@ fn register_products_with_storage(
             .ok_or_else(|| AppStorageResolutionError::IncompleteProvision(app_id.to_string()))?;
         product.register(
             app_registry,
-            AppProductContext::new(context.clone(), leases.clone(), config_home.to_path_buf()),
+            AppProductContext::new(context.clone(), leases.clone()),
         )?;
         app_registry.attach_product_contract(
             &app_id,
@@ -336,7 +327,6 @@ pub fn register_enabled(
 ) -> Result<(), ProductAppRegistrationError> {
     register_enabled_with_storage(
         registry,
-        config_home,
         context,
         storage::StorageRegistry::default_for_config_home(config_home),
         AppStorageTopology::Sqlite,
@@ -664,7 +654,6 @@ mod tests {
         let provisioning = register_products_with_storage(
             vec![fixture_product()],
             &mut registry,
-            &config_home,
             CowdAppContext::new(Arc::new(FixturePorts)),
             storage::StorageRegistry::default_for_config_home(&config_home),
             AppStorageTopology::Sqlite,
@@ -711,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn current_locked_mfg_contract_cannot_be_misreported_as_postgres_ready() {
+    fn current_locked_mfg_contract_is_backend_neutral_and_postgres_selectable() {
         let mfg = compiled_products()
             .into_iter()
             .find(|product| product.app_id().as_str() == "mfg")
@@ -720,9 +709,12 @@ mod tests {
         assert!(contract
             .requirements
             .iter()
-            .all(|requirement| requirement.backend == AppStorageBackend::Sqlite));
+            .all(|requirement| requirement.backend == AppStorageBackend::Relational));
         assert!(contract.requirements.iter().all(|requirement| {
-            resolve_backend(&requirement.backend, &storage::StorageBackendKind::Postgres).is_err()
+            matches!(
+                resolve_backend(&requirement.backend, &storage::StorageBackendKind::Postgres,),
+                Ok(storage::StorageBackendKind::Postgres)
+            )
         }));
     }
 

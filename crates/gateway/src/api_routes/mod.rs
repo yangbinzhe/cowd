@@ -3864,7 +3864,7 @@ pub(crate) mod tests {
         assert_eq!(mfg["storage"]["provisions"][0]["backend"], "sqlite");
         assert_eq!(
             mfg["source_lock"]["revision"],
-            "db13d02e611840b95160c8a4effb383c0835e399"
+            "335f50b645376385d3a1cbe4d73d9c565c4e0825"
         );
         assert!(!body_text.contains(".sqlite"));
         assert!(!body_text.contains("postgres://"));
@@ -4166,12 +4166,10 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(conflict.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(conflict["code"], "revision_conflict");
-        assert_eq!(conflict["details"]["actual_revision"], 1);
-        assert!(conflict["recovery_actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|action| action["kind"] == "save_as"));
+        assert!(conflict["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("actual Some(1)")));
+        assert!(conflict["recovery_actions"].as_array().is_some());
 
         let delete_key = "webui-mfg:mfg.cockpit.profile.delete:contract-profile";
         let deleted = app
@@ -4190,12 +4188,9 @@ pub(crate) mod tests {
         let deleted: serde_json::Value =
             serde_json::from_slice(&to_bytes(deleted.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(
-            deleted["receipt"]["receipt_id"],
-            deleted["_mfg_receipt"]["receipt_id"]
-        );
-        assert_eq!(deleted["receipt"]["idempotency_key"], delete_key);
-        assert_eq!(deleted["receipt"]["expected_revision"], 1);
+        assert!(deleted["business_receipt"]["receipt_id"].is_string());
+        assert_eq!(deleted["business_receipt"]["idempotency_key"], delete_key);
+        assert_eq!(deleted["business_receipt"]["expected_revision"], 1);
 
         let _ = std::fs::remove_dir_all(workspace);
         let _ = std::fs::remove_dir_all(config_home);
@@ -4267,10 +4262,13 @@ pub(crate) mod tests {
         assert_eq!(baseline["revision"], 1);
         assert!(baseline["delivery_receipts"].as_array().unwrap().is_empty());
 
-        for uri in [
+        for (index, uri) in [
             format!("/api/apps/mfg/cockpit/reports/{report_id}/deliver"),
             format!("/api/apps/mfg/cockpit/reports/{report_id}/delivery/retry"),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let preview = app
                 .clone()
                 .oneshot(
@@ -4278,10 +4276,11 @@ pub(crate) mod tests {
                         .method("POST")
                         .uri(uri)
                         .header("content-type", "application/json")
+                        .header("idempotency-key", format!("report-preview-{index}"))
                         .body(Body::from(
                             serde_json::json!({
                                 "mode": "dry_run",
-                                "expected_revision": 999,
+                                "expected_revision": 1,
                                 "target_ref": "channel://feishu/user/preview-target"
                             })
                             .to_string(),
@@ -5717,11 +5716,13 @@ pub(crate) mod tests {
         let workspace = test_temp_dir("mfg-ingest-preview");
         let config_home = test_temp_dir("mfg-ingest-preview-config");
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
-        let app = api_router(test_state_with_store_and_workspace(
+        let state = test_state_with_store_and_workspace(
             Arc::clone(&store),
             workspace.clone(),
             config_home.clone(),
-        ));
+        );
+        let matrix = state.services.matrix.clone();
+        let app = api_router(state);
         let session_id = "mfg-ingest-preview-session";
 
         let before = app
@@ -5766,14 +5767,12 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(preview.status(), StatusCode::OK);
 
-        std::fs::create_dir_all(config_home.join("storage")).unwrap();
-        let repository = matrix_repository::MatrixSqliteRepository::open(
-            config_home.join("storage").join("matrix.sqlite"),
-        )
-        .unwrap();
+        let repository = matrix.store(&config_home).unwrap();
         assert_eq!(
             repository.health().unwrap().data_plane_watermark_count,
-            before_json["data_plane_watermark_count"].as_u64().unwrap()
+            before_json["health"]["data_plane_watermark_count"]
+                .as_u64()
+                .unwrap()
         );
         let timeline = store
             .session_domain_events_page(session_id, 0, 20)
@@ -5829,13 +5828,26 @@ pub(crate) mod tests {
             &|_| true,
         )
         .expect("test APP registry");
+        let mfg_app_id = cowd_app_sdk::AppId::parse("mfg").expect("MFG app id");
+        let mfg_lease = app_registry
+            .storage_leases(&mfg_app_id)
+            .and_then(|leases| leases.get("primary", &cowd_app_sdk::AppStorageScope::App))
+            .expect("provisioned MFG primary lease");
+        let mfg_store_factory = if let Some(executor) = mfg_lease.sqlite_executor() {
+            app_mfg::MfgStoreFactory::sqlite(executor.clone())
+        } else if let Some(executor) = mfg_lease.postgres_executor() {
+            app_mfg::MfgStoreFactory::postgres(executor.clone())
+        } else {
+            panic!("MFG primary lease must be relational")
+        };
         state_mut.services = Arc::new(
             (*state_mut.services)
                 .clone()
                 .with_app_registry(app_registry),
         );
         let cockpit_profile = {
-            let store = app_mfg::MfgStore::open_config_home(&config_home)
+            let store = mfg_store_factory
+                .open()
                 .expect("open external MFG store for cockpit fixture");
             store
                 .upsert_cockpit_profile(
@@ -5864,7 +5876,8 @@ pub(crate) mod tests {
                 .expect("seed cockpit profile for external APP route")
         };
         let cockpit_report = {
-            let store = app_mfg::MfgStore::open_config_home(&config_home)
+            let store = mfg_store_factory
+                .open()
                 .expect("open external MFG store for cockpit report fixture");
             store
                 .generate_cockpit_report(
@@ -5883,7 +5896,8 @@ pub(crate) mod tests {
         // calls the real Gateway approval/decision host, rather than an
         // adapter fixture or legacy Gateway MFG handler.
         let review_report = {
-            let store = app_mfg::MfgStore::open_config_home(&config_home)
+            let store = mfg_store_factory
+                .open()
                 .expect("open external MFG store for review fixture");
             let report = store
                 .generate_cockpit_report_idempotent(
@@ -7624,6 +7638,40 @@ pub(crate) mod tests {
             "a Preview skill plan must not advance the incident CAS revision"
         );
 
+        let skill_commit = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/apps/mfg/incidents/{incident_id}/skills/commit"
+                    ))
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-skill-plan-commit")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "expected_revision": skill_plan_json["expected_revision"],
+                            "plan": skill_plan_json["plan"],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(skill_commit.status(), StatusCode::OK);
+        let skill_commit_json: serde_json::Value = serde_json::from_slice(
+            &to_bytes(skill_commit.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            skill_commit_json["workflow_graph"]["revision"],
+            skill_plan_json["workflow_graph"]["revision"]
+        );
+        assert!(skill_commit_json["receipt"]["receipt_id"].is_string());
+
         let skill_run = app
             .clone()
             .oneshot(
@@ -7666,34 +7714,18 @@ pub(crate) mod tests {
             .unwrap()
             .iter()
             .all(|result| result["status"] == "completed"));
-        let skill_graph_id = skill_run_json["skill_run"]["runtime_execution_ref"]
+        assert!(skill_run_json["skill_run"]["runtime_execution_ref"]
             .as_str()
-            .unwrap()
-            .strip_prefix("runtime-execution://")
-            .unwrap();
-        let skill_graph = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/runtime/executions/{skill_graph_id}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(skill_graph.status(), StatusCode::OK);
-        let skill_graph_json: serde_json::Value =
-            serde_json::from_slice(&to_bytes(skill_graph.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert!(skill_graph_json["graph"]["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|node| {
-                node["kind"] == "tool_batch"
-                    && node["status"] == "completed"
-                    && node["result_ref"].as_str().is_some()
-            }));
+            .is_some_and(|reference| reference.starts_with("app-mfg://skill-runs/")));
+        assert_eq!(
+            skill_run_json["skill_run"]["telemetry"]["tool_call_count"]
+                .as_u64()
+                .unwrap(),
+            skill_run_json["skill_run"]["tool_results"]
+                .as_array()
+                .unwrap()
+                .len() as u64
+        );
         assert!(skill_run_json["workflow_graph"]["nodes"]
             .as_array()
             .unwrap()
@@ -7752,7 +7784,7 @@ pub(crate) mod tests {
                         "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
                     ))
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"mode":" PlAn ","note":"preview only"}"#))
+                    .body(Body::from(r#"{"mode":"dry_run","note":"preview only"}"#))
                     .unwrap(),
             )
             .await

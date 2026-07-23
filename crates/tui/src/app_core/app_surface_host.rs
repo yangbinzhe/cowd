@@ -235,3 +235,22 @@ impl TuiAppHost {
 fn product_contributions() -> Vec<TuiAppSurfaceContribution> {
     cowd_product_apps::tui_surface_contributions()
 }
+
+#[cfg(test)]
+mod product_composition_tests {
+    use super::*;
+
+    #[test]
+    fn no_gateway_enabled_app_ids_mounts_no_tui_surface() {
+        let disabled = TuiAppHost::product_for_enabled_apps(&BTreeSet::new());
+        assert!(disabled.is_empty());
+    }
+
+    #[cfg(feature = "app-mfg")]
+    #[test]
+    fn gateway_enabled_mfg_id_mounts_the_compiled_tui_surface() {
+        let enabled = TuiAppHost::product_for_enabled_apps(&BTreeSet::from(["mfg".to_string()]));
+        assert!(!enabled.is_empty());
+        assert!(!enabled.panel_ids().is_empty());
+    }
+}

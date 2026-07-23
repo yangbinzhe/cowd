@@ -602,21 +602,12 @@ impl AppStorageLeases {
 pub struct AppProductContext {
     host: CowdAppContext,
     storage: AppStorageLeases,
-    legacy_config_home: PathBuf,
 }
 
 impl AppProductContext {
     #[must_use]
-    pub fn new(
-        host: CowdAppContext,
-        storage: AppStorageLeases,
-        legacy_config_home: PathBuf,
-    ) -> Self {
-        Self {
-            host,
-            storage,
-            legacy_config_home,
-        }
+    pub fn new(host: CowdAppContext, storage: AppStorageLeases) -> Self {
+        Self { host, storage }
     }
 
     #[must_use]
@@ -773,6 +764,14 @@ impl AppRegistry {
             .values()
             .flat_map(AppStorageLeases::endpoints)
             .collect()
+    }
+
+    /// Host-side lookup for an already provisioned APP lease set. This never
+    /// crosses the APP ABI; it lets composition tests and host diagnostics use
+    /// the exact attached executor instead of reconstructing a physical path.
+    #[must_use]
+    pub fn storage_leases(&self, app_id: &AppId) -> Option<&AppStorageLeases> {
+        self.storage_leases.get(app_id)
     }
 
     #[must_use]
@@ -1036,16 +1035,10 @@ impl From<std::io::Error> for AppRegistryError {
 #[derive(Clone, Copy)]
 pub struct StaticAppProduct {
     descriptor: fn() -> AppDescriptor,
-    register: StaticAppRegister,
+    register: fn(&mut AppRegistry, AppProductContext) -> Result<(), AppRegistryError>,
     tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
     storage_requirements: fn() -> Vec<AppStorageRequirement>,
     source_lock: Option<StaticAppSourceLock>,
-}
-
-#[derive(Clone, Copy)]
-enum StaticAppRegister {
-    Legacy(fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>),
-    Provisioned(fn(&mut AppRegistry, AppProductContext) -> Result<(), AppRegistryError>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1069,25 +1062,6 @@ impl StaticAppSourceLock {
 }
 
 impl StaticAppProduct {
-    /// Transitional constructor for the source-locked pre-provisioning APP.
-    /// New APPs must use [`Self::new_provisioned`]. V580 removes this entry
-    /// after the external MFG bundle consumes `AppProductContext` directly.
-    #[must_use]
-    pub const fn new(
-        descriptor: fn() -> AppDescriptor,
-        register: fn(&mut AppRegistry, PathBuf, CowdAppContext) -> Result<(), AppRegistryError>,
-        tui_surface: Option<fn() -> TuiAppSurfaceContribution>,
-        storage_requirements: fn() -> Vec<AppStorageRequirement>,
-    ) -> Self {
-        Self {
-            descriptor,
-            register: StaticAppRegister::Legacy(register),
-            tui_surface,
-            storage_requirements,
-            source_lock: None,
-        }
-    }
-
     /// Constructor for applications that consume only host-provisioned
     /// storage leases.  This is the required entry point for new APPs.
     #[must_use]
@@ -1099,7 +1073,7 @@ impl StaticAppProduct {
     ) -> Self {
         Self {
             descriptor,
-            register: StaticAppRegister::Provisioned(register),
+            register,
             tui_surface,
             storage_requirements,
             source_lock: None,
@@ -1127,12 +1101,7 @@ impl StaticAppProduct {
         registry: &mut AppRegistry,
         context: AppProductContext,
     ) -> Result<(), AppRegistryError> {
-        match self.register {
-            StaticAppRegister::Legacy(register) => {
-                register(registry, context.legacy_config_home, context.host)
-            }
-            StaticAppRegister::Provisioned(register) => register(registry, context),
-        }
+        (self.register)(registry, context)
     }
 
     #[must_use]
