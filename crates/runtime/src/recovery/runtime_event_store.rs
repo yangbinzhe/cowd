@@ -228,6 +228,13 @@ pub struct SessionTerminalInput {
     pub terminal_id: String,
     pub message_id: String,
     pub session_id: String,
+    /// Canonical graph relation captured in the same commit as the terminal.
+    /// Older terminal requests predate this field and intentionally remain
+    /// uncorrelated rather than being guessed from their identifier.
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
     pub payload_ref: String,
 }
 
@@ -282,6 +289,10 @@ pub struct RuntimeSessionOutboxRecord {
     pub session_id: String,
     pub commit_cursor: u64,
     pub payload_ref: String,
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
     pub status: String,
     pub attempts: u32,
     pub next_attempt_at_ms: Option<u64>,
@@ -1321,8 +1332,8 @@ impl SqliteRuntimeEventStore {
         let conn = self.executor.checkout()?;
         conn.execute(
             "INSERT INTO runtime_session_outbox
-             (terminal_id, message_id, session_id, commit_cursor, payload_ref, status, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0)
+             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 'pending', 0)
              ON CONFLICT(terminal_id) DO NOTHING",
             params![
                 terminal_id,
@@ -1416,7 +1427,7 @@ impl SqliteRuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
         let conn = self.executor.checkout()?;
         let mut statement = conn.prepare(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox
@@ -1468,7 +1479,7 @@ impl SqliteRuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
         let conn = self.executor.checkout()?;
         let mut statement = conn.prepare(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox WHERE status='blocked'
@@ -1904,7 +1915,7 @@ fn export_sqlite_migration_snapshot(
         .collect::<Result<Vec<_>, _>>()?;
     let session_outbox = conn
         .prepare(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox ORDER BY terminal_id ASC",
@@ -2026,16 +2037,18 @@ fn import_sqlite_migration_snapshot(
     for terminal in &snapshot.session_outbox {
         tx.execute(
             "INSERT INTO runtime_session_outbox
-             (terminal_id, message_id, session_id, commit_cursor, payload_ref, status, attempts,
+             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, attempts,
               next_attempt_at, claim_owner, claim_expires_at, failure_class, last_error,
               materialized_at, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 terminal.terminal_id,
                 terminal.message_id,
                 terminal.session_id,
                 snapshot_i64(terminal.commit_cursor, "commit_cursor")?,
                 terminal.payload_ref,
+                terminal.execution_id,
+                terminal.turn_id,
                 terminal.status,
                 i64::from(terminal.attempts),
                 terminal
@@ -2304,6 +2317,8 @@ fn create_current_tables(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
             session_id TEXT NOT NULL,
             commit_cursor INTEGER NOT NULL,
             payload_ref TEXT NOT NULL,
+            execution_id TEXT,
+            turn_id TEXT,
             status TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt_at INTEGER,
@@ -2340,6 +2355,14 @@ fn create_current_tables(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
             )?;
         }
     }
+    for (column, definition) in [("execution_id", "TEXT"), ("turn_id", "TEXT")] {
+        if !table_has_column(tx, "runtime_session_outbox", column)? {
+            tx.execute(
+                &format!("ALTER TABLE runtime_session_outbox ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -2348,7 +2371,7 @@ fn query_runtime_session_outbox(
     terminal_id: &str,
 ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
     conn.query_row(
-        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
                 attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                 last_error, materialized_at, revision
          FROM runtime_session_outbox WHERE terminal_id=?1",
@@ -2368,15 +2391,17 @@ fn row_to_runtime_session_outbox(
         session_id: row.get(2)?,
         commit_cursor: row.get::<_, i64>(3)? as u64,
         payload_ref: row.get(4)?,
-        status: row.get(5)?,
-        attempts: row.get::<_, i64>(6)? as u32,
-        next_attempt_at_ms: row.get::<_, Option<i64>>(7)?.map(|value| value as u64),
-        claim_owner: row.get(8)?,
-        claim_expires_at_ms: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
-        failure_class: row.get(10)?,
-        last_error: row.get(11)?,
-        materialized_at_ms: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
-        revision: row.get::<_, i64>(13)? as u64,
+        execution_id: row.get(5)?,
+        turn_id: row.get(6)?,
+        status: row.get(7)?,
+        attempts: row.get::<_, i64>(8)? as u32,
+        next_attempt_at_ms: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+        claim_owner: row.get(10)?,
+        claim_expires_at_ms: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+        failure_class: row.get(12)?,
+        last_error: row.get(13)?,
+        materialized_at_ms: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
+        revision: row.get::<_, i64>(15)? as u64,
     })
 }
 
@@ -2623,8 +2648,8 @@ fn insert_terminal_in_tx(
 ) -> RuntimeEventStoreResult<()> {
     tx.execute(
         "INSERT INTO runtime_session_outbox
-         (terminal_id, message_id, session_id, commit_cursor, payload_ref, status, revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0)
+         (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0)
          ON CONFLICT(terminal_id) DO NOTHING",
         params![
             terminal.terminal_id,
@@ -2632,6 +2657,8 @@ fn insert_terminal_in_tx(
             terminal.session_id,
             commit_cursor as i64,
             terminal.payload_ref,
+            terminal.execution_id,
+            terminal.turn_id,
         ],
     )?;
     let stored = query_runtime_session_outbox(tx, &terminal.terminal_id)?.ok_or_else(|| {
@@ -2644,6 +2671,8 @@ fn insert_terminal_in_tx(
         || stored.session_id != terminal.session_id
         || stored.commit_cursor != commit_cursor
         || stored.payload_ref != terminal.payload_ref
+        || stored.execution_id != terminal.execution_id
+        || stored.turn_id != terminal.turn_id
     {
         return Err(RuntimeEventStoreError::TransactionConflict {
             transaction_id: terminal.terminal_id.clone(),
@@ -2907,29 +2936,48 @@ mod tests {
     fn migration_snapshot_round_trip_preserves_canonical_digest_and_rejects_nonempty_target() {
         let source = RuntimeEventStore::try_open_in_memory().expect("source store");
         source
-            .append_transaction(AppendTransactionRequest {
-                transaction_id: "migration-round-trip".to_string(),
-                expected_streams: vec![
-                    ExpectedStreamRevision {
-                        stream_id: "migration:stream".to_string(),
-                        expected_revision: 0,
-                    },
-                    ExpectedStreamRevision {
-                        stream_id: "migration:empty-stream".to_string(),
-                        expected_revision: 0,
-                    },
-                ],
-                events: vec![input(
-                    "migration:stream",
-                    RuntimeEventScope::Recovery,
-                    "migration.seeded",
-                )
-                .into()],
-            })
+            .append_transaction_with_terminal(
+                AppendTransactionRequest {
+                    transaction_id: "migration-round-trip".to_string(),
+                    expected_streams: vec![
+                        ExpectedStreamRevision {
+                            stream_id: "migration:stream".to_string(),
+                            expected_revision: 0,
+                        },
+                        ExpectedStreamRevision {
+                            stream_id: "migration:empty-stream".to_string(),
+                            expected_revision: 0,
+                        },
+                    ],
+                    events: vec![input(
+                        "migration:stream",
+                        RuntimeEventScope::Recovery,
+                        "migration.seeded",
+                    )
+                    .into()],
+                },
+                SessionTerminalInput {
+                    terminal_id: "migration-terminal".to_string(),
+                    message_id: "migration-message".to_string(),
+                    session_id: "migration-session".to_string(),
+                    execution_id: Some("migration-execution".to_string()),
+                    turn_id: Some("migration-turn".to_string()),
+                    payload_ref: "assistant_json:\"done\"".to_string(),
+                },
+            )
             .expect("source event");
         let snapshot = source
             .export_migration_snapshot()
             .expect("export source snapshot");
+        assert_eq!(snapshot.session_outbox.len(), 1);
+        assert_eq!(
+            snapshot.session_outbox[0].execution_id.as_deref(),
+            Some("migration-execution")
+        );
+        assert_eq!(
+            snapshot.session_outbox[0].turn_id.as_deref(),
+            Some("migration-turn")
+        );
         let digest = snapshot.canonical_digest().expect("source digest");
         let target = RuntimeEventStore::try_open_in_memory().expect("target store");
         target
@@ -3170,6 +3218,37 @@ mod tests {
             .unwrap();
         assert_eq!(version, 0);
         assert!(!table_has_column(&conn, "runtime_events", "commit_cursor").unwrap());
+    }
+
+    #[test]
+    fn legacy_terminal_outbox_schema_gains_nullable_execution_relation() {
+        let mut conn = Connection::open_in_memory().expect("sqlite opens");
+        conn.execute_batch(
+            "CREATE TABLE runtime_session_outbox (
+                terminal_id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL,
+                commit_cursor INTEGER NOT NULL,
+                payload_ref TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at INTEGER,
+                claim_owner TEXT,
+                claim_expires_at INTEGER,
+                failure_class TEXT,
+                last_error TEXT,
+                materialized_at INTEGER,
+                revision INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("legacy outbox schema");
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("migration transaction");
+        create_current_tables(&tx).expect("additive schema migration");
+        tx.commit().expect("migration commits");
+        assert!(table_has_column(&conn, "runtime_session_outbox", "execution_id").unwrap());
+        assert!(table_has_column(&conn, "runtime_session_outbox", "turn_id").unwrap());
     }
 
     #[test]

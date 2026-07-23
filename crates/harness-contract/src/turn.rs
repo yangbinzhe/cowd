@@ -254,6 +254,9 @@ pub struct SessionResultPacket {
 #[serde(rename_all = "snake_case")]
 pub enum TurnInputCheckpoint {
     TurnStart,
+    /// The primary request has been handed to the durable ingress graph. It
+    /// is lifecycle evidence, not supplementary prompt context.
+    IngressDispatched,
     BeforeProviderRequest,
     AfterProviderResponse,
     AfterToolResult,
@@ -266,6 +269,7 @@ impl TurnInputCheckpoint {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::TurnStart => "turn_start",
+            Self::IngressDispatched => "ingress_dispatched",
             Self::BeforeProviderRequest => "before_provider_request",
             Self::AfterProviderResponse => "after_provider_response",
             Self::AfterToolResult => "after_tool_result",

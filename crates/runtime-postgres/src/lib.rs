@@ -90,6 +90,8 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
             session_id TEXT NOT NULL,
             commit_cursor BIGINT NOT NULL REFERENCES runtime_commits(commit_cursor),
             payload_ref TEXT NOT NULL,
+            execution_id TEXT,
+            turn_id TEXT,
             status TEXT NOT NULL,
             attempts BIGINT NOT NULL DEFAULT 0,
             next_attempt_at BIGINT,
@@ -125,6 +127,15 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
             ON runtime_session_outbox(status, next_attempt_at, claim_expires_at, commit_cursor)",
         "CREATE INDEX IF NOT EXISTS idx_runtime_consumed_decision_leases_review
             ON runtime_consumed_decision_leases(review_id, action)",
+    ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0002.terminal-execution-relation",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 2,
+    description: "persist terminal execution and turn correlation",
+    statements: &[
+        "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS execution_id TEXT",
+        "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS turn_id TEXT",
     ],
 }];
 
@@ -610,6 +621,8 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                 terminal_id: terminal_id.to_string(),
                 message_id: message_id.to_string(),
                 session_id: session_id.to_string(),
+                execution_id: None,
+                turn_id: None,
                 payload_ref: payload_ref.to_string(),
             },
             commit_cursor,
@@ -683,7 +696,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
         let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox WHERE session_id=$1 AND status='materialized'
@@ -725,7 +738,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
         let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox WHERE status='blocked'
@@ -974,7 +987,7 @@ fn export_postgres_migration_snapshot(
     })
     .collect::<RuntimeEventStoreResult<Vec<_>>>()?;
     let session_outbox = pg(connection.query(
-        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
                 attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                 last_error, materialized_at, revision
            FROM runtime_session_outbox ORDER BY terminal_id ASC",
@@ -1110,16 +1123,18 @@ fn import_postgres_migration_snapshot(
             .transpose()?;
         pg(tx.execute(
             "INSERT INTO runtime_session_outbox
-             (terminal_id, message_id, session_id, commit_cursor, payload_ref, status, attempts,
+             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, attempts,
               next_attempt_at, claim_owner, claim_expires_at, failure_class, last_error,
               materialized_at, revision)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
             &[
                 &terminal.terminal_id,
                 &terminal.message_id,
                 &terminal.session_id,
                 &to_i64(terminal.commit_cursor, "commit_cursor")?,
                 &terminal.payload_ref,
+                &terminal.execution_id,
+                &terminal.turn_id,
                 &terminal.status,
                 &i64::from(terminal.attempts),
                 &next_attempt_at,
@@ -1331,14 +1346,16 @@ fn insert_terminal_in_tx(
 ) -> RuntimeEventStoreResult<()> {
     pg(tx.execute(
         "INSERT INTO runtime_session_outbox
-         (terminal_id, message_id, session_id, commit_cursor, payload_ref, status, revision)
-         VALUES ($1,$2,$3,$4,$5,'pending',0) ON CONFLICT(terminal_id) DO NOTHING",
+         (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, revision)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0) ON CONFLICT(terminal_id) DO NOTHING",
         &[
             &terminal.terminal_id,
             &terminal.message_id,
             &terminal.session_id,
             &to_i64(commit_cursor, "commit_cursor")?,
             &terminal.payload_ref,
+            &terminal.execution_id,
+            &terminal.turn_id,
         ],
     ))?;
     let stored = query_runtime_session_outbox(tx, &terminal.terminal_id)?.ok_or_else(|| {
@@ -1351,6 +1368,8 @@ fn insert_terminal_in_tx(
         || stored.session_id != terminal.session_id
         || stored.commit_cursor != commit_cursor
         || stored.payload_ref != terminal.payload_ref
+        || stored.execution_id != terminal.execution_id
+        || stored.turn_id != terminal.turn_id
     {
         return Err(RuntimeEventStoreError::TransactionConflict {
             transaction_id: terminal.terminal_id.clone(),
@@ -1427,7 +1446,7 @@ fn query_runtime_session_outbox(
     terminal_id: &str,
 ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
     pg(client.query_opt(
-        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
+        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
                 attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                 last_error, materialized_at, revision
            FROM runtime_session_outbox WHERE terminal_id=$1",
@@ -1474,22 +1493,24 @@ fn row_to_runtime_session_outbox(row: &Row) -> RuntimeEventStoreResult<RuntimeSe
         session_id: pg(row.try_get(2))?,
         commit_cursor: from_i64(pg(row.try_get(3))?, "commit_cursor")?,
         payload_ref: pg(row.try_get(4))?,
-        status: pg(row.try_get(5))?,
-        attempts: u32::try_from(from_i64(pg(row.try_get(6))?, "attempts")?)
+        execution_id: pg(row.try_get(5))?,
+        turn_id: pg(row.try_get(6))?,
+        status: pg(row.try_get(7))?,
+        attempts: u32::try_from(from_i64(pg(row.try_get(8))?, "attempts")?)
             .map_err(|_| RuntimeEventStoreError::Corrupt("attempts exceeds u32".to_string()))?,
-        next_attempt_at_ms: pg(row.try_get::<_, Option<i64>>(7))?
+        next_attempt_at_ms: pg(row.try_get::<_, Option<i64>>(9))?
             .map(|value| from_i64(value, "next_attempt_at"))
             .transpose()?,
-        claim_owner: pg(row.try_get(8))?,
-        claim_expires_at_ms: pg(row.try_get::<_, Option<i64>>(9))?
+        claim_owner: pg(row.try_get(10))?,
+        claim_expires_at_ms: pg(row.try_get::<_, Option<i64>>(11))?
             .map(|value| from_i64(value, "claim_expires_at"))
             .transpose()?,
-        failure_class: pg(row.try_get(10))?,
-        last_error: pg(row.try_get(11))?,
-        materialized_at_ms: pg(row.try_get::<_, Option<i64>>(12))?
+        failure_class: pg(row.try_get(12))?,
+        last_error: pg(row.try_get(13))?,
+        materialized_at_ms: pg(row.try_get::<_, Option<i64>>(14))?
             .map(|value| from_i64(value, "materialized_at"))
             .transpose()?,
-        revision: from_i64(pg(row.try_get(13))?, "revision")?,
+        revision: from_i64(pg(row.try_get(15))?, "revision")?,
     })
 }
 
@@ -2024,6 +2045,8 @@ mod tests {
                     terminal_id: "terminal-real".to_string(),
                     message_id: "message-real".to_string(),
                     session_id: "session-real".to_string(),
+                    execution_id: Some("execution-real".to_string()),
+                    turn_id: Some("turn-real".to_string()),
                     payload_ref: "payload-real".to_string(),
                 },
             )
@@ -2109,14 +2132,13 @@ mod tests {
             .into_runtime_event_store(),
         );
         assert_eq!(reopened.stream_revision("graph:concurrent").unwrap(), 2);
-        assert_eq!(
-            reopened
-                .session_terminal("terminal-real")
-                .unwrap()
-                .expect("terminal persists")
-                .status,
-            "materialized"
-        );
+        let terminal = reopened
+            .session_terminal("terminal-real")
+            .unwrap()
+            .expect("terminal persists");
+        assert_eq!(terminal.status, "materialized");
+        assert_eq!(terminal.execution_id.as_deref(), Some("execution-real"));
+        assert_eq!(terminal.turn_id.as_deref(), Some("turn-real"));
 
         let temp = tempfile::tempdir().expect("temporary Runtime host");
         let workspace = temp.path().join("workspace");

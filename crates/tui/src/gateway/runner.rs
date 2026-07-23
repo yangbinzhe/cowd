@@ -30,6 +30,15 @@ static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 const APP_TRANSIENT_REQUEST_RETRY_ATTEMPTS: usize = 16;
 const APP_TRANSIENT_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(250);
 const APP_TRANSIENT_REQUEST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const EXECUTION_PROJECTION_MATERIALIZATION_DELAYS: [Duration; 6] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+    Duration::from_millis(1_600),
+];
+const MAX_EXECUTION_PROJECTION_STREAM_RECONNECTS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct GatewayTuiConfig {
@@ -43,7 +52,15 @@ pub struct GatewayTuiConfig {
 #[derive(Debug, Default)]
 struct ExecutionProjectionStreamController {
     next_generation: u64,
+    selected: Option<SelectedExecutionProjection>,
+    snapshot_request: Option<SelectedExecutionProjection>,
     active: Option<ActiveExecutionProjectionStream>,
+}
+
+#[derive(Debug)]
+struct SelectedExecutionProjection {
+    execution_id: String,
+    generation: u64,
 }
 
 #[derive(Debug)]
@@ -58,17 +75,23 @@ impl ExecutionProjectionStreamController {
     /// This raises the generation even when the new snapshot temporarily
     /// returns 404/403, so a late delta from the old execution cannot revive
     /// it in the new turn's UI.
-    fn begin_selection(&mut self, execution_id: &str) -> bool {
+    fn begin_selection(&mut self, execution_id: &str) -> Option<u64> {
         if self
-            .active
+            .selected
             .as_ref()
-            .is_some_and(|active| active.execution_id == execution_id)
+            .is_some_and(|selected| selected.execution_id == execution_id)
         {
-            return false;
+            return None;
         }
         self.stop();
+        self.snapshot_request = None;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
-        true
+        let generation = self.next_generation;
+        self.selected = Some(SelectedExecutionProjection {
+            execution_id: execution_id.to_string(),
+            generation,
+        });
+        Some(generation)
     }
 
     fn switch(
@@ -76,18 +99,18 @@ impl ExecutionProjectionStreamController {
         gateway_client: GatewayApiClient,
         execution_id: String,
         initial_cursor: u64,
+        generation: u64,
         event_tx: CowdEventSender,
     ) {
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.execution_id == execution_id)
-        {
+        if !self.accepts(generation, &execution_id) {
+            return;
+        }
+        if self.active.as_ref().is_some_and(|active| {
+            active.execution_id == execution_id && active.generation == generation
+        }) {
             return;
         }
         self.stop();
-        self.next_generation = self.next_generation.wrapping_add(1).max(1);
-        let generation = self.next_generation;
         if let Some(task) = spawn_execution_projection_stream(
             gateway_client,
             execution_id.clone(),
@@ -104,9 +127,49 @@ impl ExecutionProjectionStreamController {
     }
 
     fn accepts(&self, generation: u64, execution_id: &str) -> bool {
-        self.active.as_ref().is_some_and(|active| {
-            active.generation == generation && active.execution_id == execution_id
+        self.selected.as_ref().is_some_and(|selected| {
+            selected.generation == generation && selected.execution_id == execution_id
         })
+    }
+
+    fn selected_execution_id(&self) -> Option<String> {
+        self.selected
+            .as_ref()
+            .map(|selected| selected.execution_id.clone())
+    }
+
+    /// Coalesce every canonical snapshot request for one selected execution.
+    /// The runtime event queue may contain many deltas, but a single latest
+    /// projection is authoritative and enough to catch the TUI up.
+    fn begin_snapshot_request(&mut self, generation: u64, execution_id: &str) -> bool {
+        if !self.accepts(generation, execution_id)
+            || self.snapshot_request.as_ref().is_some_and(|request| {
+                request.generation == generation && request.execution_id == execution_id
+            })
+        {
+            return false;
+        }
+        self.snapshot_request = Some(SelectedExecutionProjection {
+            execution_id: execution_id.to_string(),
+            generation,
+        });
+        true
+    }
+
+    fn finish_snapshot_request(&mut self, generation: u64, execution_id: &str) {
+        if self.snapshot_request.as_ref().is_some_and(|request| {
+            request.generation == generation && request.execution_id == execution_id
+        }) {
+            self.snapshot_request = None;
+        }
+    }
+
+    fn clear_selection_if(&mut self, generation: u64, execution_id: &str) {
+        if self.accepts(generation, execution_id) {
+            self.stop();
+            self.selected = None;
+            self.snapshot_request = None;
+        }
     }
 
     fn stop(&mut self) {
@@ -852,11 +915,17 @@ fn dispatch_gateway_message(
                     .and_then(serde_json::Value::as_str)
                     .filter(|graph_id| !graph_id.trim().is_empty())
                 {
+                    let status = value
+                        .get("execution")
+                        .and_then(|execution| execution.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("accepted_pending_materialization")
+                        .to_string();
                     let _ = event_tx.send(CowdEvent::ExecutionGraphSummary {
                         summary: crate::RuntimeExecutionGraphSummary {
                             graph_id: Some(graph_id.to_string()),
                             board_id: None,
-                            status: "running".to_string(),
+                            status,
                             agent_tasks: 0,
                             child_executions: 0,
                             memory_candidates: 0,
@@ -1250,8 +1319,17 @@ async fn drain_cowd_events_state(
             _ => None,
         };
         if let CowdEvent::ExecutionProjectionDelta { generation, delta } = &event {
-            if execution_projection_stream.accepts(*generation, &delta.execution_id) {
-                apply_execution_projection_delta(gateway_client, state, delta).await;
+            if execution_projection_stream.accepts(*generation, &delta.execution_id)
+                && projection_delta_requires_snapshot(state, delta)
+                && execution_projection_stream
+                    .begin_snapshot_request(*generation, &delta.execution_id)
+            {
+                spawn_execution_projection_refresh(
+                    gateway_client.clone(),
+                    delta.execution_id.clone(),
+                    *generation,
+                    event_tx.clone(),
+                );
             }
             count += 1;
             if count >= limit {
@@ -1266,8 +1344,24 @@ async fn drain_cowd_events_state(
         } = &event
         {
             if execution_projection_stream.accepts(*generation, execution_id) {
-                execution_projection_stream.stop();
+                execution_projection_stream.clear_selection_if(*generation, execution_id);
                 state.invalidate_execution_projection(execution_id, message);
+            }
+            count += 1;
+            if count >= limit {
+                break;
+            }
+            continue;
+        }
+        if let CowdEvent::ExecutionProjectionRefreshFailed {
+            generation,
+            execution_id,
+            message,
+        } = &event
+        {
+            if execution_projection_stream.accepts(*generation, execution_id) {
+                execution_projection_stream.finish_snapshot_request(*generation, execution_id);
+                state.add_system_notice(SystemNoticeKind::Warning, message);
             }
             count += 1;
             if count >= limit {
@@ -1282,11 +1376,13 @@ async fn drain_cowd_events_state(
         {
             let execution_id = projection.execution_id.clone();
             if execution_projection_stream.accepts(*generation, &execution_id) {
+                execution_projection_stream.finish_snapshot_request(*generation, &execution_id);
                 state.apply_execution_projection(projection.clone());
                 execution_projection_stream.switch(
                     gateway_client.clone(),
                     execution_id,
                     projection.cursor,
+                    *generation,
                     event_tx.clone(),
                 );
             }
@@ -1296,11 +1392,10 @@ async fn drain_cowd_events_state(
             }
             continue;
         }
+        let mut materialization = None;
         if let Some(next_execution_id) = execution_id.as_deref() {
             let previous_execution_id = execution_projection_stream
-                .active
-                .as_ref()
-                .map(|active| active.execution_id.clone())
+                .selected_execution_id()
                 .or_else(|| {
                     state
                         .app
@@ -1308,7 +1403,8 @@ async fn drain_cowd_events_state(
                         .as_ref()
                         .map(|projection| projection.execution_id.clone())
                 });
-            if execution_projection_stream.begin_selection(next_execution_id) {
+            if let Some(generation) = execution_projection_stream.begin_selection(next_execution_id)
+            {
                 if let Some(previous_execution_id) = previous_execution_id
                     .filter(|previous_execution_id| previous_execution_id != next_execution_id)
                 {
@@ -1317,28 +1413,18 @@ async fn drain_cowd_events_state(
                         "Runtime selected a new execution; loading its canonical projection",
                     );
                 }
+                materialization = Some((next_execution_id.to_string(), generation));
             }
         }
         state.apply_event(event);
-        if let Some(execution_id) = execution_id {
-            match gateway_client
-                .execution_projection(&execution_id, true)
-                .await
-            {
-                Ok(projection) => {
-                    let cursor = projection.cursor;
-                    state.apply_execution_projection(projection);
-                    execution_projection_stream.switch(
-                        gateway_client.clone(),
-                        execution_id,
-                        cursor,
-                        event_tx.clone(),
-                    );
-                }
-                Err(error) => state.add_system_notice(
-                    SystemNoticeKind::Warning,
-                    &format!("Execution projection unavailable: {error}"),
-                ),
+        if let Some((execution_id, generation)) = materialization {
+            if execution_projection_stream.begin_snapshot_request(generation, &execution_id) {
+                spawn_execution_projection_materialization(
+                    gateway_client.clone(),
+                    execution_id,
+                    generation,
+                    event_tx.clone(),
+                );
             }
         }
         count += 1;
@@ -1348,47 +1434,124 @@ async fn drain_cowd_events_state(
     }
 }
 
-async fn apply_execution_projection_delta(
-    gateway_client: &GatewayApiClient,
+fn projection_delta_requires_snapshot(
     state: &mut TuiState,
     delta: &crate::protocol::ProjectionDelta,
-) {
+) -> bool {
     let Some(projection) = state.app.latest_execution_projection.as_ref() else {
-        return;
+        return false;
     };
     if projection.execution_id != delta.execution_id {
-        return;
+        return false;
     }
     let mut reducer = crate::protocol::ExecutionProjectionReducer::default();
     if matches!(
         reducer.install_snapshot(projection),
         crate::protocol::ProjectionDeltaApply::ResyncRequired
     ) {
-        return;
+        return false;
     }
-    let should_refresh = !delta.events.is_empty()
+    !delta.events.is_empty()
         || matches!(
             reducer.apply_delta(delta),
             crate::protocol::ProjectionDeltaApply::ResyncRequired
-        );
-    if should_refresh {
-        match gateway_client
-            .execution_projection(&delta.execution_id, true)
-            .await
-        {
-            Ok(snapshot) => state.apply_execution_projection(snapshot),
-            Err(error) if projection_access_or_contract_error(&error) => {
-                state.invalidate_execution_projection(
-                    &delta.execution_id,
-                    &format!("Execution projection authorization or contract changed: {error}"),
-                );
+        )
+}
+
+fn spawn_execution_projection_materialization(
+    gateway_client: GatewayApiClient,
+    execution_id: String,
+    generation: u64,
+    event_tx: CowdEventSender,
+) {
+    let Some(runtime) = shared_rt() else {
+        let _ = event_tx.send(CowdEvent::Warning {
+            message: "Execution projection observer is unavailable; TUI remains in accepted/materializing state".to_string(),
+        });
+        return;
+    };
+    runtime.spawn(async move {
+        let mut last_error = None;
+        for attempt in 0..=EXECUTION_PROJECTION_MATERIALIZATION_DELAYS.len() {
+            if attempt > 0 {
+                tokio::time::sleep(EXECUTION_PROJECTION_MATERIALIZATION_DELAYS[attempt - 1]).await;
             }
-            Err(error) => state.add_system_notice(
-                SystemNoticeKind::Warning,
-                &format!("Execution projection resync failed: {error}"),
-            ),
+            match gateway_client.execution_projection(&execution_id, true).await {
+                Ok(projection) => {
+                    let _ = event_tx.send(CowdEvent::ExecutionProjectionLoaded {
+                        generation,
+                        projection,
+                    });
+                    return;
+                }
+                Err(error) if projection_access_or_contract_error(&error) => {
+                    let _ = event_tx.send(CowdEvent::ExecutionProjectionAccessRevoked {
+                        generation,
+                        execution_id,
+                        message: format!(
+                            "Execution projection authorization or contract changed while materializing: {error}"
+                        ),
+                    });
+                    return;
+                }
+                Err(error) => last_error = Some(error),
+            }
         }
-    }
+        let _ = event_tx.send(CowdEvent::ExecutionProjectionRefreshFailed {
+            generation,
+            execution_id,
+            message: format!(
+                "Execution projection did not materialize within the bounded observer window: {}",
+                last_error.map_or_else(|| "unknown error".to_string(), |error| error.to_string())
+            ),
+        });
+    });
+}
+
+/// Fetch the latest canonical projection outside the render/event drain.
+/// Snapshot refreshes are coalesced by `ExecutionProjectionStreamController`,
+/// so high-rate graph deltas cannot create an HTTP fan-out or block keystrokes.
+fn spawn_execution_projection_refresh(
+    gateway_client: GatewayApiClient,
+    execution_id: String,
+    generation: u64,
+    event_tx: CowdEventSender,
+) {
+    let Some(runtime) = shared_rt() else {
+        let _ = event_tx.send(CowdEvent::ExecutionProjectionRefreshFailed {
+            generation,
+            execution_id,
+            message: "Execution projection refresh is unavailable because the TUI async runtime is not running"
+                .to_string(),
+        });
+        return;
+    };
+    runtime.spawn(async move {
+        match gateway_client.execution_projection(&execution_id, true).await {
+            Ok(projection) => {
+                let _ = event_tx.send(CowdEvent::ExecutionProjectionLoaded {
+                    generation,
+                    projection,
+                });
+            }
+            Err(error) if projection_access_or_contract_error(&error) => {
+                let _ = event_tx.send(CowdEvent::ExecutionProjectionAccessRevoked {
+                    generation,
+                    execution_id,
+                    message: format!(
+                        "Execution projection authorization or contract changed while refreshing: {error}"
+                    ),
+                });
+            }
+            Err(error) => {
+                let _ = event_tx.send(CowdEvent::ExecutionProjectionRefreshFailed {
+                    generation,
+                    execution_id,
+                    message: format!("Execution projection resync failed: {error}"),
+                });
+            }
+        }
+    });
 }
 
 fn spawn_execution_projection_stream(
@@ -1408,6 +1571,7 @@ fn spawn_execution_projection_stream(
     Some(runtime.spawn(async move {
         let mut cursor = initial_cursor;
         let mut retry_delay = Duration::from_millis(250);
+        let mut reconnect_attempts = 0_usize;
         loop {
             match gateway_client
                 .subscribe_execution_projection_events(
@@ -1440,6 +1604,18 @@ fn spawn_execution_projection_stream(
                         ),
                     });
                 }
+            }
+            // A stream that immediately closes successfully is also a retry
+            // loop.  Count every re-subscription, not only transport errors,
+            // so an endpoint cannot consume a TUI worker forever.
+            reconnect_attempts = reconnect_attempts.saturating_add(1);
+            if reconnect_attempts >= MAX_EXECUTION_PROJECTION_STREAM_RECONNECTS {
+                let _ = event_tx.send(CowdEvent::Warning {
+                    message: format!(
+                        "Execution projection stream reconnect budget exhausted for {execution_id}; keeping the last canonical snapshot"
+                    ),
+                });
+                break;
             }
             tokio::time::sleep(retry_delay).await;
             retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
@@ -1614,39 +1790,61 @@ mod tests {
     #[tokio::test]
     async fn execution_projection_stream_generation_rejects_zombie_and_replayed_events() {
         let mut controller = ExecutionProjectionStreamController::default();
+        let first_generation = controller
+            .begin_selection("execution-a")
+            .expect("new selection");
         let first_task = tokio::spawn(std::future::pending::<()>());
         let first_abort = first_task.abort_handle();
         controller.active = Some(ActiveExecutionProjectionStream {
             execution_id: "execution-a".to_string(),
-            generation: 1,
+            generation: first_generation,
             task: first_task,
         });
-        assert!(controller.accepts(1, "execution-a"));
+        assert!(controller.accepts(first_generation, "execution-a"));
 
-        controller.stop();
+        let second_generation = controller
+            .begin_selection("execution-b")
+            .expect("new selection");
         tokio::task::yield_now().await;
         assert!(first_abort.is_finished());
         let second_task = tokio::spawn(std::future::pending::<()>());
         controller.active = Some(ActiveExecutionProjectionStream {
             execution_id: "execution-b".to_string(),
-            generation: 2,
+            generation: second_generation,
             task: second_task,
         });
-        assert!(!controller.accepts(1, "execution-a"));
-        assert!(controller.accepts(2, "execution-b"));
+        assert!(!controller.accepts(first_generation, "execution-a"));
+        assert!(controller.accepts(second_generation, "execution-b"));
 
-        controller.stop();
+        let third_generation = controller
+            .begin_selection("execution-a")
+            .expect("new selection");
         let third_task = tokio::spawn(std::future::pending::<()>());
         controller.active = Some(ActiveExecutionProjectionStream {
             execution_id: "execution-a".to_string(),
-            generation: 3,
+            generation: third_generation,
             task: third_task,
         });
         assert!(
-            !controller.accepts(1, "execution-a"),
+            !controller.accepts(first_generation, "execution-a"),
             "a queued delta from the first A stream must not revive after A→B→A"
         );
-        assert!(controller.accepts(3, "execution-a"));
+        assert!(controller.accepts(third_generation, "execution-a"));
+    }
+
+    #[test]
+    fn selected_execution_coalesces_snapshot_refreshes_until_the_background_result_arrives() {
+        let mut controller = ExecutionProjectionStreamController::default();
+        let generation = controller
+            .begin_selection("execution-a")
+            .expect("new selection");
+        assert!(controller.begin_snapshot_request(generation, "execution-a"));
+        assert!(
+            !controller.begin_snapshot_request(generation, "execution-a"),
+            "a high-rate projection stream must not fan out HTTP refreshes"
+        );
+        controller.finish_snapshot_request(generation, "execution-a");
+        assert!(controller.begin_snapshot_request(generation, "execution-a"));
     }
 
     #[tokio::test]

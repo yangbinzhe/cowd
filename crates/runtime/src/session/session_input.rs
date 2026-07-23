@@ -22,6 +22,11 @@ pub struct SessionInputRecord {
     pub evidence_refs: Vec<String>,
     pub checkpoint: Option<TurnInputCheckpoint>,
     pub consumed_at: Option<DateTime<Utc>>,
+    /// The user request that directly owns a durable ingress graph. It is
+    /// already supplied to `submit_ingress_turn`, so checkpoint consumers must
+    /// not inject its content into the provider prompt a second time.
+    #[serde(default)]
+    primary_ingress: bool,
 }
 
 impl SessionInputRecord {
@@ -79,6 +84,7 @@ pub struct ActiveTurnLease {
 pub enum SessionInputMutationError {
     NotFound,
     AlreadyConsumed,
+    InvalidPrimaryIngress,
 }
 
 impl std::fmt::Display for SessionInputMutationError {
@@ -86,6 +92,9 @@ impl std::fmt::Display for SessionInputMutationError {
         match self {
             Self::NotFound => f.write_str("session input not found"),
             Self::AlreadyConsumed => f.write_str("session input has already been consumed"),
+            Self::InvalidPrimaryIngress => {
+                f.write_str("session input is not the expected primary ingress")
+            }
         }
     }
 }
@@ -213,8 +222,154 @@ impl SessionInputStream {
             evidence_refs,
             checkpoint: None,
             consumed_at: None,
+            primary_ingress: false,
         });
         receipt
+    }
+
+    /// Bind the exactly accepted primary ingress to the Runtime turn that is
+    /// now taking ownership of it. Missing records are normal after a process
+    /// restart because the UI projection is intentionally in-memory; they do
+    /// not block durable outbox recovery.
+    pub fn bind_primary_ingress(
+        &self,
+        idempotency_key: &str,
+        turn_id: TurnId,
+        execution_id: &str,
+    ) -> Result<Option<SessionInputRecord>, SessionInputMutationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(input_id) = inner.idempotency.get(idempotency_key).cloned() else {
+            return Ok(None);
+        };
+        let updated = {
+            let record = inner
+                .records
+                .iter_mut()
+                .find(|record| record.envelope.input_id == input_id)
+                .ok_or(SessionInputMutationError::NotFound)?;
+            if record.primary_ingress
+                && record.active_turn_id.as_ref() == Some(&turn_id)
+                && record
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference == &format!("execution_graph:{execution_id}"))
+            {
+                return Ok(Some(record.clone()));
+            }
+            if record.consumed_at.is_some()
+                || record.decision != InputRoutingDecision::StartNewTurn
+                || record.status != SessionInputStatus::QueuedNext
+            {
+                return Err(SessionInputMutationError::InvalidPrimaryIngress);
+            }
+            record.status = SessionInputStatus::AttachedToTurn;
+            record.active_turn_id = Some(turn_id.clone());
+            record.reason = InputRoutingReason::new(
+                "primary_ingress_bound",
+                "durable session ingress is owned by the canonical Runtime execution",
+                10_000,
+            );
+            record.primary_ingress = true;
+            record
+                .evidence_refs
+                .push(format!("execution_graph:{execution_id}"));
+            record
+                .evidence_refs
+                .push("session-input:primary-ingress".to_string());
+            record.clone()
+        };
+        inner.active_turn_id = Some(turn_id);
+        Ok(Some(updated))
+    }
+
+    pub fn settle_primary_ingress(
+        &self,
+        idempotency_key: &str,
+        turn_id: &TurnId,
+        execution_id: &str,
+        terminal_id: &str,
+    ) -> Result<Option<SessionInputRecord>, SessionInputMutationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(input_id) = inner.idempotency.get(idempotency_key).cloned() else {
+            return Ok(None);
+        };
+        let updated = {
+            let record = inner
+                .records
+                .iter_mut()
+                .find(|record| record.envelope.input_id == input_id)
+                .ok_or(SessionInputMutationError::NotFound)?;
+            if !record.primary_ingress || record.active_turn_id.as_ref() != Some(turn_id) {
+                return Err(SessionInputMutationError::InvalidPrimaryIngress);
+            }
+            if record.consumed_at.is_none() {
+                record.status = SessionInputStatus::Consumed;
+                record.checkpoint = Some(TurnInputCheckpoint::IngressDispatched);
+                record.consumed_at = Some(Utc::now());
+                record.reason = InputRoutingReason::new(
+                    "primary_ingress_settled",
+                    "canonical Runtime execution committed its durable terminal",
+                    10_000,
+                );
+                record
+                    .evidence_refs
+                    .push(format!("execution_graph:{execution_id}"));
+                record.evidence_refs.push(format!("terminal:{terminal_id}"));
+                record
+                    .evidence_refs
+                    .push("checkpoint:ingress_dispatched".to_string());
+            }
+            record.clone()
+        };
+        if inner.active_turn_id.as_ref() == Some(turn_id) {
+            inner.active_turn_id = None;
+        }
+        Ok(Some(updated))
+    }
+
+    pub fn fail_primary_ingress(
+        &self,
+        idempotency_key: &str,
+        turn_id: &TurnId,
+        error: impl Into<String>,
+    ) -> Result<Option<SessionInputRecord>, SessionInputMutationError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(input_id) = inner.idempotency.get(idempotency_key).cloned() else {
+            return Ok(None);
+        };
+        let updated = {
+            let record = inner
+                .records
+                .iter_mut()
+                .find(|record| record.envelope.input_id == input_id)
+                .ok_or(SessionInputMutationError::NotFound)?;
+            if !record.primary_ingress || record.active_turn_id.as_ref() != Some(turn_id) {
+                return Err(SessionInputMutationError::InvalidPrimaryIngress);
+            }
+            if record.consumed_at.is_none() {
+                record.status = SessionInputStatus::Failed;
+                record.checkpoint = None;
+                record.reason =
+                    InputRoutingReason::new("primary_ingress_failed", error.into(), 10_000);
+                record
+                    .evidence_refs
+                    .push("session-input:primary-ingress-failed".to_string());
+            }
+            record.clone()
+        };
+        if inner.active_turn_id.as_ref() == Some(turn_id) {
+            inner.active_turn_id = None;
+        }
+        Ok(Some(updated))
     }
 
     pub fn cancel_input(
@@ -506,6 +661,9 @@ fn is_checkpoint_consumable(record: &SessionInputRecord, turn_id: &TurnId) -> bo
     if record.consumed_at.is_some() {
         return false;
     }
+    if record.primary_ingress {
+        return false;
+    }
     if !is_pending_status(record.status) {
         return false;
     }
@@ -540,6 +698,66 @@ mod tests {
         assert_eq!(first.decision, InputRoutingDecision::StartNewTurn);
         assert_eq!(second.decision, InputRoutingDecision::RejectDuplicate);
         assert_eq!(stream.projection().total, 1);
+    }
+
+    #[test]
+    fn primary_ingress_binds_and_settles_without_reinjecting_the_prompt() {
+        let stream = SessionInputStream::new("s1");
+        let envelope = SessionInputEnvelope::text("s1", InputSourceKind::Webui, "already primary")
+            .with_idempotency_key("primary-1");
+        let receipt = stream.admit(envelope, RuntimeInputState::default());
+        assert_eq!(receipt.status, SessionInputStatus::QueuedNext);
+        let turn_id = TurnId::from_string("turn-primary");
+
+        let bound = stream
+            .bind_primary_ingress("primary-1", turn_id.clone(), "execution-primary")
+            .expect("bind primary ingress")
+            .expect("in-process record");
+        assert_eq!(bound.status, SessionInputStatus::AttachedToTurn);
+        assert!(stream
+            .consume_for_checkpoint(&turn_id, TurnInputCheckpoint::BeforeProviderRequest, 8)
+            .is_empty());
+        assert_eq!(stream.projection().pending_count, 1);
+
+        let settled = stream
+            .settle_primary_ingress(
+                "primary-1",
+                &turn_id,
+                "execution-primary",
+                "turn-terminal:primary-1",
+            )
+            .expect("settle primary ingress")
+            .expect("in-process record");
+        assert_eq!(settled.status, SessionInputStatus::Consumed);
+        assert_eq!(
+            settled.checkpoint,
+            Some(TurnInputCheckpoint::IngressDispatched)
+        );
+        let projection = stream.projection();
+        assert_eq!(projection.pending_count, 0);
+        assert_eq!(projection.consumed_count, 1);
+        assert_eq!(projection.active_turn_id, None);
+    }
+
+    #[test]
+    fn primary_ingress_never_mutates_a_different_idempotency_key() {
+        let stream = SessionInputStream::new("s1");
+        let receipt = stream.admit(
+            SessionInputEnvelope::text("s1", InputSourceKind::Api, "one")
+                .with_idempotency_key("primary-one"),
+            RuntimeInputState::default(),
+        );
+        let error = stream
+            .bind_primary_ingress("missing", TurnId::from_string("turn-x"), "execution-x")
+            .expect("missing in-memory record is restart-safe");
+        assert!(error.is_none());
+        assert_eq!(
+            stream
+                .record_snapshot(&receipt.input_id)
+                .expect("record")
+                .status,
+            SessionInputStatus::QueuedNext
+        );
     }
 
     #[test]

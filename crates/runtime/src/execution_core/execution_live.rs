@@ -121,6 +121,20 @@ impl LiveExecutionRecord {
             .metrics
             .memory_evidence
             .max(report.audit_projections.len() as u64);
+        self.live.metrics.memory_recalls = self.live.metrics.memory_recalls.max(
+            report
+                .ledger
+                .as_ref()
+                .map(|ledger| {
+                    ledger
+                        .components
+                        .iter()
+                        .filter(|component| component.kind.eq_ignore_ascii_case("memory"))
+                        .map(|component| component.occurrences)
+                        .sum()
+                })
+                .unwrap_or_default(),
+        );
         self.live.metrics.context_items = self.live.context_usage.as_ref().map_or(0, |usage| {
             usage
                 .components
@@ -679,5 +693,44 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(records.len() <= LIVE_CACHE_MAX_RECORDS);
         assert!(records.contains_key("active-execution"));
+    }
+
+    #[test]
+    fn completion_projects_real_memory_recall_occurrences_from_the_context_ledger() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(event_store);
+        store.record_queued(
+            "session-a",
+            "execution-memory".to_string(),
+            "turn-memory".to_string(),
+        );
+        let report = ContextTurnReport::new(
+            "turn-memory",
+            harness_contract::context::ContextPressureState::new("default", 32_000, 1_000),
+        )
+        .with_ledger(harness_contract::context::ContextLedgerProjection {
+            max_tokens: 32_000,
+            consumed_tokens: 1_000,
+            remaining_tokens: 31_000,
+            tool_result_limit: 0,
+            tool_result_consumed: 0,
+            components: vec![harness_contract::context::ContextComponentUsage {
+                kind: "memory".to_string(),
+                tokens: 80,
+                occurrences: 3,
+            }],
+            request_sequence: 1,
+            calibrated_input_tokens: Some(900),
+        });
+
+        store.complete("execution-memory", &report, "terminal-memory".to_string());
+        assert_eq!(
+            store
+                .execution_live("execution-memory")
+                .unwrap()
+                .metrics
+                .memory_recalls,
+            3
+        );
     }
 }

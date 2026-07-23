@@ -188,6 +188,14 @@ pub enum CowdEvent {
         generation: u64,
         projection: ExecutionProjection,
     },
+    /// A bounded background snapshot refresh failed.  It is separate from a
+    /// display warning so the selected execution can release its one in-flight
+    /// refresh slot without ever making the input/render loop await HTTP.
+    ExecutionProjectionRefreshFailed {
+        generation: u64,
+        execution_id: String,
+        message: String,
+    },
     /// A stream established under an earlier credential or schema contract
     /// must never keep rendering its last full snapshot after Gateway rejects
     /// it.  The generation makes a delayed revoke harmless after a selection

@@ -86,6 +86,7 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::ApprovalRequested { .. }
             | CowdEvent::ExecutionProjectionDelta { .. }
             | CowdEvent::ExecutionProjectionLoaded { .. }
+            | CowdEvent::ExecutionProjectionRefreshFailed { .. }
             | CowdEvent::ExecutionProjectionAccessRevoked { .. }
             | CowdEvent::ExecutionGraphSummary { .. }
             | CowdEvent::AppTui { .. }
@@ -116,6 +117,22 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
                     projection: queued_projection,
                 } if queued_generation == generation
                     && queued_projection.execution_id == projection.execution_id)
+            }) {
+                queue[index] = event;
+                return;
+            }
+        }
+        CowdEvent::ExecutionProjectionRefreshFailed {
+            generation,
+            execution_id,
+            ..
+        } => {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(queued, CowdEvent::ExecutionProjectionRefreshFailed {
+                    generation: queued_generation,
+                    execution_id: queued_execution_id,
+                    ..
+                } if queued_generation == generation && queued_execution_id == execution_id)
             }) {
                 queue[index] = event;
                 return;
@@ -158,6 +175,7 @@ fn retain_reliable_event(queue: &mut VecDeque<CowdEvent>, event: CowdEvent) {
             matches!(
                 queued,
                 CowdEvent::ExecutionProjectionDelta { .. }
+                    | CowdEvent::ExecutionProjectionRefreshFailed { .. }
                     | CowdEvent::ExecutionProjectionAccessRevoked { .. }
                     | CowdEvent::ExecutionGraphSummary { .. }
                     | CowdEvent::AppTui { .. }

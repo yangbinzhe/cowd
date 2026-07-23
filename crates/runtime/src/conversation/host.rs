@@ -5696,6 +5696,8 @@ where
                 terminal_id: format!("turn-terminal:{}", ingress.request_id),
                 message_id: format!("assistant:{}", ingress.message_id),
                 session_id: ingress.session_id,
+                execution_id: Some(ticket.graph_id.clone()),
+                turn_id: Some(ingress.turn_id.clone()),
                 payload_ref: format!(
                     "assistant_json:{}",
                     serde_json::to_string(&final_answer).unwrap_or_default()

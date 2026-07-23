@@ -282,7 +282,7 @@ async fn deliver_terminal(
     match outcome {
         Ok((text, message, inserted)) => {
             if inserted {
-                let event = serde_json::json!({
+                let mut event = serde_json::json!({
                     "type": "TerminalCommitted",
                     "session_id": record.session_id,
                     "terminal_id": record.terminal_id,
@@ -291,6 +291,20 @@ async fn deliver_terminal(
                     "response": text,
                     "runtime_commit_cursor": record.commit_cursor,
                 });
+                if let Some(object) = event.as_object_mut() {
+                    if let Some(execution_id) = &record.execution_id {
+                        object.insert(
+                            "execution_id".to_string(),
+                            serde_json::Value::String(execution_id.clone()),
+                        );
+                    }
+                    if let Some(turn_id) = &record.turn_id {
+                        object.insert(
+                            "turn_id".to_string(),
+                            serde_json::Value::String(turn_id.clone()),
+                        );
+                    }
+                }
                 event_bus
                     .broadcast(&record.session_id, &event.to_string())
                     .await;

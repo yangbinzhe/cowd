@@ -336,6 +336,10 @@ pub(crate) struct SessionInputAdmission {
     /// Server-issued execution identity for the accepted ingress. Surfaces
     /// attach to this canonical graph rather than inferring it from prose.
     pub(crate) execution_graph_id: String,
+    /// Server-issued terminal identity for this exact accepted ingress. It is
+    /// stable across retry and lets every Surface discard unrelated replay.
+    pub(crate) terminal_id: String,
+    pub(crate) turn_id: String,
 }
 
 impl RuntimeService {
@@ -577,6 +581,14 @@ impl RuntimeService {
             .get(&terminal_id)
             .map_err(|error| error.to_string())?
         {
+            // A worker may be replaying an already-committed terminal after
+            // process recovery. Re-establish the exact primary marker before
+            // settling so an in-memory projection created by a fresh Surface
+            // does not remain queued forever.
+            self.bind_primary_ingress_projection(record, &graph_id)
+                .await;
+            self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
+                .await;
             if let Some(resolution) = self.session_input_router.record_target_terminal(
                 record,
                 &graph_id,
@@ -675,6 +687,8 @@ impl RuntimeService {
                 return Err(error);
             }
         };
+        self.bind_primary_ingress_projection(record, &graph_id)
+            .await;
         let summary_result = owned_runtime
             .runtime_mut()?
             .submit_ingress_turn(
@@ -684,23 +698,43 @@ impl RuntimeService {
             )
             .await;
         owned_runtime.restore().await;
-        let summary = summary_result.map_err(|error| {
-            if cancellation_token.is_cancelled() {
-                self.runtime_services.cancel_live_execution(
-                    &graph_id,
-                    "cancelled while Runtime turn was running".to_string(),
-                );
-            } else {
-                self.fail_live_execution(&graph_id, error.to_string());
+        let summary = match summary_result {
+            Ok(summary) => summary,
+            Err(error) => {
+                let error = error.to_string();
+                if cancellation_token.is_cancelled() {
+                    self.runtime_services.cancel_live_execution(
+                        &graph_id,
+                        "cancelled while Runtime turn was running".to_string(),
+                    );
+                } else {
+                    self.fail_live_execution(&graph_id, error.clone());
+                }
+                self.fail_primary_ingress_projection(record, &error).await;
+                return Err(error);
             }
-            error.to_string()
-        })?;
-        let terminal = self
+        };
+        let terminal = match self
             .runtime_services
             .session_terminal_delivery()
             .get(&terminal_id)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("runtime committed no terminal for {}", record.request_id))?;
+        {
+            Ok(Some(terminal)) => terminal,
+            Ok(None) => {
+                let error = format!("runtime committed no terminal for {}", record.request_id);
+                self.fail_primary_ingress_projection(record, &error).await;
+                self.fail_live_execution(&graph_id, error.clone());
+                return Err(error);
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.fail_primary_ingress_projection(record, &error).await;
+                self.fail_live_execution(&graph_id, error.clone());
+                return Err(error);
+            }
+        };
+        self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
+            .await;
         self.complete_live_execution(&graph_id, &summary.context_turn_report, terminal_id.clone());
         if let Some(resolution) = self.session_input_router.record_target_terminal(
             record,
@@ -1410,6 +1444,7 @@ impl RuntimeService {
         .await;
         let execution_graph_id =
             runtime::session_ingress_graph_id(&session_id, &request.request_id, &request.turn_id);
+        let terminal_id = format!("turn-terminal:{}", request.request_id);
         self.record_live_execution(
             &session_id,
             execution_graph_id.clone(),
@@ -1419,7 +1454,137 @@ impl RuntimeService {
             execution_graph_id,
             receipt,
             materialized: None,
+            terminal_id,
+            turn_id: request.turn_id,
         })
+    }
+
+    /// Mirror the durable ingress worker's exact request-to-turn ownership in
+    /// the in-process input projection. Projection absence after a restart is
+    /// deliberately non-fatal: the durable outbox remains the execution
+    /// source of truth.
+    async fn bind_primary_ingress_projection(
+        &self,
+        outbox: &memory::SessionRuntimeOutboxRecord,
+        execution_id: &str,
+    ) {
+        let stream = match self.session_input_stream_for(&outbox.session_id).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::debug!(
+                    session_id = %outbox.session_id,
+                    request_id = %outbox.request_id,
+                    ?error,
+                    "ingress execution has no in-process input projection to bind"
+                );
+                return;
+            }
+        };
+        let turn_id = TurnId::from_string(outbox.turn_id.clone());
+        match stream.bind_primary_ingress(&outbox.request_id, turn_id, execution_id) {
+            Ok(Some(record)) => {
+                let receipt = record.to_receipt();
+                self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
+                self.persist_session_input_domain_event(
+                    &outbox.session_id,
+                    "SessionInputIngressBound",
+                    Some(&receipt),
+                    Some(&record),
+                    &stream,
+                    None,
+                )
+                .await;
+            }
+            Ok(None) => tracing::debug!(
+                session_id = %outbox.session_id,
+                request_id = %outbox.request_id,
+                "durable ingress recovered without an in-process input projection"
+            ),
+            Err(error) => tracing::warn!(
+                session_id = %outbox.session_id,
+                request_id = %outbox.request_id,
+                %error,
+                "refused to bind a non-primary session input to ingress execution"
+            ),
+        }
+    }
+
+    async fn settle_primary_ingress_projection(
+        &self,
+        outbox: &memory::SessionRuntimeOutboxRecord,
+        execution_id: &str,
+        terminal_id: &str,
+    ) {
+        let stream = match self.session_input_stream_for(&outbox.session_id).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::debug!(
+                    session_id = %outbox.session_id,
+                    request_id = %outbox.request_id,
+                    ?error,
+                    "terminal settled without an in-process input projection"
+                );
+                return;
+            }
+        };
+        let turn_id = TurnId::from_string(outbox.turn_id.clone());
+        match stream.settle_primary_ingress(&outbox.request_id, &turn_id, execution_id, terminal_id)
+        {
+            Ok(Some(record)) => {
+                let receipt = record.to_receipt();
+                self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
+                self.persist_session_input_domain_event(
+                    &outbox.session_id,
+                    "SessionInputIngressSettled",
+                    Some(&receipt),
+                    Some(&record),
+                    &stream,
+                    None,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                session_id = %outbox.session_id,
+                request_id = %outbox.request_id,
+                %error,
+                "refused to settle an unrelated session input"
+            ),
+        }
+    }
+
+    async fn fail_primary_ingress_projection(
+        &self,
+        outbox: &memory::SessionRuntimeOutboxRecord,
+        error: &str,
+    ) {
+        let stream = match self.session_input_stream_for(&outbox.session_id).await {
+            Ok(stream) => stream,
+            Err(_) => return,
+        };
+        let turn_id = TurnId::from_string(outbox.turn_id.clone());
+        match stream.fail_primary_ingress(&outbox.request_id, &turn_id, error) {
+            Ok(Some(record)) => {
+                let receipt = record.to_receipt();
+                self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
+                self.persist_session_input_domain_event(
+                    &outbox.session_id,
+                    "SessionInputIngressFailed",
+                    Some(&receipt),
+                    Some(&record),
+                    &stream,
+                    None,
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(mutation_error) => tracing::warn!(
+                session_id = %outbox.session_id,
+                request_id = %outbox.request_id,
+                %mutation_error,
+                "refused to fail an unrelated session input"
+            ),
+        }
     }
 
     pub(crate) async fn cancel_session_input(
@@ -2542,6 +2707,109 @@ mod tests {
             receipt.graph_id,
             runtime::session_ingress_graph_id("restart-session", "restart-request", "restart-turn")
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_terminal_settles_the_exact_primary_input_projection() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let service = test_runtime_service(
+            Arc::new(ActiveSessions::default()),
+            Some(Arc::clone(&store)),
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: "projection-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "projection-session".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("test session");
+        service
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                "projection-session".to_string(),
+                runtime::SessionInputStream::new("projection-session"),
+            );
+        let admission = service
+            .admit_session_input_with_materialized(
+                SessionInputEnvelope::text(
+                    "projection-session",
+                    harness_contract::turn::InputSourceKind::Webui,
+                    "already supplied to ingress",
+                )
+                .with_idempotency_key("projection-primary"),
+            )
+            .await
+            .expect("admission");
+        let record = store
+            .get_session_runtime_outbox("projection-primary")
+            .await
+            .expect("outbox lookup")
+            .expect("persisted ingress");
+        service
+            .runtime_services()
+            .session_terminal_delivery()
+            .enqueue(
+                &admission.terminal_id,
+                "assistant-projection-primary",
+                "projection-session",
+                42,
+                "assistant_json:\"done\"",
+            )
+            .expect("durable terminal");
+
+        service
+            .execute_ingress_record(&record, "must not call provider")
+            .await
+            .expect("recovered terminal is delivered");
+
+        let projection = service
+            .session_input_projection("projection-session")
+            .await
+            .expect("input projection");
+        assert_eq!(projection.pending_count, 0);
+        assert_eq!(projection.consumed_count, 1);
+        let stream = service
+            .session_inputs
+            .lock()
+            .unwrap()
+            .get("projection-session")
+            .cloned()
+            .expect("in-process stream");
+        let primary = stream
+            .record_snapshot(&admission.receipt.input_id)
+            .expect("primary record");
+        assert_eq!(
+            primary.status,
+            harness_contract::turn::SessionInputStatus::Consumed
+        );
+        assert_eq!(
+            primary.checkpoint,
+            Some(harness_contract::turn::TurnInputCheckpoint::IngressDispatched)
+        );
+        assert!(primary
+            .evidence_refs
+            .iter()
+            .any(|reference| reference
+                == &format!("execution_graph:{}", admission.execution_graph_id)));
+        assert!(primary
+            .evidence_refs
+            .iter()
+            .any(|reference| reference == &format!("terminal:{}", admission.terminal_id)));
     }
 
     #[test]

@@ -359,6 +359,8 @@ async fn send_message(
             )
         })?;
     let execution_graph_id = admission.execution_graph_id;
+    let terminal_id = admission.terminal_id;
+    let turn_id = admission.turn_id;
     let materialized = admission.materialized;
     let receipt = admission.receipt;
     let projection = runtime_service
@@ -375,7 +377,13 @@ async fn send_message(
         "status": "accepted",
         "execution": {
             "graph_id": execution_graph_id,
-            "status": "accepted",
+            "turn_id": turn_id,
+            "terminal_id": terminal_id,
+            "status": "accepted_pending_materialization",
+            "materialization": {
+                "state": "accepted_pending_graph",
+                "source": "durable_session_outbox",
+            },
         },
         "mode": if active_projection.active_turn_id.is_some() {
             "attached_to_active_turn"
@@ -910,18 +918,30 @@ fn terminal_committed_stream_payload(
 ) -> Option<String> {
     let response =
         crate::session_runtime_bridge::decode_terminal_payload(&record.payload_ref).ok()?;
-    Some(
-        serde_json::json!({
-            "type": "TerminalCommitted",
-            "session_id": record.session_id,
-            "terminal_id": record.terminal_id,
-            "message_id": record.message_id,
-            "response": response,
-            "runtime_commit_cursor": record.commit_cursor,
-            "replayed": true,
-        })
-        .to_string(),
-    )
+    let mut payload = serde_json::json!({
+        "type": "TerminalCommitted",
+        "session_id": record.session_id,
+        "terminal_id": record.terminal_id,
+        "message_id": record.message_id,
+        "response": response,
+        "runtime_commit_cursor": record.commit_cursor,
+        "replayed": true,
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(execution_id) = &record.execution_id {
+            object.insert(
+                "execution_id".to_string(),
+                serde_json::Value::String(execution_id.clone()),
+            );
+        }
+        if let Some(turn_id) = &record.turn_id {
+            object.insert(
+                "turn_id".to_string(),
+                serde_json::Value::String(turn_id.clone()),
+            );
+        }
+    }
+    Some(payload.to_string())
 }
 
 #[cfg(test)]
@@ -966,6 +986,8 @@ mod tests {
             session_id: "session-1".to_string(),
             commit_cursor: 42,
             payload_ref: "assistant_json:\"completed\"".to_string(),
+            execution_id: Some("execution-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
             status: "materialized".to_string(),
             attempts: 1,
             next_attempt_at_ms: None,
@@ -980,6 +1002,8 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(event["type"], "TerminalCommitted");
         assert_eq!(event["terminal_id"], "terminal-1");
+        assert_eq!(event["execution_id"], "execution-1");
+        assert_eq!(event["turn_id"], "turn-1");
         assert_eq!(event["runtime_commit_cursor"], 42);
         assert_eq!(stream_durable_cursor(&encoded), Some(42));
     }
