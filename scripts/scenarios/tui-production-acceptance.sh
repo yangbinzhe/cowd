@@ -1382,9 +1382,14 @@ malformed_status="$(
 )"
 [[ "$malformed_status" == "500" ]] \
   || fail "E10 malformed durable message did not produce the canonical HTTP 500 boundary"
+send_prompt e10-history "/history latest"
+wait_capture e10-history \
+  'Loading older durable history failed|Gateway API returned 500|malformed content|500 Internal Server Error' \
+  e10-malformed-recovery \
+  || fail "E10 malformed history refresh did not surface a typed failure in the conversation"
 send_prompt e10-history "/activity"
 wait_capture e10-history \
-  'Session history unavailable|malformed stored message|HTTP status 500|500 Internal Server Error' \
+  'Loading older durable history failed|Gateway API returned 500|malformed content|500 Internal Server Error' \
   e10-malformed-visible \
   || fail "E10 malformed history failure was not visible in the interactive Activity surface"
 rg -q '\{malformed-v584-e10' "$ARTIFACT_DIR/e10-malformed-visible.txt" \
