@@ -672,7 +672,11 @@ fn focus_acceptance_scopes_from_constraints(constraints: &[String]) -> Vec<Strin
         .flatten()
         .filter_map(|criterion| criterion.strip_prefix("evidence_scope:"))
         .filter(|scope| !scope.is_empty())
-        .map(str::to_string)
+        // Focus output criteria describe a workspace path, while Host
+        // acceptance compares typed tool resource keys. Keep the boundary
+        // fail-closed by adding the read authority explicitly instead of
+        // comparing an untyped path against `read:*` receipts.
+        .map(|scope| format!("read:{scope}"))
         .collect::<Vec<_>>();
     if scopes.is_empty() {
         // A mutation role may expose semantic output names such as
@@ -2283,6 +2287,19 @@ mod tests {
         assert_eq!(
             focus_acceptance_scopes_from_constraints(&review_constraints),
             ["verify_upstream_change:fixtures/target.txt"]
+        );
+    }
+
+    #[test]
+    fn evidence_scope_contract_projects_a_typed_read_resource_scope() {
+        let constraints = vec![
+            "focus_output_acceptance:evidence_scope:crates/runtime".to_string(),
+            "team_acceptance_contract:[{\"criterion\":\"evidence_scope:crates/runtime\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"crates/runtime\"]}}]".to_string(),
+        ];
+
+        assert_eq!(
+            focus_acceptance_scopes_from_constraints(&constraints),
+            ["read:crates/runtime"]
         );
     }
 
