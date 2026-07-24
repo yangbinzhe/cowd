@@ -1382,11 +1382,16 @@ malformed_status="$(
 )"
 [[ "$malformed_status" == "500" ]] \
   || fail "E10 malformed durable message did not produce the canonical HTTP 500 boundary"
+malformed_offset_status="$(
+  command curl -sS \
+    -o "$ARTIFACT_DIR/e10-malformed-history-offset.json" \
+    -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" \
+    "$BASE_URL/api/sessions/$OLD_SESSION_ID/messages?offset=0&limit=500"
+)"
+[[ "$malformed_offset_status" == "500" ]] \
+  || fail "E10 malformed durable message did not fail the TUI offset-history boundary"
 send_prompt e10-history "/history latest"
-wait_capture e10-history \
-  'Loading older durable history failed|Gateway API returned 500|malformed content|500 Internal Server Error' \
-  e10-malformed-recovery \
-  || fail "E10 malformed history refresh did not surface a typed failure in the conversation"
 send_prompt e10-history "/activity"
 wait_capture e10-history \
   'Loading older durable history failed|Gateway API returned 500|malformed content|500 Internal Server Error' \
