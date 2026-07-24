@@ -14,6 +14,7 @@ MODEL="cowd-v584-acceptance"
 SCREEN_PREFIX="cowd-v584-$PPID-$$"
 SESSION_A="v584-session-a-$$"
 SESSION_B="v584-session-b-$$"
+SESSION_LONG="v584-session-long-$$"
 SESSION_10K="v584-session-10k-$$"
 NONCE_A="V584-NONCE-A-$$"
 NONCE_B="V584-NONCE-B-$$"
@@ -524,39 +525,43 @@ wait_capture writer "V584-TURN2-ACK recalled=$NONCE_A" turn2 \
   || fail "turn 2 answer rendered more than once in the live transcript"
 pass "E2 multi-turn causal history is current and not shifted by one answer"
 
-send_prompt writer "V584_LONG_WRAP render the deterministic width fixture"
-wait_message "$SESSION_A" "END-OF-LONG-RESPONSE" \
+start_tui long-wrap "$SESSION_LONG" "tui:v584-long-wrap" 120 40
+wait_capture long-wrap "$MODEL" long-wrap-boot \
+  || fail "independent long-response session did not start"
+send_prompt long-wrap "V584_LONG_WRAP render the deterministic width fixture"
+wait_message "$SESSION_LONG" "END-OF-LONG-RESPONSE" \
   || fail "long response was not durably completed"
 for size in 40x24 60x30 90x32 120x40 200x52; do
   width="${size%x*}"
   height="${size#*x}"
-  resize_tui writer "$width" "$height"
+  resize_tui long-wrap "$width" "$height"
   sleep 0.35
-  send_raw writer $'\033'
-  send_raw writer $'\033[F'
+  send_raw long-wrap $'\033'
+  send_raw long-wrap $'\033[F'
   sleep 0.15
-  capture writer "width-$size-tail" \
+  capture long-wrap "width-$size-tail" \
     || fail "long-response tail could not be captured at terminal size $size"
   cp "$ARTIFACT_DIR/width-$size-tail.txt" "$ARTIFACT_DIR/width-$size.txt"
   rg -q 'END-OF-LONG-RESPONSE' "$ARTIFACT_DIR/width-$size.txt" \
     || fail "long-response tail disappeared at terminal size $size"
   [[ "$(rg -o 'END-OF-LONG-RESPONSE' "$ARTIFACT_DIR/width-$size.txt" | wc -l)" == "1" ]] \
     || fail "long response rendered more than once at terminal size $size"
-  send_raw writer $'\033[H'
+  send_raw long-wrap $'\033[H'
   sleep 0.15
-  capture writer "width-$size-head" \
+  capture long-wrap "width-$size-head" \
     || fail "long-response head could not be captured at terminal size $size"
   rg -q 'V584-LONG-BEGIN' "$ARTIFACT_DIR/width-$size-head.txt" \
     || fail "long-response Home navigation could not reach its head at $size"
   rg -q 'ROW-00.*中文|ROW-00' "$ARTIFACT_DIR/width-$size-head.txt" \
     || fail "long-response first CJK/URL/JSON/code matrix row was not reachable at $size"
-  send_raw writer $'\033[F'
+  send_raw long-wrap $'\033[F'
   sleep 0.15
-  capture writer "width-$size-return-tail" \
+  capture long-wrap "width-$size-return-tail" \
     || fail "long-response return tail could not be captured at terminal size $size"
   rg -q 'ROW-47|END-OF-LONG-RESPONSE' "$ARTIFACT_DIR/width-$size-return-tail.txt" \
     || fail "long-response End navigation did not return to the canonical tail at $size"
 done
+stop_tui long-wrap
 pass "E4 long Chinese/URL/JSON/code/emoji content has reachable head/tail and stable scroll bounds at all target widths"
 
 resize_tui writer 120 40
