@@ -254,6 +254,13 @@ impl ProviderRuntimeClient {
         let entry = match build_provider_entry(&provider_snapshot, &request.model) {
             Ok(entry) => entry,
             Err(error) => {
+                tracing::warn!(
+                    model = %request.model,
+                    registry_revision = provider_snapshot.revision(),
+                    configured_providers = ?provider_snapshot.provider_names(),
+                    error = %error,
+                    "provider request could not resolve a configured runtime client"
+                );
                 return Box::pin(futures::stream::once(async move {
                     Err(RuntimeError::new(format!(
                         "provider candidate `{}` is unavailable: {error}",
@@ -295,6 +302,10 @@ impl ProviderRuntimeClient {
                 // callers may still construct it in synchronous diagnostics.
                 // Return a normal stream error instead of panicking while
                 // attempting to spawn a Tokio task without a reactor.
+                tracing::warn!(
+                    model = %entry.model,
+                    "provider stream was created outside an active Tokio runtime"
+                );
                 let _ = sender.unbounded_send(Err(RuntimeError::new(
                     "provider stream requires an active Tokio runtime",
                 )));
@@ -342,9 +353,17 @@ async fn forward_provider_attempt(
     )
     .await
     {
-        let _ = sender.unbounded_send(Err(RuntimeError::with_provider_context_window_limit(
+        tracing::warn!(
+            model = %entry.model,
+            error = %error,
+            "provider stream attempt failed before terminal completion"
+        );
+        let provider_context_window_limit = error.error.context_window_limit_hint();
+        let provider_tool_protocol_failure = error.error.is_compatibility_tool_protocol_failure();
+        let _ = sender.unbounded_send(Err(RuntimeError::with_provider_failure_metadata(
             error.error.to_string(),
-            error.error.context_window_limit_hint(),
+            provider_context_window_limit,
+            provider_tool_protocol_failure,
         )));
     }
 }

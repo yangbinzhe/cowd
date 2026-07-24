@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,9 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(base: &str) -> Self {
-        Self { base: base.to_string() }
+        Self {
+            base: base.to_string(),
+        }
     }
 
     pub fn get(&self, path: &str) -> Result<String> {

@@ -70,6 +70,8 @@ struct SendMessageRequest {
     resource_ids: Vec<String>,
     #[serde(default)]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    client_message_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -244,6 +246,7 @@ async fn send_message(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
@@ -270,6 +273,7 @@ async fn send_message(
     if session_exists || runtime_service.has_active_session(&id) {
         authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     }
+    super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
     // The durable record is the authority boundary, not proof that this
     // Gateway process has an active Runtime instance.  A permitted owner must
     // still restore a cold session before ingress; conversely the foreign
@@ -324,7 +328,6 @@ async fn send_message(
     );
 
     let session_id = id.clone();
-    let event_bus = state.event_bus();
     let run_id = uuid::Uuid::new_v4().to_string();
     let active_projection = runtime_service
         .session_input_projection(&session_id)
@@ -337,9 +340,31 @@ async fn send_message(
                 }),
             )
         })?;
-    let mut envelope =
-        SessionInputEnvelope::text(session_id.clone(), InputSourceKind::Webui, runtime_content)
-            .with_source_ref(format!("api:/api/sessions/{session_id}/messages"));
+    let observer_id = headers
+        .get("x-cowd-observer-id")
+        .and_then(|value| value.to_str().ok());
+    let surface_id = headers
+        .get("x-cowd-surface-id")
+        .and_then(|value| value.to_str().ok());
+    let source_kind = match (surface_id, observer_id) {
+        (Some("cowd.tui"), Some(observer)) if observer.starts_with("tui:") => InputSourceKind::Tui,
+        (Some("webui"), Some(observer)) if observer.starts_with("webui:") => InputSourceKind::Webui,
+        (None, None) => InputSourceKind::Webui,
+        _ => InputSourceKind::Api,
+    };
+    let mut envelope = SessionInputEnvelope::text(session_id.clone(), source_kind, runtime_content)
+        .with_source_ref(format!(
+            "api:/api/sessions/{session_id}/messages;surface={};observer={}",
+            surface_id.unwrap_or("legacy-webui"),
+            observer_id.unwrap_or("principal-default")
+        ));
+    if let Some(client_message_id) = body
+        .client_message_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        envelope = envelope.with_source_message_id(client_message_id.trim().to_string());
+    }
     if let Some(idempotency_key) = body
         .idempotency_key
         .as_ref()
@@ -395,9 +420,6 @@ async fn send_message(
         "input_projection": projection,
         "turn_inbox": inbox,
     });
-    event_bus
-        .broadcast(&session_id, &response.to_string())
-        .await;
     Ok(Json(response))
 }
 
@@ -491,9 +513,11 @@ async fn cancel_session_input(
     AxumState(state): AxumState<Arc<AppState>>,
     Path((id, input_id)): Path<(String, String)>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(body): Json<SessionInputCancelRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -533,9 +557,11 @@ async fn reclassify_session_input(
     AxumState(state): AxumState<Arc<AppState>>,
     Path((id, input_id)): Path<(String, String)>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(body): Json<SessionInputReclassifyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -634,30 +660,78 @@ async fn get_session_messages(
             .session
             .stored_message_count(&id)
             .await
-            .unwrap_or(Some(0))
-            .unwrap_or(0);
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("durable session message count failed for `{id}`: {error}"),
+                    }),
+                )
+            })?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("session `{id}` was not found in durable storage"),
+                    }),
+                )
+            })?;
         let db_messages = if let Some(seq) = from_seq {
             state
                 .services
                 .session
                 .stored_messages_from_sequence(&id, seq, limit)
                 .await
-                .unwrap_or(Some(Vec::new()))
-                .unwrap_or_default()
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!(
+                                "durable session message read failed for `{id}` from sequence {seq}: {error}"
+                            ),
+                        }),
+                    )
+                })?
         } else {
             state
                 .services
                 .session
                 .stored_messages(&id, offset, limit)
                 .await
-                .unwrap_or(Some(Vec::new()))
-                .unwrap_or_default()
-        };
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!(
+                                "durable session message read failed for `{id}` at offset {offset}: {error}"
+                            ),
+                        }),
+                    )
+                })?
+        }
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("session `{id}` was not found in durable storage"),
+                }),
+            )
+        })?;
         let messages: Vec<serde_json::Value> = db_messages
             .iter()
-            .map(|m| {
+            .map(|m| -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
                 let blocks: Vec<serde_json::Value> =
-                    serde_json::from_str(&m.content_json).unwrap_or_default();
+                    serde_json::from_str(&m.content_json).map_err(|error| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse {
+                                error: format!(
+                                    "durable message `{}` at sequence {} has malformed content: {error}",
+                                    m.stable_message_id, m.sequence
+                                ),
+                            }),
+                        )
+                    })?;
                 let mut val = serde_json::json!({
                     "id": m.stable_message_id,
                     "session_id": m.session_id,
@@ -667,9 +741,19 @@ async fn get_session_messages(
                     "created_at_ms": m.created_at_ms,
                 });
                 if let Some(ref tu) = m.token_usage_json {
-                    if let Ok(usage) = serde_json::from_str::<serde_json::Value>(tu) {
-                        val["token_usage"] = usage;
-                    }
+                    val["token_usage"] = serde_json::from_str::<serde_json::Value>(tu).map_err(
+                        |error| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "durable message `{}` at sequence {} has malformed token usage: {error}",
+                                        m.stable_message_id, m.sequence
+                                    ),
+                                }),
+                            )
+                        },
+                    )?;
                 }
                 if let Some(ref tid) = m.tool_use_id {
                     val["tool_use_id"] = serde_json::Value::String(tid.clone());
@@ -677,9 +761,9 @@ async fn get_session_messages(
                 if let Some(ref tn) = m.tool_name {
                     val["tool_name"] = serde_json::Value::String(tn.clone());
                 }
-                val
+                Ok(val)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
         let next_seq = db_messages.last().map(|m| m.sequence + 1);
         let has_more = next_seq
             .map(|seq| seq < total)
@@ -782,7 +866,12 @@ async fn sse_stream_handler(
     headers: HeaderMap,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &session_id, SessionAccess::Read).await?;
-    let (tx, rx) = mpsc::channel(256);
+    // Replay runs after Axum receives the stream so arbitrarily many bounded
+    // pages can drain concurrently to the client. Producing replay inside the
+    // handler would either deadlock on the output channel or silently stop
+    // after one page.
+    const SESSION_STREAM_OUTPUT_CAPACITY: usize = 512;
+    let (tx, rx) = mpsc::channel(SESSION_STREAM_OUTPUT_CAPACITY);
     let (bus_tx, bus_rx) = mpsc::channel(256);
     let event_bus = state.event_bus();
     let subscription_id = event_bus.subscribe(&session_id, bus_tx).await;
@@ -792,25 +881,25 @@ async fn sse_stream_handler(
         .and_then(|value| value.parse::<u64>().ok())
         .or(query.from_cursor)
         .unwrap_or_default();
-    for event in replay_materialized_terminal_events(&state, &session_id, resume_cursor).await {
-        let _ = tx.send(event).await;
-    }
-    let _ = tx
-        .send(
-            serde_json::json!({
-                "type": "Connected",
-                "session_id": session_id,
-            })
-            .to_string(),
-        )
-        .await;
-
+    let observer_id = headers
+        .get("x-cowd-observer-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| super::validated_session_observer_id(Some(value)))
+        .map(str::to_string);
+    let revoked_attachment_actor = observer_id
+        .as_deref()
+        .map(|observer_id| super::surface_actor_id(&principal, observer_id));
+    let revoked_lease_owner = super::session_lease_owner(&principal, observer_id.as_deref());
     spawn_session_stream_authorization_guard(
         bus_rx,
-        tx.clone(),
+        tx,
+        state.clone(),
         state.config_home.clone(),
         principal,
         session_id.clone(),
+        resume_cursor,
+        revoked_attachment_actor,
+        revoked_lease_owner,
     );
 
     let stream = SseStream {
@@ -837,11 +926,70 @@ async fn sse_stream_handler(
 fn spawn_session_stream_authorization_guard(
     mut bus_rx: mpsc::Receiver<String>,
     tx: mpsc::Sender<String>,
+    state: Arc<AppState>,
     config_home: PathBuf,
     principal: AuthenticatedPrincipal,
     session_id: String,
+    resume_cursor: u64,
+    revoked_attachment_actor: Option<String>,
+    revoked_lease_owner: String,
 ) {
     tokio::spawn(async move {
+        const TERMINAL_REPLAY_PAGE_SIZE: usize = 500;
+        const TERMINAL_REPLAY_MAX_PAGES: usize = 100;
+        let mut replay_cursor = resume_cursor;
+        for page_index in 0..TERMINAL_REPLAY_MAX_PAGES {
+            let page = replay_materialized_terminal_events(
+                &state,
+                &session_id,
+                replay_cursor,
+                TERMINAL_REPLAY_PAGE_SIZE,
+            )
+            .await;
+            for event in page.events {
+                if tx.send(event).await.is_err() {
+                    return;
+                }
+            }
+            replay_cursor = replay_cursor.max(page.last_cursor.unwrap_or(replay_cursor));
+            if page.requires_resync {
+                return;
+            }
+            if page.record_count < TERMINAL_REPLAY_PAGE_SIZE {
+                break;
+            }
+            if page_index + 1 == TERMINAL_REPLAY_MAX_PAGES {
+                // This is a typed recovery boundary, not a false Connected:
+                // reconnecting from replay_cursor continues with the next
+                // bounded page and cannot strand terminal 50_001 forever.
+                let _ = tx
+                    .send(
+                        serde_json::json!({
+                            "type": "session_stream_resync",
+                            "session_id": session_id,
+                            "reason": "terminal_replay_window",
+                            "runtime_commit_cursor": replay_cursor,
+                        })
+                        .to_string(),
+                    )
+                    .await;
+                return;
+            }
+        }
+        if tx
+            .send(
+                serde_json::json!({
+                    "type": "Connected",
+                    "session_id": session_id,
+                    "runtime_commit_cursor": replay_cursor,
+                })
+                .to_string(),
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.tick().await;
         loop {
@@ -862,6 +1010,17 @@ fn spawn_session_stream_authorization_guard(
                         Err(error) => Some(format!("session stream authorization check aborted: {error}")),
                     };
                     if let Some(reason) = reason {
+                        // Revocation is a server-side authority boundary, not
+                        // just an instruction for the remote renderer. Remove
+                        // the exact observer attachment and writer lease before
+                        // publishing the terminal event so no subsequent HTTP
+                        // mutation can continue under stale Surface state.
+                        cleanup_revoked_session_stream_authority(
+                            &state,
+                            &session_id,
+                            revoked_attachment_actor.as_deref(),
+                            &revoked_lease_owner,
+                        ).await;
                         let _ = tx.send(serde_json::json!({
                             "type": "SessionAuthorizationRevoked",
                             "session_id": session_id,
@@ -883,6 +1042,40 @@ fn spawn_session_stream_authorization_guard(
     });
 }
 
+async fn cleanup_revoked_session_stream_authority(
+    state: &AppState,
+    session_id: &str,
+    attachment_actor: Option<&str>,
+    lease_owner: &str,
+) {
+    if let Some(actor_id) = attachment_actor {
+        let detached = state
+            .services
+            .session
+            .detach_session_value(session_id, actor_id)
+            .await;
+        if detached.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            tracing::warn!(
+                session_id,
+                actor_id,
+                result = %detached,
+                "revoked session stream attachment cleanup was not confirmed"
+            );
+        }
+    }
+    if let Some(registry) = state.session_lease_registry.as_ref() {
+        let released = registry.release(session_id, lease_owner).await;
+        if released.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            tracing::warn!(
+                session_id,
+                lease_owner,
+                result = %released,
+                "revoked session stream writer lease cleanup was not confirmed"
+            );
+        }
+    }
+}
+
 fn stream_durable_cursor(data: &str) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(data)
         .ok()?
@@ -894,23 +1087,64 @@ async fn replay_materialized_terminal_events(
     state: &AppState,
     session_id: &str,
     after_cursor: u64,
-) -> Vec<String> {
+    limit: usize,
+) -> ReplayTerminalPage {
     let Some(runtime) = state.services.runtime.as_ref() else {
-        return Vec::new();
+        return ReplayTerminalPage::default();
     };
     let delivery = runtime.runtime_services().session_terminal_delivery();
     let session_id = session_id.to_string();
+    let lookup_session_id = session_id.clone();
     let records = tokio::task::spawn_blocking(move || {
-        delivery.materialized_after(&session_id, after_cursor, 500)
+        delivery.materialized_after(&lookup_session_id, after_cursor, limit)
     })
     .await
     .ok()
     .and_then(Result::ok)
     .unwrap_or_default();
-    records
-        .into_iter()
-        .filter_map(|record| terminal_committed_stream_payload(&record))
-        .collect()
+    let record_count = records.len();
+    let mut last_cursor = None;
+    let mut events = Vec::with_capacity(records.len());
+    let mut requires_resync = false;
+    for record in records {
+        if let Some(event) = terminal_committed_stream_payload(&record) {
+            last_cursor = Some(record.commit_cursor);
+            events.push(event);
+        } else {
+            tracing::error!(
+                session_id,
+                terminal_id = %record.terminal_id,
+                runtime_commit_cursor = record.commit_cursor,
+                "materialized terminal cannot be replayed; refusing to advance Surface cursor"
+            );
+            events.push(
+                serde_json::json!({
+                    "type": "session_stream_resync",
+                    "session_id": session_id,
+                    "reason": "corrupt_materialized_terminal",
+                    "terminal_id": record.terminal_id,
+                    "runtime_commit_cursor": last_cursor.unwrap_or(after_cursor),
+                })
+                .to_string(),
+            );
+            requires_resync = true;
+            break;
+        }
+    }
+    ReplayTerminalPage {
+        events,
+        record_count,
+        last_cursor,
+        requires_resync,
+    }
+}
+
+#[derive(Default)]
+struct ReplayTerminalPage {
+    events: Vec<String>,
+    record_count: usize,
+    last_cursor: Option<u64>,
+    requires_resync: bool,
 }
 
 fn terminal_committed_stream_payload(
@@ -918,16 +1152,24 @@ fn terminal_committed_stream_payload(
 ) -> Option<String> {
     let response =
         crate::session_runtime_bridge::decode_terminal_payload(&record.payload_ref).ok()?;
+    let token_usage = response
+        .token_usage_json
+        .as_deref()
+        .and_then(|usage| serde_json::from_str(usage).ok());
     let mut payload = serde_json::json!({
         "type": "TerminalCommitted",
         "session_id": record.session_id,
         "terminal_id": record.terminal_id,
         "message_id": record.message_id,
-        "response": response,
+        "part_id": "assistant_text",
+        "response": response.text,
         "runtime_commit_cursor": record.commit_cursor,
         "replayed": true,
     });
     if let Some(object) = payload.as_object_mut() {
+        if let Some(token_usage) = token_usage {
+            object.insert("token_usage".to_string(), token_usage);
+        }
         if let Some(execution_id) = &record.execution_id {
             object.insert(
                 "execution_id".to_string(),
@@ -1006,5 +1248,72 @@ mod tests {
         assert_eq!(event["turn_id"], "turn-1");
         assert_eq!(event["runtime_commit_cursor"], 42);
         assert_eq!(stream_durable_cursor(&encoded), Some(42));
+    }
+
+    #[tokio::test]
+    async fn revoked_stream_cleanup_removes_only_the_exact_attachment_and_lease_owner() {
+        let state = crate::api_routes::tests::test_state();
+        let session_id = "session-revoked-stream";
+        let revoked_actor = "tui:revoked-observer";
+        let surviving_actor = "web:surviving-observer";
+        let revoked_owner = "principal:tui:revoked-observer";
+        let surviving_owner = "principal:web:surviving-observer";
+
+        state
+            .services
+            .session
+            .unified_store()
+            .expect("test session store")
+            .create_session(&crate::api_routes::new_api_session_record(session_id, None))
+            .await
+            .expect("create test session");
+        for (actor, surface) in [(revoked_actor, "tui"), (surviving_actor, "web")] {
+            let attached = state
+                .services
+                .session
+                .attach_session_value(session_id, actor, surface, Some("writer"))
+                .await;
+            assert_eq!(attached["ok"], true);
+        }
+        let registry = state
+            .session_lease_registry
+            .as_ref()
+            .expect("test lease registry");
+        assert_eq!(
+            registry
+                .acquire(session_id, revoked_owner, "collaborative")
+                .await["ok"],
+            true
+        );
+        assert_eq!(
+            registry
+                .acquire(session_id, surviving_owner, "collaborative")
+                .await["ok"],
+            true
+        );
+
+        cleanup_revoked_session_stream_authority(
+            &state,
+            session_id,
+            Some(revoked_actor),
+            revoked_owner,
+        )
+        .await;
+
+        let lifecycle = state
+            .services
+            .session
+            .lifecycle_snapshot_value(Some(session_id))
+            .await;
+        let attachment_ids = lifecycle["snapshot"]["attachments"]
+            .as_array()
+            .expect("attachments")
+            .iter()
+            .filter_map(|attachment| attachment["actor"]["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(attachment_ids, vec![surviving_actor]);
+        let leases = registry.list().await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].owner, surviving_owner);
     }
 }

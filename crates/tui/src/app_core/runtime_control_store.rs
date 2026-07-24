@@ -472,8 +472,14 @@ impl RuntimeControlSnapshot {
         app.gateway_mission_control = self.mission_control.clone();
         app.gateway_connector_degraded_reasons = self.connector_degraded_reasons.clone();
         app.gateway_degraded_reasons = self.degraded_reasons.clone();
-        app.gateway_lease_owner = self.lease_owner.clone();
-        app.gateway_lease_mode = self.lease_mode.clone();
+        // The account-wide Runtime snapshot can contain leases belonging to
+        // other observers. Once this Surface has an explicit lease outcome,
+        // that local admission result is authoritative and must not be
+        // overwritten by the first item in the global lease list.
+        if app.gateway_lease_owner.is_none() && app.gateway_lease_mode.is_none() {
+            app.gateway_lease_owner = self.lease_owner.clone();
+            app.gateway_lease_mode = self.lease_mode.clone();
+        }
     }
 
     pub fn ingest_session_ids(&mut self, session_ids: Vec<String>) {
@@ -2191,4 +2197,25 @@ pub async fn refresh_runtime_control_snapshot(
     }
 
     snapshot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_snapshot_cannot_overwrite_this_surfaces_read_only_admission() {
+        let mut app = App::new("model", "session");
+        app.gateway_lease_mode = Some("read-only".to_string());
+        let snapshot = RuntimeControlSnapshot {
+            lease_owner: Some("another-surface".to_string()),
+            lease_mode: Some("exclusive".to_string()),
+            ..RuntimeControlSnapshot::default()
+        };
+
+        snapshot.apply_to_app(&mut app);
+
+        assert_eq!(app.gateway_lease_owner, None);
+        assert_eq!(app.gateway_lease_mode.as_deref(), Some("read-only"));
+    }
 }

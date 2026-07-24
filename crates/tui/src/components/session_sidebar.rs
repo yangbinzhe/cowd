@@ -59,6 +59,8 @@ pub struct SessionSidebar {
     // ── Action flags (consumed by parent App) ──
     /// Set when user presses `d` on a session. Reset by `load()`.
     pub pending_delete_idx: Option<usize>,
+    /// Destructive deletion requires a second `d` on the same selected row.
+    delete_armed_idx: Option<usize>,
     /// Set when user presses Enter on a session (not in edit mode).
     pub pending_switch_idx: Option<usize>,
     /// Set when user commits an inline rename (Enter while editing).
@@ -92,6 +94,7 @@ impl SessionSidebar {
             edit_buffer: String::new(),
             edit_idx: 0,
             pending_delete_idx: None,
+            delete_armed_idx: None,
             pending_switch_idx: None,
             pending_rename: None,
             pending_new_session: false,
@@ -119,6 +122,7 @@ impl SessionSidebar {
 
         // Reset pending flags
         self.pending_delete_idx = None;
+        self.delete_armed_idx = None;
         self.pending_switch_idx = None;
         self.pending_rename = None;
         self.pending_new_session = false;
@@ -132,6 +136,18 @@ impl SessionSidebar {
             .iter()
             .position(|s| s.id == self.current_session_id)
             .unwrap_or(0);
+    }
+
+    /// Refresh the canonical list only when its content actually changed.
+    /// Rendering calls this every frame; preserving selection and pending
+    /// actions is therefore a correctness requirement, not an optimization.
+    pub fn refresh_if_changed(&mut self, mut sessions: Vec<SessionSummary>) -> bool {
+        sessions.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        if self.sessions == sessions {
+            return false;
+        }
+        self.load(sessions);
+        true
     }
 
     /// Update which session is considered "current".
@@ -222,6 +238,7 @@ impl SessionSidebar {
                 role,
                 content,
                 timestamp,
+                ..
             } = entry
             {
                 if role == "user" {
@@ -313,10 +330,14 @@ impl Component for SessionSidebar {
 
                 let marker = if is_current { "*" } else { " " };
                 let prefix = if is_selected { "▸" } else { " " };
-                let id_trunc = &session.id[..8.min(session.id.len())];
+                let display_name = session
+                    .title
+                    .as_deref()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| &session.id[..8.min(session.id.len())]);
                 format!(
                     "{} {}  {} msgs  {}  {}",
-                    prefix, marker, session.message_count, ts, id_trunc
+                    prefix, marker, session.message_count, ts, display_name
                 )
             };
 
@@ -345,9 +366,15 @@ impl Component for SessionSidebar {
                 ListItem::from(" Enter confirm  Esc cancel ")
                     .style(Style::default().fg(Color::DarkGray)),
             );
+        } else if self.delete_armed_idx == Some(self.selected_idx) {
+            items.push(
+                ListItem::from(" d again: permanently delete  Esc: cancel ")
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            );
         } else {
             items.push(
-                ListItem::from(" j/k↓↑ Enter r d n f ").style(Style::default().fg(Color::DarkGray)),
+                ListItem::from(" j/k↓↑ Enter r d×2 n f e ")
+                    .style(Style::default().fg(Color::DarkGray)),
             );
         }
 
@@ -415,16 +442,19 @@ impl SessionSidebar {
         match key.code {
             // Navigation
             KeyCode::Char('j') | KeyCode::Down => {
+                self.delete_armed_idx = None;
                 self.select_next();
                 EventResult::Consumed
             }
             KeyCode::Char('k') | KeyCode::Up => {
+                self.delete_armed_idx = None;
                 self.select_prev();
                 EventResult::Consumed
             }
 
             // Switch session
             KeyCode::Enter => {
+                self.delete_armed_idx = None;
                 if !self.sessions.is_empty() {
                     self.pending_switch_idx = Some(self.selected_idx);
                 }
@@ -433,6 +463,7 @@ impl SessionSidebar {
 
             // Inline rename
             KeyCode::Char('r') => {
+                self.delete_armed_idx = None;
                 if !self.sessions.is_empty() {
                     self.editing = true;
                     self.edit_idx = self.selected_idx;
@@ -444,26 +475,39 @@ impl SessionSidebar {
             // Delete flag
             KeyCode::Char('d') => {
                 if !self.sessions.is_empty() {
-                    self.pending_delete_idx = Some(self.selected_idx);
+                    if self.delete_armed_idx == Some(self.selected_idx) {
+                        self.pending_delete_idx = Some(self.selected_idx);
+                        self.delete_armed_idx = None;
+                    } else {
+                        self.delete_armed_idx = Some(self.selected_idx);
+                    }
                 }
                 EventResult::Consumed
             }
 
             // New session
             KeyCode::Char('n') => {
+                self.delete_armed_idx = None;
                 self.pending_new_session = true;
                 EventResult::Consumed
             }
 
             // Fork dialog
             KeyCode::Char('f') => {
+                self.delete_armed_idx = None;
                 self.pending_fork = true;
                 EventResult::Consumed
             }
 
             // Export dialog
             KeyCode::Char('e') => {
+                self.delete_armed_idx = None;
                 self.pending_export = true;
+                EventResult::Consumed
+            }
+
+            KeyCode::Esc => {
+                self.delete_armed_idx = None;
                 EventResult::Consumed
             }
 
@@ -491,6 +535,7 @@ mod tests {
     fn test_session(id: &str, updated_at_ms: u64, message_count: usize) -> SessionSummary {
         SessionSummary {
             id: id.to_string(),
+            title: None,
             path: format!("/sessions/{id}.json"),
             updated_at_ms,
             message_count,
@@ -765,6 +810,8 @@ mod tests {
         // j wraps from 1 → 0, pressing d at idx 0
         let _ = sidebar.handle_key(&key_event(KeyCode::Char('j')));
         let _ = sidebar.handle_key(&key_event(KeyCode::Char('d')));
+        assert!(sidebar.pending_delete_idx.is_none());
+        let _ = sidebar.handle_key(&key_event(KeyCode::Char('d')));
         assert_eq!(sidebar.pending_delete_idx, Some(0));
     }
 
@@ -935,21 +982,25 @@ mod tests {
                 role: "user".into(),
                 content: "What is the capital of France?".into(),
                 timestamp: "14:30".into(),
+                identity: None,
             },
             TimelineEntry::Message {
                 role: "assistant".into(),
                 content: "The capital is Paris.".into(),
                 timestamp: "14:31".into(),
+                identity: None,
             },
             TimelineEntry::Message {
                 role: "user".into(),
                 content: "And what about Italy?".into(),
                 timestamp: "14:32".into(),
+                identity: None,
             },
             TimelineEntry::Message {
                 role: "assistant".into(),
                 content: "Rome is the capital of Italy.".into(),
                 timestamp: "14:33".into(),
+                identity: None,
             },
         ]
     }

@@ -14,13 +14,14 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph},
 };
 
 use crate::app::{Theme, TimelineEntry};
 use crate::components::{Component, EventResult, RenderContext};
 use crate::md_renderer;
 use crate::scroll_state::ScrollState;
+use crate::wrapping::wrap_styled_lines;
 
 // ── ChatView ──────────────────────────────────────────────────────
 
@@ -33,6 +34,7 @@ pub struct ChatView {
     // ── Timeline ──
     pub timeline: Vec<TimelineEntry>,
     pub timeline_cursor: usize,
+    session_id: String,
 
     // ── Scrolling (unified scroll state from ratatui-kit pattern) ──
     pub scroll_state: ScrollState,
@@ -41,8 +43,19 @@ pub struct ChatView {
     pub turn_active: bool,
     turn_input_tokens: u64,
     turn_output_tokens: u64,
+    turn_usage_known: bool,
+    current_turn_tool_count: usize,
+    current_turn_thinking_count: usize,
     session_input_tokens: u64,
     session_output_tokens: u64,
+    context_used_tokens: Option<u64>,
+    context_window_tokens: Option<u64>,
+    context_remaining_tokens: Option<u64>,
+    context_usage_percent_bp: Option<u16>,
+    execution_status: Option<harness_contract::projection::ExecutionLiveStatus>,
+    execution_started_at_ms: Option<u64>,
+    last_progress_at_ms: Option<u64>,
+    run_metrics: Option<harness_contract::projection::RunMetricsProjection>,
     memory_total_entries: usize,
     context_selected_count: usize,
     context_omitted_count: usize,
@@ -73,9 +86,32 @@ pub struct ChatView {
     // ── Render cache ──
     cached_chat_lines: Vec<Line<'static>>,
     entry_line_counts: Vec<usize>,
+    /// Wrapped visual-row start for each timeline entry. Hidden entries are
+    /// `None`. Search navigation and rendering share this exact coordinate
+    /// system instead of relying on App-side line estimates.
+    entry_visual_starts: Vec<Option<usize>>,
     msg_version: u64,
     last_drawn_version: u64,
     lines_dirty: bool,
+    cached_wrap_width: u16,
+    last_full_sync_revision: u64,
+    last_timeline_mutation_revision: u64,
+    dirty_patch_indices: Vec<usize>,
+    last_main_entry_index: Option<usize>,
+    last_assistant_entry_index: Option<usize>,
+    tail_patch_eligible: bool,
+    append_patch_start: Option<usize>,
+    /// First cached visual row owned by the dynamic turn footer/spinner. The
+    /// transcript before this boundary is width-stable and must not be rebuilt
+    /// for the 100ms active-run clock.
+    cached_dynamic_start: usize,
+    full_rebuild_count: u64,
+    incremental_rebuild_count: u64,
+    dynamic_rebuild_count: u64,
+    finalized_cache_hits: u64,
+    finalized_cache_misses: u64,
+    last_history_prepend_revision: u64,
+    pending_history_anchor: Option<(String, usize)>,
 
     // ── Theme ──
     pub theme: Theme,
@@ -84,6 +120,7 @@ pub struct ChatView {
     pub search_query: String,
     pub search_matches: Vec<usize>,
     pub search_current: usize,
+    pending_search_scroll: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -96,6 +133,10 @@ impl ChatView {
     fn renders_in_main_chat(entry: &TimelineEntry) -> bool {
         match entry {
             TimelineEntry::Message { role, .. } => role == "user" || role == "assistant",
+            // A tool invocation is part of the causal conversation, not an
+            // implementation-only diagnostic. Keep the card compact here and
+            // leave full input/output details in Process.
+            TimelineEntry::ToolCall { .. } => true,
             TimelineEntry::SlashOutput { .. } => true,
             _ => false,
         }
@@ -114,12 +155,24 @@ impl ChatView {
         Self {
             timeline: Vec::new(),
             timeline_cursor: 0,
+            session_id: String::new(),
             scroll_state: ScrollState::new(),
             turn_active: false,
             turn_input_tokens: 0,
             turn_output_tokens: 0,
+            turn_usage_known: false,
+            current_turn_tool_count: 0,
+            current_turn_thinking_count: 0,
             session_input_tokens: 0,
             session_output_tokens: 0,
+            context_used_tokens: None,
+            context_window_tokens: None,
+            context_remaining_tokens: None,
+            context_usage_percent_bp: None,
+            execution_status: None,
+            execution_started_at_ms: None,
+            last_progress_at_ms: None,
+            run_metrics: None,
             memory_total_entries: 0,
             context_selected_count: 0,
             context_omitted_count: 0,
@@ -138,13 +191,31 @@ impl ChatView {
             compact_mode: false,
             cached_chat_lines: Vec::new(),
             entry_line_counts: Vec::new(),
+            entry_visual_starts: Vec::new(),
             msg_version: 0,
             last_drawn_version: u64::MAX,
             lines_dirty: true,
+            cached_wrap_width: 0,
+            last_full_sync_revision: u64::MAX,
+            last_timeline_mutation_revision: 0,
+            dirty_patch_indices: Vec::new(),
+            last_main_entry_index: None,
+            last_assistant_entry_index: None,
+            tail_patch_eligible: false,
+            append_patch_start: None,
+            cached_dynamic_start: 0,
+            full_rebuild_count: 0,
+            incremental_rebuild_count: 0,
+            dynamic_rebuild_count: 0,
+            finalized_cache_hits: 0,
+            finalized_cache_misses: 0,
+            last_history_prepend_revision: 0,
+            pending_history_anchor: None,
             theme: Theme::Dark,
             search_query: String::new(),
             search_matches: Vec::new(),
             search_current: 0,
+            pending_search_scroll: None,
         }
     }
 
@@ -171,31 +242,131 @@ impl ChatView {
     /// Uses incremental append: clones only new entries, falls back to
     /// full rebuild on eviction, and patches the streaming tail in-place.
     pub fn sync_from_app(&mut self, app: &crate::App) {
+        if self.last_history_prepend_revision != app.history_prepend_revision {
+            if let Some(anchor_id) = app.history_prepend_anchor_message_id.as_ref() {
+                if let Some(old_index) = self.timeline.iter().position(|entry| {
+                    matches!(
+                        entry,
+                        TimelineEntry::Message {
+                            identity:
+                                Some(crate::app::MessageIdentity {
+                                    message_id: Some(message_id),
+                                    ..
+                                }),
+                            ..
+                        } if message_id == anchor_id
+                    )
+                }) {
+                    let old_start = self
+                        .entry_visual_starts
+                        .get(old_index)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(self.scroll_state.offset);
+                    let within_anchor = self.scroll_state.offset.saturating_sub(old_start);
+                    self.pending_history_anchor = Some((anchor_id.clone(), within_anchor));
+                }
+            }
+            self.last_history_prepend_revision = app.history_prepend_revision;
+        }
         let new_len = app.timeline_len();
-        // Append new entries
-        if new_len > self.timeline.len() {
+        let previous_len = self.timeline.len();
+        let previous_last_main = self.last_main_entry_index;
+        let content_changed = app.msg_version != self.msg_version || app.lines_dirty;
+        let session_changed = self.session_id != app.session_id;
+        let full_sync =
+            session_changed || self.last_full_sync_revision != app.timeline_full_sync_revision;
+        let mut changed_main_outside_tail = false;
+        if full_sync {
+            self.timeline = app.timeline_clone_vec();
+            self.last_main_entry_index = self.timeline.iter().rposition(Self::renders_in_main_chat);
+            self.last_assistant_entry_index = self.timeline.iter().rposition(
+                |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant"),
+            );
+            self.last_timeline_mutation_revision = app.timeline_mutation_revision;
+            self.dirty_patch_indices.clear();
+        } else if new_len > self.timeline.len() {
             for i in self.timeline.len()..new_len {
                 if let Some(entry) = app.timeline_entry(i) {
+                    if Self::renders_in_main_chat(&entry) {
+                        self.last_main_entry_index = Some(i);
+                    }
+                    if matches!(&entry, TimelineEntry::Message { role, .. } if role == "assistant")
+                    {
+                        self.last_assistant_entry_index = Some(i);
+                    }
                     self.timeline.push(entry);
                 }
             }
         } else if new_len < self.timeline.len() {
             self.timeline = app.timeline_clone_vec();
+            self.last_main_entry_index = self.timeline.iter().rposition(Self::renders_in_main_chat);
+            self.last_assistant_entry_index = self.timeline.iter().rposition(
+                |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant"),
+            );
+            self.last_timeline_mutation_revision = app.timeline_mutation_revision;
+            self.dirty_patch_indices.clear();
         }
-        // Fix: sync ALL entries that changed, not just the last one
-        // This catches mid-timeline mutations like ToolProgress/ToolComplete
-        if new_len <= self.timeline.len() {
-            let sync_len = new_len.min(self.timeline.len());
-            for i in 0..sync_len {
-                if let (Some(fresh), Some(local)) =
-                    (app.timeline_entry(i), self.timeline.get_mut(i))
-                {
-                    if fresh != *local {
-                        *local = fresh;
+        // Pull exact identity-aware mutations. A bounded-log miss is a
+        // correctness event and forces a complete sync; it never silently
+        // assumes that only the last 256 entries can change.
+        if !full_sync && content_changed {
+            match app.timeline_dirty_entries_since(self.last_timeline_mutation_revision) {
+                Some((revision, dirty)) => {
+                    self.last_timeline_mutation_revision = revision;
+                    self.dirty_patch_indices.clear();
+                    for (index, fresh) in dirty {
+                        let Some(local) = self.timeline.get_mut(index) else {
+                            self.timeline = app.timeline_clone_vec();
+                            self.last_main_entry_index =
+                                self.timeline.iter().rposition(Self::renders_in_main_chat);
+                            self.last_assistant_entry_index = self.timeline.iter().rposition(
+                                |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant"),
+                            );
+                            self.last_full_sync_revision = app.timeline_full_sync_revision;
+                            self.dirty_patch_indices.clear();
+                            break;
+                        };
+                        if fresh != *local {
+                            if Self::renders_in_main_chat(&fresh) {
+                                self.dirty_patch_indices.push(index);
+                                if Some(index) != self.last_main_entry_index {
+                                    changed_main_outside_tail = true;
+                                }
+                            }
+                            *local = fresh;
+                        }
                     }
+                }
+                None => {
+                    self.timeline = app.timeline_clone_vec();
+                    self.last_main_entry_index =
+                        self.timeline.iter().rposition(Self::renders_in_main_chat);
+                    self.last_assistant_entry_index = self.timeline.iter().rposition(
+                        |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant"),
+                    );
+                    self.last_timeline_mutation_revision = app.timeline_mutation_revision;
+                    self.dirty_patch_indices.clear();
+                    changed_main_outside_tail = true;
                 }
             }
         }
+        self.tail_patch_eligible = !full_sync
+            && previous_len == new_len
+            && !changed_main_outside_tail
+            && self.last_main_entry_index.is_some();
+        self.append_patch_start = (!full_sync && new_len > previous_len)
+            .then(|| {
+                previous_last_main.or_else(|| {
+                    self.timeline[previous_len..]
+                        .iter()
+                        .position(Self::renders_in_main_chat)
+                        .map(|offset| previous_len + offset)
+                })
+            })
+            .flatten();
+        self.last_full_sync_revision = app.timeline_full_sync_revision;
+        self.session_id.clone_from(&app.session_id);
         self.timeline_cursor = app.timeline_cursor;
         self.scroll_state.offset = app.scroll_offset;
         self.scroll_state.auto_scroll = app.auto_scroll;
@@ -203,8 +374,19 @@ impl ChatView {
         self.turn_active = app.turn_is_active();
         self.turn_input_tokens = app.turn_input_tokens;
         self.turn_output_tokens = app.turn_output_tokens;
-        self.session_input_tokens = app.input_tokens;
-        self.session_output_tokens = app.output_tokens;
+        self.turn_usage_known = app.turn_usage_known;
+        self.current_turn_tool_count = app.current_turn_tool_count;
+        self.current_turn_thinking_count = app.current_turn_thinking_count;
+        self.session_input_tokens = app.durable_session_input_tokens.max(app.input_tokens);
+        self.session_output_tokens = app.durable_session_output_tokens.max(app.output_tokens);
+        self.context_used_tokens = app.context_used_tokens;
+        self.context_window_tokens = app.context_window_tokens;
+        self.context_remaining_tokens = app.context_remaining_tokens;
+        self.context_usage_percent_bp = app.context_usage_percent_bp;
+        self.execution_status = app.current_execution_status;
+        self.execution_started_at_ms = app.execution_started_at_ms;
+        self.last_progress_at_ms = app.last_progress_at_ms;
+        self.run_metrics = app.current_run_metrics.clone();
         self.memory_total_entries = app.memory_total_entries.unwrap_or(app.memory_entries.len());
         self.context_selected_count = app
             .latest_context_envelope
@@ -242,6 +424,12 @@ impl ChatView {
         self.theme = app.theme;
         self.msg_version = app.msg_version;
         self.lines_dirty = app.lines_dirty;
+        if self.search_query != app.search_query
+            || self.search_matches != app.search_matches
+            || self.search_current != app.search_current
+        {
+            self.pending_search_scroll = app.search_matches.get(app.search_current).copied();
+        }
         self.search_query = app.search_query.clone();
         self.search_matches = app.search_matches.clone();
         self.search_current = app.search_current;
@@ -254,6 +442,13 @@ impl ChatView {
         app.scroll_offset = self.scroll_state.offset;
         app.auto_scroll = self.scroll_state.auto_scroll;
         app.viewport_height = self.scroll_state.viewport_height;
+        app.cache_hits = self.finalized_cache_hits;
+        app.telemetry.finalized_cache_hits = self.finalized_cache_hits;
+        app.telemetry.finalized_cache_misses = self.finalized_cache_misses;
+        app.telemetry.live_tail_rebuild_count = self
+            .incremental_rebuild_count
+            .saturating_add(self.dynamic_rebuild_count);
+        app.telemetry.full_timeline_rebuild_count = self.full_rebuild_count;
     }
 
     // ── Navigation ────────────────────────────────────────────────
@@ -319,10 +514,9 @@ impl ChatView {
     /// Scroll so the entry at the given index is visible.
     pub fn scroll_to_entry(&mut self, entry_idx: usize) {
         let vh = self.scroll_state.viewport_height.max(1);
-        let mut offset: usize = 0;
-        for i in 0..entry_idx.min(self.entry_line_counts.len()) {
-            offset += self.entry_line_counts[i] + 1;
-        }
+        let Some(offset) = self.entry_visual_starts.get(entry_idx).copied().flatten() else {
+            return;
+        };
         let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1);
 
         let scroll = self.scroll_state.offset;
@@ -335,7 +529,8 @@ impl ChatView {
 
     // ── Line computation (internal) ───────────────────────────────
 
-    /// Total number of content lines (including separator blanks and spinner).
+    /// Total number of transcript lines. The live footer is rendered in its
+    /// own fixed viewport and therefore never changes transcript scroll math.
     pub fn total_lines(&self) -> usize {
         let n = self
             .timeline
@@ -347,18 +542,58 @@ impl ChatView {
         if total == 0 && self.timeline.is_empty() {
             total = 1;
         }
-        if self.turn_active {
-            total += 1;
-        }
         total
     }
+}
+
+fn compact_execution_status(
+    status: harness_contract::projection::ExecutionLiveStatus,
+) -> &'static str {
+    use harness_contract::projection::ExecutionLiveStatus;
+    match status {
+        ExecutionLiveStatus::Queued => "queued",
+        ExecutionLiveStatus::PreparingContext => "preparing context",
+        ExecutionLiveStatus::CallingModel => "calling model",
+        ExecutionLiveStatus::Thinking => "thinking",
+        ExecutionLiveStatus::CallingTool => "calling tool",
+        ExecutionLiveStatus::WaitingApproval => "waiting approval",
+        ExecutionLiveStatus::Finalizing => "finalizing",
+        ExecutionLiveStatus::Complete => "complete",
+        ExecutionLiveStatus::Cancelled => "cancelled",
+        ExecutionLiveStatus::Error => "error",
+    }
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 // ── Component impl ────────────────────────────────────────────────
 
 impl Component for ChatView {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
-        let viewport_h = area.height as usize;
+        let wrap_width = area.width.max(1);
+        let mut footer_lines =
+            wrap_styled_lines(self.build_dynamic_turn_lines(), usize::from(wrap_width));
+        let max_footer_height = usize::from(area.height.saturating_sub(1));
+        if footer_lines.len() > max_footer_height {
+            footer_lines = footer_lines.split_off(footer_lines.len() - max_footer_height);
+        }
+        let footer_height = u16::try_from(footer_lines.len())
+            .unwrap_or(area.height)
+            .min(area.height);
+        let transcript_height = area.height.saturating_sub(footer_height);
+        let transcript_area = Rect::new(area.x, area.y, area.width, transcript_height);
+        let footer_area = Rect::new(
+            area.x,
+            area.y.saturating_add(transcript_height),
+            area.width,
+            footer_height,
+        );
+        let viewport_h = usize::from(transcript_height);
         self.scroll_state.viewport_height = viewport_h;
 
         // ── Build line buffer before computing scroll bounds ──
@@ -366,19 +601,121 @@ impl Component for ChatView {
         // This avoids the old split-brain path where entry estimates, virtual
         // slicing, Paragraph wrapping, and the scrollbar each had different
         // ideas of content height.
-        if self.msg_version != self.last_drawn_version {
-            self.cached_chat_lines = Self::build_new_lines(self);
-            self.entry_line_counts = Self::compute_entry_line_counts(self);
+        if self.compact_mode {
+            let needs_full_rebuild = self.msg_version != self.last_drawn_version
+                || self.cached_wrap_width != wrap_width
+                || self.lines_dirty;
+            if needs_full_rebuild {
+                self.finalized_cache_misses = self.finalized_cache_misses.saturating_add(1);
+                self.cached_chat_lines =
+                    wrap_styled_lines(Self::build_compact_lines(self), usize::from(wrap_width));
+                self.entry_line_counts.clear();
+                self.last_drawn_version = self.msg_version;
+                self.cached_wrap_width = wrap_width;
+                self.lines_dirty = false;
+                self.append_patch_start = None;
+                self.full_rebuild_count = self.full_rebuild_count.saturating_add(1);
+            }
+            if !needs_full_rebuild {
+                self.finalized_cache_hits = self.finalized_cache_hits.saturating_add(1);
+            }
+            if let Some(entry_idx) = self.pending_search_scroll.take() {
+                self.scroll_to_entry(entry_idx);
+            }
+            let total_lines = self.cached_chat_lines.len().max(1);
+            self.scroll_state.set_content_size(total_lines);
+            if self.scroll_state.auto_scroll && total_lines > viewport_h {
+                self.scroll_state.offset = total_lines.saturating_sub(viewport_h);
+            }
+            let scroll_off = self
+                .scroll_state
+                .offset
+                .min(total_lines.saturating_sub(viewport_h));
+            let visible_end = scroll_off
+                .saturating_add(viewport_h.max(1))
+                .min(self.cached_chat_lines.len());
+            let visible_lines = if self.cached_chat_lines.is_empty() {
+                vec![Line::raw("")]
+            } else {
+                self.cached_chat_lines[scroll_off..visible_end].to_vec()
+            };
+            let frame = ctx.frame_mut();
+            frame.render_widget(Clear, area);
+            frame.render_widget(Paragraph::new(Text::from(visible_lines)), transcript_area);
+            if footer_height > 0 {
+                frame.render_widget(Paragraph::new(Text::from(footer_lines)), footer_area);
+            }
+            return;
+        }
+        let mut rebuilt_content = false;
+        if self.msg_version != self.last_drawn_version || self.cached_wrap_width != wrap_width {
+            if self.cached_wrap_width == wrap_width
+                && self.append_patch_start.is_some()
+                && !self.cached_chat_lines.is_empty()
+            {
+                let start = self.append_patch_start.take().expect("checked above");
+                self.rebuild_wrapped_appended_tail(start, usize::from(wrap_width));
+                self.incremental_rebuild_count = self.incremental_rebuild_count.saturating_add(1);
+            } else if self.cached_wrap_width == wrap_width
+                && !self.dirty_patch_indices.is_empty()
+                && !self.cached_chat_lines.is_empty()
+            {
+                self.rebuild_wrapped_dirty_entries(usize::from(wrap_width));
+                self.incremental_rebuild_count = self.incremental_rebuild_count.saturating_add(1);
+            } else if self.cached_wrap_width == wrap_width
+                && self.tail_patch_eligible
+                && !self.cached_chat_lines.is_empty()
+            {
+                if !self.dirty_patch_indices.is_empty() {
+                    self.rebuild_wrapped_last_main_entry(usize::from(wrap_width));
+                    self.incremental_rebuild_count =
+                        self.incremental_rebuild_count.saturating_add(1);
+                }
+            } else {
+                self.rebuild_all_wrapped(usize::from(wrap_width));
+            }
             self.last_drawn_version = self.msg_version;
+            self.cached_wrap_width = wrap_width;
             self.lines_dirty = false;
+            self.dirty_patch_indices.clear();
+            rebuilt_content = true;
         } else if self.lines_dirty {
-            self.cached_chat_lines = Self::build_new_lines(self);
-            self.entry_line_counts = Self::compute_entry_line_counts(self);
+            self.rebuild_all_wrapped(usize::from(wrap_width));
             self.lines_dirty = false;
+            rebuilt_content = true;
         }
         if self.cached_chat_lines.is_empty() {
-            self.cached_chat_lines = Self::build_new_lines(self);
-            self.entry_line_counts = Self::compute_entry_line_counts(self);
+            self.rebuild_all_wrapped(usize::from(wrap_width));
+            rebuilt_content = true;
+        }
+        if rebuilt_content {
+            self.finalized_cache_misses = self.finalized_cache_misses.saturating_add(1);
+        } else {
+            self.finalized_cache_hits = self.finalized_cache_hits.saturating_add(1);
+        }
+        if let Some((anchor_id, within_anchor)) = self.pending_history_anchor.take() {
+            if let Some(index) = self.timeline.iter().position(|entry| {
+                matches!(
+                    entry,
+                    TimelineEntry::Message {
+                        identity:
+                            Some(crate::app::MessageIdentity {
+                                message_id: Some(message_id),
+                                ..
+                            }),
+                        ..
+                    } if message_id == &anchor_id
+                )
+            }) {
+                if let Some(start) = self.entry_visual_starts.get(index).copied().flatten() {
+                    self.scroll_state.offset = start.saturating_add(within_anchor);
+                    self.scroll_state.auto_scroll = false;
+                }
+            }
+        }
+        if let Some(entry_idx) = self.pending_search_scroll.take() {
+            self.scroll_state.auto_scroll = false;
+            self.scroll_to_entry(entry_idx);
         }
 
         let total_lines = self.cached_chat_lines.len().max(1);
@@ -395,18 +732,6 @@ impl Component for ChatView {
             .offset
             .min(total_lines.saturating_sub(viewport_h));
 
-        // ── Compact mode: summary view ──
-        if self.compact_mode {
-            let compact_lines = Self::build_compact_lines(self);
-            let frame = ctx.frame_mut();
-            frame.render_widget(Clear, area);
-            let paragraph = Paragraph::new(Text::from(compact_lines))
-                .wrap(Wrap { trim: false })
-                .scroll((0, 0));
-            frame.render_widget(paragraph, area);
-            return;
-        }
-
         // ── Build visible lines ──
         let visible_end = scroll_off
             .saturating_add(viewport_h.max(1))
@@ -419,17 +744,56 @@ impl Component for ChatView {
 
         // ── Apply search highlight (Task 17) ──
         if !self.search_query.is_empty() && !self.search_matches.is_empty() {
-            let mut global_match_counter: usize = 0;
             let current_match_entry = self.search_matches.get(self.search_current).copied();
-            for line in &mut visible_lines {
-                // Only highlight lines whose entry index matches a search match
-                // We search all lines and track matches globally
-                ChatView::highlight_search_in_line(
-                    line,
-                    &self.search_query,
-                    current_match_entry,
-                    &mut global_match_counter,
+            let final_assistant_idx = self.last_assistant_entry_index;
+            let current_turn_stats = self.current_turn_stats();
+            let mut matched_entries = self.search_matches.clone();
+            matched_entries.sort_unstable();
+            matched_entries.dedup();
+            for entry_idx in matched_entries {
+                let Some(start) = self.entry_visual_starts.get(entry_idx).copied().flatten() else {
+                    continue;
+                };
+                let height = self
+                    .entry_line_counts
+                    .get(entry_idx)
+                    .copied()
+                    .unwrap_or_default();
+                let end = start.saturating_add(height);
+                if end <= scroll_off || start >= visible_end {
+                    continue;
+                }
+                let Some(entry) = self.timeline.get(entry_idx) else {
+                    continue;
+                };
+                let mut logical = Vec::new();
+                Self::build_entry_with_meta(
+                    entry,
+                    entry_idx == self.timeline_cursor,
+                    final_assistant_idx == Some(entry_idx),
+                    &mut logical,
+                    &self.theme,
+                    self.turn_input_tokens,
+                    self.turn_output_tokens,
+                    self.turn_usage_known,
+                    current_turn_stats.tool_count,
+                    current_turn_stats.thinking_count,
+                    self.memory_total_entries,
                 );
+                let is_current = current_match_entry == Some(entry_idx);
+                for line in &mut logical {
+                    Self::highlight_search_in_line(line, &self.search_query, is_current);
+                }
+                let highlighted = wrap_styled_lines(logical, usize::from(wrap_width));
+                if highlighted.len() != height {
+                    continue;
+                }
+                let replace_start = start.max(scroll_off);
+                let replace_end = end.min(visible_end);
+                for visual_row in replace_start..replace_end {
+                    visible_lines[visual_row - scroll_off] =
+                        highlighted[visual_row - start].clone();
+                }
             }
         }
 
@@ -442,7 +806,10 @@ impl Component for ChatView {
             // only the visible slice, so Ratatui's u16 scroll coordinate cannot
             // truncate a long conversation.
             .scroll((0, 0));
-        frame.render_widget(paragraph, area);
+        frame.render_widget(paragraph, transcript_area);
+        if footer_height > 0 {
+            frame.render_widget(Paragraph::new(Text::from(footer_lines)), footer_area);
+        }
     }
 
     fn handle_event(&mut self, event: &Event) -> EventResult {
@@ -535,18 +902,237 @@ impl ChatView {
 // ── Drawing logic (ported from widgets/chat.rs) ───────────────────
 
 impl ChatView {
-    /// Pre-compute per-entry line counts.
-    fn compute_entry_line_counts(&self) -> Vec<usize> {
+    fn rebuild_all_wrapped(&mut self, width: usize) {
+        self.cached_chat_lines = wrap_styled_lines(Self::build_new_lines(self), width);
+        self.cached_dynamic_start = self.cached_chat_lines.len();
+        self.entry_line_counts = Self::compute_wrapped_entry_line_counts(self, width);
+        self.rebuild_entry_visual_starts();
+        self.append_patch_start = None;
+        self.full_rebuild_count = self.full_rebuild_count.saturating_add(1);
+    }
+
+    /// Re-render only the previous visible tail plus newly appended entries.
+    ///
+    /// The previous tail is included because appending a new assistant reply
+    /// changes which entry owns the final-answer decoration and turn metrics.
+    /// Work is therefore bounded by the visible tail, independent of a 50k
+    /// durable transcript.
+    fn rebuild_wrapped_appended_tail(&mut self, start: usize, width: usize) {
+        if start >= self.timeline.len() || self.entry_line_counts.len() > self.timeline.len() {
+            self.rebuild_all_wrapped(width);
+            return;
+        }
+        self.entry_line_counts.resize(self.timeline.len(), 0);
+        self.entry_visual_starts.resize(self.timeline.len(), None);
+        let prefix_lines = self
+            .entry_visual_starts
+            .get(start)
+            .copied()
+            .flatten()
+            .unwrap_or(self.cached_dynamic_start);
+        if prefix_lines > self.cached_chat_lines.len() {
+            self.rebuild_all_wrapped(width);
+            return;
+        }
+        self.cached_chat_lines.truncate(prefix_lines);
+
+        let final_assistant_idx = self.last_assistant_entry_index;
+        let current_turn_stats = self.current_turn_stats();
+        let mut rendered = false;
+        for idx in start..self.timeline.len() {
+            let entry = &self.timeline[idx];
+            if !Self::renders_in_main_chat(entry) {
+                self.entry_line_counts[idx] = 0;
+                self.entry_visual_starts[idx] = None;
+                continue;
+            }
+            if rendered {
+                self.cached_chat_lines.push(Line::raw(""));
+            }
+            let mut logical = Vec::new();
+            Self::build_entry_with_meta(
+                entry,
+                idx == self.timeline_cursor,
+                final_assistant_idx == Some(idx),
+                &mut logical,
+                &self.theme,
+                self.turn_input_tokens,
+                self.turn_output_tokens,
+                self.turn_usage_known,
+                current_turn_stats.tool_count,
+                current_turn_stats.thinking_count,
+                self.memory_total_entries,
+            );
+            let wrapped = wrap_styled_lines(logical, width);
+            self.entry_visual_starts[idx] = Some(self.cached_chat_lines.len());
+            self.entry_line_counts[idx] = wrapped.len();
+            self.cached_chat_lines.extend(wrapped);
+            rendered = true;
+        }
+        self.cached_dynamic_start = self.cached_chat_lines.len();
+    }
+
+    /// Compute entry heights in the same visual-cell coordinate system used
+    /// by rendering and scrolling.
+    fn compute_wrapped_entry_line_counts(&self, width: usize) -> Vec<usize> {
+        let final_assistant_idx = self.last_assistant_entry_index;
+        let current_turn_stats = self.current_turn_stats();
         self.timeline
             .iter()
-            .map(|e| {
-                if Self::renders_in_main_chat(e) {
-                    e.expanded_lines()
-                } else {
-                    0
+            .enumerate()
+            .map(|(idx, entry)| {
+                if !Self::renders_in_main_chat(entry) {
+                    return 0;
                 }
+                let mut lines = Vec::new();
+                Self::build_entry_with_meta(
+                    entry,
+                    idx == self.timeline_cursor,
+                    final_assistant_idx == Some(idx),
+                    &mut lines,
+                    &self.theme,
+                    self.turn_input_tokens,
+                    self.turn_output_tokens,
+                    self.turn_usage_known,
+                    current_turn_stats.tool_count,
+                    current_turn_stats.thinking_count,
+                    self.memory_total_entries,
+                );
+                wrap_styled_lines(lines, width).len()
             })
             .collect()
+    }
+
+    fn rebuild_wrapped_last_main_entry(&mut self, width: usize) {
+        let Some(entry_idx) = self.last_main_entry_index else {
+            return;
+        };
+        if self.entry_line_counts.len() != self.timeline.len() {
+            self.cached_chat_lines = wrap_styled_lines(Self::build_new_lines(self), width);
+            self.entry_line_counts = Self::compute_wrapped_entry_line_counts(self, width);
+            return;
+        }
+        let prefix_lines = self
+            .entry_visual_starts
+            .get(entry_idx)
+            .copied()
+            .flatten()
+            .unwrap_or(self.cached_dynamic_start);
+        if prefix_lines > self.cached_chat_lines.len() {
+            self.cached_chat_lines = wrap_styled_lines(Self::build_new_lines(self), width);
+            self.entry_line_counts = Self::compute_wrapped_entry_line_counts(self, width);
+            return;
+        }
+
+        self.cached_chat_lines.truncate(prefix_lines);
+        let mut logical = Vec::new();
+        let current_turn_stats = self.current_turn_stats();
+        Self::build_entry_with_meta(
+            &self.timeline[entry_idx],
+            entry_idx == self.timeline_cursor,
+            matches!(
+                self.timeline[entry_idx],
+                TimelineEntry::Message { ref role, .. } if role == "assistant"
+            ),
+            &mut logical,
+            &self.theme,
+            self.turn_input_tokens,
+            self.turn_output_tokens,
+            self.turn_usage_known,
+            current_turn_stats.tool_count,
+            current_turn_stats.thinking_count,
+            self.memory_total_entries,
+        );
+        let wrapped = wrap_styled_lines(logical, width);
+        self.entry_visual_starts[entry_idx] = Some(self.cached_chat_lines.len());
+        self.entry_line_counts[entry_idx] = wrapped.len();
+        self.cached_chat_lines.extend(wrapped);
+        self.cached_dynamic_start = self.cached_chat_lines.len();
+    }
+
+    fn rebuild_wrapped_dirty_entries(&mut self, width: usize) {
+        if self.entry_line_counts.len() != self.timeline.len()
+            || self.entry_visual_starts.len() != self.timeline.len()
+            || self.cached_dynamic_start > self.cached_chat_lines.len()
+        {
+            self.rebuild_all_wrapped(width);
+            return;
+        }
+        self.cached_chat_lines.truncate(self.cached_dynamic_start);
+        self.dirty_patch_indices.sort_unstable();
+        self.dirty_patch_indices.dedup();
+        let final_assistant_idx = self.last_assistant_entry_index;
+        let current_turn_stats = self.current_turn_stats();
+        for entry_idx in self.dirty_patch_indices.clone() {
+            if !self
+                .timeline
+                .get(entry_idx)
+                .is_some_and(Self::renders_in_main_chat)
+            {
+                continue;
+            }
+            let Some(start) = self.entry_visual_starts.get(entry_idx).copied().flatten() else {
+                self.rebuild_all_wrapped(width);
+                return;
+            };
+            let old_len = self.entry_line_counts[entry_idx];
+            let end = start.saturating_add(old_len);
+            if end > self.cached_chat_lines.len() {
+                self.rebuild_all_wrapped(width);
+                return;
+            }
+            let mut logical = Vec::new();
+            Self::build_entry_with_meta(
+                &self.timeline[entry_idx],
+                entry_idx == self.timeline_cursor,
+                final_assistant_idx == Some(entry_idx),
+                &mut logical,
+                &self.theme,
+                self.turn_input_tokens,
+                self.turn_output_tokens,
+                self.turn_usage_known,
+                current_turn_stats.tool_count,
+                current_turn_stats.thinking_count,
+                self.memory_total_entries,
+            );
+            let wrapped = wrap_styled_lines(logical, width);
+            let new_len = wrapped.len();
+            self.cached_chat_lines.splice(start..end, wrapped);
+            self.entry_line_counts[entry_idx] = new_len;
+            if new_len != old_len {
+                for later_start in self
+                    .entry_visual_starts
+                    .iter_mut()
+                    .skip(entry_idx.saturating_add(1))
+                    .flatten()
+                {
+                    if new_len > old_len {
+                        *later_start = later_start.saturating_add(new_len - old_len);
+                    } else {
+                        *later_start = later_start.saturating_sub(old_len - new_len);
+                    }
+                }
+            }
+        }
+        self.cached_dynamic_start = self.cached_chat_lines.len();
+    }
+
+    fn rebuild_entry_visual_starts(&mut self) {
+        self.entry_visual_starts = vec![None; self.timeline.len()];
+        let mut visual_row = 0usize;
+        let mut has_visible_entry = false;
+        for (idx, entry) in self.timeline.iter().enumerate() {
+            if !Self::renders_in_main_chat(entry) {
+                continue;
+            }
+            if has_visible_entry {
+                visual_row = visual_row.saturating_add(1);
+            }
+            self.entry_visual_starts[idx] = Some(visual_row);
+            visual_row =
+                visual_row.saturating_add(self.entry_line_counts.get(idx).copied().unwrap_or(0));
+            has_visible_entry = true;
+        }
     }
 
     /// Full rebuild of chat lines from internal state.
@@ -562,15 +1148,7 @@ impl ChatView {
 
         let visible: Vec<_> = self.visible_main_entries().collect();
         let visible_count = visible.len();
-        let final_assistant_idx =
-            self.timeline
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(idx, entry)| {
-                    matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant")
-                        .then_some(idx)
-                });
+        let final_assistant_idx = self.last_assistant_entry_index;
         let current_turn_stats = self.current_turn_stats();
         for (visible_idx, (idx, entry)) in visible.into_iter().enumerate() {
             let is_focused = idx == self.timeline_cursor;
@@ -582,6 +1160,7 @@ impl ChatView {
                 &self.theme,
                 self.turn_input_tokens,
                 self.turn_output_tokens,
+                self.turn_usage_known,
                 current_turn_stats.tool_count,
                 current_turn_stats.thinking_count,
                 self.memory_total_entries,
@@ -590,15 +1169,6 @@ impl ChatView {
                 lines.push(Line::raw(""));
             }
         }
-
-        if self.turn_active {
-            let spinner = self.spinner_char();
-            lines.push(Line::from(vec![Span::styled(
-                format!("{spinner} Processing..."),
-                Style::default().fg(self.theme.accent()),
-            )]));
-        }
-
         lines
     }
 
@@ -612,145 +1182,190 @@ impl ChatView {
             return lines;
         }
 
-        let mut tool_count = 0u32;
-        let mut thinking_rounds = 0u32;
-        let mut assistant_messages: Vec<(usize, &str)> = Vec::new();
-        let mut user_messages = 0u32;
-
-        for (i, entry) in self.timeline.iter().enumerate() {
-            match entry {
-                TimelineEntry::ToolCall { done, .. } => {
-                    if *done {
-                        tool_count += 1;
+        // Clean mode is the current-reply projection, not a recent-history
+        // transcript. Showing older assistant turns here made the first visible
+        // output look like a replay and hid the live tail below the viewport.
+        let latest_user_index = self.timeline.iter().rposition(
+            |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "user"),
+        );
+        let assistant_message =
+            self.timeline
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, entry)| match entry {
+                    TimelineEntry::Message { role, content, .. }
+                        if role == "assistant"
+                            && (!self.turn_active
+                                || latest_user_index
+                                    .is_none_or(|user_index| index > user_index)) =>
+                    {
+                        Some((index, content.as_str()))
                     }
-                }
-                TimelineEntry::Thinking { .. } => {
-                    thinking_rounds += 1;
-                }
-                TimelineEntry::Message { role, content, .. } => {
-                    if role == "assistant" {
-                        assistant_messages.push((i, content.as_str()));
-                    } else if role == "user" {
-                        user_messages += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        for (pos, (entry_idx, content)) in assistant_messages.iter().enumerate() {
-            let is_final = pos + 1 == assistant_messages.len();
-            let is_focused = *entry_idx == self.timeline_cursor;
-            let label = if is_final {
-                if is_focused {
-                    "● ├─ FINAL REPLY"
-                } else {
-                    "  ├─ FINAL REPLY"
-                }
-            } else if is_focused {
-                "● ├─"
-            } else {
-                "  ├─"
-            };
+                    _ => None,
+                });
+        let Some((entry_idx, content)) = assistant_message else {
             lines.push(Line::from(Span::styled(
-                label,
-                Style::default()
-                    .fg(if is_focused {
-                        self.theme.accent()
-                    } else if is_final {
-                        self.theme.success_color()
-                    } else {
-                        self.theme.muted_color()
-                    })
-                    .bold(),
+                if self.turn_active {
+                    "Waiting for the current reply…"
+                } else {
+                    "No assistant reply yet."
+                },
+                Style::default().fg(self.theme.muted_color()),
             )));
-            let md_lines = md_renderer::render_markdown_lines(content, &self.theme);
-            let max_lines = 800usize;
-            for line in md_lines.into_iter().take(max_lines) {
-                lines.push(line);
+            return lines;
+        };
+
+        let is_focused = entry_idx == self.timeline_cursor;
+        let terminal = self
+            .execution_status
+            .is_some_and(harness_contract::projection::ExecutionLiveStatus::is_terminal);
+        let label = if self.turn_active && !terminal {
+            if is_focused {
+                "● ├─ CURRENT REPLY"
+            } else {
+                "  ├─ CURRENT REPLY"
             }
-            let total = content.lines().count();
-            if total > max_lines {
-                lines.push(Line::from(Span::styled(
-                    format!("  ... ({} more lines)", total.saturating_sub(max_lines)),
-                    Style::default().fg(self.theme.muted_color()),
-                )));
-            }
-            lines.push(Line::raw(""));
-        }
-
+        } else if is_focused {
+            "● ├─ FINAL REPLY"
+        } else {
+            "  ├─ FINAL REPLY"
+        };
         lines.push(Line::from(Span::styled(
-            "─".repeat(60),
-            Style::default().fg(self.theme.muted_color()),
+            label,
+            Style::default()
+                .fg(if is_focused {
+                    self.theme.accent()
+                } else {
+                    self.theme.success_color()
+                })
+                .bold(),
         )));
-
-        let mut stats_parts: Vec<String> = Vec::new();
-        if tool_count > 0 {
-            stats_parts.push(format!("Tools: {}", tool_count));
-        }
-        if thinking_rounds > 0 {
-            stats_parts.push(format!("Think: {}", thinking_rounds));
-        }
-        if user_messages > 0 {
-            stats_parts.push(format!("Msgs: {}", user_messages));
-        }
-        stats_parts.push(format!(
-            "Tokens: in {} / out {}",
-            fmt_tokens(self.session_input_tokens),
-            fmt_tokens(self.session_output_tokens)
-        ));
-        stats_parts.push(format!("Turn: {:.1}s", 0.0));
-        lines.push(Line::from(Span::styled(
-            format!("  {}", stats_parts.join(" · ")),
-            Style::default().fg(self.theme.warn_color()),
-        )));
-
-        let mut evidence_parts = Vec::new();
-        evidence_parts.push(format!(
-            "ctx {}/{}",
-            self.context_selected_count, self.context_omitted_count
-        ));
-        evidence_parts.push(format!(
-            "mem candidates {} / total {}",
-            self.memory_candidate_count, self.memory_total_entries
-        ));
-        evidence_parts.push(format!(
-            "reality s{} e{} p{} b{}",
-            self.reality_stage_count,
-            self.reality_event_count,
-            self.reality_promotion_count,
-            self.reality_boundary_count
-        ));
-        evidence_parts.push(format!("approvals {}", self.pending_approval_count));
-        evidence_parts.push(format!("surfaces {}", self.surface_count));
-        if self.degraded_count > 0 {
-            evidence_parts.push(format!("issues {}", self.degraded_count));
-        }
-        lines.push(Line::from(Span::styled(
-            format!("  Evidence: {}", evidence_parts.join(" · ")),
-            Style::default().fg(self.theme.muted_color()),
-        )));
+        let md_lines = md_renderer::render_markdown_lines(content, &self.theme);
+        append_bounded_head_tail(&mut lines, md_lines, 800, &self.theme);
 
         lines
     }
 
     fn current_turn_stats(&self) -> ChatTurnStats {
-        let start = self
-            .timeline
-            .iter()
-            .rposition(
-                |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "user"),
-            )
-            .unwrap_or(0);
-        let mut stats = ChatTurnStats::default();
-        for entry in self.timeline.iter().skip(start) {
-            match entry {
-                TimelineEntry::Thinking { .. } => stats.thinking_count += 1,
-                TimelineEntry::ToolCall { .. } => stats.tool_count += 1,
-                _ => {}
+        ChatTurnStats {
+            thinking_count: self.current_turn_thinking_count,
+            tool_count: self.current_turn_tool_count,
+        }
+    }
+
+    fn build_turn_footer_lines(&self) -> Vec<Line<'static>> {
+        if self.timeline.is_empty()
+            && self.run_metrics.is_none()
+            && self.execution_status.is_none()
+            && self.context_used_tokens.is_none()
+        {
+            return Vec::new();
+        }
+        let mut lines = vec![Line::from(Span::styled(
+            "─".repeat(60),
+            Style::default().fg(self.theme.muted_color()),
+        ))];
+
+        let mut context_parts = Vec::new();
+        if let Some(used) = self.context_used_tokens {
+            context_parts.push(format!("ctx {}", fmt_tokens(used)));
+        } else {
+            context_parts.push("ctx —".to_string());
+        }
+        if let Some(window) = self.context_window_tokens {
+            context_parts.push(format!("/{}", fmt_tokens(window)));
+        }
+        if let Some(percent) = self.context_usage_percent_bp {
+            context_parts.push(format!("{:.0}%", f64::from(percent) / 100.0));
+        }
+        if let Some(remaining) = self.context_remaining_tokens {
+            context_parts.push(format!("rem {}", fmt_tokens(remaining)));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {}", context_parts.join(" ")),
+            Style::default().fg(self.theme.accent()),
+        )));
+
+        let total = self
+            .turn_input_tokens
+            .saturating_add(self.turn_output_tokens);
+        lines.push(Line::from(Span::styled(
+            if self.turn_usage_known {
+                format!(
+                    "  in {} · out {} · total {}",
+                    fmt_tokens(self.turn_input_tokens),
+                    fmt_tokens(self.turn_output_tokens),
+                    fmt_tokens(total)
+                )
+            } else {
+                "  in — · out — · total —".to_string()
+            },
+            Style::default().fg(self.theme.warn_color()),
+        )));
+
+        if let Some(metrics) = &self.run_metrics {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  tools {} · memory {}/{} · approvals {} · files {}",
+                    metrics.tool_calls,
+                    metrics.memory_recalls,
+                    metrics.memory_evidence,
+                    metrics.approvals,
+                    metrics.files_touched
+                ),
+                Style::default().fg(self.theme.muted_color()),
+            )));
+        }
+
+        let mut status = self
+            .execution_status
+            .map(compact_execution_status)
+            .unwrap_or(if self.turn_active {
+                "submitting"
+            } else {
+                "idle"
+            })
+            .to_string();
+        let now = current_time_ms();
+        if let Some(started) = self.execution_started_at_ms {
+            let terminal = self
+                .execution_status
+                .is_some_and(harness_contract::projection::ExecutionLiveStatus::is_terminal);
+            let end = if terminal {
+                self.last_progress_at_ms.unwrap_or(now)
+            } else {
+                now
+            };
+            status.push_str(&format!(
+                " · elapsed {:.1}s",
+                end.saturating_sub(started) as f64 / 1_000.0
+            ));
+        }
+        if self.turn_active {
+            if let Some(last_progress) = self.last_progress_at_ms {
+                status.push_str(&format!(
+                    " · progress {:.1}s ago",
+                    now.saturating_sub(last_progress) as f64 / 1_000.0
+                ));
             }
         }
-        stats
+        lines.push(Line::from(Span::styled(
+            format!("  {status}"),
+            Style::default().fg(self.theme.success_color()),
+        )));
+        lines
+    }
+
+    fn build_dynamic_turn_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = self.build_turn_footer_lines();
+        if self.turn_active {
+            lines.push(Line::from(Span::styled(
+                format!("{} Processing...", self.spinner_char()),
+                Style::default().fg(self.theme.accent()),
+            )));
+        }
+        lines
     }
 
     #[cfg(test)]
@@ -903,66 +1518,65 @@ impl ChatView {
     /// Apply search highlight to a Line by splitting spans around match boundaries.
     ///
     /// Every occurrence of `search_query` (case-insensitive) gets inverse video.
-    /// The current match (at `search_current` global index) gets a yellow background.
-    fn highlight_search_in_line(
-        line: &mut Line<'static>,
-        query: &str,
-        current_match_idx: Option<usize>,
-        global_match_counter: &mut usize,
-    ) {
+    /// Occurrences on the selected result's visual rows get a yellow background.
+    fn highlight_search_in_line(line: &mut Line<'static>, query: &str, is_current_entry: bool) {
         if query.is_empty() {
             return;
         }
-        let lower_query = query.to_lowercase();
-        let mut new_spans: Vec<Span<'static>> = Vec::new();
-
+        let mut content = String::new();
+        let mut styled_ranges = Vec::new();
         for span in line.spans.drain(..) {
-            let content = span.content.to_string();
-            let lower_content = content.to_lowercase();
-            let mut search_start = 0;
-
-            while let Some(pos) = lower_content[search_start..].find(&lower_query) {
-                let abs_pos = search_start + pos;
-
-                // Text before match
-                if abs_pos > 0 {
-                    new_spans.push(Span::styled(
-                        content[search_start..search_start + pos].to_string(),
-                        span.style,
-                    ));
-                }
-
-                // The match itself
-                let matched = &content[abs_pos..abs_pos + query.len()];
-                let is_current = current_match_idx
-                    .map(|idx| *global_match_counter == idx)
-                    .unwrap_or(false);
-                let match_style = if is_current {
-                    Style::default()
-                        .bg(Color::Yellow)
-                        .fg(Color::Black)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    span.style
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::REVERSED)
-                };
-                new_spans.push(Span::styled(matched.to_string(), match_style));
-
-                *global_match_counter += 1;
-                search_start = abs_pos + query.len();
-            }
-
-            // Remaining text after last match
-            if search_start < content.len() {
-                new_spans.push(Span::styled(
-                    content[search_start..].to_string(),
-                    span.style,
-                ));
-            }
+            let start = content.len();
+            content.push_str(span.content.as_ref());
+            styled_ranges.push((start, content.len(), span.style));
         }
-
-        line.spans = new_spans;
+        let matches = unicode_case_insensitive_ranges(&content, query);
+        if matches.is_empty() {
+            line.spans = styled_ranges
+                .into_iter()
+                .map(|(start, end, style)| Span::styled(content[start..end].to_string(), style))
+                .collect();
+            return;
+        }
+        let mut boundaries = styled_ranges
+            .iter()
+            .flat_map(|(start, end, _)| [*start, *end])
+            .chain(matches.iter().flat_map(|(start, end)| [*start, *end]))
+            .collect::<Vec<_>>();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        line.spans = boundaries
+            .windows(2)
+            .filter_map(|window| {
+                let start = window[0];
+                let end = window[1];
+                (start < end).then(|| {
+                    let base_style = styled_ranges
+                        .iter()
+                        .find(|(range_start, range_end, _)| {
+                            start >= *range_start && start < *range_end
+                        })
+                        .map(|(_, _, style)| *style)
+                        .unwrap_or_default();
+                    let matched = matches
+                        .iter()
+                        .any(|(match_start, match_end)| start >= *match_start && end <= *match_end);
+                    let style = if !matched {
+                        base_style
+                    } else if is_current_entry {
+                        Style::default()
+                            .bg(Color::Yellow)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        base_style
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::REVERSED)
+                    };
+                    Span::styled(content[start..end].to_string(), style)
+                })
+            })
+            .collect();
     }
 
     /// Build ratatui Lines for a single timeline entry.
@@ -972,7 +1586,7 @@ impl ChatView {
         lines: &mut Vec<Line<'static>>,
         theme: &Theme,
     ) {
-        Self::build_entry_with_meta(entry, is_focused, false, lines, theme, 0, 0, 0, 0, 0);
+        Self::build_entry_with_meta(entry, is_focused, false, lines, theme, 0, 0, false, 0, 0, 0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -984,6 +1598,7 @@ impl ChatView {
         theme: &Theme,
         turn_input_tokens: u64,
         turn_output_tokens: u64,
+        turn_usage_known: bool,
         tool_count: usize,
         thinking_rounds: usize,
         memory_count: usize,
@@ -995,7 +1610,6 @@ impl ChatView {
                     "system" => (theme.muted_color(), "  "),
                     _ => (theme.fg(), ""),
                 };
-                let total_lines = content.lines().count();
                 const MAX_LINES: usize = 500;
 
                 if role == "assistant" {
@@ -1022,18 +1636,7 @@ impl ChatView {
                             )));
                         }
                     }
-                    for line in md_lines.into_iter().take(MAX_LINES) {
-                        lines.push(line);
-                    }
-                    if total_lines > MAX_LINES {
-                        lines.push(Line::from(Span::styled(
-                            format!(
-                                "  ... ({} more lines truncated)",
-                                total_lines.saturating_sub(MAX_LINES)
-                            ),
-                            Style::default().fg(theme.muted_color()),
-                        )));
-                    }
+                    append_bounded_head_tail(lines, md_lines, MAX_LINES, theme);
                     if is_final_assistant {
                         lines.push(Line::from(vec![
                             Span::styled(
@@ -1041,14 +1644,21 @@ impl ChatView {
                                 Style::default().fg(theme.warn_color()).bold(),
                             ),
                             Span::styled(
-                                format!(
-                                    "in:{} out:{} think:{} tools:{} memory:{}",
-                                    fmt_tokens(turn_input_tokens),
-                                    fmt_tokens(turn_output_tokens),
-                                    thinking_rounds,
-                                    tool_count,
-                                    memory_count
-                                ),
+                                if turn_usage_known {
+                                    format!(
+                                        "in:{} out:{} think:{} tools:{} memory:{}",
+                                        fmt_tokens(turn_input_tokens),
+                                        fmt_tokens(turn_output_tokens),
+                                        thinking_rounds,
+                                        tool_count,
+                                        memory_count
+                                    )
+                                } else {
+                                    format!(
+                                        "in:— out:— think:{} tools:{} memory:{}",
+                                        thinking_rounds, tool_count, memory_count
+                                    )
+                                },
                                 Style::default().fg(theme.muted_color()),
                             ),
                         ]));
@@ -1056,24 +1666,16 @@ impl ChatView {
                     return;
                 }
 
-                for (i, line) in content.lines().enumerate() {
-                    if i >= MAX_LINES {
-                        lines.push(Line::from(Span::styled(
-                            format!(
-                                "  ... ({} more lines truncated)",
-                                total_lines.saturating_sub(MAX_LINES)
-                            ),
-                            Style::default().fg(theme.muted_color()),
-                        )));
-                        break;
-                    }
+                let mut rendered_lines = Vec::new();
+                for line in content.lines() {
                     let mut spans = vec![Span::styled(
                         prefix.to_string(),
                         Style::default().fg(color).bold(),
                     )];
                     Self::highlight_line(line, &mut spans, color, theme);
-                    lines.push(Line::from(spans));
+                    rendered_lines.push(Line::from(spans));
                 }
+                append_bounded_head_tail(lines, rendered_lines, MAX_LINES, theme);
             }
 
             TimelineEntry::Thinking {
@@ -1147,7 +1749,8 @@ impl ChatView {
                 };
                 let focus_marker = if is_focused { "● " } else { "  " };
 
-                // Always collapsed in main view – details in Run panel
+                // Always compact in the conversation – details remain in the
+                // Process panel so raw tool output cannot flood the transcript.
                 let preview_text = if preview.is_empty() {
                     name.as_str()
                 } else {
@@ -1258,6 +1861,40 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
+/// Keep both the beginning and the newest/end portion of an oversized entry.
+/// Head-only truncation made the current answer look like a stale previous
+/// response because the terminal conclusion was literally unreachable.
+fn append_bounded_head_tail(
+    target: &mut Vec<Line<'static>>,
+    source: Vec<Line<'static>>,
+    max_lines: usize,
+    theme: &Theme,
+) {
+    let total = source.len();
+    if total <= max_lines {
+        target.extend(source);
+        return;
+    }
+    let head = max_lines / 2;
+    let tail = max_lines.saturating_sub(head);
+    let omitted = total.saturating_sub(max_lines);
+    for (index, line) in source.into_iter().enumerate() {
+        if index < head {
+            target.push(line);
+            continue;
+        }
+        if index == head {
+            target.push(Line::from(Span::styled(
+                format!("  … {omitted} lines omitted; showing the conclusion below …"),
+                Style::default().fg(theme.muted_color()),
+            )));
+        }
+        if index >= total.saturating_sub(tail) {
+            target.push(line);
+        }
+    }
+}
+
 impl Default for ChatView {
     fn default() -> Self {
         Self::new()
@@ -1265,6 +1902,55 @@ impl Default for ChatView {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
+
+fn unicode_case_insensitive_ranges(content: &str, query: &str) -> Vec<(usize, usize)> {
+    let folded_query = query.to_lowercase();
+    if folded_query.is_empty() {
+        return Vec::new();
+    }
+    let mut folded = String::new();
+    let mut map = Vec::new();
+    for (original_start, character) in content.char_indices() {
+        let original_end = original_start + character.len_utf8();
+        let lowered = character.to_lowercase().collect::<String>();
+        for lowered_character in lowered.chars() {
+            let folded_start = folded.len();
+            folded.push(lowered_character);
+            map.push((folded_start, folded.len(), original_start, original_end));
+        }
+    }
+    let mut ranges = Vec::new();
+    let mut search_start = 0;
+    while search_start <= folded.len() {
+        let Some(relative) = folded[search_start..].find(&folded_query) else {
+            break;
+        };
+        let match_start = search_start + relative;
+        let match_end = match_start + folded_query.len();
+        let original_start = map
+            .iter()
+            .find(|(_, folded_end, _, _)| *folded_end > match_start)
+            .map(|(_, _, original_start, _)| *original_start);
+        let original_end = map
+            .iter()
+            .rev()
+            .find(|(folded_start, _, _, _)| *folded_start < match_end)
+            .map(|(_, _, _, original_end)| *original_end);
+        if let (Some(original_start), Some(original_end)) = (original_start, original_end) {
+            if ranges
+                .last()
+                .is_none_or(|(_, previous_end)| *previous_end <= original_start)
+            {
+                ranges.push((original_start, original_end));
+            }
+        }
+        search_start = match_end.max(search_start.saturating_add(1));
+        while search_start < folded.len() && !folded.is_char_boundary(search_start) {
+            search_start = search_start.saturating_add(1);
+        }
+    }
+    ranges
+}
 
 #[cfg(test)]
 mod tests {
@@ -1278,7 +1964,37 @@ mod tests {
             role: role.into(),
             content: content.into(),
             timestamp: "12:00".into(),
+            identity: None,
         }
+    }
+
+    #[test]
+    fn oversized_assistant_reply_keeps_both_opening_and_conclusion() {
+        let content = (0..600)
+            .map(|index| {
+                if index == 0 {
+                    "OPENING".to_string()
+                } else if index == 599 {
+                    "FINAL-CONCLUSION".to_string()
+                } else {
+                    format!("line-{index}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let entry = make_message("assistant", &content);
+        let mut lines = Vec::new();
+
+        ChatView::build_entry(&entry, false, &mut lines, &Theme::Dark);
+
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("OPENING"));
+        assert!(rendered.contains("FINAL-CONCLUSION"));
+        assert!(rendered.contains("100 lines omitted"));
     }
 
     fn make_thinking(id: u64, content: &str, complete: bool, expanded: bool) -> TimelineEntry {
@@ -1307,6 +2023,115 @@ mod tests {
             expanded,
             exit_code,
         }
+    }
+
+    #[test]
+    fn fixed_footer_uses_typed_run_metrics_and_never_renders_fake_duration() {
+        let mut app = crate::App::new("requested-model", "compact-real-metrics");
+        app.add_message("user", "question");
+        app.add_message("assistant", "answer");
+        app.turn_input_tokens = 1_200;
+        app.turn_output_tokens = 340;
+        app.turn_usage_known = true;
+        app.durable_session_input_tokens = 8_000;
+        app.durable_session_output_tokens = 2_000;
+        app.context_used_tokens = Some(12_000);
+        app.context_window_tokens = Some(128_000);
+        app.context_remaining_tokens = Some(116_000);
+        app.context_usage_percent_bp = Some(938);
+        app.current_execution_status =
+            Some(harness_contract::projection::ExecutionLiveStatus::CallingTool);
+        app.execution_started_at_ms = Some(current_time_ms().saturating_sub(5_000));
+        app.last_progress_at_ms = Some(current_time_ms().saturating_sub(500));
+        app.current_run_metrics = Some(harness_contract::projection::RunMetricsProjection {
+            tool_calls: 4,
+            memory_recalls: 2,
+            memory_evidence: 1,
+            approvals: 1,
+            files_touched: 3,
+            input_tokens: 1_200,
+            output_tokens: 340,
+            total_tokens: 1_540,
+            ..Default::default()
+        });
+
+        let mut view = ChatView::new();
+        view.sync_from_app(&app);
+        let joined = ChatView::build_dynamic_turn_lines(&view)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("tools 4"), "{joined}");
+        assert!(joined.contains("memory 2/1"), "{joined}");
+        assert!(joined.contains("calling tool"), "{joined}");
+        assert!(
+            joined.contains("ctx 12.0k /128.0k 9% rem 116.0k"),
+            "{joined}"
+        );
+        assert!(joined.contains("elapsed "), "{joined}");
+        assert!(!joined.contains("Turn: 0.0"), "{joined}");
+    }
+
+    #[test]
+    fn compact_mode_renders_only_the_latest_assistant_reply_and_its_tail() {
+        let mut view = ChatView::new();
+        let long_reply = (0..805)
+            .map(|index| format!("current-line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.timeline = vec![
+            make_message("assistant", "stale-previous-reply"),
+            make_message("user", "new question"),
+            make_message("assistant", &long_reply),
+        ];
+        view.timeline_cursor = 2;
+        view.last_assistant_entry_index = Some(2);
+        view.turn_active = true;
+
+        let joined = ChatView::build_compact_lines(&view)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!joined.contains("stale-previous-reply"), "{joined}");
+        assert!(joined.contains("CURRENT REPLY"), "{joined}");
+        assert!(joined.contains("current-line-804"), "{joined}");
+        assert!(joined.contains("showing the conclusion below"), "{joined}");
+    }
+
+    #[test]
+    fn compact_mode_never_replays_the_previous_reply_while_a_new_turn_is_submitting() {
+        let mut view = ChatView::new();
+        view.timeline = vec![
+            make_message("user", "previous question"),
+            make_message("assistant", "previous reply must stay hidden"),
+            make_message("user", "current question"),
+        ];
+        view.timeline_cursor = 2;
+        view.last_assistant_entry_index = Some(1);
+        view.turn_active = true;
+
+        let joined = ChatView::build_compact_lines(&view)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(!joined.contains("previous reply"), "{joined}");
+        assert!(joined.contains("Waiting for the current reply"), "{joined}");
     }
 
     fn make_slash_output(command: &str, output: &str, expanded: bool) -> TimelineEntry {
@@ -1428,9 +2253,11 @@ mod tests {
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
+        assert!(joined.contains("bash: Run bash"), "{joined}");
+        assert!(joined.contains("exit:0"), "{joined}");
         assert!(
-            !joined.contains("bash") && !joined.contains("output line"),
-            "tool process should stay out of the main chat view, got: {joined}"
+            !joined.contains("output line"),
+            "raw tool output belongs in Process, got: {joined}"
         );
     }
 
@@ -1452,9 +2279,10 @@ mod tests {
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
+        assert!(joined.contains("echo: Run echo"), "{joined}");
         assert!(
-            !joined.contains("echo") && !joined.contains("Hello") && !joined.contains("🔧"),
-            "completed tool process should stay out of the main chat view, got: {joined}"
+            !joined.contains("Hello") && !joined.contains("World"),
+            "completed tool output belongs in Process, got: {joined}"
         );
     }
 
@@ -1596,6 +2424,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ten_thousand_entry_history_patches_an_early_mutation_without_full_rebuild() {
+        let mut app = crate::App::new("model", "session");
+        for index in 0..10_000 {
+            app.timeline_push(make_message("assistant", &format!("message {index}")));
+        }
+        app.mark_dirty();
+        let mut view = ChatView::new();
+        view.sync_from_app(&app);
+        let _ = render_view(&mut view, 80, 24);
+        let full_before = view.full_rebuild_count;
+        let incremental_before = view.incremental_rebuild_count;
+
+        let Some(TimelineEntry::Message { content, .. }) = app.timeline_get_mut(17) else {
+            panic!("early message exists");
+        };
+        *content = "message 17 corrected".to_string();
+        app.mark_dirty();
+        view.sync_from_app(&app);
+        let _ = render_view(&mut view, 80, 24);
+
+        assert!(matches!(
+            view.timeline.get(17),
+            Some(TimelineEntry::Message { content, .. })
+                if content == "message 17 corrected"
+        ));
+        assert_eq!(
+            view.full_rebuild_count, full_before,
+            "an exact dirty entry outside the old 256-entry tail must not force a full scan"
+        );
+        assert_eq!(
+            view.incremental_rebuild_count,
+            incremental_before.saturating_add(1)
+        );
+    }
+
     // ── Scroll-to-entry ───────────────────────────────────────────
 
     #[test]
@@ -1607,6 +2471,7 @@ mod tests {
             .map(|i| make_message("user", &format!("msg {i}")))
             .collect();
         view.entry_line_counts = vec![1usize; 10];
+        view.rebuild_entry_visual_starts();
         view.scroll_state.offset = 0;
 
         // Scroll to entry 8 (near the bottom)
@@ -1661,6 +2526,62 @@ mod tests {
             joined.contains("Processing..."),
             "Spinner should show 'Processing...' when turn is active"
         );
+    }
+
+    #[test]
+    fn live_footer_stays_fixed_when_transcript_is_scrolled_to_top() {
+        let mut view = ChatView::new();
+        view.timeline = (0..12)
+            .map(|index| make_message("assistant", &format!("reply-{index}")))
+            .collect();
+        view.last_assistant_entry_index = Some(11);
+        view.turn_active = true;
+        view.turn_usage_known = true;
+        view.turn_input_tokens = 120;
+        view.turn_output_tokens = 40;
+        view.context_used_tokens = Some(1_000);
+        view.context_window_tokens = Some(8_000);
+        view.scroll_state.auto_scroll = false;
+        view.scroll_state.offset = 0;
+
+        let lines = render_view(&mut view, 80, 12);
+        let transcript = lines[..6].join("\n");
+        let footer = lines[6..].join("\n");
+        assert!(transcript.contains("reply-0"), "{transcript}");
+        assert!(footer.contains("ctx 1.0k /8.0k"), "{footer}");
+        assert!(footer.contains("in 120 · out 40 · total 160"), "{footer}");
+        assert!(footer.contains("Processing..."), "{footer}");
+    }
+
+    #[test]
+    fn spinner_tick_does_not_rebuild_cached_transcript() {
+        let mut view = ChatView::new();
+        view.timeline = vec![
+            make_message("user", "question"),
+            make_message("assistant", "streaming reply"),
+        ];
+        view.last_assistant_entry_index = Some(1);
+        view.turn_active = true;
+
+        let _ = render_view(&mut view, 80, 16);
+        let counters = (
+            view.full_rebuild_count,
+            view.incremental_rebuild_count,
+            view.dynamic_rebuild_count,
+        );
+        let cached = view.cached_chat_lines.clone();
+        view.tick();
+        let _ = render_view(&mut view, 80, 16);
+
+        assert_eq!(
+            (
+                view.full_rebuild_count,
+                view.incremental_rebuild_count,
+                view.dynamic_rebuild_count,
+            ),
+            counters
+        );
+        assert_eq!(view.cached_chat_lines, cached);
     }
 
     // ── Event handling ────────────────────────────────────────────
@@ -1775,6 +2696,7 @@ mod tests {
         view.msg_version = 0;
         view.last_drawn_version = 0;
         view.lines_dirty = false;
+        view.cached_wrap_width = 80;
         view.scroll_state.auto_scroll = true;
 
         let _ = render_view(&mut view, 80, 8);
@@ -1824,6 +2746,7 @@ mod tests {
             make_tool_call("t1", "bash", "", true, false, Some(0)),
         ];
         view.entry_line_counts = vec![1, 1, 1, 1];
+        view.last_assistant_entry_index = Some(1);
         view.msg_version = 0;
         view.lines_dirty = false;
 
@@ -1836,8 +2759,12 @@ mod tests {
             "Expected final reply marker"
         );
         assert!(
-            !joined.contains("Let me think") && !joined.contains("bash"),
-            "Thinking and tools should stay in Process, not main chat: {joined}"
+            !joined.contains("Let me think"),
+            "Thinking details should stay in Process, not main chat: {joined}"
+        );
+        assert!(
+            joined.contains("bash: Run bash") && joined.contains("exit:0"),
+            "The conversation must expose a compact tool lifecycle card: {joined}"
         );
     }
 
@@ -1977,10 +2904,9 @@ mod tests {
 
         let lines = render_view(&mut view, 80, 24);
         let joined = lines.join("\n");
-        assert!(
-            !joined.contains("Open Subagent") && !joined.contains("Run subagent"),
-            "task tool details should stay out of the main chat view, got: {joined}"
-        );
+        assert!(joined.contains("task: Run subagent"), "{joined}");
+        assert!(joined.contains("Run subagent"), "{joined}");
+        assert!(joined.contains("Open Subagent"), "{joined}");
     }
 
     #[test]
@@ -2073,6 +2999,28 @@ mod tests {
     }
 
     #[test]
+    fn search_highlight_survives_a_visual_wrap_boundary() {
+        let mut logical = vec![Line::raw("abcdefghTARGETxyz")];
+        ChatView::highlight_search_in_line(&mut logical[0], "target", true);
+        let wrapped = wrap_styled_lines(logical, 10);
+        let highlighted_rows = wrapped
+            .iter()
+            .enumerate()
+            .filter_map(|(row, line)| {
+                line.spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(Color::Yellow))
+                    .then_some(row)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            highlighted_rows,
+            vec![0, 1],
+            "the selected match must retain highlight on both sides of wrapping"
+        );
+    }
+
+    #[test]
     fn handles_cjk() {
         let mut view = ChatView::new();
         view.timeline = vec![make_message("user", "你好世界 test 中文")];
@@ -2085,12 +3033,12 @@ mod tests {
 
         // Verify the highlight function works correctly with CJK
         let mut line = Line::from(Span::raw("你好世界 test 中文"));
-        let mut counter = 0;
-        ChatView::highlight_search_in_line(&mut line, "中文", Some(0), &mut counter);
-        // The counter should have incremented (found match)
-        assert!(counter > 0, "Should find CJK match in text");
+        ChatView::highlight_search_in_line(&mut line, "中文", true);
         // The line spans should have the highlighted match
-        let has_cjk = line.spans.iter().any(|s| s.content.contains("中文"));
+        let has_cjk = line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("中文") && span.style.bg == Some(Color::Yellow));
         assert!(has_cjk, "CJK match should be preserved in spans");
     }
 
@@ -2115,28 +3063,25 @@ mod tests {
 
         // Verify highlight_search_in_line works on a line containing match
         let mut line = Line::from(Span::raw("first match here"));
-        let mut counter = 0;
-        ChatView::highlight_search_in_line(&mut line, "match", Some(0), &mut counter);
+        ChatView::highlight_search_in_line(&mut line, "match", true);
         assert!(
-            counter > 0,
-            "Should have found at least one match in the line"
+            line.spans
+                .iter()
+                .any(|span| span.content == "match" && span.style.bg == Some(Color::Yellow)),
+            "selected entry match should use the current-result style"
         );
         // The spans should contain both the original text and highlighted parts
         assert!(!line.spans.is_empty(), "Should have split spans");
 
         let mut line2 = Line::from(Span::raw("no match here"));
-        let mut counter2 = 0;
-        ChatView::highlight_search_in_line(&mut line2, "match", None, &mut counter2);
-        // "no match here" contains "match", so counter2 should be > 0
-        assert!(counter2 > 0, "Should find 'match' in 'no match here'");
+        ChatView::highlight_search_in_line(&mut line2, "match", false);
+        assert!(line2.spans.iter().any(|span| span.content == "match"));
     }
 
     #[test]
     fn search_highlight_skips_empty_query() {
         let mut line = Line::from(Span::raw("hello world"));
-        let mut counter = 0;
-        ChatView::highlight_search_in_line(&mut line, "", None, &mut counter);
-        assert_eq!(counter, 0, "Empty query should find nothing");
+        ChatView::highlight_search_in_line(&mut line, "", false);
         assert_eq!(line.spans.len(), 1, "Spans should be unmodified");
     }
 

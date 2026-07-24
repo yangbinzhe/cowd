@@ -37,6 +37,8 @@ use harness_contract::turn::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+const PROVIDER_PROTOCOL_RECOVERY_BUDGET: u8 = 1;
+
 /// Runtime-owned host for the standard provider-backed conversation engine.
 ///
 /// Gateway supplies service adapters such as tool executors and stream callbacks, but
@@ -613,7 +615,9 @@ where
         },
         None => None,
     };
-    let session_id = runtime.session().session_id;
+    let session = runtime.session();
+    let session_id = session.session_id;
+    let turn_transcript_start = session.messages.len();
     let turn_ref = ingress
         .as_ref()
         .map(|ingress| ingress.turn_id.clone())
@@ -641,12 +645,20 @@ where
             iterations: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cache_create_tokens: 0,
+            cache_read_tokens: 0,
+            output_chars: 0,
+            output_chunks: 0,
             wall_duration_ms: 0,
             model: None,
+            models_used: Vec::new(),
+            first_token_latency_ms: None,
+            active_stream_duration_ms: 0,
             summary: None,
             failure: None,
             pending_transcript: std::collections::BTreeMap::new(),
             ingress: ingress.clone(),
+            turn_transcript_start,
             session_id: session_id.clone(),
             goal_id: String::new(),
             safety_lease: crate::execution_core::SafetyFusePolicy::derive(
@@ -663,6 +675,7 @@ where
             force_tool_allowlist_next_model: None,
             force_reasoning_effort_next_model: None,
             terminal_recovery_attempts: 0,
+            provider_protocol_recovery_attempts: 0,
             delegated_agent_role: false,
             bounded_evidence_role: false,
             focus_novelty_target_bp: 0,
@@ -2113,7 +2126,7 @@ fn selected_strategy_focus_plans(
 }
 
 fn automatic_focus_partition_plan(
-    objective: &str,
+    _objective: &str,
     scopes: Vec<String>,
 ) -> harness_contract::team::FocusPartitionPlan {
     harness_contract::team::FocusPartitionPlan {
@@ -2514,12 +2527,23 @@ struct TurnGraphState {
     iterations: usize,
     input_tokens: u64,
     output_tokens: u64,
+    cache_create_tokens: u64,
+    cache_read_tokens: u64,
+    output_chars: u64,
+    output_chunks: u64,
     wall_duration_ms: u64,
     model: Option<String>,
+    models_used: Vec<String>,
+    first_token_latency_ms: Option<u64>,
+    active_stream_duration_ms: u64,
     summary: Option<TurnSummary>,
     failure: Option<String>,
     pending_transcript: std::collections::BTreeMap<String, Vec<ConversationMessage>>,
     ingress: Option<TurnIngressRef>,
+    /// First transcript offset owned by this graph turn. Gateway ingress
+    /// already persists the initial user row; the terminal outbox persists
+    /// every committed row after it as one atomic, idempotent batch.
+    turn_transcript_start: usize,
     session_id: String,
     goal_id: String,
     safety_lease: crate::execution_core::ExecutionBudgetLease,
@@ -2532,6 +2556,7 @@ struct TurnGraphState {
     /// It is consumed once and never changes the session/provider default.
     force_reasoning_effort_next_model: Option<String>,
     terminal_recovery_attempts: u8,
+    provider_protocol_recovery_attempts: u8,
     delegated_agent_role: bool,
     bounded_evidence_role: bool,
     focus_novelty_target_bp: u16,
@@ -2949,9 +2974,19 @@ where
             transcript_len,
         );
         let consumed_inputs = runtime.take_consumed_session_inputs();
+        let cowd_bus = runtime.cowd_bus().cloned();
         drop(runtime);
         match result {
             Ok(step) => {
+                let step_output_chars = step
+                    .assistant_message
+                    .blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.chars().count() as u64),
+                        _ => None,
+                    })
+                    .sum::<u64>();
                 let usage = ExecutionUsage {
                     model: step.model.clone(),
                     input_tokens: u64::from(step.usage.input_tokens),
@@ -2970,9 +3005,71 @@ where
                 state.output_tokens = state
                     .output_tokens
                     .saturating_add(u64::from(step.usage.output_tokens));
+                state.cache_create_tokens = state
+                    .cache_create_tokens
+                    .saturating_add(u64::from(step.usage.cache_creation_input_tokens));
+                state.cache_read_tokens = state
+                    .cache_read_tokens
+                    .saturating_add(u64::from(step.usage.cache_read_input_tokens));
+                state.output_chars = state.output_chars.saturating_add(step_output_chars);
+                state.output_chunks = state.output_chunks.saturating_add(1);
                 state.wall_duration_ms =
                     state.wall_duration_ms.saturating_add(step.wall_duration_ms);
-                state.model = step.model;
+                state.model = step.model.clone();
+                for model in &step.models_used {
+                    if !state.models_used.contains(model) {
+                        state.models_used.push(model.clone());
+                    }
+                }
+                if state.first_token_latency_ms.is_none() {
+                    state.first_token_latency_ms = step.first_token_latency_ms;
+                }
+                state.active_stream_duration_ms = state
+                    .active_stream_duration_ms
+                    .saturating_add(step.active_stream_duration_ms.unwrap_or_default());
+                if let Some(bus) = cowd_bus.as_ref() {
+                    let rate = |value: u64, duration_ms: u64| {
+                        (duration_ms > 0).then(|| value as f64 * 1_000.0 / duration_ms as f64)
+                    };
+                    bus.emit(CowdEvent::RunModelTelemetry {
+                        telemetry: crate::cowd_event::RunModelTelemetry {
+                            model: state.model.clone(),
+                            models_used: state.models_used.clone(),
+                            first_token_latency_ms: state.first_token_latency_ms,
+                            active_stream_duration_ms: Some(state.active_stream_duration_ms.max(1)),
+                            wall_duration_ms: state.wall_duration_ms.max(1),
+                            output_chars: state.output_chars,
+                            output_chunks: state.output_chunks,
+                            input_tokens: state.input_tokens,
+                            output_tokens: state.output_tokens,
+                            cache_create_tokens: state.cache_create_tokens,
+                            cache_read_tokens: state.cache_read_tokens,
+                            total_tokens: state.input_tokens.saturating_add(state.output_tokens),
+                            usage_source: "provider".to_string(),
+                            wall_chars_per_second: rate(state.output_chars, state.wall_duration_ms),
+                            wall_tokens_per_second: rate(
+                                state.output_tokens,
+                                state.wall_duration_ms,
+                            ),
+                            active_chars_per_second: rate(
+                                state.output_chars,
+                                state.active_stream_duration_ms,
+                            ),
+                            active_tokens_per_second: rate(
+                                state.output_tokens,
+                                state.active_stream_duration_ms,
+                            ),
+                            chars_per_second: rate(
+                                state.output_chars,
+                                state.active_stream_duration_ms,
+                            ),
+                            tokens_per_second: rate(
+                                state.output_tokens,
+                                state.active_stream_duration_ms,
+                            ),
+                        },
+                    });
+                }
                 let provider_tokens_per_second = (step.wall_duration_ms > 0).then(|| {
                     u32::try_from(
                         u64::from(step.usage.output_tokens)
@@ -4153,11 +4250,31 @@ where
                 // graph terminal. Preserve it and let the same Goal policy
                 // that governs tools decide whether the next node retries,
                 // changes strategy, or produces an honest blocked result.
+                let protocol_failure = error.is_provider_tool_protocol_failure();
                 let reason = error.to_string();
-                let (goal_id, iteration) = {
+                let (goal_id, iteration, protocol_attempt) = {
                     let mut state = self.state.lock().await;
                     state.iterations = state.iterations.saturating_add(1);
-                    (state.goal_id.clone(), state.iterations)
+                    // `execute_model_step` temporarily appends the ingress user
+                    // before asking the provider, and the host rolls that
+                    // uncommitted mutation back after every attempt.  A failed
+                    // first attempt still commits a real graph node, so publish
+                    // the ingress user with that node before scheduling its
+                    // recovery.  Otherwise the retry runs with
+                    // `first_step=false`, loses the current objective, and can
+                    // incorrectly reuse the previous turn's terminal answer.
+                    if first_step {
+                        state.pending_transcript.insert(
+                            ticket.node_id.clone(),
+                            vec![ConversationMessage::user_text(content.clone())],
+                        );
+                    }
+                    let protocol_attempt = protocol_failure.then(|| {
+                        state.provider_protocol_recovery_attempts =
+                            state.provider_protocol_recovery_attempts.saturating_add(1);
+                        state.provider_protocol_recovery_attempts
+                    });
+                    (state.goal_id.clone(), state.iterations, protocol_attempt)
                 };
                 let observation = RuntimeObservation {
                     goal_id: goal_id.clone(),
@@ -4193,8 +4310,22 @@ where
                             reason,
                         })?;
                 observations.push(observation.clone());
-                let intervention =
-                    crate::execution_core::InterventionPolicy.propose(&goal, &observations);
+                let intervention = protocol_attempt.map_or_else(
+                    || crate::execution_core::InterventionPolicy.propose(&goal, &observations),
+                    |attempt| harness_contract::goal::RuntimeIntervention {
+                        goal_id: goal_id.clone(),
+                        kind: provider_protocol_intervention_kind(attempt),
+                        reason: if attempt <= PROVIDER_PROTOCOL_RECOVERY_BUDGET {
+                            "provider emitted a malformed recognized tool protocol frame; retry exactly once without treating protocol bytes as assistant text"
+                                .to_string()
+                        } else {
+                            "provider repeated a malformed recognized tool protocol frame after the single governed retry"
+                                .to_string()
+                        },
+                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                        expected_graph_revision: None,
+                    },
+                );
                 let (next, replan_reason, next_model_instruction) = {
                     let mut state = self.state.lock().await;
                     let (node, next_model_instruction) = match intervention.kind {
@@ -4235,7 +4366,13 @@ where
                             )
                         }
                         RuntimeInterventionKind::Replan => {
-                            let instruction = "Runtime recovery directive: a provider step failed. Replan from the committed goal and evidence before retrying; do not assume uncommitted output is valid.".to_string();
+                            let instruction = if protocol_failure {
+                                "Runtime provider-protocol recovery (single attempt): the prior response used a malformed recognized tool-call frame. Retry from committed evidence using only an exposed native tool with valid arguments, or return a normal visible final answer. Never print tool-protocol markup as prose."
+                                    .to_string()
+                            } else {
+                                "Runtime recovery directive: a provider step failed. Replan from the committed goal and evidence before retrying; do not assume uncommitted output is valid."
+                                    .to_string()
+                            };
                             state.content.push_str("\n\n");
                             state.content.push_str(&instruction);
                             state.content.push('\n');
@@ -5649,12 +5786,22 @@ where
             .projection(&ticket.graph_id)
             .await
             .map_err(|error| error.to_string())?;
-        let (ingress, goal_id, terminal_override) = {
+        let (
+            ingress,
+            goal_id,
+            terminal_override,
+            input_tokens,
+            output_tokens,
+            turn_transcript_start,
+        ) = {
             let state = self.state.lock().await;
             (
                 state.ingress.clone(),
                 state.goal_id.clone(),
                 state.terminal_override.clone(),
+                state.input_tokens,
+                state.output_tokens,
+                state.turn_transcript_start,
             )
         };
         let (completion, final_answer) = match terminal_override {
@@ -5692,6 +5839,42 @@ where
                 .map_err(|error| format!("goal completion cannot commit: {error}"))?,
         );
         if let Some(ingress) = ingress {
+            let mut transcript = {
+                let runtime = self.runtime.lock().await;
+                let session = runtime.session_async().await;
+                session
+                    .messages
+                    .get(turn_transcript_start..)
+                    .unwrap_or_default()
+                    .to_vec()
+            };
+            // The source ingress row and its Runtime request are committed in
+            // one Gateway transaction before execution begins. Persisting it
+            // again here would create a duplicate user turn.
+            if transcript
+                .first()
+                .is_some_and(|message| message.role.role_str() == "user")
+            {
+                transcript.remove(0);
+            }
+            let terminal_is_last = transcript.last().is_some_and(|message| {
+                message.role.role_str() == "assistant"
+                    && message.blocks.iter().any(
+                        |block| matches!(block, ContentBlock::Text { text } if text == &final_answer),
+                    )
+            });
+            if !terminal_is_last {
+                transcript.push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                    text: final_answer.clone(),
+                }]));
+            }
+            let transcript = transcript
+                .iter()
+                .map(|message| {
+                    serde_json::from_str::<serde_json::Value>(&message.to_json().render())
+                        .map_err(|error| format!("encode terminal transcript: {error}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             let terminal = crate::runtime_event_store::SessionTerminalInput {
                 terminal_id: format!("turn-terminal:{}", ingress.request_id),
                 message_id: format!("assistant:{}", ingress.message_id),
@@ -5699,8 +5882,19 @@ where
                 execution_id: Some(ticket.graph_id.clone()),
                 turn_id: Some(ingress.turn_id.clone()),
                 payload_ref: format!(
-                    "assistant_json:{}",
-                    serde_json::to_string(&final_answer).unwrap_or_default()
+                    "assistant_terminal_v2:{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "text": final_answer,
+                        "ingress_message_id": ingress.message_id,
+                        "transcript": transcript,
+                        "token_usage": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                        }
+                    }))
+                    .unwrap_or_default()
                 ),
             };
             outcome
@@ -5773,6 +5967,9 @@ where
             prompt_cache_events,
             iterations,
             model,
+            models_used,
+            first_token_latency_ms,
+            active_stream_duration_ms,
             input_tokens,
             output_tokens,
             wall_duration_ms,
@@ -5789,6 +5986,9 @@ where
                 std::mem::take(&mut state.prompt_cache_events),
                 state.iterations,
                 state.model.clone(),
+                state.models_used.clone(),
+                state.first_token_latency_ms,
+                state.active_stream_duration_ms,
                 state.input_tokens,
                 state.output_tokens,
                 state.wall_duration_ms,
@@ -5810,6 +6010,9 @@ where
                 prompt_cache_events,
                 iterations,
                 model,
+                models_used,
+                first_token_latency_ms,
+                active_stream_duration_ms,
                 input_tokens,
                 output_tokens,
                 wall_duration_ms,
@@ -5869,6 +6072,14 @@ fn model_intent_summary(intent: &ModelStepIntent) -> String {
             format!("model requested approval for {} action(s)", calls.len())
         }
         ModelStepIntent::Replan { reason } => format!("model requested replan: {reason}"),
+    }
+}
+
+fn provider_protocol_intervention_kind(attempt: u8) -> RuntimeInterventionKind {
+    if attempt <= PROVIDER_PROTOCOL_RECOVERY_BUDGET {
+        RuntimeInterventionKind::Replan
+    } else {
+        RuntimeInterventionKind::Block
     }
 }
 
@@ -7757,6 +7968,40 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct ProtocolFailureThenFinalClient {
+        attempts: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<ApiRequest>>>,
+    }
+
+    impl ApiClient for ProtocolFailureThenFinalClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.requests
+                .lock()
+                .expect("capture protocol recovery request")
+                .push(request);
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Box::pin(stream::iter(vec![Err(
+                    RuntimeError::with_provider_failure_metadata(
+                        "malformed compatibility tool-call frame",
+                        None,
+                        true,
+                    ),
+                )]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "protocol recovery retained current objective".to_string(),
+                )),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[derive(Clone)]
     struct ToolOnlyThenFinalClient {
         attempts: Arc<AtomicUsize>,
         saw_terminal_boundary: Arc<std::sync::atomic::AtomicBool>,
@@ -8517,6 +8762,109 @@ mod tests {
                 .count(),
             1,
             "FinalAnswer must be committed exactly once before Synthesize"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn protocol_recovery_retains_current_ingress_user_exactly_once() {
+        const OBJECTIVE: &str = "V584_INVALID_DSML current objective";
+
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let mut session = Session::new();
+        session
+            .messages
+            .push(ConversationMessage::user_text("previous objective"));
+        session
+            .messages
+            .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "previous terminal answer".to_string(),
+            }]));
+        let runtime = crate::ConversationRuntime::new(
+            session,
+            ProtocolFailureThenFinalClient {
+                attempts: Arc::clone(&attempts),
+                requests: Arc::clone(&requests),
+            },
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let (runtime, result) = submit_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            OBJECTIVE,
+            &SharedPrompter::none(),
+        )
+        .await;
+        let summary = result.expect("single governed protocol retry must recover");
+        assert_eq!(
+            summary.final_answer,
+            "protocol recovery retained current objective"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let requests = requests.lock().expect("captured protocol requests");
+        assert_eq!(requests.len(), 2);
+        for (attempt, request) in requests.iter().enumerate() {
+            assert!(
+                request.messages.iter().any(|message| {
+                    message.role == crate::MessageRole::User
+                        && message.blocks.iter().any(
+                            |block| matches!(block, ContentBlock::Text { text } if text == OBJECTIVE),
+                        )
+                }),
+                "provider attempt {} must retain the current ingress user",
+                attempt + 1,
+            );
+        }
+        assert!(requests[1]
+            .prompt
+            .trusted_system
+            .iter()
+            .chain(
+                requests[1]
+                    .prompt
+                    .contextual_packets
+                    .iter()
+                    .map(|packet| &packet.content),
+            )
+            .any(|fragment| fragment.contains("provider-protocol recovery")));
+        drop(requests);
+
+        let transcript = runtime.session_async().await.messages;
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|message| {
+                    message.role == crate::MessageRole::User
+                        && message.blocks.iter().any(
+                            |block| matches!(block, ContentBlock::Text { text } if text == OBJECTIVE),
+                        )
+                })
+                .count(),
+            1,
+            "the failed first attempt and its retry must publish one ingress user"
+        );
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|message| {
+                    message.role == crate::MessageRole::Assistant
+                        && message.blocks.iter().any(|block| {
+                            matches!(
+                                block,
+                                ContentBlock::Text { text }
+                                    if text == "protocol recovery retained current objective"
+                            )
+                        })
+                })
+                .count(),
+            1,
+            "the governed retry must publish one current-turn terminal answer"
         );
     }
 
@@ -10166,5 +10514,28 @@ mod tests {
         assert_eq!(terminal_recovery_retry_budget(&strategic), 3);
         assert_eq!(terminal_recovery_retry_budget(&pressured), 1);
         assert_eq!(terminal_recovery_retry_budget(&constrained), 1);
+    }
+
+    #[test]
+    fn recognized_provider_protocol_failure_has_one_dedicated_retry_budget() {
+        assert_eq!(PROVIDER_PROTOCOL_RECOVERY_BUDGET, 1);
+        assert!(RuntimeError::with_provider_failure_metadata(
+            "invalid sse frame: malformed compatibility tool-call frame",
+            None,
+            true,
+        )
+        .is_provider_tool_protocol_failure());
+        assert!(
+            !RuntimeError::new("connection reset while reading provider stream")
+                .is_provider_tool_protocol_failure()
+        );
+        assert_eq!(
+            provider_protocol_intervention_kind(1),
+            RuntimeInterventionKind::Replan
+        );
+        assert_eq!(
+            provider_protocol_intervention_kind(2),
+            RuntimeInterventionKind::Block
+        );
     }
 }

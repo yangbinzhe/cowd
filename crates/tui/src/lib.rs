@@ -60,6 +60,8 @@ pub mod state;
 pub mod test_utils;
 pub mod theme;
 pub mod workbench;
+#[path = "rendering/wrapping.rs"]
+pub mod wrapping;
 
 #[cfg(test)]
 #[path = "integration/tui_integration_tests.rs"]

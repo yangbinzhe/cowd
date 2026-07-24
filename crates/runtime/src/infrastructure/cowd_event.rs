@@ -121,6 +121,22 @@ pub enum CowdEvent {
         error: String,
     },
     ContextWindow(u64),
+    /// Request-local capacity and routing fact known before the first provider
+    /// byte. This is distinct from billed usage, which remains unknown until a
+    /// provider Usage event arrives.
+    ProviderAttempt {
+        model: String,
+        models_tried: Vec<String>,
+        context_window_tokens: u64,
+        context_window_source: String,
+        packed_input_tokens: u64,
+    },
+    /// Canonical write-capable tool targets observed by the graph owner. The
+    /// live reducer reconciles this at finalization so preview parsing cannot
+    /// undercount same-bytes writes or paths rejected before execution.
+    WriteAttemptsObserved {
+        paths: Vec<String>,
+    },
     ContextEnvelope {
         envelope: crate::context_runtime::ContextEnvelope,
     },
@@ -194,6 +210,10 @@ pub enum CowdEvent {
     },
     // Approval
     ApprovalRequested {
+        /// Stable identity of the approval gate request. Replayed live events
+        /// must carry the same value so projections can deduplicate them.
+        #[serde(default)]
+        request_id: String,
         tool: String,
     },
 }

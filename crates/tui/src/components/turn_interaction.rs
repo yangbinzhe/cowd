@@ -238,6 +238,8 @@ mod tests {
                 context_usage: None,
                 metrics: Default::default(),
                 output_preview: None,
+                output_preview_start_bytes: 0,
+                output_bytes: 0,
                 terminal_ref: status.is_terminal().then(|| "terminal-a".to_string()),
                 error: None,
             }),

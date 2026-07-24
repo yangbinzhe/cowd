@@ -1140,14 +1140,32 @@ impl RuntimeServices {
         &self,
         execution_id: &str,
         report: &harness_contract::context::ContextTurnReport,
+        write_attempt_paths: &[String],
         terminal_ref: String,
     ) {
         self.live_execution_store
-            .complete(execution_id, report, terminal_ref);
+            .complete(execution_id, report, write_attempt_paths, terminal_ref);
     }
 
     pub fn fail_live_execution(&self, execution_id: &str, error: String) {
         self.live_execution_store.fail(execution_id, error);
+    }
+
+    pub fn block_live_execution(
+        &self,
+        execution_id: &str,
+        report: &harness_contract::context::ContextTurnReport,
+        write_attempt_paths: &[String],
+        terminal_ref: String,
+        reason: String,
+    ) {
+        self.live_execution_store.block(
+            execution_id,
+            report,
+            write_attempt_paths,
+            terminal_ref,
+            reason,
+        );
     }
 
     pub fn cancel_live_execution(&self, execution_id: &str, detail: String) {

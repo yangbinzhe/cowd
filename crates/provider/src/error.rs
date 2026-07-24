@@ -17,6 +17,22 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "request is too large",
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatibilityToolProtocolFailure {
+    MalformedFrame,
+    FrameTooLarge,
+}
+
+impl CompatibilityToolProtocolFailure {
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::MalformedFrame => "malformed compatibility tool-call frame",
+            Self::FrameTooLarge => "compatibility tool-call frame exceeds byte limit",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ApiError {
     MissingCredentials {
@@ -66,6 +82,7 @@ pub enum ApiError {
         last_error: Box<ApiError>,
     },
     InvalidSseFrame(&'static str),
+    CompatibilityToolProtocol(CompatibilityToolProtocolFailure),
     BackoffOverflow {
         attempt: u32,
         base_delay: Duration,
@@ -81,6 +98,21 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Whether this failure represents a provider-emitted compatibility tool
+    /// frame that was recognisable as protocol data but invalid. Runtime uses
+    /// this typed classification to avoid multiplying the same bad frame
+    /// across fallback models.
+    #[must_use]
+    pub fn is_compatibility_tool_protocol_failure(&self) -> bool {
+        match self {
+            Self::CompatibilityToolProtocol(_) => true,
+            Self::RetriesExhausted { last_error, .. } => {
+                last_error.is_compatibility_tool_protocol_failure()
+            }
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub const fn missing_credentials(
         provider: &'static str,
@@ -158,6 +190,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
             | Self::InvalidProviderConfig { .. } => false,
@@ -190,6 +223,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
             | Self::InvalidProviderConfig { .. } => false,
@@ -220,6 +254,7 @@ impl ApiError {
             | Self::Json { .. }
             | Self::RequestBodyTooLarge { .. }
             | Self::InvalidSseFrame(_)
+            | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
             | Self::InvalidProviderConfig { .. } => None,
@@ -241,6 +276,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
             | Self::InvalidProviderConfig { .. } => None,
@@ -264,9 +300,10 @@ impl ApiError {
             Self::Api { status, .. } if status.as_u16() == 429 => "provider_rate_limit",
             Self::Api { .. } if self.is_generic_fatal_wrapper() => "provider_internal",
             Self::Api { .. } => "provider_error",
-            Self::Http(_) | Self::InvalidSseFrame(_) | Self::BackoffOverflow { .. } => {
-                "provider_transport"
-            }
+            Self::Http(_)
+            | Self::InvalidSseFrame(_)
+            | Self::CompatibilityToolProtocol(_)
+            | Self::BackoffOverflow { .. } => "provider_transport",
             Self::RequestBodyTooLarge { .. } => "request_too_large",
             Self::InvalidApiKeyEnv(_) | Self::Io(_) | Self::Json { .. } => "runtime_io",
             Self::NoProviderConfigured { .. } => "provider_auth",
@@ -294,6 +331,7 @@ impl ApiError {
             | Self::Io(_)
             | Self::Json { .. }
             | Self::InvalidSseFrame(_)
+            | Self::CompatibilityToolProtocol(_)
             | Self::BackoffOverflow { .. }
             | Self::NoProviderConfigured { .. }
             | Self::InvalidProviderConfig { .. } => false,
@@ -398,6 +436,9 @@ impl Display for ApiError {
                 last_error,
             } => write!(f, "api failed after {attempts} attempts: {last_error}"),
             Self::InvalidSseFrame(message) => write!(f, "invalid sse frame: {message}"),
+            Self::CompatibilityToolProtocol(failure) => {
+                write!(f, "invalid sse frame: {}", failure.message())
+            }
             Self::BackoffOverflow {
                 attempt,
                 base_delay,
@@ -528,7 +569,7 @@ fn truncate_body_snippet(body: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate_body_snippet, ApiError};
+    use super::{truncate_body_snippet, ApiError, CompatibilityToolProtocolFailure};
 
     #[test]
     fn context_window_hint_requires_a_numeric_provider_limit() {
@@ -729,5 +770,27 @@ mod tests {
         assert_eq!(error.safe_failure_class(), "provider_auth");
         assert!(!error.is_retryable());
         assert_eq!(error.request_id(), None);
+    }
+
+    #[test]
+    fn compatibility_tool_protocol_failures_are_typed_and_preserve_retry_classification() {
+        for failure in [
+            CompatibilityToolProtocolFailure::MalformedFrame,
+            CompatibilityToolProtocolFailure::FrameTooLarge,
+        ] {
+            let error = ApiError::CompatibilityToolProtocol(failure);
+            assert!(error.is_compatibility_tool_protocol_failure());
+            assert_eq!(error.safe_failure_class(), "provider_transport");
+            assert_eq!(
+                error.to_string(),
+                format!("invalid sse frame: {}", failure.message())
+            );
+
+            let exhausted = ApiError::RetriesExhausted {
+                attempts: 1,
+                last_error: Box::new(error),
+            };
+            assert!(exhausted.is_compatibility_tool_protocol_failure());
+        }
     }
 }

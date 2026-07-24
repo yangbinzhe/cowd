@@ -187,6 +187,38 @@ impl ToastManager {
 
         let frame = ctx.frame_mut();
 
+        // A stack of desktop-sized notices can consume an entire narrow
+        // terminal and cover the newest assistant output. Compact layouts show
+        // only the latest notification in a bounded banner; normal widths keep
+        // the full notification stack.
+        if area.width < 60 || area.height < 16 {
+            let Some(toast) = self.toasts.back() else {
+                return;
+            };
+            let width = area.width.saturating_sub(2).max(1);
+            let height = area.height.min(4).max(1);
+            let rect = Rect::new(
+                area.x.saturating_add(1),
+                area.y
+                    .saturating_add(1)
+                    .min(area.bottom().saturating_sub(height)),
+                width,
+                height,
+            );
+            frame.render_widget(Clear, rect);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(toast.variant.border_color()))
+                .title(toast.title.as_deref().unwrap_or(""));
+            frame.render_widget(
+                Paragraph::new(toast.message.as_str())
+                    .block(block)
+                    .wrap(Wrap { trim: true }),
+                rect,
+            );
+            return;
+        }
+
         // Max toast width: min(60, area.width - 4) for right-side padding
         let max_w = 60u16.min(area.width.saturating_sub(4));
 
@@ -337,6 +369,41 @@ mod tests {
         terminal.assert_line_contains("First message");
         terminal.assert_line_contains("Second message");
         terminal.assert_line_contains("Third message");
+    }
+
+    #[test]
+    fn narrow_terminal_shows_only_latest_toast_in_bounded_banner() {
+        let mut mgr = ToastManager::new();
+        mgr.push(
+            ToastVariant::Info,
+            Some("First".into()),
+            "First message that must not cover the transcript".into(),
+            5000,
+        );
+        mgr.push(
+            ToastVariant::Warning,
+            Some("Latest".into()),
+            "Latest compact notice".into(),
+            5000,
+        );
+
+        let mut terminal = MockTerminal::new(40, 24);
+        let theme = SkinConfig::default();
+        terminal.draw(|f: &mut Frame| {
+            let area = f.area();
+            let mut ctx = RenderContext::new(f, &theme);
+            mgr.render(&mut ctx, area);
+        });
+
+        let lines = terminal.buffer_lines();
+        let joined = lines.join("\n");
+        assert!(joined.contains("Latest"));
+        assert!(joined.contains("Latest compact notice"));
+        assert!(!joined.contains("First message"));
+        assert!(
+            lines.iter().filter(|line| !line.trim().is_empty()).count() <= 4,
+            "compact toast must not consume the narrow transcript viewport: {joined}"
+        );
     }
 
     // ── Error border ───────────────────────────────────────────────

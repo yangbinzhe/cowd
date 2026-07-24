@@ -5,8 +5,247 @@ use std::collections::BTreeSet;
 use cowd_app_host::TuiAppEvent;
 
 pub use harness_contract::projection::{
-    ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection, ProjectionDelta,
+    ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionLiveUpdate, ExecutionProjection,
+    ProjectionDelta, SessionExecutionIndexProjection,
 };
+
+/// Stable identity carried by Gateway session events.
+///
+/// None of these fields are inferred from visible text. A Runtime event may be
+/// transient, but its session/execution/turn ownership is still explicit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayEventCorrelation {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_cursor: Option<u64>,
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum GatewaySessionEvent {
+    UserMessageCommitted {
+        correlation: GatewayEventCorrelation,
+        content: String,
+        sequence: usize,
+        created_at_ms: u64,
+    },
+    TextDelta {
+        correlation: GatewayEventCorrelation,
+        text: String,
+        start_bytes: usize,
+        end_bytes: usize,
+        stream_revision: u64,
+    },
+    ThinkingDelta {
+        correlation: GatewayEventCorrelation,
+        thinking: String,
+    },
+    ToolStart {
+        correlation: GatewayEventCorrelation,
+        id: String,
+        name: String,
+        preview: String,
+    },
+    ToolProgress {
+        correlation: GatewayEventCorrelation,
+        id: String,
+        name: String,
+        progress: String,
+    },
+    ToolComplete {
+        correlation: GatewayEventCorrelation,
+        id: String,
+        name: String,
+        summary: String,
+        exit_code: Option<i32>,
+    },
+    ExecutionPhase {
+        correlation: GatewayEventCorrelation,
+        status: harness_contract::projection::ExecutionLiveStatus,
+        detail: Option<String>,
+    },
+    ProviderAttempt {
+        correlation: GatewayEventCorrelation,
+        model: String,
+        models_tried: Vec<String>,
+        context_window_tokens: u64,
+        context_window_source: String,
+        packed_input_tokens: u64,
+    },
+    ContextEnvelope {
+        correlation: GatewayEventCorrelation,
+        envelope: Value,
+    },
+    ContextWindow {
+        correlation: GatewayEventCorrelation,
+        value: u64,
+    },
+    TokenUsage {
+        correlation: GatewayEventCorrelation,
+        input: u64,
+        output: u64,
+        cache_create: u64,
+        cache_read: u64,
+    },
+    RunModelTelemetry {
+        correlation: GatewayEventCorrelation,
+        telemetry: RunModelTelemetryProjection,
+    },
+    TerminalCommitted {
+        correlation: GatewayEventCorrelation,
+        assistant_text: String,
+        sequence: Option<usize>,
+        iterations: u32,
+        token_usage: Option<Value>,
+    },
+    TurnError {
+        correlation: GatewayEventCorrelation,
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessageProjection {
+    pub id: String,
+    pub session_id: String,
+    pub sequence: usize,
+    pub role: String,
+    #[serde(default)]
+    pub blocks: Vec<Value>,
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+impl SessionMessageProjection {
+    #[must_use]
+    pub fn visible_text(&self) -> String {
+        self.blocks
+            .iter()
+            .filter_map(|block| {
+                let block_type = block.get("type").and_then(Value::as_str);
+                matches!(block_type, Some("text") | None)
+                    .then(|| block.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[must_use]
+    pub fn turn_id(&self) -> Option<&str> {
+        self.blocks.iter().find_map(|block| {
+            block
+                .get("cowd_turn_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+    }
+
+    #[must_use]
+    pub fn execution_id(&self) -> Option<&str> {
+        self.blocks.iter().find_map(|block| {
+            block
+                .get("cowd_execution_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessagesPage {
+    pub session_id: String,
+    #[serde(default)]
+    pub messages: Vec<SessionMessageProjection>,
+    pub total: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_seq: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_seq: Option<usize>,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SessionHistoryHydrationKind {
+    InitialWindow,
+    IncrementalCatchup,
+}
+
+/// Provider-observed model telemetry transported by Gateway.
+///
+/// This deliberately mirrors Runtime's public event payload without making
+/// the presentation crate depend on Runtime internals.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunModelTelemetryProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub models_used: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_stream_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub wall_duration_ms: u64,
+    #[serde(default)]
+    pub output_chars: u64,
+    #[serde(default)]
+    pub output_chunks: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_create_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub usage_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_chars_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_chars_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tokens_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chars_per_second: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStreamConnectionState {
+    Connecting,
+    Connected,
+    Reconnecting {
+        attempt: u32,
+        after_cursor: Option<u64>,
+    },
+}
 
 /// TUI-side durable cursor guard. It deliberately does not infer graph or
 /// session lifecycle from textual events: a gap requests a new canonical
@@ -123,8 +362,94 @@ pub struct RuntimePolicyDecisionSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CowdEvent {
-    TextDelta {
-        text: String,
+    /// Event emitted by one session SSE observer whose payload does not always
+    /// carry correlation itself (usage/context/telemetry/warnings). Runner
+    /// unwraps this only after routing it to the matching presentation state.
+    SessionScoped {
+        session_id: String,
+        /// Monotonic authority epoch captured when the producer was started.
+        /// A revoked/re-authorized session may reuse the same public ID, so
+        /// session identity alone is not sufficient to reject late results.
+        authority_generation: u64,
+        event: Box<CowdEvent>,
+    },
+    GatewaySession {
+        event: GatewaySessionEvent,
+    },
+    SessionHistoryPage {
+        page: SessionMessagesPage,
+    },
+    /// Messages committed after the last accepted durable sequence. App may
+    /// install these only while its visible window is at the durable tail;
+    /// an operator browsing older history must keep a contiguous window and
+    /// receive a "newer available" indication instead.
+    SessionHistoryCatchupPage {
+        page: SessionMessagesPage,
+    },
+    /// Completion facts for one bounded hydration pass. This is the typed
+    /// owner for history performance/window telemetry; UI code must not infer
+    /// these values from timeline length after eviction.
+    SessionHistoryHydrated {
+        session_id: String,
+        kind: SessionHistoryHydrationKind,
+        duration_ms: u64,
+        message_count: usize,
+        page_count: usize,
+        oldest_offset: usize,
+        total_messages: usize,
+        next_sequence: usize,
+        has_older: bool,
+    },
+    SessionHistoryOlderPage {
+        page: SessionMessagesPage,
+        oldest_offset: usize,
+        has_older: bool,
+    },
+    SessionHistoryOlderFailed {
+        session_id: String,
+        error: String,
+    },
+    SessionHistoryNewerPage {
+        page: SessionMessagesPage,
+        window_end_offset: usize,
+        has_newer: bool,
+    },
+    SessionHistoryLatestPage {
+        page: SessionMessagesPage,
+        oldest_offset: usize,
+    },
+    SessionHistoryHydrationFailed {
+        session_id: String,
+        error: String,
+    },
+    MessageAdmissionAccepted {
+        session_id: String,
+        client_message_id: String,
+        submission_generation: u64,
+    },
+    MessageAdmissionFailed {
+        session_id: String,
+        client_message_id: String,
+        submission_generation: u64,
+        original_text: String,
+        started_new_turn: bool,
+        error: String,
+    },
+    SessionAuthorizationRevoked {
+        session_id: String,
+        reason: String,
+    },
+    SessionStreamConnection {
+        session_id: String,
+        state: SessionStreamConnectionState,
+    },
+    /// Transport state of the independently streamed canonical execution
+    /// projection. Session prose may remain connected while this stream is
+    /// stale, so it must never be folded into the session SSE state.
+    ExecutionProjectionConnection {
+        generation: u64,
+        execution_id: String,
+        state: SessionStreamConnectionState,
     },
     ThinkingDelta {
         thinking: String,
@@ -154,12 +479,17 @@ pub enum CowdEvent {
         duration_ms: u64,
     },
     TurnStarted,
-    TurnComplete {
-        assistant_text: String,
-        iterations: u32,
-    },
     ResourcesCommitted {
         ids: Vec<String>,
+    },
+    ResourceUploaded {
+        id: String,
+        label: String,
+        kind: String,
+    },
+    ResourceUploadFailed {
+        path: String,
+        error: String,
     },
     /// Runtime-owned SessionIngress queue snapshot. The payload remains a
     /// shared-contract JSON value at this boundary so TUI can evolve its
@@ -171,6 +501,13 @@ pub enum CowdEvent {
         error: String,
     },
     ContextWindow(u64),
+    ProviderAttempt {
+        model: String,
+        models_tried: Vec<String>,
+        context_window_tokens: u64,
+        context_window_source: String,
+        packed_input_tokens: u64,
+    },
     ContextEnvelope {
         envelope: Value,
     },
@@ -187,6 +524,10 @@ pub enum CowdEvent {
     ExecutionProjectionLoaded {
         generation: u64,
         projection: ExecutionProjection,
+    },
+    ExecutionProjectionLive {
+        generation: u64,
+        update: ExecutionLiveUpdate,
     },
     /// A bounded background snapshot refresh failed.  It is separate from a
     /// display warning so the selected execution can release its one in-flight
@@ -213,6 +554,9 @@ pub enum CowdEvent {
         output: u64,
         cache_create: u64,
         cache_read: u64,
+    },
+    RunModelTelemetry {
+        telemetry: RunModelTelemetryProjection,
     },
     CompactionNotice {
         removed_count: usize,

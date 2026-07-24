@@ -1,0 +1,317 @@
+#!/usr/bin/env node
+
+/**
+ * Deterministic OpenAI-compatible provider used by the V584 production TUI
+ * acceptance gate.  It records exactly which conversation roles/texts reached
+ * the provider, streams in multiple chunks, reports usage and can deliberately
+ * emit a split invalid DSML frame to verify the fail-closed protocol boundary.
+ */
+import fs from "node:fs";
+import http from "node:http";
+
+const port = Number.parseInt(process.env.COWD_V584_PROVIDER_PORT ?? "18784", 10);
+const logPath = process.env.COWD_V584_PROVIDER_LOG;
+const fixtureModel = "cowd-v584-acceptance";
+
+function textOf(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      return typeof part.text === "string" ? part.text : "";
+    })
+    .join("");
+}
+
+function exposedToolNames(request) {
+  return (Array.isArray(request.tools) ? request.tools : [])
+    .map((tool) => tool?.function?.name)
+    .filter((name) => typeof name === "string" && name.length > 0);
+}
+
+function recordRequest(request, messages) {
+  if (!logPath) return;
+  const record = {
+    received_at: new Date().toISOString(),
+    model: request.model ?? fixtureModel,
+    stream: request.stream === true,
+    exposed_tools: exposedToolNames(request),
+    messages: messages.map((message) => ({
+      role: message?.role ?? "unknown",
+      text: textOf(message?.content),
+      tool_call_id: message?.tool_call_id ?? null,
+    })),
+  };
+  fs.appendFileSync(logPath, `${JSON.stringify(record)}\n`, "utf8");
+}
+
+function responseFor(messages, tools) {
+  const userMessages = messages
+    .filter((message) => message?.role === "user")
+    .map((message) => textOf(message.content))
+    // Runtime context packets deliberately use provider-user role so they
+    // cannot gain system authority. They are not durable human turns and must
+    // not inflate the fixture's causal-history assertion.
+    .filter((text) => !text.startsWith("## Runtime context data\n"));
+  const latest = userMessages.at(-1) ?? "";
+  const prior = userMessages.slice(0, -1).join("\n");
+
+  if (latest.includes("V584_TURN_1")) {
+    const nonce = latest.match(/V584-NONCE-[A-Z0-9-]+/)?.[0] ?? "NONCE-MISSING";
+    return {
+      chunks: [`V584-TURN1-ACK nonce=${nonce}`],
+      finishReason: "stop",
+    };
+  }
+  if (latest.includes("V584_TURN_2")) {
+    const nonce = prior.match(/V584-NONCE-[A-Z0-9-]+/)?.[0] ?? "NONCE-MISSING";
+    return {
+      chunks: [
+        "V584-TURN2-ACK ",
+        `recalled=${nonce} `,
+        `provider_user_history=${userMessages.length}`,
+      ],
+      finishReason: "stop",
+      delayMs: 120,
+    };
+  }
+  if (latest.includes("V584_LONG_WRAP")) {
+    const matrix = Array.from({ length: 48 }, (_, index) => {
+      const row = String(index).padStart(2, "0");
+      return (
+        `ROW-${row} 中文自然折行必须保留字符与顺序；` +
+        `URL https://example.invalid/terminal/${row}/a-very-long-path?alpha=1234567890&beta=折行；` +
+        `JSON {"row":${index},"emoji":"🚀🧪","完整":true}; ` +
+        `CODE verifyTerminalWidth(${40 + index});\n`
+      );
+    }).join("");
+    return {
+      chunks: [
+        "V584-LONG-BEGIN 中文折行验证：这是不能丢失末尾的超长句子，",
+        "它必须在不同终端宽度内自然换行且继续显示全部文字。\n",
+        matrix,
+        "V584-LONG-END 🚀🧪 END-OF-LONG-RESPONSE",
+      ],
+      finishReason: "stop",
+      delayMs: 120,
+    };
+  }
+  if (latest.includes("V584_SLOW_STATUS")) {
+    return {
+      chunks: ["V584-SLOW-BEGIN ", "stream-progress-visible ", "V584-SLOW-END"],
+      finishReason: "stop",
+      delayMs: 650,
+    };
+  }
+  if (latest.includes("V584_VALID_DSML")) {
+    const toolResultAfterRequest = messages
+      .slice(
+        Math.max(
+          0,
+          messages.findLastIndex(
+            (message) =>
+              message?.role === "user" &&
+              textOf(message.content).includes("V584_VALID_DSML"),
+          ),
+        ),
+      )
+      .some((message) => message?.role === "tool");
+    if (toolResultAfterRequest) {
+      return {
+        chunks: ["V584-DSML-TOOL-COMPLETE"],
+        finishReason: "stop",
+      };
+    }
+    const exposed = exposedToolNames({ tools });
+    const toolName =
+      exposed.find((name) => /list.*mcp.*resource/i.test(name)) ??
+      exposed.find((name) => name === "tool_cache_stats") ??
+      exposed.find((name) => name === "workspace_snapshot") ??
+      exposed.find((name) => name === "runtime_capabilities");
+    if (!toolName) {
+      return {
+        chunks: ["V584-DSML-NO-SAFE-EXPOSED-TOOL"],
+        finishReason: "stop",
+      };
+    }
+    const invocation =
+      toolName === "runtime_capabilities"
+        ? `<｜｜DSML｜｜invoke name="${toolName}"><｜｜DSML｜｜parameter name="intent" string="true">verify the production DSML read-only tool boundary</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke>`
+        : `<｜｜DSML｜｜invoke name="${toolName}"></｜｜DSML｜｜invoke>`;
+    return {
+      chunks: [
+        "<｜｜DSML｜｜tool_",
+        `calls>${invocation}</｜｜DSML｜｜tool_calls>`,
+      ],
+      finishReason: "stop",
+      delayMs: 80,
+    };
+  }
+  if (latest.includes("V584_OBSERVER_SYNC")) {
+    if (latest.includes("publish one answer")) {
+      return {
+        chunks: [
+          "V584-OBSERVER-SYNC-BEGIN ",
+          "live-progress-visible ",
+          "V584-OBSERVER-SYNC-ACK",
+        ],
+        finishReason: "stop",
+        delayMs: 500,
+      };
+    }
+    const marker = latest.includes("from WebUI")
+      ? "V584-WEBUI-TO-TUI-ACK"
+      : latest.includes("from TUI")
+        ? "V584-TUI-TO-WEBUI-ACK"
+        : latest.includes("after WebUI disconnect")
+          ? "V584-WEBUI-DISCONNECT-ACK"
+          : latest.includes("after reconnect")
+            ? "V584-RECONNECT-ACK"
+            : "V584-OBSERVER-SYNC-ACK";
+    return {
+      chunks: [marker],
+      finishReason: "stop",
+    };
+  }
+  if (latest.includes("V584_INVALID_DSML")) {
+    return {
+      chunks: [
+        "<｜｜DSML｜｜tool_",
+        'calls><｜｜DSML｜｜invoke name="bash"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>',
+      ],
+      finishReason: "stop",
+      delayMs: 80,
+    };
+  }
+  return {
+    chunks: ["V584-DEFAULT-ACK"],
+    finishReason: "stop",
+  };
+}
+
+function streamResponse(response, model, requestId, userCount) {
+  const { chunks, finishReason, delayMs = 0 } = response;
+  let index = 0;
+  const emit = () => {
+    if (index < chunks.length) {
+      const chunk = {
+        id: requestId,
+        object: "chat.completion.chunk",
+        model,
+        choices: [
+          {
+            index: 0,
+            delta: { content: chunks[index] },
+            finish_reason: null,
+          },
+        ],
+      };
+      this.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      index += 1;
+      if (delayMs > 0) {
+        setTimeout(emit, delayMs);
+      } else {
+        emit();
+      }
+      return;
+    }
+
+    const terminal = {
+      id: requestId,
+      object: "chat.completion.chunk",
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+      usage: {
+        prompt_tokens: 120 + userCount * 17,
+        completion_tokens: Math.max(
+          1,
+          Math.ceil(chunks.join("").length / 4),
+        ),
+        total_tokens:
+          120 +
+          userCount * 17 +
+          Math.max(1, Math.ceil(chunks.join("").length / 4)),
+      },
+    };
+    this.write(`data: ${JSON.stringify(terminal)}\n\n`);
+    this.end("data: [DONE]\n\n");
+  };
+  emit();
+}
+
+let requestSequence = 0;
+const server = http.createServer((request, response) => {
+  if (logPath) {
+    fs.appendFileSync(
+      logPath,
+      `${JSON.stringify({
+        received_at: new Date().toISOString(),
+        phase: "request_start",
+        method: request.method,
+        url: request.url,
+      })}\n`,
+      "utf8",
+    );
+  }
+  if (request.method === "GET" && request.url === "/health") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end('{"ok":true}');
+    return;
+  }
+  if (
+    request.method !== "POST" ||
+    !["/v1/chat/completions", "/chat/completions"].includes(request.url)
+  ) {
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end('{"error":{"message":"fixture route not found"}}');
+    return;
+  }
+
+  let body = "";
+  request.setEncoding("utf8");
+  request.on("data", (chunk) => {
+    body += chunk;
+  });
+  request.on("end", () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      response.writeHead(400, { "content-type": "application/json" });
+      response.end('{"error":{"message":"invalid JSON"}}');
+      return;
+    }
+    const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+    recordRequest(parsed, messages);
+    requestSequence += 1;
+    const requestId = `chatcmpl-v584-${requestSequence}`;
+    const model =
+      typeof parsed.model === "string" && parsed.model.length > 0
+        ? parsed.model
+        : fixtureModel;
+    const fixtureResponse = responseFor(messages, parsed.tools);
+    response.writeHead(200, {
+      "cache-control": "no-cache",
+      "content-type": "text/event-stream",
+      connection: "keep-alive",
+      "x-request-id": requestId,
+    });
+    streamResponse.call(
+      response,
+      fixtureResponse,
+      model,
+      requestId,
+      messages.filter((message) => message?.role === "user").length,
+    );
+  });
+});
+
+server.listen(port, "127.0.0.1", () => {
+  process.stdout.write(`cowd V584 TUI provider listening on ${port}\n`);
+});
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => server.close(() => process.exit(0)));
+}

@@ -5,6 +5,7 @@
 // Shared state: ActiveSessions, CognitiveContextManager, ToolCatalog, SessionEventBus
 
 use std::collections::BTreeMap;
+use std::future::IntoFuture;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -1094,7 +1095,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // External sidecar process launch is driven by edge requests, not by runtime boot.
 
     // 5. HTTP server with graceful shutdown on SIGINT/SIGTERM
-    let shutdown_signal = async {
+    let (shutdown_started_tx, mut shutdown_started_rx) = tokio::sync::watch::channel(false);
+    let shutdown_signal = async move {
         #[cfg(unix)]
         {
             let mut sigterm =
@@ -1125,12 +1127,35 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 Err(error) => tracing::error!("failed to install ctrl_c handler: {error}"),
             }
         }
+        let _ = shutdown_started_tx.send(true);
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await
-        .map_err(|e| format!("HTTP server error: {e}"))?;
+    let mut server = Box::pin(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal)
+            .into_future(),
+    );
+    let serve_result = tokio::select! {
+        result = &mut server => result,
+        changed = shutdown_started_rx.changed() => {
+            if changed.is_err() || !*shutdown_started_rx.borrow() {
+                server.await
+            } else {
+                const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+                match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut server).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_ms = GRACEFUL_SHUTDOWN_TIMEOUT.as_millis(),
+                            "Gateway graceful shutdown deadline expired; closing long-lived HTTP/SSE connections"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        }
+    };
+    serve_result.map_err(|e| format!("HTTP server error: {e}"))?;
 
     // ── Cleanup after shutdown ──
     tracing::info!("cleaning up runtime host resources...");

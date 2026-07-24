@@ -51,6 +51,14 @@ cleanup() {
     echo "surface lane cleanup left a fixed listener behind" >&2
     return 1
   fi
+  if [[ -n "${COWD_MFG_LANE_EVIDENCE_DIR:-}" ]]; then
+    mkdir -p "${COWD_MFG_LANE_EVIDENCE_DIR}"
+    for artifact in gateway.log webui.log profile-set.stderr profile-manager.json; do
+      if [[ -f "${SCENARIO_ROOT}/${artifact}" ]]; then
+        cp "${SCENARIO_ROOT}/${artifact}" "${COWD_MFG_LANE_EVIDENCE_DIR}/${artifact}"
+      fi
+    done
+  fi
   if [[ "${COWD_MFG_LANE_KEEP_WORKSPACE:-0}" != "1" ]]; then
     rm -rf "${SCENARIO_ROOT}"
   fi
@@ -161,6 +169,11 @@ curl -fsS "${WEBUI_URL}/index.html" >/dev/null
 
 cd "${ROOT}"
 env \
+  COWD_BIN="${BIN}" \
+  COWD_CONFIG_HOME="${CONFIG_HOME}" \
+  COWD_MFG_TEST_CONFIG_HOME="${CONFIG_HOME}" \
+  COWD_MFG_TEST_HOME="${TEST_HOME}" \
+  COWD_MFG_TEST_WORKSPACE="${WORKSPACE}" \
   COWD_GATEWAY_URL="${BASE_URL}" \
   COWD_API_TOKEN="${TOKEN}" \
   COWD_VISUAL_BASE_URL="${WEBUI_URL}" \

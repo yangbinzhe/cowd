@@ -81,6 +81,10 @@ fn runtime_event_stream_payload(event: runtime::CowdEvent) -> serde_json::Value 
     };
     if let (Some(context), serde_json::Value::Object(fields)) = (execution_context, &mut payload) {
         fields.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(context.session_id),
+        );
+        fields.insert(
             "execution_id".to_string(),
             serde_json::Value::String(context.execution_id),
         );
@@ -88,8 +92,46 @@ fn runtime_event_stream_payload(event: runtime::CowdEvent) -> serde_json::Value 
             "turn_id".to_string(),
             serde_json::Value::String(context.turn_id),
         );
+        if !fields.contains_key("part_id") {
+            let part_id = match fields.get("type").and_then(serde_json::Value::as_str) {
+                Some("TextDelta") => Some("assistant_text".to_string()),
+                Some("ThinkingDelta") => Some("thinking".to_string()),
+                Some("ToolStart" | "ToolProgress" | "ToolComplete") => fields
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                    .map(ToOwned::to_owned),
+                _ => None,
+            };
+            if let Some(part_id) = part_id {
+                fields.insert("part_id".to_string(), serde_json::Value::String(part_id));
+            }
+        }
     }
     payload
+}
+
+fn tool_event_identity(event: &runtime::CowdEvent) -> Option<(&str, bool, bool)> {
+    match event.domain_event() {
+        runtime::CowdEvent::ToolStart { id, .. } => Some((id, true, false)),
+        runtime::CowdEvent::ToolProgress { id, .. } => Some((id, false, false)),
+        runtime::CowdEvent::ToolComplete { id, .. } => Some((id, false, true)),
+        _ => None,
+    }
+}
+
+fn rewrite_tool_event_identity(event: &mut runtime::CowdEvent, instance_id: &str) {
+    match event {
+        runtime::CowdEvent::ExecutionScoped { event, .. } => {
+            rewrite_tool_event_identity(event, instance_id);
+        }
+        runtime::CowdEvent::ToolStart { id, .. }
+        | runtime::CowdEvent::ToolProgress { id, .. }
+        | runtime::CowdEvent::ToolComplete { id, .. } => {
+            *id = instance_id.to_string();
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +346,35 @@ fn session_execution_index_from_outbox(
     }
 }
 
+fn reconcile_session_execution_indices(
+    mut volatile: SessionExecutionIndexProjection,
+    durable: SessionExecutionIndexProjection,
+) -> SessionExecutionIndexProjection {
+    let same_execution = volatile.latest_execution_id.is_some()
+        && volatile.latest_execution_id == durable.latest_execution_id;
+    let volatile_has_terminal_outcome = volatile.latest_status.is_some_and(is_live_terminal);
+    if same_execution && volatile_has_terminal_outcome {
+        // The outbox's Materialized state means only that the terminal message
+        // reached the durable transcript. It is not an execution-success
+        // verdict. A persisted Runtime terminal outcome for the same execution
+        // is authoritative even when outbox bookkeeping has a later timestamp.
+        if volatile.terminal_ref.is_none() {
+            volatile.terminal_ref = durable.terminal_ref;
+        }
+        volatile.last_progress_at_ms =
+            match (volatile.last_progress_at_ms, durable.last_progress_at_ms) {
+                (Some(left), Some(right)) => Some(left.max(right)),
+                (left, right) => left.or(right),
+            };
+        return volatile;
+    }
+    match (volatile.last_progress_at_ms, durable.last_progress_at_ms) {
+        (Some(live), Some(persisted)) if live >= persisted => volatile,
+        (Some(_), None) => volatile,
+        _ => durable,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
     sessions: Arc<ActiveSessions>,
@@ -318,6 +389,7 @@ pub(crate) struct RuntimeService {
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
     session_event_relays: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
+    session_activation_locks: Arc<Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
     provider_registry: Arc<runtime::ProviderRegistry>,
     upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
@@ -374,6 +446,7 @@ impl RuntimeService {
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
             session_event_relays: Arc::new(Mutex::new(BTreeMap::new())),
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
+            session_activation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             approval_gate: None,
             provider_registry,
             upgrade_coordinator,
@@ -446,11 +519,7 @@ impl RuntimeService {
             return volatile;
         };
         let durable = session_execution_index_from_outbox(session_id, &records);
-        match (volatile.last_progress_at_ms, durable.last_progress_at_ms) {
-            (Some(live), Some(persisted)) if live >= persisted => volatile,
-            (Some(_), None) => volatile,
-            _ => durable,
-        }
+        reconcile_session_execution_indices(volatile, durable)
     }
 
     pub(crate) async fn recoverable_running_session_execution_indices(
@@ -485,15 +554,37 @@ impl RuntimeService {
         &self,
         execution_id: &str,
         report: &ContextTurnReport,
+        write_attempt_paths: &[String],
         terminal_ref: String,
     ) {
-        self.runtime_services
-            .complete_live_execution(execution_id, report, terminal_ref);
+        self.runtime_services.complete_live_execution(
+            execution_id,
+            report,
+            write_attempt_paths,
+            terminal_ref,
+        );
     }
 
     fn fail_live_execution(&self, execution_id: &str, error: String) {
         self.runtime_services
             .fail_live_execution(execution_id, error);
+    }
+
+    fn block_live_execution(
+        &self,
+        execution_id: &str,
+        report: &ContextTurnReport,
+        write_attempt_paths: &[String],
+        terminal_ref: String,
+        reason: String,
+    ) {
+        self.runtime_services.block_live_execution(
+            execution_id,
+            report,
+            write_attempt_paths,
+            terminal_ref,
+            reason,
+        );
     }
 
     fn install_active_turn_control(
@@ -735,7 +826,44 @@ impl RuntimeService {
         };
         self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
             .await;
-        self.complete_live_execution(&graph_id, &summary.context_turn_report, terminal_id.clone());
+        match summary.terminal_completion {
+            harness_contract::goal::GoalCompletion::Satisfied => self.complete_live_execution(
+                &graph_id,
+                &summary.context_turn_report,
+                &summary.write_attempt_paths,
+                terminal_id.clone(),
+            ),
+            harness_contract::goal::GoalCompletion::Blocked
+            | harness_contract::goal::GoalCompletion::Open => {
+                let reason = format!("Runtime turn blocked: {}", summary.final_answer);
+                self.block_live_execution(
+                    &graph_id,
+                    &summary.context_turn_report,
+                    &summary.write_attempt_paths,
+                    terminal_id.clone(),
+                    reason.clone(),
+                );
+                let event = runtime::CowdEvent::ExecutionScoped {
+                    context: runtime::CowdExecutionContext {
+                        execution_id: graph_id.clone(),
+                        session_id: record.session_id.clone(),
+                        turn_id: record.turn_id.clone(),
+                    },
+                    event: Box::new(runtime::CowdEvent::TurnError { error: reason }),
+                };
+                self.session_kernel
+                    .event_bus()
+                    .broadcast(
+                        &record.session_id,
+                        &runtime_event_stream_payload(event).to_string(),
+                    )
+                    .await;
+            }
+            harness_contract::goal::GoalCompletion::Cancelled => {
+                self.runtime_services
+                    .cancel_live_execution(&graph_id, "Runtime turn cancelled".to_string());
+            }
+        }
         if let Some(resolution) = self.session_input_router.record_target_terminal(
             record,
             &graph_id,
@@ -1211,22 +1339,153 @@ impl RuntimeService {
         model_hint: Option<&str>,
         system_prompt: Vec<String>,
     ) -> Result<(), String> {
+        let activation_lock = {
+            let mut locks = self
+                .session_activation_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let _activation_guard = activation_lock.lock().await;
+        // Recheck only after acquiring the keyed gate. Multiple Surfaces can
+        // submit the first ingress concurrently, but exactly one may hydrate
+        // and install the session carrier.
         if self.has_active_session(session_id) {
             return Ok(());
         }
-        let stored_model = self
+        let hydration_started = std::time::Instant::now();
+        let stored_record = self
             .session_kernel
             .stored_session(session_id)
             .await
-            .map_err(|error| error.to_string())?
-            .and_then(|record| record.model)
+            .map_err(|error| error.to_string())?;
+        let stored_model = stored_record
+            .as_ref()
+            .and_then(|record| record.model.clone())
             .filter(|model| !model.trim().is_empty());
         let model = model_hint
             .filter(|model| !model.trim().is_empty())
             .map(ToOwned::to_owned)
             .or(stored_model)
             .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
-        let runtime = self.build_session_runtime_entry(session_id, &model, system_prompt)?;
+        let session = if let Some(record) = stored_record {
+            // A missing arbitrary truncation is deliberate. Runtime's context
+            // builder owns prompt budgeting; silently dropping durable turns
+            // here is indistinguishable from memory loss. The guard prevents a
+            // corrupt store from exhausting the Gateway process.
+            const MAX_HYDRATED_MESSAGES: usize = 50_000;
+            const MAX_HYDRATED_BYTES: usize = 128 * 1024 * 1024;
+            const MAX_STABLE_SNAPSHOT_ATTEMPTS: usize = 16;
+            let mut messages = None;
+            for attempt in 1..=MAX_STABLE_SNAPSHOT_ATTEMPTS {
+                let total_before = self
+                    .session_kernel
+                    .stored_message_count(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default();
+                if total_before > MAX_HYDRATED_MESSAGES {
+                    return Err(format!(
+                        "session {session_id} contains {total_before} messages, above the safe runtime hydration limit {MAX_HYDRATED_MESSAGES}; compact or checkpoint it before activation"
+                    ));
+                }
+                let candidate = self
+                    .session_kernel
+                    .stored_messages(session_id, 0, total_before)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default();
+                let hydrated_bytes = candidate.iter().try_fold(0usize, |total, message| {
+                    let message_bytes = message
+                        .stable_message_id
+                        .len()
+                        .saturating_add(message.session_id.len())
+                        .saturating_add(message.role.len())
+                        .saturating_add(message.content_json.len())
+                        .saturating_add(
+                            message
+                                .token_usage_json
+                                .as_ref()
+                                .map_or(0, std::string::String::len),
+                        )
+                        .saturating_add(
+                            message
+                                .tool_use_id
+                                .as_ref()
+                                .map_or(0, std::string::String::len),
+                        )
+                        .saturating_add(
+                            message
+                                .tool_name
+                                .as_ref()
+                                .map_or(0, std::string::String::len),
+                        );
+                    total.checked_add(message_bytes)
+                });
+                let Some(hydrated_bytes) = hydrated_bytes else {
+                    return Err(format!(
+                        "session {session_id} hydration byte accounting overflowed; compact or checkpoint it before activation"
+                    ));
+                };
+                if hydrated_bytes > MAX_HYDRATED_BYTES {
+                    return Err(format!(
+                        "session {session_id} durable payload is {hydrated_bytes} bytes, above the safe runtime hydration limit {MAX_HYDRATED_BYTES}; compact or checkpoint it before activation"
+                    ));
+                }
+                let total_after = self
+                    .session_kernel
+                    .stored_message_count(session_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or_default();
+                let sequences_are_contiguous = candidate
+                    .iter()
+                    .enumerate()
+                    .all(|(sequence, message)| message.sequence == sequence);
+                if total_before == total_after
+                    && candidate.len() == total_before
+                    && sequences_are_contiguous
+                {
+                    messages = Some((candidate, hydrated_bytes, attempt));
+                    break;
+                }
+                if attempt < MAX_STABLE_SNAPSHOT_ATTEMPTS {
+                    tokio::task::yield_now().await;
+                }
+            }
+            let (messages, hydrated_bytes, snapshot_attempts) = messages.ok_or_else(|| {
+                format!(
+                    "session {session_id} changed during all {MAX_STABLE_SNAPSHOT_ATTEMPTS} runtime hydration snapshot attempts; retry activation after ingress stabilizes"
+                )
+            })?;
+            tracing::info!(
+                session_id,
+                hydration_messages = messages.len(),
+                hydration_bytes = hydrated_bytes,
+                hydration_duration_ms = hydration_started.elapsed().as_millis(),
+                hydration_snapshot_attempts = snapshot_attempts,
+                "hydrated persisted session into Runtime carrier"
+            );
+            crate::entry::session_store_entry::hydrated_runtime_session(record, messages)?
+        } else {
+            let mut session = runtime::Session::new();
+            session.session_id = session_id.to_string();
+            session
+        };
+        if session.closed {
+            return Err(format!(
+                "session {session_id} is closed and cannot activate a new Runtime carrier"
+            ));
+        }
+        let runtime =
+            self.build_session_runtime_entry(session, session_id, &model, system_prompt)?;
         self.register_runtime(session_id.to_string(), runtime)?;
         Ok(())
     }
@@ -1237,6 +1496,11 @@ impl RuntimeService {
         mut runtime: crate::runtime_entry::GatewayRuntimeEntry,
     ) -> Result<Option<Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>>, String>
     {
+        if self.sessions.get(&session_id).is_some() {
+            return Err(format!(
+                "session {session_id} already has an active Runtime carrier; refusing replacement"
+            ));
+        }
         if let Some(approval_gate) = &self.approval_gate {
             runtime.install_approval_gate(Arc::clone(approval_gate));
         }
@@ -1331,15 +1595,81 @@ impl RuntimeService {
         let runtime_services = Arc::clone(&self.runtime_services);
         let mut receiver = bus.subscribe();
         let handle = runtime.spawn(async move {
+            let mut tool_ordinals = HashMap::<(String, String, String), u64>::new();
+            let mut active_tool_instances = HashMap::<(String, String, String), String>::new();
+            let mut text_stream_offsets = HashMap::<(String, String, String), usize>::new();
             loop {
                 match receiver.recv().await {
-                    Ok(event) => {
+                    Ok(mut event) => {
+                        if let (Some(context), Some((provider_id, started, completed))) = (
+                            event.execution_context().cloned(),
+                            tool_event_identity(&event),
+                        ) {
+                            let provider_id = provider_id.to_string();
+                            let key = (context.execution_id, context.turn_id, provider_id.clone());
+                            let instance_id = if started {
+                                let ordinal = tool_ordinals.entry(key.clone()).or_default();
+                                let instance_id = format!("{provider_id}#cowd-{ordinal}");
+                                *ordinal = ordinal.saturating_add(1);
+                                active_tool_instances.insert(key.clone(), instance_id.clone());
+                                instance_id
+                            } else {
+                                active_tool_instances.get(&key).cloned().unwrap_or_else(|| {
+                                    let ordinal = tool_ordinals.entry(key.clone()).or_default();
+                                    let instance_id = format!("{provider_id}#cowd-{ordinal}");
+                                    *ordinal = ordinal.saturating_add(1);
+                                    instance_id
+                                })
+                            };
+                            rewrite_tool_event_identity(&mut event, &instance_id);
+                            if completed {
+                                active_tool_instances.remove(&key);
+                            }
+                        }
                         runtime_services.observe_live_execution_event(&relay_session_id, &event);
+                        let mut payload = runtime_event_stream_payload(event);
+                        if payload.get("type").and_then(serde_json::Value::as_str)
+                            == Some("TextDelta")
+                        {
+                            let execution_id = payload
+                                .get("execution_id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let turn_id = payload
+                                .get("turn_id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let part_id = payload
+                                .get("part_id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("assistant_text")
+                                .to_string();
+                            let text_bytes = payload
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .map_or(0, str::len);
+                            let stream_key = (execution_id, turn_id, part_id);
+                            let start_bytes =
+                                *text_stream_offsets.entry(stream_key.clone()).or_default();
+                            let end_bytes = start_bytes.saturating_add(text_bytes);
+                            if let serde_json::Value::Object(fields) = &mut payload {
+                                fields.insert(
+                                    "start_bytes".to_string(),
+                                    serde_json::json!(start_bytes),
+                                );
+                                fields
+                                    .insert("end_bytes".to_string(), serde_json::json!(end_bytes));
+                                fields.insert(
+                                    "stream_revision".to_string(),
+                                    serde_json::json!(end_bytes),
+                                );
+                            }
+                            text_stream_offsets.insert(stream_key, end_bytes);
+                        }
                         gateway_bus
-                            .broadcast(
-                                &relay_session_id,
-                                &runtime_event_stream_payload(event).to_string(),
-                            )
+                            .broadcast(&relay_session_id, &payload.to_string())
                             .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -1425,7 +1755,8 @@ impl RuntimeService {
                 .transpose()
                 .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?,
         };
-        self.session_input_router
+        let persisted = self
+            .session_input_router
             .persist_input(&session_id, &content, &request)
             .await
             .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
@@ -1450,6 +1781,23 @@ impl RuntimeService {
             execution_graph_id.clone(),
             request.turn_id.clone(),
         );
+        self.session_kernel
+            .event_bus()
+            .broadcast(
+                &session_id,
+                &serde_json::json!({
+                    "type": "UserMessageCommitted",
+                    "session_id": session_id,
+                    "message_id": &request.message_id,
+                    "sequence": persisted.sequence,
+                    "execution_id": &execution_graph_id,
+                    "turn_id": &request.turn_id,
+                    "content": &content,
+                    "created_at_ms": request.created_at_ms,
+                })
+                .to_string(),
+            )
+            .await;
         Ok(SessionInputAdmission {
             execution_graph_id,
             receipt,
@@ -1660,11 +2008,11 @@ impl RuntimeService {
 
     pub(crate) fn build_session_runtime_entry(
         &self,
+        session: runtime::Session,
         session_id: &str,
         model: &str,
         system_prompt: Vec<String>,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
-        let session = runtime::Session::new();
         if let Some(store) = self.session_kernel.unified_store() {
             crate::runtime_factory::create_runtime_entry_with_session_store(
                 store,
@@ -3101,6 +3449,7 @@ mod tests {
         service.complete_live_execution(
             "execution-finished",
             &report,
+            &[],
             "terminal-finished".to_string(),
         );
 
@@ -3189,6 +3538,39 @@ mod tests {
                 "request-pending",
                 "turn-pending"
             ))
+        );
+    }
+
+    #[test]
+    fn durable_materialization_cannot_reclassify_blocked_live_outcome_as_complete() {
+        let execution_id = "session-ingress-graph:blocked".to_string();
+        let volatile = SessionExecutionIndexProjection {
+            session_id: "session-blocked".to_string(),
+            active_execution_ids: Vec::new(),
+            latest_execution_id: Some(execution_id.clone()),
+            latest_status: Some(ExecutionLiveStatus::Error),
+            latest_live_revision: Some(7),
+            last_progress_at_ms: Some(100),
+            terminal_ref: Some("turn-terminal:blocked".to_string()),
+        };
+        let durable = SessionExecutionIndexProjection {
+            session_id: "session-blocked".to_string(),
+            active_execution_ids: Vec::new(),
+            latest_execution_id: Some(execution_id),
+            latest_status: Some(ExecutionLiveStatus::Complete),
+            latest_live_revision: None,
+            last_progress_at_ms: Some(110),
+            terminal_ref: Some("turn-terminal:blocked".to_string()),
+        };
+
+        let reconciled = reconcile_session_execution_indices(volatile, durable);
+
+        assert_eq!(reconciled.latest_status, Some(ExecutionLiveStatus::Error));
+        assert_eq!(reconciled.latest_live_revision, Some(7));
+        assert_eq!(reconciled.last_progress_at_ms, Some(110));
+        assert_eq!(
+            reconciled.terminal_ref.as_deref(),
+            Some("turn-terminal:blocked")
         );
     }
 }

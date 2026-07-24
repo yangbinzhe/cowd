@@ -444,6 +444,116 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "ALTER TABLE session_mission_outbox_history ADD COLUMN IF NOT EXISTS to_status TEXT",
         "ALTER TABLE session_mission_outbox_history ADD COLUMN IF NOT EXISTS attempts BIGINT",
     ],
+}, PostgresMigrationSpec {
+    id: "session.0003.reconcile-message-summaries",
+    domain: SESSION_DOMAIN,
+    version: 3,
+    description: "reconcile legacy session counters with durable messages",
+    statements: &[
+        "UPDATE session_records
+            SET message_count = (
+                    SELECT COUNT(*) FROM session_messages
+                     WHERE session_id=session_records.session_id
+                ),
+                input_tokens = COALESCE((
+                    SELECT SUM(COALESCE(
+                        (token_usage_json::jsonb->>'input_tokens')::bigint, 0
+                    ))
+                      FROM session_messages
+                     WHERE session_id=session_records.session_id
+                ), 0),
+                output_tokens = COALESCE((
+                    SELECT SUM(COALESCE(
+                        (token_usage_json::jsonb->>'output_tokens')::bigint, 0
+                    ))
+                      FROM session_messages
+                     WHERE session_id=session_records.session_id
+        ), 0)",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0004.safe-message-usage-reconciliation",
+    domain: SESSION_DOMAIN,
+    version: 4,
+    description: "make durable message usage reconciliation tolerant of malformed legacy payloads",
+    statements: &[
+        "CREATE OR REPLACE FUNCTION cowd_safe_session_usage_token(raw TEXT, token_key TEXT)
+         RETURNS BIGINT
+         LANGUAGE plpgsql
+         IMMUTABLE
+         STRICT
+         AS $$
+         DECLARE
+             parsed JSONB;
+             token_text TEXT;
+         BEGIN
+             parsed := raw::jsonb;
+             token_text := parsed ->> token_key;
+             IF token_text IS NULL THEN
+                 RETURN 0;
+             END IF;
+             IF jsonb_typeof(parsed -> token_key) = 'number'
+                AND token_text ~ '^[0-9]+$'
+                AND token_text::numeric <= 9223372036854775807::numeric THEN
+                 RETURN token_text::bigint;
+             END IF;
+             RETURN 0;
+         EXCEPTION WHEN OTHERS THEN
+             RETURN 0;
+         END
+         $$",
+        "UPDATE session_records
+            SET message_count = (
+                    SELECT COUNT(*) FROM session_messages
+                     WHERE session_id=session_records.session_id
+                ),
+                input_tokens = COALESCE((
+                    SELECT SUM(cowd_safe_session_usage_token(
+                        token_usage_json, 'input_tokens'
+                    ))
+                      FROM session_messages
+                     WHERE session_id=session_records.session_id
+                ), 0),
+                output_tokens = COALESCE((
+                    SELECT SUM(cowd_safe_session_usage_token(
+                        token_usage_json, 'output_tokens'
+                    ))
+                      FROM session_messages
+                     WHERE session_id=session_records.session_id
+        ), 0)",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0005.monotonic-session-activity-ms",
+    domain: SESSION_DOMAIN,
+    version: 5,
+    description: "align PostgreSQL session activity clocks with SQLite monotonic millisecond semantics",
+    statements: &[
+        "CREATE OR REPLACE FUNCTION cowd_safe_session_epoch_ms(raw TEXT)
+         RETURNS BIGINT
+         LANGUAGE plpgsql
+         IMMUTABLE
+         STRICT
+         AS $$
+         BEGIN
+             RETURN GREATEST(
+                 0,
+                 FLOOR(EXTRACT(EPOCH FROM raw::timestamptz) * 1000)::bigint
+             );
+         EXCEPTION WHEN OTHERS THEN
+             RETURN 0;
+         END
+         $$",
+        "ALTER TABLE session_records ADD COLUMN IF NOT EXISTS created_at_ms BIGINT NOT NULL DEFAULT 0",
+        "ALTER TABLE session_records ADD COLUMN IF NOT EXISTS updated_at_ms BIGINT NOT NULL DEFAULT 0",
+        "UPDATE session_records
+            SET created_at_ms = GREATEST(created_at_ms, cowd_safe_session_epoch_ms(created_at)),
+                updated_at_ms = GREATEST(
+                    updated_at_ms,
+                    cowd_safe_session_epoch_ms(last_activity),
+                    cowd_safe_session_epoch_ms(created_at)
+                )",
+        "CREATE INDEX IF NOT EXISTS idx_session_records_updated_ms
+            ON session_records(updated_at_ms DESC, session_id ASC)",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -453,6 +563,7 @@ pub struct PostgresSessionStore {
 
 impl PostgresSessionStore {
     pub fn new(executor: PostgresExecutor) -> memory::store::Result<Self> {
+        prepare_legacy_session_usage_for_migration(&executor)?;
         executor
             .apply_migrations(SESSION_DOMAIN, SESSION_MIGRATIONS)
             .map_err(storage_error)?;
@@ -480,8 +591,10 @@ impl PostgresSessionStore {
                 "INSERT INTO session_records(
                     session_id, platform, chat_id, user_id, model, created_at,
                     last_activity, message_count, reset_policy, metadata_json,
-                    input_tokens, output_tokens, estimated_cost_usd, status
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    input_tokens, output_tokens, estimated_cost_usd, status,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+                    cowd_safe_session_epoch_ms($6), cowd_safe_session_epoch_ms($7))
                  ON CONFLICT(session_id) DO NOTHING",
                 &session_params(session),
             )
@@ -505,7 +618,9 @@ impl PostgresSessionStore {
                 "UPDATE session_records SET
                     platform=$2, chat_id=$3, user_id=$4, model=$5, created_at=$6,
                     last_activity=$7, message_count=$8, reset_policy=$9, metadata_json=$10,
-                    input_tokens=$11, output_tokens=$12, estimated_cost_usd=$13, status=$14
+                    input_tokens=$11, output_tokens=$12, estimated_cost_usd=$13, status=$14,
+                    created_at_ms=cowd_safe_session_epoch_ms($6),
+                    updated_at_ms=cowd_safe_session_epoch_ms($7)
                  WHERE session_id=$1",
                 &session_params(session),
             )
@@ -520,8 +635,10 @@ impl PostgresSessionStore {
                 "INSERT INTO session_records(
                     session_id, platform, chat_id, user_id, model, created_at,
                     last_activity, message_count, reset_policy, metadata_json,
-                    input_tokens, output_tokens, estimated_cost_usd, status
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    input_tokens, output_tokens, estimated_cost_usd, status,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+                    cowd_safe_session_epoch_ms($6), cowd_safe_session_epoch_ms($7))
                  ON CONFLICT(session_id) DO UPDATE SET
                     platform=EXCLUDED.platform, chat_id=EXCLUDED.chat_id,
                     user_id=EXCLUDED.user_id, model=EXCLUDED.model,
@@ -529,7 +646,9 @@ impl PostgresSessionStore {
                     message_count=EXCLUDED.message_count, reset_policy=EXCLUDED.reset_policy,
                     metadata_json=EXCLUDED.metadata_json, input_tokens=EXCLUDED.input_tokens,
                     output_tokens=EXCLUDED.output_tokens,
-                    estimated_cost_usd=EXCLUDED.estimated_cost_usd, status=EXCLUDED.status",
+                    estimated_cost_usd=EXCLUDED.estimated_cost_usd, status=EXCLUDED.status,
+                    created_at_ms=EXCLUDED.created_at_ms,
+                    updated_at_ms=EXCLUDED.updated_at_ms",
                 &session_params(session),
             )
             .map_err(postgres_error)?;
@@ -548,12 +667,17 @@ impl PostgresSessionStore {
     }
 
     pub fn mark_session_closed(&self, session_id: &str) -> memory::store::Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now_at = chrono::Utc::now();
+        let now = now_at.to_rfc3339();
+        let now_ms = now_at.timestamp_millis().max(0);
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .execute(
-                "UPDATE session_records SET status='closed', last_activity=$1 WHERE session_id=$2",
-                &[&now, &session_id],
+                "UPDATE session_records
+                    SET status='closed', last_activity=$1,
+                        updated_at_ms=GREATEST(updated_at_ms, $2)
+                  WHERE session_id=$3",
+                &[&now, &now_ms, &session_id],
             )
             .map_err(postgres_error)?;
         Ok(())
@@ -858,6 +982,7 @@ impl PostgresSessionStore {
         message_id: &str,
         session_id: &str,
         content_json: &str,
+        token_usage_json: Option<&str>,
         created_at_ms: u64,
     ) -> memory::store::Result<(SessionMessage, bool)> {
         if message_id.trim().is_empty() || session_id.trim().is_empty() {
@@ -882,14 +1007,29 @@ impl PostgresSessionStore {
             )
             .map_err(postgres_error)?
         {
-            let existing = row_to_message(&row)?;
+            let mut existing = row_to_message(&row)?;
             if existing.session_id != session_id
                 || existing.role != "assistant"
                 || existing.content_json != content_json
+                || matches!(
+                    (existing.token_usage_json.as_deref(), token_usage_json),
+                    (Some(existing), Some(requested)) if existing != requested
+                )
             {
                 return Err(memory::MemoryError::Store(format!(
                     "terminal message_id `{message_id}` conflicts with committed content"
                 )));
+            }
+            if existing.token_usage_json.is_none() && token_usage_json.is_some() {
+                transaction
+                    .execute(
+                        "UPDATE session_messages SET token_usage_json=$2
+                          WHERE stable_message_id=$1",
+                        &[&message_id, &token_usage_json],
+                    )
+                    .map_err(postgres_error)?;
+                existing.token_usage_json = token_usage_json.map(ToOwned::to_owned);
+                refresh_session_usage_summary_tx(&mut transaction, session_id)?;
             }
             transaction.commit().map_err(postgres_error)?;
             return Ok((existing, false));
@@ -911,12 +1051,157 @@ impl PostgresSessionStore {
             blocks_count: 1,
             tool_use_id: None,
             tool_name: None,
-            token_usage_json: None,
+            token_usage_json: token_usage_json.map(ToOwned::to_owned),
             created_at_ms,
         };
         insert_message_tx(&mut transaction, &message)?;
+        refresh_session_message_summary_tx(&mut transaction, session_id, created_at_ms)?;
+        refresh_session_usage_summary_tx(&mut transaction, session_id)?;
         transaction.commit().map_err(postgres_error)?;
         Ok((message, true))
+    }
+
+    pub fn append_terminal_transcript_idempotent(
+        &self,
+        terminal_message_id: &str,
+        ingress_message_id: &str,
+        session_id: &str,
+        messages: &[SessionMessage],
+        created_at_ms: u64,
+    ) -> memory::store::Result<(Vec<SessionMessage>, bool)> {
+        if terminal_message_id.trim().is_empty()
+            || ingress_message_id.trim().is_empty()
+            || session_id.trim().is_empty()
+            || messages.is_empty()
+            || messages
+                .last()
+                .is_none_or(|message| message.stable_message_id != terminal_message_id)
+        {
+            return Err(memory::MemoryError::Store(
+                "terminal transcript requires a non-empty session, terminal ID, and terminal final row"
+                    .to_string(),
+            ));
+        }
+        if messages.iter().any(|message| {
+            message.stable_message_id.trim().is_empty()
+                || message.session_id != session_id
+                || message.role.trim().is_empty()
+                || serde_json::from_str::<serde_json::Value>(&message.content_json)
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .is_none()
+        }) {
+            return Err(memory::MemoryError::Store(
+                "terminal transcript contains an invalid message row".to_string(),
+            ));
+        }
+        let unique_ids = messages
+            .iter()
+            .map(|message| message.stable_message_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_ids.len() != messages.len() {
+            return Err(memory::MemoryError::Store(
+                "terminal transcript contains duplicate stable message IDs".to_string(),
+            ));
+        }
+
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        transaction
+            .query_one(
+                "SELECT session_id FROM session_records WHERE session_id=$1 FOR UPDATE",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?;
+        let mut loaded = Vec::with_capacity(messages.len());
+        for requested in messages {
+            let existing = transaction
+                .query_opt(
+                    "SELECT stable_message_id, session_id, sequence, role, content_json,
+                            blocks_count, tool_use_id, tool_name, token_usage_json, created_at_ms
+                       FROM session_messages WHERE stable_message_id=$1",
+                    &[&requested.stable_message_id],
+                )
+                .map_err(postgres_error)?
+                .map(|row| row_to_message(&row))
+                .transpose()?;
+            loaded.push(existing);
+        }
+        let terminal_exists = loaded.last().is_some_and(Option::is_some);
+        if terminal_exists {
+            let mut committed = Vec::with_capacity(messages.len());
+            for (requested, existing) in messages.iter().zip(loaded.into_iter()) {
+                let existing = existing.ok_or_else(|| {
+                    memory::MemoryError::Store(format!(
+                        "terminal transcript `{terminal_message_id}` is partially committed"
+                    ))
+                })?;
+                if existing.session_id != requested.session_id
+                    || existing.role != requested.role
+                    || existing.content_json != requested.content_json
+                    || existing.blocks_count != requested.blocks_count
+                    || existing.tool_use_id != requested.tool_use_id
+                    || existing.tool_name != requested.tool_name
+                    || existing.token_usage_json != requested.token_usage_json
+                {
+                    return Err(memory::MemoryError::Store(format!(
+                        "terminal transcript message_id `{}` conflicts with committed content",
+                        requested.stable_message_id
+                    )));
+                }
+                committed.push(existing);
+            }
+            committed.sort_by_key(|message| message.sequence);
+            transaction.commit().map_err(postgres_error)?;
+            return Ok((committed, false));
+        }
+        if loaded.iter().any(Option::is_some) {
+            return Err(memory::MemoryError::Store(format!(
+                "terminal transcript `{terminal_message_id}` collides with existing intermediate rows"
+            )));
+        }
+
+        let _ingress_sequence: i64 = transaction
+            .query_opt(
+                "SELECT sequence FROM session_messages
+                  WHERE stable_message_id=$1 AND session_id=$2 AND role='user'",
+                &[&ingress_message_id, &session_id],
+            )
+            .map_err(postgres_error)?
+            .ok_or_else(|| {
+                memory::MemoryError::Store(format!(
+                    "terminal transcript ingress `{ingress_message_id}` is not committed"
+                ))
+            })?
+            .try_get(0)
+            .map_err(postgres_error)?;
+        // Published sequence values are immutable Surface cursors. Append the
+        // transcript physically and reconstruct turn causality from metadata.
+        let first_sequence = transaction
+            .query_one(
+                "SELECT COALESCE(MAX(sequence), -1) + 1
+                   FROM session_messages WHERE session_id=$1",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?
+            .try_get::<_, i64>(0)
+            .map_err(postgres_error)
+            .and_then(|sequence| from_i64(sequence, "message sequence"))?;
+        let mut committed = Vec::with_capacity(messages.len());
+        for (index, requested) in messages.iter().enumerate() {
+            let mut message = requested.clone();
+            message.sequence = first_sequence.saturating_add(index);
+            message.created_at_ms = created_at_ms.saturating_add(index as u64);
+            insert_message_tx(&mut transaction, &message)?;
+            committed.push(message);
+        }
+        let last_created_at = committed
+            .last()
+            .map_or(created_at_ms, |message| message.created_at_ms);
+        refresh_session_message_summary_tx(&mut transaction, session_id, last_created_at)?;
+        refresh_session_usage_summary_tx(&mut transaction, session_id)?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok((committed, true))
     }
 
     pub fn search_messages(
@@ -1642,6 +1927,11 @@ impl PostgresSessionStore {
             ));
         }
         insert_message_tx(&mut transaction, message)?;
+        refresh_session_message_summary_tx(
+            &mut transaction,
+            &message.session_id,
+            message.created_at_ms,
+        )?;
         let record = insert_runtime_outbox_tx(&mut transaction, message, request)?;
         transaction.commit().map_err(postgres_error)?;
         Ok(record)
@@ -1711,6 +2001,7 @@ impl PostgresSessionStore {
             created_at_ms,
         };
         insert_message_tx(&mut transaction, &message)?;
+        refresh_session_message_summary_tx(&mut transaction, session_id, created_at_ms)?;
         let record = insert_runtime_outbox_tx(&mut transaction, &message, request)?;
         transaction.commit().map_err(postgres_error)?;
         Ok(record)
@@ -2250,6 +2541,120 @@ impl PostgresSessionStore {
     }
 }
 
+/// Migration 0003 predates tolerant usage parsing and its checksum is already
+/// part of the production migration ledger, so it cannot be rewritten.
+/// Quarantine only unusable legacy usage payloads before that migration runs.
+/// Valid JSON with bounded numeric token fields is preserved byte-for-byte.
+fn prepare_legacy_session_usage_for_migration(
+    executor: &PostgresExecutor,
+) -> memory::store::Result<()> {
+    let mut connection = executor.checkout_runtime().map_err(storage_error)?;
+    let mut transaction = connection.transaction().map_err(postgres_error)?;
+    // This compatibility preflight creates helper functions before the
+    // immutable migration ledger can run migration 0003. It must share the
+    // exact domain lock used by `PostgresExecutor::apply_migrations`;
+    // otherwise concurrent Gateway processes can both enter PostgreSQL's
+    // `CREATE OR REPLACE FUNCTION` catalogue path and one fails on
+    // `pg_proc_proname_args_nsp_index`.
+    transaction
+        .query_one(
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            &[&format!("cowd-storage:{SESSION_DOMAIN}")],
+        )
+        .map_err(postgres_error)?;
+    transaction
+        .batch_execute(
+            "CREATE OR REPLACE FUNCTION cowd_session_usage_json_is_reconcilable(raw TEXT)
+             RETURNS BOOLEAN
+             LANGUAGE plpgsql
+             IMMUTABLE
+             STRICT
+             AS $$
+             DECLARE
+                 parsed JSONB;
+                 token_text TEXT;
+                 token_key TEXT;
+             BEGIN
+                 parsed := raw::jsonb;
+                 FOREACH token_key IN ARRAY ARRAY['input_tokens', 'output_tokens'] LOOP
+                     token_text := parsed ->> token_key;
+                     IF token_text IS NOT NULL
+                        AND (jsonb_typeof(parsed -> token_key) <> 'number'
+                             OR token_text !~ '^[0-9]+$'
+                             OR token_text::numeric > 9223372036854775807::numeric) THEN
+                         RETURN FALSE;
+                     END IF;
+                 END LOOP;
+                 RETURN TRUE;
+             EXCEPTION WHEN OTHERS THEN
+                 RETURN FALSE;
+             END
+             $$;
+             CREATE OR REPLACE FUNCTION cowd_session_usage_json_for_legacy_cast(raw TEXT)
+             RETURNS TEXT
+             LANGUAGE plpgsql
+             IMMUTABLE
+             STRICT
+             AS $$
+             DECLARE
+                 parsed JSONB;
+                 token_text TEXT;
+                 token_key TEXT;
+                 token_value BIGINT;
+             BEGIN
+                 BEGIN
+                     parsed := raw::jsonb;
+                 EXCEPTION WHEN OTHERS THEN
+                     parsed := '{}'::jsonb;
+                 END;
+                 FOREACH token_key IN ARRAY ARRAY['input_tokens', 'output_tokens'] LOOP
+                     token_text := parsed ->> token_key;
+                     token_value := 0;
+                     IF jsonb_typeof(parsed -> token_key) = 'number'
+                        AND token_text ~ '^[0-9]+$'
+                        AND token_text::numeric <= 9223372036854775807::numeric THEN
+                         token_value := token_text::bigint;
+                     END IF;
+                     parsed := jsonb_set(
+                         parsed,
+                         ARRAY[token_key],
+                         to_jsonb(token_value),
+                         TRUE
+                     );
+                 END LOOP;
+                 RETURN parsed::text;
+             END
+             $$;
+             DO $$
+             DECLARE
+                 migration_applied BOOLEAN := FALSE;
+             BEGIN
+                 IF to_regclass('cowd_schema_migrations') IS NOT NULL THEN
+                     EXECUTE
+                         'SELECT EXISTS(
+                              SELECT 1
+                                FROM cowd_schema_migrations
+                               WHERE id = $1
+                          )'
+                        INTO migration_applied
+                       USING 'session.0003.reconcile-message-summaries';
+                 END IF;
+                 IF to_regclass('session_messages') IS NOT NULL
+                    AND NOT migration_applied THEN
+                     UPDATE session_messages
+                        SET token_usage_json =
+                            cowd_session_usage_json_for_legacy_cast(token_usage_json)
+                      WHERE token_usage_json IS NOT NULL
+                        AND NOT cowd_session_usage_json_is_reconcilable(token_usage_json);
+                 END IF;
+             END
+             $$;",
+        )
+        .map_err(postgres_error)?;
+    transaction.commit().map_err(postgres_error)?;
+    Ok(())
+}
+
 const SESSION_SELECT_BY_ID: &str =
     "SELECT session_id, platform, chat_id, user_id, model, created_at,
     last_activity, message_count, reset_policy, metadata_json, input_tokens, output_tokens,
@@ -2292,15 +2697,18 @@ fn upsert_session_tx(
     transaction.execute(
         "INSERT INTO session_records(
             session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,
-            reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status,
+            created_at_ms,updated_at_ms
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+            cowd_safe_session_epoch_ms($6),cowd_safe_session_epoch_ms($7))
          ON CONFLICT(session_id) DO UPDATE SET
             platform=EXCLUDED.platform,chat_id=EXCLUDED.chat_id,user_id=EXCLUDED.user_id,
             model=EXCLUDED.model,created_at=EXCLUDED.created_at,last_activity=EXCLUDED.last_activity,
             message_count=EXCLUDED.message_count,reset_policy=EXCLUDED.reset_policy,
             metadata_json=EXCLUDED.metadata_json,input_tokens=EXCLUDED.input_tokens,
             output_tokens=EXCLUDED.output_tokens,estimated_cost_usd=EXCLUDED.estimated_cost_usd,
-            status=EXCLUDED.status",
+            status=EXCLUDED.status,created_at_ms=EXCLUDED.created_at_ms,
+            updated_at_ms=EXCLUDED.updated_at_ms",
         &session_params(session),
     ).map_err(postgres_error)?;
     Ok(())
@@ -2795,6 +3203,62 @@ fn row_to_session(row: &Row) -> memory::store::Result<SessionRecord> {
     })
 }
 
+fn refresh_session_message_summary_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+    activity_ms: u64,
+) -> memory::store::Result<()> {
+    let activity = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(to_u64_i64(
+        activity_ms,
+        "session activity time",
+    )?)
+    .unwrap_or_else(chrono::Utc::now)
+    .to_rfc3339();
+    let activity_ms = to_u64_i64(activity_ms, "session activity time")?;
+    transaction
+        .execute(
+            "UPDATE session_records
+                SET message_count = (
+                        SELECT COUNT(*) FROM session_messages WHERE session_id=$1
+                    ),
+                    last_activity = CASE
+                        WHEN updated_at_ms <= $3 THEN $2
+                        ELSE last_activity
+                    END,
+                    updated_at_ms = GREATEST(updated_at_ms, $3)
+              WHERE session_id=$1",
+            &[&session_id, &activity, &activity_ms],
+        )
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
+fn refresh_session_usage_summary_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+) -> memory::store::Result<()> {
+    transaction
+        .execute(
+            "UPDATE session_records
+                SET input_tokens = COALESCE((
+                        SELECT SUM(cowd_safe_session_usage_token(
+                            token_usage_json, 'input_tokens'
+                        ))
+                          FROM session_messages WHERE session_id=$1
+                    ), 0),
+                    output_tokens = COALESCE((
+                        SELECT SUM(cowd_safe_session_usage_token(
+                            token_usage_json, 'output_tokens'
+                        ))
+                          FROM session_messages WHERE session_id=$1
+                    ), 0)
+              WHERE session_id=$1",
+            &[&session_id],
+        )
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
 fn insert_message_tx(
     transaction: &mut PostgresTransaction<'_>,
     message: &SessionMessage,
@@ -2928,11 +3392,24 @@ fn checkpoint_from_event(event: &SessionEvent) -> Option<String> {
 }
 
 fn storage_error(error: storage::StorageError) -> memory::MemoryError {
-    memory::MemoryError::Store(error.to_string())
+    match error {
+        storage::StorageError::Postgres(error) => postgres_error(error),
+        other => memory::MemoryError::Store(other.to_string()),
+    }
 }
 
 fn postgres_error(error: postgres::Error) -> memory::MemoryError {
-    memory::MemoryError::Store(error.to_string())
+    let detail = error.as_db_error().map_or_else(
+        || error.to_string(),
+        |database_error| {
+            format!(
+                "{} (SQLSTATE {})",
+                database_error.message(),
+                database_error.code().code()
+            )
+        },
+    );
+    memory::MemoryError::Store(detail)
 }
 
 fn to_i64(value: usize, label: &str) -> memory::store::Result<i64> {
@@ -3149,9 +3626,20 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: &str,
         c: &str,
-        d: u64,
+        d: Option<&str>,
+        e: u64,
     ) -> memory::store::Result<(SessionMessage, bool)> {
-        self.append_terminal_message_idempotent(a, b, c, d)
+        self.append_terminal_message_idempotent(a, b, c, d, e)
+    }
+    fn append_terminal_transcript_idempotent(
+        &self,
+        a: &str,
+        b: &str,
+        c: &str,
+        d: &[SessionMessage],
+        e: u64,
+    ) -> memory::store::Result<(Vec<SessionMessage>, bool)> {
+        self.append_terminal_transcript_idempotent(a, b, c, d, e)
     }
     fn insert_messages_batch(&self, a: &[SessionMessage]) -> memory::store::Result<()> {
         self.insert_messages_batch(a)
@@ -3503,5 +3991,152 @@ mod tests {
             .collect::<Vec<_>>();
         sequences.sort_unstable();
         assert_eq!(sequences, vec![0, 1]);
+    }
+
+    #[test]
+    fn postgres_terminal_transcript_preserves_published_cursor_and_is_idempotent() {
+        let Some(store) = real_store() else {
+            eprintln!("skipping real PostgreSQL session test: COWD_TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let session_id = format!(
+            "causal-terminal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_millis()
+        );
+        store
+            .create_session(&session(&session_id))
+            .expect("create isolated session");
+        for (sequence, id, text, turn_id) in [
+            (0, "user-1", "first", "turn-1"),
+            (1, "user-2", "second", "turn-2"),
+        ] {
+            store
+                .insert_message(&SessionMessage {
+                    stable_message_id: format!("{session_id}:{id}"),
+                    session_id: session_id.clone(),
+                    sequence,
+                    role: "user".to_string(),
+                    content_json: serde_json::json!([{
+                        "type": "text",
+                        "text": text,
+                        "cowd_turn_id": turn_id,
+                        "cowd_turn_ingress_message_id": format!("{session_id}:{id}"),
+                    }])
+                    .to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: sequence as u64 + 1,
+                })
+                .expect("insert ingress");
+        }
+        let terminal_id = format!("{session_id}:assistant-1");
+        let ingress_id = format!("{session_id}:user-1");
+        let transcript = vec![SessionMessage {
+            stable_message_id: terminal_id.clone(),
+            session_id: session_id.clone(),
+            sequence: usize::MAX,
+            role: "assistant".to_string(),
+            content_json: serde_json::json!([{
+                "type": "text",
+                "text": "first answer",
+                "cowd_turn_id": "turn-1",
+                "cowd_turn_ingress_message_id": ingress_id,
+            }])
+            .to_string(),
+            blocks_count: 1,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: Some(
+                serde_json::json!({"input_tokens": 3, "output_tokens": 2}).to_string(),
+            ),
+            created_at_ms: 3,
+        }];
+
+        let (committed, inserted) = store
+            .append_terminal_transcript_idempotent(
+                &terminal_id,
+                &ingress_id,
+                &session_id,
+                &transcript,
+                3,
+            )
+            .expect("commit terminal transcript");
+        assert!(inserted);
+        assert_eq!(committed[0].sequence, 2);
+        let physical = store
+            .get_all_messages(&session_id)
+            .expect("load physical order");
+        assert_eq!(
+            physical
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "published ingress cursors must stay immutable in PostgreSQL"
+        );
+
+        let (replayed, inserted) = store
+            .append_terminal_transcript_idempotent(
+                &terminal_id,
+                &ingress_id,
+                &session_id,
+                &transcript,
+                99,
+            )
+            .expect("replay terminal transcript");
+        assert!(!inserted);
+        assert_eq!(replayed, committed);
+        assert_eq!(
+            store
+                .get_all_messages(&session_id)
+                .expect("reload physical order"),
+            physical
+        );
+        store
+            .delete_session(&session_id)
+            .expect("delete isolated session");
+    }
+
+    #[test]
+    fn postgres_concurrent_store_startup_serializes_preflight_and_migrations() {
+        let Some(url) = std::env::var("COWD_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            eprintln!(
+                "skipping real PostgreSQL concurrency test: COWD_TEST_POSTGRES_URL is not set"
+            );
+            return;
+        };
+        let worker_count = 8;
+        let gate = Arc::new(Barrier::new(worker_count));
+        let workers = (0..worker_count)
+            .map(|worker| {
+                let gate = Arc::clone(&gate);
+                let url = url.clone();
+                std::thread::spawn(move || {
+                    let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url)]);
+                    gate.wait();
+                    PostgresSessionStore::connect(
+                        PostgresConnectionConfig::new(
+                            format!("session-postgres-concurrent-{worker}"),
+                            "test.pg",
+                            "cowd-v584-concurrent-test",
+                        ),
+                        &resolver,
+                    )
+                    .expect("concurrent PostgreSQL session store opens")
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("startup worker does not panic");
+        }
     }
 }

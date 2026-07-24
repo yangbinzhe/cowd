@@ -23,6 +23,7 @@ sha2 = "0.10"
 syntect = { version = "5", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 toml = "0.8"
+tracing.workspace = true
 tui-textarea = "0.7"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"

@@ -27,7 +27,11 @@ pub struct SystemStatusBar {
     memory: String,
     mode: String,
     evidence: String,
+    model: String,
+    transport: String,
     issue: Option<String>,
+    activity_timeline_len: usize,
+    activity_full_sync_revision: u64,
 }
 
 impl SystemStatusBar {
@@ -37,66 +41,58 @@ impl SystemStatusBar {
 
     pub fn sync_from_app(&mut self, app: &App) {
         self.runtime = runtime_health(app).to_string();
-        self.turn = if app.turn_is_active() {
-            if app.timeline_iter().any(|(_, entry)| {
-                matches!(
-                    entry,
-                    TimelineEntry::Thinking {
-                        complete: false,
-                        ..
-                    }
-                )
-            }) {
-                "thinking".to_string()
-            } else if app
-                .timeline_iter()
-                .any(|(_, entry)| matches!(entry, TimelineEntry::ToolCall { done: false, .. }))
-            {
-                "tool".to_string()
-            } else {
-                "running".to_string()
+        self.turn = if let Some(status) = app.current_execution_status {
+            execution_status_label(status).to_string()
+        } else if app.turn_is_active() {
+            match app.timeline_last() {
+                Some(TimelineEntry::Thinking {
+                    complete: false, ..
+                }) => "thinking".to_string(),
+                Some(TimelineEntry::ToolCall { done: false, .. }) => "tool".to_string(),
+                _ => "running".to_string(),
             }
         } else {
             "idle".to_string()
         };
         self.session_id = app.session_id.clone();
-        let stats = app.session_activity_stats();
-        self.thinking_count = stats.thinking_count as u32;
-        self.tool_count = stats.tool_count as u32;
-        self.reply_count = stats.message_count as u32;
-        self.event_count = stats.event_count as u32;
+        if self.activity_timeline_len != app.timeline_len()
+            || self.activity_full_sync_revision != app.timeline_full_sync_revision
+        {
+            let stats = app.session_activity_stats();
+            self.thinking_count = stats.thinking_count as u32;
+            self.tool_count = stats.tool_count as u32;
+            self.reply_count = stats.message_count as u32;
+            self.event_count = stats.event_count as u32;
+            self.activity_timeline_len = app.timeline_len();
+            self.activity_full_sync_revision = app.timeline_full_sync_revision;
+        }
         self.approval_count = app
             .gateway_pending_approvals
             .unwrap_or_default()
             .max(app.permission_count as u64)
             + u64::from(app.approval.is_some());
         self.permission_count = app.permission_count;
-        self.last_phase = "idle".to_string();
-        for (_, entry) in app.timeline_iter() {
-            match entry {
-                TimelineEntry::Thinking { complete, .. } => {
-                    self.last_phase = if *complete {
-                        "thought saved"
-                    } else {
-                        "thinking"
-                    }
-                    .into();
+        self.last_phase = app
+            .current_execution_status_detail
+            .clone()
+            .unwrap_or_else(|| match app.timeline_last() {
+                Some(TimelineEntry::Thinking { complete, .. }) => if *complete {
+                    "thought saved"
+                } else {
+                    "thinking"
                 }
-                TimelineEntry::ToolCall { name, done, .. } => {
-                    self.last_phase = if *done {
+                .to_string(),
+                Some(TimelineEntry::ToolCall { name, done, .. }) => {
+                    if *done {
                         format!("tool {name} done")
                     } else {
                         format!("tool {name} running")
-                    };
+                    }
                 }
-                TimelineEntry::Message { role, .. } => {
-                    self.last_phase = format!("{role} message");
-                }
-                TimelineEntry::SlashOutput { command, .. } => {
-                    self.last_phase = format!("/{command} output");
-                }
-            }
-        }
+                Some(TimelineEntry::Message { role, .. }) => format!("{role} message"),
+                Some(TimelineEntry::SlashOutput { command, .. }) => format!("/{command} output"),
+                None => "idle".to_string(),
+            });
         self.daemon = app
             .gateway_runtime_readiness
             .clone()
@@ -122,6 +118,53 @@ impl SystemStatusBar {
             "panorama".to_string()
         };
         self.evidence = evidence_health(app);
+        self.model = match (
+            app.requested_model.as_deref(),
+            app.effective_model.as_deref(),
+        ) {
+            (Some(requested), Some(effective)) if requested != effective => {
+                format!("{}→{}", preview(requested, 12), preview(effective, 12))
+            }
+            (_, Some(effective)) => preview(effective, 26),
+            (Some(requested), None) => format!("{}…", preview(requested, 24)),
+            (None, None) => "unresolved".to_string(),
+        };
+        self.transport = match &app.stream_connection_state {
+            crate::protocol::SessionStreamConnectionState::Connecting => "connecting".to_string(),
+            crate::protocol::SessionStreamConnectionState::Connected if app.history_hydrated => {
+                "live".to_string()
+            }
+            crate::protocol::SessionStreamConnectionState::Connected => "syncing".to_string(),
+            crate::protocol::SessionStreamConnectionState::Reconnecting {
+                attempt,
+                after_cursor,
+            } => after_cursor.map_or_else(
+                || format!("reconnect:{attempt}"),
+                |cursor| format!("reconnect:{attempt}@{cursor}"),
+            ),
+        };
+        if matches!(
+            app.stream_connection_state,
+            crate::protocol::SessionStreamConnectionState::Connected
+        ) {
+            if let Some(projection_state) = app.projection_connection_state.as_ref() {
+                self.transport = match projection_state {
+                    crate::protocol::SessionStreamConnectionState::Connecting => {
+                        "projection:connecting".to_string()
+                    }
+                    crate::protocol::SessionStreamConnectionState::Connected => {
+                        self.transport.clone()
+                    }
+                    crate::protocol::SessionStreamConnectionState::Reconnecting {
+                        attempt,
+                        after_cursor,
+                    } => after_cursor.map_or_else(
+                        || format!("projection:reconnect:{attempt}"),
+                        |cursor| format!("projection:reconnect:{attempt}@{cursor}"),
+                    ),
+                };
+            }
+        }
         self.issue = app
             .gateway_degraded_reasons
             .first()
@@ -146,9 +189,28 @@ impl Component for SystemStatusBar {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("session ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                short_session(&self.session_id),
+                self.transport.clone(),
+                Style::default().fg(if self.transport == "live" {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
+            sep(),
+            Span::styled(self.turn.clone(), Style::default().fg(turn_color)),
+            sep(),
+            Span::styled(
+                format!("model {}", self.model),
+                Style::default().fg(if self.model.contains('→') {
+                    Color::Yellow
+                } else {
+                    Color::White
+                }),
+            ),
+            sep(),
+            Span::styled(
+                format!("session {}", short_session(&self.session_id)),
                 Style::default().fg(Color::White),
             ),
             sep(),
@@ -167,8 +229,6 @@ impl Component for SystemStatusBar {
                 ),
                 Style::default().fg(Color::DarkGray),
             ),
-            sep(),
-            Span::styled(self.turn.clone(), Style::default().fg(turn_color)),
             Span::styled(
                 format!("  {}", preview(&self.last_phase, 28)),
                 Style::default().fg(turn_color),
@@ -205,6 +265,23 @@ impl Component for SystemStatusBar {
 
     fn id(&self) -> &str {
         "system_status_bar"
+    }
+}
+
+fn execution_status_label(
+    status: harness_contract::projection::ExecutionLiveStatus,
+) -> &'static str {
+    use harness_contract::projection::ExecutionLiveStatus;
+    match status {
+        ExecutionLiveStatus::Queued => "queued",
+        ExecutionLiveStatus::PreparingContext => "context",
+        ExecutionLiveStatus::CallingModel | ExecutionLiveStatus::Thinking => "thinking",
+        ExecutionLiveStatus::CallingTool => "tool",
+        ExecutionLiveStatus::WaitingApproval => "approval",
+        ExecutionLiveStatus::Finalizing => "finalizing",
+        ExecutionLiveStatus::Complete => "complete",
+        ExecutionLiveStatus::Cancelled => "cancelled",
+        ExecutionLiveStatus::Error => "error",
     }
 }
 
@@ -291,7 +368,7 @@ fn fit_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> 
     let mut used = 0usize;
     let mut fitted = Vec::new();
     for span in spans {
-        let width = span.content.chars().count();
+        let width = unicode_width::UnicodeWidthStr::width(span.content.as_ref());
         if used + width > max_width {
             break;
         }
@@ -307,6 +384,16 @@ mod tests {
     use crate::components::RenderContext;
     use crate::skin::SkinConfig;
     use crate::test_utils::MockTerminal;
+
+    #[test]
+    fn fit_spans_counts_terminal_cells_for_wide_glyphs() {
+        let spans = vec![Span::raw("A"), Span::raw("🧠"), Span::raw("B")];
+
+        let fitted = fit_spans(spans, 2);
+
+        assert_eq!(fitted.len(), 1);
+        assert_eq!(fitted[0].content.as_ref(), "A");
+    }
 
     #[test]
     fn runtime_health_blocks_on_pending_approvals() {
@@ -377,7 +464,10 @@ mod tests {
 
     #[test]
     fn render_system_status_bar_keeps_top_line_calm() {
-        let app = App::new("deepseek-v4-pro", "s");
+        let mut app = App::new("deepseek-v4-pro", "s");
+        app.effective_model = Some("deepseek-v4-flash".into());
+        app.history_hydrated = true;
+        app.stream_connection_state = crate::protocol::SessionStreamConnectionState::Connected;
         let mut bar = SystemStatusBar::new();
         bar.sync_from_app(&app);
 
@@ -390,11 +480,12 @@ mod tests {
 
         let joined = terminal.buffer_lines().join("\n");
         assert!(joined.contains("session"));
+        assert!(joined.contains("model"));
+        assert!(joined.contains("deepseek"));
+        assert!(joined.contains("live"));
         assert!(!joined.contains("state"));
         assert!(!joined.contains("provider"));
         assert!(!joined.contains("gateway"));
         assert!(!joined.contains("connectors"));
-        assert!(joined.contains("mode"));
-        assert!(joined.contains("panorama"));
     }
 }

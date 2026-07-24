@@ -159,7 +159,7 @@ fn simple_question_stays_direct_and_clean() {
 fn complex_task_builds_execution_execution_graph() {
     let spec = ScenarioSpec::new(
         "complex_execution_graph",
-        "全面规划 runtime gateway service crate 的复杂架构演进",
+        "使用多 Agent 分别规划 runtime、gateway service crate 的复杂架构演进并综合审查",
     )
     .expect_mode(ExecutionPattern::Collaborate)
     .require(ScenarioCheck::bool(
@@ -185,7 +185,7 @@ fn complex_task_builds_execution_execution_graph() {
     ));
     let kernel = RuntimeAiKernel::begin_turn(
         "harness-complex",
-        "全面规划 runtime gateway service crate 的复杂架构演进",
+        "使用多 Agent 分别规划 runtime、gateway service crate 的复杂架构演进并综合审查",
         runtime::context_runtime::ContextProfile::MainTurn,
         &[],
     );

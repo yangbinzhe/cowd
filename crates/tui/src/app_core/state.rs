@@ -17,7 +17,9 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -104,7 +106,60 @@ pub(crate) const TAB_GATEWAY: usize = 10;
 pub(crate) struct PendingAppTransportEffect {
     pub app_id: String,
     pub panel_id: String,
+    pub session_id: String,
+    pub authority_generation: u64,
     pub effect: TuiAppEffect,
+}
+
+pub(crate) type CoreGatewayFuture = Pin<
+    Box<
+        dyn Future<Output = Result<serde_json::Value, crate::gateway_client::GatewayApiError>>
+            + Send,
+    >,
+>;
+pub(crate) type CoreGatewayOperation =
+    Box<dyn FnOnce(crate::gateway_client::GatewayApiClient) -> CoreGatewayFuture + Send>;
+pub(crate) type CoreGatewayCompletion =
+    Box<dyn FnOnce(&mut TuiState, Result<serde_json::Value, String>) + Send>;
+
+/// One core-panel request that the runner must execute away from the terminal
+/// input/render task. Its completion reducer is returned to the main task, so
+/// only the UI owner mutates component state.
+pub(crate) struct PendingCoreGatewayEffect {
+    pub session_id: String,
+    pub authority_generation: u64,
+    pub operation: CoreGatewayOperation,
+    pub completion: CoreGatewayCompletion,
+}
+
+pub(crate) struct CompletedCoreGatewayEffect {
+    session_id: String,
+    authority_generation: u64,
+    result: Result<serde_json::Value, String>,
+    completion: CoreGatewayCompletion,
+}
+
+impl CompletedCoreGatewayEffect {
+    pub(crate) fn new(
+        session_id: String,
+        authority_generation: u64,
+        result: Result<serde_json::Value, String>,
+        completion: CoreGatewayCompletion,
+    ) -> Self {
+        Self {
+            session_id,
+            authority_generation,
+            result,
+            completion,
+        }
+    }
+
+    pub(crate) fn apply_if_current(self, state: &mut TuiState) {
+        if !state.accepts_authority(&self.session_id, self.authority_generation) {
+            return;
+        }
+        (self.completion)(state, self.result);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,7 +466,13 @@ pub struct TuiState {
     /// domain state; each mounted panel owns that state in its own package.
     pub app_tui_host: TuiAppHost,
     pending_app_transport_effects: Vec<PendingAppTransportEffect>,
+    pending_core_gateway_effects: Vec<PendingCoreGatewayEffect>,
     active_app_panel: Option<String>,
+    /// Epoch for every asynchronous request launched from the active surface.
+    /// Revocation and an atomic session switch both advance it, preventing a
+    /// delayed response from a prior authority from repopulating the shell.
+    authority_generation: u64,
+    authorization_revoked: bool,
 
     /// Runtime activity panel summarizing run/context/tool state.
     pub runtime_activity_panel: RuntimeActivityPanel,
@@ -543,8 +604,14 @@ impl TuiState {
         let config_panel = ConfigPanel::new();
         let gateway_panel = GatewayPanel::new();
         let surface_panel = SurfacePanel::new();
-        let app_tui_host = TuiAppHost::product();
-        let active_app_panel = app_tui_host.panel_ids().into_iter().next();
+        // Gateway application admission is the runtime source of truth.  Do
+        // not briefly mount every statically linked application while the
+        // catalogue request is still in flight: feature unification can link
+        // an APP into a core TUI build, and a deployment can disable a linked
+        // APP.  `set_gateway_enabled_apps` mounts only the confirmed set after
+        // the Gateway handshake succeeds.
+        let app_tui_host = TuiAppHost::product_for_enabled_apps(&std::collections::BTreeSet::new());
+        let active_app_panel = None;
         let runtime_activity_panel = RuntimeActivityPanel::new();
         let tool_ops_panel = ToolOpsPanel::new();
         let system_status_bar = SystemStatusBar::new();
@@ -599,7 +666,10 @@ impl TuiState {
             surface_panel,
             app_tui_host,
             pending_app_transport_effects: Vec::new(),
+            pending_core_gateway_effects: Vec::new(),
             active_app_panel,
+            authority_generation: 1,
+            authorization_revoked: false,
             runtime_activity_panel,
             tool_ops_panel,
             system_status_bar,
@@ -676,12 +746,28 @@ impl TuiState {
 
         match &event {
             CowdEvent::TurnStarted => self.app.turn_interaction.submit_started(),
+            CowdEvent::GatewaySession {
+                event:
+                    crate::protocol::GatewaySessionEvent::UserMessageCommitted { correlation, .. },
+            } => {
+                if let Some(execution_id) = correlation.execution_id.as_deref() {
+                    let selects_visible_execution = self.app.current_execution_id.is_none()
+                        || self.app.current_execution_id.as_deref() == Some(execution_id)
+                        || !self.app.turn_is_active()
+                        || self.app.current_execution_status.is_some_and(
+                            harness_contract::projection::ExecutionLiveStatus::is_terminal,
+                        );
+                    if selects_visible_execution {
+                        self.app.turn_interaction.ingress_accepted(execution_id);
+                    }
+                }
+            }
             CowdEvent::ExecutionGraphSummary { summary } => {
                 if let Some(execution_id) = summary.graph_id.as_deref() {
                     self.app.turn_interaction.ingress_accepted(execution_id);
                 }
             }
-            CowdEvent::TurnComplete { .. } | CowdEvent::TurnError { .. } => {}
+            CowdEvent::TurnError { .. } => {}
             CowdEvent::SessionInputProjection { .. } => {}
             CowdEvent::Warning { message } if message.contains("projection stream interrupted") => {
                 self.app.turn_interaction.reconnecting();
@@ -722,10 +808,7 @@ impl TuiState {
         {
             match effect {
                 TuiAppEffect::Navigate { route, context } => {
-                    self.open_surface_for_slash_result(route.trim_start_matches('/'));
-                    if let Some(context) = context.as_ref() {
-                        self.apply_app_navigation_context(context);
-                    }
+                    self.apply_app_navigation_effect(&route, context.as_ref());
                 }
                 TuiAppEffect::Composer { text } => {
                     self.app.input.set_text(&text);
@@ -750,10 +833,35 @@ impl TuiState {
                         .push(PendingAppTransportEffect {
                             app_id,
                             panel_id,
+                            session_id: self.app.session_id.clone(),
+                            authority_generation: self.authority_generation,
                             effect,
                         });
                 }
             }
+        }
+    }
+
+    fn apply_app_navigation_effect(&mut self, route: &str, context: Option<&serde_json::Value>) {
+        let is_backlink_completion = context.is_some_and(|context| {
+            context.get("kind").and_then(serde_json::Value::as_str) == Some("backlink")
+                && (context
+                    .get("object")
+                    .is_some_and(|object| !object.is_null())
+                    || context
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| !message.trim().is_empty()))
+        });
+        // Initial navigation opens and focuses the destination, then records
+        // the pending canonical target. Its asynchronous completion must not
+        // reopen the sidebar: reopening clears the pending identity and also
+        // steals focus if the operator has moved elsewhere.
+        if !is_backlink_completion {
+            self.open_surface_for_slash_result(route.trim_start_matches('/'));
+        }
+        if let Some(context) = context {
+            self.apply_app_navigation_context(context);
         }
     }
 
@@ -772,7 +880,7 @@ impl TuiState {
         else {
             return;
         };
-        let object = context.get("object");
+        let object = context.get("object").filter(|object| !object.is_null());
         let failure = context
             .get("error")
             .and_then(serde_json::Value::as_str)
@@ -782,7 +890,13 @@ impl TuiState {
             || target.starts_with("application-execution://")
             || target.starts_with("task://")
         {
-            self.runtime_activity_panel.focus_backlink_target(target);
+            if object.is_none() && failure.is_none() {
+                self.runtime_activity_panel.focus_backlink_target(target);
+                return;
+            }
+            if !self.runtime_activity_panel.accepts_backlink_result(target) {
+                return;
+            }
             if let Some(object) = object {
                 if runtime_backlink_object_matches_target(target, object) {
                     if target.starts_with("runtime-execution://") {
@@ -812,8 +926,38 @@ impl TuiState {
             return;
         }
 
+        if target.starts_with("evidence://") || target.starts_with("mfg:evidence:") {
+            if object.is_none() && failure.is_none() {
+                self.reality_panel.focus_backlink_target(target);
+                return;
+            }
+            if !self.reality_panel.accepts_backlink_result(target) {
+                return;
+            }
+            if let Some(object) = object {
+                if evidence_backlink_object_matches_target(target, object) {
+                    self.reality_panel
+                        .record_backlink_object(target, object.clone());
+                } else {
+                    self.reality_panel.record_backlink_failure(
+                        target,
+                        "Application returned evidence whose canonical identity does not match the backlink",
+                    );
+                }
+            } else if let Some(message) = failure {
+                self.reality_panel.record_backlink_failure(target, message);
+            }
+            return;
+        }
+
         if target.starts_with("approval://") {
-            self.approval_cockpit_panel.focus_backlink_target(target);
+            if object.is_none() && failure.is_none() {
+                self.approval_cockpit_panel.focus_backlink_target(target);
+                return;
+            }
+            if !self.approval_cockpit_panel.accepts_backlink_result(target) {
+                return;
+            }
             if let Some(object) = object {
                 if approval_backlink_object_matches_target(target, object) {
                     self.approval_cockpit_panel
@@ -832,7 +976,13 @@ impl TuiState {
         }
 
         if target.starts_with("receipt://cross-plane/") || target.starts_with("surface://") {
-            self.surface_panel.focus_backlink_target(target);
+            if object.is_none() && failure.is_none() {
+                self.surface_panel.focus_backlink_target(target);
+                return;
+            }
+            if !self.surface_panel.accepts_backlink_result(target) {
+                return;
+            }
             if let Some(object) = object {
                 if surface_backlink_receipt_matches_target(target, object) {
                     self.surface_panel
@@ -852,6 +1002,96 @@ impl TuiState {
     pub(crate) fn take_pending_app_transport_effects(&mut self) -> Vec<PendingAppTransportEffect> {
         self.flush_app_effects();
         std::mem::take(&mut self.pending_app_transport_effects)
+    }
+
+    pub(crate) fn queue_gateway_api<F, Fut, C>(&mut self, operation: F, completion: C)
+    where
+        F: FnOnce(crate::gateway_client::GatewayApiClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<serde_json::Value, crate::gateway_client::GatewayApiError>>
+            + Send
+            + 'static,
+        C: FnOnce(&mut TuiState, Result<serde_json::Value, String>) + Send + 'static,
+    {
+        self.pending_core_gateway_effects
+            .push(PendingCoreGatewayEffect {
+                session_id: self.app.session_id.clone(),
+                authority_generation: self.authority_generation,
+                operation: Box::new(move |client| Box::pin(operation(client))),
+                completion: Box::new(completion),
+            });
+        self.app.request_redraw();
+    }
+
+    pub(crate) fn authority_generation(&self) -> u64 {
+        self.authority_generation
+    }
+
+    pub(crate) fn accepts_authority(&self, session_id: &str, generation: u64) -> bool {
+        !self.authorization_revoked
+            && self.app.session_id == session_id
+            && self.authority_generation == generation
+    }
+
+    pub(crate) fn revoke_session_authority(&mut self, reason: &str) {
+        self.authority_generation = self.authority_generation.wrapping_add(1).max(1);
+        self.authorization_revoked = true;
+        self.pending_app_transport_effects.clear();
+        self.pending_core_gateway_effects.clear();
+        self.app.revoke_session_authorization(reason);
+    }
+
+    pub(crate) fn install_session_authority(&mut self, generation: u64) {
+        self.authority_generation = generation.max(1);
+        self.authorization_revoked = false;
+        self.pending_app_transport_effects.clear();
+        self.pending_core_gateway_effects.clear();
+    }
+
+    pub(crate) fn take_pending_core_gateway_effects(&mut self) -> Vec<PendingCoreGatewayEffect> {
+        std::mem::take(&mut self.pending_core_gateway_effects)
+    }
+
+    pub(crate) fn apply_gateway_session_catalog(&mut self, payload: &serde_json::Value) {
+        let sessions = payload
+            .get("sessions")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|session| {
+                let id = session
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)?
+                    .to_string();
+                let updated_at_ms = session
+                    .get("updated_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+                    .map(|timestamp| timestamp.timestamp_millis().max(0) as u64)
+                    .unwrap_or_default();
+                Some(crate::app::SessionSummary {
+                    id,
+                    title: session
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned),
+                    path: session
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    updated_at_ms,
+                    message_count: session
+                        .get("message_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_default() as usize,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.app.picker_sessions = sessions.clone();
+        self.session_sidebar.refresh_if_changed(sessions);
+        self.session_sidebar
+            .set_current_session(&self.app.session_id);
+        self.app.request_redraw();
     }
 
     /// Reconcile the statically linked terminal contributions with the APPs
@@ -902,19 +1142,25 @@ impl TuiState {
         {
             return false;
         }
-        if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return self.cycle_app_panel(false);
-        }
-        if key.code == KeyCode::BackTab && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return self.cycle_app_panel(true);
-        }
         let Some(panel_id) = self.active_app_panel.clone() else {
             return false;
         };
         let handled = self.app_tui_host.handle_key(&panel_id, key);
         self.flush_app_effects();
         self.sync_app_palette_actions();
-        handled
+        if handled {
+            return true;
+        }
+        // Nested APP focus owns Ctrl+Tab when it implements that key. Only
+        // bubble an unhandled chord to the host-level APP switcher; otherwise
+        // the shell silently steals the focus navigation advertised by the APP.
+        if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.cycle_app_panel(false);
+        }
+        if key.code == KeyCode::BackTab && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return self.cycle_app_panel(true);
+        }
+        false
     }
 
     fn handle_app_command(&mut self, command: &str) -> bool {
@@ -953,6 +1199,21 @@ impl TuiState {
     pub fn apply_execution_projection(&mut self, projection: crate::protocol::ExecutionProjection) {
         if self.app.apply_execution_projection(projection.clone()) {
             self.app.turn_interaction.projection_snapshot(&projection);
+            if self.app.live_output_snapshot_gap {
+                self.app.turn_interaction.reconnecting();
+            }
+        }
+    }
+
+    pub fn apply_execution_live_update(&mut self, update: crate::protocol::ExecutionLiveUpdate) {
+        if self.app.apply_execution_live_update(update) {
+            let projection = self.app.latest_execution_projection.clone();
+            if let Some(projection) = projection.as_ref() {
+                self.app.turn_interaction.projection_snapshot(projection);
+            }
+            if self.app.live_output_snapshot_gap {
+                self.app.turn_interaction.reconnecting();
+            }
         }
     }
 
@@ -1024,9 +1285,8 @@ impl TuiState {
                         }
                     }
                     TAB_SESSIONS => {
-                        if !self.app.picker_sessions.is_empty() {
-                            self.session_sidebar.load(self.app.picker_sessions.clone());
-                        }
+                        self.session_sidebar
+                            .refresh_if_changed(self.app.picker_sessions.clone());
                         self.session_sidebar
                             .set_current_session(&self.app.session_id);
                     }
@@ -1043,18 +1303,6 @@ impl TuiState {
 
         // BUG 1 FIX: No bidirectional sync — app.input is the single source of truth.
         // Prompt is used only for autocomplete suggestions (rendered as overlay dropdown).
-
-        // BUG 5 FIX: Real-time token count update.
-        // During active turns, ensure token_count reflects cumulative usage.
-        // This acts as a fallback if background TokenUsage events are delayed.
-        if self.app.turn_is_active() {
-            let turn_total = self.app.turn_input_tokens + self.app.turn_output_tokens;
-            let base_total = self.app.input_tokens + self.app.output_tokens;
-            // token_count should reflect the highest known total
-            if turn_total > 0 && base_total + turn_total > self.app.token_count {
-                self.app.token_count = base_total + turn_total;
-            }
-        }
 
         // Sync status bar from App state
         self.system_status_bar.sync_from_app(&self.app);
@@ -1465,7 +1713,12 @@ impl TuiState {
         // 2.5. Render the bottom composer from its canonical model. Layout is
         // derived from the current frame and cannot mutate authored bytes.
         {
-            self.composer.mode_label = self.app.turn_interaction.label();
+            self.composer.mode_label =
+                if self.app.gateway_lease_mode.as_deref() == Some("read-only") {
+                    "Read-only session".to_string()
+                } else {
+                    self.app.turn_interaction.label()
+                };
             let pending_resources = self.app.pending_resources.len();
             let queued_follow_ups = self.app.queued_follow_up_count();
             let queued_preview = self
@@ -1697,6 +1950,8 @@ impl TuiState {
 
         // Update last drawn version for render skip optimization
         self.app.last_drawn_version = self.app.msg_version;
+        self.app.last_drawn_render_version = self.app.render_version;
+        self.app.lines_dirty = false;
     }
 
     // ── Input Handling ──────────────────────────────────────────
@@ -2053,13 +2308,16 @@ impl TuiState {
         // 4. Text-editing keys → direct to textarea (bypass keybind engine)
         if self.is_textarea_key(&key) {
             self.handle_composer_edit_key(key);
-            self.set_focus_target(FocusTarget::Input);
+            // Typing and autocomplete are transient composer state, not
+            // explicit focus navigation. Announcing both on every keystroke
+            // stacks toast overlays and can hide the active transcript.
+            self.set_focus_target_silent(FocusTarget::Input);
             // BUG 1 FIX: Refresh suggestions from app.input text, not prompt's stale textarea
             let text = self.input_text();
             self.prompt
                 .refresh_suggestions_from_text_at_cursor(&text, self.input_cursor_byte_offset());
             if self.prompt.suggestions_visible() {
-                self.set_focus_target(FocusTarget::PromptSuggestions);
+                self.set_focus_target_silent(FocusTarget::PromptSuggestions);
             }
             return ProcessedKey::Nothing;
         }
@@ -2116,6 +2374,7 @@ impl TuiState {
                 return ProcessedKey::Nothing;
             }
             self.prompt.add_history(text.clone());
+            self.app.record_input_history(text.clone());
             self.app.input = crate::components::composer::model::ComposerModel::default();
             return ProcessedKey::Submit(text);
         }
@@ -2422,6 +2681,10 @@ impl TuiState {
         self.focus_target = target;
     }
 
+    fn set_focus_target_silent(&mut self, target: FocusTarget) {
+        self.focus_target = target;
+    }
+
     fn is_navigation_key(key: &crossterm::event::KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
         matches!(
@@ -2606,33 +2869,36 @@ impl TuiState {
         };
         if self.file_tree.preview_path() == Some(path.as_str()) {
             let path_for_request = path.clone();
-            let result = run_gateway_api_blocking(move |client| async move {
-                client
-                    .workspace_file_preview(&path_for_request, 64 * 1024)
-                    .await
-            });
-            match result {
-                Ok(value) => {
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default();
-                    let truncated = value
-                        .get("truncated")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    let rendered = if truncated {
-                        format!("{content}\n\n<preview truncated>")
-                    } else {
-                        content.to_string()
-                    };
-                    self.file_tree.apply_preview(&path, rendered);
-                }
-                Err(error) => {
-                    self.file_tree
-                        .apply_preview(&path, format!("<gateway preview error: {error}>"));
-                }
-            }
+            self.queue_gateway_api(
+                move |client| async move {
+                    client
+                        .workspace_file_preview(&path_for_request, 64 * 1024)
+                        .await
+                },
+                move |state, result| match result {
+                    Ok(value) => {
+                        let content = value
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        let truncated = value
+                            .get("truncated")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let rendered = if truncated {
+                            format!("{content}\n\n<preview truncated>")
+                        } else {
+                            content.to_string()
+                        };
+                        state.file_tree.apply_preview(&path, rendered);
+                    }
+                    Err(error) => {
+                        state
+                            .file_tree
+                            .apply_preview(&path, format!("<gateway preview error: {error}>"));
+                    }
+                },
+            );
         }
     }
 
@@ -2684,19 +2950,24 @@ impl TuiState {
                 "model_lease": "default",
                 "resource_scopes": [format!("session:{}", self.app.session_id)],
             });
-            let result = run_gateway_api_blocking(move |client| async move {
-                let mut receipt = client.instantiate_team_template(body).await?;
-                if let Some(team_id) = receipt
-                    .pointer("/team/team_id")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    let working_state = client.team_working_state(team_id).await?;
-                    receipt["working_state"] = working_state;
-                }
-                Ok(receipt)
-            });
-            self.agent_team_panel
-                .record_action_result("team.instantiate", result);
+            self.queue_gateway_api(
+                move |client| async move {
+                    let mut receipt = client.instantiate_team_template(body).await?;
+                    if let Some(team_id) = receipt
+                        .pointer("/team/team_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        let working_state = client.team_working_state(team_id).await?;
+                        receipt["working_state"] = working_state;
+                    }
+                    Ok(receipt)
+                },
+                |state, result| {
+                    state
+                        .agent_team_panel
+                        .record_action_result("team.instantiate", result);
+                },
+            );
             return true;
         }
         let action = match key.code {
@@ -2715,20 +2986,40 @@ impl TuiState {
             "session_id": self.app.session_id,
             "message": "TUI operator control action"
         });
-        let result = match action {
-            "input" => run_gateway_api_blocking(move |client| async move {
-                client.runtime_agent_input(&agent_id, payload).await
-            }),
-            "interrupt" => run_gateway_api_blocking(move |client| async move {
-                client.runtime_agent_interrupt(&agent_id, payload).await
-            }),
-            "shutdown" => run_gateway_api_blocking(move |client| async move {
-                client.runtime_agent_shutdown(&agent_id, payload).await
-            }),
+        let action_label = format!("agent.{action}");
+        match action {
+            "input" => self.queue_gateway_api(
+                move |client| async move {
+                    client.runtime_agent_input(&agent_id, payload).await
+                },
+                move |state, result| {
+                    state
+                        .agent_team_panel
+                        .record_action_result(&action_label, result);
+                },
+            ),
+            "interrupt" => self.queue_gateway_api(
+                move |client| async move {
+                    client.runtime_agent_interrupt(&agent_id, payload).await
+                },
+                move |state, result| {
+                    state
+                        .agent_team_panel
+                        .record_action_result(&action_label, result);
+                },
+            ),
+            "shutdown" => self.queue_gateway_api(
+                move |client| async move {
+                    client.runtime_agent_shutdown(&agent_id, payload).await
+                },
+                move |state, result| {
+                    state
+                        .agent_team_panel
+                        .record_action_result(&action_label, result);
+                },
+            ),
             _ => return false,
-        };
-        self.agent_team_panel
-            .record_action_result(&format!("agent.{action}"), result);
+        }
         true
     }
 
@@ -2741,68 +3032,84 @@ impl TuiState {
         }
         match key.code {
             KeyCode::Char('e') => {
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client.harness_eval_latest_report().await
-                });
-                self.gateway_panel.record_harness_eval_latest(result);
+                self.queue_gateway_api(
+                    move |client| async move { client.harness_eval_latest_report().await },
+                    |state, result| state.gateway_panel.record_harness_eval_latest(result),
+                );
                 true
             }
             KeyCode::Char('E') => {
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client.harness_eval_run_smoke().await
-                });
-                self.gateway_panel
-                    .record_action_result("harness_eval.run_smoke", result);
+                self.queue_gateway_api(
+                    move |client| async move { client.harness_eval_run_smoke().await },
+                    |state, result| {
+                        state
+                            .gateway_panel
+                            .record_action_result("harness_eval.run_smoke", result);
+                    },
+                );
                 true
             }
             KeyCode::Char('v') => {
-                let result = run_gateway_api_blocking(move |client| async move {
-                    let signals = client.evolution_signals().await?;
-                    let diagnoses = client.evolution_diagnoses().await?;
-                    let missions = client.evolution_missions_summary().await?;
-                    let proposals = client.evolution_proposals().await?;
-                    let candidates = client.evolution_candidates().await?;
-                    let reviews = client.evolution_reviews().await?;
-                    Ok(serde_json::json!({
-                        "kind": "evolution.overview",
-                        "signals": signals,
-                        "diagnoses": diagnoses,
-                        "missions": missions,
-                        "proposals": proposals,
-                        "candidates": candidates,
-                        "reviews": reviews,
-                    }))
-                });
-                self.gateway_panel.record_evolution_overview(result);
+                self.queue_gateway_api(
+                    move |client| async move {
+                        let signals = client.evolution_signals().await?;
+                        let diagnoses = client.evolution_diagnoses().await?;
+                        let missions = client.evolution_missions_summary().await?;
+                        let proposals = client.evolution_proposals().await?;
+                        let candidates = client.evolution_candidates().await?;
+                        let reviews = client.evolution_reviews().await?;
+                        Ok(serde_json::json!({
+                            "kind": "evolution.overview",
+                            "signals": signals,
+                            "diagnoses": diagnoses,
+                            "missions": missions,
+                            "proposals": proposals,
+                            "candidates": candidates,
+                            "reviews": reviews,
+                        }))
+                    },
+                    |state, result| state.gateway_panel.record_evolution_overview(result),
+                );
                 true
             }
             KeyCode::Char('p') => {
-                let result = run_gateway_api_blocking(move |client| async move {
-                    let policy = client.evolution_evaluation_policy().await?;
-                    let reviews = client.evolution_evaluation_policy_reviews().await?;
-                    Ok(serde_json::json!({
-                        "kind": "evolution.evaluation_policy.overview",
-                        "policy": policy.get("policy").cloned().unwrap_or(policy),
-                        "reviews": reviews,
-                    }))
-                });
-                self.gateway_panel.record_evaluation_policy_overview(result);
+                self.queue_gateway_api(
+                    move |client| async move {
+                        let policy = client.evolution_evaluation_policy().await?;
+                        let reviews = client.evolution_evaluation_policy_reviews().await?;
+                        Ok(serde_json::json!({
+                            "kind": "evolution.evaluation_policy.overview",
+                            "policy": policy.get("policy").cloned().unwrap_or(policy),
+                            "reviews": reviews,
+                        }))
+                    },
+                    |state, result| {
+                        state
+                            .gateway_panel
+                            .record_evaluation_policy_overview(result);
+                    },
+                );
                 true
             }
             KeyCode::Char('m') => {
-                let result =
-                    run_gateway_api_blocking(
-                        move |client| async move { client.managed_agents().await },
-                    );
-                self.gateway_panel.record_managed_agent_overview(result);
+                self.queue_gateway_api(
+                    move |client| async move { client.managed_agents().await },
+                    |state, result| state.gateway_panel.record_managed_agent_overview(result),
+                );
                 true
             }
             KeyCode::Char('D') => {
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client.dispatch_managed_agents("tui-operator", 16).await
-                });
-                self.gateway_panel
-                    .record_action_result("runtime.managed_agents.dispatch_due_and_retry", result);
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client.dispatch_managed_agents("tui-operator", 16).await
+                    },
+                    |state, result| {
+                        state.gateway_panel.record_action_result(
+                            "runtime.managed_agents.dispatch_due_and_retry",
+                            result,
+                        );
+                    },
+                );
                 true
             }
             KeyCode::Char('R') => {
@@ -2814,11 +3121,16 @@ impl TuiState {
                     );
                     return true;
                 };
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client.reset_managed_agent_health(&managed_agent_id).await
-                });
-                self.gateway_panel
-                    .record_action_result("runtime.managed_agents.health.reset", result);
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client.reset_managed_agent_health(&managed_agent_id).await
+                    },
+                    |state, result| {
+                        state
+                            .gateway_panel
+                            .record_action_result("runtime.managed_agents.health.reset", result);
+                    },
+                );
                 true
             }
             KeyCode::Char('n') => {
@@ -2860,17 +3172,23 @@ impl TuiState {
                 };
                 let review_id_for_request = review_id.clone();
                 let decision_for_request = decision.to_string();
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client
-                        .evolution_review_decision(
-                            &review_id_for_request,
-                            &decision_for_request,
-                            "TUI human operator decision",
-                        )
-                        .await
-                });
-                self.gateway_panel
-                    .record_release_review_decision(&review_id, decision, result);
+                let decision = decision.to_string();
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client
+                            .evolution_review_decision(
+                                &review_id_for_request,
+                                &decision_for_request,
+                                "TUI human operator decision",
+                            )
+                            .await
+                    },
+                    move |state, result| {
+                        state
+                            .gateway_panel
+                            .record_release_review_decision(&review_id, &decision, result);
+                    },
+                );
                 true
             }
             KeyCode::Char('A') | KeyCode::Char('X') => {
@@ -2888,25 +3206,36 @@ impl TuiState {
                 };
                 let review_id_for_request = review_id.clone();
                 let decision_for_request = decision.to_string();
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client
-                        .evolution_evaluation_policy_review_decision(
-                            &review_id_for_request,
-                            &decision_for_request,
-                            "TUI human operator decision",
-                        )
-                        .await
-                });
-                self.gateway_panel
-                    .record_policy_review_decision(&review_id, decision, result);
+                let decision = decision.to_string();
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client
+                            .evolution_evaluation_policy_review_decision(
+                                &review_id_for_request,
+                                &decision_for_request,
+                                "TUI human operator decision",
+                            )
+                            .await
+                    },
+                    move |state, result| {
+                        state
+                            .gateway_panel
+                            .record_policy_review_decision(&review_id, &decision, result);
+                    },
+                );
                 true
             }
             KeyCode::Char('t') => {
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client.tick_mission_schedules(serde_json::json!({})).await
-                });
-                self.gateway_panel
-                    .record_action_result("mission.schedule.tick", result);
+                self.queue_gateway_api(
+                    move |client| async move {
+                        client.tick_mission_schedules(serde_json::json!({})).await
+                    },
+                    |state, result| {
+                        state
+                            .gateway_panel
+                            .record_action_result("mission.schedule.tick", result);
+                    },
+                );
                 true
             }
             _ => false,
@@ -2945,22 +3274,16 @@ impl TuiState {
         match key.code {
             KeyCode::Char('h') => {
                 let label = format!("surface.health_check:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_health_check(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_health_check(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('s') => {
                 let label = format!("surface.start:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_start(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_start(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('x') => {
@@ -2968,12 +3291,9 @@ impl TuiState {
                     return true;
                 }
                 let label = format!("surface.stop:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_stop(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_stop(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('r') => {
@@ -2984,150 +3304,117 @@ impl TuiState {
                     return true;
                 }
                 let label = format!("surface.restart:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_restart(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_restart(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('R') => {
                 let label = format!("surface.repair:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_repair(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_repair(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('m') => {
                 let label = format!("surface.send:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client
-                            .surface_send(
-                                &surface_id,
-                                "tui:operator",
-                                None,
-                                "TUI operator ping",
-                                serde_json::json!({"source": "tui.surface_panel"}),
-                            )
-                            .await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client
+                        .surface_send(
+                            &surface_id,
+                            "tui:operator",
+                            None,
+                            "TUI operator ping",
+                            serde_json::json!({"source": "tui.surface_panel"}),
+                        )
+                        .await
+                });
                 true
             }
             KeyCode::Char('a') => {
                 let label = format!("surface.action:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client
-                            .surface_action(
-                                &surface_id,
-                                "diagnose",
-                                serde_json::json!({"source": "tui.surface_panel"}),
-                            )
-                            .await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client
+                        .surface_action(
+                            &surface_id,
+                            "diagnose",
+                            serde_json::json!({"source": "tui.surface_panel"}),
+                        )
+                        .await
+                });
                 true
             }
             KeyCode::Char('g') => {
                 let label = format!("surface.messages:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_messages(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_messages(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('i') => {
                 let label = format!("surface.inbox:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_inbox(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_inbox(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('o') => {
                 let label = format!("surface.outbox:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_outbox(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_outbox(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('v') => {
                 let label = format!("surface.deliveries:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_deliveries(&surface_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_deliveries(&surface_id).await
+                });
                 true
             }
             KeyCode::Char('p') => {
                 let label = format!("surface.inbox.replay:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        let inbox = client.surface_inbox(&surface_id).await?;
-                        let message_id = first_surface_message_id(&inbox).ok_or_else(|| {
-                            crate::gateway_client::GatewayApiError::Url(
-                                "No inbox message id found".to_string(),
-                            )
-                        })?;
-                        client.surface_replay_inbox(&surface_id, &message_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    let inbox = client.surface_inbox(&surface_id).await?;
+                    let message_id = first_surface_message_id(&inbox).ok_or_else(|| {
+                        crate::gateway_client::GatewayApiError::Url(
+                            "No inbox message id found".to_string(),
+                        )
+                    })?;
+                    client.surface_replay_inbox(&surface_id, &message_id).await
+                });
                 true
             }
             KeyCode::Char('d') => {
                 let label = format!("surface.outbox.retry:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        let outbox = client.surface_outbox(&surface_id).await?;
-                        let delivery_id = first_surface_delivery_id(&outbox).ok_or_else(|| {
-                            crate::gateway_client::GatewayApiError::Url(
-                                "No retryable delivery id found".to_string(),
-                            )
-                        })?;
-                        client.surface_retry_outbox(&surface_id, &delivery_id).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    let outbox = client.surface_outbox(&surface_id).await?;
+                    let delivery_id = first_surface_delivery_id(&outbox).ok_or_else(|| {
+                        crate::gateway_client::GatewayApiError::Url(
+                            "No retryable delivery id found".to_string(),
+                        )
+                    })?;
+                    client.surface_retry_outbox(&surface_id, &delivery_id).await
+                });
                 true
             }
             KeyCode::Char('D') => {
                 let label = format!("surface.outbox.dead_letter:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        let outbox = client.surface_outbox(&surface_id).await?;
-                        let delivery_id = first_surface_delivery_id(&outbox).ok_or_else(|| {
-                            crate::gateway_client::GatewayApiError::Url(
-                                "No delivery id found".to_string(),
-                            )
-                        })?;
-                        client
-                            .surface_dead_letter_outbox(
-                                &surface_id,
-                                &delivery_id,
-                                "operator moved delivery from TUI",
-                            )
-                            .await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    let outbox = client.surface_outbox(&surface_id).await?;
+                    let delivery_id = first_surface_delivery_id(&outbox).ok_or_else(|| {
+                        crate::gateway_client::GatewayApiError::Url(
+                            "No delivery id found".to_string(),
+                        )
+                    })?;
+                    client
+                        .surface_dead_letter_outbox(
+                            &surface_id,
+                            &delivery_id,
+                            "operator moved delivery from TUI",
+                        )
+                        .await
+                });
                 true
             }
             KeyCode::Char('A') => {
@@ -3138,12 +3425,9 @@ impl TuiState {
                     return true;
                 }
                 let label = format!("surface.messages.archive:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_archive_messages(&surface_id, 100).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_archive_messages(&surface_id, 100).await
+                });
                 true
             }
             KeyCode::Char('P') => {
@@ -3154,16 +3438,25 @@ impl TuiState {
                     return true;
                 }
                 let label = format!("surface.messages.purge_archived_events:{surface_id}");
-                self.surface_panel.record_action_result(
-                    &label,
-                    run_gateway_api_blocking(move |client| async move {
-                        client.surface_purge_archived_events(&surface_id, 100).await
-                    }),
-                );
+                self.queue_surface_action(label, move |client| async move {
+                    client.surface_purge_archived_events(&surface_id, 100).await
+                });
                 true
             }
             _ => false,
         }
+    }
+
+    fn queue_surface_action<F, Fut>(&mut self, label: String, operation: F)
+    where
+        F: FnOnce(crate::gateway_client::GatewayApiClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<serde_json::Value, crate::gateway_client::GatewayApiError>>
+            + Send
+            + 'static,
+    {
+        self.queue_gateway_api(operation, move |state, result| {
+            state.surface_panel.record_action_result(&label, result);
+        });
     }
 
     fn handle_skills_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
@@ -3189,11 +3482,9 @@ impl TuiState {
             "session_id": session_id,
             "reason": "tui skill panel action",
         });
-        self.skills_panel.record_action_result(
-            action,
-            run_gateway_api_blocking(move |client| async move {
-                client.skill_action(&skill_id, action, payload).await
-            }),
+        self.queue_gateway_api(
+            move |client| async move { client.skill_action(&skill_id, action, payload).await },
+            move |state, result| state.skills_panel.record_action_result(action, result),
         );
         true
     }
@@ -3218,28 +3509,28 @@ impl TuiState {
                         .set_status("No selected tool to execute");
                     return true;
                 };
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| {
+                self.queue_tool_ops(move |client| {
                     let name = tool_name;
                     async move {
                         client
                             .tool_execute(&name, serde_json::json!({}), "read_only")
                             .await
                     }
-                }));
+                });
                 true
             }
             (ToolOpsMode::Operations, KeyCode::Char('i')) => {
                 let prompt = self.tool_ops_panel.intent_prompt.clone();
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                self.queue_tool_ops(move |client| async move {
                     client.tool_intent_plan(&prompt, Vec::new()).await
-                }));
+                });
                 true
             }
             (ToolOpsMode::Operations, KeyCode::Char('f')) => {
                 let prompt = self.tool_ops_panel.fanout_prompt.clone();
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                self.queue_tool_ops(move |client| async move {
                     client.tool_context_fanout_plan(&prompt).await
-                }));
+                });
                 true
             }
             (ToolOpsMode::Operations, KeyCode::Char('b')) => {
@@ -3253,9 +3544,9 @@ impl TuiState {
                         return true;
                     }
                 };
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                self.queue_tool_ops(move |client| async move {
                     client.tool_batch_readonly(calls, 4).await
-                }));
+                });
                 true
             }
             (ToolOpsMode::Mutations, KeyCode::Char('v')) => {
@@ -3269,9 +3560,9 @@ impl TuiState {
                         return true;
                     }
                 };
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                self.queue_tool_ops(move |client| async move {
                     client.tool_mutation_preview(edits).await
-                }));
+                });
                 true
             }
             (ToolOpsMode::Mutations, KeyCode::Char('A')) => {
@@ -3296,16 +3587,19 @@ impl TuiState {
                 };
                 let expected_hashes = serde_json::to_value(&self.tool_ops_panel.expected_hashes)
                     .unwrap_or_else(|_| serde_json::json!({}));
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                self.queue_tool_ops(move |client| async move {
                     client.tool_mutation_apply(edits, expected_hashes).await
-                }));
+                });
                 true
             }
             (ToolOpsMode::Checkpoints, KeyCode::Char('n')) => {
-                self.record_tool_ops_result(run_gateway_api_blocking(|client| async move {
-                    client.tool_checkpoint_create("tui checkpoint").await
-                }));
-                self.refresh_tool_ops_panel_overview();
+                self.queue_gateway_api(
+                    |client| async move { client.tool_checkpoint_create("tui checkpoint").await },
+                    |state, result| {
+                        state.record_tool_ops_result(result);
+                        state.refresh_tool_ops_panel_overview();
+                    },
+                );
                 true
             }
             (ToolOpsMode::Checkpoints, KeyCode::Char('d')) => {
@@ -3318,9 +3612,9 @@ impl TuiState {
                         .set_status("No selected checkpoint to diff");
                     return true;
                 };
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
-                    client.tool_checkpoint_diff(&id).await
-                }));
+                self.queue_tool_ops(
+                    move |client| async move { client.tool_checkpoint_diff(&id).await },
+                );
                 true
             }
             (ToolOpsMode::Checkpoints, KeyCode::Char('R')) => {
@@ -3336,10 +3630,13 @@ impl TuiState {
                 if !self.tool_ops_panel.arm_restore_checkpoint(id.clone()) {
                     return true;
                 }
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
-                    client.tool_checkpoint_restore(&id).await
-                }));
-                self.refresh_tool_ops_panel_overview();
+                self.queue_gateway_api(
+                    move |client| async move { client.tool_checkpoint_restore(&id).await },
+                    |state, result| {
+                        state.record_tool_ops_result(result);
+                        state.refresh_tool_ops_panel_overview();
+                    },
+                );
                 true
             }
             (ToolOpsMode::Risk, KeyCode::Char('s')) => {
@@ -3349,9 +3646,9 @@ impl TuiState {
                     "actor": "tui-operator",
                     "inputs": { "mode": "risk" }
                 });
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                self.queue_tool_ops(move |client| async move {
                     client.cross_plane_policy_simulate(action).await
-                }));
+                });
                 true
             }
             (ToolOpsMode::Risk, KeyCode::Char('p')) => {
@@ -3368,9 +3665,9 @@ impl TuiState {
                     "data_classification": "internal",
                     "identity_trust": "verified"
                 });
-                self.record_tool_ops_result(run_gateway_api_blocking(move |client| async move {
+                self.queue_tool_ops(move |client| async move {
                     client.preflight_cross_plane_action(action).await
-                }));
+                });
                 true
             }
             _ => false,
@@ -3378,28 +3675,52 @@ impl TuiState {
     }
 
     fn refresh_tool_ops_panel_overview(&mut self) {
-        match run_gateway_api_blocking(|client| async move { client.tool_registry().await }) {
-            Ok(payload) => self.tool_ops_panel.sync_registry(&payload),
-            Err(error) => self
-                .tool_ops_panel
-                .set_status(format!("Registry refresh failed: {error}")),
-        }
-        if let Ok(payload) =
-            run_gateway_api_blocking(|client| async move { client.tool_cache_stats().await })
-        {
-            self.tool_ops_panel.sync_cache(&payload);
-        }
-        if let Ok(payload) =
-            run_gateway_api_blocking(|client| async move { client.tool_checkpoints().await })
-        {
-            self.tool_ops_panel.sync_checkpoints(&payload);
-        }
+        self.queue_gateway_api(
+            |client| async move { client.tool_registry().await },
+            |state, result| match result {
+                Ok(payload) => state.tool_ops_panel.sync_registry(&payload),
+                Err(error) => state
+                    .tool_ops_panel
+                    .set_status(format!("Registry refresh failed: {error}")),
+            },
+        );
+        self.queue_gateway_api(
+            |client| async move { client.tool_cache_stats().await },
+            |state, result| {
+                if let Ok(payload) = result {
+                    state.tool_ops_panel.sync_cache(&payload);
+                }
+            },
+        );
+        self.queue_gateway_api(
+            |client| async move { client.tool_checkpoints().await },
+            |state, result| {
+                if let Ok(payload) = result {
+                    state.tool_ops_panel.sync_checkpoints(&payload);
+                }
+            },
+        );
         let session_id = self.app.session_id.clone();
-        if let Ok(payload) = run_gateway_api_blocking(move |client| async move {
-            client.runtime_timeline(&session_id, 50).await
-        }) {
-            self.tool_ops_panel.sync_ledger(&payload);
-        }
+        self.queue_gateway_api(
+            move |client| async move { client.runtime_timeline(&session_id, 50).await },
+            |state, result| {
+                if let Ok(payload) = result {
+                    state.tool_ops_panel.sync_ledger(&payload);
+                }
+            },
+        );
+    }
+
+    fn queue_tool_ops<F, Fut>(&mut self, operation: F)
+    where
+        F: FnOnce(crate::gateway_client::GatewayApiClient) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<serde_json::Value, crate::gateway_client::GatewayApiError>>
+            + Send
+            + 'static,
+    {
+        self.queue_gateway_api(operation, |state, result| {
+            state.record_tool_ops_result(result);
+        });
     }
 
     fn record_tool_ops_result(&mut self, result: Result<serde_json::Value, String>) {
@@ -3667,7 +3988,7 @@ impl TuiState {
 
     pub fn open_surface_for_slash_result(&mut self, command_name: &str) {
         match command_name {
-            "status" | "model" | "cost" | "sandbox" | "doctor" | "context" => {
+            "runtime" | "status" | "model" | "cost" | "sandbox" | "doctor" | "context" => {
                 self.open_sidebar_tab(TAB_RUNTIME, "Runtime");
             }
             "config" | "providers" => self.open_topic_panel(SidebarTopicPanel::Config),
@@ -3773,14 +4094,18 @@ impl TuiState {
     }
 
     fn refresh_command_projection_from_gateway(&mut self) {
-        if let Ok(payload) =
-            run_gateway_api_blocking(|client| async move { client.slash_projection("tui").await })
-        {
-            self.command_palette.sync_command_projection(&payload);
-            self.sync_app_palette_actions();
-            self.prompt
-                .sync_command_suggestions_from_projection(&payload);
-        }
+        self.queue_gateway_api(
+            |client| async move { client.slash_projection("tui").await },
+            |state, result| {
+                if let Ok(payload) = result {
+                    state.command_palette.sync_command_projection(&payload);
+                    state.sync_app_palette_actions();
+                    state
+                        .prompt
+                        .sync_command_suggestions_from_projection(&payload);
+                }
+            },
+        );
     }
 
     /// Handle a key press while search is active.
@@ -3955,15 +4280,15 @@ impl TuiState {
             Action::ToggleAgentPanel => {
                 self.agent_team_panel.toggle();
                 if self.agent_team_panel.visible {
-                    let result = run_gateway_api_blocking(move |client| async move {
-                        client.team_templates().await
-                    });
-                    match result {
-                        Ok(payload) => self.agent_team_panel.set_team_templates(&payload),
-                        Err(error) => self
-                            .agent_team_panel
-                            .record_action_result("team.templates", Err(error)),
-                    }
+                    self.queue_gateway_api(
+                        move |client| async move { client.team_templates().await },
+                        |state, result| match result {
+                            Ok(payload) => state.agent_team_panel.set_team_templates(&payload),
+                            Err(error) => state
+                                .agent_team_panel
+                                .record_action_result("team.templates", Err(error)),
+                        },
+                    );
                 }
             }
             Action::TogglePerformanceDashboard => {
@@ -4021,9 +4346,38 @@ impl TuiState {
                 // The event loop reads self.app.input content separately.
             }
             Action::NextModel => {
+                let previous_model = self.app.model.clone();
+                let previous_requested = self.app.requested_model.clone();
                 if let Some(model) = self.app.next_model() {
+                    let session_id = self.app.session_id.clone();
+                    let requested_model = model.clone();
                     self.app
-                        .show_notification(&format!("Switched to model: {model}"));
+                        .show_notification(&format!("Requesting model switch: {requested_model}"));
+                    self.queue_gateway_api(
+                        move |client| async move {
+                            client
+                                .update_session_model(&session_id, &requested_model)
+                                .await
+                        },
+                        move |state, result| match result {
+                            Ok(_) => {
+                                state.app.requested_model = Some(model.clone());
+                                state.app.model = model.clone();
+                                state.app.model_dirty = false;
+                                state.app.show_notification(&format!(
+                                    "Session model updated: {model}; effective model will confirm on the next provider attempt"
+                                ));
+                            }
+                            Err(error) => {
+                                state.app.model = previous_model.clone();
+                                state.app.requested_model = previous_requested.clone();
+                                state.app.model_dirty = false;
+                                state.app.show_notification(&format!(
+                                    "Model switch failed and was rolled back: {error}"
+                                ));
+                            }
+                        },
+                    );
                 }
             }
             Action::RefreshConfigStatus => {
@@ -4127,214 +4481,197 @@ impl TuiState {
                     }
                 }
                 let approval_id = id.clone();
-                let projection_id = id.clone();
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client
-                        .respond_approval(&id, approved, Some("once"), None)
-                        .await
-                })
-                .or_else(move |_| {
-                    run_gateway_api_blocking(move |client| async move {
+                let request_id = id.clone();
+                self.queue_gateway_api(
+                    move |client| async move {
                         client
-                            .respond_approval(&projection_id, approved, Some("once"), None)
+                            .respond_approval(&request_id, approved, Some("once"), None)
                             .await
-                    })
-                });
-                match result {
-                    Ok(_) => {
-                        let verdict = if approved { "approved" } else { "rejected" };
-                        self.push_runtime_action_receipt(
-                            "ok",
-                            verdict,
-                            "daemon-control",
-                            "daemon.approval.respond",
-                            Some(approval_id.clone()),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Success,
-                            Some("Approval".into()),
-                            format!("Gateway approval {verdict}"),
-                            2000,
-                        );
-                    }
-                    Err(err) => {
-                        self.push_runtime_action_receipt(
-                            "failed",
-                            &err,
-                            "daemon-control",
-                            "daemon.approval.respond",
-                            Some(approval_id),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Warning,
-                            Some("Approval".into()),
-                            err,
-                            3000,
-                        );
-                    }
-                }
+                    },
+                    move |state, result| match result {
+                        Ok(_) => {
+                            let verdict = if approved { "approved" } else { "rejected" };
+                            state.push_runtime_action_receipt(
+                                "ok",
+                                verdict,
+                                "daemon-control",
+                                "daemon.approval.respond",
+                                Some(approval_id.clone()),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Success,
+                                Some("Approval".into()),
+                                format!("Gateway approval {verdict}"),
+                                2000,
+                            );
+                        }
+                        Err(err) => {
+                            state.push_runtime_action_receipt(
+                                "failed",
+                                &err,
+                                "daemon-control",
+                                "daemon.approval.respond",
+                                Some(approval_id),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Warning,
+                                Some("Approval".into()),
+                                err,
+                                3000,
+                            );
+                        }
+                    },
+                );
             }
             Action::CancelGatewayTask(id) => {
                 let task_id = id.clone();
-                let projection_id = id.clone();
-                let result =
-                    run_gateway_api_blocking(
-                        move |client| async move { client.cancel_task(&id).await },
-                    )
-                    .or_else(move |_| {
-                        run_gateway_api_blocking(move |client| async move {
-                            client.cancel_task(&projection_id).await
-                        })
-                    });
-                match result {
-                    Ok(_) => {
-                        self.push_runtime_action_receipt(
-                            "ok",
-                            "cancelled",
-                            "daemon-control",
-                            "daemon.task.cancel",
-                            Some(task_id.clone()),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Success,
-                            Some("Task".into()),
-                            "Gateway task canceled".into(),
-                            2000,
-                        );
-                    }
-                    Err(err) => {
-                        self.push_runtime_action_receipt(
-                            "failed",
-                            &err,
-                            "daemon-control",
-                            "daemon.task.cancel",
-                            Some(task_id),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Warning,
-                            Some("Task".into()),
-                            err,
-                            3000,
-                        );
-                    }
-                }
+                let request_id = id.clone();
+                self.queue_gateway_api(
+                    move |client| async move { client.cancel_task(&request_id).await },
+                    move |state, result| match result {
+                        Ok(_) => {
+                            state.push_runtime_action_receipt(
+                                "ok",
+                                "cancelled",
+                                "daemon-control",
+                                "daemon.task.cancel",
+                                Some(task_id.clone()),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Success,
+                                Some("Task".into()),
+                                "Gateway task canceled".into(),
+                                2000,
+                            );
+                        }
+                        Err(err) => {
+                            state.push_runtime_action_receipt(
+                                "failed",
+                                &err,
+                                "daemon-control",
+                                "daemon.task.cancel",
+                                Some(task_id),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Warning,
+                                Some("Task".into()),
+                                err,
+                                3000,
+                            );
+                        }
+                    },
+                );
             }
             Action::CompleteGatewayTask(id) => {
                 let task_id = id.clone();
-                let projection_id = id.clone();
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client.complete_task(&id).await
-                })
-                .or_else(move |_| {
-                    run_gateway_api_blocking(move |client| async move {
-                        client.complete_task(&projection_id).await
-                    })
-                });
-                match result {
-                    Ok(_) => {
-                        self.push_runtime_action_receipt(
-                            "ok",
-                            "completed",
-                            "daemon-control",
-                            "daemon.task.complete",
-                            Some(task_id.clone()),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Success,
-                            Some("Task".into()),
-                            "Gateway task completed".into(),
-                            2000,
-                        );
-                    }
-                    Err(err) => {
-                        self.push_runtime_action_receipt(
-                            "failed",
-                            &err,
-                            "daemon-control",
-                            "daemon.task.complete",
-                            Some(task_id),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Warning,
-                            Some("Task".into()),
-                            err,
-                            3000,
-                        );
-                    }
-                }
+                let request_id = id.clone();
+                self.queue_gateway_api(
+                    move |client| async move { client.complete_task(&request_id).await },
+                    move |state, result| match result {
+                        Ok(_) => {
+                            state.push_runtime_action_receipt(
+                                "ok",
+                                "completed",
+                                "daemon-control",
+                                "daemon.task.complete",
+                                Some(task_id.clone()),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Success,
+                                Some("Task".into()),
+                                "Gateway task completed".into(),
+                                2000,
+                            );
+                        }
+                        Err(err) => {
+                            state.push_runtime_action_receipt(
+                                "failed",
+                                &err,
+                                "daemon-control",
+                                "daemon.task.complete",
+                                Some(task_id),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Warning,
+                                Some("Task".into()),
+                                err,
+                                3000,
+                            );
+                        }
+                    },
+                );
             }
             Action::RevalidateConnectorResource { reference, state } => {
                 let resource_ref = reference.clone();
                 let desired_state = state.clone();
-                let projection_ref = reference.clone();
-                let projection_state = state.clone();
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client
-                        .revalidate_connector_resource(&reference, &state)
-                        .await
-                })
-                .or_else(move |_| {
-                    run_gateway_api_blocking(move |client| async move {
+                let request_ref = reference.clone();
+                let request_state = state.clone();
+                self.queue_gateway_api(
+                    move |client| async move {
                         client
-                            .revalidate_connector_resource(&projection_ref, &projection_state)
+                            .revalidate_connector_resource(&request_ref, &request_state)
                             .await
-                    })
-                });
-                match result {
-                    Ok(value)
-                        if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) =>
-                    {
-                        self.apply_local_connector_resource_state(&resource_ref, &desired_state);
-                        self.push_runtime_action_receipt(
-                            "ok",
-                            &desired_state,
-                            "daemon-control",
-                            "connector.resource.revalidate",
-                            Some(resource_ref.clone()),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Success,
-                            Some("Connector".into()),
-                            format!("Resource marked {desired_state}"),
-                            2000,
-                        );
-                    }
-                    Ok(value) => {
-                        let reason = value
-                            .get("reason")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("resource state unchanged")
-                            .to_string();
-                        self.push_runtime_action_receipt(
-                            "skipped",
-                            &reason,
-                            "daemon-control",
-                            "connector.resource.revalidate",
-                            Some(resource_ref),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Warning,
-                            Some("Connector".into()),
-                            reason,
-                            3000,
-                        );
-                    }
-                    Err(err) => {
-                        self.push_runtime_action_receipt(
-                            "failed",
-                            &err,
-                            "daemon-control",
-                            "connector.resource.revalidate",
-                            Some(resource_ref),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Warning,
-                            Some("Connector".into()),
-                            err,
-                            3000,
-                        );
-                    }
-                }
+                    },
+                    move |state, result| match result {
+                        Ok(value)
+                            if value.get("ok").and_then(serde_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            state.apply_local_connector_resource_state(
+                                &resource_ref,
+                                &desired_state,
+                            );
+                            state.push_runtime_action_receipt(
+                                "ok",
+                                &desired_state,
+                                "daemon-control",
+                                "connector.resource.revalidate",
+                                Some(resource_ref.clone()),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Success,
+                                Some("Connector".into()),
+                                format!("Resource marked {desired_state}"),
+                                2000,
+                            );
+                        }
+                        Ok(value) => {
+                            let reason = value
+                                .get("reason")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("resource state unchanged")
+                                .to_string();
+                            state.push_runtime_action_receipt(
+                                "skipped",
+                                &reason,
+                                "daemon-control",
+                                "connector.resource.revalidate",
+                                Some(resource_ref),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Warning,
+                                Some("Connector".into()),
+                                reason,
+                                3000,
+                            );
+                        }
+                        Err(err) => {
+                            state.push_runtime_action_receipt(
+                                "failed",
+                                &err,
+                                "daemon-control",
+                                "connector.resource.revalidate",
+                                Some(resource_ref),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Warning,
+                                Some("Connector".into()),
+                                err,
+                                3000,
+                            );
+                        }
+                    },
+                );
             }
             Action::PromoteConnectorResourceToMemory {
                 reference,
@@ -4343,82 +4680,77 @@ impl TuiState {
                 let session_id = session_id
                     .clone()
                     .or_else(|| Some(self.app.session_id.clone()));
-                let projection_ref = reference.clone();
                 let receipt_ref = reference.clone();
-                let projection_session_id = session_id.clone();
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client
-                        .promote_connector_resource_to_memory(&reference, session_id.as_deref())
-                        .await
-                })
-                .or_else(move |_| {
-                    run_gateway_api_blocking(move |client| async move {
+                let request_ref = reference.clone();
+                self.queue_gateway_api(
+                    move |client| async move {
                         client
                             .promote_connector_resource_to_memory(
-                                &projection_ref,
-                                projection_session_id.as_deref(),
+                                &request_ref,
+                                session_id.as_deref(),
                             )
                             .await
-                    })
-                });
-                match result {
-                    Ok(value)
-                        if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) =>
-                    {
-                        let memory_id = value
-                            .get("memory_id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("remembered");
-                        self.push_runtime_action_receipt(
-                            "ok",
-                            memory_id,
-                            "daemon-control",
-                            "connector.resource.promote_memory",
-                            Some(receipt_ref.clone()),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Success,
-                            Some("Memory".into()),
-                            "Connector resource remembered".into(),
-                            2000,
-                        );
-                    }
-                    Ok(value) => {
-                        let reason = value
-                            .get("reason")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("memory promotion skipped")
-                            .to_string();
-                        self.push_runtime_action_receipt(
-                            "skipped",
-                            &reason,
-                            "daemon-control",
-                            "connector.resource.promote_memory",
-                            Some(receipt_ref.clone()),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Warning,
-                            Some("Memory".into()),
-                            reason,
-                            3000,
-                        );
-                    }
-                    Err(err) => {
-                        self.push_runtime_action_receipt(
-                            "failed",
-                            &err,
-                            "daemon-control",
-                            "connector.resource.promote_memory",
-                            Some(receipt_ref),
-                        );
-                        self.toast_manager.push(
-                            ToastVariant::Warning,
-                            Some("Memory".into()),
-                            err,
-                            3000,
-                        );
-                    }
-                }
+                    },
+                    move |state, result| match result {
+                        Ok(value)
+                            if value.get("ok").and_then(serde_json::Value::as_bool)
+                                == Some(true) =>
+                        {
+                            let memory_id = value
+                                .get("memory_id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("remembered");
+                            state.push_runtime_action_receipt(
+                                "ok",
+                                memory_id,
+                                "daemon-control",
+                                "connector.resource.promote_memory",
+                                Some(receipt_ref.clone()),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Success,
+                                Some("Memory".into()),
+                                "Connector resource remembered".into(),
+                                2000,
+                            );
+                        }
+                        Ok(value) => {
+                            let reason = value
+                                .get("reason")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("memory promotion skipped")
+                                .to_string();
+                            state.push_runtime_action_receipt(
+                                "skipped",
+                                &reason,
+                                "daemon-control",
+                                "connector.resource.promote_memory",
+                                Some(receipt_ref.clone()),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Warning,
+                                Some("Memory".into()),
+                                reason,
+                                3000,
+                            );
+                        }
+                        Err(err) => {
+                            state.push_runtime_action_receipt(
+                                "failed",
+                                &err,
+                                "daemon-control",
+                                "connector.resource.promote_memory",
+                                Some(receipt_ref),
+                            );
+                            state.toast_manager.push(
+                                ToastVariant::Warning,
+                                Some("Memory".into()),
+                                err,
+                                3000,
+                            );
+                        }
+                    },
+                );
             }
             Action::TogglePanel(ref name) if name == "sidebar" => {
                 self.layout_state.toggle_sidebar(&mut self.layout_tree);
@@ -4518,42 +4850,38 @@ impl TuiState {
     }
 
     fn refresh_config_panel(&mut self) -> bool {
-        let config = run_gateway_api_blocking(|client| async move { client.config().await });
-        let providers =
-            run_gateway_api_blocking(|client| async move { client.config_providers().await });
-        let effective =
-            run_gateway_api_blocking(
-                |client| async move { client.runtime_effective_config().await },
-            );
-        let reload_status =
-            run_gateway_api_blocking(|client| async move { client.config_reload_status().await });
-
-        match (config, providers, effective, reload_status) {
-            (Ok(config), Ok(providers), Ok(effective), Ok(reload_status)) => {
-                self.config_panel.sync_config(config, providers, effective);
-                self.config_panel.sync_config_reload_status(reload_status);
-                self.config_panel.set_status("Config projection refreshed");
-                true
-            }
-            (config, providers, effective, reload_status) => {
-                let mut errors = Vec::new();
-                if let Err(error) = config {
-                    errors.push(format!("config: {error}"));
+        self.config_panel.set_status("Refreshing config…");
+        self.queue_gateway_api(
+            |client| async move {
+                let config = client.config().await?;
+                let providers = client.config_providers().await?;
+                let effective = client.runtime_effective_config().await?;
+                let reload_status = client.config_reload_status().await?;
+                Ok(serde_json::json!({
+                    "config": config,
+                    "providers": providers,
+                    "effective": effective,
+                    "reload_status": reload_status,
+                }))
+            },
+            |state, result| match result {
+                Ok(payload) => {
+                    state.config_panel.sync_config(
+                        payload.get("config").cloned().unwrap_or_default(),
+                        payload.get("providers").cloned().unwrap_or_default(),
+                        payload.get("effective").cloned().unwrap_or_default(),
+                    );
+                    state.config_panel.sync_config_reload_status(
+                        payload.get("reload_status").cloned().unwrap_or_default(),
+                    );
+                    state.config_panel.set_status("Config projection refreshed");
                 }
-                if let Err(error) = providers {
-                    errors.push(format!("providers: {error}"));
-                }
-                if let Err(error) = effective {
-                    errors.push(format!("effective: {error}"));
-                }
-                if let Err(error) = reload_status {
-                    errors.push(format!("reload-status: {error}"));
-                }
-                self.config_panel
-                    .set_status(format!("Config refresh failed: {}", errors.join("; ")));
-                false
-            }
-        }
+                Err(error) => state
+                    .config_panel
+                    .set_status(format!("Config refresh failed: {error}")),
+            },
+        );
+        true
     }
 
     fn handle_config_panel_action(&mut self, event: &crossterm::event::Event) -> bool {
@@ -4571,12 +4899,15 @@ impl TuiState {
                     self.config_panel.set_status("No model selected");
                     return true;
                 };
-                let result = run_gateway_api_blocking(move |client| async move {
-                    client.update_config_model(&model).await
-                });
-                self.config_panel
-                    .record_action_result("config.model.update", result);
-                self.refresh_config_panel();
+                self.queue_gateway_api(
+                    move |client| async move { client.update_config_model(&model).await },
+                    |state, result| {
+                        state
+                            .config_panel
+                            .record_action_result("config.model.update", result);
+                        state.refresh_config_panel();
+                    },
+                );
                 true
             }
             _ => false,
@@ -4799,6 +5130,44 @@ fn approval_backlink_object_matches_target(target: &str, object: &serde_json::Va
         })
 }
 
+fn evidence_backlink_object_matches_target(target: &str, object: &serde_json::Value) -> bool {
+    let expected = target
+        .strip_prefix("evidence://matrix/")
+        .or_else(|| target.strip_prefix("evidence://"))
+        .or_else(|| target.strip_prefix("mfg:evidence:"))
+        .map(|value| value.split(['/', '?', '#']).next().unwrap_or_default())
+        .filter(|value| !value.is_empty());
+    let Some(expected) = expected else {
+        return false;
+    };
+    fn contains_identity(value: &serde_json::Value, expected: &str) -> bool {
+        match value {
+            serde_json::Value::Object(object) => {
+                ["packet_id", "evidence_id", "id", "ref"]
+                    .into_iter()
+                    .any(|field| {
+                        object
+                            .get(field)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| {
+                                value == expected
+                                    || value.ends_with(&format!("://matrix/{expected}"))
+                                    || value.ends_with(&format!(":{expected}"))
+                            })
+                    })
+                    || object
+                        .values()
+                        .any(|value| contains_identity(value, expected))
+            }
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| contains_identity(value, expected)),
+            _ => false,
+        }
+    }
+    contains_identity(object, expected)
+}
+
 /// Surface backlinks span two exact object planes: cross-plane receipts and
 /// per-surface outbox/message records.  Validate both the object identity and
 /// the surface namespace before allowing a response to replace the focused
@@ -5013,44 +5382,6 @@ impl L4MemoryView {
     }
 }
 
-fn gateway_api_auth_token() -> Option<String> {
-    crate::gateway_client::default_auth_token()
-}
-
-fn run_gateway_api_blocking<F, Fut>(operation: F) -> Result<serde_json::Value, String>
-where
-    F: FnOnce(crate::gateway_client::GatewayApiClient) -> Fut + Send + 'static,
-    Fut: std::future::Future<
-            Output = Result<serde_json::Value, crate::gateway_client::GatewayApiError>,
-        > + Send
-        + 'static,
-{
-    let run = move || {
-        let Some(client) = crate::gateway_client::GatewayApiClient::ensure_running_with_retry(
-            gateway_api_auth_token(),
-        )
-        .map_err(|err| err.to_string())?
-        else {
-            return Err("Gateway API is not running".to_string());
-        };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| err.to_string())?;
-        runtime
-            .block_on(operation(client))
-            .map_err(|err| err.to_string())
-    };
-
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(run)
-            .join()
-            .map_err(|_| "Gateway API worker panicked".to_string())?
-    } else {
-        run()
-    }
-}
-
 fn first_surface_message_id(value: &serde_json::Value) -> Option<String> {
     first_string_field(
         value,
@@ -5117,6 +5448,20 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
 
+    fn gateway_correlation(
+        session_id: &str,
+        execution_id: &str,
+        turn_id: &str,
+    ) -> crate::protocol::GatewayEventCorrelation {
+        crate::protocol::GatewayEventCorrelation {
+            session_id: session_id.to_string(),
+            execution_id: Some(execution_id.to_string()),
+            turn_id: Some(turn_id.to_string()),
+            part_id: Some("assistant_text".to_string()),
+            ..Default::default()
+        }
+    }
+
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5147,10 +5492,139 @@ mod tests {
         assert_eq!(state.theme_engine.theme.name, "dark");
     }
 
+    #[tokio::test]
+    async fn gateway_effect_is_deferred_and_reduced_only_on_the_ui_owner() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let operation_ran = Arc::new(AtomicBool::new(false));
+        let completion_ran = Arc::new(AtomicBool::new(false));
+        let operation_probe = Arc::clone(&operation_ran);
+        let completion_probe = Arc::clone(&completion_ran);
+        let mut state = TuiState::new("test-model", "test-session");
+        state.queue_gateway_api(
+            move |_client| async move {
+                operation_probe.store(true, Ordering::SeqCst);
+                Ok(serde_json::json!({"ok": true}))
+            },
+            move |_state, result| {
+                assert_eq!(
+                    result.expect("background result"),
+                    serde_json::json!({"ok": true})
+                );
+                completion_probe.store(true, Ordering::SeqCst);
+            },
+        );
+
+        assert!(
+            !operation_ran.load(Ordering::SeqCst),
+            "queuing an HTTP effect must never execute it on the input/render thread"
+        );
+        let mut pending = state.take_pending_core_gateway_effects();
+        assert_eq!(pending.len(), 1);
+        let PendingCoreGatewayEffect {
+            session_id,
+            authority_generation,
+            operation,
+            completion,
+        } = pending.pop().expect("queued effect");
+        let client = crate::gateway_client::GatewayApiClient::new("http://127.0.0.1:1", None)
+            .expect("client");
+        let result = operation(client).await.map_err(|error| error.to_string());
+        assert!(operation_ran.load(Ordering::SeqCst));
+        assert!(
+            !completion_ran.load(Ordering::SeqCst),
+            "background completion must not mutate UI state"
+        );
+
+        CompletedCoreGatewayEffect::new(session_id, authority_generation, result, completion)
+            .apply_if_current(&mut state);
+        assert!(completion_ran.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn model_switch_waits_for_gateway_authority_and_rolls_back_on_failure() {
+        let mut state = TuiState::new("model-a", "session-model");
+        state.app.available_models = vec!["model-a".to_string(), "model-b".to_string()];
+        state.app.requested_model = Some("model-a".to_string());
+
+        state.dispatch_action(Action::NextModel);
+        assert_eq!(state.app.model, "model-b");
+        assert_eq!(
+            state.app.requested_model.as_deref(),
+            Some("model-a"),
+            "the requested model remains authoritative until Gateway confirms the PATCH"
+        );
+        let mut pending = state.take_pending_core_gateway_effects();
+        assert_eq!(pending.len(), 1);
+        let PendingCoreGatewayEffect { completion, .. } =
+            pending.pop().expect("model update effect");
+        CompletedCoreGatewayEffect::new(
+            state.app.session_id.clone(),
+            state.authority_generation(),
+            Err("Gateway rejected model".to_string()),
+            completion,
+        )
+        .apply_if_current(&mut state);
+
+        assert_eq!(state.app.model, "model-a");
+        assert_eq!(state.app.requested_model.as_deref(), Some("model-a"));
+        assert!(!state.app.model_dirty);
+        assert!(state
+            .app
+            .notification
+            .as_deref()
+            .is_some_and(|value| value.contains("rolled back")));
+    }
+
+    #[test]
+    fn revoked_authority_rejects_late_core_gateway_completion() {
+        let mut state = TuiState::new("model-a", "session-a");
+        state.queue_gateway_api(
+            |_client| async { Ok(serde_json::json!({"secret":"late"})) },
+            |state, result| {
+                if result.is_ok() {
+                    state.app.input.set_text("late secret completion");
+                }
+            },
+        );
+        let PendingCoreGatewayEffect {
+            session_id,
+            authority_generation,
+            completion,
+            ..
+        } = state
+            .take_pending_core_gateway_effects()
+            .pop()
+            .expect("queued completion");
+        state.revoke_session_authority("test revoke");
+        CompletedCoreGatewayEffect::new(
+            session_id,
+            authority_generation,
+            Ok(serde_json::json!({"secret":"late"})),
+            completion,
+        )
+        .apply_if_current(&mut state);
+
+        assert_ne!(state.app.input.text(), "late secret completion");
+        assert!(state
+            .app
+            .history_hydration_error
+            .as_deref()
+            .is_some_and(|error| error.contains("authorization revoked")));
+    }
+
     #[cfg(feature = "app-mfg")]
     #[test]
     fn product_app_surface_mounts_the_external_panel_and_its_transport_effects() {
         let mut state = TuiState::new("test-model", "test-session");
+        assert!(
+            state.app_tui_host.is_empty(),
+            "linked applications remain hidden until Gateway admission"
+        );
+        state.set_gateway_enabled_apps(&std::collections::BTreeSet::from(["mfg".to_string()]));
         assert_eq!(state.app_tui_host.panel_ids(), vec!["mfg".to_string()]);
 
         let effects = state.take_pending_app_transport_effects();
@@ -5166,6 +5640,29 @@ mod tests {
                 if request_id.starts_with("mfg.live.snapshot:")
                     && path == "/api/apps/mfg/live/snapshot"
         )));
+    }
+
+    #[cfg(feature = "app-mfg")]
+    #[test]
+    fn nested_app_focus_chord_is_offered_to_the_active_panel_before_host_switching() {
+        let mut state = TuiState::new("test-model", "test-session");
+        state.set_gateway_enabled_apps(&std::collections::BTreeSet::from(["mfg".to_string()]));
+        state.open_sidebar_tab(TAB_APPS, "Apps");
+
+        assert!(state.handle_app_panel_key(KeyEvent::new(
+            KeyCode::BackTab,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+        for _ in 0..100 {
+            state.toast_manager.tick();
+        }
+        let mut terminal = MockTerminal::new(160, 44);
+        terminal.draw(|frame| state.render(frame));
+        let joined = terminal.buffer_lines().join("\n");
+        assert!(
+            joined.contains("focus=Actions"),
+            "the host stole Ctrl+Shift+Tab instead of allowing MFG to move its nested focus:\n{joined}"
+        );
     }
 
     #[cfg(feature = "app-mfg")]
@@ -5189,6 +5686,14 @@ mod tests {
     #[test]
     fn application_backlink_identity_guards_accept_only_the_canonical_approval_and_surface_object()
     {
+        assert!(evidence_backlink_object_matches_target(
+            "evidence://matrix/packet-1",
+            &serde_json::json!({"packet": {"packet_id": "packet-1"}}),
+        ));
+        assert!(!evidence_backlink_object_matches_target(
+            "evidence://matrix/packet-1",
+            &serde_json::json!({"packet": {"packet_id": "packet-2"}}),
+        ));
         assert!(approval_backlink_object_matches_target(
             "approval://approval-1",
             &serde_json::json!({"approval_id": "approval-1", "status": "pending"}),
@@ -5222,6 +5727,51 @@ mod tests {
             "surface://webui/message-1",
             &serde_json::json!({"surface": "slack", "message_id": "message-1"}),
         ));
+    }
+
+    #[test]
+    fn late_application_backlink_response_cannot_refocus_a_newer_selection() {
+        let mut state = TuiState::new("model", "session");
+        state.apply_app_navigation_context(&serde_json::json!({
+            "kind": "backlink",
+            "target": "runtime-execution://execution-a",
+            "object": null,
+            "error": null,
+        }));
+        state.apply_app_navigation_context(&serde_json::json!({
+            "kind": "backlink",
+            "target": "runtime-execution://execution-b",
+            "object": null,
+            "error": null,
+        }));
+        state.apply_app_navigation_context(&serde_json::json!({
+            "kind": "backlink",
+            "target": "runtime-execution://execution-a",
+            "object": {"execution_id": "execution-a"},
+            "error": null,
+        }));
+        assert!(state
+            .runtime_activity_panel
+            .accepts_backlink_result("runtime-execution://execution-b"));
+        assert!(!state
+            .runtime_activity_panel
+            .accepts_backlink_result("runtime-execution://execution-a"));
+
+        state.apply_app_navigation_context(&serde_json::json!({
+            "kind": "backlink",
+            "target": "evidence://matrix/packet-b",
+            "object": null,
+            "error": null,
+        }));
+        state.apply_app_navigation_context(&serde_json::json!({
+            "kind": "backlink",
+            "target": "evidence://matrix/packet-a",
+            "object": {"packet": {"packet_id": "packet-a"}},
+            "error": null,
+        }));
+        assert!(state
+            .reality_panel
+            .accepts_backlink_result("evidence://matrix/packet-b"));
     }
 
     #[test]
@@ -5328,6 +5878,7 @@ mod tests {
         // picker methods
         let sessions = vec![crate::app::SessionSummary {
             id: "s1".into(),
+            title: None,
             path: "/tmp".into(),
             updated_at_ms: 1000,
             message_count: 3,
@@ -5365,12 +5916,28 @@ mod tests {
         let mut state = TuiState::new("m", "s");
 
         state.apply_event(CowdEvent::TurnStarted);
-        state.apply_event(CowdEvent::TextDelta {
-            text: "Hello world".into(),
+        let correlation = gateway_correlation("s", "execution-1", "turn-1");
+        state.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TextDelta {
+                correlation: correlation.clone(),
+                text: "Hello world".into(),
+                start_bytes: 0,
+                end_bytes: "Hello world".len(),
+                stream_revision: 1,
+            },
         });
-        state.apply_event(CowdEvent::TurnComplete {
-            assistant_text: String::new(),
-            iterations: 1,
+        state.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
+                correlation: crate::protocol::GatewayEventCorrelation {
+                    message_id: Some("assistant-1".to_string()),
+                    terminal_id: Some("terminal-1".to_string()),
+                    ..correlation
+                },
+                assistant_text: String::new(),
+                sequence: Some(1),
+                iterations: 1,
+                token_usage: None,
+            },
         });
 
         assert!(state.timeline_len() >= 1);
@@ -5534,6 +6101,10 @@ mod tests {
             result,
             ProcessedKey::Submit(text) if text == "  keep leading\nkeep trailing  "
         ));
+        assert_eq!(
+            state.app.input_history.last().map(String::as_str),
+            Some("  keep leading\nkeep trailing  ")
+        );
     }
 
     #[test]
@@ -6061,7 +6632,7 @@ mod tests {
     fn slash_result_opens_expected_surface() {
         let mut state = TuiState::new("m", "s");
 
-        state.open_surface_for_slash_result("status");
+        state.open_surface_for_slash_result("runtime");
         assert!(state.layout_state.sidebar_visible);
         assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
         assert_eq!(state.focus_target, FocusTarget::Sidebar);
@@ -6071,6 +6642,38 @@ mod tests {
         assert_eq!(
             state.focus_target,
             FocusTarget::TopicPanel(SidebarTopicPanel::Memory)
+        );
+    }
+
+    #[test]
+    fn application_backlink_completion_preserves_the_pending_runtime_identity() {
+        let mut state = TuiState::new("m", "s");
+        let target = "task://task-1";
+        state.apply_app_navigation_effect(
+            "/runtime",
+            Some(&serde_json::json!({
+                "kind": "backlink",
+                "target": target,
+                "object": null,
+                "error": null,
+            })),
+        );
+        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
+        assert!(state.runtime_activity_panel.accepts_backlink_result(target));
+
+        state.apply_app_navigation_effect(
+            "/runtime",
+            Some(&serde_json::json!({
+                "kind": "backlink",
+                "target": target,
+                "object": {"task_id": "task-1", "status": "active"},
+                "error": null,
+            })),
+        );
+        assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
+        assert!(
+            state.runtime_activity_panel.accepts_backlink_result(target),
+            "resolved navigation must not clear its own pending target"
         );
     }
 
@@ -6166,13 +6769,33 @@ mod tests {
             "missing top abbreviated session id: {joined}"
         );
         assert!(
-            joined.contains("deepseek-v4-pro STD"),
-            "missing footer model without prefix: {joined}"
+            joined.contains("m:deepseek-v4-pro…"),
+            "missing compact requested-model waiting state: {joined}"
         );
         assert!(
             !joined.contains("model:") && !joined.contains("focus:"),
             "footer should not show model prefix or focus: {joined}"
         );
+        assert!(
+            joined.contains("ctx —"),
+            "missing compact context: {joined}"
+        );
+    }
+
+    #[test]
+    fn render_never_double_counts_canonical_live_token_metrics() {
+        let mut state = TuiState::new("model", "session-token-render");
+        state.app.turn_interaction.submit_started();
+        state.app.turn_input_tokens = 10;
+        state.app.turn_output_tokens = 2;
+        state.app.input_tokens = 10;
+        state.app.output_tokens = 2;
+        state.app.token_count = 12;
+
+        let mut terminal = MockTerminal::new(100, 28);
+        terminal.draw(|frame| state.render(frame));
+
+        assert_eq!(state.app.token_count, 12);
     }
 
     #[test]
@@ -6238,6 +6861,23 @@ mod tests {
     }
 
     #[test]
+    fn normal_typing_and_suggestions_do_not_stack_focus_toasts() {
+        let mut state = TuiState::new("m", "s");
+
+        let result = state.process_raw_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+
+        assert!(matches!(result, ProcessedKey::Nothing));
+        assert!(
+            state.toast_manager.is_empty(),
+            "composer focus transitions must stay silent during ordinary typing"
+        );
+        assert!(matches!(
+            state.focus_target,
+            FocusTarget::Input | FocusTarget::PromptSuggestions
+        ));
+    }
+
+    #[test]
     fn input_up_down_moves_cursor_when_input_has_content() {
         let mut state = TuiState::new("m", "s");
         state.app.input_history.push("history".into());
@@ -6278,15 +6918,37 @@ mod tests {
     fn streaming_snapshot_deltas_replace_instead_of_duplicate() {
         let mut state = TuiState::new("m", "s");
         state.apply_event(CowdEvent::TurnStarted);
-        state.apply_event(CowdEvent::TextDelta {
-            text: "partial".into(),
+        let correlation = gateway_correlation("s", "execution-1", "turn-1");
+        state.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TextDelta {
+                correlation: correlation.clone(),
+                text: "partial".into(),
+                start_bytes: 0,
+                end_bytes: "partial".len(),
+                stream_revision: 1,
+            },
         });
-        state.apply_event(CowdEvent::TextDelta {
-            text: "partial output".into(),
+        state.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TextDelta {
+                correlation: correlation.clone(),
+                text: "partial output".into(),
+                start_bytes: 0,
+                end_bytes: "partial output".len(),
+                stream_revision: 2,
+            },
         });
-        state.apply_event(CowdEvent::TurnComplete {
-            assistant_text: "partial output".into(),
-            iterations: 1,
+        state.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
+                correlation: crate::protocol::GatewayEventCorrelation {
+                    message_id: Some("assistant-1".to_string()),
+                    terminal_id: Some("terminal-1".to_string()),
+                    ..correlation
+                },
+                assistant_text: "partial output".into(),
+                sequence: Some(1),
+                iterations: 1,
+                token_usage: None,
+            },
         });
 
         assert_eq!(state.timeline_len(), 1);

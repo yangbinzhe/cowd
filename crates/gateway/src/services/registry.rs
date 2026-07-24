@@ -612,8 +612,20 @@ mod tests {
         assert!(registry.storage_endpoints().iter().any(|endpoint| {
             endpoint.domain == storage::StorageDomainId::app("mfg", "primary")
         }));
+        let reviewed_revision = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../apps/mfg/source.lock.toml"
+        ))
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("rev = "))
+        .map(|value| value.trim_matches('"'))
+        .expect("reviewed MFG source-lock revision");
+        assert_eq!(
+            mfg.source_lock.as_ref().expect("MFG source lock").revision,
+            reviewed_revision
+        );
         let projection = serde_json::to_string(&registered).expect("registry projection");
-        assert!(projection.contains("cf7a13b5bcf233f8033190e4a2b017206805aa7b"));
+        assert!(projection.contains(reviewed_revision));
         assert!(!projection.contains(".sqlite"));
         assert!(!projection.contains(config_home.to_string_lossy().as_ref()));
         let _ = std::fs::remove_dir_all(config_home);

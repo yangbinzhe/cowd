@@ -1414,10 +1414,16 @@ impl MatrixSqliteRepository {
 
     pub fn build_evidence_packet(
         &self,
+        packet_id: Option<&str>,
         attention_id: Option<&str>,
         problem_statement: Option<&str>,
     ) -> Result<MatrixEvidencePacket, MatrixSqliteRepositoryError> {
         let connection = self.executor.checkout()?;
+        if let Some(packet_id) = packet_id {
+            if let Some(existing) = find_evidence_packet(&connection, packet_id)? {
+                return Ok(existing);
+            }
+        }
         let attention = match attention_id {
             Some(id) => Some(
                 find_attention(&connection, id)?
@@ -1431,6 +1437,9 @@ impl MatrixSqliteRepository {
                 .map(|item| item.title.as_str())
                 .unwrap_or("MATRIX operational evidence packet")
         }));
+        if let Some(packet_id) = packet_id {
+            packet.packet_id = packet_id.to_string();
+        }
         packet.attention_id = attention.as_ref().map(|item| item.attention_id.clone());
         if let Some(item) = attention {
             packet.confidence = item.confidence.min(0.75);
@@ -1468,8 +1477,13 @@ impl MatrixSqliteRepository {
                 packet.confidence = packet.confidence.max(0.65);
             }
         }
-        insert_evidence_packet(&connection, &packet)?;
-        Ok(packet)
+        insert_evidence_packet_once(&connection, &packet)?;
+        find_evidence_packet(&connection, &packet.packet_id)?.ok_or_else(|| {
+            MatrixSqliteRepositoryError::NotFound(format!(
+                "canonical evidence packet {} disappeared after insert",
+                packet.packet_id
+            ))
+        })
     }
 
     pub fn insert_ai_harness_evidence_packet(
@@ -2536,6 +2550,24 @@ fn insert_evidence_packet(
 ) -> Result<(), MatrixSqliteRepositoryError> {
     connection.execute(
         r"INSERT OR REPLACE INTO matrix_evidence_packet (
+            packet_id, attention_id, packet_json, created_at
+        ) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            packet.packet_id,
+            packet.attention_id,
+            serde_json::to_string(packet)?,
+            packet.created_at.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_evidence_packet_once(
+    connection: &Connection,
+    packet: &MatrixEvidencePacket,
+) -> Result<(), MatrixSqliteRepositoryError> {
+    connection.execute(
+        r"INSERT OR IGNORE INTO matrix_evidence_packet (
             packet_id, attention_id, packet_json, created_at
         ) VALUES (?1, ?2, ?3, ?4)",
         params![

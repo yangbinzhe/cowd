@@ -315,10 +315,17 @@ const MIN_PROVIDER_INPUT_RESERVE_TOKENS: u32 = 4_096;
 
 fn bounded_provider_output_tokens(model: &str, context_window: u32) -> u32 {
     let provider_cap = provider::max_tokens_for_model(model);
-    let window_cap = context_window
+    let fixed_reserve_cap = context_window
         .saturating_sub(MIN_PROVIDER_INPUT_RESERVE_TOKENS)
-        .max(1_024);
-    provider_cap.min(window_cap)
+        .max(1);
+    // `max_tokens` is an output ceiling, not a reason to starve the request
+    // itself. Unknown/custom models commonly report a 64k generic provider
+    // cap; on a 16k context that previously reserved 12k for output and made
+    // Cowd's own production system/tool schema impossible to send. Preserve
+    // at least half of the physical window for input while still honoring
+    // smaller provider-specific output limits.
+    let balanced_cap = (context_window / 2).max(1);
+    provider_cap.min(fixed_reserve_cap).min(balanced_cap)
 }
 
 fn provider_transport_policy(
@@ -372,25 +379,6 @@ fn conversation_messages_token_estimate(messages: &[ConversationMessage]) -> u64
                 .saturating_add(crate::context_ledger::estimate_text_tokens(tool_name))
                 .saturating_add(crate::context_ledger::estimate_text_tokens(output)),
         })
-}
-
-fn latest_user_prompt_text(messages: &[ConversationMessage]) -> String {
-    messages
-        .iter()
-        .rev()
-        .find(|message| message.role == crate::session::MessageRole::User)
-        .map(|message| {
-            message
-                .blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
 }
 
 fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelStepIntent {
@@ -971,6 +959,7 @@ impl std::error::Error for ToolError {}
 pub struct RuntimeError {
     message: String,
     provider_context_window_limit: Option<u32>,
+    provider_tool_protocol_failure: bool,
 }
 
 impl RuntimeError {
@@ -979,6 +968,7 @@ impl RuntimeError {
         Self {
             message: message.into(),
             provider_context_window_limit: None,
+            provider_tool_protocol_failure: false,
         }
     }
 
@@ -990,12 +980,31 @@ impl RuntimeError {
         Self {
             message: message.into(),
             provider_context_window_limit,
+            provider_tool_protocol_failure: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_provider_failure_metadata(
+        message: impl Into<String>,
+        provider_context_window_limit: Option<u32>,
+        provider_tool_protocol_failure: bool,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            provider_context_window_limit,
+            provider_tool_protocol_failure,
         }
     }
 
     #[must_use]
     pub const fn provider_context_window_limit(&self) -> Option<u32> {
         self.provider_context_window_limit
+    }
+
+    #[must_use]
+    pub const fn is_provider_tool_protocol_failure(&self) -> bool {
+        self.provider_tool_protocol_failure
     }
 }
 
@@ -1065,6 +1074,11 @@ pub struct ModelStepResult {
     pub usage: TokenUsage,
     pub prompt_cache_events: Vec<PromptCacheEvent>,
     pub model: Option<String>,
+    /// Ordered provider/model candidates actually attempted for this
+    /// successful step, including failed fallbacks before the winner.
+    pub models_used: Vec<String>,
+    pub first_token_latency_ms: Option<u64>,
+    pub active_stream_duration_ms: Option<u64>,
     pub wall_duration_ms: u64,
     /// Whether this response was requested under the one-shot, zero-tool
     /// terminal checkpoint. Graph owners must enforce the boundary from the
@@ -1997,12 +2011,18 @@ where
         ))];
         let inventory = self.api_client.context_inventory();
         let mut last_error = None;
+        let mut models_tried = Vec::new();
 
         for model in self.model_candidates_for_turn(objective) {
             let mut request =
                 match self.pack_provider_attempt(&prompt, &messages, &model, inventory) {
                     Ok(request) => request,
                     Err(error) => {
+                        tracing::warn!(
+                            model,
+                            error = %error,
+                            "provider request preflight rejected clean terminal synthesis"
+                        );
                         last_error = Some(error);
                         continue;
                     }
@@ -2015,7 +2035,24 @@ where
                         continue;
                     }
                 };
+            if !models_tried.contains(&model) {
+                models_tried.push(model.clone());
+            }
+            if let Some(cowd) = &self.cowd_bus {
+                cowd.emit(crate::cowd_event::CowdEvent::ProviderAttempt {
+                    model: model.clone(),
+                    models_tried: models_tried.clone(),
+                    context_window_tokens: request.budget.context_window_tokens,
+                    context_window_source: request.budget.context_window_source.clone(),
+                    packed_input_tokens: request
+                        .budget
+                        .fixed_input_tokens
+                        .saturating_add(request.budget.dynamic_input_tokens)
+                        .saturating_add(request.budget.protocol_overhead_tokens),
+                });
+            }
             let cancellation = self.cancellation_token.clone();
+            let stream_started = Instant::now();
             let mut stream = self.api_client.stream(request);
             let mut text = String::new();
             let mut thinking = String::new();
@@ -2025,6 +2062,7 @@ where
             let mut cache_events = Vec::new();
             let mut effective_model = None;
             let mut failed = None;
+            let mut first_event_at = None;
             use futures::StreamExt;
             loop {
                 let event = tokio::select! {
@@ -2039,6 +2077,7 @@ where
                         None => break,
                     }
                 };
+                first_event_at.get_or_insert_with(Instant::now);
                 match event {
                     Ok(AssistantEvent::ProviderModel { model }) => {
                         effective_model = Some(model);
@@ -2073,6 +2112,9 @@ where
                 reservation.reconcile(usage);
             }
             if let Some(error) = failed {
+                if error.is_provider_tool_protocol_failure() {
+                    return Err(error);
+                }
                 last_error = Some(error);
                 continue;
             }
@@ -2092,6 +2134,12 @@ where
                     input: call.input.clone(),
                 });
             }
+            let effective_model = effective_model.or(Some(model));
+            if let Some(model) = effective_model.as_ref() {
+                if !models_tried.contains(model) {
+                    models_tried.push(model.clone());
+                }
+            }
             return Ok(ModelStepResult {
                 intent: classify_model_step_intent(text, calls),
                 assistant_message: ConversationMessage {
@@ -2101,7 +2149,13 @@ where
                 },
                 usage,
                 prompt_cache_events: cache_events,
-                model: effective_model.or(Some(model)),
+                model: effective_model,
+                models_used: models_tried.clone(),
+                first_token_latency_ms: first_event_at.map(|first| {
+                    u64::try_from(first.saturating_duration_since(stream_started).as_millis())
+                        .unwrap_or(u64::MAX)
+                }),
+                active_stream_duration_ms: first_event_at.map(|first| millis_since(first).max(1)),
                 wall_duration_ms: millis_since(started_at).max(1),
                 text_only_response: true,
             });
@@ -3760,6 +3814,7 @@ where
 
         let mut last_error = None;
         let mut candidates = VecDeque::from(model_candidates);
+        let mut models_tried = Vec::new();
         // One retry per model is sufficient: calibration only accepts a
         // smaller explicit provider limit, so the second request is strictly
         // smaller. Repeating beyond that would mask malformed provider errors.
@@ -3769,6 +3824,11 @@ where
                 match self.pack_provider_attempt(&prompt, &request_messages, &model, inventory) {
                     Ok(request) => request,
                     Err(error) => {
+                        tracing::warn!(
+                            model,
+                            error = %error,
+                            "provider request preflight rejected model candidate"
+                        );
                         last_error = Some(error);
                         continue;
                     }
@@ -3782,6 +3842,22 @@ where
                         continue;
                     }
                 };
+            if !models_tried.contains(&model) {
+                models_tried.push(model.clone());
+            }
+            if let Some(cowd) = &self.cowd_bus {
+                cowd.emit(crate::cowd_event::CowdEvent::ProviderAttempt {
+                    model: model.clone(),
+                    models_tried: models_tried.clone(),
+                    context_window_tokens: request.budget.context_window_tokens,
+                    context_window_source: request.budget.context_window_source.clone(),
+                    packed_input_tokens: request
+                        .budget
+                        .fixed_input_tokens
+                        .saturating_add(request.budget.dynamic_input_tokens)
+                        .saturating_add(request.budget.protocol_overhead_tokens),
+                });
+            }
             self.record_provider_context_request(&request, self.session().messages.len());
             let attempt_budget = self.runtime_budget_plan_for_candidates(&[model.clone()]);
             let transport_policy = provider_transport_policy(
@@ -3809,6 +3885,7 @@ where
                 None
             };
             let mut stream = self.api_client.stream(request);
+            let stream_started = Instant::now();
             let mut text = String::new();
             let mut effective_model = None;
             let mut thinking = String::new();
@@ -3817,6 +3894,7 @@ where
             let mut usage = TokenUsage::default();
             let mut cache_events = Vec::new();
             let mut failed = None;
+            let mut first_event_at = None;
             use futures::StreamExt;
             loop {
                 let next = tokio::select! {
@@ -3859,6 +3937,7 @@ where
                         }
                     }
                 };
+                first_event_at.get_or_insert_with(Instant::now);
                 match event {
                     Ok(AssistantEvent::ProviderModel { model }) => {
                         effective_model = Some(model);
@@ -3930,6 +4009,9 @@ where
                 reservation.reconcile(usage);
             }
             if let Some(error) = failed {
+                if error.is_provider_tool_protocol_failure() {
+                    return Err(error);
+                }
                 if let Some(observed_limit) = error.provider_context_window_limit() {
                     if calibration_retries.insert(model.clone())
                         && self.calibrate_model_context_window(&model, observed_limit)
@@ -3994,6 +4076,12 @@ where
                 &decision,
                 classified,
             );
+            let effective_model = effective_model.or(Some(model));
+            if let Some(model) = effective_model.as_ref() {
+                if !models_tried.contains(model) {
+                    models_tried.push(model.clone());
+                }
+            }
             return Ok(ModelStepResult {
                 intent,
                 assistant_message,
@@ -4001,7 +4089,13 @@ where
                 prompt_cache_events: cache_events,
                 // Preserve the model that actually produced the provider stream,
                 // not merely Runtime's preferred candidate.
-                model: effective_model.or(Some(model)),
+                model: effective_model,
+                models_used: models_tried.clone(),
+                first_token_latency_ms: first_event_at.map(|first| {
+                    u64::try_from(first.saturating_duration_since(stream_started).as_millis())
+                        .unwrap_or(u64::MAX)
+                }),
+                active_stream_duration_ms: first_event_at.map(|first| millis_since(first).max(1)),
                 wall_duration_ms: millis_since(started_at).max(1),
                 text_only_response,
             });
@@ -4237,6 +4331,9 @@ where
         prompt_cache_events: Vec<PromptCacheEvent>,
         iterations: usize,
         model: Option<String>,
+        models_used: Vec<String>,
+        first_token_latency_ms: Option<u64>,
+        active_stream_duration_ms: u64,
         input_tokens: u64,
         output_tokens: u64,
         wall_duration_ms: u64,
@@ -4299,9 +4396,9 @@ where
         let usage = self.usage_tracker.cumulative_usage();
         let telemetry = crate::cowd_event::RunModelTelemetry {
             model: model.clone(),
-            models_used: model.into_iter().collect(),
-            first_token_latency_ms: None,
-            active_stream_duration_ms: None,
+            models_used,
+            first_token_latency_ms,
+            active_stream_duration_ms: Some(active_stream_duration_ms.max(1)),
             wall_duration_ms: wall_duration_ms.max(1),
             output_chars: final_answer.chars().count() as u64,
             output_chunks: iterations as u64,
@@ -4360,6 +4457,9 @@ where
         self.record_turn_completed(&summary);
         self.record_ai_kernel_trace_event(&summary.ai_kernel_trace, self.session().messages.len());
         if let Some(ref cowd) = self.cowd_bus {
+            cowd.emit(crate::cowd_event::CowdEvent::WriteAttemptsObserved {
+                paths: summary.write_attempt_paths.clone(),
+            });
             cowd.emit(crate::cowd_event::CowdEvent::RunModelTelemetry {
                 telemetry: summary.model_telemetry.clone(),
             });
@@ -4411,26 +4511,35 @@ where
                     status: harness_contract::projection::ExecutionLiveStatus::WaitingApproval,
                     detail: Some("runtime_strategy_tool_batch".to_string()),
                 });
-                cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
-                    tool: "runtime_strategy_tool_batch".to_string(),
-                });
             }
-            match gate
-                .require_explicit_approval("runtime_strategy_tool_batch", &approval_input)
-                .await
-            {
+            let approval_bus = self.cowd_bus().cloned();
+            let approval_result = gate
+                .require_explicit_approval_with_observer(
+                    "runtime_strategy_tool_batch",
+                    &approval_input,
+                    move |request| {
+                        if let Some(cowd) = approval_bus {
+                            cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
+                                request_id: request.id.clone(),
+                                tool: "runtime_strategy_tool_batch".to_string(),
+                            });
+                        }
+                    },
+                )
+                .await;
+            match approval_result {
                 crate::approval_gate::ApprovalGateResult::Approved { .. }
                 | crate::approval_gate::ApprovalGateResult::AutoPass { .. } => {
                     validation.approval_satisfied = true;
                 }
-                crate::approval_gate::ApprovalGateResult::Denied { reason } => {
+                crate::approval_gate::ApprovalGateResult::Denied { reason, .. } => {
                     validation.allowed = false;
                     validation
                         .findings
                         .push(format!("critical_mutation_approval_denied:{reason}"));
                     return;
                 }
-                crate::approval_gate::ApprovalGateResult::TimedOut => {
+                crate::approval_gate::ApprovalGateResult::TimedOut { .. } => {
                     validation.allowed = false;
                     validation
                         .findings
@@ -4599,12 +4708,23 @@ where
                 // Smart approval gate check
                 if !strategy_approval_satisfied {
                     if let Some(gate) = &self.approval_gate {
-                        let gate_result = gate.evaluate(tool_name, &effective_input).await;
+                        let approval_bus = self.cowd_bus().cloned();
+                        let approval_tool = tool_name.to_string();
+                        let gate_result = gate
+                            .evaluate_with_observer(tool_name, &effective_input, move |request| {
+                                if let Some(cowd) = approval_bus {
+                                    cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
+                                        request_id: request.id.clone(),
+                                        tool: approval_tool,
+                                    });
+                                }
+                            })
+                            .await;
                         let denial_reason = match gate_result {
-                            crate::approval_gate::ApprovalGateResult::Denied { reason } => {
+                            crate::approval_gate::ApprovalGateResult::Denied { reason, .. } => {
                                 Some(reason)
                             }
-                            crate::approval_gate::ApprovalGateResult::TimedOut => {
+                            crate::approval_gate::ApprovalGateResult::TimedOut { .. } => {
                                 Some(format!("approval timed out for tool `{tool_name}`"))
                             }
                             crate::approval_gate::ApprovalGateResult::AutoPass { .. }
@@ -7101,6 +7221,7 @@ where
 
     /// Admit exactly one strategy identity for a turn. This is the only
     /// conversation-layer call site allowed to create a decision.
+    #[cfg(test)]
     pub(crate) fn begin_turn_strategy(
         &self,
         turn_ref: impl Into<String>,
@@ -9027,6 +9148,46 @@ mod tests {
         );
         assert!(!request.prompt.contextual_packets.is_empty());
         assert!(!request.budget.omitted_packet_ids.is_empty());
+    }
+
+    #[test]
+    fn custom_model_output_ceiling_cannot_starve_production_input_window() {
+        let context_window = 16_384;
+        let output =
+            super::bounded_provider_output_tokens("custom-model-with-generic-cap", context_window);
+        assert_eq!(output, context_window / 2);
+
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["production system policy ".repeat(400)],
+        )
+        .without_memory();
+        runtime.set_active_model("custom-model-with-generic-cap");
+        runtime = runtime.with_model_context_window(context_window);
+
+        let request = runtime
+            .pack_provider_attempt(
+                &PromptAssembly::new(vec!["production system policy ".repeat(400)]),
+                &[ConversationMessage::user_text(
+                    "current durable user turn ".repeat(20),
+                )],
+                "custom-model-with-generic-cap",
+                super::ProviderContextInventory {
+                    tool_count: 3,
+                    tool_schema_tokens: 1_740,
+                },
+            )
+            .expect("production prompt and bootstrap schemas must reach a 16k custom model");
+
+        assert_eq!(
+            request.budget.requested_output_tokens,
+            u64::from(context_window / 2)
+        );
+        assert!(request.budget.executable);
+        assert!(request.budget.fixed_input_tokens <= request.budget.hard_input_cap_tokens);
     }
 
     #[derive(Clone)]

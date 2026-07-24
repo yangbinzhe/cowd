@@ -329,8 +329,20 @@ pub fn app_with_tool_calls(n: usize) -> App {
 pub fn app_streaming() -> App {
     let mut app = App::new("fixture-model", "fixture-session");
     app.apply_event(CowdEvent::TurnStarted);
-    app.apply_event(CowdEvent::TextDelta {
-        text: "Streaming response...".into(),
+    app.apply_event(CowdEvent::GatewaySession {
+        event: crate::protocol::GatewaySessionEvent::TextDelta {
+            correlation: crate::protocol::GatewayEventCorrelation {
+                session_id: "fixture-session".to_string(),
+                execution_id: Some("fixture-execution".to_string()),
+                turn_id: Some("fixture-turn".to_string()),
+                part_id: Some("assistant_text".to_string()),
+                ..Default::default()
+            },
+            text: "Streaming response...".into(),
+            start_bytes: 0,
+            end_bytes: "Streaming response...".len(),
+            stream_revision: 1,
+        },
     });
     app
 }

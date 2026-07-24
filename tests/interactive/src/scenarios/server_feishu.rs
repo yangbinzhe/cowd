@@ -1,7 +1,10 @@
 use crate::reporter::TestRunner;
 
 pub fn has_scenario(name: &str) -> bool {
-    matches!(name, "server_feishu_status" | "server_feishu_config" | "" | "all")
+    matches!(
+        name,
+        "server_feishu_status" | "server_feishu_config" | "" | "all"
+    )
 }
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {

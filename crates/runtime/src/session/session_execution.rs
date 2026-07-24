@@ -694,8 +694,13 @@ impl SessionInputRouter {
         content: &str,
         request: &SessionRuntimeOutboxRequest,
     ) -> Result<SessionRuntimeOutboxRecord, SessionInputRouterError> {
-        let content_json = serde_json::to_string(&json!([{ "type": "text", "text": content }]))
-            .map_err(|error| SessionInputRouterError::Runtime(error.to_string()))?;
+        let content_json = serde_json::to_string(&json!([{
+            "type": "text",
+            "text": content,
+            "cowd_turn_id": request.turn_id,
+            "cowd_turn_ingress_message_id": request.message_id,
+        }]))
+        .map_err(|error| SessionInputRouterError::Runtime(error.to_string()))?;
         self.store
             .append_ingress_with_runtime_outbox(
                 session_id,

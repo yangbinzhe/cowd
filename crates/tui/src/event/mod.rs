@@ -140,18 +140,20 @@ mod tests {
     }
 
     // ── existing_events_tests_still_pass ──────────────────────
-    // Verifies backward compatibility: the CowdEvent channel
-    // (cowd_event_channel / CowdEventSender / CowdEventReceiver)
-    // in tui::events still works after the EventBus module is introduced.
+    // Verifies the CowdEvent channel (cowd_event_channel /
+    // CowdEventSender / CowdEventReceiver) still works after the EventBus
+    // module is introduced.
     #[test]
     fn existing_events_tests_still_pass() {
         let (tx, mut rx) = crate::events::cowd_event_channel();
-        tx.send(CowdEvent::TextDelta {
-            text: "backward-compat".into(),
+        tx.send(CowdEvent::ThinkingDelta {
+            thinking: "channel-event".into(),
         })
         .unwrap();
         let event = rx.try_recv().unwrap();
-        assert!(matches!(event, CowdEvent::TextDelta { text } if text == "backward-compat"));
+        assert!(
+            matches!(event, CowdEvent::ThinkingDelta { thinking } if thinking == "channel-event")
+        );
     }
 
     // ── drain_clears_queue ────────────────────────────────────

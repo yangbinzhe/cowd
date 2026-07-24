@@ -244,14 +244,18 @@ async fn get_surface_status_handler(
 async fn get_surface_trigger_events_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let surface = surface::normalize_surface_id(&id);
-    let events = state.services.surface.trigger_events(&surface);
-    Json(serde_json::json!({
+    let events = state
+        .services
+        .surface
+        .trigger_events(&surface)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
         "kind": "surface.trigger_events",
         "surface": surface,
         "events": events,
-    }))
+    })))
 }
 
 async fn retry_surface_trigger_event_handler(

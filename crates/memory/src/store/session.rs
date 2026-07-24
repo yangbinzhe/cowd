@@ -502,8 +502,81 @@ fn init_schema(conn: &Connection) -> Result<()> {
         [],
     )
     .map_err(sql_err)?;
+    // The reconciliation reads and writes the token summary columns. Legacy
+    // databases receive those columns above, so this must remain after every
+    // sessions-table ALTER and before the schema transaction commits.
+    reconcile_legacy_session_summaries(conn)?;
 
     conn.execute_batch("COMMIT;").map_err(sql_err)?;
+    Ok(())
+}
+
+fn reconcile_legacy_session_summaries(conn: &Connection) -> Result<()> {
+    const MIGRATION_ID: &str = "session.0003.reconcile-message-summaries";
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS session_store_migrations (
+            migration_id TEXT PRIMARY KEY,
+            applied_at_ms INTEGER NOT NULL
+        )",
+        [],
+    )
+    .map_err(sql_err)?;
+    let applied = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM session_store_migrations WHERE migration_id=?1
+            )",
+            params![MIGRATION_ID],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_err)?;
+    if applied {
+        return Ok(());
+    }
+    // Legacy databases can already contain `sessions` rows before the
+    // external-content FTS table and its UPDATE trigger are installed.
+    // Rebuild first; otherwise the trigger's delete command targets a missing
+    // FTS row and SQLite reports the database image as malformed.
+    conn.execute(
+        "INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild')",
+        [],
+    )
+    .map_err(sql_err)?;
+    conn.execute_batch(
+        r"UPDATE sessions
+              SET message_count = (
+                      SELECT COUNT(*) FROM messages WHERE session_id=sessions.session_id
+                  ),
+                  input_tokens = COALESCE((
+                      SELECT SUM(
+                          CASE WHEN token_usage_json IS NOT NULL
+                                    AND json_valid(token_usage_json)
+                                    AND json_type(token_usage_json, '$.input_tokens') = 'integer'
+                                    AND json_extract(token_usage_json, '$.input_tokens') >= 0
+                               THEN COALESCE(json_extract(token_usage_json, '$.input_tokens'), 0)
+                               ELSE 0 END
+                      )
+                        FROM messages WHERE session_id=sessions.session_id
+                  ), 0),
+                  output_tokens = COALESCE((
+                      SELECT SUM(
+                          CASE WHEN token_usage_json IS NOT NULL
+                                    AND json_valid(token_usage_json)
+                                    AND json_type(token_usage_json, '$.output_tokens') = 'integer'
+                                    AND json_extract(token_usage_json, '$.output_tokens') >= 0
+                               THEN COALESCE(json_extract(token_usage_json, '$.output_tokens'), 0)
+                               ELSE 0 END
+                      )
+                        FROM messages WHERE session_id=sessions.session_id
+                  ), 0)",
+    )
+    .map_err(sql_err)?;
+    conn.execute(
+        "INSERT INTO session_store_migrations(migration_id, applied_at_ms)
+         VALUES (?1, ?2)",
+        params![MIGRATION_ID, Utc::now().timestamp_millis().max(0)],
+    )
+    .map_err(sql_err)?;
     Ok(())
 }
 
@@ -989,6 +1062,67 @@ fn query_outbox(conn: &Connection, request_id: &str) -> Result<Option<SessionRun
     )
     .optional()
     .map_err(sql_err)
+}
+
+fn refresh_session_message_summary_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+    activity_ms: u64,
+) -> Result<()> {
+    let activity_ms = i64::try_from(activity_ms).unwrap_or(i64::MAX);
+    let activity = DateTime::<Utc>::from_timestamp_millis(activity_ms)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339();
+    tx.execute(
+        r"UPDATE sessions
+              SET message_count = (
+                      SELECT COUNT(*) FROM messages WHERE session_id = ?1
+                  ),
+                  last_activity = CASE
+                      WHEN updated_at_ms <= ?3 THEN ?2
+                      ELSE last_activity
+                  END,
+                  updated_at_ms = MAX(updated_at_ms, ?3)
+            WHERE session_id = ?1",
+        params![session_id, activity, activity_ms],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn refresh_session_usage_summary_tx(
+    tx: &rusqlite::Transaction<'_>,
+    session_id: &str,
+) -> Result<()> {
+    tx.execute(
+        r"UPDATE sessions
+              SET input_tokens = COALESCE((
+                      SELECT SUM(
+                          CASE WHEN token_usage_json IS NOT NULL
+                                    AND json_valid(token_usage_json)
+                                    AND json_type(token_usage_json, '$.input_tokens') = 'integer'
+                                    AND json_extract(token_usage_json, '$.input_tokens') >= 0
+                               THEN COALESCE(json_extract(token_usage_json, '$.input_tokens'), 0)
+                               ELSE 0 END
+                      )
+                        FROM messages WHERE session_id=?1
+                  ), 0),
+                  output_tokens = COALESCE((
+                      SELECT SUM(
+                          CASE WHEN token_usage_json IS NOT NULL
+                                    AND json_valid(token_usage_json)
+                                    AND json_type(token_usage_json, '$.output_tokens') = 'integer'
+                                    AND json_extract(token_usage_json, '$.output_tokens') >= 0
+                               THEN COALESCE(json_extract(token_usage_json, '$.output_tokens'), 0)
+                               ELSE 0 END
+                      )
+                        FROM messages WHERE session_id=?1
+                  ), 0)
+            WHERE session_id=?1",
+        params![session_id],
+    )
+    .map_err(sql_err)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1958,6 +2092,7 @@ impl SqliteSessionStore {
         message_id: &str,
         session_id: &str,
         content_json: &str,
+        token_usage_json: Option<&str>,
         created_at_ms: u64,
     ) -> Result<(SessionMessage, bool)> {
         if message_id.trim().is_empty() || session_id.trim().is_empty() {
@@ -1992,14 +2127,27 @@ impl SqliteSessionStore {
             )
             .optional()
             .map_err(sql_err)?;
-        if let Some(existing) = existing {
+        if let Some(mut existing) = existing {
             if existing.session_id != session_id
                 || existing.role != "assistant"
                 || existing.content_json != content_json
+                || matches!(
+                    (existing.token_usage_json.as_deref(), token_usage_json),
+                    (Some(existing), Some(requested)) if existing != requested
+                )
             {
                 return Err(MemoryError::Store(format!(
                     "terminal message_id `{message_id}` conflicts with committed content"
                 )));
+            }
+            if existing.token_usage_json.is_none() && token_usage_json.is_some() {
+                tx.execute(
+                    "UPDATE messages SET token_usage_json=?2 WHERE stable_message_id=?1",
+                    params![message_id, token_usage_json],
+                )
+                .map_err(sql_err)?;
+                existing.token_usage_json = token_usage_json.map(ToOwned::to_owned);
+                refresh_session_usage_summary_tx(&tx, session_id)?;
             }
             tx.commit().map_err(sql_err)?;
             return Ok((existing, false));
@@ -2014,16 +2162,20 @@ impl SqliteSessionStore {
         tx.execute(
             "INSERT INTO messages
              (stable_message_id, session_id, sequence, role, content_json, blocks_count,
-              created_at_ms) VALUES (?1, ?2, ?3, 'assistant', ?4, 1, ?5)",
+              token_usage_json, created_at_ms)
+              VALUES (?1, ?2, ?3, 'assistant', ?4, 1, ?5, ?6)",
             params![
                 message_id,
                 session_id,
                 sequence as i64,
                 content_json,
+                token_usage_json,
                 created_at_ms as i64
             ],
         )
         .map_err(sql_err)?;
+        refresh_session_message_summary_tx(&tx, session_id, created_at_ms)?;
+        refresh_session_usage_summary_tx(&tx, session_id)?;
         tx.commit().map_err(sql_err)?;
         Ok((
             SessionMessage {
@@ -2035,11 +2187,199 @@ impl SqliteSessionStore {
                 blocks_count: 1,
                 tool_use_id: None,
                 tool_name: None,
-                token_usage_json: None,
+                token_usage_json: token_usage_json.map(ToOwned::to_owned),
                 created_at_ms,
             },
             true,
         ))
+    }
+
+    /// Atomically append the complete Runtime transcript for one terminal.
+    ///
+    /// The caller supplies stable IDs for every row and the final row must use
+    /// `terminal_message_id`. A retry either observes the complete identical
+    /// batch or fails closed; a partially matching batch is never accepted.
+    pub fn append_terminal_transcript_idempotent(
+        &self,
+        terminal_message_id: &str,
+        ingress_message_id: &str,
+        session_id: &str,
+        messages: &[SessionMessage],
+        created_at_ms: u64,
+    ) -> Result<(Vec<SessionMessage>, bool)> {
+        if terminal_message_id.trim().is_empty()
+            || ingress_message_id.trim().is_empty()
+            || session_id.trim().is_empty()
+            || messages.is_empty()
+            || messages
+                .last()
+                .is_none_or(|message| message.stable_message_id != terminal_message_id)
+        {
+            return Err(MemoryError::Store(
+                "terminal transcript requires a non-empty session, terminal ID, and terminal final row"
+                    .to_string(),
+            ));
+        }
+        if messages.iter().any(|message| {
+            message.stable_message_id.trim().is_empty()
+                || message.session_id != session_id
+                || message.role.trim().is_empty()
+                || serde_json::from_str::<serde_json::Value>(&message.content_json)
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .is_none()
+        }) {
+            return Err(MemoryError::Store(
+                "terminal transcript contains an invalid message row".to_string(),
+            ));
+        }
+        let unique_ids = messages
+            .iter()
+            .map(|message| message.stable_message_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if unique_ids.len() != messages.len() {
+            return Err(MemoryError::Store(
+                "terminal transcript contains duplicate stable message IDs".to_string(),
+            ));
+        }
+
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let load = |message_id: &str| -> Result<Option<SessionMessage>> {
+            tx.query_row(
+                "SELECT stable_message_id, session_id, sequence, role, content_json, blocks_count,
+                        tool_use_id, tool_name, token_usage_json, created_at_ms
+                   FROM messages WHERE stable_message_id = ?1",
+                params![message_id],
+                |row| {
+                    Ok(SessionMessage {
+                        stable_message_id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        sequence: row.get::<_, i64>(2)? as usize,
+                        role: row.get(3)?,
+                        content_json: row.get(4)?,
+                        blocks_count: row.get::<_, i64>(5)? as usize,
+                        tool_use_id: row.get(6)?,
+                        tool_name: row.get(7)?,
+                        token_usage_json: row.get(8)?,
+                        created_at_ms: row.get::<_, i64>(9)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(sql_err)
+        };
+        let terminal_exists = load(terminal_message_id)?.is_some();
+        let mut existing = Vec::with_capacity(messages.len());
+        for requested in messages {
+            match load(&requested.stable_message_id)? {
+                Some(committed) => {
+                    if committed.session_id != requested.session_id
+                        || committed.role != requested.role
+                        || committed.content_json != requested.content_json
+                        || committed.blocks_count != requested.blocks_count
+                        || committed.tool_use_id != requested.tool_use_id
+                        || committed.tool_name != requested.tool_name
+                        || committed.token_usage_json != requested.token_usage_json
+                    {
+                        return Err(MemoryError::Store(format!(
+                            "terminal transcript message_id `{}` conflicts with committed content",
+                            requested.stable_message_id
+                        )));
+                    }
+                    existing.push(committed);
+                }
+                None if terminal_exists => {
+                    return Err(MemoryError::Store(format!(
+                        "terminal transcript `{terminal_message_id}` is partially committed"
+                    )));
+                }
+                None => {}
+            }
+        }
+        if terminal_exists {
+            if existing.len() != messages.len() {
+                return Err(MemoryError::Store(format!(
+                    "terminal transcript `{terminal_message_id}` is partially committed"
+                )));
+            }
+            existing.sort_by_key(|message| message.sequence);
+            tx.commit().map_err(sql_err)?;
+            return Ok((existing, false));
+        }
+        if !existing.is_empty() {
+            return Err(MemoryError::Store(format!(
+                "terminal transcript `{terminal_message_id}` collides with existing intermediate rows"
+            )));
+        }
+
+        let _ingress_sequence = tx
+            .query_row(
+                "SELECT sequence FROM messages
+                  WHERE stable_message_id=?1 AND session_id=?2 AND role='user'",
+                params![ingress_message_id, session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .ok_or_else(|| {
+                MemoryError::Store(format!(
+                    "terminal transcript ingress `{ingress_message_id}` is not committed"
+                ))
+            })?;
+        // Durable sequence is an immutable append cursor. A later terminal may
+        // causally belong before already accepted queued ingress rows, but
+        // renumbering those published rows would make every Surface cursor
+        // skip or replay data. Causal ordering is carried in block metadata
+        // and reconstructed by Runtime/Surface reducers; physical storage
+        // remains append-only.
+        let first_sequence = tx
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM messages WHERE session_id=?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_err)
+            .and_then(|sequence| {
+                usize::try_from(sequence).map_err(|_| {
+                    MemoryError::Store("terminal transcript sequence overflow".to_string())
+                })
+            })?;
+        let mut committed = Vec::with_capacity(messages.len());
+        for (index, requested) in messages.iter().enumerate() {
+            let mut message = requested.clone();
+            message.sequence = first_sequence.saturating_add(index);
+            message.created_at_ms = created_at_ms.saturating_add(index as u64);
+            tx.execute(
+                r"INSERT INTO messages
+                    (stable_message_id, session_id, sequence, role, content_json, blocks_count,
+                     tool_use_id, tool_name, token_usage_json, created_at_ms)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    message.stable_message_id,
+                    message.session_id,
+                    message.sequence as i64,
+                    message.role,
+                    message.content_json,
+                    message.blocks_count as i64,
+                    message.tool_use_id,
+                    message.tool_name,
+                    message.token_usage_json,
+                    message.created_at_ms as i64,
+                ],
+            )
+            .map_err(sql_err)?;
+            committed.push(message);
+        }
+        let last_created_at = committed
+            .last()
+            .map_or(created_at_ms, |message| message.created_at_ms);
+        refresh_session_message_summary_tx(&tx, session_id, last_created_at)?;
+        refresh_session_usage_summary_tx(&tx, session_id)?;
+        tx.commit().map_err(sql_err)?;
+        Ok((committed, true))
     }
 
     /// Insert multiple messages in a single transaction.
@@ -2136,6 +2476,7 @@ impl SqliteSessionStore {
             ],
         )
         .map_err(sql_err)?;
+        refresh_session_message_summary_tx(&tx, &message.session_id, message.created_at_ms)?;
         tx.execute(
             r"INSERT INTO session_runtime_outbox
                 (request_id, turn_id, message_id, session_id, sequence, status,
@@ -2213,6 +2554,7 @@ impl SqliteSessionStore {
             ],
         )
         .map_err(sql_err)?;
+        refresh_session_message_summary_tx(&tx, session_id, created_at_ms)?;
         tx.execute(
             r"INSERT INTO session_runtime_outbox
                 (request_id, turn_id, message_id, session_id, sequence, status,
@@ -3952,6 +4294,92 @@ mod tests {
     }
 
     #[test]
+    fn terminal_transcript_preserves_published_cursor_and_is_idempotent() {
+        let (store, _dir) = make_store();
+        let session_id = "causal-terminal";
+        store.create_session(&make_record(session_id)).unwrap();
+        for (sequence, id, text, turn_id) in [
+            (0, "user-1", "first", "turn-1"),
+            (1, "user-2", "second", "turn-2"),
+        ] {
+            store
+                .insert_message(&SessionMessage {
+                    stable_message_id: id.to_string(),
+                    session_id: session_id.to_string(),
+                    sequence,
+                    role: "user".to_string(),
+                    content_json: serde_json::json!([{
+                        "type": "text",
+                        "text": text,
+                        "cowd_turn_id": turn_id,
+                        "cowd_turn_ingress_message_id": id,
+                    }])
+                    .to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: sequence as u64 + 1,
+                })
+                .unwrap();
+        }
+        let transcript = vec![SessionMessage {
+            stable_message_id: "assistant-1".to_string(),
+            session_id: session_id.to_string(),
+            sequence: usize::MAX,
+            role: "assistant".to_string(),
+            content_json: serde_json::json!([{
+                "type": "text",
+                "text": "first answer",
+                "cowd_turn_id": "turn-1",
+                "cowd_turn_ingress_message_id": "user-1",
+            }])
+            .to_string(),
+            blocks_count: 1,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: Some(
+                serde_json::json!({"input_tokens": 3, "output_tokens": 2}).to_string(),
+            ),
+            created_at_ms: 3,
+        }];
+
+        let (committed, inserted) = store
+            .append_terminal_transcript_idempotent(
+                "assistant-1",
+                "user-1",
+                session_id,
+                &transcript,
+                3,
+            )
+            .unwrap();
+        assert!(inserted);
+        assert_eq!(committed[0].sequence, 2);
+        let physical = store.get_all_messages(session_id).unwrap();
+        assert_eq!(
+            physical
+                .iter()
+                .map(|message| (message.stable_message_id.as_str(), message.sequence))
+                .collect::<Vec<_>>(),
+            vec![("user-1", 0), ("user-2", 1), ("assistant-1", 2)],
+            "already-published ingress cursors must never be renumbered"
+        );
+
+        let (replayed, inserted) = store
+            .append_terminal_transcript_idempotent(
+                "assistant-1",
+                "user-1",
+                session_id,
+                &transcript,
+                99,
+            )
+            .unwrap();
+        assert!(!inserted);
+        assert_eq!(replayed, committed);
+        assert_eq!(store.get_all_messages(session_id).unwrap(), physical);
+    }
+
+    #[test]
     fn list_sessions_by_workspace_root_filters_and_orders_by_activity() {
         let (store, _dir) = make_store();
         let workspace_a = "/tmp/cowd-workspace-a";
@@ -4853,6 +5281,14 @@ mod tests {
         assert_eq!(first, duplicate);
         assert_eq!(first.status, OutboxStatus::Pending);
         assert_eq!(store.get_message_count("s-outbox").unwrap(), 1);
+        assert_eq!(
+            store
+                .get_session("s-outbox")
+                .unwrap()
+                .unwrap()
+                .message_count,
+            1
+        );
 
         let mut conflicting = request;
         conflicting.turn_id = "turn-other".to_string();

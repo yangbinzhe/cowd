@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use memory::{OutboxFailureClass, SessionMissionOutboxOperation, UnifiedSessionStore};
@@ -251,64 +255,132 @@ async fn deliver_terminal(
     worker_id: &str,
     record: runtime::RuntimeSessionOutboxRecord,
 ) {
-    let outcome = decode_terminal_payload(&record.payload_ref).and_then(|text| {
-        serde_json::to_string(&serde_json::json!([{ "type": "text", "text": text }]))
-            .map_err(|error| {
-                (
-                    runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-                    error.to_string(),
-                )
-            })
-            .map(|content| (text, content))
-    });
-    let outcome = match outcome {
-        Ok((text, content_json)) => store
-            .append_terminal_message_idempotent(
-                &record.message_id,
-                &record.session_id,
-                &content_json,
-                now_ms(),
-            )
-            .await
-            .map(|(message, inserted)| (text, message, inserted))
-            .map_err(|error| {
-                (
+    let outcome = match decode_terminal_payload(&record.payload_ref) {
+        Ok(payload) => {
+            let mut transcript = payload.transcript.unwrap_or_else(|| {
+                vec![DecodedTerminalTranscriptMessage {
+                    role: "assistant".to_string(),
+                    content_json: serde_json::json!([
+                        { "type": "text", "text": payload.text.clone() }
+                    ])
+                    .to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: payload.token_usage_json.clone(),
+                }]
+            });
+            annotate_terminal_tool_instances(
+                &mut transcript,
+                record.execution_id.as_deref(),
+                record.turn_id.as_deref(),
+                payload.ingress_message_id.as_deref(),
+            );
+            let transcript_len = transcript.len();
+            let messages = transcript
+                .into_iter()
+                .enumerate()
+                .map(|(index, message)| memory::SessionMessage {
+                    stable_message_id: if index + 1 == transcript_len {
+                        record.message_id.clone()
+                    } else {
+                        format!("{}:transcript:{index}", record.message_id)
+                    },
+                    session_id: record.session_id.clone(),
+                    sequence: index,
+                    role: message.role,
+                    content_json: message.content_json,
+                    blocks_count: message.blocks_count,
+                    tool_use_id: message.tool_use_id,
+                    tool_name: message.tool_name,
+                    token_usage_json: message.token_usage_json,
+                    created_at_ms: 0,
+                })
+                .collect::<Vec<_>>();
+            let write = if let Some(ingress_message_id) = payload.ingress_message_id.as_deref() {
+                store
+                    .append_terminal_transcript_idempotent(
+                        &record.message_id,
+                        ingress_message_id,
+                        &record.session_id,
+                        &messages,
+                        now_ms(),
+                    )
+                    .await
+            } else {
+                let terminal = messages.last().expect("legacy transcript has one row");
+                store
+                    .append_terminal_message_idempotent(
+                        &record.message_id,
+                        &record.session_id,
+                        &terminal.content_json,
+                        terminal.token_usage_json.as_deref(),
+                        now_ms(),
+                    )
+                    .await
+                    .map(|(terminal, inserted)| (vec![terminal], inserted))
+            };
+            match write {
+                Ok((messages, inserted)) => {
+                    let terminal = messages.last().cloned().ok_or_else(|| {
+                        (
+                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                            "terminal transcript committed no terminal row".to_string(),
+                        )
+                    });
+                    terminal.map(|terminal| {
+                        (payload.text, payload.token_usage_json, terminal, inserted)
+                    })
+                }
+                Err(error) => Err((
                     runtime::RuntimeSessionOutboxFailureClass::Permanent,
                     error.to_string(),
-                )
-            }),
+                )),
+            }
+        }
         Err(error) => Err(error),
     };
     match outcome {
-        Ok((text, message, inserted)) => {
-            if inserted {
-                let mut event = serde_json::json!({
-                    "type": "TerminalCommitted",
-                    "session_id": record.session_id,
-                    "terminal_id": record.terminal_id,
-                    "message_id": record.message_id,
-                    "sequence": message.sequence,
-                    "response": text,
-                    "runtime_commit_cursor": record.commit_cursor,
-                });
-                if let Some(object) = event.as_object_mut() {
-                    if let Some(execution_id) = &record.execution_id {
-                        object.insert(
-                            "execution_id".to_string(),
-                            serde_json::Value::String(execution_id.clone()),
-                        );
-                    }
-                    if let Some(turn_id) = &record.turn_id {
-                        object.insert(
-                            "turn_id".to_string(),
-                            serde_json::Value::String(turn_id.clone()),
-                        );
-                    }
+        Ok((text, token_usage_json, message, inserted)) => {
+            // The message write is exactly-once; delivery notification is
+            // intentionally at-least-once. A process can die after commit but
+            // before broadcast, so suppressing a duplicate notification would
+            // leave live Surfaces permanently waiting. Stable terminal/message
+            // identities make replay harmless and let each Surface dedupe.
+            let mut event = serde_json::json!({
+                "type": "TerminalCommitted",
+                "session_id": record.session_id,
+                "terminal_id": record.terminal_id,
+                "message_id": record.message_id,
+                "part_id": "assistant_text",
+                "sequence": message.sequence,
+                "response": text,
+                "runtime_commit_cursor": record.commit_cursor,
+                "replayed": !inserted,
+            });
+            if let Some(object) = event.as_object_mut() {
+                if let Some(usage) = token_usage_json
+                    .as_deref()
+                    .and_then(|usage| serde_json::from_str(usage).ok())
+                {
+                    object.insert("token_usage".to_string(), usage);
                 }
-                event_bus
-                    .broadcast(&record.session_id, &event.to_string())
-                    .await;
+                if let Some(execution_id) = &record.execution_id {
+                    object.insert(
+                        "execution_id".to_string(),
+                        serde_json::Value::String(execution_id.clone()),
+                    );
+                }
+                if let Some(turn_id) = &record.turn_id {
+                    object.insert(
+                        "turn_id".to_string(),
+                        serde_json::Value::String(turn_id.clone()),
+                    );
+                }
             }
+            event_bus
+                .broadcast(&record.session_id, &event.to_string())
+                .await;
             let event_store = event_store.clone();
             let terminal_id = record.terminal_id.clone();
             let worker = worker_id.to_string();
@@ -353,16 +425,343 @@ async fn deliver_terminal(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedTerminalPayload {
+    pub(crate) text: String,
+    pub(crate) token_usage_json: Option<String>,
+    pub(crate) ingress_message_id: Option<String>,
+    pub(crate) transcript: Option<Vec<DecodedTerminalTranscriptMessage>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecodedTerminalTranscriptMessage {
+    pub(crate) role: String,
+    pub(crate) content_json: String,
+    pub(crate) blocks_count: usize,
+    pub(crate) tool_use_id: Option<String>,
+    pub(crate) tool_name: Option<String>,
+    pub(crate) token_usage_json: Option<String>,
+}
+
+fn annotate_terminal_tool_instances(
+    transcript: &mut [DecodedTerminalTranscriptMessage],
+    execution_id: Option<&str>,
+    turn_id: Option<&str>,
+    ingress_message_id: Option<&str>,
+) {
+    let mut ordinals = HashMap::<String, u64>::new();
+    let mut pending = HashMap::<String, VecDeque<String>>::new();
+    for message in transcript {
+        let Ok(mut blocks) = serde_json::from_str::<Vec<serde_json::Value>>(&message.content_json)
+        else {
+            continue;
+        };
+        for block in &mut blocks {
+            let Some(object) = block.as_object_mut() else {
+                continue;
+            };
+            if let Some(turn_id) = turn_id {
+                object.insert(
+                    "cowd_turn_id".to_string(),
+                    serde_json::Value::String(turn_id.to_string()),
+                );
+            }
+            if let Some(ingress_message_id) = ingress_message_id {
+                object.insert(
+                    "cowd_turn_ingress_message_id".to_string(),
+                    serde_json::Value::String(ingress_message_id.to_string()),
+                );
+            }
+            if let Some(execution_id) = execution_id {
+                object.insert(
+                    "cowd_execution_id".to_string(),
+                    serde_json::Value::String(execution_id.to_string()),
+                );
+            }
+            let (provider_id, is_use) = match object.get("type").and_then(serde_json::Value::as_str)
+            {
+                Some("tool_use") => (
+                    object
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned),
+                    true,
+                ),
+                Some("tool_result") => (
+                    object
+                        .get("tool_use_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned),
+                    false,
+                ),
+                _ => (None, false),
+            };
+            let Some(provider_id) = provider_id else {
+                continue;
+            };
+            let instance_id = if is_use {
+                let ordinal = ordinals.entry(provider_id.clone()).or_default();
+                let instance_id = format!("{provider_id}#cowd-{ordinal}");
+                *ordinal = ordinal.saturating_add(1);
+                pending
+                    .entry(provider_id)
+                    .or_default()
+                    .push_back(instance_id.clone());
+                instance_id
+            } else {
+                pending
+                    .entry(provider_id.clone())
+                    .or_default()
+                    .pop_front()
+                    .unwrap_or_else(|| {
+                        let ordinal = ordinals.entry(provider_id.clone()).or_default();
+                        let instance_id = format!("{provider_id}#cowd-{ordinal}");
+                        *ordinal = ordinal.saturating_add(1);
+                        instance_id
+                    })
+            };
+            object.insert(
+                "cowd_tool_instance_id".to_string(),
+                serde_json::Value::String(instance_id),
+            );
+        }
+        if let Ok(content_json) = serde_json::to_string(&blocks) {
+            message.content_json = content_json;
+        }
+    }
+}
+
 pub(crate) fn decode_terminal_payload(
     payload_ref: &str,
-) -> Result<String, (runtime::RuntimeSessionOutboxFailureClass, String)> {
+) -> Result<DecodedTerminalPayload, (runtime::RuntimeSessionOutboxFailureClass, String)> {
+    if let Some(encoded) = payload_ref
+        .strip_prefix("assistant_terminal_v2:")
+        .or_else(|| payload_ref.strip_prefix("assistant_terminal_v1:"))
+    {
+        let is_v2 = payload_ref.starts_with("assistant_terminal_v2:");
+        let payload = serde_json::from_str::<serde_json::Value>(encoded).map_err(|error| {
+            (
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                error.to_string(),
+            )
+        })?;
+        let text = payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| {
+                (
+                    runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                    "terminal payload has no visible text".to_string(),
+                )
+            })?
+            .to_string();
+        let token_usage_json = decode_terminal_usage(payload.get("token_usage"), is_v2)?;
+        let ingress_message_id = if is_v2 {
+            Some(
+                payload
+                    .get("ingress_message_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|message_id| !message_id.trim().is_empty())
+                    .ok_or_else(|| {
+                        (
+                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                            "terminal transcript requires ingress_message_id".to_string(),
+                        )
+                    })?
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        let transcript = if is_v2 {
+            let messages = payload
+                .get("transcript")
+                .and_then(serde_json::Value::as_array)
+                .filter(|messages| !messages.is_empty() && messages.len() <= 10_000)
+                .ok_or_else(|| {
+                    (
+                        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                        "terminal transcript must contain 1..=10000 messages".to_string(),
+                    )
+                })?;
+            let mut decoded = Vec::with_capacity(messages.len());
+            for message in messages {
+                let object = message.as_object().ok_or_else(|| {
+                    (
+                        runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                        "terminal transcript message must be an object".to_string(),
+                    )
+                })?;
+                let role = object
+                    .get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|role| matches!(*role, "system" | "user" | "assistant" | "tool"))
+                    .ok_or_else(|| {
+                        (
+                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                            "terminal transcript message has an invalid role".to_string(),
+                        )
+                    })?
+                    .to_string();
+                let blocks = object
+                    .get("blocks")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|blocks| !blocks.is_empty())
+                    .ok_or_else(|| {
+                        (
+                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                            "terminal transcript message must contain blocks".to_string(),
+                        )
+                    })?;
+                let (tool_use_id, tool_name) = blocks
+                    .iter()
+                    .find_map(|block| {
+                        let block = block.as_object()?;
+                        match block.get("type").and_then(serde_json::Value::as_str)? {
+                            "tool_use" => Some((
+                                block
+                                    .get("id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToOwned::to_owned),
+                                block
+                                    .get("name")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToOwned::to_owned),
+                            )),
+                            "tool_result" => Some((
+                                block
+                                    .get("tool_use_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToOwned::to_owned),
+                                block
+                                    .get("tool_name")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToOwned::to_owned),
+                            )),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or((None, None));
+                decoded.push(DecodedTerminalTranscriptMessage {
+                    role,
+                    content_json: serde_json::to_string(blocks).map_err(|error| {
+                        (
+                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                            error.to_string(),
+                        )
+                    })?,
+                    blocks_count: blocks.len(),
+                    tool_use_id,
+                    tool_name,
+                    token_usage_json: decode_terminal_usage(object.get("usage"), false)?,
+                });
+            }
+            let terminal = decoded.last_mut().ok_or_else(|| {
+                (
+                    runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                    "terminal transcript has no final message".to_string(),
+                )
+            })?;
+            let terminal_has_text = terminal.role == "assistant"
+                && serde_json::from_str::<serde_json::Value>(&terminal.content_json)
+                    .ok()
+                    .and_then(|value| value.as_array().cloned())
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                                && block.get("text").and_then(serde_json::Value::as_str)
+                                    == Some(text.as_str())
+                        })
+                    });
+            if !terminal_has_text {
+                return Err((
+                    runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                    "terminal transcript final assistant row does not contain terminal text"
+                        .to_string(),
+                ));
+            }
+            if terminal.token_usage_json.is_none() {
+                terminal.token_usage_json = token_usage_json.clone();
+            }
+            Some(decoded)
+        } else {
+            None
+        };
+        return Ok(DecodedTerminalPayload {
+            text,
+            token_usage_json,
+            ingress_message_id,
+            transcript,
+        });
+    }
     let encoded = payload_ref.strip_prefix("assistant_json:").ok_or_else(|| {
         (
             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-            "terminal payload does not use assistant_json".to_string(),
+            "terminal payload does not use a supported typed schema".to_string(),
         )
     })?;
-    serde_json::from_str::<String>(encoded).map_err(|error| {
+    serde_json::from_str::<String>(encoded)
+        .map(|text| DecodedTerminalPayload {
+            text,
+            token_usage_json: None,
+            ingress_message_id: None,
+            transcript: None,
+        })
+        .map_err(|error| {
+            (
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                error.to_string(),
+            )
+        })
+}
+
+fn decode_terminal_usage(
+    usage: Option<&serde_json::Value>,
+    required_core_fields: bool,
+) -> Result<Option<String>, (runtime::RuntimeSessionOutboxFailureClass, String)> {
+    let Some(usage) = usage else {
+        return if required_core_fields {
+            Err((
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                "terminal token_usage is required".to_string(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+    let usage = usage.as_object().ok_or_else(|| {
+        (
+            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+            "terminal token_usage must be an object".to_string(),
+        )
+    })?;
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ] {
+        let value = usage.get(field);
+        if required_core_fields
+            && matches!(field, "input_tokens" | "output_tokens")
+            && value.is_none()
+        {
+            return Err((
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                format!("terminal token_usage.{field} is required"),
+            ));
+        }
+        if value.is_some_and(|value| value.as_u64().is_none_or(|value| value > i64::MAX as u64)) {
+            return Err((
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                format!(
+                    "terminal token_usage.{field} must be a non-negative 64-bit database integer"
+                ),
+            ));
+        }
+    }
+    serde_json::to_string(usage).map(Some).map_err(|error| {
         (
             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
             error.to_string(),
@@ -426,10 +825,73 @@ mod tests {
     #[test]
     fn terminal_payload_requires_typed_prefix() {
         assert_eq!(
-            decode_terminal_payload("assistant_json:\"done\"").unwrap(),
+            decode_terminal_payload("assistant_json:\"done\"")
+                .unwrap()
+                .text,
             "done"
         );
+        let payload = decode_terminal_payload(
+            r#"assistant_terminal_v1:{"text":"done","token_usage":{"input_tokens":12,"output_tokens":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.text, "done");
+        assert!(payload
+            .token_usage_json
+            .as_deref()
+            .is_some_and(|usage| usage.contains("\"input_tokens\":12")));
+        assert!(decode_terminal_payload(
+            r#"assistant_terminal_v1:{"text":"done","token_usage":{"input_tokens":"12","output_tokens":3}}"#
+        )
+        .is_err());
         assert!(decode_terminal_payload("evidence:1").is_err());
+    }
+
+    #[test]
+    fn terminal_annotation_preserves_causality_on_non_tool_blocks() {
+        let mut transcript = vec![DecodedTerminalTranscriptMessage {
+            role: "assistant".to_string(),
+            content_json: serde_json::json!([
+                {"type": "thinking", "thinking": "reason"},
+                {"type": "text", "text": "done"}
+            ])
+            .to_string(),
+            blocks_count: 2,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: None,
+        }];
+
+        annotate_terminal_tool_instances(
+            &mut transcript,
+            Some("execution-1"),
+            Some("turn-1"),
+            Some("ingress-1"),
+        );
+
+        let blocks =
+            serde_json::from_str::<Vec<serde_json::Value>>(transcript[0].content_json.as_str())
+                .unwrap();
+        assert_eq!(blocks.len(), 2);
+        for block in blocks {
+            assert_eq!(
+                block
+                    .get("cowd_execution_id")
+                    .and_then(serde_json::Value::as_str),
+                Some("execution-1")
+            );
+            assert_eq!(
+                block
+                    .get("cowd_turn_id")
+                    .and_then(serde_json::Value::as_str),
+                Some("turn-1")
+            );
+            assert_eq!(
+                block
+                    .get("cowd_turn_ingress_message_id")
+                    .and_then(serde_json::Value::as_str),
+                Some("ingress-1")
+            );
+        }
     }
 
     #[tokio::test]
@@ -570,7 +1032,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_success_ack_failure_replays_without_duplicate_message_or_event() {
+    async fn append_success_ack_failure_replays_notification_without_duplicate_message() {
         let (event_store, store, event_bus, mut rx) = delivery_fixture().await;
         event_store
             .enqueue("t1", "m1", "s1", 7, "assistant_json:\"done\"")
@@ -589,6 +1051,7 @@ mod tests {
         assert_eq!(terminal_event["terminal_id"], "t1");
         assert_eq!(terminal_event["message_id"], "m1");
         assert_eq!(terminal_event["runtime_commit_cursor"], 7);
+        assert_eq!(terminal_event["replayed"], false);
         assert_eq!(event_store.get("t1").unwrap().unwrap().status, "claimed");
 
         let reclaimed = event_store
@@ -598,7 +1061,12 @@ mod tests {
             .unwrap();
         deliver_terminal(&event_store, &store, &event_bus, "owner-b", reclaimed).await;
         assert_eq!(store.get_messages("s1", 0, 10).await.unwrap().len(), 1);
-        assert!(rx.try_recv().is_err(), "replay must not rebroadcast");
+        let replayed: serde_json::Value =
+            serde_json::from_str(&rx.try_recv().expect("retry must rebroadcast")).unwrap();
+        assert_eq!(replayed["terminal_id"], "t1");
+        assert_eq!(replayed["message_id"], "m1");
+        assert_eq!(replayed["replayed"], true);
+        assert!(rx.try_recv().is_err(), "one retry emits one notification");
         assert_eq!(
             event_store.get("t1").unwrap().unwrap().status,
             "materialized"
@@ -621,6 +1089,41 @@ mod tests {
         assert_eq!(poison.len(), 1);
         assert_eq!(poison[0].terminal_id, "poison");
         assert_eq!(poison[0].failure_class.as_deref(), Some("corrupt_payload"));
+    }
+
+    #[tokio::test]
+    async fn typed_terminal_atomically_materializes_usage_and_session_counters_before_ack() {
+        let (event_store, store, event_bus, _rx) = delivery_fixture().await;
+        event_store
+            .enqueue(
+                "usage-terminal",
+                "usage-message",
+                "s1",
+                8,
+                r#"assistant_terminal_v1:{"text":"done","token_usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}"#,
+            )
+            .unwrap();
+        let record = event_store
+            .claim("worker", 100, 10, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        deliver_terminal(&event_store, &store, &event_bus, "worker", record).await;
+
+        let session = store.get_session("s1").await.unwrap().unwrap();
+        let messages = store.get_messages("s1", 0, 10).await.unwrap();
+        assert_eq!(session.message_count, 1);
+        assert_eq!(session.input_tokens, 12);
+        assert_eq!(session.output_tokens, 3);
+        assert_eq!(
+            messages[0]
+                .token_usage_json
+                .as_deref()
+                .and_then(|usage| serde_json::from_str::<serde_json::Value>(usage).ok())
+                .and_then(|usage| usage["output_tokens"].as_u64()),
+            Some(3)
+        );
     }
 
     #[tokio::test]

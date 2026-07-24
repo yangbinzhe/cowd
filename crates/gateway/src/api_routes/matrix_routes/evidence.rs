@@ -10,6 +10,7 @@ pub(super) async fn matrix_evidence_build_handler(
         .matrix
         .build_evidence_packet(
             &state.config_home,
+            None,
             request.attention_id.as_deref(),
             request.problem_statement.as_deref(),
         )

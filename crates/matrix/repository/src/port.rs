@@ -176,7 +176,7 @@ macro_rules! matrix_store_operations {
             list_metric_definitions() -> Vec<MatrixMetricDefinition>;
             metric_states(metric_id: &str) -> Vec<MatrixMetricState>;
             list_changes(limit: usize) -> Vec<MatrixChangeEvent>;
-            build_evidence_packet(attention_id: Option<&str>, problem_statement: Option<&str>) -> MatrixEvidencePacket;
+            build_evidence_packet(packet_id: Option<&str>, attention_id: Option<&str>, problem_statement: Option<&str>) -> MatrixEvidencePacket;
             insert_ai_harness_evidence_packet(packet: &MatrixEvidencePacket) -> MatrixEvidencePacket;
             get_evidence_packet(packet_id: &str) -> Option<MatrixEvidencePacket>;
             list_evidence_packets(limit: usize) -> Vec<MatrixEvidencePacket>;

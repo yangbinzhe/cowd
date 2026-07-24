@@ -5,12 +5,12 @@ use std::{
 
 use axum::{
     extract::{Extension, Path, Query, State as AxumState},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use memory::store::session::{SessionEvent, SessionRecord};
+use memory::store::session::{SessionEvent, SessionMessage, SessionRecord};
 use serde::{Deserialize, Serialize};
 
 use super::{surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
@@ -457,6 +457,7 @@ pub(super) async fn get_session_execution_index(
 struct SessionInfo {
     id: String,
     status: String,
+    message_count: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -589,15 +590,47 @@ async fn attach_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(body): Json<SessionAttachRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
-    let actor_id = surface_actor_id(&principal, &body.surface);
+    let observer_id = headers
+        .get("x-cowd-observer-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| super::validated_session_observer_id(Some(value)))
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "session attach requires a valid x-cowd-observer-id".to_string(),
+                }),
+            )
+        })?;
+    let role = body.role.as_deref().unwrap_or("reader");
+    if !matches!(role, "reader" | "writer") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session attachment role must be reader or writer".to_string(),
+            }),
+        ));
+    }
+    authorize_session_access(
+        &state,
+        &principal,
+        &id,
+        if role == "writer" {
+            SessionAccess::Write
+        } else {
+            SessionAccess::Read
+        },
+    )
+    .await?;
+    let actor_id = surface_actor_id(&principal, observer_id);
     Ok(Json(
         state
             .services
             .session
-            .attach_session_value(&id, &actor_id, &body.surface, body.role.as_deref())
+            .attach_session_value(&id, &actor_id, &body.surface, Some(role))
             .await,
     ))
 }
@@ -606,10 +639,26 @@ async fn detach_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(body): Json<SessionDetachRequest>,
+    headers: HeaderMap,
+    Json(_body): Json<SessionDetachRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
-    let actor_id = surface_actor_id(&principal, &body.surface);
+    // Detach only removes the exact authenticated observer attachment derived
+    // below. A reader must be able to leave without gaining conversation write
+    // authority, otherwise read-only Surfaces leak lifecycle attachments.
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
+    let observer_id = headers
+        .get("x-cowd-observer-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| super::validated_session_observer_id(Some(value)))
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "session detach requires a valid x-cowd-observer-id".to_string(),
+                }),
+            )
+        })?;
+    let actor_id = surface_actor_id(&principal, observer_id);
     Ok(Json(
         state
             .services
@@ -710,6 +759,7 @@ fn session_info_from_record(record: SessionRecord) -> SessionInfo {
     SessionInfo {
         id: record.session_id,
         status: record.status,
+        message_count: record.message_count,
         title: session_title_from_metadata(record.metadata_json.as_deref()),
         model: record.model,
         created_at: Some(record.created_at),
@@ -723,6 +773,7 @@ fn active_session_info(id: String) -> SessionInfo {
     SessionInfo {
         id,
         status: "active".to_string(),
+        message_count: 0,
         title: None,
         model: None,
         created_at: None,
@@ -1042,6 +1093,7 @@ async fn ensure_session_handler(
         "created": outcome.created,
         "restored": outcome.restored,
         "source": outcome.record.platform,
+        "model": outcome.record.model,
         "active_sessions": state.services.session.list_active_session_ids().len(),
     })))
 }
@@ -1088,6 +1140,7 @@ async fn cancel_session_turn_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(body): Json<CancelSessionTurnRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if id.trim().is_empty() {
@@ -1100,6 +1153,7 @@ async fn cancel_session_turn_handler(
     }
 
     authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
 
     let actor_id = format!("principal:{}", principal.0.claims().principal_id);
     let reason = body
@@ -1494,6 +1548,142 @@ fn collect_tool_timeline(events: &[serde_json::Value]) -> Vec<serde_json::Value>
         .collect()
 }
 
+fn tool_instance_identity(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("cowd_tool_instance_id")
+        .or_else(|| payload.get("tool_instance_id"))
+        .or_else(|| payload.get("invocation_id"))
+        .or_else(|| payload.get("id"))
+        .or_else(|| payload.get("tool_call_id"))
+        .or_else(|| payload.get("tool_use_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn merge_tool_projection_item(
+    order: &mut Vec<String>,
+    tools: &mut BTreeMap<String, serde_json::Value>,
+    mut payload: serde_json::Value,
+) {
+    let Some(identity) = tool_instance_identity(&payload) else {
+        return;
+    };
+    let object = payload
+        .as_object_mut()
+        .expect("tool projection payloads are normalized to objects");
+    object.insert(
+        "tool_instance_id".to_string(),
+        serde_json::Value::String(identity.clone()),
+    );
+    if !object.contains_key("tool_name") {
+        if let Some(name) = object.get("name").cloned() {
+            object.insert("tool_name".to_string(), name);
+        }
+    }
+    if !tools.contains_key(&identity) {
+        order.push(identity.clone());
+        tools.insert(identity, payload);
+        return;
+    }
+    let existing = tools
+        .get_mut(&identity)
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("canonical tool projection item is an object");
+    for (key, value) in object {
+        if !value.is_null() {
+            existing.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn durable_tool_payloads(messages: &[SessionMessage]) -> Vec<serde_json::Value> {
+    let mut payloads = Vec::new();
+    for message in messages {
+        let Ok(blocks) = serde_json::from_str::<Vec<serde_json::Value>>(&message.content_json)
+        else {
+            continue;
+        };
+        for block in blocks {
+            let Some(block_type) = block
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+            else {
+                continue;
+            };
+            if !matches!(block_type.as_str(), "tool_use" | "tool_result") {
+                continue;
+            }
+            let mut payload = block;
+            let object = payload
+                .as_object_mut()
+                .expect("durable transcript blocks are JSON objects");
+            object.insert(
+                "source".to_string(),
+                serde_json::Value::String("durable_transcript".to_string()),
+            );
+            object.insert(
+                "durable_message_id".to_string(),
+                serde_json::Value::String(message.stable_message_id.clone()),
+            );
+            object.insert(
+                "durable_sequence".to_string(),
+                serde_json::json!(message.sequence),
+            );
+            match block_type.as_str() {
+                "tool_use" => {
+                    object.insert(
+                        "status".to_string(),
+                        serde_json::Value::String("running".to_string()),
+                    );
+                    if let Some(input) = object.get("input").cloned() {
+                        object.insert("preview".to_string(), input);
+                    }
+                }
+                "tool_result" => {
+                    let failed = object
+                        .get("is_error")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    object.insert(
+                        "status".to_string(),
+                        serde_json::Value::String(
+                            if failed { "failed" } else { "completed" }.to_string(),
+                        ),
+                    );
+                    if let Some(output) = object.get("output").cloned() {
+                        object.insert("summary".to_string(), output);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            payloads.push(payload);
+        }
+    }
+    payloads
+}
+
+fn canonical_tool_timeline(
+    events: &[serde_json::Value],
+    messages: &[SessionMessage],
+) -> Vec<serde_json::Value> {
+    let mut order = Vec::new();
+    let mut tools = BTreeMap::new();
+    for payload in collect_tool_timeline(events)
+        .into_iter()
+        .chain(durable_tool_payloads(messages))
+    {
+        if payload.is_object() {
+            merge_tool_projection_item(&mut order, &mut tools, payload);
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|identity| tools.remove(&identity))
+        .collect()
+}
+
 fn payload_type_contains(payload: &serde_json::Value, needles: &[&str]) -> bool {
     payload
         .get("type")
@@ -1725,6 +1915,7 @@ fn turn_projection_from_event_values(
 fn session_run_projection_from_events(
     session_id: &str,
     stored_events: Vec<SessionEvent>,
+    durable_messages: &[SessionMessage],
     stats: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let events = stored_events
@@ -1740,8 +1931,7 @@ fn session_run_projection_from_events(
         .collect::<Vec<_>>();
     let runtime_run_count = runs.len();
     let run_graph = runtime_run_tree_summary(&runs);
-    let mut tool_timeline = collect_tool_timeline(&events);
-    tool_timeline.extend(collect_payloads_by_types(&events, &["PartialAnswer"]));
+    let tool_timeline = canonical_tool_timeline(&events, durable_messages);
     let token_usage = collect_payloads_by_types(&events, &["TokenUsage"]);
     let latest_model_telemetry = latest_payload_by_type(&events, "RunModelTelemetry")
         .and_then(|payload| payload.get("telemetry").cloned().or(Some(payload)));
@@ -1781,8 +1971,8 @@ fn session_run_projection_from_events(
     let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();
     for tool in &tool_timeline {
         let name = tool
-            .get("name")
-            .or_else(|| tool.get("tool_name"))
+            .get("tool_name")
+            .or_else(|| tool.get("name"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("tool")
             .to_string();
@@ -1924,8 +2114,33 @@ async fn get_session_turns(
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
-    let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(2_000).min(10_000);
+    let from_seq = if let Some(from_seq) = params.from_seq {
+        from_seq
+    } else {
+        let Some((total, _)) = state
+            .services
+            .session
+            .stored_events_page(&id, 0, 1)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to probe session projection events: {error}"),
+                    }),
+                )
+            })?
+        else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "session store not available".to_string(),
+                }),
+            ));
+        };
+        total.saturating_sub(limit)
+    };
     let Some((total, stored_events)) = state
         .services
         .session
@@ -2038,9 +2253,32 @@ async fn get_session_projection(
     Query(params): Query<GetEventsParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
-    let from_seq = params.from_seq.unwrap_or(0);
     let limit = params.limit.unwrap_or(2_000).min(10_000);
-    let Some((total, stored_events)) = state
+    let Some((global_total, _)) = state
+        .services
+        .session
+        .stored_events_page(&id, 0, 1)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to probe session projection events: {error}"),
+                }),
+            )
+        })?
+    else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session store not available".to_string(),
+            }),
+        ));
+    };
+    let from_seq = params
+        .from_seq
+        .unwrap_or_else(|| global_total.saturating_sub(limit));
+    let Some((_remaining_total, stored_events)) = state
         .services
         .session
         .stored_events_page(&id, from_seq, limit)
@@ -2078,12 +2316,45 @@ async fn get_session_projection(
             .ok()
             .and_then(|Json(stats)| serde_json::to_value(stats).ok())
     };
-    let mut projection = session_run_projection_from_events(&id, stored_events, stats);
+    let message_total = state
+        .services
+        .session
+        .stored_message_count(&id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to count durable projection messages: {error}"),
+                }),
+            )
+        })?
+        .unwrap_or_default();
+    let durable_messages = state
+        .services
+        .session
+        .stored_messages(&id, message_total.saturating_sub(10_000), 10_000)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to load durable projection messages: {error}"),
+                }),
+            )
+        })?
+        .unwrap_or_default();
+    let projection_has_more = stored_events
+        .last()
+        .map(|event| event.sequence.saturating_add(1) < global_total)
+        .unwrap_or(false);
+    let mut projection =
+        session_run_projection_from_events(&id, stored_events, &durable_messages, stats);
     projection["paging"] = serde_json::json!({
-        "total": total,
+        "total": global_total,
         "from_seq": from_seq,
         "limit": limit,
-        "has_more": projection["event_digest"]["total"].as_u64().unwrap_or_default() < total as u64,
+        "has_more": projection_has_more,
     });
 
     Ok(Json(projection))
@@ -2195,8 +2466,10 @@ async fn compact_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(id): Path<String>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Destructive).await?;
+    super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2324,8 +2597,10 @@ async fn stored_session_stats_response(
         tool: 0,
     };
     let mut tool_usage: HashMap<String, usize> = HashMap::new();
-    let mut input_tokens = record.input_tokens.max(0) as u32;
-    let mut output_tokens = record.output_tokens.max(0) as u32;
+    let recorded_input_tokens = record.input_tokens.max(0) as u32;
+    let recorded_output_tokens = record.output_tokens.max(0) as u32;
+    let mut fallback_input_tokens = 0u32;
+    let mut fallback_output_tokens = 0u32;
     for message in &messages {
         match message.role.as_str() {
             "user" => counts.user += 1,
@@ -2336,15 +2611,21 @@ async fn stored_session_stats_response(
         if let Some(tool_name) = message.tool_name.as_ref().filter(|name| !name.is_empty()) {
             *tool_usage.entry(tool_name.clone()).or_insert(0) += 1;
         }
-        if input_tokens == 0 {
-            input_tokens =
-                input_tokens.saturating_add(token_count_from_usage(message, "input_tokens"));
-        }
-        if output_tokens == 0 {
-            output_tokens =
-                output_tokens.saturating_add(token_count_from_usage(message, "output_tokens"));
-        }
+        fallback_input_tokens =
+            fallback_input_tokens.saturating_add(token_count_from_usage(message, "input_tokens"));
+        fallback_output_tokens =
+            fallback_output_tokens.saturating_add(token_count_from_usage(message, "output_tokens"));
     }
+    let input_tokens = if recorded_input_tokens == 0 {
+        fallback_input_tokens
+    } else {
+        recorded_input_tokens
+    };
+    let output_tokens = if recorded_output_tokens == 0 {
+        fallback_output_tokens
+    } else {
+        recorded_output_tokens
+    };
     Ok(Json(SessionStatsSnapshot {
         session_id: id.to_string(),
         message_count: messages.len().max(record.message_count.max(0) as usize),
@@ -2632,7 +2913,7 @@ mod tests {
             }),
         )];
 
-        let projection = session_run_projection_from_events("session-v31", events, None);
+        let projection = session_run_projection_from_events("session-v31", events, &[], None);
 
         assert_eq!(projection["tool_timeline"].as_array().unwrap().len(), 1);
         assert_eq!(projection["tool_timeline"][0]["contract_version"], 2);
@@ -2763,6 +3044,7 @@ mod tests {
         let projection = session_run_projection_from_events(
             "session-v31",
             events,
+            &[],
             Some(serde_json::json!({
                 "tokens": {
                     "input": 100,
@@ -2776,7 +3058,7 @@ mod tests {
         assert_eq!(projection["source"], "gateway.session_events");
         assert_eq!(projection["view_modes"]["default"], "full_evidence");
         assert_eq!(projection["run_graph"]["summary"]["completed_count"], 1);
-        assert_eq!(projection["tool_summary"]["by_name"]["read"], 2);
+        assert_eq!(projection["tool_summary"]["by_name"]["read"], 1);
         assert_eq!(projection["token_speed"]["token_usage"][0]["total"], 150);
         assert_eq!(
             projection["token_speed"]["model_telemetry"]["model"],
@@ -2793,5 +3075,68 @@ mod tests {
             1
         );
         assert_eq!(projection["risk_approval"]["count"], 1);
+    }
+
+    #[test]
+    fn session_run_projection_materializes_one_tool_from_durable_transcript() {
+        let messages = vec![
+            SessionMessage {
+                stable_message_id: "assistant-tool".to_string(),
+                session_id: "session-v31".to_string(),
+                sequence: 10,
+                role: "assistant".to_string(),
+                content_json: serde_json::json!([{
+                    "type": "tool_use",
+                    "id": "provider-tool-1",
+                    "cowd_tool_instance_id": "provider-tool-1#cowd-0",
+                    "name": "runtime_capabilities",
+                    "input": "{\"detail\":\"execution_patterns\"}"
+                }])
+                .to_string(),
+                blocks_count: 1,
+                tool_use_id: Some("provider-tool-1".to_string()),
+                tool_name: Some("runtime_capabilities".to_string()),
+                token_usage_json: None,
+                created_at_ms: 1_000,
+            },
+            SessionMessage {
+                stable_message_id: "tool-result".to_string(),
+                session_id: "session-v31".to_string(),
+                sequence: 11,
+                role: "tool".to_string(),
+                content_json: serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": "provider-tool-1",
+                    "cowd_tool_instance_id": "provider-tool-1#cowd-0",
+                    "tool_name": "runtime_capabilities",
+                    "output": "ok",
+                    "is_error": false
+                }])
+                .to_string(),
+                blocks_count: 1,
+                tool_use_id: Some("provider-tool-1".to_string()),
+                tool_name: Some("runtime_capabilities".to_string()),
+                token_usage_json: None,
+                created_at_ms: 1_001,
+            },
+        ];
+
+        let projection =
+            session_run_projection_from_events("session-v31", Vec::new(), &messages, None);
+
+        assert_eq!(projection["tool_summary"]["count"], 1);
+        assert_eq!(
+            projection["tool_summary"]["by_name"]["runtime_capabilities"],
+            1
+        );
+        assert_eq!(projection["tool_timeline"][0]["status"], "completed");
+        assert_eq!(
+            projection["tool_timeline"][0]["tool_instance_id"],
+            "provider-tool-1#cowd-0"
+        );
+        assert_eq!(
+            projection["tool_timeline"][0]["durable_sequence"],
+            serde_json::json!(11)
+        );
     }
 }

@@ -102,27 +102,53 @@ fn runtime_production_source_has_no_mfg_application_implementation() {
 }
 
 #[test]
-fn mfg_application_is_allowed_to_depend_on_matrix_but_not_webui() {
-    let mfg_root = repo_root().join("crates/app-mfg/src");
-    let files = read_rs_files(&mfg_root);
+fn mfg_application_is_pinned_externally_and_host_composition_stays_generic() {
+    let root = repo_root();
+    let manifest = fs::read_to_string(root.join("crates/product-apps/Cargo.toml"))
+        .expect("product APP manifest should load");
+    let generated = fs::read_to_string(root.join("crates/product-apps/src/generated.rs"))
+        .expect("generated product catalogue should load");
+    let source_lock = fs::read_to_string(root.join("apps/mfg/source.lock.toml"))
+        .expect("source lock should load");
     assert!(
-        files
-            .iter()
-            .any(|(_, content)| content.contains("use matrix_core::")
-                || content.contains("matrix_core::")),
-        "MFG application crate should depend on Matrix contracts"
+        manifest.contains(
+            "cowd-app-mfg-bundle = { git = \"https://gitee.com/eyeout/cowd-app-mfg\", rev = "
+        ),
+        "MFG must enter the product host through an immutable external bundle dependency"
+    );
+    let revision = source_lock
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("rev = "))
+        .map(|value| value.trim_matches('"'))
+        .expect("MFG source lock revision");
+    assert!(
+        manifest.contains(&format!("rev = \"{revision}\"")),
+        "generated dependency must use the reviewed MFG source-lock revision"
+    );
+    assert!(
+        generated.contains(&format!("\"{revision}\"")),
+        "runtime source-lock receipt must use the same reviewed revision"
+    );
+    assert!(
+        generated.contains("cowd_app_mfg_bundle::product().with_source_lock("),
+        "MFG must register through the generic static product boundary"
     );
 
-    for (path, content) in files {
+    for (path, content) in read_rs_files(&root.join("crates/product-apps/src")) {
         let production = content.split("#[cfg(test)]").next().unwrap_or(&content);
         assert!(
             !production.contains("runtime::mfg"),
-            "MFG application source {} must not depend on runtime::mfg",
+            "product host source {} must not depend on runtime::mfg",
             path.display()
         );
         assert!(
             !production.contains("webui"),
-            "MFG runtime source {} must not depend on WebUI",
+            "product host source {} must not depend on WebUI",
+            path.display()
+        );
+        assert!(
+            !production.contains("matrix_core::"),
+            "generic product host source {} must not absorb MFG/Matrix domain logic",
             path.display()
         );
     }
@@ -159,20 +185,36 @@ fn gateway_depends_on_mfg_application_crate() {
 }
 
 #[test]
-fn mfg_store_facade_does_not_expose_matrix_store() {
-    let store = repo_root().join("crates/app-mfg/src/store.rs");
-    let content =
-        fs::read_to_string(&store).unwrap_or_else(|_| panic!("read source {}", store.display()));
+fn gateway_production_uses_only_the_static_product_boundary_for_mfg() {
+    let root = repo_root();
+    let manifest = fs::read_to_string(root.join("crates/gateway/Cargo.toml"))
+        .expect("Gateway manifest should load");
+    let production_dependencies = manifest
+        .split("[dev-dependencies]")
+        .next()
+        .expect("Gateway production dependency section");
+    assert!(
+        production_dependencies.contains("cowd-product-apps"),
+        "Gateway production must depend on the generic product host"
+    );
+    assert!(
+        !production_dependencies.contains("cowd-app-mfg-core"),
+        "Gateway production must not depend directly on the MFG core crate"
+    );
 
-    for term in [
-        "impl Deref for MfgStore",
-        "pub fn matrix(",
-        "pub(crate) fn matrix(",
-        "pub use runtime::MatrixStore",
-    ] {
+    for (path, content) in read_rs_files(&root.join("crates/gateway/src")) {
+        let production = content.split("#[cfg(test)]").next().unwrap_or(&content);
+        for term in ["app_mfg::", "cowd_app_mfg_"] {
+            assert!(
+                !production.contains(term),
+                "Gateway production source {} bypasses the static product boundary through {term}",
+                path.display()
+            );
+        }
         assert!(
-            !content.contains(term),
-            "MFG store facade must not leak MatrixStore through {term}"
+            !production.contains("pub use matrix_repository::MatrixStore"),
+            "Gateway production source {} must not re-export MatrixStore to APPs",
+            path.display()
         );
     }
 }

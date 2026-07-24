@@ -28,7 +28,7 @@ fn node(id: &str, kind: ExecutionNodeKind) -> ExecutionNodeSpec {
 fn deep_task_closure_links_strategy_execution_graph_memory_matrix_and_final_gate() {
     let kernel = RuntimeAiKernel::begin_turn(
         "deep-task-closure",
-        "完整迁移 gateway runtime service 并保证 matrix evidence、memory pulse、测试回归和最终审查",
+        "使用多 Agent 协作完整迁移 gateway runtime service，并分别保证 matrix evidence、memory pulse、测试回归和最终审查",
         runtime::context_runtime::ContextProfile::MainTurn,
         &[
             "project context".to_string(),

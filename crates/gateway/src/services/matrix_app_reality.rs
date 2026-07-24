@@ -321,6 +321,7 @@ pub(super) fn dispatch(
             serde_json::to_value(ingested)?
         }
         "evidence.build" => serde_json::to_value(store.build_evidence_packet(
+            input::<Option<String>>(input_value, "packet_id")?.as_deref(),
             input::<Option<String>>(input_value, "attention_id")?.as_deref(),
             input::<Option<String>>(input_value, "problem_statement")?.as_deref(),
         )?)?,
@@ -482,5 +483,40 @@ mod tests {
         .expect_err("unbounded limit rejected");
         assert_eq!(unbounded.code(), "validation_failed");
         assert!(dispatch(store.as_ref(), "sql.execute", &serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn evidence_build_replays_the_same_canonical_packet_identity() {
+        let (_config_home, store) = fixture_store();
+        let packet_id = "evidence-mfg-idempotent-fixture";
+        let first = dispatch(
+            store.as_ref(),
+            "evidence.build",
+            &serde_json::json!({
+                "packet_id": packet_id,
+                "problem_statement": "first canonical problem"
+            }),
+        )
+        .expect("first evidence build");
+        let replay = dispatch(
+            store.as_ref(),
+            "evidence.build",
+            &serde_json::json!({
+                "packet_id": packet_id,
+                "problem_statement": "a retried request cannot replace canonical content"
+            }),
+        )
+        .expect("idempotent evidence replay");
+        let fetched = dispatch(
+            store.as_ref(),
+            "evidence.get",
+            &serde_json::json!({"packet_id": packet_id}),
+        )
+        .expect("canonical evidence fetch");
+
+        assert_eq!(first, replay);
+        assert_eq!(replay, fetched);
+        assert_eq!(first["packet_id"], packet_id);
+        assert_eq!(first["problem_statement"], "first canonical problem");
     }
 }

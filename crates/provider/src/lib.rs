@@ -22,7 +22,7 @@ pub use client::{
     oauth_token_is_expired, read_base_url, read_xai_base_url, resolve_saved_oauth_token,
     resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient,
 };
-pub use error::ApiError;
+pub use error::{ApiError, CompatibilityToolProtocolFailure};
 pub use http_client::{
     build_http_client, build_http_client_or_default, build_http_client_with, ProxyConfig,
 };

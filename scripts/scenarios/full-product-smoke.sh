@@ -23,6 +23,7 @@ SMOKE_ID="release-smoke-$$"
 PRINCIPAL="principal:local-human"
 GRANT_ID="grant-$SMOKE_ID"
 API_TOKEN="release-smoke-$$_credential"
+SMOKE_OBSERVER_ID="release-smoke:$$_writer"
 FAILED=0
 
 curl() {
@@ -187,10 +188,14 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SMOKE_ID/ensure" \
   -d '{"model":"release-smoke-model"}' \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True and data.get("session_id") == sys.argv[1], data' "$SMOKE_ID"
 curl -fsS -X POST "$BASE_URL/api/sessions/$SMOKE_ID/attach" \
+  -H "x-cowd-observer-id: $SMOKE_OBSERVER_ID" \
+  -H 'x-cowd-surface-id: release-smoke' \
   -H 'content-type: application/json' \
   -d '{"surface":"release-smoke","role":"writer"}' \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is not False, data'
 curl -fsS -X POST "$BASE_URL/api/runtime/session-leases/acquire" \
+  -H "x-cowd-observer-id: $SMOKE_OBSERVER_ID" \
+  -H 'x-cowd-surface-id: release-smoke' \
   -H 'content-type: application/json' \
   -d "{\"session_id\":\"$SMOKE_ID\",\"mode\":\"collaborative\"}" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is not False, data'

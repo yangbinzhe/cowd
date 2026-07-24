@@ -411,7 +411,7 @@ async fn cross_plane_action_execute_handler(
 ) -> axum::response::Response {
     let now = chrono::Utc::now();
     let mode = normalize_execute_mode(&request.mode);
-    let mut readiness =
+    let readiness =
         evaluate_action_readiness(&state, request.action.into_action(&principal), &mode, now).await;
     let idempotency_key = request
         .idempotency_key

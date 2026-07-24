@@ -1,5 +1,5 @@
-use std::process::Command;
 use serde_json::Value;
+use std::process::Command;
 
 /// Call LLM with a prompt, returns response text
 fn call_llm(prompt: &str) -> Option<String> {
@@ -11,11 +11,18 @@ fn call_llm(prompt: &str) -> Option<String> {
             "messages": [{"role": "user", "content": prompt}]
         });
         if let Ok(out) = Command::new("curl")
-            .args(["-s", "https://api.anthropic.com/v1/messages",
-                   "-H", "Content-Type: application/json",
-                   "-H", &format!("x-api-key: {}", key),
-                   "-H", "anthropic-version: 2023-06-01",
-                   "-d", &payload.to_string()])
+            .args([
+                "-s",
+                "https://api.anthropic.com/v1/messages",
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                &format!("x-api-key: {}", key),
+                "-H",
+                "anthropic-version: 2023-06-01",
+                "-d",
+                &payload.to_string(),
+            ])
             .output()
         {
             if let Ok(body) = String::from_utf8(out.stdout) {
@@ -27,8 +34,15 @@ fn call_llm(prompt: &str) -> Option<String> {
     }
     // Fallback: try local Ollama
     if let Ok(out) = Command::new("curl")
-        .args(["-s", "http://localhost:11434/api/generate",
-               "-d", &format!(r#"{{"model":"llama3.2","prompt":{},"stream":false}}"#, serde_json::to_string(prompt).unwrap_or_default())])
+        .args([
+            "-s",
+            "http://localhost:11434/api/generate",
+            "-d",
+            &format!(
+                r#"{{"model":"llama3.2","prompt":{},"stream":false}}"#,
+                serde_json::to_string(prompt).unwrap_or_default()
+            ),
+        ])
         .output()
     {
         if let Ok(body) = String::from_utf8(out.stdout) {
@@ -44,7 +58,8 @@ fn call_llm(prompt: &str) -> Option<String> {
 pub fn generate_prompt(skill: &str) -> String {
     if let Some(response) = call_llm(&format!(
         "Generate a single short user prompt (max 10 words) for testing {}. \
-         Just return the prompt, no explanation.", skill
+         Just return the prompt, no explanation.",
+        skill
     )) {
         return response.trim().trim_matches('"').to_string();
     }

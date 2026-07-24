@@ -30,6 +30,9 @@ pub struct SandboxConfig {
     pub namespace_restrictions: Option<bool>,
     pub network_isolation: Option<bool>,
     pub filesystem_mode: Option<FilesystemIsolationMode>,
+    /// Explicit filesystem authority root. When omitted, the command working
+    /// directory remains the workspace root for backwards compatibility.
+    pub workspace_root: Option<PathBuf>,
     pub allowed_mounts: Vec<String>,
 }
 
@@ -39,6 +42,7 @@ pub struct SandboxRequest {
     pub namespace_restrictions: bool,
     pub network_isolation: bool,
     pub filesystem_mode: FilesystemIsolationMode,
+    pub workspace_root: Option<PathBuf>,
     pub allowed_mounts: Vec<String>,
 }
 
@@ -61,6 +65,7 @@ pub struct SandboxStatus {
     pub network_active: bool,
     pub filesystem_mode: FilesystemIsolationMode,
     pub filesystem_active: bool,
+    pub workspace_root: Option<String>,
     pub allowed_mounts: Vec<String>,
     pub in_container: bool,
     pub container_markers: Vec<String>,
@@ -93,6 +98,7 @@ impl SandboxConfig {
             filesystem_mode: filesystem_mode_override
                 .or(self.filesystem_mode)
                 .unwrap_or_default(),
+            workspace_root: self.workspace_root.clone(),
             allowed_mounts: allowed_mounts_override.unwrap_or_else(|| self.allowed_mounts.clone()),
         }
     }
@@ -182,6 +188,15 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
         && (!request.network_isolation || network_supported);
 
     let allowed_mounts = normalize_mounts(&request.allowed_mounts, cwd);
+    let workspace_root = request.workspace_root.as_ref().map(|root| {
+        if root.is_absolute() {
+            root.clone()
+        } else {
+            cwd.join(root)
+        }
+        .display()
+        .to_string()
+    });
 
     SandboxStatus {
         enabled: request.enabled,
@@ -194,6 +209,7 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
         network_active: request.enabled && request.network_isolation && network_supported,
         filesystem_mode: request.filesystem_mode,
         filesystem_active,
+        workspace_root,
         allowed_mounts,
         in_container: container.in_container,
         container_markers: container.markers,
@@ -276,6 +292,7 @@ mod tests {
             namespace_restrictions: Some(true),
             network_isolation: Some(false),
             filesystem_mode: Some(FilesystemIsolationMode::WorkspaceOnly),
+            workspace_root: Some(std::path::PathBuf::from("/workspace")),
             allowed_mounts: vec!["logs".to_string()],
         };
 
@@ -291,6 +308,10 @@ mod tests {
         assert!(!request.namespace_restrictions);
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
+        assert_eq!(
+            request.workspace_root,
+            Some(std::path::PathBuf::from("/workspace"))
+        );
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
     }
 }

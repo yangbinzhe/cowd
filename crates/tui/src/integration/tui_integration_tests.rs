@@ -57,18 +57,37 @@ fn integration_launch_type_stream() {
     state.apply_event(CowdEvent::TurnStarted);
     assert!(state.turn_is_active());
 
-    state.apply_event(CowdEvent::TextDelta {
-        text: "Hi there!".into(),
+    let correlation = crate::protocol::GatewayEventCorrelation {
+        session_id: "test-session".to_string(),
+        execution_id: Some("execution-1".to_string()),
+        turn_id: Some("turn-1".to_string()),
+        part_id: Some("assistant_text".to_string()),
+        ..Default::default()
+    };
+    state.apply_event(CowdEvent::GatewaySession {
+        event: crate::protocol::GatewaySessionEvent::TextDelta {
+            correlation: correlation.clone(),
+            text: "Hi there!".into(),
+            start_bytes: 0,
+            end_bytes: "Hi there!".len(),
+            stream_revision: 1,
+        },
     });
-    state.apply_event(CowdEvent::TurnComplete {
-        assistant_text: "Hi there!".into(),
-        iterations: 1,
+    state.apply_event(CowdEvent::GatewaySession {
+        event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
+            correlation: crate::protocol::GatewayEventCorrelation {
+                message_id: Some("assistant-1".to_string()),
+                terminal_id: Some("terminal-1".to_string()),
+                ..correlation
+            },
+            assistant_text: "Hi there!".into(),
+            sequence: Some(1),
+            iterations: 1,
+            token_usage: None,
+        },
     });
 
-    // A legacy stream terminal updates the transcript but is deliberately
-    // not allowed to forge Runtime lifecycle completion. The projection
-    // stream supplies the authoritative terminal_ref.
-    assert!(state.turn_is_active());
+    assert!(!state.turn_is_active());
     assert!(state.timeline_len() >= 2);
 }
 
@@ -134,45 +153,40 @@ fn integration_terminal_display_mode_and_control_shortcuts() {
 }
 
 #[test]
-fn integration_clean_mode_renders_current_turn_evidence_summary() {
+fn integration_clean_mode_renders_current_turn_live_stats() {
     let mut terminal = MockTerminal::new(120, 24);
     let mut state = TuiState::new("test-model", "test-session");
     state.app.compact_chat = true;
     state.app.add_message("user", "Run a diagnostic");
     state.app.add_message("assistant", "Diagnostic complete.");
-    state.app.latest_context_envelope = Some(serde_json::json!({
-        "selected": [{"id": "ctx-1"}, {"id": "ctx-2"}],
-        "omitted": [{"id": "ctx-old"}]
-    }));
-    state.app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
-        graph_id: None,
-        board_id: None,
-        status: "ready".into(),
-        agent_tasks: 0,
-        child_executions: 0,
-        memory_candidates: 4,
-        conflicts: 0,
-        completion_rate: None,
-        synthesis_lift: None,
-        complementarity_score: None,
+    state.app.turn_input_tokens = 1_200;
+    state.app.turn_output_tokens = 340;
+    state.app.turn_usage_known = true;
+    state.app.current_execution_status =
+        Some(harness_contract::projection::ExecutionLiveStatus::CallingTool);
+    state.app.current_run_metrics = Some(harness_contract::projection::RunMetricsProjection {
+        tool_calls: 4,
+        memory_recalls: 2,
+        memory_evidence: 1,
+        approvals: 1,
+        files_touched: 3,
+        input_tokens: 1_200,
+        output_tokens: 340,
+        total_tokens: 1_540,
+        ..Default::default()
     });
-    state.app.gateway_fact_flow = Some(crate::runtime_control_store::FactFlowSummary {
-        source: "test".into(),
-        session_id: Some("test-session".into()),
-        stage_count: 2,
-        event_count: 3,
-        promotion_count: 1,
-        boundary_count: 1,
-    });
-    state.app.gateway_pending_approvals = Some(1);
 
     terminal.draw(|frame| state.render(frame));
     let joined = terminal.buffer_lines().join("\n");
-    assert!(joined.contains("Evidence:"));
-    assert!(joined.contains("ctx 2/1"));
-    assert!(joined.contains("mem candidates 4"));
-    assert!(joined.contains("reality s2 e3 p1 b1"));
-    assert!(joined.contains("approvals 1"));
+    assert!(
+        joined.contains("in 1.2k · out 340 · total 1.5k"),
+        "{joined}"
+    );
+    assert!(
+        joined.contains("tools 4 · memory 2/1 · approvals 1 · files 3"),
+        "{joined}"
+    );
+    assert!(joined.contains("calling tool"), "{joined}");
 }
 
 #[test]
@@ -182,12 +196,14 @@ fn integration_session_picker_lifecycle() {
     let sessions = vec![
         crate::app::SessionSummary {
             id: "sess-001".into(),
+            title: None,
             path: "/tmp".into(),
             updated_at_ms: 1000,
             message_count: 5,
         },
         crate::app::SessionSummary {
             id: "sess-002".into(),
+            title: None,
             path: "/tmp".into(),
             updated_at_ms: 2000,
             message_count: 10,

@@ -521,12 +521,35 @@ impl UnifiedSessionStore {
         message_id: &str,
         session_id: &str,
         content_json: &str,
+        token_usage_json: Option<&str>,
         created_at_ms: u64,
     ) -> Result<(SessionMessage, bool)> {
         self.inner.append_terminal_message_idempotent(
             message_id,
             session_id,
             content_json,
+            token_usage_json,
+            created_at_ms,
+        )
+    }
+
+    /// Atomically materialize every message produced by a Runtime turn.
+    ///
+    /// The last input row must carry `terminal_message_id`. Re-delivery is
+    /// idempotent only when every immutable transcript field still matches.
+    pub async fn append_terminal_transcript_idempotent(
+        &self,
+        terminal_message_id: &str,
+        ingress_message_id: &str,
+        session_id: &str,
+        messages: &[SessionMessage],
+        created_at_ms: u64,
+    ) -> Result<(Vec<SessionMessage>, bool)> {
+        self.inner.append_terminal_transcript_idempotent(
+            terminal_message_id,
+            ingress_message_id,
+            session_id,
+            messages,
             created_at_ms,
         )
     }

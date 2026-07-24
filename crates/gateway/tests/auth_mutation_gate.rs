@@ -95,7 +95,10 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
         .expect("ensure response");
     assert_eq!(ensured.status(), StatusCode::OK);
 
-    for (surface, role) in [("tui", "writer"), ("webui", "reader")] {
+    for (surface, observer_id, role) in [
+        ("tui", "tui:auth-gate", "writer"),
+        ("webui", "webui:auth-gate", "reader"),
+    ] {
         let response = app
             .clone()
             .oneshot(
@@ -104,6 +107,7 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
                     .uri("/api/sessions/session-surface-identity/attach")
                     .header("authorization", "Bearer gateway-test-token")
                     .header("content-type", "application/json")
+                    .header("x-cowd-observer-id", observer_id)
                     .body(Body::from(format!(
                         r#"{{"surface":"{surface}","role":"{role}"}}"#
                     )))
@@ -146,12 +150,16 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
     assert!(attachments.iter().any(|attachment| {
         attachment.pointer("/actor/surface") == Some(&serde_json::json!("tui"))
             && attachment.pointer("/actor/id")
-                == Some(&serde_json::json!("principal:local-human:surface:tui"))
+                == Some(&serde_json::json!(
+                    "principal:local-human:surface:tui:auth-gate"
+                ))
     }));
     assert!(attachments.iter().any(|attachment| {
         attachment.pointer("/actor/surface") == Some(&serde_json::json!("webui"))
             && attachment.pointer("/actor/id")
-                == Some(&serde_json::json!("principal:local-human:surface:webui"))
+                == Some(&serde_json::json!(
+                    "principal:local-human:surface:webui:auth-gate"
+                ))
     }));
 
     let detached = app
@@ -161,6 +169,7 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
                 .uri("/api/sessions/session-surface-identity/detach")
                 .header("authorization", "Bearer gateway-test-token")
                 .header("content-type", "application/json")
+                .header("x-cowd-observer-id", "tui:auth-gate")
                 .body(Body::from(r#"{"surface":"tui"}"#))
                 .expect("detach request"),
         )
@@ -184,27 +193,67 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
 #[tokio::test]
 async fn task_slash_dispatch_executes_the_gateway_owned_task_service() {
     let harness = GatewayTestHarness::in_memory().expect("gateway test harness");
-    let response = harness
-        .router()
+    let app = harness.router();
+    let session_id = "task-slash-auth-session";
+    let observer_id = "tui:task-slash-auth";
+    let ensured = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{session_id}/ensure"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"test-model"}"#))
+                .expect("task slash session ensure request"),
+        )
+        .await
+        .expect("task slash session ensure response");
+    assert_eq!(ensured.status(), StatusCode::OK);
+    let attached = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{session_id}/attach"))
+                .header("content-type", "application/json")
+                .header("x-cowd-observer-id", observer_id)
+                .body(Body::from(r#"{"surface":"tui","role":"writer"}"#))
+                .expect("task slash writer attach request"),
+        )
+        .await
+        .expect("task slash writer attach response");
+    assert_eq!(attached.status(), StatusCode::OK);
+
+    let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/slash/dispatch")
                 .header("content-type", "application/json")
+                .header("x-cowd-observer-id", observer_id)
                 .body(Body::from(
-                    r#"{"command":"tasks","args":{"input":"/tasks start --yolo prove task slash wiring","surface":"tui"}}"#,
+                    serde_json::json!({
+                        "command": "tasks",
+                        "args": {
+                            "input": "/tasks start --yolo prove task slash wiring",
+                            "surface": "tui",
+                            "session_id": session_id,
+                        }
+                    })
+                    .to_string(),
                 ))
                 .expect("task slash request"),
         )
         .await
         .expect("task slash response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let body: serde_json::Value = serde_json::from_slice(
         &to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("task slash body"),
     )
     .expect("task slash json");
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["ok"], true);
     assert_eq!(body["status"], "complete");
     assert_eq!(body["data"]["dispatch"], "task_service");

@@ -231,10 +231,10 @@ async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
                 continue;
             }
         };
-        let text = match crate::session_runtime_bridge::decode_terminal_payload(
+        let payload = match crate::session_runtime_bridge::decode_terminal_payload(
             &terminal.payload_ref,
         ) {
-            Ok(text) => text,
+            Ok(payload) => payload,
             Err((_, error)) => {
                 let _ = state
                     .services
@@ -244,7 +244,9 @@ async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
                 continue;
             }
         };
-        if let Err(error) = deliver_surface_terminal(state, &inbox, &text, &terminal_id).await {
+        if let Err(error) =
+            deliver_surface_terminal(state, &inbox, &payload.text, &terminal_id).await
+        {
             tracing::warn!(
                 surface = %inbox.surface,
                 message_id = %inbox.message_id,

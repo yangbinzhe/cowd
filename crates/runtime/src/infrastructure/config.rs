@@ -1977,8 +1977,19 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
             "namespaceRestrictions",
             "merged settings.sandbox",
         )?,
-        network_isolation: optional_bool(sandbox, "networkIsolation", "merged settings.sandbox")?,
+        network_isolation: optional_bool_dual(
+            sandbox,
+            "network_isolation",
+            "merged settings.sandbox",
+        )?
+        .or(optional_bool(
+            sandbox,
+            "isolate_network",
+            "merged settings.sandbox",
+        )?),
         filesystem_mode,
+        workspace_root: optional_string_dual(sandbox, "workspace_root", "merged settings.sandbox")?
+            .map(|value| crate::cowd_dirs::expand_tilde(&value)),
         allowed_mounts: optional_string_array_dual(
             sandbox,
             "allowed_mounts",

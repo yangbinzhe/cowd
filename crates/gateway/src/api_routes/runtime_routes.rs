@@ -446,6 +446,8 @@ pub(super) async fn get_execution_projection_events(
             cursor,
             false,
             None::<std::time::Instant>,
+            None::<u64>,
+            None::<std::time::Instant>,
         ),
         |(
             state,
@@ -456,6 +458,8 @@ pub(super) async fn get_execution_projection_events(
             mut cursor,
             ended,
             mut auth_checked_at,
+            mut last_live_revision,
+            mut last_live_emitted_at,
         )| async move {
             if ended {
                 return None;
@@ -502,6 +506,8 @@ pub(super) async fn get_execution_projection_events(
                                 cursor,
                                 true,
                                 auth_checked_at,
+                                last_live_revision,
+                                last_live_emitted_at,
                             ),
                         ));
                     }
@@ -539,6 +545,8 @@ pub(super) async fn get_execution_projection_events(
                                 cursor,
                                 true,
                                 auth_checked_at,
+                                last_live_revision,
+                                last_live_emitted_at,
                             ),
                         ));
                     }
@@ -562,10 +570,57 @@ pub(super) async fn get_execution_projection_events(
                                 cursor,
                                 true,
                                 auth_checked_at,
+                                last_live_revision,
+                                last_live_emitted_at,
                             ),
                         ));
                     }
                 };
+                let observed_live = runtime.execution_live(&execution_id);
+                let observed_live_revision = observed_live.as_ref().map(|live| live.revision);
+                if observed_live_revision.is_some() && observed_live_revision != last_live_revision
+                {
+                    let live = observed_live.expect("revision came from live state");
+                    let terminal = live.status.is_terminal();
+                    let min_interval = std::time::Duration::from_millis(100);
+                    if !terminal
+                        && last_live_emitted_at
+                            .is_some_and(|emitted| emitted.elapsed() < min_interval)
+                    {
+                        tokio::time::sleep(min_interval.saturating_sub(
+                            last_live_emitted_at.expect("checked above").elapsed(),
+                        ))
+                        .await;
+                        continue;
+                    }
+                    last_live_revision = Some(live.revision);
+                    last_live_emitted_at = Some(std::time::Instant::now());
+                    let update = harness_contract::projection::ExecutionLiveUpdate {
+                        schema_version:
+                            harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
+                        execution_id: execution_id.clone(),
+                        live,
+                    };
+                    let event = Event::default()
+                        .event("projection_live")
+                        .json_data(update)
+                        .unwrap_or_else(|_| Event::default().event("projection_error"));
+                    return Some((
+                        Ok::<Event, Infallible>(event),
+                        (
+                            state,
+                            runtime,
+                            execution_id,
+                            principal,
+                            detail_scope,
+                            cursor,
+                            false,
+                            auth_checked_at,
+                            last_live_revision,
+                            last_live_emitted_at,
+                        ),
+                    ));
+                }
                 match runtime::execution_projection::delta(
                     &runtime,
                     &execution_id,
@@ -573,25 +628,72 @@ pub(super) async fn get_execution_projection_events(
                     &context,
                 ) {
                     Ok(delta) if delta.target_cursor > cursor => {
-                        cursor = delta.target_cursor;
-                        let event = Event::default()
-                            .id(cursor.to_string())
-                            .event("projection_delta")
-                            .json_data(delta)
-                            .unwrap_or_else(|_| Event::default().event("projection_error"));
-                        return Some((
-                            Ok::<Event, Infallible>(event),
-                            (
-                                state,
-                                runtime,
-                                execution_id,
-                                principal,
-                                detail_scope,
-                                cursor,
-                                false,
-                                auth_checked_at,
-                            ),
-                        ));
+                        // A durable runtime event is not itself a complete
+                        // typed graph/entity patch. Sending the generic delta
+                        // forced old TUI clients to perform one HTTP snapshot
+                        // and restart their healthy SSE stream for every
+                        // batch. Materialize the authoritative snapshot on
+                        // this same connection instead: one snapshot can jump
+                        // directly to the current head and remains correct for
+                        // graph, strategy, commands and terminal changes.
+                        match runtime::execution_projection::snapshot(
+                            &runtime,
+                            &execution_id,
+                            &context,
+                        )
+                        .await
+                        {
+                            Ok(snapshot) => {
+                                cursor = cursor.max(snapshot.cursor).max(delta.target_cursor);
+                                last_live_revision =
+                                    snapshot.live.as_ref().map(|live| live.revision);
+                                let event = Event::default()
+                                    .id(cursor.to_string())
+                                    .event("projection_snapshot")
+                                    .json_data(snapshot)
+                                    .unwrap_or_else(|_| Event::default().event("projection_error"));
+                                return Some((
+                                    Ok::<Event, Infallible>(event),
+                                    (
+                                        state,
+                                        runtime,
+                                        execution_id,
+                                        principal,
+                                        detail_scope,
+                                        cursor,
+                                        false,
+                                        auth_checked_at,
+                                        last_live_revision,
+                                        last_live_emitted_at,
+                                    ),
+                                ));
+                            }
+                            Err(error) => {
+                                let event = Event::default().event("projection_resync").data(
+                                    serde_json::json!({
+                                        "reason": error.to_string(),
+                                        "snapshot_url": format!("/api/runtime/executions/{execution_id}"),
+                                        "base_cursor": cursor,
+                                    })
+                                    .to_string(),
+                                );
+                                return Some((
+                                    Ok(event),
+                                    (
+                                        state,
+                                        runtime,
+                                        execution_id,
+                                        principal,
+                                        detail_scope,
+                                        cursor,
+                                        true,
+                                        auth_checked_at,
+                                        last_live_revision,
+                                        last_live_emitted_at,
+                                    ),
+                                ));
+                            }
+                        }
                     }
                     Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
                     Err(error) => {
@@ -614,6 +716,8 @@ pub(super) async fn get_execution_projection_events(
                                 cursor,
                                 true,
                                 auth_checked_at,
+                                last_live_revision,
+                                last_live_emitted_at,
                             ),
                         ));
                     }
@@ -630,6 +734,7 @@ pub(super) async fn execute_projection_command(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(execution_id): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<harness_contract::projection::ExecutionCommandRequest>,
 ) -> Result<
     Json<harness_contract::projection::ExecutionCommandReceipt>,
@@ -641,6 +746,20 @@ pub(super) async fn execute_projection_command(
             "runtime.maintenance.manage capability is required for execution commands",
         ));
     }
+    let authorization_scope = {
+        let runtime = execution_runtime(&state)?;
+        runtime::execution_projection::authorization_scope(&runtime, &execution_id)
+            .map_err(projection_error)?
+    };
+    let Some(session_id) = authorization_scope.session_id.as_deref() else {
+        return Err(runtime_event_error(
+            StatusCode::FORBIDDEN,
+            "execution command has no authoritative session writer scope",
+        ));
+    };
+    // Resolve the authenticated projection scope before acquiring or joining
+    // a writer lease. Otherwise an unauthorized caller could leave behind a
+    // durable lease as a side effect of a request that is rejected later.
     let context = execution_projection_context(
         &state,
         &principal,
@@ -648,6 +767,7 @@ pub(super) async fn execute_projection_command(
         harness_contract::projection::ProjectionDetailScope::Full,
     )
     .await?;
+    super::require_session_writer_admission(&state, &principal, &headers, session_id).await?;
     let runtime = execution_runtime(&state)?;
     runtime::execution_projection::command(&runtime, &execution_id, &context, request)
         .await
@@ -1686,37 +1806,177 @@ pub(super) async fn get_runtime_config_reload_status(
     Json(crate::runtime_host::config_reload::status_value(&reload))
 }
 
-async fn get_runtime_session_leases(AxumState(state): AxumState<Arc<AppState>>) -> Json<Value> {
-    Json(session_lease_projection(&state).await)
+async fn get_runtime_session_leases(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Json<Value> {
+    let Some(registry) = state.session_lease_registry.as_ref() else {
+        return Json(session_lease_projection(&state).await);
+    };
+    let mut visible = Vec::new();
+    for lease in registry.list().await {
+        if super::session_routes::authorize_session_access(
+            &state,
+            &principal,
+            &lease.session_id,
+            super::session_routes::SessionAccess::Read,
+        )
+        .await
+        .is_ok()
+        {
+            visible.push(lease);
+        }
+    }
+    Json(serde_json::json!({
+        "kind": "runtime_session_leases",
+        "status": "available",
+        "attached": true,
+        "total": visible.len(),
+        "leases": visible,
+    }))
 }
 
 async fn acquire_runtime_session_lease(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(request): Json<RuntimeSessionLeaseAcquireRequest>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    super::session_routes::authorize_session_access(
+        &state,
+        &principal,
+        &request.session_id,
+        super::session_routes::SessionAccess::Write,
+    )
+    .await?;
+    let observer_id =
+        required_writer_observer(&state, &principal, &headers, &request.session_id).await?;
     let Some(registry) = state.session_lease_registry.as_ref() else {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": "session lease registry is not attached",
-        }));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session lease registry is not attached".to_string(),
+            }),
+        ));
     };
     let mode = request.mode.as_deref().unwrap_or("collaborative");
-    let owner = format!("principal:{}", principal.0.claims().principal_id);
-    Json(registry.acquire(&request.session_id, &owner, mode).await)
+    if !matches!(mode, "collaborative" | "exclusive" | "takeover") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session lease mode must be collaborative, exclusive, or takeover"
+                    .to_string(),
+            }),
+        ));
+    }
+    if mode == "takeover"
+        && (!principal.0.is_human_interactive()
+            || !principal.0.has_capability("runtime.maintenance.manage"))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "session lease takeover requires runtime.maintenance.manage".to_string(),
+            }),
+        ));
+    }
+    let owner = super::session_lease_owner(&principal, Some(observer_id));
+    let result = registry.acquire(&request.session_id, &owner, mode).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(Json(result))
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("session lease acquisition rejected")
+                    .to_string(),
+            }),
+        ))
+    }
 }
 
 async fn release_runtime_session_lease(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(request): Json<RuntimeSessionLeaseReleaseRequest>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    super::session_routes::authorize_session_access(
+        &state,
+        &principal,
+        &request.session_id,
+        super::session_routes::SessionAccess::Write,
+    )
+    .await?;
+    let observer_id =
+        required_writer_observer(&state, &principal, &headers, &request.session_id).await?;
     let Some(registry) = state.session_lease_registry.as_ref() else {
-        return Json(serde_json::json!({
-            "ok": false,
-            "error": "session lease registry is not attached",
-        }));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session lease registry is not attached".to_string(),
+            }),
+        ));
     };
-    let owner = format!("principal:{}", principal.0.claims().principal_id);
-    Json(registry.release(&request.session_id, &owner).await)
+    let owner = super::session_lease_owner(&principal, Some(observer_id));
+    let result = registry.release(&request.session_id, &owner).await;
+    if result.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(Json(result))
+    } else {
+        Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: result
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("session lease release rejected")
+                    .to_string(),
+            }),
+        ))
+    }
+}
+
+async fn required_writer_observer<'a>(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    headers: &'a HeaderMap,
+    session_id: &str,
+) -> Result<&'a str, (StatusCode, Json<ErrorResponse>)> {
+    let observer_id = headers
+        .get("x-cowd-observer-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| super::validated_session_observer_id(Some(value)))
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "session lease mutation requires a valid x-cowd-observer-id".to_string(),
+                }),
+            )
+        })?;
+    let actor_id = super::surface_actor_id(principal, observer_id);
+    let role = state
+        .services
+        .session
+        .lifecycle_attachment_role(session_id, &actor_id)
+        .await;
+    if role.as_deref() != Some("writer") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: match role.as_deref() {
+                    Some("reader") => {
+                        "reader session attachment cannot acquire or release a writer lease"
+                            .to_string()
+                    }
+                    _ => "session lease mutation requires the exact attached writer Surface"
+                        .to_string(),
+                },
+            }),
+        ));
+    }
+    Ok(observer_id)
 }

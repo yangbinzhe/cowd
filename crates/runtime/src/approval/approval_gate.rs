@@ -33,11 +33,14 @@ pub enum ApprovalGateResult {
     /// Command is allowed without user interaction.
     AutoPass { reason: AutoPassReason },
     /// Command was explicitly approved by the user (with persistence info).
-    Approved { persistence: ApprovalPersistence },
+    Approved {
+        persistence: ApprovalPersistence,
+        request_id: String,
+    },
     /// Command was denied by the user.
-    Denied { reason: String },
+    Denied { reason: String, request_id: String },
     /// Approval request timed out without user response.
-    TimedOut,
+    TimedOut { request_id: String },
 }
 
 /// Trait for sending approval-related SSE events to the frontend.
@@ -179,6 +182,21 @@ impl SmartApprovalGate {
     /// For read-only tools, it auto-passes.
     /// For other tools, it auto-passes (they have their own permission checks).
     pub async fn evaluate(&self, tool_name: &str, input: &str) -> ApprovalGateResult {
+        self.evaluate_with_observer(tool_name, input, |_| {}).await
+    }
+
+    /// Evaluate a normal tool invocation and notify exactly once after a real
+    /// approval request is registered. Auto-pass/cached paths never invoke the
+    /// observer, so live metrics cannot count approvals that did not exist.
+    pub async fn evaluate_with_observer<F>(
+        &self,
+        tool_name: &str,
+        input: &str,
+        on_registered: F,
+    ) -> ApprovalGateResult
+    where
+        F: FnOnce(&ApprovalRequest) + Send,
+    {
         // Step 0: Same-session auto-approve
         let input_preview: String = input.chars().take(80).collect();
         let key = format!("{tool_name}:{input_preview}");
@@ -221,7 +239,10 @@ impl SmartApprovalGate {
                 }
                 ApprovalGateResult::AutoPass { reason }
             }
-            SmartApprovalVerdict::NeedsApproval(request) => self.request_approval(request).await,
+            SmartApprovalVerdict::NeedsApproval(request) => {
+                self.request_approval_with_observer(request, on_registered)
+                    .await
+            }
         }
     }
 
@@ -232,6 +253,24 @@ impl SmartApprovalGate {
     /// critical, so an auto-pass is only valid when SOLO mode explicitly opts
     /// out of honoring critical approvals.
     pub async fn require_explicit_approval(&self, action: &str, input: &str) -> ApprovalGateResult {
+        self.require_explicit_approval_with_observer(action, input, |_| {})
+            .await
+    }
+
+    /// Require explicit approval and report the request immediately after it
+    /// has been registered in the pending map, before waiting for a verdict.
+    /// This is the only point at which the request ID is both real and
+    /// observable, so live execution metrics must be emitted here rather than
+    /// after the potentially 120-second wait completes.
+    pub async fn require_explicit_approval_with_observer<F>(
+        &self,
+        action: &str,
+        input: &str,
+        on_registered: F,
+    ) -> ApprovalGateResult
+    where
+        F: FnOnce(&ApprovalRequest) + Send,
+    {
         let approval_key = explicit_strategy_approval_key(action, input);
         if self.session_approved.lock().await.contains(&approval_key) {
             return ApprovalGateResult::AutoPass {
@@ -259,7 +298,8 @@ impl SmartApprovalGate {
             timestamp: chrono::Utc::now(),
             timeout_secs: 120,
         };
-        self.request_approval(request).await
+        self.request_approval_with_observer(request, on_registered)
+            .await
     }
 
     /// Return a kernel-level risk receipt without blocking for user approval.
@@ -324,7 +364,14 @@ impl SmartApprovalGate {
     /// map, sends an SSE event to the frontend, and blocks until:
     /// - The user responds (via POST /api/approval/respond)
     /// - The timeout expires (120 seconds)
-    async fn request_approval(&self, request: ApprovalRequest) -> ApprovalGateResult {
+    async fn request_approval_with_observer<F>(
+        &self,
+        request: ApprovalRequest,
+        on_registered: F,
+    ) -> ApprovalGateResult
+    where
+        F: FnOnce(&ApprovalRequest) + Send,
+    {
         let request_id = request.id.clone();
         let timeout_secs = request.timeout_secs;
 
@@ -336,6 +383,7 @@ impl SmartApprovalGate {
             .write()
             .await
             .insert(request_id.clone(), (request.clone(), tx));
+        on_registered(&request);
 
         // Send SSE event to frontend
         if let Some(sender) = &self.sse_sender {
@@ -349,10 +397,16 @@ impl SmartApprovalGate {
                     // Resolve event will be sent by the respond handler
                     ApprovalGateResult::Approved {
                         persistence: ApprovalPersistence::Once, // Default; actual persistence recorded by handler
+                        request_id: request_id.clone(),
                     }
                 }
-                ApprovalVerdict::Denied { reason } => ApprovalGateResult::Denied { reason },
-                ApprovalVerdict::TimedOut => ApprovalGateResult::TimedOut,
+                ApprovalVerdict::Denied { reason } => ApprovalGateResult::Denied {
+                    reason,
+                    request_id: request_id.clone(),
+                },
+                ApprovalVerdict::TimedOut => ApprovalGateResult::TimedOut {
+                    request_id: request_id.clone(),
+                },
             },
             Ok(Err(_)) => {
                 // Channel closed without response
@@ -368,6 +422,7 @@ impl SmartApprovalGate {
                 }
                 ApprovalGateResult::Denied {
                     reason: "Approval channel closed".to_string(),
+                    request_id: request_id.clone(),
                 }
             }
             Err(_) => {
@@ -380,7 +435,7 @@ impl SmartApprovalGate {
                 if let Err(error) = self.record_history(entry) {
                     tracing::error!(%request_id, %error, "approval timeout was not persisted");
                 }
-                ApprovalGateResult::TimedOut
+                ApprovalGateResult::TimedOut { request_id }
             }
         }
     }
@@ -651,6 +706,110 @@ mod tests {
                 reason: AutoPassReason::CachedApproval { .. }
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn explicit_strategy_approval_observer_runs_before_the_verdict() {
+        let gate = Arc::new(make_gate(ApprovalConfig::default()));
+        let pending_gate = Arc::clone(&gate);
+        let (registered_tx, mut registered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let approval = tokio::spawn(async move {
+            pending_gate
+                .require_explicit_approval_with_observer(
+                    "runtime_strategy_tool_batch",
+                    r#"{"tool":"write_file"}"#,
+                    move |request| {
+                        registered_tx
+                            .send(request.id.clone())
+                            .expect("observer receives the registered request");
+                    },
+                )
+                .await
+        });
+
+        let request_id = tokio::time::timeout(Duration::from_secs(1), registered_rx.recv())
+            .await
+            .expect("registration must be visible before approval timeout")
+            .expect("observer channel remains open");
+        assert!(
+            !approval.is_finished(),
+            "registration is reported while the decision is still pending"
+        );
+        let pending = gate.get_pending_requests().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, request_id);
+
+        gate.resolve_approval(
+            &request_id,
+            ApprovalVerdict::Approved,
+            ApprovalPersistence::Once,
+        )
+        .await
+        .expect("pending strategy approval should resolve");
+        assert!(matches!(
+            approval.await.expect("approval task should join"),
+            ApprovalGateResult::Approved {
+                request_id: resolved,
+                ..
+            } if resolved == request_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn normal_destructive_approval_observer_runs_once_and_auto_pass_is_silent() {
+        let gate = Arc::new(make_gate(ApprovalConfig {
+            auto_pass_low_risk: false,
+            solo_mode: false,
+            ..ApprovalConfig::default()
+        }));
+        let pending_gate = Arc::clone(&gate);
+        let (registered_tx, mut registered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let approval = tokio::spawn(async move {
+            pending_gate
+                .evaluate_with_observer(
+                    "bash",
+                    r#"{"command":"rm -rf /tmp/cowd-observer-test"}"#,
+                    move |request| {
+                        registered_tx
+                            .send(request.id.clone())
+                            .expect("normal approval observer receives request");
+                    },
+                )
+                .await
+        });
+        let request_id = tokio::time::timeout(Duration::from_secs(1), registered_rx.recv())
+            .await
+            .expect("normal approval must register before timeout")
+            .expect("observer channel remains open");
+        assert_eq!(gate.get_pending_requests().await[0].id, request_id);
+        assert!(
+            registered_rx.try_recv().is_err(),
+            "one real request emits exactly one observer event"
+        );
+        gate.resolve_approval(
+            &request_id,
+            ApprovalVerdict::Approved,
+            ApprovalPersistence::Once,
+        )
+        .await
+        .expect("normal approval resolves");
+        assert!(matches!(
+            approval.await.expect("approval task joins"),
+            ApprovalGateResult::Approved { .. }
+        ));
+
+        let (silent_tx, mut silent_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(matches!(
+            gate.evaluate_with_observer("bash", r#"{"command":"ls -la"}"#, move |_| {
+                let _ = silent_tx.send(());
+            })
+            .await,
+            ApprovalGateResult::AutoPass { .. }
+        ));
+        assert!(
+            silent_rx.try_recv().is_err(),
+            "auto-pass does not create a synthetic approval metric"
+        );
     }
 
     #[tokio::test]

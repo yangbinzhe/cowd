@@ -10,7 +10,7 @@ use std::{
 use axum::{
     body::Body,
     extract::State as AxumState,
-    http::{header, Request, StatusCode},
+    http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     Router,
@@ -99,6 +99,121 @@ pub struct AppState {
     pub profile_manager: Arc<ProfileManager>,
     pub services: Arc<GatewayServices>,
     pub session_lease_registry: Option<Arc<session::SessionLeaseRegistry>>,
+}
+
+fn validated_session_observer_id(observer_id: Option<&str>) -> Option<&str> {
+    observer_id.map(str::trim).filter(|value| {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '-' | '_' | '.'))
+    })
+}
+
+pub(super) fn session_lease_owner(
+    principal: &AuthenticatedPrincipal,
+    observer_id: Option<&str>,
+) -> String {
+    let principal_owner = format!("principal:{}", principal.0.claims().principal_id);
+    validated_session_observer_id(observer_id).map_or(principal_owner.clone(), |observer| {
+        format!("{principal_owner}:observer:{observer}")
+    })
+}
+
+pub(super) fn session_lease_owner_from_headers(
+    principal: &AuthenticatedPrincipal,
+    headers: &HeaderMap,
+) -> String {
+    let observer_id = headers
+        .get("x-cowd-observer-id")
+        .and_then(|value| value.to_str().ok());
+    session_lease_owner(principal, observer_id)
+}
+
+/// Admit one session mutation from a concrete attached Surface.
+///
+/// Authentication grants access to the account; it does not silently upgrade
+/// a reader attachment into a writer. Mutation routes therefore require a
+/// valid observer identity, an existing writer attachment for that exact
+/// principal/surface pair, and a compatible writer lease.
+pub(super) async fn require_session_writer_admission(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    headers: &HeaderMap,
+    session_id: &str,
+) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let raw_observer = match headers.get("x-cowd-observer-id") {
+        Some(value) => Some(value.to_str().map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "x-cowd-observer-id is not valid UTF-8".to_string(),
+                }),
+            )
+        })?),
+        None => None,
+    };
+    let observer_id = raw_observer.and_then(|value| validated_session_observer_id(Some(value)));
+    if raw_observer.is_some() && observer_id.is_none() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "x-cowd-observer-id is invalid".to_string(),
+            }),
+        ));
+    }
+    let owner = if let Some(observer_id) = observer_id {
+        let actor_id = surface_actor_id(principal, observer_id);
+        let role = state
+            .services
+            .session
+            .lifecycle_attachment_role(session_id, &actor_id)
+            .await;
+        if role.as_deref() != Some("writer") {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: match role.as_deref() {
+                        Some("reader") => {
+                            "reader session attachment cannot execute mutations".to_string()
+                        }
+                        _ => "session mutation requires an attached writer Surface".to_string(),
+                    },
+                }),
+            ));
+        }
+        session_lease_owner(principal, Some(observer_id))
+    } else {
+        // Backward-compatible server-side attachment for credentialed
+        // surfaces that predate the observer contract (notably WebUI).
+        // Explicit Surface clients always send their observer id; a second
+        // Surface owned by the same authenticated principal must not become
+        // read-only merely because TUI is also observing the session.
+        session_lease_owner(principal, None)
+    };
+    let registry = state.session_lease_registry.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "session lease registry unavailable; mutation is fail-closed".to_string(),
+            }),
+        )
+    })?;
+    let admission = registry.ensure_writer(session_id, &owner).await;
+    if admission.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: admission
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("session writer lease rejected")
+                    .to_string(),
+            }),
+        ));
+    }
+    Ok(owner)
 }
 
 /// Request identity derived exclusively by Gateway authentication middleware.
@@ -976,7 +1091,9 @@ pub mod test_support {
                     profile_id: "default".to_string(),
                     profile_manager: profiles,
                     services,
-                    session_lease_registry: None,
+                    session_lease_registry: Some(
+                        Arc::new(session::SessionLeaseRegistry::default()),
+                    ),
                 }),
             })
         }
@@ -1209,7 +1326,7 @@ mod capacity_middleware_tests {
 // ── Response types ─────────────────────────────────────────────
 
 #[derive(Debug)]
-struct ErrorResponse {
+pub(super) struct ErrorResponse {
     error: String,
 }
 
@@ -1724,36 +1841,12 @@ pub(crate) mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
-            session_lease_registry: None,
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
         })
     }
 
     fn test_state_with_config(config: serde_json::Value) -> Arc<AppState> {
         test_state_with_config_and_runtime(config, None)
-    }
-
-    fn test_state_with_lease_registry(
-        registry: Arc<session::SessionLeaseRegistry>,
-    ) -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
-        let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
-        let task_kernel = test_task_kernel();
-        Arc::new(AppState {
-            tool_registry: tools,
-            config: None,
-            event_bus,
-            static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
-            approval_gate: None,
-            auth_token: None,
-            workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            config_home: isolated_test_config_home(),
-            profile_id: "default".to_string(),
-            profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
-            session_lease_registry: Some(registry),
-        })
     }
 
     fn test_state_with_config_and_runtime(
@@ -1795,7 +1888,7 @@ pub(crate) mod tests {
                 surface_host,
                 workspace_root,
             ),
-            session_lease_registry: None,
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
         })
     }
 
@@ -1835,7 +1928,7 @@ pub(crate) mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services(session_kernel, task_kernel, None),
-            session_lease_registry: None,
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
         })
     }
 
@@ -1868,7 +1961,7 @@ pub(crate) mod tests {
                 workspace_root,
                 config_home.clone(),
             ),
-            session_lease_registry: None,
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
         })
     }
 
@@ -1908,7 +2001,7 @@ pub(crate) mod tests {
                 crate::services::GatewayServices::with_memory_for_tests(memory_manager)
                     .with_task_kernel_for_tests(task_kernel),
             ),
-            session_lease_registry: None,
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
         })
     }
 
@@ -1934,7 +2027,7 @@ pub(crate) mod tests {
                 crate::services::GatewayServices::with_memory_for_tests(memory_manager)
                     .with_task_kernel_for_tests(task_kernel),
             ),
-            session_lease_registry: None,
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
         })
     }
 
@@ -1965,7 +2058,7 @@ pub(crate) mod tests {
                 crate::services::GatewayServices::with_approval_for_tests(gate)
                     .with_task_kernel_for_tests(task_kernel),
             ),
-            session_lease_registry: None,
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
         })
     }
 
@@ -1993,7 +2086,7 @@ pub(crate) mod tests {
                 workspace_root,
                 config_home,
             ),
-            session_lease_registry: None,
+            session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
         })
     }
 
@@ -2306,7 +2399,11 @@ pub(crate) mod tests {
         run_id: &str,
         expected: &str,
     ) -> serde_json::Value {
-        for _ in 0..200 {
+        // The quick harness runs in a real background worker. Under the full
+        // Gateway suite hundreds of concurrent tests can legitimately delay
+        // it beyond five seconds; keep the wait bounded while never treating
+        // an honest `running` state as completion.
+        for _ in 0..1_200 {
             let detail = app
                 .clone()
                 .oneshot(
@@ -3322,22 +3419,46 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn execution_projection_routes_use_runtime_snapshot_delta_and_command_contracts() {
-        use harness_contract::execution_graph::ExecutionGraph;
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+        };
 
-        let state = test_state();
+        let session_id = "projection-route-session";
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".to_string()),
+            ))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
         let runtime = state
             .services
             .runtime
             .as_ref()
             .expect("runtime service")
             .runtime_services();
-        let graph = ExecutionGraph::new("projection route test");
+        let mut graph = ExecutionGraph::new("projection route test");
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            serde_json::json!({
+                "session_id": session_id,
+                "kind": "projection_route_test",
+            })
+            .to_string(),
+        );
+        graph
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        graph.nodes.push(node);
         let execution_id = graph.id.clone();
         runtime
             .graph_runner()
-            .start(graph)
+            .register(graph)
             .await
-            .expect("graph starts");
+            .expect("graph registers");
         let app = api_router(Arc::clone(&state));
 
         let snapshot = app
@@ -3862,10 +3983,15 @@ pub(crate) mod tests {
         assert_eq!(mfg["storage"]["contract"]["contract_version"], 1);
         assert_eq!(mfg["storage"]["contract"]["migration_owner"], "mfg");
         assert_eq!(mfg["storage"]["provisions"][0]["backend"], "sqlite");
-        assert_eq!(
-            mfg["source_lock"]["revision"],
-            "cf7a13b5bcf233f8033190e4a2b017206805aa7b"
-        );
+        let reviewed_revision = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../apps/mfg/source.lock.toml"
+        ))
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("rev = "))
+        .map(|value| value.trim_matches('"'))
+        .expect("reviewed MFG source-lock revision");
+        assert_eq!(mfg["source_lock"]["revision"], reviewed_revision);
         assert!(!body_text.contains(".sqlite"));
         assert!(!body_text.contains("postgres://"));
         assert!(!body_text.contains("secret_ref"));
@@ -4014,6 +4140,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/reality/data-plane/ingest-plan")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-reality-facade-ingest-plan")
                     .body(Body::from(
                         serde_json::json!({
                             "session_id": "mfg-reality-test",
@@ -4033,10 +4160,20 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(plan.status(), StatusCode::OK);
+        let status = plan.status();
+        let receipt_header = plan
+            .headers()
+            .get("x-cowd-receipt-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
         let body = to_bytes(plan.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["kind"], "mfg.reality.data_plane.ingest_plan");
+        assert_eq!(
+            json["receipt"]["receipt_id"].as_str(),
+            receipt_header.as_deref()
+        );
         assert_eq!(
             json["boundary"]["ownership"],
             "MFG consumes Reality Core projections; Reality Core owns Matrix management."
@@ -5745,6 +5882,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/reality/data-plane/ingest-plan")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-ingest-preview-request")
                     .body(Body::from(
                         serde_json::json!({
                             "request_id": "mfg-ingest-preview-request",
@@ -5765,7 +5903,19 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(preview.status(), StatusCode::OK);
+        let status = preview.status();
+        let receipt_header = preview
+            .headers()
+            .get("x-cowd-receipt-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = to_bytes(preview.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let preview_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            preview_json["receipt"]["receipt_id"].as_str(),
+            receipt_header.as_deref()
+        );
 
         let repository = matrix.store(&config_home).unwrap();
         assert_eq!(
@@ -6205,8 +6355,9 @@ pub(crate) mod tests {
                         "/api/apps/mfg/reality/evidence/{packet_id}/quality-gate"
                     ))
                     .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
                     .header("idempotency-key", "gateway-external-evidence-quality")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -6292,8 +6443,9 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri(format!("/api/apps/mfg/incidents/{incident_id}/analyze"))
                     .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
                     .header("idempotency-key", "gateway-external-incident-analysis")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -6482,6 +6634,7 @@ pub(crate) mod tests {
                     .uri("/api/apps/mfg/reality/data-plane/ingest-plan")
                     .header("authorization", "Bearer mfg-live-auth-token")
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "gateway-external-ingest-plan")
                     .body(Body::from(
                         serde_json::json!({
                             "request_id": "gateway-external-ingest-plan",
@@ -6534,7 +6687,12 @@ pub(crate) mod tests {
                         .method("POST")
                         .uri(path)
                         .header("authorization", "Bearer mfg-live-auth-token")
-                        .body(Body::empty())
+                        .header("content-type", "application/json")
+                        .header(
+                            "idempotency-key",
+                            format!("gateway-external-preview-{expected_kind}"),
+                        )
+                        .body(Body::from("{}"))
                         .unwrap(),
                 )
                 .await
@@ -6796,8 +6954,9 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/reality/compute/jobs/gateway-external-compute-plan/run")
                     .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
                     .header("idempotency-key", "gateway-external-compute-run")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -6824,8 +6983,9 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/reality/compute/jobs/gateway-external-compute-plan/run")
                     .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
                     .header("idempotency-key", "gateway-external-compute-run")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -6845,8 +7005,9 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/reality/metrics/recompute")
                     .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
                     .header("idempotency-key", "gateway-external-metric-recompute")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -6869,8 +7030,9 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/apps/mfg/reality/metrics/recompute")
                     .header("authorization", "Bearer mfg-live-auth-token")
+                    .header("content-type", "application/json")
                     .header("idempotency-key", "gateway-external-metric-recompute")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -7593,6 +7755,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri(format!("/api/apps/mfg/incidents/{incident_id}/skills/plan"))
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-skill-plan")
                     .body(Body::from(r#"{"limit":1}"#))
                     .unwrap(),
             )
@@ -7739,8 +7902,9 @@ pub(crate) mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/apps/mfg/incidents/{incident_id}/analyze"))
+                    .header("content-type", "application/json")
                     .header("idempotency-key", "mfg-domain-analyze")
-                    .body(Body::empty())
+                    .body(Body::from("{}"))
                     .unwrap(),
             )
             .await
@@ -7784,6 +7948,7 @@ pub(crate) mod tests {
                         "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
                     ))
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-analysis-action-preview")
                     .body(Body::from(r#"{"mode":"dry_run","note":"preview only"}"#))
                     .unwrap(),
             )
@@ -7823,6 +7988,7 @@ pub(crate) mod tests {
                         "/api/apps/mfg/analyses/{analysis_id}/actions/{action_id}/execute"
                     ))
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-analysis-action-invalid")
                     .body(Body::from(r#"{"mode":"unknown"}"#))
                     .unwrap(),
             )
@@ -7877,6 +8043,7 @@ pub(crate) mod tests {
                         "/api/apps/mfg/executions/{execution_id}/cross-plane/execute"
                     ))
                     .header("content-type", "application/json")
+                    .header("idempotency-key", "mfg-domain-cross-plane-preview")
                     .body(Body::from(r#"{"mode":"dry_run"}"#))
                     .unwrap(),
             )
@@ -10082,7 +10249,7 @@ runtime:
         assert_eq!(json["components"]["permissions"]["auth_required"], false);
         assert_eq!(
             json["components"]["session"]["leases"]["status"],
-            "unavailable"
+            "available"
         );
         assert_eq!(json["diagnostics"]["durable_session_store"], false);
         assert_eq!(json["diagnostics"]["memory_attached"], false);
@@ -10163,8 +10330,30 @@ runtime:
 
     #[tokio::test]
     async fn runtime_session_lease_routes_share_runtime_host_registry_projection() {
-        let registry = Arc::new(session::SessionLeaseRegistry::default());
-        let app = api_router(test_state_with_lease_registry(registry));
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&new_api_session_record("session-a", None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        for (observer, role) in [
+            ("tui:test", "writer"),
+            ("tui:reader", "reader"),
+            ("tui:other-writer", "writer"),
+        ] {
+            let attached = state
+                .services
+                .session
+                .attach_session_value(
+                    "session-a",
+                    &format!("principal:local-human:surface:{observer}"),
+                    "tui",
+                    Some(role),
+                )
+                .await;
+            assert_eq!(attached["ok"], true);
+        }
+        let app = api_router(state.clone());
 
         let acquire = app
             .clone()
@@ -10173,6 +10362,7 @@ runtime:
                     .method("POST")
                     .uri("/api/runtime/session-leases/acquire")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:test")
                     .body(Body::from(
                         serde_json::json!({
                             "session_id": "session-a",
@@ -10188,9 +10378,86 @@ runtime:
         let body = to_bytes(acquire.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
-        assert_eq!(json["owner"], "principal:local-human");
+        assert_eq!(json["owner"], "principal:local-human:observer:tui:test");
         assert_eq!(json["mode"], "exclusive");
         assert!(json["acquired_at_ms"].as_u64().is_some());
+
+        let reader_acquire = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/acquire")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:reader")
+                    .body(Body::from(r#"{"session_id":"session-a"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader_acquire.status(), StatusCode::FORBIDDEN);
+
+        let reader_detach = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/session-a/detach")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:reader")
+                    .body(Body::from(r#"{"surface":"tui"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reader_detach.status(), StatusCode::OK);
+        let body = to_bytes(reader_detach.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["ok"], true);
+        let lifecycle = state
+            .services
+            .session
+            .lifecycle_snapshot_value(Some("session-a"))
+            .await;
+        let attachments = lifecycle["snapshot"]["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert!(attachments.iter().all(|attachment| {
+            attachment["actor"]["actor_id"] != "principal:local-human:surface:tui:reader"
+        }));
+
+        let spoofed_body_observer = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/acquire")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:test")
+                    .body(Body::from(
+                        r#"{"session_id":"session-a","observer_id":"tui:other-writer"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(spoofed_body_observer.status().is_client_error());
+
+        let unknown_session = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/acquire")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:test")
+                    .body(Body::from(r#"{"session_id":"session-unknown"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_session.status(), StatusCode::NOT_FOUND);
 
         let list = app
             .clone()
@@ -10226,8 +10493,23 @@ runtime:
         assert_eq!(json["components"]["session"]["leases"]["total"], 1);
         assert_eq!(
             json["components"]["session"]["leases"]["leases"][0]["owner"],
-            "principal:local-human"
+            "principal:local-human:observer:tui:test"
         );
+
+        let cross_tab_release = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/release")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:other-writer")
+                    .body(Body::from(r#"{"session_id":"session-a"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_tab_release.status(), StatusCode::CONFLICT);
 
         let release = app
             .oneshot(
@@ -10235,6 +10517,7 @@ runtime:
                     .method("POST")
                     .uri("/api/runtime/session-leases/release")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:test")
                     .body(Body::from(
                         serde_json::json!({
                             "session_id": "session-a",
@@ -10643,7 +10926,19 @@ providers:
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&config_home).unwrap();
 
-        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&new_api_session_record(
+                "s1",
+                Some("test-model".to_string()),
+            ))
+            .await
+            .unwrap();
+        let app = api_router(test_state_with_store_and_workspace(
+            store,
+            workspace,
+            config_home,
+        ));
         let response = app
             .clone()
             .oneshot(
@@ -10726,7 +11021,9 @@ providers:
                     .method("POST")
                     .uri("/api/slash/dispatch")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"command":"/compact","args":{}}"#))
+                    .body(Body::from(
+                        r#"{"command":"/compact","args":{"session_id":"s1"}}"#,
+                    ))
                     .unwrap(),
             )
             .await

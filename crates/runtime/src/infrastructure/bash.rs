@@ -277,9 +277,26 @@ fn hardened_launch(
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
 ) -> io::Result<sandbox_launcher::PreparedSandboxCommand> {
-    let workspace = cwd.canonicalize()?;
+    let canonical_cwd = cwd.canonicalize()?;
+    let workspace = match sandbox_status.workspace_root.as_deref() {
+        Some(configured_root) => {
+            let root = PathBuf::from(configured_root).canonicalize()?;
+            if !canonical_cwd.starts_with(&root) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "command working directory {} is outside configured sandbox workspace root {}",
+                        canonical_cwd.display(),
+                        root.display()
+                    ),
+                ));
+            }
+            root
+        }
+        None => canonical_cwd.clone(),
+    };
     let mut spec = SandboxLaunchSpec::workspace(&workspace);
-    spec.working_directory = Some(workspace);
+    spec.working_directory = Some(canonical_cwd);
     spec.network_enabled = !sandbox_status.network_active;
     let tool_root = crate::cowd_dirs::user_tools_dir();
     if tool_root.is_dir() {

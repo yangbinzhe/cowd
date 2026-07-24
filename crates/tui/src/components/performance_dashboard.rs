@@ -36,9 +36,13 @@ pub struct PerformanceDashboard {
 #[derive(Debug, Clone, Default)]
 pub struct PerformanceReport {
     pub avg_prepare_context_latency_ms: f64,
+    pub latency_reported: bool,
     pub cache_hit_rate: f64,
+    pub cache_hit_rate_reported: bool,
     pub avg_compression_ratio: f64,
+    pub compression_reported: bool,
     pub avg_extract_duration_ms: f64,
+    pub extract_duration_reported: bool,
     pub tuning_applied: bool,
     pub last_tuning: Option<DateTime<Utc>>,
     pub total_samples: usize,
@@ -82,27 +86,40 @@ impl PerformanceDashboard {
         if self.last_sync.elapsed() < REFRESH_INTERVAL {
             return;
         }
-        if app.memory_status.is_none() && app.memory_total_entries.is_none() {
+        let cache_total = app
+            .telemetry
+            .finalized_cache_hits
+            .saturating_add(app.telemetry.finalized_cache_misses);
+        let has_reported_data = app.telemetry.history_hydration_duration_ms.is_some()
+            || cache_total > 0
+            || app.telemetry.session_sse_reconnect_count > 0
+            || app.telemetry.projection_sse_reconnect_count > 0
+            || app.telemetry.full_timeline_rebuild_count > 0
+            || app.telemetry.live_tail_rebuild_count > 0;
+        if !has_reported_data {
             self.last_report = None;
             self.last_sync = Instant::now();
             return;
         }
 
-        let total_entries = app.memory_total_entries.unwrap_or(app.memory_entries.len());
-        let vector_count = app.memory_vector_count.unwrap_or_default();
+        let cache_hit_rate = (cache_total > 0)
+            .then(|| app.telemetry.finalized_cache_hits as f64 / cache_total as f64);
         let report = PerformanceReport {
-            avg_prepare_context_latency_ms: 0.0,
-            cache_hit_rate: if total_entries == 0 {
-                0.0
-            } else {
-                (vector_count as f64 / total_entries as f64).min(1.0)
-            },
+            avg_prepare_context_latency_ms: app
+                .telemetry
+                .history_hydration_duration_ms
+                .unwrap_or_default() as f64,
+            latency_reported: app.telemetry.history_hydration_duration_ms.is_some(),
+            cache_hit_rate: cache_hit_rate.unwrap_or_default(),
+            cache_hit_rate_reported: cache_hit_rate.is_some(),
             avg_compression_ratio: 0.0,
+            compression_reported: false,
             avg_extract_duration_ms: 0.0,
+            extract_duration_reported: false,
             tuning_applied: false,
             last_tuning: None,
-            total_samples: total_entries,
-            window_size: app.memory_layer_counts.iter().sum(),
+            total_samples: usize::try_from(cache_total).unwrap_or(usize::MAX),
+            window_size: app.telemetry.history_hydrated_messages,
             current_tuning: TuningConfig::default(),
             last_updated: Some(Utc::now()),
         };
@@ -123,7 +140,7 @@ impl PerformanceDashboard {
     fn render_content(&self, area: Rect, ctx: &mut RenderContext) {
         let Some(ref report) = self.last_report else {
             let no_data = Paragraph::new(
-                "No performance data available.\nStart a session to collect metrics.",
+                "No measured performance data available.\nMetrics remain not reported until a real history/render/transport sample exists.",
             )
             .style(Style::default().fg(Color::DarkGray))
             .wrap(Wrap { trim: false });
@@ -153,8 +170,12 @@ impl PerformanceDashboard {
             .block(
                 Block::default()
                     .title(format!(
-                        " Prepare Latency (avg: {:.0}ms) ",
-                        report.avg_prepare_context_latency_ms
+                        " History hydration ({}) ",
+                        if report.latency_reported {
+                            format!("{:.0}ms", report.avg_prepare_context_latency_ms)
+                        } else {
+                            "not reported".to_string()
+                        }
                     ))
                     .borders(Borders::ALL),
             )
@@ -183,8 +204,16 @@ impl PerformanceDashboard {
                     .fg(gauge_color)
                     .add_modifier(Modifier::BOLD),
             )
-            .percent(hit_pct.min(100))
-            .label(format!("{:.1}%", report.cache_hit_rate * 100.0));
+            .percent(if report.cache_hit_rate_reported {
+                hit_pct.min(100)
+            } else {
+                0
+            })
+            .label(if report.cache_hit_rate_reported {
+                format!("{:.1}%", report.cache_hit_rate * 100.0)
+            } else {
+                "not reported".to_string()
+            });
         ctx.frame_mut().render_widget(gauge, chunks[1]);
 
         // ── Row 3: Compression Ratio Bar ────────────────────────────
@@ -199,16 +228,31 @@ impl PerformanceDashboard {
         let comp_gauge = Gauge::default()
             .block(
                 Block::default()
-                    .title(" Compression Ratio ")
+                    .title(if report.compression_reported {
+                        " Compression Ratio "
+                    } else {
+                        " Compression Ratio (not reported) "
+                    })
                     .borders(Borders::ALL),
             )
             .gauge_style(Style::default().fg(comp_color).add_modifier(Modifier::BOLD))
             .percent(comp_pct)
-            .label(format!(
-                "{:.1}%  (extract: {:.0}ms)",
-                report.avg_compression_ratio * 100.0,
-                report.avg_extract_duration_ms
-            ));
+            .label(if report.compression_reported {
+                if report.extract_duration_reported {
+                    format!(
+                        "{:.1}%  (extract: {:.0}ms)",
+                        report.avg_compression_ratio * 100.0,
+                        report.avg_extract_duration_ms
+                    )
+                } else {
+                    format!(
+                        "{:.1}%  (extract: not reported)",
+                        report.avg_compression_ratio * 100.0
+                    )
+                }
+            } else {
+                "not reported".to_string()
+            });
         ctx.frame_mut().render_widget(comp_gauge, chunks[2]);
 
         // ── Row 4: Stats Footer ─────────────────────────────────────
@@ -362,9 +406,13 @@ mod tests {
     ) -> PerformanceReport {
         PerformanceReport {
             avg_prepare_context_latency_ms: latency_ms,
+            latency_reported: true,
             avg_extract_duration_ms: extract_ms,
+            extract_duration_reported: true,
             avg_compression_ratio: compression,
+            compression_reported: true,
             cache_hit_rate: hit_rate,
+            cache_hit_rate_reported: true,
             total_samples: 50,
             window_size: 100,
             last_updated: Some(Utc::now()),
@@ -497,7 +545,7 @@ mod tests {
         let lines = render_dashboard(&mut dashboard, 60, 15);
         let joined = lines.join("\n");
         assert!(
-            joined.contains("No performance data available"),
+            joined.contains("No measured performance data"),
             "Should show no-data message, got: {joined}"
         );
     }
@@ -515,7 +563,7 @@ mod tests {
         let lines = render_dashboard(&mut dashboard, 80, 20);
         let joined = lines.join("\n");
         assert!(
-            joined.contains("Prepare Latency"),
+            joined.contains("History hydration"),
             "Should show latency sparkline, got: {joined}"
         );
         assert!(

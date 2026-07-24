@@ -1,9 +1,13 @@
 use crate::api::ApiClient;
-use crate::server::ServerProcess;
 use crate::reporter::TestRunner;
+use crate::server::ServerProcess;
 
 pub fn has_scenario(name: &str) -> bool {
-    name == "server_health" || name == "server_memory" || name == "server_core" || name == "all" || name == ""
+    name == "server_health"
+        || name == "server_memory"
+        || name == "server_core"
+        || name == "all"
+        || name == ""
 }
 
 pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
@@ -13,8 +17,11 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
 
     runner.run("Health check", || {
         let body = api.get("/health")?;
-        if body.contains("ok") { Ok(()) }
-        else { Err(anyhow::anyhow!("Health: {body}")) }
+        if body.contains("ok") {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Health: {body}"))
+        }
     });
 
     runner.run("Session list", || {

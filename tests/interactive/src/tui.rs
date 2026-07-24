@@ -438,10 +438,6 @@ impl TuiSession {
         Ok(())
     }
 
-    pub fn artifact_dir(&self) -> &Path {
-        &self.artifact_dir
-    }
-
     pub fn close(mut self) -> Result<()> {
         self.send("/quit")?;
         self.enter()?;

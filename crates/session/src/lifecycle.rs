@@ -218,6 +218,22 @@ impl SessionLifecycleKernel {
         Ok(event)
     }
 
+    /// Return the role of one concrete Surface attachment. Missing
+    /// attachments remain distinguishable from explicit readers so stateless
+    /// API clients can retain backwards-compatible admission while attached
+    /// observer surfaces are enforced fail-closed.
+    pub async fn attachment_role(&self, session_id: &str, actor_id: &str) -> Option<String> {
+        if self.ensure_loaded(session_id).await.is_err() {
+            return None;
+        }
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.attachments.get(actor_id))
+            .and_then(|attachment| attachment.actor.role.clone())
+    }
+
     pub async fn mark_active(&self, session_id: &str) -> Result<SessionLifecycleEvent, String> {
         let session_id = validate_session_id(session_id)?;
         let _mutation = self.mutation_gate.lock().await;

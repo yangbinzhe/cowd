@@ -17,7 +17,10 @@ struct SessionSubscriber {
     sender: EventSender,
     /// Text SSE is deliberately lossy under pressure.  This bit turns the
     /// loss into an explicit recovery protocol instead of a silent gap.
-    resync_pending: AtomicBool,
+    ///
+    /// It is shared with the independent marker-delivery task because the
+    /// event that fills the channel may itself be the final durable terminal.
+    resync_pending: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,9 +33,9 @@ pub struct SessionEventBusMetrics {
 
 pub struct SessionEventBus {
     listeners: RwLock<HashMap<String, Vec<SessionSubscriber>>>,
-    lag_marked: AtomicU64,
-    resync_sent: AtomicU64,
-    disconnected: AtomicU64,
+    lag_marked: Arc<AtomicU64>,
+    resync_sent: Arc<AtomicU64>,
+    disconnected: Arc<AtomicU64>,
     next_subscriber_id: AtomicU64,
 }
 
@@ -40,9 +43,9 @@ impl SessionEventBus {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             listeners: RwLock::new(HashMap::new()),
-            lag_marked: AtomicU64::new(0),
-            resync_sent: AtomicU64::new(0),
-            disconnected: AtomicU64::new(0),
+            lag_marked: Arc::new(AtomicU64::new(0)),
+            resync_sent: Arc::new(AtomicU64::new(0)),
+            disconnected: Arc::new(AtomicU64::new(0)),
             next_subscriber_id: AtomicU64::new(1),
         })
     }
@@ -59,7 +62,7 @@ impl SessionEventBus {
             .push(SessionSubscriber {
                 id,
                 sender: tx,
-                resync_pending: AtomicBool::new(false),
+                resync_pending: Arc::new(AtomicBool::new(false)),
             });
         id
     }
@@ -81,9 +84,13 @@ impl SessionEventBus {
     }
 
     /// Send an SSE event string to all subscribers of the given session.
-    /// Uses try_send to avoid blocking the producer.  A slow consumer is
-    /// explicitly told to resync on the next writable opportunity; it never
-    /// silently treats a dropped transient delta as a terminal event.
+    /// Uses try_send to avoid coupling fast producers/subscribers to a slow
+    /// Surface. When a channel is full an independent, ordered resync marker
+    /// waits for that subscriber's next writable slot. Subsequent broadcasts
+    /// are withheld from that subscriber until the marker is accepted.
+    ///
+    /// The marker cannot depend on a later application broadcast: the
+    /// dropped event may be the session's final durable terminal.
     pub async fn broadcast(&self, session_id: &str, sse_data: &str) {
         let listeners = self.listeners.read().await;
         if let Some(txs) = listeners.get(session_id) {
@@ -91,28 +98,7 @@ impl SessionEventBus {
             let mut dead_ids = Vec::new();
             for (i, subscriber) in txs.iter().enumerate() {
                 if subscriber.resync_pending.load(Ordering::Acquire) {
-                    let marker = serde_json::json!({
-                        "type": "session_stream_resync",
-                        "session_id": session_id,
-                        "reason": "transport_lag",
-                    })
-                    .to_string();
-                    match subscriber.sender.try_send(marker) {
-                        Ok(()) => {
-                            subscriber.resync_pending.store(false, Ordering::Release);
-                            self.resync_sent.fetch_add(1, Ordering::Relaxed);
-                            // The marker itself is the recovery boundary. Do
-                            // not immediately refill this small channel with
-                            // another transient delta before the client can
-                            // refresh its durable projection/transcript.
-                            continue;
-                        }
-                        Err(mpsc::error::TrySendError::Full(_)) => continue,
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            dead_ids.push(subscriber.id);
-                            continue;
-                        }
-                    }
+                    continue;
                 }
                 match subscriber.sender.try_send(data.clone()) {
                     Ok(()) => {}
@@ -122,8 +108,33 @@ impl SessionEventBus {
                             tracing::warn!(
                                 session_id,
                                 consumer_index = i,
-                                "SSE consumer lagged; explicit resync pending"
+                                "SSE consumer lagged; scheduling an independent durable resync boundary"
                             );
+                            let marker = serde_json::json!({
+                                "type": "session_stream_resync",
+                                "session_id": session_id,
+                                "reason": "transport_lag",
+                            })
+                            .to_string();
+                            let sender = subscriber.sender.clone();
+                            let pending = Arc::clone(&subscriber.resync_pending);
+                            let resync_sent = Arc::clone(&self.resync_sent);
+                            let disconnected = Arc::clone(&self.disconnected);
+                            tokio::spawn(async move {
+                                match sender.send(marker).await {
+                                    Ok(()) => {
+                                        resync_sent.fetch_add(1, Ordering::Relaxed);
+                                        // `send` preserves channel ordering.
+                                        // Clear only after the recovery
+                                        // boundary occupies its slot.
+                                        pending.store(false, Ordering::Release);
+                                    }
+                                    Err(_) => {
+                                        disconnected.fetch_add(1, Ordering::Relaxed);
+                                        pending.store(false, Ordering::Release);
+                                    }
+                                }
+                            });
                         }
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -299,6 +310,41 @@ mod tests {
             fast_events.push(event);
         }
         assert_eq!(fast_events.len(), 3);
+        let metrics = bus.metrics().await;
+        assert_eq!(metrics.lag_marked, 1);
+        assert_eq!(metrics.resync_sent, 1);
+    }
+
+    #[tokio::test]
+    async fn final_event_overflow_delivers_resync_without_later_broadcast() {
+        let bus = SessionEventBus::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        let _ = bus.subscribe("session-terminal", tx).await;
+
+        bus.broadcast(
+            "session-terminal",
+            r#"{"type":"TextDelta","content":"fills-channel"}"#,
+        )
+        .await;
+        // This can be the final TerminalCommitted broadcast. It cannot fit,
+        // and this test deliberately emits no later application event.
+        bus.broadcast(
+            "session-terminal",
+            r#"{"type":"TerminalCommitted","terminal_id":"terminal-1"}"#,
+        )
+        .await;
+
+        let first = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("filled event remains readable")
+            .expect("subscriber remains connected");
+        assert!(first.contains("TextDelta"));
+        let marker = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("resync marker must not require a later broadcast")
+            .expect("subscriber remains connected");
+        assert!(marker.contains("session_stream_resync"));
+        assert!(marker.contains("transport_lag"));
         let metrics = bus.metrics().await;
         assert_eq!(metrics.lag_marked, 1);
         assert_eq!(metrics.resync_sent, 1);

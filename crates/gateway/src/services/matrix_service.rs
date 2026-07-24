@@ -680,11 +680,12 @@ impl MatrixService {
     pub(crate) fn build_evidence_packet(
         &self,
         config_home: impl AsRef<Path>,
+        packet_id: Option<&str>,
         attention_id: Option<&str>,
         problem_statement: Option<&str>,
     ) -> Result<MatrixEvidencePacket, GatewayMatrixRepositoryError> {
         self.store(config_home)?
-            .build_evidence_packet(attention_id, problem_statement)
+            .build_evidence_packet(packet_id, attention_id, problem_statement)
     }
 
     pub(crate) fn insert_ai_harness_evidence_packet(

@@ -14,6 +14,7 @@ CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 GATEWAY_LOG="$TMP_DIR/gateway.log"
 SESSION_ID="runtime-surface-session-$$"
+OBSERVER_ID="runtime-surface:$$_writer"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-runtime-surface-scenario}"
 API_TOKEN="runtime-surface-$$_credential"
 
@@ -129,7 +130,15 @@ curl -fsS "$BASE_URL/health" >/dev/null
 curl -fsS "$BASE_URL/api/sessions/$SESSION_ID/ensure" \
   -H 'content-type: application/json' \
   -d '{"model":"claude-sonnet-4-6"}' >"$TMP_DIR/ensure-session.json"
+curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/attach" \
+  -H "x-cowd-observer-id: $OBSERVER_ID" \
+  -H 'x-cowd-surface-id: runtime-surface' \
+  -H 'content-type: application/json' \
+  -d '{"surface":"runtime-surface","role":"writer"}' \
+  >"$TMP_DIR/attach-session.json"
 curl -fsS "$BASE_URL/api/runtime/session-leases/acquire" \
+  -H "x-cowd-observer-id: $OBSERVER_ID" \
+  -H 'x-cowd-surface-id: runtime-surface' \
   -H 'content-type: application/json' \
   -d "{\"session_id\":\"$SESSION_ID\",\"mode\":\"collaborative\"}" \
   >"$TMP_DIR/acquire-lease.json"

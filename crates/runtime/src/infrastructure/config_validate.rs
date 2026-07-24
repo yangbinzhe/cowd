@@ -250,6 +250,26 @@ const TOP_LEVEL_FIELDS: &[FieldSpec] = &[
         name: "runtime",
         expected: FieldType::Object,
     },
+    FieldSpec {
+        name: "context_budget",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "model_context_windows",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "apps",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "storage",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
+        name: "gateAutoFix",
+        expected: FieldType::Object,
+    },
 ];
 
 const HOOKS_FIELDS: &[FieldSpec] = &[
@@ -379,11 +399,23 @@ const SANDBOX_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Bool,
     },
     FieldSpec {
+        name: "isolate_network",
+        expected: FieldType::Bool,
+    },
+    FieldSpec {
         name: "filesystemMode",
         expected: FieldType::String,
     },
     FieldSpec {
         name: "filesystem_mode",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "workspaceRoot",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "workspace_root",
         expected: FieldType::String,
     },
     FieldSpec {

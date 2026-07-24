@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, CompatibilityToolProtocolFailure};
 use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
@@ -41,6 +41,8 @@ const COMPAT_TOOL_USE_FENCE_OPEN: &str = "```tool_use";
 const COMPAT_JSON_FENCE_OPEN: &str = "```json";
 const COMPAT_TOOL_CALL_OPEN: &str = "<tool_call>";
 const COMPAT_TOOL_CALL_CLOSE: &str = "</tool_call>";
+const COMPAT_TOOL_FRAME_MAX_BYTES: usize = 1024 * 1024;
+const COMPAT_JSON_LOOKAHEAD_MAX_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -692,7 +694,7 @@ impl StreamState {
             }
 
             if let Some(content) = choice.delta.content.filter(|value| !value.is_empty()) {
-                self.ingest_text_content(content, &mut events);
+                self.ingest_text_content(content, &mut events)?;
             }
 
             for tool_call in choice.delta.tool_calls {
@@ -744,19 +746,24 @@ impl StreamState {
 
         let mut events = Vec::new();
         if let Some(frame) = self.dsml_frame.take() {
-            if let Some(calls) = parse_compat_tool_calls(&frame, &self.exposed_tool_names) {
-                self.emit_dsml_tool_calls(calls, &mut events);
-            } else {
-                let preview = if frame.chars().count() > 100 {
-                    format!("{}…", frame.chars().take(100).collect::<String>())
-                } else {
-                    frame.clone()
-                };
-                tracing::warn!(
-                    dsml_frame_preview = %preview,
-                    "rejected malformed DSML tool-call frame; falling back to text emission"
-                );
-                self.emit_text_content(frame, &mut events);
+            match parse_compat_tool_calls(&frame, &self.exposed_tool_names) {
+                Ok(calls) => self.emit_dsml_tool_calls(calls, &mut events),
+                Err(_)
+                    if frame.trim_start().starts_with(COMPAT_JSON_FENCE_OPEN)
+                        && !json_fence_claims_tool_protocol(&frame) =>
+                {
+                    // A generic JSON code fence is ordinary answer content
+                    // unless its object explicitly claims the compatibility
+                    // tool envelope. Do not turn configuration/examples into
+                    // provider protocol failures.
+                    self.emit_text_content(frame, &mut events);
+                }
+                Err(error) => {
+                    log_rejected_compat_tool_frame(&self.model, &frame, error);
+                    // Once a provider emitted any supported protocol marker,
+                    // the bytes are no longer ordinary assistant prose.
+                    return Err(compatibility_tool_protocol_error(error));
+                }
             }
         }
         if !self.dsml_prefix.is_empty() {
@@ -817,10 +824,40 @@ impl StreamState {
         Ok(events)
     }
 
-    fn ingest_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
+    fn ingest_text_content(
+        &mut self,
+        content: String,
+        events: &mut Vec<StreamEvent>,
+    ) -> Result<(), ApiError> {
         if let Some(frame) = self.dsml_frame.as_mut() {
             frame.push_str(&content);
-            return;
+            if frame.trim_start().starts_with(COMPAT_JSON_FENCE_OPEN) {
+                match json_tool_discriminator_state(frame) {
+                    JsonToolDiscriminator::Rejected => {
+                        let ordinary_json = self.dsml_frame.take().unwrap_or_default();
+                        self.emit_text_content(ordinary_json, events);
+                    }
+                    JsonToolDiscriminator::Pending
+                        if frame.len() >= COMPAT_JSON_LOOKAHEAD_MAX_BYTES =>
+                    {
+                        let ordinary_json = self.dsml_frame.take().unwrap_or_default();
+                        self.emit_text_content(ordinary_json, events);
+                    }
+                    JsonToolDiscriminator::Confirmed
+                        if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES =>
+                    {
+                        return Err(ApiError::CompatibilityToolProtocol(
+                            CompatibilityToolProtocolFailure::FrameTooLarge,
+                        ));
+                    }
+                    JsonToolDiscriminator::Pending | JsonToolDiscriminator::Confirmed => {}
+                }
+            } else if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
+                return Err(ApiError::CompatibilityToolProtocol(
+                    CompatibilityToolProtocolFailure::FrameTooLarge,
+                ));
+            }
+            return Ok(());
         }
 
         self.dsml_prefix.push_str(&content);
@@ -831,7 +868,34 @@ impl StreamState {
                 self.emit_text_content(preceding_text, events);
             }
             self.dsml_frame = Some(frame);
-            return;
+            let frame = self.dsml_frame.as_deref().unwrap_or_default();
+            if frame.trim_start().starts_with(COMPAT_JSON_FENCE_OPEN) {
+                match json_tool_discriminator_state(frame) {
+                    JsonToolDiscriminator::Rejected => {
+                        let ordinary_json = self.dsml_frame.take().unwrap_or_default();
+                        self.emit_text_content(ordinary_json, events);
+                    }
+                    JsonToolDiscriminator::Pending
+                        if frame.len() >= COMPAT_JSON_LOOKAHEAD_MAX_BYTES =>
+                    {
+                        let ordinary_json = self.dsml_frame.take().unwrap_or_default();
+                        self.emit_text_content(ordinary_json, events);
+                    }
+                    JsonToolDiscriminator::Confirmed
+                        if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES =>
+                    {
+                        return Err(ApiError::CompatibilityToolProtocol(
+                            CompatibilityToolProtocolFailure::FrameTooLarge,
+                        ));
+                    }
+                    JsonToolDiscriminator::Pending | JsonToolDiscriminator::Confirmed => {}
+                }
+            } else if frame.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
+                return Err(ApiError::CompatibilityToolProtocol(
+                    CompatibilityToolProtocolFailure::FrameTooLarge,
+                ));
+            }
+            return Ok(());
         }
 
         let retained = longest_compat_tool_prefix_suffix(&self.dsml_prefix);
@@ -841,6 +905,7 @@ impl StreamState {
             self.dsml_prefix = retained;
             self.emit_text_content(released, events);
         }
+        Ok(())
     }
 
     fn emit_dsml_tool_calls(&mut self, calls: Vec<DsmlToolCall>, events: &mut Vec<StreamEvent>) {
@@ -1742,12 +1807,34 @@ fn normalize_chat_completion_response(
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<BTreeSet<_>>();
-        if let Some(calls) = parse_compat_tool_calls(&text, &exposed_tool_names) {
-            content.extend(calls.into_iter().map(|call| OutputContentBlock::ToolUse {
-                id: call.id,
-                name: call.name,
-                input: call.input,
-            }));
+        if let Some(marker_offset) = first_compat_tool_marker(&text) {
+            let (visible_prefix, protocol_frame) = text.split_at(marker_offset);
+            match parse_compat_tool_calls(protocol_frame, &exposed_tool_names) {
+                Ok(calls) => {
+                    if !visible_prefix.is_empty() {
+                        content.push(OutputContentBlock::Text {
+                            text: visible_prefix.to_string(),
+                        });
+                    }
+                    content.extend(calls.into_iter().map(|call| OutputContentBlock::ToolUse {
+                        id: call.id,
+                        name: call.name,
+                        input: call.input,
+                    }));
+                }
+                Err(_)
+                    if protocol_frame
+                        .trim_start()
+                        .starts_with(COMPAT_JSON_FENCE_OPEN)
+                        && !json_fence_claims_tool_protocol(protocol_frame) =>
+                {
+                    content.push(OutputContentBlock::Text { text });
+                }
+                Err(error) => {
+                    log_rejected_compat_tool_frame(model, protocol_frame, error);
+                    return Err(compatibility_tool_protocol_error(error));
+                }
+            }
         } else {
             content.push(OutputContentBlock::Text { text });
         }
@@ -1850,56 +1937,135 @@ struct DsmlToolCall {
     input: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompatToolFrameError {
+    FrameTooLarge,
+    UnrecognizedMarker,
+    Unterminated,
+    InvalidAttributes,
+    UnknownTool,
+    InvalidArguments,
+    DuplicateParameter,
+    EmptyCalls,
+    UnsupportedShape,
+}
+
+impl CompatToolFrameError {
+    const fn class(self) -> &'static str {
+        match self {
+            Self::FrameTooLarge => "frame_too_large",
+            Self::UnrecognizedMarker => "unrecognized_marker",
+            Self::Unterminated => "unterminated",
+            Self::InvalidAttributes => "invalid_attributes",
+            Self::UnknownTool => "unknown_tool",
+            Self::InvalidArguments => "invalid_arguments",
+            Self::DuplicateParameter => "duplicate_parameter",
+            Self::EmptyCalls => "empty_calls",
+            Self::UnsupportedShape => "unsupported_shape",
+        }
+    }
+}
+
+fn compatibility_tool_protocol_error(error: CompatToolFrameError) -> ApiError {
+    ApiError::CompatibilityToolProtocol(match error {
+        CompatToolFrameError::FrameTooLarge => CompatibilityToolProtocolFailure::FrameTooLarge,
+        CompatToolFrameError::UnrecognizedMarker
+        | CompatToolFrameError::Unterminated
+        | CompatToolFrameError::InvalidAttributes
+        | CompatToolFrameError::UnknownTool
+        | CompatToolFrameError::InvalidArguments
+        | CompatToolFrameError::DuplicateParameter
+        | CompatToolFrameError::EmptyCalls
+        | CompatToolFrameError::UnsupportedShape => {
+            CompatibilityToolProtocolFailure::MalformedFrame
+        }
+    })
+}
+
+fn log_rejected_compat_tool_frame(model: &str, frame: &str, error: CompatToolFrameError) {
+    tracing::warn!(
+        provider = "openai_compat",
+        model,
+        frame_bytes = frame.len(),
+        failure_class = error.class(),
+        redacted_preview = "<compat-tool-frame-redacted>",
+        "rejected malformed compatibility tool-call frame"
+    );
+}
+
 fn parse_dsml_tool_calls(
     text: &str,
     exposed_tool_names: &BTreeSet<String>,
-) -> Option<Vec<DsmlToolCall>> {
+) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
     let body = text
         .trim()
-        .strip_prefix(DSML_TOOL_CALLS_OPEN)?
-        .strip_suffix(DSML_TOOL_CALLS_CLOSE)?;
+        .strip_prefix(DSML_TOOL_CALLS_OPEN)
+        .ok_or(CompatToolFrameError::UnrecognizedMarker)?
+        .strip_suffix(DSML_TOOL_CALLS_CLOSE)
+        .ok_or(CompatToolFrameError::Unterminated)?;
     let mut remaining = body.trim();
     let mut calls = Vec::new();
 
     while !remaining.is_empty() {
-        let after_open = remaining.strip_prefix(DSML_INVOKE_OPEN)?;
-        let tag_end = after_open.find('>')?;
+        let after_open = remaining
+            .strip_prefix(DSML_INVOKE_OPEN)
+            .ok_or(CompatToolFrameError::UnsupportedShape)?;
+        let tag_end = after_open
+            .find('>')
+            .ok_or(CompatToolFrameError::Unterminated)?;
         let attributes = parse_dsml_attributes(&after_open[..tag_end])?;
         if attributes.len() != 1 {
-            return None;
+            return Err(CompatToolFrameError::InvalidAttributes);
         }
-        let name = attributes.get("name")?.clone();
+        let name = attributes
+            .get("name")
+            .ok_or(CompatToolFrameError::InvalidAttributes)?
+            .clone();
         if !exposed_tool_names.contains(&name) {
-            return None;
+            return Err(CompatToolFrameError::UnknownTool);
         }
         let after_tag = &after_open[tag_end + 1..];
-        let (parameters, after_close) = after_tag.split_once(DSML_INVOKE_CLOSE)?;
+        let (parameters, after_close) = after_tag
+            .split_once(DSML_INVOKE_CLOSE)
+            .ok_or(CompatToolFrameError::Unterminated)?;
         let mut parameter_source = parameters.trim();
         let mut input = serde_json::Map::new();
         while !parameter_source.is_empty() {
-            let after_parameter_open = parameter_source.strip_prefix(DSML_PARAMETER_OPEN)?;
-            let parameter_tag_end = after_parameter_open.find('>')?;
+            let after_parameter_open = parameter_source
+                .strip_prefix(DSML_PARAMETER_OPEN)
+                .ok_or(CompatToolFrameError::UnsupportedShape)?;
+            let parameter_tag_end = after_parameter_open
+                .find('>')
+                .ok_or(CompatToolFrameError::Unterminated)?;
             let parameter_attributes =
                 parse_dsml_attributes(&after_parameter_open[..parameter_tag_end])?;
             if parameter_attributes.len() != 2 {
-                return None;
+                return Err(CompatToolFrameError::InvalidAttributes);
             }
-            let parameter_name = parameter_attributes.get("name")?.clone();
-            let is_string = match parameter_attributes.get("string")?.as_str() {
+            let parameter_name = parameter_attributes
+                .get("name")
+                .ok_or(CompatToolFrameError::InvalidAttributes)?
+                .clone();
+            let is_string = match parameter_attributes
+                .get("string")
+                .ok_or(CompatToolFrameError::InvalidAttributes)?
+                .as_str()
+            {
                 "true" => true,
                 "false" => false,
-                _ => return None,
+                _ => return Err(CompatToolFrameError::InvalidAttributes),
             };
             let parameter_after_tag = &after_parameter_open[parameter_tag_end + 1..];
-            let (value, after_parameter_close) =
-                parameter_after_tag.split_once(DSML_PARAMETER_CLOSE)?;
+            let (value, after_parameter_close) = parameter_after_tag
+                .split_once(DSML_PARAMETER_CLOSE)
+                .ok_or(CompatToolFrameError::Unterminated)?;
             let value = if is_string {
                 Value::String(value.to_string())
             } else {
-                serde_json::from_str(value).ok()?
+                serde_json::from_str(value).map_err(|_| CompatToolFrameError::InvalidArguments)?
             };
             if input.insert(parameter_name, value).is_some() {
-                return None;
+                return Err(CompatToolFrameError::DuplicateParameter);
             }
             parameter_source = after_parameter_close.trim();
         }
@@ -1911,38 +2077,57 @@ fn parse_dsml_tool_calls(
         remaining = after_close.trim();
     }
 
-    (!calls.is_empty()).then_some(calls)
+    if calls.is_empty() {
+        Err(CompatToolFrameError::EmptyCalls)
+    } else {
+        Ok(calls)
+    }
 }
 
 fn parse_compat_tool_calls(
     text: &str,
     exposed_tool_names: &BTreeSet<String>,
-) -> Option<Vec<DsmlToolCall>> {
-    parse_dsml_tool_calls(text, exposed_tool_names)
-        .or_else(|| parse_fenced_tool_call(text, exposed_tool_names))
-        .or_else(|| parse_tagged_tool_call(text, exposed_tool_names))
+) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
+    if text.len() > COMPAT_TOOL_FRAME_MAX_BYTES {
+        return Err(CompatToolFrameError::FrameTooLarge);
+    }
+    let trimmed = text.trim();
+    if trimmed.starts_with(DSML_TOOL_CALLS_OPEN) {
+        parse_dsml_tool_calls(trimmed, exposed_tool_names)
+    } else if trimmed.starts_with(COMPAT_TOOL_USE_FENCE_OPEN)
+        || trimmed.starts_with(COMPAT_JSON_FENCE_OPEN)
+    {
+        parse_fenced_tool_call(trimmed, exposed_tool_names)
+    } else if trimmed.starts_with(COMPAT_TOOL_CALL_OPEN) {
+        parse_tagged_tool_call(trimmed, exposed_tool_names)
+    } else {
+        Err(CompatToolFrameError::UnrecognizedMarker)
+    }
 }
 
 fn parse_fenced_tool_call(
     text: &str,
     exposed_tool_names: &BTreeSet<String>,
-) -> Option<Vec<DsmlToolCall>> {
+) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
     let trimmed = text.trim();
-    if let Some(body) = trimmed
-        .strip_prefix(COMPAT_TOOL_USE_FENCE_OPEN)
-        .and_then(|body| body.strip_suffix("```"))
-    {
+    if let Some(body) = trimmed.strip_prefix(COMPAT_TOOL_USE_FENCE_OPEN) {
+        let body = body
+            .strip_suffix("```")
+            .ok_or(CompatToolFrameError::Unterminated)?;
         let body = body.trim_start_matches(['\r', '\n']).trim();
-        let (name, arguments) = body.split_once('\n')?;
+        let (name, arguments) = body
+            .split_once('\n')
+            .ok_or(CompatToolFrameError::UnsupportedShape)?;
         let name = name.trim();
         if !exposed_tool_names.contains(name) {
-            return None;
+            return Err(CompatToolFrameError::UnknownTool);
         }
-        let input = serde_json::from_str::<Value>(arguments.trim()).ok()?;
+        let input = serde_json::from_str::<Value>(arguments.trim())
+            .map_err(|_| CompatToolFrameError::InvalidArguments)?;
         if !input.is_object() {
-            return None;
+            return Err(CompatToolFrameError::InvalidArguments);
         }
-        return Some(vec![DsmlToolCall {
+        return Ok(vec![DsmlToolCall {
             id: "compat-tool-0".to_string(),
             name: name.to_string(),
             input,
@@ -1950,69 +2135,196 @@ fn parse_fenced_tool_call(
     }
 
     let body = trimmed
-        .strip_prefix(COMPAT_JSON_FENCE_OPEN)?
-        .strip_suffix("```")?
+        .strip_prefix(COMPAT_JSON_FENCE_OPEN)
+        .ok_or(CompatToolFrameError::UnrecognizedMarker)?
+        .strip_suffix("```")
+        .ok_or(CompatToolFrameError::Unterminated)?
         .trim_start_matches(['\r', '\n'])
         .trim();
-    let value = serde_json::from_str::<Value>(body).ok()?;
-    let object = value.as_object()?;
+    let value =
+        serde_json::from_str::<Value>(body).map_err(|_| CompatToolFrameError::InvalidArguments)?;
+    let object = value
+        .as_object()
+        .ok_or(CompatToolFrameError::InvalidArguments)?;
     if object.len() != 2 || !object.contains_key("tool") || !object.contains_key("arguments") {
-        return None;
+        return Err(CompatToolFrameError::UnsupportedShape);
     }
-    let name = object.get("tool")?.as_str()?;
+    let name = object
+        .get("tool")
+        .and_then(Value::as_str)
+        .ok_or(CompatToolFrameError::UnsupportedShape)?;
     if !exposed_tool_names.contains(name) {
-        return None;
+        return Err(CompatToolFrameError::UnknownTool);
     }
-    let input = object.get("arguments")?.clone();
+    let input = object
+        .get("arguments")
+        .ok_or(CompatToolFrameError::UnsupportedShape)?
+        .clone();
     if !input.is_object() {
-        return None;
+        return Err(CompatToolFrameError::InvalidArguments);
     }
-    Some(vec![DsmlToolCall {
+    Ok(vec![DsmlToolCall {
         id: "compat-tool-0".to_string(),
         name: name.to_string(),
         input,
     }])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonToolDiscriminator {
+    Pending,
+    Confirmed,
+    Rejected,
+}
+
+fn json_tool_discriminator_state(frame: &str) -> JsonToolDiscriminator {
+    let trimmed = frame.trim();
+    let Some(body) = trimmed.strip_prefix(COMPAT_JSON_FENCE_OPEN) else {
+        return JsonToolDiscriminator::Rejected;
+    };
+    let body = body.trim_start_matches(['\r', '\n']);
+    if let Some(complete) = body.strip_suffix("```") {
+        let Ok(Value::Object(object)) = serde_json::from_str::<Value>(complete.trim()) else {
+            return if partial_json_tool_discriminator(body) == JsonToolDiscriminator::Confirmed {
+                JsonToolDiscriminator::Confirmed
+            } else {
+                JsonToolDiscriminator::Rejected
+            };
+        };
+        return if object.len() == 2
+            && object.get("tool").is_some_and(Value::is_string)
+            && object.get("arguments").is_some_and(Value::is_object)
+        {
+            JsonToolDiscriminator::Confirmed
+        } else {
+            JsonToolDiscriminator::Rejected
+        };
+    }
+    partial_json_tool_discriminator(body)
+}
+
+fn partial_json_tool_discriminator(body: &str) -> JsonToolDiscriminator {
+    let bytes = body.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    let mut tool_string = false;
+    let mut arguments_object = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => {
+                depth = depth.saturating_add(1);
+                index += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            b'"' => {
+                let string_depth = depth;
+                index += 1;
+                let start = index;
+                let mut escaped = false;
+                while index < bytes.len() {
+                    let byte = bytes[index];
+                    if escaped {
+                        escaped = false;
+                    } else if byte == b'\\' {
+                        escaped = true;
+                    } else if byte == b'"' {
+                        break;
+                    }
+                    index += 1;
+                }
+                if index >= bytes.len() {
+                    return JsonToolDiscriminator::Pending;
+                }
+                let key = &body[start..index];
+                index += 1;
+                if string_depth != 1 {
+                    continue;
+                }
+                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+                if bytes.get(index) != Some(&b':') {
+                    continue;
+                }
+                index += 1;
+                while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                    index += 1;
+                }
+                let Some(value_start) = bytes.get(index).copied() else {
+                    return JsonToolDiscriminator::Pending;
+                };
+                match key {
+                    "tool" if value_start == b'"' => tool_string = true,
+                    "arguments" if value_start == b'{' => arguments_object = true,
+                    "tool" | "arguments" => return JsonToolDiscriminator::Rejected,
+                    _ => return JsonToolDiscriminator::Rejected,
+                }
+                if tool_string && arguments_object {
+                    return JsonToolDiscriminator::Confirmed;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    JsonToolDiscriminator::Pending
+}
+
+fn json_fence_claims_tool_protocol(frame: &str) -> bool {
+    json_tool_discriminator_state(frame) == JsonToolDiscriminator::Confirmed
+}
+
 fn parse_tagged_tool_call(
     text: &str,
     exposed_tool_names: &BTreeSet<String>,
-) -> Option<Vec<DsmlToolCall>> {
+) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
     let mut body = text
         .trim()
-        .strip_prefix(COMPAT_TOOL_CALL_OPEN)?
-        .strip_suffix(COMPAT_TOOL_CALL_CLOSE)?
+        .strip_prefix(COMPAT_TOOL_CALL_OPEN)
+        .ok_or(CompatToolFrameError::UnrecognizedMarker)?
+        .strip_suffix(COMPAT_TOOL_CALL_CLOSE)
+        .ok_or(CompatToolFrameError::Unterminated)?
         .trim();
     let mut name = None;
     let mut input = serde_json::Map::new();
     while !body.is_empty() {
-        let tag_end = body.find('>')?;
-        let tag = body.strip_prefix('<')?[..tag_end.saturating_sub(1)].trim();
+        let tag_end = body.find('>').ok_or(CompatToolFrameError::Unterminated)?;
+        let tag = body
+            .strip_prefix('<')
+            .ok_or(CompatToolFrameError::UnsupportedShape)?[..tag_end.saturating_sub(1)]
+            .trim();
         if tag.is_empty()
             || !tag
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || character == '_')
         {
-            return None;
+            return Err(CompatToolFrameError::UnsupportedShape);
         }
         let after_open = &body[tag_end + 1..];
         let close = format!("</{tag}>");
-        let (raw_value, remaining) = after_open.split_once(&close)?;
+        let (raw_value, remaining) = after_open
+            .split_once(&close)
+            .ok_or(CompatToolFrameError::Unterminated)?;
         if raw_value.contains('<') || raw_value.contains('>') {
-            return None;
+            return Err(CompatToolFrameError::UnsupportedShape);
         }
         match tag {
             "tool_name" => {
                 if name.replace(raw_value.trim().to_string()).is_some() {
-                    return None;
+                    return Err(CompatToolFrameError::DuplicateParameter);
                 }
             }
             "parameters" => {
-                let parameters = serde_json::from_str::<Value>(raw_value.trim()).ok()?;
-                let parameters = parameters.as_object()?;
+                let parameters = serde_json::from_str::<Value>(raw_value.trim())
+                    .map_err(|_| CompatToolFrameError::InvalidArguments)?;
+                let parameters = parameters
+                    .as_object()
+                    .ok_or(CompatToolFrameError::InvalidArguments)?;
                 for (key, value) in parameters {
                     if input.insert(key.clone(), value.clone()).is_some() {
-                        return None;
+                        return Err(CompatToolFrameError::DuplicateParameter);
                     }
                 }
             }
@@ -2024,28 +2336,33 @@ fn parse_tagged_tool_call(
                     )
                     .is_some()
                 {
-                    return None;
+                    return Err(CompatToolFrameError::DuplicateParameter);
                 }
             }
         }
         body = remaining.trim();
     }
-    let name = name?;
+    let name = name.ok_or(CompatToolFrameError::UnsupportedShape)?;
     if !exposed_tool_names.contains(&name) {
-        return None;
+        return Err(CompatToolFrameError::UnknownTool);
     }
-    Some(vec![DsmlToolCall {
+    Ok(vec![DsmlToolCall {
         id: "compat-tool-0".to_string(),
         name,
         input: Value::Object(input),
     }])
 }
 
-fn parse_dsml_attributes(source: &str) -> Option<BTreeMap<String, String>> {
+fn parse_dsml_attributes(source: &str) -> Result<BTreeMap<String, String>, CompatToolFrameError> {
     let mut attributes = BTreeMap::new();
     for token in source.split_whitespace() {
-        let (key, value) = token.split_once('=')?;
-        let value = value.strip_prefix('"')?.strip_suffix('"')?;
+        let (key, value) = token
+            .split_once('=')
+            .ok_or(CompatToolFrameError::InvalidAttributes)?;
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .ok_or(CompatToolFrameError::InvalidAttributes)?;
         if key.is_empty()
             || value.contains('<')
             || value.contains('>')
@@ -2053,10 +2370,14 @@ fn parse_dsml_attributes(source: &str) -> Option<BTreeMap<String, String>> {
                 .insert(key.to_string(), value.to_string())
                 .is_some()
         {
-            return None;
+            return Err(CompatToolFrameError::InvalidAttributes);
         }
     }
-    (!attributes.is_empty()).then_some(attributes)
+    if attributes.is_empty() {
+        Err(CompatToolFrameError::InvalidAttributes)
+    } else {
+        Ok(attributes)
+    }
 }
 
 fn compat_tool_markers() -> [&'static str; 4] {
@@ -2438,7 +2759,7 @@ mod tests {
         parse_dsml_tool_calls, parse_tool_arguments, responses_endpoint, OpenAiCompatClient,
         OpenAiCompatConfig, OpenAiWireProtocol,
     };
-    use crate::error::ApiError;
+    use crate::error::{ApiError, CompatibilityToolProtocolFailure};
     use crate::types::{
         ImageSource, InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
         ToolResultContentBlock,
@@ -2760,11 +3081,9 @@ mod tests {
     }
 
     #[test]
-    fn streaming_xml_shaped_text_is_never_promoted_to_a_tool_use() {
+    fn streaming_recognized_but_invalid_xml_tool_frame_fails_closed() {
         use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
-        use crate::types::{
-            ContentBlockDelta, ContentBlockDeltaEvent, OutputContentBlock, StreamEvent,
-        };
+        use crate::types::{OutputContentBlock, StreamEvent};
 
         let tool = ToolDefinition {
             name: "read_file".to_string(),
@@ -2794,19 +3113,12 @@ mod tests {
                 if matches!(&start.content_block, OutputContentBlock::ToolUse { .. })
         )));
 
-        let terminal = state.finish().expect("stream finish");
-        assert!(terminal.iter().any(|event| matches!(
-            event,
-            StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                delta: ContentBlockDelta::TextDelta { text },
-                ..
-            }) if text.contains("<function=read_file>")
-        )));
-        assert!(terminal.iter().all(|event| !matches!(
-            event,
-            StreamEvent::ContentBlockStart(start)
-                if matches!(&start.content_block, OutputContentBlock::ToolUse { .. })
-        )));
+        assert!(matches!(
+            state.finish(),
+            Err(ApiError::CompatibilityToolProtocol(
+                CompatibilityToolProtocolFailure::MalformedFrame
+            ))
+        ));
     }
 
     #[test]
@@ -2832,12 +3144,12 @@ mod tests {
             "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"shell\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
             &exposed,
         )
-        .is_none());
+        .is_err());
         assert!(parse_dsml_tool_calls(
             "<tool_call><function=ReadMcpResource></tool_call>",
             &exposed,
         )
-        .is_none());
+        .is_err());
     }
 
     #[test]
@@ -2878,17 +3190,123 @@ mod tests {
             "```json\n{\"tool\":\"shell\",\"arguments\":{}}\n```",
             &exposed,
         )
-        .is_none());
+        .is_err());
         assert!(parse_compat_tool_calls(
             "```json\n{\"tool\":\"ToolSearch\",\"arguments\":{},\"comment\":\"run it\"}\n```",
             &exposed,
         )
-        .is_none());
+        .is_err());
         assert!(parse_compat_tool_calls(
             "Use this example: <tool_call><tool_name>ToolSearch</tool_name><parameters>{}</parameters></tool_call>",
             &exposed,
         )
-        .is_none());
+        .is_err());
+    }
+
+    #[test]
+    fn generic_json_lookahead_is_bounded_and_released_as_text() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{ContentBlockDelta, StreamEvent};
+
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[]);
+        let ordinary_json = format!("```json\n{{{}", " ".repeat(5_000));
+        let events = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "message-long-json".to_string(),
+                model: Some("deepseek-v4-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        content: Some(ordinary_json.clone()),
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .expect("generic JSON is ordinary text");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ContentBlockDelta(delta)
+                    if matches!(&delta.delta, ContentBlockDelta::TextDelta { text }
+                        if text == &ordinary_json)
+            )),
+            "a non-discriminated JSON fence must be released at the bounded lookahead"
+        );
+        assert!(
+            state.dsml_frame.is_none(),
+            "generic JSON must not remain quarantined after the lookahead cap"
+        );
+        state.finish().expect("ordinary JSON finishes normally");
+    }
+
+    #[test]
+    fn nested_tool_shaped_json_does_not_claim_the_top_level_protocol() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
+
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[]);
+        let ordinary_json =
+            "```json\n{\"example\":{\"tool\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}}\n```";
+        let events = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "message-nested-json".to_string(),
+                model: Some("deepseek-v4-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        content: Some(ordinary_json.to_string()),
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+            })
+            .expect("nested example is ordinary text");
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(delta)
+                if matches!(&delta.delta, ContentBlockDelta::TextDelta { text }
+                    if text == ordinary_json)
+        )));
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(start.content_block, OutputContentBlock::ToolUse { .. })
+        )));
+        state.finish().expect("nested example finishes normally");
+    }
+
+    #[test]
+    fn claimed_tool_protocol_is_rejected_at_the_hard_byte_cap() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+
+        let tool = ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("read a file".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
+        let oversized = format!(
+            "```json\n{{\"tool\":\"read_file\",\"arguments\":{{\"payload\":\"{}\"}}}}\n```",
+            "x".repeat(super::COMPAT_TOOL_FRAME_MAX_BYTES)
+        );
+        assert!(matches!(
+            state.ingest_chunk(ChatCompletionChunk {
+                id: "message-oversized-tool".to_string(),
+                model: Some("deepseek-v4-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        content: Some(oversized),
+                        ..ChunkDelta::default()
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+            }),
+            Err(ApiError::CompatibilityToolProtocol(
+                CompatibilityToolProtocolFailure::FrameTooLarge
+            ))
+        ));
     }
 
     #[test]
@@ -2988,6 +3406,86 @@ mod tests {
             event,
             StreamEvent::MessageDelta(delta) if delta.delta.stop_reason.as_deref() == Some("tool_use")
         )));
+    }
+
+    #[test]
+    fn malformed_or_unexposed_dsml_fails_closed_without_text_delta() {
+        use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
+        use crate::error::ApiError;
+        use crate::types::{ContentBlockDelta, StreamEvent};
+
+        let tool = ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("read a source file".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[tool]);
+        let events = state
+            .ingest_chunk(ChatCompletionChunk {
+                id: "message-invalid-dsml".to_string(),
+                model: Some("deepseek-v4-flash".to_string()),
+                choices: vec![ChunkChoice {
+                    delta: ChunkDelta {
+                        content: Some(
+                            "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"
+                                .to_string(),
+                        ),
+                        ..ChunkDelta::default()
+                    },
+                        finish_reason: Some("stop".to_string()),
+                    }],
+                usage: None,
+            })
+            .expect("chunks are quarantined until finish");
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            StreamEvent::ContentBlockDelta(delta)
+                if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("DSML"))
+        )));
+        assert!(matches!(
+            state.finish(),
+            Err(ApiError::CompatibilityToolProtocol(
+                CompatibilityToolProtocolFailure::MalformedFrame
+            ))
+        ));
+    }
+
+    #[test]
+    fn non_streaming_malformed_dsml_uses_the_same_fail_closed_boundary() {
+        use super::{
+            normalize_chat_completion_response, ChatChoice, ChatCompletionResponse, ChatMessage,
+        };
+
+        let tool = ToolDefinition {
+            name: "read_file".to_string(),
+            description: Some("read a source file".to_string()),
+            input_schema: json!({"type":"object"}),
+        };
+        let response = ChatCompletionResponse {
+            id: "message-invalid-dsml".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(
+                        "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"bash\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"
+                            .to_string(),
+                    ),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                    signature: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: None,
+        };
+
+        assert!(matches!(
+            normalize_chat_completion_response("deepseek-v4-flash", response, &[tool]),
+            Err(ApiError::CompatibilityToolProtocol(
+                CompatibilityToolProtocolFailure::MalformedFrame
+            ))
+        ));
     }
 
     #[test]

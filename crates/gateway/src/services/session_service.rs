@@ -174,6 +174,7 @@ impl SessionService {
                 let snapshot = lifecycle_kernel.snapshot(session_id).await;
                 serde_json::json!({
                     "ok": true,
+                    "session_id": session_id,
                     "event": event,
                     "snapshot": snapshot,
                 })
@@ -201,6 +202,7 @@ impl SessionService {
                 let snapshot = lifecycle_kernel.snapshot(session_id).await;
                 serde_json::json!({
                     "ok": true,
+                    "session_id": session_id,
                     "event": event,
                     "snapshot": snapshot,
                 })
@@ -233,6 +235,35 @@ impl SessionService {
                 "sessions": lifecycle_kernel.snapshots().await,
             }),
         }
+    }
+
+    pub(crate) async fn lifecycle_attachment_role(
+        &self,
+        session_id: &str,
+        actor_id: &str,
+    ) -> Option<String> {
+        let lifecycle_kernel = self.lifecycle_kernel()?;
+        lifecycle_kernel.attachment_role(session_id, actor_id).await
+    }
+
+    pub(crate) async fn principal_has_lifecycle_attachment(
+        &self,
+        session_id: &str,
+        principal_actor_id: &str,
+    ) -> bool {
+        let Some(lifecycle_kernel) = self.lifecycle_kernel() else {
+            return false;
+        };
+        let actor_prefix = format!("{principal_actor_id}:surface:");
+        lifecycle_kernel
+            .snapshot(session_id)
+            .await
+            .is_some_and(|snapshot| {
+                snapshot
+                    .attachments
+                    .iter()
+                    .any(|attachment| attachment.actor.id.starts_with(&actor_prefix))
+            })
     }
 
     pub(crate) async fn replay_session_value(
@@ -577,6 +608,7 @@ mod tests {
             .attach_session_value("session-1", "tui-1", "tui", Some("reader"))
             .await;
         assert_eq!(attached["ok"], true);
+        assert_eq!(attached["session_id"], "session-1");
         assert_eq!(attached["event"]["sequence"], 0);
         assert_eq!(attached["snapshot"]["state"], "attached");
 
@@ -586,6 +618,7 @@ mod tests {
 
         let detached = service.detach_session_value("session-1", "tui-1").await;
         assert_eq!(detached["ok"], true);
+        assert_eq!(detached["session_id"], "session-1");
         assert_eq!(detached["snapshot"]["state"], "detached");
     }
 }

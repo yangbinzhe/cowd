@@ -24,6 +24,9 @@ pub struct RealityPanel {
     memory_entries: usize,
     view: RealityView,
     scroll: usize,
+    focused_backlink_target: Option<String>,
+    focused_backlink_resolution: Option<String>,
+    focused_backlink_object: Option<serde_json::Value>,
 }
 
 impl RealityPanel {
@@ -36,6 +39,9 @@ impl RealityPanel {
             memory_entries: 0,
             view: RealityView::Overview,
             scroll: 0,
+            focused_backlink_target: None,
+            focused_backlink_resolution: None,
+            focused_backlink_object: None,
         }
     }
 
@@ -53,6 +59,50 @@ impl RealityPanel {
 
     pub fn handle_event(&mut self, event: &Event) -> EventResult {
         <Self as Component>::handle_event(self, event)
+    }
+
+    pub fn focus_backlink_target(&mut self, target: impl Into<String>) {
+        let target = target.into();
+        self.focused_backlink_target = Some(target);
+        self.focused_backlink_resolution =
+            Some("loading exact evidence object from its canonical owner".to_string());
+        self.focused_backlink_object = None;
+        self.view = RealityView::Samples;
+        self.scroll = 0;
+    }
+
+    #[must_use]
+    pub fn accepts_backlink_result(&self, target: &str) -> bool {
+        self.focused_backlink_target.as_deref() == Some(target)
+    }
+
+    pub fn record_backlink_object(&mut self, target: &str, object: serde_json::Value) {
+        if !self.accepts_backlink_result(target) {
+            return;
+        }
+        let available = object
+            .get("available")
+            .and_then(serde_json::Value::as_bool)
+            .map_or("resolved", |available| {
+                if available {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            });
+        self.focused_backlink_resolution = Some(format!("{target} {available}"));
+        self.focused_backlink_object = Some(object);
+        self.view = RealityView::Samples;
+        self.scroll = 0;
+    }
+
+    pub fn record_backlink_failure(&mut self, target: &str, message: &str) {
+        if !self.accepts_backlink_result(target) {
+            return;
+        }
+        self.focused_backlink_resolution = Some(format!("Resolution failed: {message}"));
+        self.focused_backlink_object = None;
+        self.scroll = 0;
     }
 }
 
@@ -92,6 +142,21 @@ impl Component for RealityPanel {
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::raw(""));
+        if let Some(target) = self.focused_backlink_target.as_deref() {
+            lines.push(kv("Focused evidence", target));
+            lines.push(kv(
+                "Resolution",
+                self.focused_backlink_resolution
+                    .as_deref()
+                    .unwrap_or("pending"),
+            ));
+            if let Some(object) = self.focused_backlink_object.as_ref() {
+                let summary = serde_json::to_string(object)
+                    .unwrap_or_else(|_| "evidence object is not serializable".to_string());
+                lines.push(kv("Object", &summary));
+            }
+            lines.push(Line::raw(""));
+        }
 
         match self.view {
             RealityView::Overview => {

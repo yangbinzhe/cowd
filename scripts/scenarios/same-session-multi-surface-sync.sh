@@ -14,7 +14,9 @@ HOME_DIR="$TMP_DIR/home"
 LOG="$TMP_DIR/gateway.log"
 API_TOKEN="same-session-sync-$$_credential"
 SESSION_ID="same-session-session-$$"
-OWNER="principal:local-human"
+TUI_OBSERVER_ID="tui:same-session-writer-$$"
+WEBUI_OBSERVER_ID="webui:same-session-reader-$$"
+OWNER="principal:local-human:observer:$TUI_OBSERVER_ID"
 TASK_OBJECTIVE="same-session same-session sync task $$"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-same-session-scenario}"
 
@@ -114,15 +116,23 @@ curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/ensure" \
   -H 'content-type: application/json' \
   -d '{"model":"claude-sonnet-4-6"}' \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True and data.get("session_id") == sys.argv[1], data' "$SESSION_ID"
-for attachment in '{"surface":"tui","role":"writer"}' '{"surface":"webui","role":"reader"}'; do
-  curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/attach" \
-    -H 'content-type: application/json' \
-    -d "$attachment" \
-    | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True, data'
-done
+curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/attach" \
+  -H "x-cowd-observer-id: $TUI_OBSERVER_ID" \
+  -H 'x-cowd-surface-id: tui' \
+  -H 'content-type: application/json' \
+  -d '{"surface":"tui","role":"writer"}' \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True, data'
+curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/attach" \
+  -H "x-cowd-observer-id: $WEBUI_OBSERVER_ID" \
+  -H 'x-cowd-surface-id: webui' \
+  -H 'content-type: application/json' \
+  -d '{"surface":"webui","role":"reader"}' \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True, data'
 curl -fsS "$BASE_URL/api/sessions/$SESSION_ID/lifecycle" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); items=data.get("snapshot",{}).get("attachments",[]); assert data.get("ok") is True and len(items) == 2 and {item["actor"]["surface"] for item in items} == {"tui","webui"}, data'
 curl -fsS -X POST "$BASE_URL/api/runtime/session-leases/acquire" \
+  -H "x-cowd-observer-id: $TUI_OBSERVER_ID" \
+  -H 'x-cowd-surface-id: tui' \
   -H 'content-type: application/json' \
   -d "{\"session_id\":\"$SESSION_ID\",\"mode\":\"collaborative\"}" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True, data'

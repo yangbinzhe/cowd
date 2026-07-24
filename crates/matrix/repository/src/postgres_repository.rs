@@ -1372,10 +1372,18 @@ impl PostgresMatrixRepository {
 
     fn build_evidence_packet(
         &self,
+        packet_id: Option<&str>,
         attention_id: Option<&str>,
         problem_statement: Option<&str>,
     ) -> MatrixStoreResult<MatrixEvidencePacket> {
         self.with_connection(|connection| {
+            if let Some(packet_id) = packet_id {
+                if let Some(existing) =
+                    read_json::<_, MatrixEvidencePacket>(connection, EVIDENCE, packet_id)?
+                {
+                    return Ok(existing);
+                }
+            }
             let attention = match attention_id {
                 Some(attention_id) => {
                     read_json::<_, MatrixAttentionItem>(connection, ATTENTION, attention_id)?
@@ -1392,6 +1400,9 @@ impl PostgresMatrixRepository {
                     .map(|item| item.title.as_str())
                     .unwrap_or("MATRIX operational evidence packet")
             }));
+            if let Some(packet_id) = packet_id {
+                packet.packet_id = packet_id.to_string();
+            }
             packet.attention_id = attention.as_ref().map(|item| item.attention_id.clone());
             if let Some(attention) = attention {
                 packet.confidence = attention.confidence.min(0.75);
@@ -1435,8 +1446,13 @@ impl PostgresMatrixRepository {
                     packet.confidence = packet.confidence.max(0.65);
                 }
             }
-            write_json(connection, EVIDENCE, &packet.packet_id, &packet)?;
-            Ok(packet)
+            write_json_once(connection, EVIDENCE, &packet.packet_id, &packet)?;
+            read_json(connection, EVIDENCE, &packet.packet_id)?.ok_or_else(|| {
+                MatrixStoreError::NotFound(format!(
+                    "canonical evidence packet {} disappeared after insert",
+                    packet.packet_id
+                ))
+            })
         })
     }
 
@@ -1784,6 +1800,23 @@ fn write_json<C: PostgresClient, T: Serialize>(
     let sql = format!(
         "INSERT INTO {table}(id, payload, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) \
          ON CONFLICT(id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at"
+    );
+    client
+        .execute(&sql, &[&id, &payload])
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
+fn write_json_once<C: PostgresClient, T: Serialize>(
+    client: &mut C,
+    table: &str,
+    id: &str,
+    value: &T,
+) -> MatrixStoreResult<()> {
+    let payload = serde_json::to_value(value).map_err(json_error)?;
+    let sql = format!(
+        "INSERT INTO {table}(id, payload, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) \
+         ON CONFLICT(id) DO NOTHING"
     );
     client
         .execute(&sql, &[&id, &payload])

@@ -2,15 +2,17 @@ use std::sync::Arc;
 
 use crate::command::slash::CommandSurface;
 use axum::{
-    extract::{Path as AxumPath, Query, State as AxumState},
-    http::StatusCode,
+    extract::{Extension, Path as AxumPath, Query, State as AxumState},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 
-use super::{api_error, AppState, ErrorResponse};
+use super::{
+    api_error, session_routes::SessionAccess, AppState, AuthenticatedPrincipal, ErrorResponse,
+};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -76,15 +78,35 @@ async fn slash_history_handler(
 
 async fn slash_dispatch_handler(
     AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
     Json(body): Json<SlashDispatchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let args = body.args.unwrap_or_else(|| serde_json::json!({}));
+    if !slash_command_is_read_only(&body.command) {
+        let session_id = args
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session_id| !session_id.trim().is_empty())
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    "mutating slash dispatch requires an authoritative session_id",
+                )
+            })?;
+        super::session_routes::authorize_session_access(
+            &state,
+            &principal,
+            session_id,
+            SessionAccess::Write,
+        )
+        .await?;
+        super::require_session_writer_admission(&state, &principal, &headers, session_id).await?;
+    }
     let receipt = state
         .services
         .slash
-        .dispatch(
-            &body.command,
-            body.args.unwrap_or_else(|| serde_json::json!({})),
-        )
+        .dispatch(&body.command, args)
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
     if !receipt.ok {
@@ -100,6 +122,25 @@ async fn slash_dispatch_handler(
         .system
         .append_command_history(&state.config_home, &receipt);
     Ok(Json(receipt))
+}
+
+fn slash_command_is_read_only(command: &str) -> bool {
+    matches!(
+        command
+            .trim_start_matches('/')
+            .to_ascii_lowercase()
+            .as_str(),
+        "help"
+            | "status"
+            | "context"
+            | "usage"
+            | "model"
+            | "models"
+            | "sessions"
+            | "history"
+            | "tools"
+            | "memory"
+    )
 }
 
 async fn slash_resolve_handler(

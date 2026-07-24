@@ -319,10 +319,30 @@ pub struct ExecutionLiveState {
     pub metrics: RunMetricsProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_preview: Option<String>,
+    /// Byte offset of `output_preview` within the current assistant part.
+    /// Older producers default to zero, meaning the preview is a complete
+    /// prefix/snapshot.
+    #[serde(default)]
+    pub output_preview_start_bytes: u64,
+    /// Total UTF-8 bytes emitted for the current assistant part.
+    #[serde(default)]
+    pub output_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Lightweight same-connection update for Runtime-owned live facts.
+///
+/// Durable graph/entity changes continue to use [`ExecutionProjection`].
+/// Streaming text and rapidly changing metrics use this envelope so a token
+/// delta never forces storage scans or serialization of the full graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionLiveUpdate {
+    pub schema_version: u32,
+    pub execution_id: String,
+    pub live: ExecutionLiveState,
 }
 
 /// A discovery-only session-to-execution relation.  Detailed facts always
@@ -553,6 +573,8 @@ mod tests {
             context_usage: None,
             metrics: RunMetricsProjection::default(),
             output_preview: None,
+            output_preview_start_bytes: 0,
+            output_bytes: 0,
             terminal_ref: None,
             error: None,
         });

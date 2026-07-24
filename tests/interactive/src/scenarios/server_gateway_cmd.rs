@@ -2,7 +2,10 @@ use crate::reporter::TestRunner;
 use std::process::Command;
 
 pub fn has_scenario(name: &str) -> bool {
-    matches!(name, "server_gateway_start" | "server_gateway_status" | "server_gateway_stop" | "" | "all")
+    matches!(
+        name,
+        "server_gateway_start" | "server_gateway_status" | "server_gateway_stop" | "" | "all"
+    )
 }
 
 fn cowd_bin() -> String {
@@ -25,7 +28,9 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
             .args(["gateway", "status"])
             .output()?;
         if !out.status.success() && out.stdout.is_empty() && out.stderr.is_empty() {
-            return Err(anyhow::anyhow!("Gateway status produced no diagnostic output"));
+            return Err(anyhow::anyhow!(
+                "Gateway status produced no diagnostic output"
+            ));
         }
         Ok(())
     });
