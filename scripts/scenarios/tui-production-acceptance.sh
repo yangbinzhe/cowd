@@ -1297,21 +1297,7 @@ pass "E9 real 10k-session PTY tail/search/RSS gates passed (${tenk_tail_ms}ms/${
 
 stop_gateway
 
-sqlite3 "$OLD_CONFIG_HOME/storage/session.sqlite" <<SQL
-DROP TABLE IF EXISTS v584_e10_message_backup;
-CREATE TABLE v584_e10_message_backup AS
-SELECT stable_message_id, content_json
-FROM messages
-WHERE session_id = '$OLD_SESSION_ID'
-ORDER BY sequence
-LIMIT 1;
-UPDATE messages
-SET content_json = '{malformed-v584-e10'
-WHERE stable_message_id = (
-  SELECT stable_message_id FROM v584_e10_message_backup LIMIT 1
-);
-SQL
-start_gateway || fail "E10 malformed-history Gateway did not become healthy"
+start_gateway || fail "E10 baseline-history Gateway did not become healthy"
 bad_token_status="$(
   command curl -sS \
     -o "$ARTIFACT_DIR/e10-unauthorized.json" \
@@ -1368,6 +1354,25 @@ auth_curl \
   -X POST "$BASE_URL/api/sessions/$OLD_SESSION_ID/detach" \
   -d '{"surface":"tui"}' \
   >"$ARTIFACT_DIR/e10-reader-detach.json"
+
+start_tui e10-history "$OLD_SESSION_ID" "tui:v584-e10-history" 120 40
+wait_capture e10-history "$old_fragment" e10-valid-history-boot \
+  || fail "E10 baseline durable history did not hydrate before corruption"
+sqlite3 "$OLD_CONFIG_HOME/storage/session.sqlite" <<SQL
+DROP TABLE IF EXISTS v584_e10_message_backup;
+CREATE TABLE v584_e10_message_backup AS
+SELECT stable_message_id, content_json
+FROM messages
+WHERE session_id = '$OLD_SESSION_ID'
+ORDER BY sequence
+LIMIT 1;
+DROP TRIGGER IF EXISTS messages_fts_au;
+UPDATE messages
+SET content_json = '{malformed-v584-e10'
+WHERE stable_message_id = (
+  SELECT stable_message_id FROM v584_e10_message_backup LIMIT 1
+);
+SQL
 malformed_status="$(
   command curl -sS \
     -o "$ARTIFACT_DIR/e10-malformed-history.json" \
@@ -1377,10 +1382,6 @@ malformed_status="$(
 )"
 [[ "$malformed_status" == "500" ]] \
   || fail "E10 malformed durable message did not produce the canonical HTTP 500 boundary"
-start_tui e10-history "$OLD_SESSION_ID" "tui:v584-e10-history" 120 40
-wait_capture e10-history "$MODEL" e10-malformed-boot \
-  || fail "E10 malformed-history TUI did not remain interactive"
-sleep 1
 send_prompt e10-history "/activity"
 wait_capture e10-history \
   'Session history unavailable|malformed stored message|HTTP status 500|500 Internal Server Error' \
@@ -1402,6 +1403,14 @@ WHERE stable_message_id IN (
   SELECT stable_message_id FROM v584_e10_message_backup
 );
 DROP TABLE v584_e10_message_backup;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, session_id, role, content_text, tool_name)
+    VALUES ('delete', old.id, old.session_id, old.role, NULL, old.tool_name);
+    INSERT INTO messages_fts(rowid, session_id, role, content_text, tool_name)
+    VALUES (new.id, new.session_id, new.role,
+            (SELECT group_concat(json_extract(value,'$.text'),' ') FROM json_each(new.content_json) WHERE json_extract(value,'$.type')='text'),
+            new.tool_name);
+END;
 SQL
 start_gateway || fail "E10 repaired-history Gateway did not become healthy"
 start_tui e10-recovered "$OLD_SESSION_ID" "tui:v584-e10-recovered" 120 40
