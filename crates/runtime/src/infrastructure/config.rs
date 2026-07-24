@@ -662,12 +662,51 @@ impl Default for SessionStorageExecutionConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactStorageConfig {
+    pub compact_threshold_bytes: u64,
+    pub max_object_bytes: u64,
+    pub total_quota_bytes: u64,
+    pub gc_high_water_bytes: u64,
+    pub gc_low_water_bytes: u64,
+    pub orphan_grace_ms: u64,
+}
+
+impl Default for ArtifactStorageConfig {
+    fn default() -> Self {
+        let defaults = crate::ArtifactStoreConfig::default();
+        Self {
+            compact_threshold_bytes: defaults.compact_threshold_bytes,
+            max_object_bytes: defaults.max_object_bytes,
+            total_quota_bytes: defaults.total_quota_bytes,
+            gc_high_water_bytes: defaults.gc_high_water_bytes,
+            gc_low_water_bytes: defaults.gc_low_water_bytes,
+            orphan_grace_ms: defaults.orphan_grace_ms,
+        }
+    }
+}
+
+impl From<ArtifactStorageConfig> for crate::ArtifactStoreConfig {
+    fn from(value: ArtifactStorageConfig) -> Self {
+        Self {
+            compact_threshold_bytes: value.compact_threshold_bytes,
+            max_object_bytes: value.max_object_bytes,
+            total_quota_bytes: value.total_quota_bytes,
+            gc_high_water_bytes: value.gc_high_water_bytes,
+            gc_low_water_bytes: value.gc_low_water_bytes,
+            orphan_grace_ms: value.orphan_grace_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageTopologyConfig {
     pub backend: StorageBackendSelection,
     pub postgres: Option<PostgresTopologyConfig>,
     pub session_execution: SessionStorageExecutionConfig,
+    pub artifacts: ArtifactStorageConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2620,6 +2659,60 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
         })
         .transpose()?
         .unwrap_or_default();
+    let artifacts = storage
+        .get("artifacts")
+        .map(|value| {
+            let value = expect_object(value, "merged settings.storage.artifacts")?;
+            let defaults = ArtifactStorageConfig::default();
+            let compact_threshold_bytes = optional_u64(
+                value,
+                "compactThresholdBytes",
+                "merged settings.storage.artifacts",
+            )?
+            .unwrap_or(defaults.compact_threshold_bytes);
+            let max_object_bytes =
+                optional_u64(value, "maxObjectBytes", "merged settings.storage.artifacts")?
+                    .unwrap_or(defaults.max_object_bytes);
+            let total_quota_bytes = optional_u64(
+                value,
+                "totalQuotaBytes",
+                "merged settings.storage.artifacts",
+            )?
+            .unwrap_or(defaults.total_quota_bytes);
+            let gc_high_water_bytes = optional_u64(
+                value,
+                "gcHighWaterBytes",
+                "merged settings.storage.artifacts",
+            )?
+            .unwrap_or(defaults.gc_high_water_bytes);
+            let gc_low_water_bytes = optional_u64(
+                value,
+                "gcLowWaterBytes",
+                "merged settings.storage.artifacts",
+            )?
+            .unwrap_or(defaults.gc_low_water_bytes);
+            let orphan_grace_ms =
+                optional_u64(value, "orphanGraceMs", "merged settings.storage.artifacts")?
+                    .unwrap_or(defaults.orphan_grace_ms);
+            let selected = ArtifactStorageConfig {
+                compact_threshold_bytes,
+                max_object_bytes,
+                total_quota_bytes,
+                gc_high_water_bytes,
+                gc_low_water_bytes,
+                orphan_grace_ms,
+            };
+            crate::ArtifactStoreConfig::from(selected)
+                .validate()
+                .map_err(|error| {
+                    ConfigError::Parse(format!(
+                        "merged settings.storage.artifacts is invalid: {error}"
+                    ))
+                })?;
+            Ok::<ArtifactStorageConfig, ConfigError>(selected)
+        })
+        .transpose()?
+        .unwrap_or_default();
     if backend == StorageBackendSelection::Postgres && postgres.is_none() {
         return Err(ConfigError::Parse(
             "merged settings.storage.postgres is required when backend=postgres".to_string(),
@@ -2629,6 +2722,7 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
         backend,
         postgres,
         session_execution,
+        artifacts,
     })
 }
 
@@ -4876,6 +4970,19 @@ gateway:
         assert!(defaults.postgres.is_none());
         assert!(defaults.session_execution.workers > 0);
         assert!(defaults.session_execution.queue_capacity > 0);
+        assert_eq!(defaults.artifacts, crate::ArtifactStorageConfig::default());
+
+        let artifact_override = JsonValue::parse(
+            r#"{"storage":{"artifacts":{"compactThresholdBytes":1024,"maxObjectBytes":2048,"totalQuotaBytes":8192,"gcHighWaterBytes":6144,"gcLowWaterBytes":4096,"orphanGraceMs":250}}}"#,
+        )
+        .unwrap();
+        let selected = parse_optional_storage_config(&artifact_override).unwrap();
+        assert_eq!(selected.artifacts.compact_threshold_bytes, 1_024);
+        assert_eq!(selected.artifacts.max_object_bytes, 2_048);
+        assert_eq!(selected.artifacts.total_quota_bytes, 8_192);
+        assert_eq!(selected.artifacts.gc_high_water_bytes, 6_144);
+        assert_eq!(selected.artifacts.gc_low_water_bytes, 4_096);
+        assert_eq!(selected.artifacts.orphan_grace_ms, 250);
 
         let postgres = JsonValue::parse(
             r#"{"storage":{"backend":"postgres","sessionExecution":{"workers":6,"queueCapacity":72},"postgres":{"logicalIdentity":"cowd-test","secretRef":"env:COWD_TEST_POSTGRES_URL","maxConnections":24,"minIdleConnections":3,"checkoutTimeoutMs":2500}}}"#,
@@ -4901,5 +5008,10 @@ gateway:
         )
         .unwrap();
         assert!(parse_optional_storage_config(&invalid_execution).is_err());
+        let invalid_artifacts = JsonValue::parse(
+            r#"{"storage":{"artifacts":{"compactThresholdBytes":4096,"maxObjectBytes":1024}}}"#,
+        )
+        .unwrap();
+        assert!(parse_optional_storage_config(&invalid_artifacts).is_err());
     }
 }

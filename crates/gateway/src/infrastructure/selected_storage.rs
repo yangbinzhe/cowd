@@ -35,6 +35,7 @@ pub(crate) struct SelectedStorageTopology {
     pub(crate) surface_messages: Arc<dyn SurfaceMessageLedger>,
     pub(crate) connector_factory: Arc<dyn connector::ResourceDirectoryFactory>,
     pub(crate) connector_handle: storage::StorageHandle,
+    pub(crate) artifact_store: Arc<runtime::ArtifactStore>,
 }
 
 impl SelectedStorageTopology {
@@ -64,7 +65,7 @@ impl SelectedStorageTopology {
         let registry = base_registry(config_home, workspace_root)?;
         match config.backend {
             runtime::StorageBackendSelection::Sqlite => {
-                Self::sqlite(registry, config.session_execution)
+                Self::sqlite(registry, config.session_execution, config.artifacts)
             }
             runtime::StorageBackendSelection::Postgres => {
                 if let Some(apps) = activation_apps {
@@ -80,11 +81,14 @@ impl SelectedStorageTopology {
                 })?;
                 let executor = connect_postgres(postgres)?;
                 let session_execution = config.session_execution;
-                std::thread::spawn(move || Self::postgres(registry, executor, session_execution))
-                    .join()
-                    .map_err(|_| {
-                        "PostgreSQL domain adapter initialization thread panicked".to_string()
-                    })?
+                let artifacts = config.artifacts;
+                std::thread::spawn(move || {
+                    Self::postgres(registry, executor, session_execution, artifacts)
+                })
+                .join()
+                .map_err(|_| {
+                    "PostgreSQL domain adapter initialization thread panicked".to_string()
+                })?
             }
         }
     }
@@ -92,6 +96,7 @@ impl SelectedStorageTopology {
     fn sqlite(
         registry: StorageRegistry,
         session_execution: runtime::SessionStorageExecutionConfig,
+        artifacts: runtime::ArtifactStorageConfig,
     ) -> Result<Self, String> {
         registry.ensure_directories().map_err(stringify)?;
         let session_endpoint = endpoint(&registry, &StorageDomainId::Session, None)?;
@@ -116,6 +121,11 @@ impl SelectedStorageTopology {
             &StorageDomainId::ConnectorDirectory,
             Some(&workspace_scope),
         )?;
+        let blob_endpoint = endpoint(&registry, &StorageDomainId::Blobs, None)?;
+        let artifact_store = Arc::new(runtime::ArtifactStore::sqlite(
+            blob_endpoint.path,
+            artifacts.into(),
+        ));
 
         let session_store = Arc::new(
             UnifiedSessionStore::open_sqlite_storage_handle_with_execution_config(
@@ -189,6 +199,7 @@ impl SelectedStorageTopology {
             surface_messages,
             connector_factory,
             connector_handle: connector_endpoint.as_handle(),
+            artifact_store,
         })
     }
 
@@ -196,6 +207,7 @@ impl SelectedStorageTopology {
         mut registry: StorageRegistry,
         executor: PostgresExecutor,
         session_execution: runtime::SessionStorageExecutionConfig,
+        artifacts: runtime::ArtifactStorageConfig,
     ) -> Result<Self, String> {
         replace_business_endpoints_with_postgres(&mut registry)?;
         let workspace_scope = workspace_scope(&registry)?;
@@ -204,6 +216,18 @@ impl SelectedStorageTopology {
             &StorageDomainId::ConnectorDirectory,
             Some(&workspace_scope),
         )?;
+        let blob_endpoint = endpoint(&registry, &StorageDomainId::Blobs, None)?;
+        let artifact_store = Arc::new(
+            runtime::ArtifactStore::new(
+                blob_endpoint.path,
+                Arc::new(
+                    runtime_postgres::PostgresArtifactRepository::new(executor.clone())
+                        .map_err(stringify)?,
+                ),
+                artifacts.into(),
+            )
+            .map_err(stringify)?,
+        );
 
         let session =
             session_postgres::PostgresSessionStore::new(executor.clone()).map_err(stringify)?;
@@ -272,6 +296,7 @@ impl SelectedStorageTopology {
             surface_messages,
             connector_factory,
             connector_handle: connector_endpoint.as_handle(),
+            artifact_store,
         })
     }
 

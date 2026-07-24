@@ -938,7 +938,7 @@ mod tests {
                 "a".repeat(64),
                 1,
                 "application/json",
-                format!("session-event://{}/1", packet.session_id),
+                "artifact://art_orchestration_packet",
                 format!("session:{}", packet.session_id),
             );
             let mut evidence_refs = packet.evidence_refs.clone();

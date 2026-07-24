@@ -9,6 +9,9 @@ use crate::context_ledger::estimate_text_tokens;
 
 pub use harness_contract::context::EvidenceAuditProjection as AuditProjection;
 pub use projection::audit_projection;
+pub use raw::{
+    migrate_legacy_raw_evidence, RawEvidenceMigrationOptions, RawEvidenceMigrationReport,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelReceipt {

@@ -875,6 +875,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .provider_registry(Arc::clone(&provider_registry))
             .tool_execution_host(runtime_tool_host)
             .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
+            .artifact_store(Arc::clone(&selected_storage.artifact_store))
             .reality_recall_port(Arc::new(
                 runtime::RealityRecallPort::with_fact_and_matrix_store(
                     &approval_dir,
@@ -914,6 +915,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     evolution_runtime
         .set(Arc::downgrade(&runtime_services))
         .map_err(|_| "failed to bind Runtime evolution evaluation executor".to_string())?;
+    run_artifact_startup_migration(
+        &approval_dir,
+        &selected_storage.session_store,
+        &selected_storage.artifact_store,
+    )
+    .await?;
     run_legacy_execution_startup_migration(&runtime_services, &approval_dir)?;
     gateway_runtime_tool_host
         .bind_runtime_services(Arc::clone(&runtime_services))
@@ -1241,6 +1248,71 @@ fn run_legacy_execution_startup_migration(
     runtime_services
         .import_legacy_execution_receipt(&legacy_receipt, env!("CARGO_PKG_VERSION"))
         .map_err(|error| format!("legacy execution migration failed; startup blocked: {error}"))
+}
+
+async fn run_artifact_startup_migration(
+    config_home: &Path,
+    session_store: &Arc<memory::UnifiedSessionStore>,
+    artifact_store: &Arc<runtime::ArtifactStore>,
+) -> Result<(), String> {
+    let resource_store = runtime::ResourceStore::from_artifact_store(
+        config_home,
+        Arc::clone(artifact_store),
+        runtime::ResourceCapabilityIndex::default(),
+    );
+    let resource_report =
+        resource_store.migrate_legacy_resources(runtime::ResourceMigrationOptions {
+            dry_run: false,
+            resume_after: None,
+            limit: usize::MAX,
+        });
+    let evidence_report = runtime::migrate_legacy_raw_evidence(
+        Arc::clone(session_store),
+        Arc::clone(artifact_store),
+        runtime::RawEvidenceMigrationOptions {
+            dry_run: false,
+            resume_after_session: None,
+            session_limit: usize::MAX,
+        },
+    )
+    .await;
+    let report = serde_json::json!({
+        "schema": "cowd.artifact-migration.v1",
+        "completed_at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default(),
+        "resource": resource_report,
+        "raw_evidence": evidence_report,
+    });
+    let migration_root = config_home.join("migrations");
+    std::fs::create_dir_all(&migration_root)
+        .map_err(|error| format!("create artifact migration report directory: {error}"))?;
+    let report_path = migration_root.join("artifact-v1-report.json");
+    let staging_path = migration_root.join("artifact-v1-report.json.pending");
+    std::fs::write(
+        &staging_path,
+        serde_json::to_vec_pretty(&report)
+            .map_err(|error| format!("encode artifact migration report: {error}"))?,
+    )
+    .map_err(|error| format!("write artifact migration report: {error}"))?;
+    std::fs::rename(&staging_path, &report_path)
+        .map_err(|error| format!("publish artifact migration report: {error}"))?;
+    let resource_complete = report["resource"]["complete"].as_bool().unwrap_or(false);
+    let evidence_complete = report["raw_evidence"]["complete"]
+        .as_bool()
+        .unwrap_or(false);
+    if !resource_complete || !evidence_complete {
+        return Err(format!(
+            "artifact migration is incomplete; inspect {}",
+            report_path.display()
+        ));
+    }
+    tracing::info!(
+        path = %report_path.display(),
+        "artifact and raw-evidence migration gate passed"
+    );
+    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────

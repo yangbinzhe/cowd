@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 use crate::{
@@ -520,17 +521,34 @@ impl GatewayApiClient {
         path: &Path,
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        let bytes = std::fs::read(path).map_err(|error| GatewayApiError::Url(error.to_string()))?;
+        let bytes = tokio::fs::metadata(path)
+            .await
+            .map_err(|error| GatewayApiError::Url(error.to_string()))?
+            .len();
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|error| GatewayApiError::Url(error.to_string()))?;
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("resource.bin")
             .to_string();
-        let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
+        let body =
+            reqwest::Body::wrap_stream(futures::stream::try_unfold(file, |mut file| async move {
+                let mut chunk = vec![0_u8; 64 * 1024];
+                let read = file.read(&mut chunk).await?;
+                if read == 0 {
+                    Ok::<_, std::io::Error>(None)
+                } else {
+                    chunk.truncate(read);
+                    Ok(Some((chunk, file)))
+                }
+            }));
+        let part = reqwest::multipart::Part::stream_with_length(body, bytes).file_name(file_name);
         let form = reqwest::multipart::Form::new()
-            .part("file", part)
             .text("source", "tui")
-            .text("session_id", session_id.to_string());
+            .text("session_id", session_id.to_string())
+            .part("file", part);
         let url = format!("{}/api/resources", self.base_url);
         let request = self.authorize(self.client.post(url).multipart(form));
         let response = request.send().await.map_err(GatewayApiError::Http)?;

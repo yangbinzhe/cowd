@@ -323,6 +323,7 @@ async fn send_message(
     );
     let runtime_content = render_message_resource_context(
         &state.config_home,
+        state.services.artifact_store(),
         &state.services.resource_capability_index(),
         &body.content,
         &body.resource_ids,
@@ -609,6 +610,7 @@ async fn reclassify_session_input(
 
 fn render_message_resource_context(
     config_home: &std::path::Path,
+    artifact_store: Option<Arc<runtime::ArtifactStore>>,
     capabilities: &runtime::ResourceCapabilityIndex,
     content: &str,
     ids: &[String],
@@ -616,9 +618,20 @@ fn render_message_resource_context(
     if ids.is_empty() {
         return content.to_string();
     }
-    let store = runtime::ResourceStore::for_config_home_with_capabilities(
-        config_home,
-        capabilities.clone(),
+    let store = artifact_store.map_or_else(
+        || {
+            runtime::ResourceStore::for_config_home_with_capabilities(
+                config_home,
+                capabilities.clone(),
+            )
+        },
+        |artifacts| {
+            runtime::ResourceStore::from_artifact_store(
+                config_home,
+                artifacts,
+                capabilities.clone(),
+            )
+        },
     );
     let mut pairs = Vec::new();
     let mut failures = Vec::new();
@@ -1218,6 +1231,7 @@ mod tests {
 
         let rendered = render_message_resource_context(
             &temp.path().join("home"),
+            None,
             &runtime::ResourceCapabilityIndex::default(),
             "请分析附件",
             &[resource.id.clone(), resource.id.clone()],

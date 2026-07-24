@@ -216,7 +216,7 @@ mod tests {
                 "a".repeat(64),
                 1,
                 "text/plain",
-                "session-event://session/1",
+                "artifact://art_result_validator_1",
                 "session:session",
             )],
             changes: Vec::new(),
@@ -282,7 +282,7 @@ mod tests {
             "b".repeat(64),
             1,
             "text/plain",
-            "session-event://session/2",
+            "artifact://art_result_validator_2",
             "session:session",
         );
         task.evidence_refs = vec![upstream.clone()];
@@ -306,7 +306,7 @@ mod tests {
             "c".repeat(64),
             10,
             "text/plain",
-            "session-event://session/shared",
+            "artifact://art_result_validator_shared",
             "session:session",
         );
         task.evidence_refs = vec![shared.clone()];

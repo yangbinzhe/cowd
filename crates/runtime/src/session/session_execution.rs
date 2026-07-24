@@ -1365,7 +1365,7 @@ mod tests {
                     "sha256:abc",
                     3,
                     "text/plain",
-                    "session-event://source/1",
+                    "artifact://art_session_source_1",
                     "session:other",
                 )],
                 context_budget_lease: Some(

@@ -147,6 +147,7 @@ where
         .with_knowledge_activation(services.knowledge_activation())
         .with_explicit_team_escalation(root_provider_owner)
         .with_runtime_event_store(Arc::clone(services.event_store()))
+        .with_artifact_store(Arc::clone(services.artifact_store()))
         .with_skill_profiles(config.skill_profiles)
         .with_agent_skill_profile(config.agent_skill_profile)
         .with_skill_prompt_assets(config.skill_prompt_assets)
@@ -591,7 +592,12 @@ where
     T: ToolExecutor,
 {
     let turn_started_at = std::time::Instant::now();
-    let runtime = runtime.with_runtime_event_store(Arc::clone(services.event_store()));
+    let mut runtime = runtime
+        .with_runtime_event_store(Arc::clone(services.event_store()))
+        .with_artifact_store(Arc::clone(services.artifact_store()));
+    if let Some(store) = services.session_store() {
+        runtime = runtime.with_session_store(store);
+    }
     let evaluation_control = match evaluation_turn_control(content) {
         Ok(control) => control,
         Err(error) => return (runtime, Err(error)),
@@ -1122,10 +1128,42 @@ where
         if let Some(error) = state.failure.take() {
             return Err(RuntimeError::new(error));
         }
-        let summary = state
-            .summary
-            .take()
-            .ok_or_else(|| RuntimeError::new("execution graph produced no terminal turn result"))?;
+        let summary = if let Some(summary) = state.summary.take() {
+            summary
+        } else {
+            drop(state);
+            let graph = services
+                .graph_state_store()
+                .load_async(&graph_id)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let statuses = graph
+                .nodes
+                .iter()
+                .map(|node| {
+                    let failure = graph
+                        .node_results
+                        .get(&node.id)
+                        .and_then(|result| result.failure.as_ref())
+                        .map(|failure| format!(":{}", failure.message))
+                        .unwrap_or_default();
+                    format!(
+                        "{}:{}={:?}{failure}",
+                        node.id,
+                        node.executor_kind,
+                        graph
+                            .node_statuses
+                            .get(&node.id)
+                            .copied()
+                            .unwrap_or(ExecutionNodeStatus::Planned)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(RuntimeError::new(format!(
+                "execution graph produced no terminal turn result; graph={graph_id}; nodes=[{statuses}]"
+            )));
+        };
         let projection = services
             .graph_runner()
             .projection(&graph_id)
@@ -4756,6 +4794,7 @@ where
                 &prepared_tool_invocations,
                 &execution_decision,
                 self.services.tool_execution_plane(),
+                self.services.commit_service(),
             )
             .await;
             let orchestration_terminal_summary = completed_orchestration_terminal_summary(
@@ -4768,8 +4807,12 @@ where
             // the next model node sees the result, route its raw output
             // through the same durable evidence and context-ledger path used
             // by normal conversation tool calls.
-            let messages =
-                compact_governed_tool_messages(&self.runtime, &calls, governed.messages).await;
+            let messages = compact_governed_tool_messages(&self.runtime, &calls, governed.messages)
+                .await
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("tool evidence durability barrier failed: {error}"),
+                })?;
             (
                 crate::conversation::ToolBatchStepResult {
                     failed: messages
@@ -5557,7 +5600,7 @@ async fn compact_governed_tool_messages<C, T>(
     runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     calls: &[ModelToolCall],
     raw_messages: Vec<ConversationMessage>,
-) -> Vec<ConversationMessage>
+) -> Result<Vec<ConversationMessage>, RuntimeError>
 where
     C: ApiClient,
     T: ToolExecutor,
@@ -5592,10 +5635,10 @@ where
         messages.push(
             runtime
                 .prepare_governed_tool_result(tool_use_id, tool_name, input, output, is_error)
-                .await,
+                .await?,
         );
     }
-    messages
+    Ok(messages)
 }
 
 /// Execute a ToolBatch using the already-governed plan rather than serialising
@@ -5625,6 +5668,7 @@ async fn execute_governed_runtime_tool_batch(
     >,
     decision: &crate::execution_core::RuntimeExecutionDecision,
     execution_plane: &Arc<crate::ToolExecutionPlane>,
+    commit_service: &crate::execution_core::graph::ExecutionCommitService,
 ) -> GovernedToolBatchResult {
     let requests = calls
         .iter()
@@ -5667,6 +5711,7 @@ async fn execute_governed_runtime_tool_batch(
     let mut results = vec![None; calls.len()];
 
     for batch in plan.batches.clone() {
+        let wave_indices = batch.indices.clone();
         let parallel = batch.max_concurrency > 1
             && batch.indices.len() > 1
             && batch.indices.iter().all(|index| {
@@ -5681,6 +5726,10 @@ async fn execute_governed_runtime_tool_batch(
                 let execution_plane = Arc::clone(execution_plane);
                 let demand = plan.tasks[index].resource_demand.clone();
                 let authorization = tool_authorizations.get(&calls[index].id).cloned();
+                let effect = prepared_invocations
+                    .get(&calls[index].id)
+                    .map(|invocation| invocation.effect.clone());
+                let commit_service = commit_service.clone();
                 let request = bound_runtime_tool_request(
                     &calls[index],
                     &plan.tasks[index],
@@ -5693,7 +5742,14 @@ async fn execute_governed_runtime_tool_batch(
                 );
                 async move {
                     let executed = execution_plane
-                        .execute(&demand, None, move || host.execute_runtime_tool(&request))
+                        .execute(&demand, None, move || {
+                            execute_fenced_runtime_tool(
+                                host.as_ref(),
+                                &commit_service,
+                                &request,
+                                effect.as_ref(),
+                            )
+                        })
                         .await;
                     (index, executed.map_err(|error| error.to_string()))
                 }
@@ -5703,12 +5759,11 @@ async fn execute_governed_runtime_tool_batch(
             .await;
             for (index, joined) in completed {
                 results[index] = Some(match joined {
-                    Ok(outcome) => tool_outcome_message(outcome),
-                    Err(error) => ConversationMessage::tool_result(
-                        calls[index].id.clone(),
-                        calls[index].name.clone(),
+                    Ok(outcome) => outcome,
+                    Err(error) => failed_governed_tool_outcome(
+                        &calls[index],
+                        plan.tasks[index].safety_category,
                         format!("governed tool execution failed: {error}"),
-                        true,
                     ),
                 });
             }
@@ -5716,6 +5771,10 @@ async fn execute_governed_runtime_tool_batch(
             for index in batch.indices {
                 let host = Arc::clone(&host);
                 let authorization = tool_authorizations.get(&calls[index].id).cloned();
+                let effect = prepared_invocations
+                    .get(&calls[index].id)
+                    .map(|invocation| invocation.effect.clone());
+                let commit_service = commit_service.clone();
                 let request = bound_runtime_tool_request(
                     &calls[index],
                     &plan.tasks[index],
@@ -5729,18 +5788,63 @@ async fn execute_governed_runtime_tool_batch(
                 let demand = plan.tasks[index].resource_demand.clone();
                 results[index] = Some(
                     match execution_plane
-                        .execute(&demand, None, move || host.execute_runtime_tool(&request))
+                        .execute(&demand, None, move || {
+                            execute_fenced_runtime_tool(
+                                host.as_ref(),
+                                &commit_service,
+                                &request,
+                                effect.as_ref(),
+                            )
+                        })
                         .await
                     {
-                        Ok(outcome) => tool_outcome_message(outcome),
-                        Err(error) => ConversationMessage::tool_result(
-                            calls[index].id.clone(),
-                            calls[index].name.clone(),
+                        Ok(outcome) => outcome,
+                        Err(error) => failed_governed_tool_outcome(
+                            &calls[index],
+                            plan.tasks[index].safety_category,
                             format!("governed tool execution failed: {error}"),
-                            true,
                         ),
                     },
                 );
+            }
+        }
+        let readonly_receipts = wave_indices
+            .iter()
+            .filter_map(|index| {
+                let invocation = prepared_invocations.get(&calls[*index].id)?;
+                (invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read)
+                    .then(|| {
+                        (
+                            bound_runtime_tool_request(
+                                &calls[*index],
+                                &plan.tasks[*index],
+                                &plan.plan_id,
+                                plan.revision,
+                                session_id,
+                                model_lease,
+                                ticket,
+                                tool_authorizations.get(&calls[*index].id).cloned(),
+                            ),
+                            results[*index].clone().expect("wave result must exist"),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if let Err(error) = commit_service.commit_readonly_tool_receipts(&readonly_receipts) {
+            for index in wave_indices {
+                if prepared_invocations
+                    .get(&calls[index].id)
+                    .is_some_and(|invocation| {
+                        invocation.effect.effect_kind
+                            == harness_contract::tool::ToolEffectKind::Read
+                    })
+                {
+                    results[index] = Some(failed_governed_tool_outcome(
+                        &calls[index],
+                        plan.tasks[index].safety_category,
+                        format!("tool completed but its durable read receipt failed: {error}"),
+                    ));
+                }
             }
         }
     }
@@ -5749,20 +5853,105 @@ async fn execute_governed_runtime_tool_batch(
         .into_iter()
         .enumerate()
         .map(|(index, result)| {
-            result.unwrap_or_else(|| {
-                ConversationMessage::tool_result(
-                    calls[index].id.clone(),
-                    calls[index].name.clone(),
+            tool_outcome_message(result.unwrap_or_else(|| {
+                failed_governed_tool_outcome(
+                    &calls[index],
+                    plan.tasks[index].safety_category,
                     "tool scheduler did not produce a result".to_string(),
-                    true,
                 )
-            })
+            }))
         })
         .collect();
     GovernedToolBatchResult {
         messages,
         max_concurrency_observed,
         parallel_batches,
+    }
+}
+
+fn failed_governed_tool_outcome(
+    call: &ModelToolCall,
+    category: crate::ToolSafetyCategory,
+    error: String,
+) -> crate::RuntimeToolExecutionOutcome {
+    crate::RuntimeToolExecutionOutcome {
+        tool_use_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        status: crate::RuntimeToolExecutionStatus::Failed,
+        category,
+        output: None,
+        error: Some(error),
+        evidence_ref: format!("tool-execution-failed:{}", call.id),
+    }
+}
+
+fn execute_fenced_runtime_tool(
+    host: &dyn crate::RuntimeExecutionHost,
+    commit_service: &crate::execution_core::graph::ExecutionCommitService,
+    request: &crate::RuntimeToolExecutionRequest,
+    effect: Option<&harness_contract::tool::ToolEffectDescriptor>,
+) -> crate::RuntimeToolExecutionOutcome {
+    let Some(effect) = effect else {
+        return crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Failed,
+            category: request.category,
+            output: None,
+            error: Some(
+                "governed tool execution is blocked because its registered effect descriptor is missing"
+                    .to_string(),
+            ),
+            evidence_ref: format!("tool-effect-missing:{}", request.tool_use_id),
+        };
+    };
+    match commit_service.begin_tool_effect(request, effect) {
+        Ok(crate::execution_core::graph::ToolEffectState::Completed(outcome)) => outcome,
+        Ok(crate::execution_core::graph::ToolEffectState::Uncertain) => {
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: crate::RuntimeToolExecutionStatus::Failed,
+                category: request.category,
+                output: None,
+                error: Some(
+                    "tool effect is uncertain; non-idempotent execution was not replayed"
+                        .to_string(),
+                ),
+                evidence_ref: format!("tool-effect-uncertain:{}", request.idempotency_key),
+            }
+        }
+        Ok(
+            crate::execution_core::graph::ToolEffectState::Fresh
+            | crate::execution_core::graph::ToolEffectState::NotRequired,
+        ) => {
+            let outcome = host.execute_runtime_tool(request);
+            if let Err(error) = commit_service.commit_tool_effect(request, effect, &outcome) {
+                return crate::RuntimeToolExecutionOutcome {
+                    tool_use_id: request.tool_use_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    status: crate::RuntimeToolExecutionStatus::Failed,
+                    category: request.category,
+                    output: None,
+                    error: Some(format!(
+                        "tool effect completed but its durable receipt failed: {error}"
+                    )),
+                    evidence_ref: format!("tool-effect-receipt-failed:{}", request.idempotency_key),
+                };
+            }
+            outcome
+        }
+        Err(error) => crate::RuntimeToolExecutionOutcome {
+            tool_use_id: request.tool_use_id.clone(),
+            tool_name: request.tool_name.clone(),
+            status: crate::RuntimeToolExecutionStatus::Failed,
+            category: request.category,
+            output: None,
+            error: Some(format!(
+                "tool effect intent failed before execution: {error}"
+            )),
+            evidence_ref: format!("tool-effect-intent-failed:{}", request.idempotency_key),
+        },
     }
 }
 
@@ -8320,7 +8509,7 @@ mod tests {
                 "a".repeat(64),
                 1,
                 "application/json",
-                format!("session-event://{}/1", packet.session_id),
+                "artifact://art_conversation_host_packet",
                 format!("session:{}", packet.session_id),
             );
             let mut evidence_refs = packet.evidence_refs.clone();
@@ -8741,9 +8930,9 @@ mod tests {
             };
 
             match name {
-                "read_file" => Some(ToolEffectDescriptor {
+                "ToolSearch" | "read_file" => Some(ToolEffectDescriptor {
                     tool_id: name.to_string(),
-                    descriptor_hash: "test-read-file-v1".to_string(),
+                    descriptor_hash: format!("test-{name}-v1"),
                     effect_kind: ToolEffectKind::Read,
                     idempotency: ToolIdempotency::Idempotent,
                     scopes: vec![PermissionScope::new(
@@ -9378,8 +9567,29 @@ mod tests {
         let executed = Arc::new(AtomicUsize::new(0));
         let executions_seen_before_second_model = Arc::new(AtomicUsize::new(0));
         let order = Arc::new(Mutex::new(Vec::new()));
+        let session = Session::new();
+        let session_store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        session_store
+            .create_session(&memory::SessionRecord {
+                session_id: session.session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "dependent-wave".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
         let runtime = crate::ConversationRuntime::new(
-            Session::new(),
+            session,
             TwoToolClient {
                 requests: 0,
                 executed: Arc::clone(&executed),
@@ -9394,7 +9604,9 @@ mod tests {
             PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
             vec!["use requested tools".to_string()],
         )
-        .without_memory();
+        .without_memory()
+        .with_session_store(session_store)
+        .with_artifact_store(Arc::clone(services.artifact_store()));
 
         let (_runtime, result) = submit_owned_conversation_turn(
             runtime,
@@ -9535,6 +9747,7 @@ mod tests {
             &tool_effects,
             &decision,
             services.tool_execution_plane(),
+            services.commit_service(),
         )
         .await;
         let messages = governed.messages;

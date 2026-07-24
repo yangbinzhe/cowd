@@ -127,6 +127,7 @@ pub struct RuntimeServicesBuilder {
     provider_registry: Arc<crate::ProviderRegistry>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     session_store: Option<Arc<memory::UnifiedSessionStore>>,
+    artifact_store: Option<Arc<crate::ArtifactStore>>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
     reality_recall_port: Option<Arc<RealityRecallPort>>,
     knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
@@ -390,6 +391,12 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    #[must_use]
+    pub fn artifact_store(mut self, store: Arc<crate::ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
+
     /// Install the only Memory kernel that Runtime-owned conversation hosts may
     /// use. Gateway may construct and monitor this component, but it must not
     /// assemble Memory context on behalf of a turn.
@@ -495,6 +502,15 @@ impl RuntimeServicesBuilder {
                 .as_handle();
             Arc::new(RuntimeEventStore::try_open(runtime_event_handle.path)?)
         };
+        let artifact_store = self.artifact_store.unwrap_or_else(|| {
+            let endpoint = storage_registry
+                .endpoint(&storage::StorageDomainId::Blobs)
+                .expect("default storage registry always contains the blobs endpoint");
+            Arc::new(crate::ArtifactStore::sqlite(
+                endpoint.path.clone(),
+                crate::ArtifactStoreConfig::default(),
+            ))
+        });
         let resource_state_root = std::env::temp_dir()
             .join("cowd-runtime-resource-locks")
             .join(&workspace_key);
@@ -517,6 +533,7 @@ impl RuntimeServicesBuilder {
             self.resource_quotas,
             self.provider_registry,
             self.tool_execution_host,
+            artifact_store,
             self.memory_manager,
             self.reality_recall_port,
             self.knowledge_activation,
@@ -596,6 +613,7 @@ pub struct RuntimeServices {
     provider_registry: Arc<crate::ProviderRegistry>,
     provider_transport_pool: Arc<crate::ProviderTransportPool>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
+    artifact_store: Arc<crate::ArtifactStore>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
     skill_catalog: Arc<RwLock<crate::RuntimeSkillCatalog>>,
@@ -620,6 +638,7 @@ impl RuntimeServices {
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             tool_execution_host: None,
             session_store: None,
+            artifact_store: None,
             memory_manager: None,
             reality_recall_port: None,
             knowledge_activation: None,
@@ -659,6 +678,13 @@ impl RuntimeServices {
             default_resource_quotas(),
             Arc::new(crate::ProviderRegistry::empty()),
             None,
+            Arc::new(crate::ArtifactStore::sqlite(
+                storage_registry
+                    .endpoint(&storage::StorageDomainId::Blobs)?
+                    .path
+                    .clone(),
+                crate::ArtifactStoreConfig::default(),
+            )),
             None,
             None,
             None,
@@ -695,6 +721,7 @@ impl RuntimeServices {
         resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
         provider_registry: Arc<crate::ProviderRegistry>,
         tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
+        artifact_store: Arc<crate::ArtifactStore>,
         memory_manager: Option<Arc<memory::CognitiveContextManager>>,
         reality_recall_port: Option<Arc<RealityRecallPort>>,
         knowledge_activation: Option<crate::knowledge_activation::KnowledgeActivationRuntime>,
@@ -864,6 +891,7 @@ impl RuntimeServices {
             provider_registry,
             provider_transport_pool,
             tool_execution_host,
+            artifact_store,
             memory_manager,
             evolution_eval_runner,
             skill_catalog: Arc::new(RwLock::new(skill_catalog)),
@@ -3078,6 +3106,9 @@ impl RuntimeServices {
     pub fn provider_transport_pool(&self) -> &Arc<crate::ProviderTransportPool> {
         &self.provider_transport_pool
     }
+    pub fn artifact_store(&self) -> &Arc<crate::ArtifactStore> {
+        &self.artifact_store
+    }
     pub fn tool_execution_host(&self) -> Option<&Arc<dyn crate::RuntimeExecutionHost>> {
         self.tool_execution_host.as_ref()
     }
@@ -3610,7 +3641,7 @@ mod tests {
                 "a".repeat(64),
                 1,
                 "application/json",
-                format!("session-event://{}/1", packet.session_id),
+                "artifact://art_runtime_services_packet",
                 format!("session:{}", packet.session_id),
             ));
             Ok(AgentReturnPacket {
@@ -3679,7 +3710,7 @@ mod tests {
                 "a".repeat(64),
                 1,
                 "application/json",
-                format!("session-event://{}/1", packet.session_id),
+                "artifact://art_runtime_services_shared",
                 format!("session:{}", packet.session_id),
             ));
             Ok(AgentReturnPacket {

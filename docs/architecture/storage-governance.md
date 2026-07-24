@@ -28,6 +28,7 @@ turn 与 App 都不得在请求期间自行判断后端或重新打开数据库�
 | approval | `approval` | approval history and decisions |
 | surface message | `surface` | inbox/outbox/delivery evidence |
 | connector directory | `connector` | external resource directory |
+| artifact | `runtime` | Resource、Tool raw 与 Evidence 的统一 CAS、授权读取、配额和 GC |
 | App relational storage | each App bundle | App-owned schema, snapshot and migration hook |
 
 ## Runtime configuration
@@ -41,6 +42,13 @@ storage:
   sessionExecution:
     workers: 8
     queueCapacity: 64
+  artifacts:
+    compactThresholdBytes: 262144
+    maxObjectBytes: 536870912
+    totalQuotaBytes: 21474836480
+    gcHighWaterBytes: 19327352832
+    gcLowWaterBytes: 17179869184
+    orphanGraceMs: 86400000
   postgres:
     logicalIdentity: cowd-primary
     secretRef: env:COWD_POSTGRES_URL
@@ -48,6 +56,13 @@ storage:
     minIdleConnections: 2
     checkoutTimeoutMs: 5000
 ```
+
+Artifact 元数据和小对象随 selected backend 使用 SQLite/PostgreSQL；大对象只通过
+`StorageDomainId::Blobs` 的选定目录访问。公开 Resource/Evidence DTO 仅返回
+`artifact://` selector、hash、大小、媒体类型和可见域，不返回宿主路径。Gateway 启动时会
+幂等迁移旧 `storage/resources/objects` 与 Session 内联 raw evidence，并在
+`~/.cowd/migrations/artifact-v1-report.json` 留下 hash 校验、游标和完成状态；迁移未完成
+会阻止新旧语义混用。
 
 `secretRef` currently accepts the strict `env:VARIABLE` form. Environment variables resolve
 credentials at the process boundary; they do not replace the configuration file as the topology

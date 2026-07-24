@@ -6,7 +6,9 @@ use harness_contract::execution_graph::{
     ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
     ExecutionTransitionError,
 };
+use harness_contract::tool::{ToolEffectDescriptor, ToolEffectKind, ToolIdempotency};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::runtime_event_store::{
@@ -59,12 +61,176 @@ pub enum ExecutionEffectState {
     Uncertain,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolEffectState {
+    NotRequired,
+    Fresh,
+    Completed(crate::RuntimeToolExecutionOutcome),
+    Uncertain,
+}
+
 #[derive(Clone)]
 pub struct ExecutionCommitService {
     event_store: Arc<RuntimeEventStore>,
 }
 
 impl ExecutionCommitService {
+    pub fn commit_readonly_tool_receipts(
+        &self,
+        receipts: &[(
+            crate::RuntimeToolExecutionRequest,
+            crate::RuntimeToolExecutionOutcome,
+        )],
+    ) -> Result<(), ExecutionCommitError> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        let mut expected_streams = Vec::with_capacity(receipts.len());
+        let mut events = Vec::with_capacity(receipts.len());
+        let mut receipt_keys = Vec::with_capacity(receipts.len());
+        for (request, outcome) in receipts {
+            let stream_id = format!("execution-effect:{}", request.idempotency_key);
+            let receipt_key = format!("{}:read-receipt", request.idempotency_key);
+            if self
+                .event_store
+                .event_by_idempotency_key(&stream_id, &receipt_key)?
+                .is_some()
+            {
+                continue;
+            }
+            expected_streams.push(ExpectedStreamRevision {
+                stream_id: stream_id.clone(),
+                expected_revision: self.event_store.stream_revision(&stream_id)?,
+            });
+            events.push(RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id,
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "execution.read.receipt".to_string(),
+                    status: Some("completed".to_string()),
+                    actor: Some("governed_tool".to_string()),
+                    refs: tool_effect_refs(request),
+                    payload: json!({
+                        "idempotency_key": request.idempotency_key,
+                        "tool_use_id": request.tool_use_id,
+                        "tool_name": request.tool_name,
+                        "input_sha256": format!(
+                            "sha256:{:x}",
+                            Sha256::digest(request.input.as_bytes())
+                        ),
+                        "outcome": bounded_tool_effect_outcome(outcome),
+                    }),
+                },
+                idempotency_key: Some(receipt_key.clone()),
+                schema_version: 1,
+            });
+            receipt_keys.push(receipt_key);
+        }
+        if events.is_empty() {
+            return Ok(());
+        }
+        receipt_keys.sort();
+        let digest = format!("{:x}", Sha256::digest(receipt_keys.join("\n").as_bytes()));
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("readonly-tool-wave:{digest}"),
+                expected_streams,
+                events,
+            })?;
+        Ok(())
+    }
+
+    pub fn begin_tool_effect(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+    ) -> Result<ToolEffectState, ExecutionCommitError> {
+        if effect.effect_kind == ToolEffectKind::Read {
+            return Ok(ToolEffectState::NotRequired);
+        }
+        let stream_id = format!("execution-effect:{}", request.idempotency_key);
+        if let Some(receipt) = self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &format!("{}:receipt", request.idempotency_key))?
+        {
+            return serde_json::from_value(receipt.payload)
+                .map(ToolEffectState::Completed)
+                .map_err(ExecutionCommitError::Serialization);
+        }
+        if self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &format!("{}:intent", request.idempotency_key))?
+            .is_some()
+        {
+            return Ok(match effect.idempotency {
+                ToolIdempotency::Idempotent | ToolIdempotency::IdempotentWithKey => {
+                    ToolEffectState::Fresh
+                }
+                ToolIdempotency::NonIdempotent | ToolIdempotency::Unknown => {
+                    ToolEffectState::Uncertain
+                }
+            });
+        }
+        let revision = self.event_store.stream_revision(&stream_id)?;
+        self.event_store.append_batch_if_revision(
+            stream_id.clone(),
+            revision,
+            format!("{}:intent", request.idempotency_key),
+            vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id,
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "execution.effect.intent".to_string(),
+                    status: Some("inflight".to_string()),
+                    actor: Some("governed_tool".to_string()),
+                    refs: tool_effect_refs(request),
+                    payload: json!({
+                        "idempotency_key": request.idempotency_key,
+                        "tool_use_id": request.tool_use_id,
+                        "tool_name": request.tool_name,
+                        "input_sha256": format!("sha256:{:x}", Sha256::digest(request.input.as_bytes())),
+                        "effect": effect,
+                    }),
+                },
+                idempotency_key: Some(format!("{}:intent", request.idempotency_key)),
+                schema_version: 1,
+            }],
+        )?;
+        Ok(ToolEffectState::Fresh)
+    }
+
+    pub fn commit_tool_effect(
+        &self,
+        request: &crate::RuntimeToolExecutionRequest,
+        effect: &ToolEffectDescriptor,
+        outcome: &crate::RuntimeToolExecutionOutcome,
+    ) -> Result<(), ExecutionCommitError> {
+        if effect.effect_kind == ToolEffectKind::Read {
+            return Ok(());
+        }
+        let stream_id = format!("execution-effect:{}", request.idempotency_key);
+        let revision = self.event_store.stream_revision(&stream_id)?;
+        self.event_store.append_batch_if_revision(
+            stream_id.clone(),
+            revision,
+            format!("{}:receipt", request.idempotency_key),
+            vec![RuntimeTransactionEventInput {
+                event: RuntimeEventInput {
+                    stream_id,
+                    scope: RuntimeEventScope::ExecutionNode,
+                    kind: "execution.effect.receipt".to_string(),
+                    status: Some("completed".to_string()),
+                    actor: Some("governed_tool".to_string()),
+                    refs: tool_effect_refs(request),
+                    payload: serde_json::to_value(bounded_tool_effect_outcome(outcome))?,
+                },
+                idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
+                schema_version: 1,
+            }],
+        )?;
+        Ok(())
+    }
+
     pub fn begin_execution_effect(
         &self,
         ticket: &super::registry::NodeExecutionTicket,
@@ -929,6 +1095,45 @@ impl ExecutionCommitService {
     }
 }
 
+fn tool_effect_refs(request: &crate::RuntimeToolExecutionRequest) -> Vec<RuntimeEventRef> {
+    let mut refs = vec![RuntimeEventRef {
+        kind: "tool_invocation".to_string(),
+        id: request.tool_use_id.clone(),
+    }];
+    if let Some(parent) = &request.parent_execution {
+        refs.push(RuntimeEventRef {
+            kind: "execution_graph".to_string(),
+            id: parent.execution_id.clone(),
+        });
+        refs.push(RuntimeEventRef {
+            kind: "execution_node".to_string(),
+            id: parent.node_id.clone(),
+        });
+    }
+    refs
+}
+
+fn bounded_tool_effect_outcome(
+    outcome: &crate::RuntimeToolExecutionOutcome,
+) -> crate::RuntimeToolExecutionOutcome {
+    const MAX_RECEIPT_CHARS: usize = 16 * 1024;
+    let mut bounded = outcome.clone();
+    bounded.output = bounded.output.map(|output| {
+        if output.chars().count() <= MAX_RECEIPT_CHARS {
+            output
+        } else {
+            let prefix = output.chars().take(MAX_RECEIPT_CHARS).collect::<String>();
+            format!(
+                "{prefix}\n[effect receipt truncated; full output requires its artifact receipt]"
+            )
+        }
+    });
+    bounded.error = bounded
+        .error
+        .map(|error| error.chars().take(MAX_RECEIPT_CHARS).collect());
+    bounded
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1114,5 +1319,137 @@ fn graph_status(graph: &ExecutionGraph) -> Option<&'static str> {
         Some("paused")
     } else {
         Some("running")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_contract::tool::{
+        ToolApprovalClass, ToolEffectKind, ToolIdempotency, ToolPermissionMode,
+    };
+
+    fn request(id: &str) -> crate::RuntimeToolExecutionRequest {
+        crate::RuntimeToolExecutionRequest {
+            governed_plan_id: "plan".to_string(),
+            governed_plan_revision: 1,
+            idempotency_key: format!("idem-{id}"),
+            tool_use_id: id.to_string(),
+            tool_name: "fixture_tool".to_string(),
+            input: format!(r#"{{"id":"{id}"}}"#),
+            category: crate::ToolSafetyCategory::ReadOnly,
+            authorization: None,
+            session_id: Some("session".to_string()),
+            model_lease: None,
+            parent_execution: None,
+            evaluation_isolated: false,
+            managed_invocation: None,
+        }
+    }
+
+    fn outcome(id: &str, output: &str) -> crate::RuntimeToolExecutionOutcome {
+        crate::RuntimeToolExecutionOutcome {
+            tool_use_id: id.to_string(),
+            tool_name: "fixture_tool".to_string(),
+            status: crate::RuntimeToolExecutionStatus::Executed,
+            category: crate::ToolSafetyCategory::ReadOnly,
+            output: Some(output.to_string()),
+            error: None,
+            evidence_ref: format!("tool://{id}"),
+        }
+    }
+
+    fn mutation_effect(idempotency: ToolIdempotency) -> ToolEffectDescriptor {
+        ToolEffectDescriptor {
+            tool_id: "fixture_tool".to_string(),
+            descriptor_hash: "fixture-effect-v1".to_string(),
+            effect_kind: ToolEffectKind::Write,
+            idempotency,
+            scopes: Vec::new(),
+            required_permission: ToolPermissionMode::WorkspaceWrite,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        }
+    }
+
+    #[test]
+    fn readonly_wave_receipts_commit_atomically_and_replay_idempotently() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = ExecutionCommitService::new(Arc::clone(&store));
+        let receipts = vec![
+            (request("read-1"), outcome("read-1", "one")),
+            (request("read-2"), outcome("read-2", "two")),
+        ];
+        service
+            .commit_readonly_tool_receipts(&receipts)
+            .expect("commit read wave");
+        let first = store
+            .event_by_idempotency_key("execution-effect:idem-read-1", "idem-read-1:read-receipt")
+            .unwrap()
+            .expect("first receipt");
+        let second = store
+            .event_by_idempotency_key("execution-effect:idem-read-2", "idem-read-2:read-receipt")
+            .unwrap()
+            .expect("second receipt");
+        assert_eq!(first.transaction_id, second.transaction_id);
+        service
+            .commit_readonly_tool_receipts(&receipts)
+            .expect("idempotent replay");
+        assert_eq!(
+            store
+                .list_stream("execution-effect:idem-read-1")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn mutation_intent_blocks_uncertain_replay_and_completed_receipt_rehydrates() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = ExecutionCommitService::new(store);
+        let mutation_request = request("mutation");
+        let non_idempotent = mutation_effect(ToolIdempotency::NonIdempotent);
+        assert_eq!(
+            service
+                .begin_tool_effect(&mutation_request, &non_idempotent)
+                .unwrap(),
+            ToolEffectState::Fresh
+        );
+        assert_eq!(
+            service
+                .begin_tool_effect(&mutation_request, &non_idempotent)
+                .unwrap(),
+            ToolEffectState::Uncertain
+        );
+        let outcome = outcome("mutation", &"x".repeat(32 * 1024));
+        service
+            .commit_tool_effect(&mutation_request, &non_idempotent, &outcome)
+            .unwrap();
+        let ToolEffectState::Completed(rehydrated) = service
+            .begin_tool_effect(&mutation_request, &non_idempotent)
+            .unwrap()
+        else {
+            panic!("completed mutation must rehydrate its receipt");
+        };
+        assert!(rehydrated.output.unwrap().len() < 20 * 1024);
+
+        let idempotent_request = request("idempotent-mutation");
+        let idempotent = mutation_effect(ToolIdempotency::IdempotentWithKey);
+        assert_eq!(
+            service
+                .begin_tool_effect(&idempotent_request, &idempotent)
+                .unwrap(),
+            ToolEffectState::Fresh
+        );
+        assert_eq!(
+            service
+                .begin_tool_effect(&idempotent_request, &idempotent)
+                .unwrap(),
+            ToolEffectState::Fresh
+        );
     }
 }

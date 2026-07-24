@@ -91,6 +91,7 @@ pub(crate) fn process_cwd_lock() -> &'static Mutex<()> {
 pub(crate) struct ContextService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    artifact_store: Option<Arc<runtime::ArtifactStore>>,
 }
 
 impl ContextService {
@@ -98,7 +99,13 @@ impl ContextService {
         Self {
             label: "context",
             owner: "0.9.315 Context service boundary",
+            artifact_store: None,
         }
+    }
+
+    pub(crate) fn with_artifact_store(mut self, store: Arc<runtime::ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
     }
 
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
@@ -605,6 +612,19 @@ pub(crate) struct GatewayServices {
     pub(crate) capacity: crate::gateway_capacity::GatewayCapacityController,
     pub(crate) owner: &'static str,
     pub(crate) boundary_status: &'static str,
+}
+
+impl GatewayServices {
+    pub(crate) fn artifact_store(&self) -> Option<Arc<runtime::ArtifactStore>> {
+        self.selected_storage
+            .as_ref()
+            .map(|topology| Arc::clone(&topology.artifact_store))
+            .or_else(|| {
+                self.runtime
+                    .as_ref()
+                    .map(|runtime| Arc::clone(runtime.runtime_services().artifact_store()))
+            })
+    }
 }
 
 impl SessionService {

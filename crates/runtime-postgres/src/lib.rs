@@ -38,6 +38,7 @@ use storage::{
 
 const RUNTIME_EVENT_DOMAIN: &str = "runtime_event";
 const TASK_DOMAIN: &str = "runtime_task";
+const ARTIFACT_DOMAIN: &str = "runtime_artifact";
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 const EVENT_COLUMNS: &str =
@@ -154,6 +155,42 @@ const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         )",
         "CREATE INDEX IF NOT EXISTS idx_runtime_tasks_status_created
             ON runtime_tasks(status, created_at_ms DESC, task_id DESC)",
+    ],
+}];
+
+const ARTIFACT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
+    id: "runtime_artifact.0001.initial",
+    domain: ARTIFACT_DOMAIN,
+    version: 1,
+    description: "create unified artifact compact tier and catalogue",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS artifact_objects (
+            sha256 TEXT PRIMARY KEY,
+            bytes BIGINT NOT NULL,
+            tier TEXT NOT NULL,
+            compact_body BYTEA,
+            created_at_ms BIGINT NOT NULL
+        )",
+        "CREATE TABLE IF NOT EXISTS artifact_records (
+            artifact_id TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL REFERENCES artifact_objects(sha256),
+            bytes BIGINT NOT NULL,
+            media_type TEXT NOT NULL,
+            visibility_scope TEXT NOT NULL,
+            tier TEXT NOT NULL,
+            created_at_ms BIGINT NOT NULL,
+            last_access_at_ms BIGINT NOT NULL
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_artifact_records_hash
+            ON artifact_records(sha256)",
+        "CREATE TABLE IF NOT EXISTS artifact_pins (
+            artifact_id TEXT NOT NULL REFERENCES artifact_records(artifact_id) ON DELETE CASCADE,
+            owner TEXT NOT NULL,
+            until_ms BIGINT NOT NULL,
+            PRIMARY KEY(artifact_id, owner)
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_artifact_pins_expiry
+            ON artifact_pins(until_ms)",
     ],
 }];
 
@@ -1886,6 +1923,294 @@ fn write_task_migration_manifest(
     fs::rename(temporary_path, manifest_path).map_err(|error| error.to_string())
 }
 
+/// PostgreSQL compact-tier and metadata adapter for Runtime artifacts.
+#[derive(Clone, Debug)]
+pub struct PostgresArtifactRepository {
+    executor: PostgresExecutor,
+}
+
+impl PostgresArtifactRepository {
+    pub fn new(executor: PostgresExecutor) -> Result<Self, String> {
+        executor
+            .apply_migrations(ARTIFACT_DOMAIN, ARTIFACT_MIGRATIONS)
+            .map_err(|error| error.to_string())?;
+        Ok(Self { executor })
+    }
+}
+
+impl runtime::ArtifactMetadataRepository for PostgresArtifactRepository {
+    fn put_object(&self, object: &runtime::ArtifactObjectRecord) -> Result<bool, String> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO artifact_objects
+                 (sha256, bytes, tier, compact_body, created_at_ms)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT(sha256) DO NOTHING",
+                &[
+                    &object.sha256,
+                    &artifact_to_i64(object.bytes)?,
+                    &artifact_tier_name(&object.tier),
+                    &object.compact_body,
+                    &artifact_to_i64(object.created_at_ms)?,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(|error| error.to_string())
+    }
+
+    fn object(&self, sha256: &str) -> Result<Option<runtime::ArtifactObjectRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        connection
+            .query_opt(
+                "SELECT sha256, bytes, tier, compact_body, created_at_ms
+                 FROM artifact_objects WHERE sha256=$1",
+                &[&sha256],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| artifact_object_from_row(&row))
+            .transpose()
+    }
+
+    fn put_record(&self, record: &runtime::ArtifactRecord) -> Result<(), String> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "INSERT INTO artifact_records
+                 (artifact_id, sha256, bytes, media_type, visibility_scope, tier,
+                  created_at_ms, last_access_at_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &record.artifact_id,
+                    &record.sha256,
+                    &artifact_to_i64(record.bytes)?,
+                    &record.media_type,
+                    &record.visibility_scope,
+                    &artifact_tier_name(&record.tier),
+                    &artifact_to_i64(record.created_at_ms)?,
+                    &artifact_to_i64(record.last_access_at_ms)?,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn record(&self, artifact_id: &str) -> Result<Option<runtime::ArtifactRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        connection
+            .query_opt(
+                "SELECT artifact_id, sha256, bytes, media_type, visibility_scope, tier,
+                        created_at_ms, last_access_at_ms
+                 FROM artifact_records WHERE artifact_id=$1",
+                &[&artifact_id],
+            )
+            .map_err(|error| error.to_string())?
+            .map(|row| artifact_record_from_row(&row))
+            .transpose()
+    }
+
+    fn touch(&self, artifact_id: &str, at_ms: u64) -> Result<(), String> {
+        self.executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?
+            .execute(
+                "UPDATE artifact_records SET last_access_at_ms=$2 WHERE artifact_id=$1",
+                &[&artifact_id, &artifact_to_i64(at_ms)?],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn remove_record(&self, artifact_id: &str) -> Result<(), String> {
+        self.executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?
+            .execute(
+                "DELETE FROM artifact_records WHERE artifact_id=$1",
+                &[&artifact_id],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn unreferenced_objects_before(
+        &self,
+        before_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<runtime::ArtifactObjectRecord>, String> {
+        self.executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?
+            .query(
+                "SELECT object.sha256, object.bytes, object.tier, object.compact_body,
+                        object.created_at_ms
+                 FROM artifact_objects object
+                 LEFT JOIN artifact_records record ON record.sha256=object.sha256
+                 WHERE record.artifact_id IS NULL AND object.created_at_ms <= $1
+                 ORDER BY object.created_at_ms ASC LIMIT $2",
+                &[
+                    &artifact_to_i64(before_ms)?,
+                    &artifact_to_i64(limit as u64)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(artifact_object_from_row)
+            .collect()
+    }
+
+    fn remove_object(&self, sha256: &str) -> Result<(), String> {
+        self.executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?
+            .execute(
+                "DELETE FROM artifact_objects
+                 WHERE sha256=$1
+                 AND NOT EXISTS (
+                    SELECT 1 FROM artifact_records WHERE artifact_records.sha256=$1
+                 )",
+                &[&sha256],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn pin(&self, artifact_id: &str, owner: &str, until_ms: u64) -> Result<(), String> {
+        self.executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?
+            .execute(
+                "INSERT INTO artifact_pins (artifact_id, owner, until_ms)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT(artifact_id, owner)
+                 DO UPDATE SET until_ms=EXCLUDED.until_ms",
+                &[&artifact_id, &owner, &artifact_to_i64(until_ms)?],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn unpin(&self, artifact_id: &str, owner: &str) -> Result<(), String> {
+        self.executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?
+            .execute(
+                "DELETE FROM artifact_pins WHERE artifact_id=$1 AND owner=$2",
+                &[&artifact_id, &owner],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    fn is_pinned(&self, artifact_id: &str, at_ms: u64) -> Result<bool, String> {
+        self.executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT 1 FROM artifact_pins
+                    WHERE artifact_id=$1 AND until_ms>$2
+                 )",
+                &[&artifact_id, &artifact_to_i64(at_ms)?],
+            )
+            .map(|row| row.get(0))
+            .map_err(|error| error.to_string())
+    }
+
+    fn stats(&self, at_ms: u64) -> Result<runtime::ArtifactStoreStats, String> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        let object_row = connection
+            .query_one(
+                "SELECT COUNT(*), COALESCE(SUM(bytes), 0)::BIGINT,
+                        COALESCE(SUM(CASE WHEN tier='compact' THEN bytes ELSE 0 END), 0)::BIGINT,
+                        COALESCE(SUM(CASE WHEN tier='blob' THEN bytes ELSE 0 END), 0)::BIGINT
+                 FROM artifact_objects",
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        let artifacts = connection
+            .query_one("SELECT COUNT(*) FROM artifact_records", &[])
+            .map_err(|error| error.to_string())?
+            .get::<_, i64>(0);
+        let pins = connection
+            .query_one(
+                "SELECT COUNT(*) FROM artifact_pins WHERE until_ms>$1",
+                &[&artifact_to_i64(at_ms)?],
+            )
+            .map_err(|error| error.to_string())?
+            .get::<_, i64>(0);
+        Ok(runtime::ArtifactStoreStats {
+            objects: artifact_from_i64(object_row.get(0), "objects")?,
+            artifacts: artifact_from_i64(artifacts, "artifacts")?,
+            physical_bytes: artifact_from_i64(object_row.get(1), "physical_bytes")?,
+            compact_bytes: artifact_from_i64(object_row.get(2), "compact_bytes")?,
+            blob_bytes: artifact_from_i64(object_row.get(3), "blob_bytes")?,
+            pins: artifact_from_i64(pins, "pins")?,
+        })
+    }
+}
+
+fn artifact_object_from_row(row: &Row) -> Result<runtime::ArtifactObjectRecord, String> {
+    Ok(runtime::ArtifactObjectRecord {
+        sha256: row.get(0),
+        bytes: artifact_from_i64(row.get(1), "bytes")?,
+        tier: artifact_tier(row.get::<_, String>(2).as_str())?,
+        compact_body: row.get(3),
+        created_at_ms: artifact_from_i64(row.get(4), "created_at_ms")?,
+    })
+}
+
+fn artifact_record_from_row(row: &Row) -> Result<runtime::ArtifactRecord, String> {
+    Ok(runtime::ArtifactRecord {
+        artifact_id: row.get(0),
+        sha256: row.get(1),
+        bytes: artifact_from_i64(row.get(2), "bytes")?,
+        media_type: row.get(3),
+        visibility_scope: row.get(4),
+        tier: artifact_tier(row.get::<_, String>(5).as_str())?,
+        created_at_ms: artifact_from_i64(row.get(6), "created_at_ms")?,
+        last_access_at_ms: artifact_from_i64(row.get(7), "last_access_at_ms")?,
+    })
+}
+
+fn artifact_tier_name(tier: &runtime::ArtifactObjectTier) -> &'static str {
+    match tier {
+        runtime::ArtifactObjectTier::Compact => "compact",
+        runtime::ArtifactObjectTier::Blob => "blob",
+    }
+}
+
+fn artifact_tier(value: &str) -> Result<runtime::ArtifactObjectTier, String> {
+    match value {
+        "compact" => Ok(runtime::ArtifactObjectTier::Compact),
+        "blob" => Ok(runtime::ArtifactObjectTier::Blob),
+        value => Err(format!("unknown artifact tier `{value}`")),
+    }
+}
+
+fn artifact_to_i64(value: u64) -> Result<i64, String> {
+    i64::try_from(value).map_err(|_| format!("artifact integer {value} exceeds PostgreSQL BIGINT"))
+}
+
+fn artifact_from_i64(value: i64, field: &str) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("artifact field `{field}` is negative"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -2282,5 +2607,123 @@ mod tests {
                 .is_err()
         );
         assert!(executor.health().metrics.checkout_count > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_artifact_repository_matches_sqlite_selector_and_scope_contract() {
+        let url = match std::env::var("COWD_TEST_POSTGRES_URL") {
+            Ok(url) if !url.trim().is_empty() => url,
+            _ => {
+                eprintln!(
+                    "skipping real PostgreSQL artifact test: COWD_TEST_POSTGRES_URL is not set"
+                );
+                return;
+            }
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let resolver = StaticSecretRefResolver::new([("artifact.pg".to_string(), url)]);
+        let executor = PostgresExecutor::connect(
+            PostgresConnectionConfig::new(
+                format!("runtime-artifact-{suffix}"),
+                "artifact.pg",
+                format!("cowd-artifact-test-{suffix}"),
+            ),
+            &resolver,
+        )
+        .expect("PostgreSQL artifact executor opens");
+        let repository = Arc::new(
+            PostgresArtifactRepository::new(executor)
+                .expect("PostgreSQL artifact migrations apply"),
+        );
+        let root = tempfile::tempdir().expect("artifact blob root");
+        let store = runtime::ArtifactStore::new(
+            root.path(),
+            repository.clone(),
+            runtime::ArtifactStoreConfig {
+                compact_threshold_bytes: 8,
+                max_object_bytes: 2 * 1024 * 1024,
+                total_quota_bytes: 4 * 1024 * 1024,
+                gc_high_water_bytes: 3 * 1024 * 1024,
+                gc_low_water_bytes: 2 * 1024 * 1024,
+                orphan_grace_ms: 0,
+            },
+        )
+        .expect("PostgreSQL artifact store composes");
+        let scope = format!("session:artifact-{suffix}");
+        let artifact = store
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "application/octet-stream".to_string(),
+                    visibility_scope: scope.clone(),
+                    expected_bytes: Some(32),
+                    original_name: Some("postgres.bin".to_string()),
+                },
+                &[0x44; 32],
+            )
+            .await
+            .expect("PostgreSQL artifact write");
+        assert!(artifact.selector.starts_with("artifact://"));
+        assert_eq!(
+            store
+                .read(&artifact, &scope, Some(4..12))
+                .await
+                .expect("PostgreSQL artifact range read"),
+            vec![0x44; 8]
+        );
+        assert!(matches!(
+            store.read(&artifact, "session:other", None).await,
+            Err(runtime::ArtifactError::Unauthorized)
+        ));
+        let second_root = tempfile::tempdir().expect("second artifact blob root");
+        let second_repository: Arc<dyn runtime::ArtifactMetadataRepository> = repository.clone();
+        let second_store = runtime::ArtifactStore::new(
+            second_root.path(),
+            second_repository,
+            runtime::ArtifactStoreConfig {
+                compact_threshold_bytes: 8,
+                max_object_bytes: 2 * 1024 * 1024,
+                total_quota_bytes: 4 * 1024 * 1024,
+                gc_high_water_bytes: 3 * 1024 * 1024,
+                gc_low_water_bytes: 2 * 1024 * 1024,
+                orphan_grace_ms: 0,
+            },
+        )
+        .expect("second PostgreSQL artifact store composes");
+        let repeated = second_store
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "application/octet-stream".to_string(),
+                    visibility_scope: scope.clone(),
+                    expected_bytes: Some(32),
+                    original_name: Some("postgres-repeat.bin".to_string()),
+                },
+                &[0x44; 32],
+            )
+            .await
+            .expect("repeated hash repairs the selected local blob root");
+        assert_eq!(
+            second_store
+                .read(&repeated, &scope, None)
+                .await
+                .expect("repaired PostgreSQL artifact read"),
+            vec![0x44; 32]
+        );
+        store
+            .pin(
+                &artifact,
+                "postgres-parity",
+                runtime::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+            )
+            .expect("PostgreSQL artifact pin");
+        assert!(store.delete(&artifact, &scope).is_err());
+        store
+            .unpin(&artifact, "postgres-parity")
+            .expect("PostgreSQL artifact unpin");
+        store
+            .delete(&artifact, &scope)
+            .expect("PostgreSQL artifact record delete");
+        second_store
+            .delete(&repeated, &scope)
+            .expect("second PostgreSQL artifact record delete");
     }
 }

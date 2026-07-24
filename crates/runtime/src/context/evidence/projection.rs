@@ -52,7 +52,7 @@ mod tests {
             "sha256:raw",
             300,
             "text/plain",
-            "session-event://s1/1",
+            "artifact://art_projection_1",
             "session:s1",
         );
         let projection = audit_projection(&receipt, Some(&access));
@@ -68,7 +68,7 @@ mod tests {
             "sha256:raw",
             300,
             "text/plain",
-            "session-event://s1/2",
+            "artifact://art_projection_2",
             "session:s1",
         );
         assert!(!audit_projection(&receipt, Some(&access)).raw_available);

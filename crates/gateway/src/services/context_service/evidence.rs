@@ -1,6 +1,6 @@
 use super::*;
-use harness_contract::context::{EvidenceAccessRef, EvidenceAuditProjection};
-use sha2::{Digest, Sha256};
+use harness_contract::context::{EvidenceAccessRef, EvidenceAuditProjection, EvidenceContentKind};
+use harness_contract::core::EvidenceRef;
 
 const DEFAULT_EVIDENCE_SNIPPET_BYTES: usize = 4 * 1024;
 const MAX_EVIDENCE_SNIPPET_BYTES: usize = 16 * 1024;
@@ -193,14 +193,14 @@ impl ContextService {
             .await
         {
             return self
-                .resolve_audit_projection(session, session_id, projection, snippet_bytes)
+                .resolve_audit_projection(session_id, projection, snippet_bytes)
                 .await;
         }
         if let Ok(Some(raw_events)) = session
             .stored_timeline_runtime_page(session_id, 0, 1000)
             .await
         {
-            if let Some(raw_match) = raw_events.events.into_iter().find_map(|event| {
+            if let Some((event, access)) = raw_events.events.into_iter().find_map(|event| {
                 (event.kind == "evidence.raw.persisted")
                     .then_some(event)
                     .and_then(|event| {
@@ -209,26 +209,37 @@ impl ContextService {
                             .get("evidence_id")
                             .and_then(|value| value.as_str())
                             .is_some_and(|id| id == tool_id);
-                        evidence_matches.then(|| {
-                    let raw = payload.get("raw").and_then(serde_json::Value::as_str);
-                    serde_json::json!({
-                        "type": event.kind,
-                        "sequence": event.sequence,
-                        "created_at_ms": event.created_at_ms,
-                        "metadata": raw_evidence_metadata(&payload),
-                        "snippet": raw.map(|raw| byte_safe_snippet(raw, snippet_bytes)),
-                        "snippet_truncated": raw.is_some_and(|raw| raw.len() > snippet_bytes),
-                    })
-                })
+                        let access = evidence_matches
+                            .then(|| evidence_access_from_raw_event(tool_id, &payload))
+                            .flatten()?;
+                        Some((
+                            serde_json::json!({
+                                "type": event.kind,
+                                "sequence": event.sequence,
+                                "created_at_ms": event.created_at_ms,
+                                "metadata": raw_evidence_metadata(&payload),
+                            }),
+                            access,
+                        ))
                     })
             }) {
-                return serde_json::json!({
-                    "ref": reference,
-                    "kind": "tool",
-                    "available": true,
-                    "session_id": session_id,
-                    "events": [raw_match],
-                });
+                let mut resolved = self
+                    .resolve_audit_projection(
+                        session_id,
+                        EvidenceAuditProjection {
+                            evidence_ref: access.evidence_ref.clone(),
+                            content_kind: EvidenceContentKind::Text,
+                            raw_tokens: 0,
+                            receipt_tokens: 0,
+                            omitted_tokens: 0,
+                            raw_available: true,
+                            access: Some(access),
+                        },
+                        snippet_bytes,
+                    )
+                    .await;
+                resolved["events"] = serde_json::json!([event]);
+                return resolved;
             }
         }
         serde_json::json!({
@@ -334,7 +345,6 @@ impl ContextService {
 
     async fn resolve_audit_projection(
         &self,
-        session: &SessionService,
         session_id: &str,
         projection: EvidenceAuditProjection,
         snippet_bytes: usize,
@@ -348,7 +358,7 @@ impl ContextService {
                 "reason": "raw evidence has no durable access receipt",
             });
         };
-        let Some(sequence) = validated_session_event_selector(access, session_id) else {
+        if !validated_artifact_selector(access, session_id) {
             return serde_json::json!({
                 "ref": format!("tool://{}", projection.evidence_ref.id()),
                 "kind": "tool",
@@ -356,45 +366,53 @@ impl ContextService {
                 "projection": projection,
                 "reason": "evidence access scope or retrieval selector is invalid for this session",
             });
-        };
-        let event = session
-            .stored_timeline_runtime_page(session_id, sequence, 1)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|page| {
-                page.events
-                    .into_iter()
-                    .find(|event| event.sequence == sequence)
-            });
-        let Some(event) = event else {
+        }
+        let Some(artifacts) = self.artifact_store.as_ref() else {
             return serde_json::json!({
                 "ref": format!("tool://{}", projection.evidence_ref.id()),
                 "kind": "tool",
                 "available": false,
                 "projection": projection,
-                "reason": "durable evidence event is unavailable",
+                "reason": "runtime artifact store is unavailable",
             });
         };
-        let payload = event.payload;
-        let raw = payload.get("raw").and_then(serde_json::Value::as_str);
-        let verified = raw.is_some_and(|raw| evidence_payload_matches(raw, access));
+        let artifact = harness_contract::context::ArtifactRef::durable(
+            access.retrieval_selector.clone(),
+            access.sha256.clone(),
+            access.bytes,
+            access.media_type.clone(),
+            access.visibility_scope.clone(),
+        );
+        let read_limit = (snippet_bytes as u64).min(access.bytes);
+        let read = artifacts
+            .read(&artifact, &access.visibility_scope, Some(0..read_limit))
+            .await;
+        let Ok(raw) = read else {
+            return serde_json::json!({
+                "ref": format!("tool://{}", projection.evidence_ref.id()),
+                "kind": "tool",
+                "available": false,
+                "projection": projection,
+                "reason": read.err().map(|error| error.to_string()),
+            });
+        };
+        let snippet = String::from_utf8_lossy(&raw).into_owned();
         serde_json::json!({
             "ref": format!("tool://{}", projection.evidence_ref.id()),
             "kind": "tool",
-            "available": verified,
-            "verified": verified,
+            "available": true,
+            "verified": true,
             "session_id": session_id,
             "projection": projection,
-            "event": {
-                "type": event.kind,
-                "sequence": event.sequence,
-                "created_at_ms": event.created_at_ms,
-                "metadata": raw_evidence_metadata(&payload),
-                "snippet": raw.filter(|_| verified).map(|raw| byte_safe_snippet(raw, snippet_bytes)),
-                "snippet_truncated": raw.is_some_and(|raw| verified && raw.len() > snippet_bytes),
+            "artifact": {
+                "selector": access.retrieval_selector,
+                "sha256": access.sha256,
+                "bytes": access.bytes,
+                "media_type": access.media_type,
+                "snippet": snippet,
+                "snippet_truncated": access.bytes > read_limit,
             },
-            "reason": (!verified).then_some("durable evidence hash or byte count does not match"),
+            "reason": null,
         })
     }
 }
@@ -405,20 +423,23 @@ fn projection_visible_to_session(projection: &EvidenceAuditProjection, session_i
     })
 }
 
-fn validated_session_event_selector(access: &EvidenceAccessRef, session_id: &str) -> Option<usize> {
-    if !access.is_durable() || access.visibility_scope != format!("session:{session_id}") {
-        return None;
-    }
-    let selector = access.retrieval_selector.strip_prefix("session-event://")?;
-    let (selector_session, sequence) = selector.rsplit_once('/')?;
-    (selector_session == session_id)
-        .then(|| sequence.parse::<usize>().ok())
-        .flatten()
+fn validated_artifact_selector(access: &EvidenceAccessRef, session_id: &str) -> bool {
+    access.is_durable()
+        && access.visibility_scope == format!("session:{session_id}")
+        && access
+            .retrieval_selector
+            .strip_prefix("artifact://")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
+#[cfg(test)]
 fn evidence_payload_matches(raw: &str, access: &EvidenceAccessRef) -> bool {
     access.bytes == raw.len() as u64
-        && access.sha256 == format!("sha256:{:x}", Sha256::digest(raw.as_bytes()))
+        && access.sha256
+            == format!(
+                "sha256:{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(raw.as_bytes())
+            )
 }
 
 fn byte_safe_snippet(raw: &str, max_bytes: usize) -> &str {
@@ -444,6 +465,20 @@ fn raw_evidence_metadata(payload: &serde_json::Value) -> serde_json::Value {
         "byte_count": payload.get("byte_count"),
         "content_hash": payload.get("content_hash"),
     })
+}
+
+fn evidence_access_from_raw_event(
+    evidence_id: &str,
+    payload: &serde_json::Value,
+) -> Option<EvidenceAccessRef> {
+    Some(EvidenceAccessRef::durable(
+        EvidenceRef::new("tool", evidence_id),
+        payload.get("content_hash")?.as_str()?,
+        payload.get("byte_count")?.as_u64()?,
+        payload.get("media_type")?.as_str()?,
+        payload.get("artifact_selector")?.as_str()?,
+        payload.get("visibility_scope")?.as_str()?,
+    ))
 }
 
 pub(super) fn workspace_file_unavailable(reference: &str, reason: &str) -> serde_json::Value {
@@ -485,7 +520,10 @@ mod tests {
     use std::sync::Arc;
 
     use harness_contract::{
-        context::{EvidenceAccessRef, EvidenceAuditProjection, EvidenceContentKind},
+        context::{
+            ArtifactWriteDescriptor, EvidenceAccessRef, EvidenceAuditProjection,
+            EvidenceContentKind,
+        },
         core::EvidenceRef,
     };
     use memory::{SessionDomainEvent, SessionDomainScope, SessionRecord, UnifiedSessionStore};
@@ -493,7 +531,7 @@ mod tests {
 
     use super::{
         byte_safe_snippet, evidence_payload_matches, projection_visible_to_session,
-        validated_session_event_selector, ContextService,
+        validated_artifact_selector, ContextService,
     };
     use crate::{
         event_bus::SessionEventBus, gateway::ActiveSessions, services::SessionService,
@@ -514,7 +552,7 @@ mod tests {
                 format!("sha256:{:x}", sha2::Sha256::digest(raw.as_bytes())),
                 raw.len() as u64,
                 "text/plain",
-                format!("session-event://{session_id}/7"),
+                "artifact://art_evidence_1",
                 format!("session:{session_id}"),
             )),
         }
@@ -526,11 +564,8 @@ mod tests {
         assert!(projection_visible_to_session(&projection, "session-a"));
         assert!(!projection_visible_to_session(&projection, "session-b"));
         let access = projection.access.as_ref().expect("durable access");
-        assert_eq!(
-            validated_session_event_selector(access, "session-a"),
-            Some(7)
-        );
-        assert_eq!(validated_session_event_selector(access, "session-b"), None);
+        assert!(validated_artifact_selector(access, "session-a"));
+        assert!(!validated_artifact_selector(access, "session-b"));
     }
 
     #[test]
@@ -571,7 +606,23 @@ mod tests {
             .expect("create session");
 
         let raw = "canonical durable output";
-        let raw_event = store
+        let artifact_store = Arc::new(runtime::ArtifactStore::sqlite(
+            tempfile::tempdir().expect("artifact tempdir").keep(),
+            runtime::ArtifactStoreConfig::default(),
+        ));
+        let artifact = artifact_store
+            .write_bytes(
+                ArtifactWriteDescriptor {
+                    media_type: "text/plain".to_string(),
+                    visibility_scope: format!("session:{session_id}"),
+                    expected_bytes: Some(raw.len() as u64),
+                    original_name: Some("evidence-1.raw".to_string()),
+                },
+                raw.as_bytes(),
+            )
+            .await
+            .expect("persist artifact");
+        store
             .append_session_domain_event_allocating_sequence(&SessionDomainEvent::new(
                 session_id,
                 0,
@@ -580,9 +631,9 @@ mod tests {
                 serde_json::json!({
                     "type": "RawEvidence",
                     "evidence_id": "evidence-1",
-                    "raw": raw,
-                    "content_hash": format!("sha256:{:x}", sha2::Sha256::digest(raw.as_bytes())),
-                    "byte_count": raw.len(),
+                    "artifact_selector": artifact.selector.clone(),
+                    "content_hash": artifact.sha256.clone(),
+                    "byte_count": artifact.bytes,
                     "media_type": "text/plain",
                     "visibility_scope": format!("session:{session_id}"),
                 }),
@@ -600,10 +651,10 @@ mod tests {
             raw_available: true,
             access: Some(EvidenceAccessRef::durable(
                 evidence_ref,
-                format!("sha256:{:x}", sha2::Sha256::digest(raw.as_bytes())),
-                raw.len() as u64,
+                artifact.sha256.clone(),
+                artifact.bytes,
                 "text/plain",
-                format!("session-event://{session_id}/{}", raw_event.sequence),
+                artifact.selector.clone(),
                 format!("session:{session_id}"),
             )),
         };
@@ -630,7 +681,7 @@ mod tests {
             Some(store),
             SessionEventBus::new(),
         )));
-        let context = ContextService::new();
+        let context = ContextService::new().with_artifact_store(artifact_store);
         let projections = context
             .evidence_audit_projections(&restarted_session, session_id, 0, 20)
             .await
@@ -648,6 +699,6 @@ mod tests {
             .await;
         assert_eq!(resolved["available"], true);
         assert_eq!(resolved["verified"], true);
-        assert_eq!(resolved["event"]["snippet"], raw);
+        assert_eq!(resolved["artifact"]["snippet"], raw);
     }
 }

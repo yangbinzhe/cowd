@@ -228,6 +228,7 @@ mod tests {
         assert!(has("POST", "/api/surfaces/:id/trigger-events/retry"));
         assert!(has("GET", "/api/cowd/release-gate"));
         assert!(has("POST", "/api/resources"));
+        assert!(has("GET", "/api/resources/:id/content"));
         assert!(manifest
             .iter()
             .any(|entry| { entry.path == "/api/approval/pending" && entry.criticality == "p1" }));

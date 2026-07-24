@@ -899,7 +899,9 @@ fn surface_resource_evidence_rows(
                     "kind": resource.kind,
                     "declared_mime": resource.declared_mime,
                     "detected_mime": resource.detected_mime,
-                    "storage_path": resource.storage_path,
+                    "artifact_selector": resource.artifact.selector,
+                    "sha256": resource.artifact.sha256,
+                    "bytes": resource.artifact.bytes,
                     "hint": hint,
                 })
             });
@@ -994,7 +996,7 @@ struct SurfaceMediaAttachment {
 #[derive(Debug, Clone)]
 struct SurfaceResourceRegistration {
     attachment: SurfaceMediaAttachment,
-    resource: Option<(runtime::ResourceEnvelope, runtime::ResourceHint)>,
+    resource: Option<(runtime::ResourceProjection, runtime::ResourceHint)>,
     error: Option<String>,
 }
 
@@ -1043,11 +1045,20 @@ fn register_surface_resources(
     session_id: &str,
     media: &[SurfaceMediaAttachment],
 ) -> Vec<SurfaceResourceRegistration> {
+    let artifact_store = state.services.artifact_store();
     media
         .iter()
         .map(|attachment| {
-            let store = runtime::ResourceStore::for_config_home_with_capabilities(
+            let Some(artifact_store) = artifact_store.as_ref() else {
+                return SurfaceResourceRegistration {
+                    attachment: attachment.clone(),
+                    resource: None,
+                    error: Some("runtime artifact store is unavailable".to_string()),
+                };
+            };
+            let store = runtime::ResourceStore::from_artifact_store(
                 &state.config_home,
+                Arc::clone(artifact_store),
                 state.services.resource_capability_index(),
             );
             match store.register_resource_from_path(

@@ -131,6 +131,15 @@ storage:
   # sessionExecution:
   #   workers: 8
   #   queueCapacity: 64
+  # Resource、Tool 原始输出和 Evidence 共用的 Artifact 物理层。
+  # 小对象进 selected SQLite/PostgreSQL，大对象进入 blobs；以下均可按部署规模覆盖。
+  artifacts:
+    compactThresholdBytes: 262144       # 256 KiB
+    maxObjectBytes: 536870912           # 512 MiB
+    totalQuotaBytes: 21474836480         # 20 GiB
+    gcHighWaterBytes: 19327352832        # 18 GiB
+    gcLowWaterBytes: 17179869184         # 16 GiB
+    orphanGraceMs: 86400000              # 24 h
   root: "~/.cowd/storage"
   sqlite:
     session: "session.sqlite"

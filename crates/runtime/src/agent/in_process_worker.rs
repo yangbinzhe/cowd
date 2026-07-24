@@ -2060,7 +2060,7 @@ mod tests {
             "sha256:same",
             1,
             "text/plain",
-            "session-event://session/upstream",
+            "artifact://art_worker_upstream",
             "session:session",
         );
         let packet = test_agent_packet(vec![upstream.clone()]);
@@ -2096,7 +2096,7 @@ mod tests {
             "sha256:change",
             1,
             "application/json",
-            "session-event://session/change",
+            "artifact://art_worker_change",
             "session:session",
         );
         let packet = test_agent_packet(vec![evidence]);
@@ -2757,7 +2757,7 @@ mod tests {
                 "sha256:frame",
                 1,
                 "text/plain",
-                "session-event://session/1",
+                "artifact://art_worker_fixture_1",
                 "session:session",
             )],
             resource_scopes: Vec::new(),
@@ -2777,7 +2777,7 @@ mod tests {
             "sha256:tool",
             1,
             "text/plain",
-            "session-event://session/2",
+            "artifact://art_worker_fixture_2",
             "session:session",
         );
         let audits = vec![harness_contract::context::EvidenceAuditProjection {

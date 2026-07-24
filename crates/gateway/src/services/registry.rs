@@ -188,7 +188,8 @@ impl GatewayServices {
             memory,
             approval: ApprovalService::with_gate_and_ledger(approval_gate, approval_ledger)
                 .with_runtime_services(Arc::clone(&runtime_services)),
-            context: ContextService::new(),
+            context: ContextService::new()
+                .with_artifact_store(Arc::clone(runtime_services.artifact_store())),
             connector,
             cross_plane: CrossPlaneService::new(Arc::clone(&runtime_services)),
             tool: ToolService::new(),
@@ -244,7 +245,8 @@ impl GatewayServices {
             task,
             approval: ApprovalService::new(),
             memory: MemoryService::new(),
-            context: ContextService::new(),
+            context: ContextService::new()
+                .with_artifact_store(Arc::clone(baseline_runtime.artifact_store())),
             connector: ConnectorService::new(),
             cross_plane: CrossPlaneService::new(baseline_runtime),
             tool: ToolService::new(),

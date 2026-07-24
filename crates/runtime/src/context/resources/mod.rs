@@ -7,13 +7,11 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use harness_contract::context::{ArtifactRef, ArtifactWriteDescriptor};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::cowd_dirs;
-
-pub const MAX_RESOURCE_BYTES: u64 = 100 * 1024 * 1024;
+use crate::{cowd_dirs, ArtifactStore, ArtifactStoreConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,7 +51,7 @@ impl ResourceKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceEnvelope {
+pub struct ResourceProjection {
     pub id: String,
     pub uri: String,
     pub source: String,
@@ -65,7 +63,7 @@ pub struct ResourceEnvelope {
     pub kind: ResourceKind,
     pub size_bytes: u64,
     pub sha256: String,
-    pub storage_path: PathBuf,
+    pub artifact: ArtifactRef,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub metadata: serde_json::Value,
@@ -109,7 +107,7 @@ pub struct ResourcePromptHint {
 
 impl ResourceHint {
     #[must_use]
-    pub fn prompt_hint(&self, envelope: &ResourceEnvelope) -> ResourcePromptHint {
+    pub fn prompt_hint(&self, envelope: &ResourceProjection) -> ResourcePromptHint {
         ResourcePromptHint {
             resource_id: self.resource_id.clone(),
             uri: envelope.uri.clone(),
@@ -138,9 +136,43 @@ pub struct ResourceEvidence {
     pub tool_or_skill: Option<String>,
     pub status: String,
     pub summary: String,
-    pub artifact_path: Option<PathBuf>,
+    pub artifact_selector: Option<String>,
     pub error_summary: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceMigrationOptions {
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub resume_after: Option<String>,
+    #[serde(default = "default_resource_migration_limit")]
+    pub limit: usize,
+}
+
+impl Default for ResourceMigrationOptions {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            resume_after: None,
+            limit: default_resource_migration_limit(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResourceMigrationReport {
+    pub dry_run: bool,
+    pub scanned: usize,
+    pub already_current: usize,
+    pub eligible: usize,
+    pub migrated: usize,
+    pub failed: usize,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+    pub legacy_object_root_removed: bool,
+    pub failures: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +285,7 @@ impl ResourceCapabilityIndex {
 #[derive(Debug, Clone)]
 pub struct ResourceStore {
     root: PathBuf,
+    artifact_store: Arc<ArtifactStore>,
     capabilities: ResourceCapabilityIndex,
 }
 
@@ -272,8 +305,30 @@ impl ResourceStore {
         config_home: &Path,
         capabilities: ResourceCapabilityIndex,
     ) -> Self {
+        let registry = storage::StorageRegistry::default_for_config_home(config_home);
+        let blob_root = registry
+            .endpoint(&storage::StorageDomainId::Blobs)
+            .map(|endpoint| endpoint.path.clone())
+            .unwrap_or_else(|_| config_home.join("storage").join("blobs"));
+        Self::from_artifact_store(
+            config_home,
+            Arc::new(ArtifactStore::sqlite(
+                blob_root,
+                ArtifactStoreConfig::default(),
+            )),
+            capabilities,
+        )
+    }
+
+    #[must_use]
+    pub fn from_artifact_store(
+        config_home: &Path,
+        artifact_store: Arc<ArtifactStore>,
+        capabilities: ResourceCapabilityIndex,
+    ) -> Self {
         Self {
             root: config_home.join("storage").join("resources"),
+            artifact_store,
             capabilities,
         }
     }
@@ -293,6 +348,11 @@ impl ResourceStore {
         &self.capabilities
     }
 
+    #[must_use]
+    pub fn artifact_store(&self) -> &Arc<ArtifactStore> {
+        &self.artifact_store
+    }
+
     pub fn refresh_capabilities(&self, snapshot: ResourceCapabilitySnapshot) {
         self.capabilities.refresh(snapshot);
     }
@@ -304,7 +364,7 @@ impl ResourceStore {
         source_message_id: Option<String>,
         session_id: Option<String>,
         declared_mime: Option<String>,
-    ) -> Result<(ResourceEnvelope, ResourceHint), String> {
+    ) -> Result<(ResourceProjection, ResourceHint), String> {
         let path = path.as_ref();
         if !path.is_file() {
             return Err(format!("resource path is not a file: {}", path.display()));
@@ -312,17 +372,13 @@ impl ResourceStore {
         let size_bytes = fs::metadata(path)
             .map_err(|e| format!("read resource metadata: {e}"))?
             .len();
-        if size_bytes > MAX_RESOURCE_BYTES {
+        if size_bytes > self.artifact_store.config().max_object_bytes {
             return Err(format!(
                 "resource is too large: {} bytes exceeds {} bytes",
-                size_bytes, MAX_RESOURCE_BYTES
+                size_bytes,
+                self.artifact_store.config().max_object_bytes
             ));
         }
-        let mut file = fs::File::open(path).map_err(|e| format!("open resource: {e}"))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .map_err(|e| format!("read resource: {e}"))?;
-        let sha256 = sha256_hex(&bytes);
         let original_name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -334,15 +390,54 @@ impl ResourceStore {
             .map(|ext| ext.to_ascii_lowercase());
         let detected_mime = detect_mime(path, declared_mime.as_deref(), extension.as_deref());
         let kind = detect_kind(&original_name, detected_mime.as_deref());
+        let visibility_scope = session_id
+            .as_ref()
+            .map_or_else(|| "public".to_string(), |id| format!("session:{id}"));
+        let artifact = self
+            .artifact_store
+            .write_path_blocking(
+                ArtifactWriteDescriptor {
+                    media_type: detected_mime
+                        .clone()
+                        .or_else(|| declared_mime.clone())
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    visibility_scope,
+                    expected_bytes: Some(size_bytes),
+                    original_name: Some(original_name.clone()),
+                },
+                path,
+            )
+            .map_err(|error| error.to_string())?;
+        self.register_resource_from_artifact(
+            artifact,
+            source,
+            source_message_id,
+            session_id,
+            original_name,
+            declared_mime,
+            detected_mime,
+            kind,
+            serde_json::json!({
+                "input_source": "local_path_ingress",
+            }),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_resource_from_artifact(
+        &self,
+        artifact: ArtifactRef,
+        source: impl Into<String>,
+        source_message_id: Option<String>,
+        session_id: Option<String>,
+        original_name: String,
+        declared_mime: Option<String>,
+        detected_mime: Option<String>,
+        kind: ResourceKind,
+        metadata: serde_json::Value,
+    ) -> Result<(ResourceProjection, ResourceHint), String> {
         let id = format!("res_{}", Uuid::new_v4().simple());
-        let storage_path = self.object_path(&sha256, extension.as_deref());
-        if let Some(parent) = storage_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create resource object dir: {e}"))?;
-        }
-        if !storage_path.exists() {
-            fs::write(&storage_path, &bytes).map_err(|e| format!("write resource object: {e}"))?;
-        }
-        let envelope = ResourceEnvelope {
+        let envelope = ResourceProjection {
             id: id.clone(),
             uri: format!("resource://{id}"),
             source: source.into(),
@@ -352,18 +447,30 @@ impl ResourceStore {
             declared_mime,
             detected_mime,
             kind,
-            size_bytes: bytes.len() as u64,
-            sha256: format!("sha256:{sha256}"),
-            storage_path,
+            size_bytes: artifact.bytes,
+            sha256: artifact.sha256.clone(),
+            artifact: artifact.clone(),
             created_at: Utc::now(),
-            metadata: serde_json::json!({
-                "input_path": path.display().to_string(),
-            }),
+            metadata,
         };
-        self.write_metadata(&envelope)?;
+        let pin_owner = format!("resource:{id}");
+        self.artifact_store
+            .pin(
+                &artifact,
+                &pin_owner,
+                crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+            )
+            .map_err(|error| format!("pin resource artifact: {error}"))?;
+        if let Err(error) = self.write_metadata(&envelope) {
+            let _ = self.artifact_store.unpin(&artifact, &pin_owner);
+            let _ = self
+                .artifact_store
+                .delete(&artifact, &artifact.visibility_scope);
+            return Err(error);
+        }
         let capabilities = self.capabilities.snapshot();
         let hint = resource_hint(&envelope, &capabilities);
-        self.append_evidence(ResourceEvidence {
+        if let Err(error) = self.append_evidence(ResourceEvidence {
             resource_id: envelope.id.clone(),
             turn_id: None,
             action: "register_resource_from_path".to_string(),
@@ -376,14 +483,53 @@ impl ResourceStore {
                 envelope.original_name,
                 envelope.uri
             ),
-            artifact_path: Some(envelope.storage_path.clone()),
+            artifact_selector: Some(artifact.selector.clone()),
             error_summary: None,
             created_at: Utc::now(),
-        })?;
+        }) {
+            let _ = fs::remove_file(self.metadata_path(&id));
+            let _ = self.artifact_store.unpin(&artifact, &pin_owner);
+            let _ = self
+                .artifact_store
+                .delete(&artifact, &artifact.visibility_scope);
+            return Err(error);
+        }
         Ok((envelope, hint))
     }
 
-    pub fn get(&self, id: &str) -> Result<ResourceEnvelope, String> {
+    pub fn register_uploaded_artifact(
+        &self,
+        artifact: ArtifactRef,
+        source: impl Into<String>,
+        source_message_id: Option<String>,
+        session_id: Option<String>,
+        original_name: String,
+        declared_mime: Option<String>,
+    ) -> Result<(ResourceProjection, ResourceHint), String> {
+        let extension = Path::new(&original_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        let detected_mime = detect_mime(
+            Path::new(&original_name),
+            declared_mime.as_deref(),
+            extension.as_deref(),
+        );
+        let kind = detect_kind(&original_name, detected_mime.as_deref());
+        self.register_resource_from_artifact(
+            artifact,
+            source,
+            source_message_id,
+            session_id,
+            original_name,
+            declared_mime,
+            detected_mime,
+            kind,
+            serde_json::json!({"input_source": "gateway_multipart"}),
+        )
+    }
+
+    pub fn get(&self, id: &str) -> Result<ResourceProjection, String> {
         let path = self.metadata_path(id);
         let raw = fs::read_to_string(&path)
             .map_err(|e| format!("resource metadata not found for {id}: {e}"))?;
@@ -419,13 +565,242 @@ impl ResourceStore {
             .map_err(|e| format!("write resource evidence: {e}"))
     }
 
-    fn object_path(&self, sha256: &str, extension: Option<&str>) -> PathBuf {
-        let prefix = sha256.chars().take(2).collect::<String>();
-        let file_name = match extension.filter(|ext| !ext.trim().is_empty()) {
-            Some(extension) => format!("{sha256}.{extension}"),
-            None => sha256.to_string(),
+    /// Migrates the pre-Artifact resource object root without keeping a
+    /// permanent dual-read path. The cursor is the metadata filename returned
+    /// by the preceding report; every item is hash-verified before publish.
+    pub fn migrate_legacy_resources(
+        &self,
+        options: ResourceMigrationOptions,
+    ) -> ResourceMigrationReport {
+        let mut report = ResourceMigrationReport {
+            dry_run: options.dry_run,
+            ..ResourceMigrationReport::default()
         };
-        self.root.join("objects").join(prefix).join(file_name)
+        let metadata_root = self.root.join("metadata");
+        let mut metadata_files = fs::read_dir(&metadata_root)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect::<Vec<_>>();
+        metadata_files.sort();
+
+        let mut remaining_after_limit = false;
+        for path in metadata_files {
+            let cursor = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            if options
+                .resume_after
+                .as_deref()
+                .is_some_and(|resume| cursor.as_str() <= resume)
+            {
+                continue;
+            }
+            if report.scanned >= options.limit.max(1) {
+                remaining_after_limit = true;
+                break;
+            }
+            report.scanned += 1;
+            report.next_cursor = Some(cursor.clone());
+            match self.migrate_legacy_resource_metadata(&path, options.dry_run) {
+                Ok(ResourceMigrationOutcome::Current) => report.already_current += 1,
+                Ok(ResourceMigrationOutcome::Eligible) => report.eligible += 1,
+                Ok(ResourceMigrationOutcome::Migrated) => {
+                    report.eligible += 1;
+                    report.migrated += 1;
+                }
+                Err(error) => {
+                    report.failed += 1;
+                    report.failures.push(format!("{cursor}: {error}"));
+                }
+            }
+        }
+        report.complete = !remaining_after_limit && report.failed == 0;
+        if report.complete
+            && !options.dry_run
+            && !self.has_legacy_resource_metadata()
+            && self.root.join("objects").exists()
+        {
+            match fs::remove_dir_all(self.root.join("objects")) {
+                Ok(()) => report.legacy_object_root_removed = true,
+                Err(error) => {
+                    report.complete = false;
+                    report.failed += 1;
+                    report
+                        .failures
+                        .push(format!("remove legacy resource object root: {error}"));
+                }
+            }
+        }
+        report
+    }
+
+    fn migrate_legacy_resource_metadata(
+        &self,
+        path: &Path,
+        dry_run: bool,
+    ) -> Result<ResourceMigrationOutcome, String> {
+        let raw = fs::read_to_string(path)
+            .map_err(|error| format!("read legacy resource metadata: {error}"))?;
+        let mut value = serde_json::from_str::<serde_json::Value>(&raw)
+            .map_err(|error| format!("decode legacy resource metadata: {error}"))?;
+        if value.get("artifact").is_some() {
+            return Ok(ResourceMigrationOutcome::Current);
+        }
+        let storage_path = value
+            .get("storage_path")
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| "metadata has neither artifact nor legacy storage_path".to_string())?;
+        let canonical_object_root = self
+            .root
+            .join("objects")
+            .canonicalize()
+            .map_err(|error| format!("resolve legacy object root: {error}"))?;
+        let canonical_path = storage_path
+            .canonicalize()
+            .map_err(|error| format!("resolve legacy object: {error}"))?;
+        if !canonical_path.starts_with(&canonical_object_root) || !canonical_path.is_file() {
+            return Err("legacy object is outside the governed resource root".to_string());
+        }
+        let (hash, bytes) = sha256_file(&canonical_path)?;
+        let expected_hash = value
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "legacy resource hash is missing".to_string())?;
+        let expected_bytes = value
+            .get("size_bytes")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| "legacy resource byte count is missing".to_string())?;
+        if expected_hash != hash || expected_bytes != bytes {
+            return Err(format!(
+                "legacy object verification failed: expected {expected_hash}/{expected_bytes}, got {hash}/{bytes}"
+            ));
+        }
+        if dry_run {
+            return Ok(ResourceMigrationOutcome::Eligible);
+        }
+
+        let session_id = value.get("session_id").and_then(serde_json::Value::as_str);
+        let scope = session_id.map_or_else(|| "public".to_string(), |id| format!("session:{id}"));
+        let media_type = value
+            .get("detected_mime")
+            .or_else(|| value.get("declared_mime"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let original_name = value
+            .get("original_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("resource.bin")
+            .to_string();
+        let artifact = self
+            .artifact_store
+            .write_path_blocking(
+                ArtifactWriteDescriptor {
+                    media_type,
+                    visibility_scope: scope.clone(),
+                    expected_bytes: Some(bytes),
+                    original_name: Some(original_name),
+                },
+                &canonical_path,
+            )
+            .map_err(|error| format!("publish legacy resource artifact: {error}"))?;
+        if artifact.sha256 != hash || artifact.bytes != bytes {
+            let _ = self.artifact_store.delete(&artifact, &scope);
+            return Err("published artifact does not match the legacy object".to_string());
+        }
+        let resource_id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        self.artifact_store
+            .pin(
+                &artifact,
+                &format!("resource:{resource_id}"),
+                crate::ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+            )
+            .map_err(|error| format!("pin migrated resource artifact: {error}"))?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| "legacy resource metadata must be an object".to_string())?;
+        object.remove("storage_path");
+        object.insert(
+            "artifact".to_string(),
+            serde_json::to_value(&artifact)
+                .map_err(|error| format!("encode artifact reference: {error}"))?,
+        );
+        if let Some(metadata) = object
+            .get_mut("metadata")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove("input_path");
+            metadata.insert(
+                "legacy_resource_migrated".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if let Err(error) = write_json_atomic(path, &value) {
+            let _ = self
+                .artifact_store
+                .unpin(&artifact, &format!("resource:{resource_id}"));
+            let _ = self.artifact_store.delete(&artifact, &scope);
+            return Err(error);
+        }
+        self.migrate_legacy_resource_evidence(&resource_id, &artifact)?;
+        Ok(ResourceMigrationOutcome::Migrated)
+    }
+
+    fn migrate_legacy_resource_evidence(
+        &self,
+        resource_id: &str,
+        artifact: &ArtifactRef,
+    ) -> Result<(), String> {
+        let path = self.evidence_path(resource_id);
+        let Ok(raw) = fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let mut changed = false;
+        let mut lines = Vec::new();
+        for line in raw.lines() {
+            let mut value = serde_json::from_str::<serde_json::Value>(line)
+                .map_err(|error| format!("decode legacy resource evidence: {error}"))?;
+            if let Some(object) = value.as_object_mut() {
+                if object.remove("artifact_path").is_some() {
+                    object.insert(
+                        "artifact_selector".to_string(),
+                        serde_json::Value::String(artifact.selector.clone()),
+                    );
+                    changed = true;
+                }
+            }
+            lines.push(
+                serde_json::to_string(&value)
+                    .map_err(|error| format!("encode migrated resource evidence: {error}"))?,
+            );
+        }
+        if changed {
+            write_text_atomic(&path, &format!("{}\n", lines.join("\n")))?;
+        }
+        Ok(())
+    }
+
+    fn has_legacy_resource_metadata(&self) -> bool {
+        fs::read_dir(self.root.join("metadata"))
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .any(|entry| {
+                fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                    .is_some_and(|value| value.get("storage_path").is_some())
+            })
     }
 
     fn metadata_path(&self, id: &str) -> PathBuf {
@@ -436,7 +811,7 @@ impl ResourceStore {
         self.root.join("evidence").join(format!("{id}.jsonl"))
     }
 
-    fn write_metadata(&self, envelope: &ResourceEnvelope) -> Result<(), String> {
+    fn write_metadata(&self, envelope: &ResourceProjection) -> Result<(), String> {
         let path = self.metadata_path(&envelope.id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("create resource metadata dir: {e}"))?;
@@ -454,7 +829,7 @@ pub fn register_resource_from_path(
     source_message_id: Option<String>,
     session_id: Option<String>,
     declared_mime: Option<String>,
-) -> Result<(ResourceEnvelope, ResourceHint), String> {
+) -> Result<(ResourceProjection, ResourceHint), String> {
     ResourceStore::default_for_config_home(config_home).register_resource_from_path(
         path,
         source,
@@ -466,7 +841,7 @@ pub fn register_resource_from_path(
 
 #[must_use]
 pub fn resource_hint(
-    envelope: &ResourceEnvelope,
+    envelope: &ResourceProjection,
     capabilities: &ResourceCapabilitySnapshot,
 ) -> ResourceHint {
     let mut recommended_directions = Vec::new();
@@ -611,12 +986,6 @@ pub fn render_resource_context_markdown(resources: &[ResourcePromptHint]) -> Str
         "Resource handling principle: use native support or an actually exposed tool first. Query runtime capabilities only when a narrower parser/skill/plugin path is needed. Do not invent unseen content.\n",
     );
     rendered
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 fn detect_mime(path: &Path, declared: Option<&str>, extension: Option<&str>) -> Option<String> {
@@ -774,6 +1143,60 @@ fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceMigrationOutcome {
+    Current,
+    Eligible,
+    Migrated,
+}
+
+const fn default_resource_migration_limit() -> usize {
+    1_000
+}
+
+fn sha256_file(path: &Path) -> Result<(String, u64), String> {
+    use sha2::{Digest, Sha256};
+
+    let mut input =
+        fs::File::open(path).map_err(|error| format!("open legacy resource object: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| format!("read legacy resource object: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes.saturating_add(read as u64);
+    }
+    Ok((format!("sha256:{:x}", hasher.finalize()), bytes))
+}
+
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<(), String> {
+    let rendered = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("encode migrated metadata: {error}"))?;
+    write_bytes_atomic(path, &rendered)
+}
+
+fn write_text_atomic(path: &Path, value: &str) -> Result<(), String> {
+    write_bytes_atomic(path, value.as_bytes())
+}
+
+fn write_bytes_atomic(path: &Path, value: &[u8]) -> Result<(), String> {
+    let temporary = path.with_extension(format!(
+        "{}.migrating",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("data")
+    ));
+    fs::write(&temporary, value)
+        .map_err(|error| format!("write migration staging file: {error}"))?;
+    fs::rename(&temporary, path).map_err(|error| format!("publish migrated metadata: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,14 +1221,109 @@ mod tests {
 
         assert_eq!(envelope.kind, ResourceKind::Audio);
         assert_eq!(envelope.source_message_id.as_deref(), Some("msg-1"));
-        assert!(envelope
-            .storage_path
-            .starts_with(config_home.join("storage/resources/objects")));
+        assert!(envelope.artifact.selector.starts_with("artifact://"));
+        assert!(!serde_json::to_string(&envelope)
+            .expect("resource projection serializes")
+            .contains(temp.path().to_string_lossy().as_ref()));
         assert!(hint
             .missing_capabilities
             .iter()
             .any(|value| value.contains("transcription")));
         assert!(!temp.path().join("workspace").exists());
+    }
+
+    #[test]
+    fn legacy_resource_migration_is_verified_resumable_and_idempotent() {
+        use sha2::{Digest, Sha256};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_home = temp.path().join("home");
+        let resource_root = config_home.join("storage").join("resources");
+        let payload = b"legacy resource bytes";
+        let digest = format!("sha256:{:x}", Sha256::digest(payload));
+        let legacy_path = resource_root.join("objects").join("ab").join("legacy.txt");
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, payload).unwrap();
+        let metadata_path = resource_root.join("metadata").join("res_legacy.json");
+        fs::create_dir_all(metadata_path.parent().unwrap()).unwrap();
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "id": "res_legacy",
+                "uri": "resource://res_legacy",
+                "source": "legacy",
+                "source_message_id": null,
+                "session_id": "session-legacy",
+                "original_name": "legacy.txt",
+                "declared_mime": "text/plain",
+                "detected_mime": "text/plain",
+                "kind": "text",
+                "size_bytes": payload.len(),
+                "sha256": digest,
+                "storage_path": legacy_path,
+                "created_at": "2026-07-25T00:00:00Z",
+                "metadata": {"input_path": "/private/source/legacy.txt"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let evidence_path = resource_root.join("evidence").join("res_legacy.jsonl");
+        fs::create_dir_all(evidence_path.parent().unwrap()).unwrap();
+        fs::write(
+            &evidence_path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "resource_id": "res_legacy",
+                    "turn_id": null,
+                    "action": "register",
+                    "actor": "legacy",
+                    "tool_or_skill": null,
+                    "status": "stored",
+                    "summary": "legacy",
+                    "artifact_path": legacy_path,
+                    "error_summary": null,
+                    "created_at": "2026-07-25T00:00:00Z"
+                })
+            ),
+        )
+        .unwrap();
+
+        let store = ResourceStore::default_for_config_home(&config_home);
+        let dry_run = store.migrate_legacy_resources(ResourceMigrationOptions {
+            dry_run: true,
+            resume_after: None,
+            limit: 100,
+        });
+        assert!(dry_run.complete);
+        assert_eq!(dry_run.eligible, 1);
+        assert_eq!(dry_run.migrated, 0);
+        assert!(legacy_path.exists());
+
+        let applied = store.migrate_legacy_resources(ResourceMigrationOptions::default());
+        assert!(applied.complete, "{:?}", applied.failures);
+        assert_eq!(applied.migrated, 1);
+        assert!(applied.legacy_object_root_removed);
+        let current = store.get("res_legacy").unwrap();
+        assert!(current.artifact.selector.starts_with("artifact://"));
+        assert_eq!(
+            store
+                .artifact_store()
+                .read_blocking(&current.artifact, "session:session-legacy", None)
+                .unwrap(),
+            payload
+        );
+        let encoded = fs::read_to_string(&metadata_path).unwrap();
+        assert!(!encoded.contains("storage_path"));
+        assert!(!encoded.contains("/private/source"));
+        assert!(!fs::read_to_string(evidence_path)
+            .unwrap()
+            .contains("artifact_path"));
+
+        let repeated = store.migrate_legacy_resources(ResourceMigrationOptions::default());
+        assert!(repeated.complete);
+        assert_eq!(repeated.migrated, 0);
+        assert_eq!(repeated.already_current, 1);
     }
 
     #[test]
@@ -867,7 +1385,7 @@ mod tests {
 
     #[test]
     fn prompt_hint_excludes_capability_inventory_and_is_bounded() {
-        let envelope = ResourceEnvelope {
+        let envelope = ResourceProjection {
             id: "res_test".to_string(),
             uri: "resource://res_test".to_string(),
             source: "test".to_string(),
@@ -879,7 +1397,13 @@ mod tests {
             kind: ResourceKind::Pdf,
             size_bytes: 42,
             sha256: "sha256:test".to_string(),
-            storage_path: PathBuf::from("/tmp/report.pdf"),
+            artifact: ArtifactRef::durable(
+                "artifact://art_test",
+                "sha256:test",
+                42,
+                "application/pdf",
+                "public",
+            ),
             created_at: Utc::now(),
             metadata: serde_json::json!({}),
         };
@@ -914,7 +1438,7 @@ mod tests {
         let store = ResourceStore::default_for_config_home(&temp.path().join("home"));
         let path = temp.path().join("huge.bin");
         let file = fs::File::create(&path).expect("create sparse file");
-        file.set_len(MAX_RESOURCE_BYTES + 1)
+        file.set_len(store.artifact_store().config().max_object_bytes + 1)
             .expect("mark sparse file length");
 
         let error = store

@@ -158,6 +158,8 @@ pub mod agent_run_handle;
 pub mod agent_runtime;
 #[path = "approval/approval_gate.rs"]
 pub mod approval_gate;
+#[path = "context/artifact.rs"]
+pub mod artifact;
 #[path = "policy/autonomy_profile.rs"]
 pub mod autonomy_profile;
 #[path = "session/checkpoint.rs"]
@@ -365,12 +367,12 @@ pub use compact::{
     should_compact, CompactionConfig, CompactionResult,
 };
 pub use config::{
-    redact_serde_json, AppStartupConfig, ApprovalConfig, AppsConfig, CompressionConfig,
-    ConfigDiagnostic as RuntimeConfigDiagnostic, ConfigDiagnosticSeverity, ConfigEntry,
-    ConfigError, ConfigLoadResult, ConfigLoader, ConfigSource, DomainProfile, GateAutoFixConfig,
-    GatewayCapacityConfig, GatewayConfig, McpConfigCollection, McpManagedProxyServerConfig,
-    McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig, McpServerConfig,
-    McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
+    redact_serde_json, AppStartupConfig, ApprovalConfig, AppsConfig, ArtifactStorageConfig,
+    CompressionConfig, ConfigDiagnostic as RuntimeConfigDiagnostic, ConfigDiagnosticSeverity,
+    ConfigEntry, ConfigError, ConfigLoadResult, ConfigLoader, ConfigSource, DomainProfile,
+    GateAutoFixConfig, GatewayCapacityConfig, GatewayConfig, McpConfigCollection,
+    McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig, McpSdkServerConfig,
+    McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
     PlatformConfig as GatewayPlatformConfig, PostgresTopologyConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig,
     RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig, SessionResetPolicy,
@@ -386,7 +388,8 @@ pub use conflict_arbiter::{
     ConflictSeverity, ConflictSourceKind,
 };
 pub use context_evidence::{
-    audit_projection as project_evidence_audit, AuditProjection, ModelReceipt,
+    audit_projection as project_evidence_audit, migrate_legacy_raw_evidence, AuditProjection,
+    ModelReceipt, RawEvidenceMigrationOptions, RawEvidenceMigrationReport,
 };
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
@@ -473,6 +476,12 @@ pub use managed_agent::{
 };
 pub use runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 
+pub use artifact::{
+    ArtifactError, ArtifactGcPort, ArtifactGcReport, ArtifactMetadataPort,
+    ArtifactMetadataRepository, ArtifactObjectRecord, ArtifactObjectTier, ArtifactReadPort,
+    ArtifactRecord, ArtifactStore, ArtifactStoreConfig, ArtifactStoreStats, ArtifactWriteSink,
+    SqliteArtifactRepository, ARTIFACT_PERMANENT_PIN_UNTIL_MS,
+};
 pub(crate) use evolution::EvolutionCandidateRegistration;
 pub use evolution::{
     candidate_kind_from_proposal, candidate_kinds_from_root_cause, CanaryObservationReport,
@@ -615,8 +624,9 @@ pub use remote::{
 };
 pub use resources::{
     register_resource_from_path, render_resource_context_markdown, resource_hint,
-    ResourceCapabilityIndex, ResourceCapabilitySnapshot, ResourceEnvelope, ResourceEvidence,
-    ResourceHint, ResourceKind, ResourcePromptHint, ResourceStore, MAX_RESOURCE_BYTES,
+    ResourceCapabilityIndex, ResourceCapabilitySnapshot, ResourceEvidence, ResourceHint,
+    ResourceKind, ResourceMigrationOptions, ResourceMigrationReport, ResourceProjection,
+    ResourcePromptHint, ResourceStore,
 };
 pub use runtime_event_replay::{
     candidate_from_action, RuntimeEventReplayer, RuntimeRecoveryAction, RuntimeRecoveryActionKind,

@@ -453,6 +453,9 @@ impl ExecutionGraphRunner {
         graph_id: &str,
         node: harness_contract::execution_graph::ExecutionNodeSpec,
     ) -> Result<(String, NodeExecutionOutcome), ExecutionRunnerError> {
+        let leaf_effect_owner = node.kind
+            == harness_contract::execution_graph::ExecutionNodeKind::ToolBatch
+            && node.executor_kind == "tool_batch";
         if let Some(waiter) = self.command_intent_waiter(graph_id) {
             waiter.await;
             return Err(ExecutionRunnerError::CommandSuperseded { node_id: node.id });
@@ -547,7 +550,11 @@ impl ExecutionGraphRunner {
                     }),
                 ));
             }
-            self.commit_service.begin_execution_effect(&ticket)?
+            if leaf_effect_owner {
+                ExecutionEffectState::Fresh
+            } else {
+                self.commit_service.begin_execution_effect(&ticket)?
+            }
         };
         match effect_state {
             ExecutionEffectState::Completed(outcome) => {
@@ -594,8 +601,10 @@ impl ExecutionGraphRunner {
             );
         }
         let outcome = outcome?;
-        self.commit_service
-            .commit_execution_effect(&ticket, &outcome)?;
+        if !leaf_effect_owner {
+            self.commit_service
+                .commit_execution_effect(&ticket, &outcome)?;
+        }
         Ok((ticket.node_id.clone(), outcome))
     }
 

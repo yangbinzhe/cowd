@@ -13,6 +13,118 @@ pub enum EvidenceDurability {
     Unavailable,
 }
 
+/// Backend-neutral reference to bytes managed by the Runtime artifact plane.
+///
+/// The selector is the only public locator. Physical paths, database keys, and
+/// compact/blob tier choices are adapter-private and must never cross a
+/// Runtime or Gateway contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub selector: String,
+    pub sha256: String,
+    pub bytes: u64,
+    pub media_type: String,
+    pub durability: EvidenceDurability,
+    pub visibility_scope: String,
+}
+
+impl ArtifactRef {
+    #[must_use]
+    pub fn durable(
+        selector: impl Into<String>,
+        sha256: impl Into<String>,
+        bytes: u64,
+        media_type: impl Into<String>,
+        visibility_scope: impl Into<String>,
+    ) -> Self {
+        Self {
+            selector: selector.into(),
+            sha256: sha256.into(),
+            bytes,
+            media_type: media_type.into(),
+            durability: EvidenceDurability::Durable,
+            visibility_scope: visibility_scope.into(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_durable(&self) -> bool {
+        matches!(self.durability, EvidenceDurability::Durable)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactWriteDescriptor {
+    pub media_type: String,
+    pub visibility_scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_name: Option<String>,
+}
+
+/// Tool output before Runtime publishes its evidence receipt.
+///
+/// Existing bounded tools can return inline text. Tools that may produce large
+/// output publish directly through the Runtime artifact sink and return only a
+/// bounded summary plus the durable selector. This keeps large bytes out of
+/// the Tool execution result, effect receipt, Session history, and model
+/// request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolOutputDraft {
+    BoundedInline {
+        content: String,
+    },
+    StagedArtifact {
+        summary: String,
+        artifact_ref: ArtifactRef,
+    },
+}
+
+impl ToolOutputDraft {
+    #[must_use]
+    pub fn bounded_inline(content: impl Into<String>) -> Self {
+        Self::BoundedInline {
+            content: content.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn staged_artifact(summary: impl Into<String>, artifact_ref: ArtifactRef) -> Self {
+        Self::StagedArtifact {
+            summary: summary.into(),
+            artifact_ref,
+        }
+    }
+
+    #[must_use]
+    pub fn model_text(&self) -> &str {
+        match self {
+            Self::BoundedInline { content } => content,
+            Self::StagedArtifact { summary, .. } => summary,
+        }
+    }
+
+    #[must_use]
+    pub const fn artifact_ref(&self) -> Option<&ArtifactRef> {
+        match self {
+            Self::BoundedInline { .. } => None,
+            Self::StagedArtifact { artifact_ref, .. } => Some(artifact_ref),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolOutputEnvelope {
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_ref: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ref: Option<EvidenceAccessRef>,
+    pub receipt: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceAccessRef {
     pub evidence_ref: EvidenceRef,
@@ -432,6 +544,8 @@ pub struct ToolObservation {
     pub invocation_id: String,
     pub raw_ref: EvidenceRef,
     pub model_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_envelope: Option<ToolOutputEnvelope>,
     pub artifacts: Vec<ContextArtifact>,
     pub token_estimate: u64,
 }
@@ -451,8 +565,15 @@ impl ToolObservation {
             raw_ref,
             token_estimate: estimate_tokens(&model_summary),
             model_summary,
+            output_envelope: None,
             artifacts: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_output_envelope(mut self, output_envelope: ToolOutputEnvelope) -> Self {
+        self.output_envelope = Some(output_envelope);
+        self
     }
 
     #[must_use]

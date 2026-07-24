@@ -21,7 +21,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 sha2 = "0.10"
 syntect = { version = "5", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs"] }
 toml = "0.8"
 tracing.workspace = true
 tui-textarea = "0.7"

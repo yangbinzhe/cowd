@@ -1494,7 +1494,6 @@ pub(crate) mod tests {
         ApprovalPersistence, ApprovalVerdict, DestructivePatternDetector,
     };
     use runtime::{ContextProfile, ResumeContextSource};
-    use sha2::Digest;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
@@ -9097,7 +9096,7 @@ pub(crate) mod tests {
 
         let boundary = "cowd-resource-boundary";
         let body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"session_id\"\r\n\r\nsession-1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\nwebui\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.mp3\"\r\nContent-Type: application/octet-stream\r\n\r\nfake mp3 data\r\n--{boundary}--\r\n"
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"source\"\r\n\r\nwebui\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"voice.mp3\"\r\nContent-Type: application/octet-stream\r\n\r\nfake mp3 data\r\n--{boundary}--\r\n"
         );
         let upload_response = app
             .clone()
@@ -9126,6 +9125,14 @@ pub(crate) mod tests {
             .starts_with("resource://"));
         assert_eq!(json["resource"]["kind"], "audio");
         assert_eq!(json["resource"]["detected_mime"], "audio/mpeg");
+        assert!(json["resource"]["artifact"]["selector"]
+            .as_str()
+            .unwrap()
+            .starts_with("artifact://"));
+        assert!(json["resource"].get("storage_path").is_none());
+        assert!(!serde_json::to_string(&json)
+            .unwrap()
+            .contains(config_home.to_string_lossy().as_ref()));
         assert!(json["hint"]["guardrails"]
             .as_array()
             .unwrap()
@@ -9154,6 +9161,25 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(get_response.status(), StatusCode::OK);
+
+        let content_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/resources/{resource_id}/content"))
+                    .header(header::RANGE, "bytes=5-7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(content_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            to_bytes(content_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "mp3"
+        );
 
         let evidence_response = app
             .oneshot(
@@ -15260,9 +15286,25 @@ providers:
             ))
             .await
             .unwrap();
+        let state = test_state_with_store(Arc::clone(&store));
         let raw = "tests passed";
-        let content_hash = format!("sha256:{:x}", sha2::Sha256::digest(raw.as_bytes()));
-        let raw_event = store
+        let artifacts = state
+            .services
+            .artifact_store()
+            .expect("test artifact store");
+        let artifact = artifacts
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/plain".to_string(),
+                    visibility_scope: format!("session:{session_id}"),
+                    expected_bytes: Some(raw.len() as u64),
+                    original_name: Some("tool-1.raw".to_string()),
+                },
+                raw.as_bytes(),
+            )
+            .await
+            .expect("persist test artifact");
+        store
             .append_session_domain_event_allocating_sequence(&memory::SessionDomainEvent::new(
                 session_id,
                 0,
@@ -15272,9 +15314,9 @@ providers:
                     "type": "RawEvidence",
                     "evidence_id": "tool-1",
                     "tool_name": "bash",
-                    "raw": raw,
-                    "content_hash": content_hash,
-                    "byte_count": raw.len(),
+                    "artifact_selector": artifact.selector.clone(),
+                    "content_hash": artifact.sha256.clone(),
+                    "byte_count": artifact.bytes,
                     "media_type": "text/plain",
                     "visibility_scope": format!("session:{session_id}"),
                 }),
@@ -15292,10 +15334,10 @@ providers:
             raw_available: true,
             access: Some(harness_contract::context::EvidenceAccessRef::durable(
                 evidence_ref,
-                content_hash,
-                raw.len() as u64,
+                artifact.sha256,
+                artifact.bytes,
                 "text/plain",
-                format!("session-event://{session_id}/{}", raw_event.sequence),
+                artifact.selector,
                 format!("session:{session_id}"),
             )),
         };
@@ -15317,7 +15359,6 @@ providers:
             .await
             .unwrap();
 
-        let state = test_state_with_store(store);
         let app = api_router(state);
         let response = app
             .oneshot(
@@ -15337,7 +15378,7 @@ providers:
         assert_eq!(json["available"], true);
         assert_eq!(json["kind"], "tool");
         assert_eq!(json["verified"], true);
-        assert_eq!(json["event"]["snippet"], "tests passed");
+        assert_eq!(json["artifact"]["snippet"], "tests passed");
     }
 
     #[tokio::test]

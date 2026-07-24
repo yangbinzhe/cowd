@@ -96,7 +96,7 @@ impl AgentRuntimeBackend for CompletedBackend {
             "a".repeat(64),
             1,
             "application/json",
-            format!("session-event://{}/1", packet.session_id),
+            "artifact://art_team_working_state",
             format!("session:{}", packet.session_id),
         ));
         Ok(AgentReturnPacket {

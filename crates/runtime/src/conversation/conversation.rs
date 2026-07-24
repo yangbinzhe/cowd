@@ -926,6 +926,20 @@ pub trait ApiClient {
 pub trait ToolExecutor: Send + Sync + 'static {
     fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError>;
 
+    /// Execute a Tool using the bounded-output contract consumed by Runtime.
+    ///
+    /// Implementors that can produce large output should publish it through
+    /// Runtime's Artifact sink and return `StagedArtifact`. Existing small
+    /// tools retain their behavior through this default adapter.
+    fn execute_output(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        self.execute(tool_name, input)
+            .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+    }
+
     /// Production executors override this with a receipt from their pinned
     /// ToolHost. The fallback is deliberately read-only for small embedded and
     /// test executors that do not own a catalog.
@@ -1014,6 +1028,16 @@ pub trait ToolExecutor: Send + Sync + 'static {
         Err(ToolError::new(format!(
             "tool `{tool_name}` has no authorized execution implementation"
         )))
+    }
+
+    fn execute_authorized_output(
+        &self,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        self.execute_authorized(authorization, tool_name, input)
+            .map(harness_contract::context::ToolOutputDraft::bounded_inline)
     }
 
     fn has_registered_tools(&self) -> bool {
@@ -1454,6 +1478,8 @@ pub struct ConversationRuntime<C, T> {
     tool_callback: Option<Arc<dyn ToolCallback>>,
     /// Optional managed SQLite session store for messages and domain events.
     session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
+    /// Runtime-selected Artifact plane shared by attachments and raw evidence.
+    artifact_store: Option<Arc<crate::ArtifactStore>>,
     /// Whether the in-memory transcript may also write message rows directly.
     /// Gateway ingress owns durable user/terminal writes through its outboxes;
     /// disabling this for an ingress turn prevents a second transcript writer.
@@ -1751,6 +1777,7 @@ where
             last_reality_recall_report: std::sync::Mutex::new(None),
             tool_callback: None,
             session_store: None,
+            artifact_store: None,
             transcript_persistence: true,
             runtime_event_store: None,
             event_log: None,
@@ -3266,6 +3293,12 @@ where
         store: Arc<memory::session_store::UnifiedSessionStore>,
     ) -> Self {
         self.session_store = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn with_artifact_store(mut self, store: Arc<crate::ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
         self
     }
 
@@ -5132,52 +5165,160 @@ where
                 let is_evidence_retrieve = tool_name == "evidence_retrieve";
                 let demand = task.resource_demand.clone();
                 let plane = Arc::clone(&self.tool_execution_plane);
-                let execution = plane
-                    .execute(&demand, Some(tool_timeout), move || {
-                        if is_evidence_retrieve {
-                            return retrieve_tool_evidence_from_sandbox(
-                                evidence_sandbox.as_ref(),
-                                &tinput,
-                            )
-                            .map_err(ToolError::new);
-                        }
-                        if matches!(tname.as_str(), "ToolSearch" | "runtime_capabilities") {
-                            tool_exec.execute(&tname, &tinput)
+                let effect_request = crate::RuntimeToolExecutionRequest {
+                    governed_plan_id: plan_id.to_string(),
+                    governed_plan_revision: plan_revision,
+                    idempotency_key: format!(
+                        "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
+                        self.session().session_id
+                    ),
+                    tool_use_id: tool_use_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    input: effective_input.clone(),
+                    category: task.safety_category,
+                    authorization: Some(authorization.authorization.clone()),
+                    session_id: Some(self.session().session_id),
+                    model_lease: None,
+                    parent_execution: None,
+                    evaluation_isolated: false,
+                    managed_invocation: None,
+                };
+                let effect_commit = self.runtime_event_store.as_ref().map(|store| {
+                    crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(store))
+                });
+                let effect_state = match effect_commit.as_ref() {
+                    Some(commit) => commit
+                        .begin_tool_effect(&effect_request, &task.effect)
+                        .map_err(|error| RuntimeError::new(error.to_string()))?,
+                    None if task.effect.effect_kind
+                        == harness_contract::tool::ToolEffectKind::Read =>
+                    {
+                        crate::execution_core::graph::ToolEffectState::NotRequired
+                    }
+                    None => {
+                        return Err(RuntimeError::new(
+                            "mutation tool execution requires the durable Runtime effect ledger",
+                        ));
+                    }
+                };
+                let execute_fresh = matches!(
+                    effect_state,
+                    crate::execution_core::graph::ToolEffectState::Fresh
+                        | crate::execution_core::graph::ToolEffectState::NotRequired
+                );
+                let execution = match effect_state {
+                    crate::execution_core::graph::ToolEffectState::Completed(outcome) => {
+                        if outcome.status == crate::RuntimeToolExecutionStatus::Executed {
+                            Ok(Ok(
+                                harness_contract::context::ToolOutputDraft::bounded_inline(
+                                    outcome.output.unwrap_or_default(),
+                                ),
+                            ))
                         } else {
-                            tool_exec.execute_authorized(
-                                &authorization.authorization,
-                                &tname,
-                                &tinput,
-                            )
+                            Ok(Err(ToolError::new(
+                                outcome
+                                    .error
+                                    .or(outcome.output)
+                                    .unwrap_or_else(|| "durable tool effect failed".to_string()),
+                            )))
                         }
-                    })
-                    .await;
-                let (output, mut is_error, mut failure_kind) = match execution {
+                    }
+                    crate::execution_core::graph::ToolEffectState::Uncertain => {
+                        return Err(RuntimeError::new(format!(
+                            "tool effect `{}` is uncertain; non-idempotent execution was not replayed",
+                            effect_request.idempotency_key
+                        )));
+                    }
+                    crate::execution_core::graph::ToolEffectState::Fresh
+                    | crate::execution_core::graph::ToolEffectState::NotRequired => {
+                        plane
+                            .execute(&demand, Some(tool_timeout), move || {
+                                if is_evidence_retrieve {
+                                    return retrieve_tool_evidence_from_sandbox(
+                                        evidence_sandbox.as_ref(),
+                                        &tinput,
+                                    )
+                                    .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+                                    .map_err(ToolError::new);
+                                }
+                                if matches!(tname.as_str(), "ToolSearch" | "runtime_capabilities") {
+                                    tool_exec.execute_output(&tname, &tinput)
+                                } else {
+                                    tool_exec.execute_authorized_output(
+                                        &authorization.authorization,
+                                        &tname,
+                                        &tinput,
+                                    )
+                                }
+                            })
+                            .await
+                    }
+                };
+                let (output_draft, mut is_error, mut failure_kind) = match execution {
                     Ok(Ok(output)) => (output, false, None),
                     Ok(Err(error)) => (
-                        error.to_string(),
+                        harness_contract::context::ToolOutputDraft::bounded_inline(
+                            error.to_string(),
+                        ),
                         true,
                         Some(ToolFailureKind::ExecutionError),
                     ),
                     Err(crate::ToolExecutionPlaneError::TimedOut(_)) => {
                         tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution waiter timed out; started operation remains fenced");
                         (
-                            format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
+                            harness_contract::context::ToolOutputDraft::bounded_inline(format!(
+                                "tool `{tname_for_err}` timed out after {tool_timeout:?}"
+                            )),
                             true,
                             Some(ToolFailureKind::Timeout),
                         )
                     }
                     Err(crate::ToolExecutionPlaneError::Panicked) => (
-                        "tool execution panicked".to_string(),
+                        harness_contract::context::ToolOutputDraft::bounded_inline(
+                            "tool execution panicked",
+                        ),
                         true,
                         Some(ToolFailureKind::Panic),
                     ),
                     Err(error) => (
-                        error.to_string(),
+                        harness_contract::context::ToolOutputDraft::bounded_inline(
+                            error.to_string(),
+                        ),
                         true,
                         Some(ToolFailureKind::ExecutionError),
                     ),
                 };
+                let output = output_draft.model_text().to_string();
+                if execute_fresh {
+                    if let Some(commit) = effect_commit.as_ref() {
+                        commit
+                            .commit_tool_effect(
+                                &effect_request,
+                                &task.effect,
+                                &crate::RuntimeToolExecutionOutcome {
+                                    tool_use_id: tool_use_id.to_string(),
+                                    tool_name: tool_name.to_string(),
+                                    status: if is_error {
+                                        crate::RuntimeToolExecutionStatus::Failed
+                                    } else {
+                                        crate::RuntimeToolExecutionStatus::Executed
+                                    },
+                                    category: task.safety_category,
+                                    output: (!is_error).then(|| output.clone()),
+                                    error: is_error.then(|| output.clone()),
+                                    evidence_ref: format!(
+                                        "tool-effect:{}",
+                                        effect_request.idempotency_key
+                                    ),
+                                },
+                            )
+                            .map_err(|error| {
+                                RuntimeError::new(format!(
+                                    "tool effect completed but durable receipt failed: {error}"
+                                ))
+                            })?;
+                    }
+                }
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.hook_runner
                     .fire_post_tool(tool_name, &output, is_error, elapsed_ms);
@@ -5249,46 +5390,34 @@ where
                     .map(vision_index_summary)
                     .unwrap_or_else(|| combined.clone());
                 let (raw_ref, raw_access) = self
-                    .record_tool_raw_evidence(
+                    .record_tool_output_evidence(
                         tool_use_id,
                         tool_name,
                         &completed_record.input_hash,
+                        &output_draft,
                         &combined,
                         is_error,
                         elapsed_ms,
                         None,
                     )
-                    .await;
+                    .await?;
                 self.maybe_index_tool_output(
                     raw_ref.id(),
                     tool_name,
                     &indexable_output,
-                    raw_access.as_ref(),
+                    Some(&raw_access),
                 );
-                let completed_record = if raw_access.is_some() {
-                    completed_record.with_full_output_ref(format!("tool://{}", raw_ref.id()))
-                } else {
-                    completed_record
-                };
+                let completed_record =
+                    completed_record.with_full_output_ref(format!("tool://{}", raw_ref.id()));
                 let mut model_receipt = self.tool_model_receipt(
                     tool_name,
                     &combined,
                     is_error,
                     &raw_ref,
-                    raw_access.as_ref(),
+                    Some(&raw_access),
                 );
                 if let Some(payload) = prepared_vision.as_ref() {
-                    model_receipt.summary = if raw_access.is_some() {
-                        vision_tool_model_receipt(payload, &raw_ref)
-                    } else {
-                        format!(
-                            "Tool `vision_analyze` completed, but raw evidence persistence is unavailable. Image input is attached as a structured vision block for the next model call. path={}, media_type={}, size_bytes={}, prompt={}",
-                            payload.image_path,
-                            payload.media_type,
-                            payload.size_bytes.unwrap_or_default(),
-                            payload.prompt
-                        )
-                    };
+                    model_receipt.summary = vision_tool_model_receipt(payload, &raw_ref);
                     model_receipt.receipt_tokens =
                         crate::context_ledger::estimate_text_tokens(&model_receipt.summary);
                     model_receipt.omitted_tokens = model_receipt
@@ -5298,7 +5427,7 @@ where
                         model_receipt.receipt_tokens < model_receipt.raw_tokens;
                 }
                 let audit_projection =
-                    crate::context_evidence::audit_projection(&model_receipt, raw_access.as_ref());
+                    crate::context_evidence::audit_projection(&model_receipt, Some(&raw_access));
                 self.push_turn_evidence_audit(audit_projection);
                 let model_summary = model_receipt.summary;
                 self.emit_tool_completed(
@@ -5307,12 +5436,30 @@ where
                     &indexable_output,
                     if is_error { Some(1) } else { Some(0) },
                 );
-                self.push_turn_tool_observation(ToolObservation::new(
-                    tool_name.to_string(),
-                    completed_record.invocation_id.clone(),
-                    raw_ref,
-                    model_summary.clone(),
-                ));
+                let output_envelope = harness_contract::context::ToolOutputEnvelope {
+                    summary: model_summary.clone(),
+                    artifact_ref: Some(harness_contract::context::ArtifactRef::durable(
+                        raw_access.retrieval_selector.clone(),
+                        raw_access.sha256.clone(),
+                        raw_access.bytes,
+                        raw_access.media_type.clone(),
+                        raw_access.visibility_scope.clone(),
+                    )),
+                    evidence_ref: Some(raw_access),
+                    receipt: completed_record
+                        .full_output_ref
+                        .clone()
+                        .unwrap_or_else(|| format!("tool://{}", raw_ref.id())),
+                };
+                self.push_turn_tool_observation(
+                    ToolObservation::new(
+                        tool_name.to_string(),
+                        completed_record.invocation_id.clone(),
+                        raw_ref,
+                        model_summary.clone(),
+                    )
+                    .with_output_envelope(output_envelope),
+                );
                 let result = ConversationMessage::tool_result(
                     tool_use_id.to_string(),
                     tool_name.to_string(),
@@ -6881,15 +7028,22 @@ where
         is_error: bool,
         duration_ms: u64,
         source_evidence_ref: Option<&str>,
-    ) -> (EvidenceRef, Option<EvidenceAccessRef>) {
+    ) -> Result<(EvidenceRef, EvidenceAccessRef), RuntimeError> {
         let content_hash = model_protocol::fingerprint::stable_hash_bytes(output.as_bytes());
         let evidence_id = format!("tool-raw-{tool_use_id}-{content_hash:016x}");
         let evidence_ref = EvidenceRef::new("tool", evidence_id.clone());
         if let Some(access) = self.existing_evidence_access(&evidence_ref) {
-            return (evidence_ref, Some(access));
+            return Ok((evidence_ref, access));
         }
         let Some(ref store) = self.session_store else {
-            return (evidence_ref, None);
+            return Err(RuntimeError::new(
+                "raw tool evidence cannot be published without the Session store",
+            ));
+        };
+        let Some(ref artifacts) = self.artifact_store else {
+            return Err(RuntimeError::new(
+                "raw tool evidence cannot be published without the Artifact store",
+            ));
         };
         let session_id = self.session().session_id;
         let metadata = serde_json::json!({
@@ -6906,7 +7060,10 @@ where
             "source_evidence_ref": source_evidence_ref,
         });
         let facade = crate::context_evidence::raw::RawEvidenceFacade::new(
-            crate::context_evidence::raw::SessionStoreRawEvidenceStore::new(Arc::clone(store)),
+            crate::context_evidence::raw::SessionStoreRawEvidenceStore::new(
+                Arc::clone(store),
+                Arc::clone(artifacts),
+            ),
         );
         let access = match facade
             .persist(crate::context_evidence::raw::RawEvidenceWrite {
@@ -6914,26 +7071,88 @@ where
                 session_id: session_id.clone(),
                 media_type: "text/plain; charset=utf-8".to_string(),
                 visibility_scope: format!("session:{session_id}"),
-                payload: output.as_bytes().to_vec(),
+                payload: output.to_string(),
                 metadata,
             })
             .await
         {
             Ok(access) => access,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    session_id,
-                    evidence_id,
-                    "tool raw evidence append failed; retaining bounded ephemeral receipt"
-                );
-                return (evidence_ref, None);
-            }
+            Err(error) => return Err(RuntimeError::new(error.to_string())),
         };
         if let Ok(mut ledger) = self.turn_context_ledger.lock() {
             let _ = ledger.register_evidence_hash(evidence_id);
         }
-        (evidence_ref, Some(access))
+        Ok((evidence_ref, access))
+    }
+
+    async fn record_tool_output_evidence(
+        &self,
+        tool_use_id: &str,
+        tool_name: &str,
+        input_hash: &str,
+        draft: &harness_contract::context::ToolOutputDraft,
+        model_text: &str,
+        is_error: bool,
+        duration_ms: u64,
+        source_evidence_ref: Option<&str>,
+    ) -> Result<(EvidenceRef, EvidenceAccessRef), RuntimeError> {
+        let Some(artifact) = draft.artifact_ref() else {
+            return self
+                .record_tool_raw_evidence(
+                    tool_use_id,
+                    tool_name,
+                    input_hash,
+                    model_text,
+                    is_error,
+                    duration_ms,
+                    source_evidence_ref,
+                )
+                .await;
+        };
+        let evidence_id = format!(
+            "tool-raw-{tool_use_id}-{}",
+            artifact.sha256.trim_start_matches("sha256:")
+        );
+        let evidence_ref = EvidenceRef::new("tool", evidence_id.clone());
+        if let Some(access) = self.existing_evidence_access(&evidence_ref) {
+            return Ok((evidence_ref, access));
+        }
+        let Some(ref store) = self.session_store else {
+            return Err(RuntimeError::new(
+                "staged tool evidence cannot be published without the Session store",
+            ));
+        };
+        let Some(ref artifacts) = self.artifact_store else {
+            return Err(RuntimeError::new(
+                "staged tool evidence cannot be published without the Artifact store",
+            ));
+        };
+        let session_id = self.session().session_id;
+        let metadata = serde_json::json!({
+            "type": "ToolObservationRaw",
+            "evidence_id": evidence_id,
+            "session_id": session_id,
+            "tool_call_id": tool_use_id,
+            "tool_name": tool_name,
+            "input_hash": input_hash,
+            "is_error": is_error,
+            "duration_ms": duration_ms,
+            "summary_line_count": model_text.lines().count(),
+            "summary_byte_count": model_text.len(),
+            "source_evidence_ref": source_evidence_ref,
+            "native_staged_artifact": true,
+        });
+        let access = crate::context_evidence::raw::SessionStoreRawEvidenceStore::new(
+            Arc::clone(store),
+            Arc::clone(artifacts),
+        )
+        .persist_artifact(evidence_ref.clone(), session_id, artifact.clone(), metadata)
+        .await
+        .map_err(|error| RuntimeError::new(error.to_string()))?;
+        if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+            let _ = ledger.register_evidence_hash(evidence_id);
+        }
+        Ok((evidence_ref, access))
     }
 
     /// Produce a bounded model receipt for an outcome already executed by the
@@ -6946,7 +7165,7 @@ where
         input: &str,
         output: &str,
         is_error: bool,
-    ) -> ConversationMessage {
+    ) -> Result<ConversationMessage, RuntimeError> {
         let input_hash = format!(
             "{:016x}",
             model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
@@ -6962,13 +7181,13 @@ where
                 0,
                 Some(&source_evidence_ref),
             )
-            .await;
-        self.maybe_index_tool_output(raw_ref.id(), tool_name, output, raw_access.as_ref());
+            .await?;
+        self.maybe_index_tool_output(raw_ref.id(), tool_name, output, Some(&raw_access));
         let receipt =
-            self.tool_model_receipt(tool_name, output, is_error, &raw_ref, raw_access.as_ref());
+            self.tool_model_receipt(tool_name, output, is_error, &raw_ref, Some(&raw_access));
         self.push_turn_evidence_audit(crate::context_evidence::audit_projection(
             &receipt,
-            raw_access.as_ref(),
+            Some(&raw_access),
         ));
         let summary = receipt.summary;
         self.emit_tool_completed(
@@ -6977,18 +7196,33 @@ where
             output,
             if is_error { Some(1) } else { Some(0) },
         );
-        self.push_turn_tool_observation(ToolObservation::new(
-            tool_name.to_string(),
-            tool_use_id.to_string(),
-            raw_ref,
-            summary.clone(),
-        ));
-        ConversationMessage::tool_result(
+        let output_envelope = harness_contract::context::ToolOutputEnvelope {
+            summary: summary.clone(),
+            artifact_ref: Some(harness_contract::context::ArtifactRef::durable(
+                raw_access.retrieval_selector.clone(),
+                raw_access.sha256.clone(),
+                raw_access.bytes,
+                raw_access.media_type.clone(),
+                raw_access.visibility_scope.clone(),
+            )),
+            evidence_ref: Some(raw_access),
+            receipt: format!("tool://{}", raw_ref.id()),
+        };
+        self.push_turn_tool_observation(
+            ToolObservation::new(
+                tool_name.to_string(),
+                tool_use_id.to_string(),
+                raw_ref,
+                summary.clone(),
+            )
+            .with_output_envelope(output_envelope),
+        );
+        Ok(ConversationMessage::tool_result(
             tool_use_id.to_string(),
             tool_name.to_string(),
             summary,
             is_error,
-        )
+        ))
     }
 
     fn tool_model_receipt(
@@ -10242,7 +10476,7 @@ mod tests {
             "sha256:test",
             output.len() as u64,
             "text/plain; charset=utf-8",
-            format!("session-event://{session_id}/1"),
+            "artifact://art_conversation_output",
             format!("session:{session_id}"),
         );
         runtime.maybe_index_tool_output(evidence_id, "read_file", &output, Some(&access));
@@ -11030,14 +11264,42 @@ mod tests {
             requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             projections: Arc::clone(&projections),
         };
+        let artifact_root = tempfile::tempdir().unwrap();
+        let session = Session::new();
+        let session_store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        session_store
+            .create_session(&memory::SessionRecord {
+                session_id: session.session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "dynamic-exposure".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
         let mut runtime = ConversationRuntime::new(
-            Session::new(),
+            session,
             api,
             DynamicExposureToolExecutor,
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
-        .without_memory();
+        .without_memory()
+        .with_runtime_event_store(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()))
+        .with_session_store(session_store)
+        .with_artifact_store(Arc::new(crate::ArtifactStore::sqlite(
+            artifact_root.path(),
+            crate::ArtifactStoreConfig::default(),
+        )));
         runtime
             .begin_turn_strategy("test-dynamic-exposure-turn", "inspect files")
             .expect("test turn strategy admission");
@@ -11081,6 +11343,7 @@ mod tests {
 
     #[tokio::test]
     async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
+        let artifact_root = tempfile::tempdir().unwrap();
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
         let session = Session::new();
         let session_id = session.session_id.clone();
@@ -11111,6 +11374,10 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory()
+        .with_artifact_store(Arc::new(crate::ArtifactStore::sqlite(
+            artifact_root.path(),
+            crate::ArtifactStoreConfig::default(),
+        )))
         .with_session_store(Arc::clone(&store));
         let raw = format!("first\n{}\nlast", "middle-evidence ".repeat(8_000));
 
@@ -11122,7 +11389,8 @@ mod tests {
                 &raw,
                 false,
             )
-            .await;
+            .await
+            .expect("durable evidence receipt");
 
         let output = receipt
             .blocks
@@ -11146,13 +11414,32 @@ mod tests {
             .expect("durable tool evidence");
         assert!(events.events.iter().any(|event| {
             event.kind == "evidence.raw.persisted"
-                && event.payload.get("raw").and_then(serde_json::Value::as_str)
-                    == Some(raw.as_str())
+                && event
+                    .payload
+                    .get("artifact_selector")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|selector| selector.starts_with("artifact://"))
+                && event.payload.get("raw").is_none()
         }));
         let audit = runtime.turn_evidence_audits();
         assert_eq!(audit.len(), 1);
         assert!(audit[0].access.is_some());
         assert!(audit[0].omitted_tokens > 0);
+        let observations = runtime.turn_tool_observations();
+        assert_eq!(observations.len(), 1);
+        let envelope = observations[0]
+            .output_envelope
+            .as_ref()
+            .expect("tool output envelope must be connected to the turn report");
+        assert!(envelope.receipt.starts_with("tool://"));
+        assert!(envelope
+            .artifact_ref
+            .as_ref()
+            .is_some_and(|artifact| artifact.selector.starts_with("artifact://")));
+        assert!(envelope
+            .evidence_ref
+            .as_ref()
+            .is_some_and(harness_contract::context::EvidenceAccessRef::is_durable));
     }
 
     #[tokio::test]
@@ -11173,7 +11460,7 @@ mod tests {
         let raw = "raw output retained only in the active runtime when durable write fails\n"
             .repeat(1_000);
 
-        let result = runtime
+        let error = runtime
             .prepare_governed_tool_result(
                 "raw-failure-1",
                 "read_file",
@@ -11181,33 +11468,10 @@ mod tests {
                 &raw,
                 false,
             )
-            .await;
-        let output = result
-            .blocks
-            .iter()
-            .find_map(|block| match block {
-                ContentBlock::ToolResult { output, .. } => Some(output),
-                _ => None,
-            })
-            .expect("fallback still produces a model-visible tool result");
-        assert!(output.contains("Ephemeral evidence (active runtime only)"));
-        assert!(!output.contains(raw.as_str()));
-        let evidence_id = output
-            .split("tool://")
-            .nth(1)
-            .and_then(|tail| tail.split_whitespace().next())
-            .map(|value| value.trim_end_matches('.'))
-            .expect("bounded receipt should identify its evidence");
-        let retrieved = runtime
-            .retrieve_tool_evidence(&format!(
-                r#"{{"evidence_ref":"tool://{evidence_id}","query":"durable write fails","limit":1}}"#
-            ))
-            .expect("active runtime should retain an ephemeral evidence spool");
-        assert!(retrieved.contains(raw.lines().next().unwrap_or_default()));
-        let audit = runtime.turn_evidence_audits();
-        assert_eq!(audit.len(), 1);
-        assert!(audit[0].access.is_none());
-        assert!(!audit[0].raw_available);
+            .await
+            .expect_err("missing artifact durability must block publication");
+        assert!(error.to_string().contains("Artifact store"));
+        assert!(runtime.turn_evidence_audits().is_empty());
     }
 
     #[tokio::test]
