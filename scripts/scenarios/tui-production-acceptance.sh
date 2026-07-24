@@ -312,7 +312,7 @@ node --check "$ROOT/scripts/fixtures/v584-tui-provider.mjs" \
   || fail "production acceptance requires a clean committed source tree"
 cargo test -p tui e10_ -- --test-threads=1 \
   >"$ARTIFACT_DIR/e10-fail-closed-unit-gates.txt" 2>&1
-rg -q 'test result: ok\\. 7 passed; 0 failed' \
+rg -q 'test result: ok\. 7 passed; 0 failed' \
   "$ARTIFACT_DIR/e10-fail-closed-unit-gates.txt" \
   || fail "E10 source gate did not execute exactly seven fail-closed tests"
 "$BIN" --version >"$ARTIFACT_DIR/cowd-version.txt" 2>&1
