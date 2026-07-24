@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
@@ -247,6 +248,49 @@ struct RuntimeTurnOwner {
         Option<runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor>>,
 }
 
+struct MeasuredRuntimeEntryGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, crate::runtime_entry::GatewayRuntimeEntry>,
+    acquired_at: Instant,
+}
+
+impl Deref for MeasuredRuntimeEntryGuard<'_> {
+    type Target = crate::runtime_entry::GatewayRuntimeEntry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for MeasuredRuntimeEntryGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for MeasuredRuntimeEntryGuard<'_> {
+    fn drop(&mut self) {
+        runtime::execution_core::performance::observe_duration(
+            "runtime_lock_hold_ms",
+            self.acquired_at.elapsed(),
+        );
+    }
+}
+
+async fn lock_runtime_entry(
+    entry: &tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>,
+) -> MeasuredRuntimeEntryGuard<'_> {
+    let started = Instant::now();
+    let guard = entry.lock().await;
+    runtime::execution_core::performance::observe_duration(
+        "runtime_lock_wait_ms",
+        started.elapsed(),
+    );
+    MeasuredRuntimeEntryGuard {
+        guard,
+        acquired_at: Instant::now(),
+    }
+}
+
 impl RuntimeTurnOwner {
     fn new(
         entry: Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>,
@@ -273,7 +317,7 @@ impl RuntimeTurnOwner {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
-        let mut entry = self.entry.lock().await;
+        let mut entry = lock_runtime_entry(&self.entry).await;
         entry.restore_runtime_after_turn(runtime);
     }
 }
@@ -287,7 +331,7 @@ impl Drop for RuntimeTurnOwner {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    let mut entry = entry.lock().await;
+                    let mut entry = lock_runtime_entry(&entry).await;
                     if entry.turn_is_owned() {
                         entry.restore_runtime_after_turn(runtime);
                     } else {
@@ -753,7 +797,7 @@ impl RuntimeService {
             Some(graph_id.clone()),
         );
         let mut owned_runtime = match async {
-            let mut runtime = runtime_entry.lock().await;
+            let mut runtime = lock_runtime_entry(&runtime_entry).await;
             runtime.set_context_profile(ingress_options.profile);
             for message in ingress_options.pre_messages {
                 runtime
@@ -1353,7 +1397,12 @@ impl RuntimeService {
                 lock
             }
         };
+        let activation_queue_started = Instant::now();
         let _activation_guard = activation_lock.lock().await;
+        runtime::execution_core::performance::observe_duration(
+            "session_activation_queue_ms",
+            activation_queue_started.elapsed(),
+        );
         // Recheck only after acquiring the keyed gate. Multiple Surfaces can
         // submit the first ingress concurrently, but exactly one may hydrate
         // and install the session carrier.
@@ -1487,6 +1536,10 @@ impl RuntimeService {
         let runtime =
             self.build_session_runtime_entry(session, session_id, &model, system_prompt)?;
         self.register_runtime(session_id.to_string(), runtime)?;
+        runtime::execution_core::performance::observe_duration(
+            "hydrate_ms",
+            hydration_started.elapsed(),
+        );
         Ok(())
     }
 
@@ -1703,7 +1756,7 @@ impl RuntimeService {
         session_id: &str,
     ) -> Option<tokio::sync::broadcast::Receiver<runtime::CowdEvent>> {
         let runtime_entry = self.sessions.get(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
+        let runtime_guard = lock_runtime_entry(&runtime_entry).await;
         if runtime_guard.turn_is_owned() {
             return None;
         }
@@ -2099,7 +2152,7 @@ impl RuntimeService {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
-        let runtime_guard = runtime_entry.lock().await;
+        let runtime_guard = lock_runtime_entry(&runtime_entry).await;
         if runtime_guard.turn_is_owned() {
             return Err(RuntimeTurnExecutionError::Runtime(format!(
                 "session {session_id} is executing before its input stream was initialized"
@@ -2215,7 +2268,7 @@ impl RuntimeService {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
-        let runtime_guard = runtime_entry.lock().await;
+        let runtime_guard = lock_runtime_entry(&runtime_entry).await;
         runtime_guard.set_context_profile(profile);
         runtime_guard.replace_external_context_sources(
             &[
@@ -2239,7 +2292,7 @@ impl RuntimeService {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
-        let mut runtime_guard = runtime_entry.lock().await;
+        let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
         runtime_guard.install_turn_control(cancellation_token, hook_abort_signal);
         Ok(())
     }
@@ -2319,7 +2372,7 @@ impl RuntimeService {
         let (cancellation_token, _turn_control) =
             self.install_active_turn_control(&turn_id.to_string(), session_id, None);
         let mut owned_runtime = {
-            let mut runtime_guard = runtime_entry.lock().await;
+            let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
             runtime_guard.set_context_profile(options.profile);
             for message in options.pre_messages {
                 runtime_guard
@@ -2531,7 +2584,7 @@ impl RuntimeService {
 
     pub(crate) async fn session_snapshot(&self, session_id: &str) -> Option<runtime::Session> {
         let runtime_entry = self.sessions.get(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
+        let runtime_guard = lock_runtime_entry(&runtime_entry).await;
         if runtime_guard.turn_is_owned() {
             return None;
         }
@@ -2557,7 +2610,7 @@ impl RuntimeService {
             return Ok(None);
         };
 
-        let mut runtime_guard = runtime_entry.lock().await;
+        let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
         let (result, session_snapshot) = runtime_guard
             .compact_active_session()
             .await
@@ -2679,7 +2732,7 @@ impl RuntimeService {
         limit: usize,
     ) -> Option<ActiveMessagesPage> {
         let runtime_entry = self.sessions.get(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
+        let runtime_guard = lock_runtime_entry(&runtime_entry).await;
         if runtime_guard.turn_is_owned() {
             return None;
         }
@@ -2788,7 +2841,7 @@ impl RuntimeService {
         let Some(model) = model else {
             return true;
         };
-        let mut runtime_guard = runtime_entry.lock().await;
+        let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
         runtime_guard.update_session_model(model).await;
         self.session_models
             .lock()
@@ -2802,7 +2855,7 @@ impl RuntimeService {
         session_id: &str,
     ) -> Option<runtime::ContextEnvelope> {
         let runtime_entry = self.sessions.get(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
+        let runtime_guard = lock_runtime_entry(&runtime_entry).await;
         runtime_guard.last_context_envelope()
     }
 
@@ -2811,7 +2864,7 @@ impl RuntimeService {
         session_id: &str,
     ) -> Option<harness_contract::context::ContextTurnReport> {
         let runtime_entry = self.sessions.get(session_id)?;
-        let runtime_guard = runtime_entry.lock().await;
+        let runtime_guard = lock_runtime_entry(&runtime_entry).await;
         runtime_guard.last_context_turn_report()
     }
 

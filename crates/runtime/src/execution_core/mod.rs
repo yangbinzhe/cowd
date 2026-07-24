@@ -13,6 +13,7 @@ pub mod graph;
 pub mod model_affordance;
 pub mod orchestration_binding;
 pub mod pattern_catalog;
+pub mod performance;
 pub mod protocols;
 pub mod reflexion;
 pub mod report;

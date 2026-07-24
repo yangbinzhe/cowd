@@ -32,6 +32,7 @@ pub(crate) struct GatewayHealthSnapshot {
     pub(crate) runtime: GatewayRuntimeSnapshot,
     pub(crate) storage: StorageGatewaySnapshot,
     pub(crate) capacity: crate::gateway_capacity::GatewayCapacitySnapshot,
+    pub(crate) performance: Vec<runtime::execution_core::performance::PerformanceMetricSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +120,7 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         runtime,
         storage,
         capacity: state.services.capacity.snapshot(),
+        performance: runtime::execution_core::performance::performance_snapshot(),
     }
 }
 

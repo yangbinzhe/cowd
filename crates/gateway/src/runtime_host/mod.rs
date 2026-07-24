@@ -663,6 +663,7 @@ impl Drop for PidFileGuard {
 
 pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String> {
     let started_at = Instant::now();
+    spawn_event_loop_lag_probe();
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
 
@@ -1172,6 +1173,20 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // PID file is cleaned up by PidFileGuard drop
     tracing::info!("runtime host shutdown complete");
     Ok(())
+}
+
+fn spawn_event_loop_lag_probe() {
+    tokio::spawn(async {
+        let interval = Duration::from_millis(250);
+        loop {
+            let started = Instant::now();
+            tokio::time::sleep(interval).await;
+            runtime::execution_core::performance::observe_duration(
+                "event_loop_lag_ms",
+                started.elapsed().saturating_sub(interval),
+            );
+        }
+    });
 }
 
 /// The timer is an event source only. It claims due Mission schedules and

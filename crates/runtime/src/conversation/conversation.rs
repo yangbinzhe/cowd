@@ -663,6 +663,33 @@ fn preview_chars(value: &str, max_chars: usize) -> String {
     preview
 }
 
+fn conversation_message_payload_bytes(messages: &[ConversationMessage]) -> usize {
+    messages.iter().fold(0usize, |total, message| {
+        message.blocks.iter().fold(total, |total, block| {
+            let bytes = match block {
+                ContentBlock::Text { text } => text.len(),
+                ContentBlock::Image {
+                    media_type,
+                    data,
+                    source_path,
+                } => media_type.len() + data.len() + source_path.as_deref().map_or(0, str::len),
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } => thinking.len() + signature.as_deref().map_or(0, str::len),
+                ContentBlock::ToolUse { id, name, input } => id.len() + name.len() + input.len(),
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    ..
+                } => tool_use_id.len() + tool_name.len() + output.len(),
+            };
+            total.saturating_add(bytes)
+        })
+    })
+}
+
 fn millis_since(start: Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
@@ -3713,6 +3740,7 @@ where
         // applies each model's hard cap, schema and history. If preflight
         // compacts the transcript, this snapshot is rebuilt before dispatch.
         let one_shot_context_items = self.take_next_model_context_items();
+        let context_select_started = Instant::now();
         let mut prompt = self
             .prepare_reality_context_with_budget_and_items(
                 user_input,
@@ -3720,6 +3748,10 @@ where
                 one_shot_context_items.clone(),
             )
             .await;
+        crate::execution_core::performance::observe_duration(
+            "context_select_ms",
+            context_select_started.elapsed(),
+        );
         let evidence = crate::evidence_planner::plan_evidence_with_understanding(
             user_input,
             &decision.strategy.understanding,
@@ -3761,7 +3793,16 @@ where
             ),
             8,
         );
+        let request_clone_started = Instant::now();
         let mut request_messages = self.session.read().await.messages.clone();
+        crate::execution_core::performance::observe_duration(
+            "request_history_clone_ms",
+            request_clone_started.elapsed(),
+        );
+        crate::execution_core::performance::observe_bytes(
+            "clone_bytes",
+            conversation_message_payload_bytes(&request_messages),
+        );
 
         // Compression is a request-preflight recovery path, never a fixed
         // transcript-ratio timer. Optional packets have already been allowed
@@ -3820,19 +3861,25 @@ where
         // smaller. Repeating beyond that would mask malformed provider errors.
         let mut calibration_retries = BTreeSet::new();
         while let Some(model) = candidates.pop_front() {
-            let mut request =
-                match self.pack_provider_attempt(&prompt, &request_messages, &model, inventory) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        tracing::warn!(
-                            model,
-                            error = %error,
-                            "provider request preflight rejected model candidate"
-                        );
-                        last_error = Some(error);
-                        continue;
-                    }
-                };
+            let materialize_started = Instant::now();
+            let materialized =
+                self.pack_provider_attempt(&prompt, &request_messages, &model, inventory);
+            crate::execution_core::performance::observe_duration(
+                "request_materialize_ms",
+                materialize_started.elapsed(),
+            );
+            let mut request = match materialized {
+                Ok(request) => request,
+                Err(error) => {
+                    tracing::warn!(
+                        model,
+                        error = %error,
+                        "provider request preflight rejected model candidate"
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             request.reasoning_effort_override = one_shot_reasoning_effort.clone();
             let mut evaluation_reservation =
                 match EvaluationProviderTokenReservation::acquire(&mut request) {
@@ -3867,23 +3914,29 @@ where
             let idle_timeout = transport_policy.idle_timeout;
             let heartbeat_grace = transport_policy.heartbeat_grace;
             let cancellation = self.cancellation_token.clone();
-            let provider_started = Instant::now();
             let provider_lease = if let Some(manager) = &self.provider_admission {
+                let provider_queue_started = Instant::now();
                 let acquire = manager.acquire(
                     crate::execution_core::graph::ExecutionResourceKind::Provider,
                     Some(Duration::from_secs(30)),
                 );
-                Some(tokio::select! {
+                let lease = tokio::select! {
                     () = cancellation.cancelled() => {
                         return Err(RuntimeError::new("turn cancelled while waiting for provider capacity"));
                     }
                     lease = acquire => lease.map_err(|error| RuntimeError::new(format!(
                         "provider capacity admission failed: {error}"
                     )))?,
-                })
+                };
+                crate::execution_core::performance::observe_duration(
+                    "provider_admission_queue_ms",
+                    provider_queue_started.elapsed(),
+                );
+                Some(lease)
             } else {
                 None
             };
+            let provider_started = Instant::now();
             let mut stream = self.api_client.stream(request);
             let stream_started = Instant::now();
             let mut text = String::new();
@@ -3895,6 +3948,7 @@ where
             let mut cache_events = Vec::new();
             let mut failed = None;
             let mut first_event_at = None;
+            let mut first_text_delta_observed = false;
             use futures::StreamExt;
             loop {
                 let next = tokio::select! {
@@ -3943,6 +3997,13 @@ where
                         effective_model = Some(model);
                     }
                     Ok(AssistantEvent::TextDelta(delta)) => {
+                        if !first_text_delta_observed {
+                            first_text_delta_observed = true;
+                            crate::execution_core::performance::observe_duration(
+                                "actual_first_delta_ms",
+                                provider_started.elapsed(),
+                            );
+                        }
                         text.push_str(&delta);
                         if let Some(ref cowd) = self.cowd_bus {
                             cowd.emit(crate::cowd_event::CowdEvent::TextDelta {
@@ -3997,6 +4058,14 @@ where
                 }
             }
             drop(stream);
+            crate::execution_core::performance::observe_duration(
+                "provider_stream_ms",
+                stream_started.elapsed(),
+            );
+            crate::execution_core::performance::observe_duration(
+                "provider_service_ms",
+                provider_started.elapsed(),
+            );
             if let Some(manager) = &self.provider_admission {
                 let _ = manager.observe_runtime_pressure(
                     &crate::execution_core::graph::ExecutionResourceKind::Provider,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compare the current candidate with the last V6 baseline through exactly the
+# Compare the current candidate with the immediately preceding release through exactly the
 # same public Session API. The default controlled mode uses a deterministic
 # local OpenAI-compatible fixture so the hard performance gate measures
 # Gateway/Runtime work rather than remote model/network jitter. Live-provider
@@ -13,14 +13,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${COWD_V9_PERFORMANCE_MODE:-controlled}"
 SOURCE_CONFIG_HOME="${COWD_EVAL_CONFIG_HOME:-}"
-BASELINE_REF="${COWD_V9_PERFORMANCE_BASELINE_REF:-v0.9.476}"
+BASELINE_REF="${COWD_V9_PERFORMANCE_BASELINE_REF:-v0.9.585}"
 CANDIDATE_PORT="${COWD_V9_PERFORMANCE_CANDIDATE_PORT:-8766}"
 BASELINE_PORT="${COWD_V9_PERFORMANCE_BASELINE_PORT:-8765}"
 PROVIDER_PORT="${COWD_V9_PERFORMANCE_PROVIDER_PORT:-8877}"
 CANDIDATE_URL="http://127.0.0.1:${CANDIDATE_PORT}"
 BASELINE_URL="http://127.0.0.1:${BASELINE_PORT}"
 MODEL="${COWD_EVAL_MODEL:-deepseek-v4-flash}"
-PAIRS="${COWD_V9_PERFORMANCE_PAIRS:-5}"
+PAIRS="${COWD_V9_PERFORMANCE_PAIRS:-20}"
 ARCHIVE_ROOT="${COWD_V9_PERFORMANCE_ARCHIVE_DIR:-$ROOT/target/v9-performance-artifacts}"
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/cowd-v9-performance.XXXXXX")"
 FIXTURE_CONFIG="$ROOT/scripts/fixtures/v9-performance-config.yaml"
@@ -158,6 +158,8 @@ COWD_API_TOKEN="$TOKEN" \
     --candidate-url "$CANDIDATE_URL" \
     --provider "$MODEL" \
     --pairs "$PAIRS" \
+    --min-pairs "${COWD_V9_PERFORMANCE_MIN_PAIRS:-5}" \
+    --target-relative-ci-half-width-bp "${COWD_V9_PERFORMANCE_CI_HALF_WIDTH_BP:-500}" \
     --poll-interval-ms "${COWD_V9_PERFORMANCE_POLL_INTERVAL_MS:-20}" \
     --output "$REPORT_PATH"
 

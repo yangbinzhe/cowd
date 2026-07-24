@@ -8,9 +8,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    sync::mpsc,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,6 +20,8 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+use crate::measurement::start_first_delta_observer;
 
 pub const AUTO_STRATEGY_SEED: u64 = 20_260_716;
 pub const DEFAULT_MAX_TOKENS: u64 = 20_000_000;
@@ -1199,7 +1199,7 @@ fn run_sample(
         return sample;
     };
     sample.session_id = Some(session_id.clone());
-    let ttft_observer = match start_ttft_observer(client, endpoint, &session_id) {
+    let ttft_observer = match start_first_delta_observer(client, endpoint, &session_id) {
         Ok(observer) => observer,
         Err(error) => {
             sample.error = Some(format!("ttft_observer:{error}"));
@@ -1385,8 +1385,13 @@ fn run_sample(
         thread::sleep(options.poll_interval);
     }
     if let Ok(first_delta_at) = ttft_observer.recv_timeout(Duration::from_millis(500)) {
-        sample.ttft_ms =
-            u64::try_from(first_delta_at.duration_since(started).as_millis()).unwrap_or(u64::MAX);
+        sample.ttft_ms = u64::try_from(
+            first_delta_at
+                .observed_at
+                .duration_since(started)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
         sample.ttft_observed = true;
     }
     if let Ok(stats) = get_json(
@@ -2687,81 +2692,6 @@ fn binomial_coefficient(n: usize, k: usize) -> u128 {
     })
 }
 
-fn start_ttft_observer(
-    client: &Client,
-    base: &str,
-    session_id: &str,
-) -> Result<mpsc::Receiver<Instant>, String> {
-    let client = client.clone();
-    let url = format!("{base}/api/sessions/{session_id}/stream");
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
-    let (first_tx, first_rx) = mpsc::sync_channel::<Instant>(1);
-    thread::spawn(move || {
-        let response = match client.get(url).send() {
-            Ok(response) if response.status().is_success() => response,
-            Ok(response) => {
-                let _ = ready_tx.send(Err(format!("SSE returned HTTP {}", response.status())));
-                return;
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
-                return;
-            }
-        };
-        let mut ready = false;
-        let mut first_sent = false;
-        for line in BufReader::new(response).lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
-                continue;
-            };
-            match event.get("type").and_then(Value::as_str) {
-                Some("Connected") => {
-                    if !ready {
-                        ready = true;
-                        let _ = ready_tx.send(Ok(()));
-                    }
-                }
-                Some("TextDelta") if !first_sent && visible_output_text(&event).is_some() => {
-                    first_sent = true;
-                    let _ = first_tx.send(Instant::now());
-                }
-                Some("TerminalCommitted") => {
-                    if !first_sent && visible_output_text(&event).is_some() {
-                        let _ = first_tx.send(Instant::now());
-                    }
-                    break;
-                }
-                _ => {}
-            }
-        }
-        if !ready {
-            let _ = ready_tx.send(Err("SSE closed before the Connected event".to_string()));
-        }
-    });
-    ready_rx
-        .recv_timeout(Duration::from_secs(5))
-        .map_err(|_| "SSE Connected event timed out".to_string())??;
-    Ok(first_rx)
-}
-
-fn visible_output_text(event: &Value) -> Option<&str> {
-    match event.get("type").and_then(Value::as_str) {
-        Some("TextDelta") => event
-            .get("content")
-            .or_else(|| event.get("text"))
-            .and_then(Value::as_str),
-        Some("TerminalCommitted") => event.get("response").and_then(Value::as_str),
-        _ => None,
-    }
-    .filter(|text| !text.is_empty())
-}
-
 fn apply_observed_cost(sample: &mut Sample, requested_model: &str) {
     if !sample.usage_observed || !exact_model_revisions(&sample.models_used, requested_model) {
         return;
@@ -2894,26 +2824,6 @@ fn valid_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn durable_terminal_response_counts_as_first_visible_output() {
-        assert_eq!(
-            visible_output_text(&json!({
-                "type": "TerminalCommitted",
-                "response": "committed answer"
-            })),
-            Some("committed answer")
-        );
-        assert_eq!(
-            visible_output_text(&json!({"type": "TextDelta", "text": "delta"})),
-            Some("delta")
-        );
-        assert!(visible_output_text(&json!({
-            "type": "TerminalCommitted",
-            "response": ""
-        }))
-        .is_none());
-    }
 
     #[test]
     fn latin_schedule_is_stable_and_balanced() {

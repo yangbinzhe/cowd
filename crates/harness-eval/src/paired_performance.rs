@@ -1,10 +1,5 @@
-//! Public-API paired performance evaluation.
-//!
-//! This intentionally measures what a surface can observe: from message
-//! admission to the first *durably materialized* assistant response. It does
-//! not borrow Runtime internals or discard slow/failed samples. A historical
-//! baseline and a candidate are started independently by the caller, then
-//! exercised in alternating order to reduce simple time-drift bias.
+//! Public-API paired performance evaluation with distinct first-delta,
+//! durability, and terminal measurements.
 
 use std::{
     thread,
@@ -16,13 +11,24 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+use crate::measurement::{
+    paired_delta_confidence, start_first_delta_observer, validate_metric_definitions,
+    FaultDriverPlan, MeasurementFault, METRIC_DEFINITIONS, RELIABLE_TAIL_MIN_SAMPLES,
+};
+
+const SEQUENTIAL_SEED: u64 = 20_260_725;
+const WORKLOAD_PROMPT: &str = "只回答 7 乘以 8 的结果。不要调用工具，不要组队。";
 
 #[derive(Debug, Clone)]
 pub struct PairedPerformanceOptions {
     pub baseline_url: String,
     pub candidate_url: String,
     pub model: String,
+    pub min_pairs: usize,
     pub pairs: usize,
+    pub target_relative_ci_half_width_bp: u64,
     pub token: Option<String>,
     pub timeout: Duration,
     pub poll_interval: Duration,
@@ -30,8 +36,21 @@ pub struct PairedPerformanceOptions {
 
 impl PairedPerformanceOptions {
     pub fn validate(&self) -> Result<(), String> {
-        if self.pairs < 5 {
-            return Err("paired performance evaluation requires at least five pairs".to_string());
+        if self.min_pairs < 5 {
+            return Err(
+                "paired performance evaluation requires at least five minimum pairs".to_string(),
+            );
+        }
+        if self.pairs < self.min_pairs {
+            return Err("paired performance maximum pairs must be >= minimum pairs".to_string());
+        }
+        if self.target_relative_ci_half_width_bp == 0
+            || self.target_relative_ci_half_width_bp > 10_000
+        {
+            return Err(
+                "paired performance CI half-width target must be in 1..=10000 basis points"
+                    .to_string(),
+            );
         }
         for (label, url) in [
             ("baseline", self.baseline_url.as_str()),
@@ -50,9 +69,22 @@ impl PairedPerformanceOptions {
 
 pub fn run_paired_performance(options: PairedPerformanceOptions) -> Result<Value, String> {
     options.validate()?;
+    validate_metric_definitions()?;
     let client = build_client(&options)?;
     let baseline = EndpointRunner::new("baseline", &options.baseline_url, &options, &client);
     let candidate = EndpointRunner::new("candidate", &options.candidate_url, &options, &client);
+    let warmup = json!({
+        "baseline": baseline.run(usize::MAX),
+        "candidate": candidate.run(usize::MAX),
+    });
+    if warmup["baseline"]["status"].as_str() != Some("passed")
+        || warmup["candidate"]["status"].as_str() != Some("passed")
+    {
+        return Err(format!(
+            "paired performance warmup failed: {}",
+            summarize_json(&warmup)
+        ));
+    }
     let mut pairs = Vec::with_capacity(options.pairs);
 
     for pair_index in 0..options.pairs {
@@ -74,37 +106,82 @@ pub fn run_paired_performance(options: PairedPerformanceOptions) -> Result<Value
             "baseline": baseline_sample,
             "candidate": candidate_sample,
         }));
+        if sequential_confidence(&pairs, options.target_relative_ci_half_width_bp).is_some_and(
+            |decision| {
+                pair_index + 1 >= options.min_pairs
+                    && decision["status"].as_str() == Some("converged")
+            },
+        ) {
+            break;
+        }
     }
 
+    let sampling = sequential_confidence(&pairs, options.target_relative_ci_half_width_bp)
+        .unwrap_or_else(|| json!({"status": "inconclusive", "reason": "missing paired metrics"}));
+    let process_metrics = json!({
+        "baseline": baseline.performance_snapshot(),
+        "candidate": candidate.performance_snapshot(),
+    });
+    validate_reported_metric_ids(&process_metrics)?;
+    let fault_driver = FaultDriverPlan {
+        enabled: false,
+        fault: MeasurementFault::StreamDisconnectBeforeFirstDelta,
+        trigger_after_events: 1,
+    };
+    fault_driver.validate()?;
     let baseline_summary = summarize_samples(&pairs, "baseline");
     let candidate_summary = summarize_samples(&pairs, "candidate");
     let gate = compare(
         &baseline_summary,
         &candidate_summary,
-        options.pairs,
+        pairs.len(),
         options.poll_interval,
+        &sampling,
     );
 
     Ok(json!({
         "kind": "harness_eval.paired_public_api_performance",
         "status": gate["status"].as_str().unwrap_or("failed"),
         "measurement": {
-            "ttft_definition": "milliseconds from public message admission to the first durable assistant response visible through the public session API",
-            "wall_definition": "milliseconds from public message admission to the terminal durable assistant response",
-            "prompt": "只回答 7 乘以 8 的结果。不要调用工具，不要组队。",
+            "first_surface_delta_definition": "milliseconds from public message admission to the first TextDelta observed on the public Surface stream",
+            "actual_first_delta_definition": "provider-request to first Runtime TextDelta duration exported by the process performance snapshot",
+            "first_durable_assistant_definition": "milliseconds from public message admission to the first durable assistant response visible through the public session API",
+            "terminal_wall_definition": "milliseconds from public message admission to the terminal durable assistant response",
+            "prompt": WORKLOAD_PROMPT,
             "acceptance": "assistant response contains 56",
             "all_samples_retained": true,
             "alternating_pair_order": true,
+            "tail_percentile_min_samples": RELIABLE_TAIL_MIN_SAMPLES,
+            "metric_definitions": METRIC_DEFINITIONS,
         },
+        "workload_manifest": {
+            "schema_version": 1,
+            "prompt_sha256": format!("{:x}", Sha256::digest(WORKLOAD_PROMPT.as_bytes())),
+            "model": options.model,
+            "protocol": "gateway_session_api",
+            "reasoning": "provider_profile",
+            "seed": SEQUENTIAL_SEED,
+            "transport_fingerprint": "public_http_sse_and_durable_projection",
+            "storage_topology": "gateway_selected_storage",
+            "feature_flags": [],
+        },
+        "fault_driver": fault_driver,
+        "warmup": warmup,
         "environment": {
             "baseline_url": options.baseline_url,
             "candidate_url": options.candidate_url,
             "model": options.model,
             "pairs_required": options.pairs,
+            "min_pairs": options.min_pairs,
+            "max_pairs": options.pairs,
+            "pairs_completed": pairs.len(),
+            "target_relative_ci_half_width_bp": options.target_relative_ci_half_width_bp,
             "timeout_ms": options.timeout.as_millis(),
             "poll_interval_ms": options.poll_interval.as_millis(),
         },
         "pairs": pairs,
+        "sampling": sampling,
+        "process_metrics": process_metrics,
         "baseline": baseline_summary,
         "candidate": candidate_summary,
         "gate": gate,
@@ -172,38 +249,107 @@ impl<'a> EndpointRunner<'a> {
             );
         };
 
+        let first_delta_observer =
+            match start_first_delta_observer(self.client, &self.base_url, &session_id) {
+                Ok(observer) => observer,
+                Err(error) => {
+                    return failed_sample(self.label, pair_index, "first_delta_observer", error);
+                }
+            };
         let started = Instant::now();
         let admission = self.post(
             &format!("/api/sessions/{session_id}/messages"),
             json!({
-                "content": "只回答 7 乘以 8 的结果。不要调用工具，不要组队。",
+                "content": WORKLOAD_PROMPT,
                 "idempotency_key": format!("paired-performance-{}-{}-{}", self.label, pair_index, uuid::Uuid::new_v4()),
             }),
         );
-        if let Err(error) = admission {
-            return failed_sample(self.label, pair_index, "admit_message", error);
-        }
+        let admission = match admission {
+            Ok(value) => value,
+            Err(error) => return failed_sample(self.label, pair_index, "admit_message", error),
+        };
+        let Some(execution_id) = admission
+            .pointer("/execution/graph_id")
+            .or_else(|| admission.get("graph_id"))
+            .or_else(|| admission.get("execution_graph_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return failed_sample(
+                self.label,
+                pair_index,
+                "admit_message",
+                "response lacks canonical execution graph id".to_string(),
+            );
+        };
 
         let deadline = started + self.timeout;
+        let mut first_surface_delta = None;
+        let mut first_durable_assistant_ms = None;
+        let mut assistant_text = None;
         loop {
+            if first_surface_delta.is_none() {
+                first_surface_delta = first_delta_observer.try_recv().ok();
+            }
             match self.get(&format!("/api/sessions/{session_id}/messages?limit=200")) {
                 Ok(messages) => {
-                    if let Some(text) = latest_assistant_text(&messages) {
-                        let elapsed_ms = started.elapsed().as_millis() as u64;
-                        let accepted = text.contains("56");
-                        return json!({
-                            "endpoint": self.label,
-                            "pair_index": pair_index,
-                            "status": if accepted { "passed" } else { "failed" },
-                            "session_id": session_id,
-                            "first_durable_response_ms": elapsed_ms,
-                            "wall_ms": elapsed_ms,
-                            "acceptance": {"passed": accepted, "required": "56"},
-                            "response_summary": summarize(&text, 240),
-                        });
+                    if first_durable_assistant_ms.is_none() {
+                        if let Some(text) = latest_assistant_text(&messages) {
+                            first_durable_assistant_ms = Some(started.elapsed().as_millis() as u64);
+                            assistant_text = Some(text);
+                        }
                     }
                 }
                 Err(error) => return failed_sample(self.label, pair_index, "poll_messages", error),
+            }
+            let terminal = match self.get(&format!("/api/runtime/executions/{execution_id}")) {
+                Ok(projection) => execution_projection_is_terminal(&projection),
+                Err(error) if error.starts_with("HTTP 404 ") => false,
+                Err(error) => {
+                    return failed_sample(
+                        self.label,
+                        pair_index,
+                        "poll_execution_projection",
+                        error,
+                    );
+                }
+            };
+            if terminal {
+                if first_surface_delta.is_none() {
+                    first_surface_delta = first_delta_observer
+                        .recv_timeout(Duration::from_millis(500))
+                        .ok();
+                }
+                if let (Some(durable_ms), Some(text)) =
+                    (first_durable_assistant_ms, assistant_text.as_deref())
+                {
+                    let terminal_wall_ms = started.elapsed().as_millis() as u64;
+                    let accepted = text.contains("56");
+                    let first_surface_delta_ms = first_surface_delta.map(|observed| {
+                        u64::try_from(observed.observed_at.duration_since(started).as_millis())
+                            .unwrap_or(u64::MAX)
+                    });
+                    let first_surface_delta_source_cursor =
+                        first_surface_delta.and_then(|observed| observed.source_cursor);
+                    return json!({
+                        "endpoint": self.label,
+                        "pair_index": pair_index,
+                        "status": if accepted && first_surface_delta_ms.is_some() { "passed" } else { "failed" },
+                        "session_id": session_id,
+                        "execution_id": execution_id,
+                        "first_surface_delta_ms": first_surface_delta_ms,
+                        "first_surface_delta_source_cursor": first_surface_delta_source_cursor,
+                        "first_durable_assistant_ms": durable_ms,
+                        "terminal_wall_ms": terminal_wall_ms,
+                        "measurement_error": if first_surface_delta_ms.is_none() {
+                            Some("no visible TextDelta was observed; durable response was not substituted for TTFT")
+                        } else {
+                            None
+                        },
+                        "acceptance": {"passed": accepted, "required": "56"},
+                        "response_summary": summarize(text, 240),
+                    });
+                }
             }
             if Instant::now() >= deadline {
                 return failed_sample(
@@ -233,6 +379,55 @@ impl<'a> EndpointRunner<'a> {
             .map_err(|error| error.to_string())
             .and_then(response_json)
     }
+
+    fn performance_snapshot(&self) -> Value {
+        self.get("/healthz")
+            .ok()
+            .and_then(|health| health.get("performance").cloned())
+            .unwrap_or_else(|| json!({"status": "unavailable"}))
+    }
+}
+
+fn validate_reported_metric_ids(process_metrics: &Value) -> Result<(), String> {
+    let canonical = METRIC_DEFINITIONS
+        .iter()
+        .map(|metric| metric.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    for endpoint in ["baseline", "candidate"] {
+        let Some(samples) = process_metrics.get(endpoint).and_then(Value::as_array) else {
+            continue;
+        };
+        for sample in samples {
+            let Some(metric_id) = sample.get("metric_id").and_then(Value::as_str) else {
+                return Err(format!(
+                    "{endpoint} performance snapshot contains a metric without metric_id"
+                ));
+            };
+            if !canonical.contains(metric_id) {
+                return Err(format!(
+                    "{endpoint} performance snapshot contains unknown metric `{metric_id}`"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execution_projection_is_terminal(value: &Value) -> bool {
+    serde_json::from_value::<harness_contract::projection::ExecutionProjection>(value.clone())
+        .is_ok_and(|projection| {
+            !projection.graph.nodes.is_empty()
+                && projection
+                    .graph
+                    .nodes
+                    .iter()
+                    .all(|node| node.status.is_terminal())
+                && projection
+                    .strategy
+                    .as_ref()
+                    .and_then(|strategy| strategy.actual.as_ref())
+                    .is_some()
+        })
 }
 
 fn response_json(response: reqwest::blocking::Response) -> Result<Value, String> {
@@ -311,13 +506,15 @@ fn summarize_samples(pairs: &[Value], key: &str) -> Value {
         .iter()
         .filter(|sample| sample.get("status").and_then(Value::as_str) != Some("passed"))
         .count();
-    let ttft = values(&samples, "first_durable_response_ms");
-    let wall = values(&samples, "wall_ms");
+    let first_surface_delta = values(&samples, "first_surface_delta_ms");
+    let first_durable_assistant = values(&samples, "first_durable_assistant_ms");
+    let terminal_wall = values(&samples, "terminal_wall_ms");
     json!({
         "sample_count": samples.len(),
         "failed_sample_count": failed,
-        "ttft_ms": percentile_summary(ttft),
-        "wall_ms": percentile_summary(wall),
+        "first_surface_delta_ms": percentile_summary(first_surface_delta),
+        "first_durable_assistant_ms": percentile_summary(first_durable_assistant),
+        "terminal_wall_ms": percentile_summary(terminal_wall),
     })
 }
 
@@ -330,10 +527,13 @@ fn values(samples: &[&Value], field: &str) -> Vec<u64> {
 
 fn percentile_summary(mut values: Vec<u64>) -> Value {
     values.sort_unstable();
+    let tail_reliable = values.len() >= RELIABLE_TAIL_MIN_SAMPLES;
     json!({
         "samples": values,
         "p50": percentile(&values, 0.50),
-        "p95": percentile(&values, 0.95),
+        "p95": tail_reliable.then(|| percentile(&values, 0.95)).flatten(),
+        "p95_reliable": tail_reliable,
+        "tail_min_samples": RELIABLE_TAIL_MIN_SAMPLES,
     })
 }
 
@@ -349,11 +549,44 @@ fn percentile(values: &[u64], quantile: f64) -> Option<u64> {
     values.get(index).copied()
 }
 
+fn sequential_confidence(pairs: &[Value], target_half_width_bp: u64) -> Option<Value> {
+    let paired_values = |field: &str| {
+        pairs
+            .iter()
+            .map(|pair| {
+                Some((
+                    pair.pointer(&format!("/baseline/{field}"))?.as_u64()?,
+                    pair.pointer(&format!("/candidate/{field}"))?.as_u64()?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+    };
+    let ttft = paired_values("first_surface_delta_ms")?;
+    let wall = paired_values("terminal_wall_ms")?;
+    let (baseline_ttft, candidate_ttft): (Vec<_>, Vec<_>) = ttft.into_iter().unzip();
+    let (baseline_wall, candidate_wall): (Vec<_>, Vec<_>) = wall.into_iter().unzip();
+    let ttft_ci = paired_delta_confidence(&baseline_ttft, &candidate_ttft, SEQUENTIAL_SEED)?;
+    let wall_ci = paired_delta_confidence(
+        &baseline_wall,
+        &candidate_wall,
+        SEQUENTIAL_SEED ^ 0x9e37_79b9,
+    )?;
+    let converged = ttft_ci.relative_half_width_bp <= target_half_width_bp
+        && wall_ci.relative_half_width_bp <= target_half_width_bp;
+    Some(json!({
+        "status": if converged { "converged" } else { "inconclusive" },
+        "target_relative_ci_half_width_bp": target_half_width_bp,
+        "first_surface_delta": ttft_ci,
+        "terminal_wall": wall_ci,
+    }))
+}
+
 fn compare(
     baseline: &Value,
     candidate: &Value,
     required_pairs: usize,
     poll_interval: Duration,
+    sampling: &Value,
 ) -> Value {
     let failures = baseline
         .get("failed_sample_count")
@@ -371,10 +604,29 @@ fn compare(
         .get("sample_count")
         .and_then(Value::as_u64)
         .unwrap_or_default();
-    let baseline_ttft = baseline.pointer("/ttft_ms/p50").and_then(Value::as_u64);
-    let candidate_ttft = candidate.pointer("/ttft_ms/p50").and_then(Value::as_u64);
-    let baseline_wall = baseline.pointer("/wall_ms/p95").and_then(Value::as_u64);
-    let candidate_wall = candidate.pointer("/wall_ms/p95").and_then(Value::as_u64);
+    let baseline_ttft = baseline
+        .pointer("/first_surface_delta_ms/p50")
+        .and_then(Value::as_u64);
+    let candidate_ttft = candidate
+        .pointer("/first_surface_delta_ms/p50")
+        .and_then(Value::as_u64);
+    let baseline_wall_summary = baseline.get("terminal_wall_ms").unwrap_or(&Value::Null);
+    let candidate_wall_summary = candidate.get("terminal_wall_ms").unwrap_or(&Value::Null);
+    let tail_reliable = baseline_wall_summary
+        .get("p95_reliable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && candidate_wall_summary
+            .get("p95_reliable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let wall_percentile = if tail_reliable { "p95" } else { "p50" };
+    let baseline_wall = baseline_wall_summary
+        .get(wall_percentile)
+        .and_then(Value::as_u64);
+    let candidate_wall = candidate_wall_summary
+        .get(wall_percentile)
+        .and_then(Value::as_u64);
     let polling_precision_allowance_ms = u64::try_from(poll_interval.as_millis())
         .unwrap_or(u64::MAX)
         .saturating_mul(2);
@@ -399,7 +651,8 @@ fn compare(
     let wall_delta = baseline_wall
         .zip(candidate_wall)
         .map(|(base, current)| current.saturating_sub(base));
-    let passed = failures == 0
+    let passed = sampling.get("status").and_then(Value::as_str) == Some("converged")
+        && failures == 0
         && baseline_count == required_pairs as u64
         && candidate_count == required_pairs as u64
         && ttft_delta
@@ -412,21 +665,24 @@ fn compare(
         "status": if passed { "passed" } else { "failed" },
         "requirements": {
             "pairs": required_pairs,
+            "sequential_sampling": sampling,
             "p50_ttft_max_regression_ms": ttft_limit,
-            "p95_wall_max_regression_ms": wall_limit,
+            "wall_max_regression_ms": wall_limit,
+            "wall_gate_percentile": wall_percentile,
+            "tail_percentile_reliable": tail_reliable,
             "p50_ttft_target_without_sampling_error_ms": ttft_limit_without_sampling_error,
-            "p95_wall_target_without_sampling_error_ms": wall_limit_without_sampling_error,
+            "wall_target_without_sampling_error_ms": wall_limit_without_sampling_error,
             "polling_precision_allowance_ms": polling_precision_allowance_ms,
-            "formula": "TTFT max(100ms, 5% baseline) + 2*poll_interval; wall max(300ms, 10% baseline) + 2*poll_interval",
+            "formula": "actual TTFT p50 max(100ms, 5% baseline) + 2*poll_interval; wall uses p95 only with at least 20 samples per endpoint, otherwise p50, max(300ms, 10% baseline) + 2*poll_interval",
         },
         "observed": {
             "failed_samples": failures,
             "baseline_p50_ttft_ms": baseline_ttft,
             "candidate_p50_ttft_ms": candidate_ttft,
             "p50_ttft_regression_ms": ttft_delta,
-            "baseline_p95_wall_ms": baseline_wall,
-            "candidate_p95_wall_ms": candidate_wall,
-            "p95_wall_regression_ms": wall_delta,
+            "baseline_wall_ms": baseline_wall,
+            "candidate_wall_ms": candidate_wall,
+            "wall_regression_ms": wall_delta,
         },
     })
 }
@@ -454,7 +710,8 @@ mod tests {
         let summary = percentile_summary(vec![500, 100, 300, 200, 400]);
         assert_eq!(summary["samples"], json!([100, 200, 300, 400, 500]));
         assert_eq!(summary["p50"], 300);
-        assert_eq!(summary["p95"], 500);
+        assert_eq!(summary["p95"], Value::Null);
+        assert_eq!(summary["p95_reliable"], false);
     }
 
     #[test]
@@ -463,6 +720,9 @@ mod tests {
 
         assert_eq!(percentile(&values, 0.95), Some(19));
         assert_eq!(percentile(&values, 1.0), Some(20));
+        let summary = percentile_summary(values);
+        assert_eq!(summary["p95"], 19);
+        assert_eq!(summary["p95_reliable"], true);
     }
 
     #[test]
@@ -470,17 +730,23 @@ mod tests {
         let baseline = json!({
             "sample_count": 5,
             "failed_sample_count": 0,
-            "ttft_ms": {"p50": 1000},
-            "wall_ms": {"p95": 2000},
+            "first_surface_delta_ms": {"p50": 1000},
+            "terminal_wall_ms": {"p50": 2000, "p95": null, "p95_reliable": false},
         });
         let candidate = json!({
             "sample_count": 4,
             "failed_sample_count": 1,
-            "ttft_ms": {"p50": 1000},
-            "wall_ms": {"p95": 2000},
+            "first_surface_delta_ms": {"p50": 1000},
+            "terminal_wall_ms": {"p50": 2000, "p95": null, "p95_reliable": false},
         });
         assert_eq!(
-            compare(&baseline, &candidate, 5, Duration::ZERO)["status"],
+            compare(
+                &baseline,
+                &candidate,
+                5,
+                Duration::ZERO,
+                &json!({"status":"converged"})
+            )["status"],
             "failed"
         );
     }
@@ -490,17 +756,23 @@ mod tests {
         let baseline = json!({
             "sample_count": 5,
             "failed_sample_count": 0,
-            "ttft_ms": {"p50": 1000},
-            "wall_ms": {"p95": 2000},
+            "first_surface_delta_ms": {"p50": 1000},
+            "terminal_wall_ms": {"p50": 2000, "p95": null, "p95_reliable": false},
         });
         let candidate = json!({
             "sample_count": 5,
             "failed_sample_count": 0,
-            "ttft_ms": {"p50": 1050},
-            "wall_ms": {"p95": 2200},
+            "first_surface_delta_ms": {"p50": 1050},
+            "terminal_wall_ms": {"p50": 2200, "p95": null, "p95_reliable": false},
         });
         assert_eq!(
-            compare(&baseline, &candidate, 5, Duration::ZERO)["status"],
+            compare(
+                &baseline,
+                &candidate,
+                5,
+                Duration::ZERO,
+                &json!({"status":"converged"})
+            )["status"],
             "passed"
         );
     }
@@ -510,29 +782,33 @@ mod tests {
         let baseline = json!({
             "sample_count": 5,
             "failed_sample_count": 0,
-            "ttft_ms": {"p50": 1000},
-            "wall_ms": {"p95": 2000},
+            "first_surface_delta_ms": {"p50": 1000},
+            "terminal_wall_ms": {"p50": 2000, "p95": null, "p95_reliable": false},
         });
         let within = json!({
             "sample_count": 5,
             "failed_sample_count": 0,
-            "ttft_ms": {"p50": 1140},
-            "wall_ms": {"p95": 2200},
+            "first_surface_delta_ms": {"p50": 1140},
+            "terminal_wall_ms": {"p50": 2200, "p95": null, "p95_reliable": false},
         });
         let beyond = json!({
             "sample_count": 5,
             "failed_sample_count": 0,
-            "ttft_ms": {"p50": 1141},
-            "wall_ms": {"p95": 2200},
+            "first_surface_delta_ms": {"p50": 1141},
+            "terminal_wall_ms": {"p50": 2200, "p95": null, "p95_reliable": false},
         });
         let interval = Duration::from_millis(20);
 
-        let allowed = compare(&baseline, &within, 5, interval);
+        let sampling = json!({"status":"converged"});
+        let allowed = compare(&baseline, &within, 5, interval, &sampling);
         assert_eq!(
             allowed["requirements"]["polling_precision_allowance_ms"],
             40
         );
         assert_eq!(allowed["status"], "passed");
-        assert_eq!(compare(&baseline, &beyond, 5, interval)["status"], "failed");
+        assert_eq!(
+            compare(&baseline, &beyond, 5, interval, &sampling)["status"],
+            "failed"
+        );
     }
 }

@@ -95,9 +95,22 @@ fn run() -> Result<(), String> {
             let output = required_option(&args[1..], "--output")?;
             let pairs = option_value(&args[1..], "--pairs")
                 .as_deref()
-                .unwrap_or("5")
+                .unwrap_or("20")
                 .parse::<usize>()
                 .map_err(|_| "--pairs must be a positive integer".to_string())?;
+            let min_pairs = option_value(&args[1..], "--min-pairs")
+                .as_deref()
+                .unwrap_or("5")
+                .parse::<usize>()
+                .map_err(|_| "--min-pairs must be a positive integer".to_string())?;
+            let target_relative_ci_half_width_bp =
+                option_value(&args[1..], "--target-relative-ci-half-width-bp")
+                    .as_deref()
+                    .unwrap_or("500")
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        "--target-relative-ci-half-width-bp must be a positive integer".to_string()
+                    })?;
             let timeout_secs = option_value(&args[1..], "--timeout-secs")
                 .as_deref()
                 .unwrap_or("600")
@@ -115,7 +128,9 @@ fn run() -> Result<(), String> {
                 baseline_url,
                 candidate_url,
                 model,
+                min_pairs,
                 pairs,
+                target_relative_ci_half_width_bp,
                 token,
                 timeout: Duration::from_secs(timeout_secs),
                 // Public message polling is part of this end-to-end measurement.
@@ -222,7 +237,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--pairs 5] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--min-pairs 5] [--pairs 20] [--target-relative-ci-half-width-bp 500] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
     );
 }
 

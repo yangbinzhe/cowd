@@ -249,6 +249,7 @@ async fn send_message(
     headers: HeaderMap,
     Json(body): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let ingress_started = std::time::Instant::now();
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -420,6 +421,10 @@ async fn send_message(
         "input_projection": projection,
         "turn_inbox": inbox,
     });
+    runtime::execution_core::performance::observe_duration(
+        "gateway_accept_ms",
+        ingress_started.elapsed(),
+    );
     Ok(Json(response))
 }
 
@@ -1031,9 +1036,14 @@ fn spawn_session_stream_authorization_guard(
                 }
                 event = bus_rx.recv() => match event {
                     Some(event) => {
+                        let projection_started = std::time::Instant::now();
                         if tx.send(event).await.is_err() {
                             break;
                         }
+                        runtime::execution_core::performance::observe_duration(
+                            "surface_projection_ms",
+                            projection_started.elapsed(),
+                        );
                     }
                     None => break,
                 },
