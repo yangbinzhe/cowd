@@ -243,7 +243,7 @@ impl UsageTracker {
     #[must_use]
     pub fn from_session(session: &Session) -> Self {
         let mut tracker = Self::new();
-        for message in &session.messages {
+        for message in session.messages() {
             if let Some(usage) = message.usage {
                 tracker.record(usage);
             }
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn reconstructs_usage_from_session_messages() {
         let mut session = Session::new();
-        session.messages = vec![ConversationMessage {
+        session.replace_messages(vec![ConversationMessage {
             role: MessageRole::Assistant,
             blocks: vec![ContentBlock::Text {
                 text: "done".to_string(),
@@ -461,7 +461,7 @@ mod tests {
                 cache_creation_input_tokens: 1,
                 cache_read_input_tokens: 0,
             }),
-        }];
+        }]);
 
         let tracker = UsageTracker::from_session(&session);
         assert_eq!(tracker.turns(), 1);

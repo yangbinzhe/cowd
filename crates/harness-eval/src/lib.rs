@@ -3322,7 +3322,8 @@ mod tests {
                     text: "Return exactly OK.".to_string(),
                 }],
                 usage: None,
-            }],
+            }]
+            .into(),
             model,
             reasoning_effort_override: None,
             budget: runtime::context_ledger::RequestBudgetReport::for_attempt(

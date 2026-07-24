@@ -1879,14 +1879,14 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
                     "kind": "restored",
                     "session_id": session.session_id,
                     "path": handle.path.display().to_string(),
-                    "message_count": session.messages.len(),
+                    "message_count": session.message_count(),
                 })
             );
         } else {
             println!(
                 "Restored session from {} ({} messages).",
                 handle.path.display(),
-                session.messages.len()
+                session.message_count()
             );
         }
         return;
@@ -2229,7 +2229,7 @@ fn run_resume_command(
                 message: Some(format_status_report(
                     session.model.as_deref().unwrap_or("restored-session"),
                     StatusUsage {
-                        message_count: session.messages.len(),
+                        message_count: session.message_count(),
                         turns: tracker.turns(),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
@@ -2242,7 +2242,7 @@ fn run_resume_command(
                 json: Some(status_json_value(
                     session.model.as_deref(),
                     StatusUsage {
-                        message_count: session.messages.len(),
+                        message_count: session.message_count(),
                         turns: tracker.turns(),
                         latest: tracker.current_turn_usage(),
                         cumulative: usage,
@@ -2351,7 +2351,7 @@ fn run_resume_command(
         SlashCommand::Export { path } => {
             let export_path = resolve_export_path(path.as_deref(), session)?;
             fs::write(&export_path, render_export_text(session))?;
-            let msg_count = session.messages.len();
+            let msg_count = session.message_count();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 session_path: None,
@@ -2457,7 +2457,7 @@ fn run_resume_command(
             target: Some(target),
         } if act == "switch" => {
             let (handle, switched) = load_session_reference(target)?;
-            let message_count = switched.messages.len();
+            let message_count = switched.message_count();
             let session_id = switched.session_id.clone();
             Ok(ResumeCommandOutcome::new(
                 switched,
@@ -3099,8 +3099,7 @@ fn collect_session_prompt_history(session: &Session) -> Vec<SessionPromptHistory
     }
     let timestamp_ms = session.updated_at_ms;
     session
-        .messages
-        .iter()
+        .messages()
         .filter(|message| message.role == MessageRole::User)
         .filter_map(|message| {
             message.blocks.iter().find_map(|block| match block {
@@ -3116,8 +3115,7 @@ fn collect_session_prompt_history(session: &Session) -> Vec<SessionPromptHistory
 
 fn recent_user_context(session: &Session, limit: usize) -> String {
     let requests = session
-        .messages
-        .iter()
+        .messages()
         .filter(|message| message.role == MessageRole::User)
         .filter_map(|message| {
             message.blocks.iter().find_map(|block| match block {
@@ -3250,7 +3248,7 @@ fn compact_message_text(message: &ConversationMessage) -> String {
 }
 
 pub(crate) fn session_db_resume_context_packet(session: &Session) -> Option<ResumeContextPacket> {
-    if session.messages.is_empty()
+    if session.history().is_empty()
         && session.compaction.is_none()
         && session.fork.is_none()
         && session.prompt_history.is_empty()
@@ -3259,8 +3257,7 @@ pub(crate) fn session_db_resume_context_packet(session: &Session) -> Option<Resu
     }
 
     let recent_turns = session
-        .messages
-        .iter()
+        .messages()
         .rev()
         .take(4)
         .filter_map(|message| {
@@ -5973,7 +5970,7 @@ mod tests {
         // given
         let mut session = Session::new();
         session.session_id = "session-export-test".to_string();
-        session.messages = vec![
+        session.replace_messages(vec![
             ConversationMessage::user_text("How do I list files?"),
             ConversationMessage::assistant(vec![
                 ContentBlock::Text {
@@ -5995,7 +5992,7 @@ mod tests {
                 }],
                 usage: None,
             },
-        ];
+        ]);
 
         // when
         let markdown = render_session_markdown(
@@ -6025,7 +6022,7 @@ mod tests {
         // given
         let mut session = Session::new();
         session.session_id = "errs".to_string();
-        session.messages = vec![ConversationMessage {
+        session.replace_messages(vec![ConversationMessage {
             role: MessageRole::Tool,
             blocks: vec![ContentBlock::ToolResult {
                 tool_use_id: "short".to_string(),
@@ -6034,7 +6031,7 @@ mod tests {
                 is_error: true,
             }],
             usage: None,
-        }];
+        }]);
 
         // when
         let markdown =
@@ -6654,20 +6651,24 @@ mod tests {
     fn session_db_resume_packet_summarizes_recent_session_state() {
         let mut session = runtime::Session::new();
         session.session_id = "session-resume-packet".to_string();
-        session.messages.push(runtime::ConversationMessage {
-            role: runtime::MessageRole::User,
-            blocks: vec![runtime::ContentBlock::Text {
-                text: "continue the context runtime work".to_string(),
-            }],
-            usage: None,
-        });
-        session.messages.push(runtime::ConversationMessage {
-            role: runtime::MessageRole::Assistant,
-            blocks: vec![runtime::ContentBlock::Text {
-                text: "context timeline is persisted".to_string(),
-            }],
-            usage: None,
-        });
+        session
+            .push_message(runtime::ConversationMessage {
+                role: runtime::MessageRole::User,
+                blocks: vec![runtime::ContentBlock::Text {
+                    text: "continue the context runtime work".to_string(),
+                }],
+                usage: None,
+            })
+            .expect("append user");
+        session
+            .push_message(runtime::ConversationMessage {
+                role: runtime::MessageRole::Assistant,
+                blocks: vec![runtime::ContentBlock::Text {
+                    text: "context timeline is persisted".to_string(),
+                }],
+                usage: None,
+            })
+            .expect("append assistant");
         session.compaction = Some(runtime::SessionCompaction {
             count: 2,
             removed_message_count: 8,
@@ -7447,7 +7448,7 @@ UU conflicted.rs",
         assert_eq!(hydrated.session_id, session_id);
         assert_eq!(hydrated.model.as_deref(), Some("test-model"));
         assert_eq!(hydrated.workspace_root.as_deref(), Some(root.as_path()));
-        assert_eq!(hydrated.messages, vec![message]);
+        assert_eq!(hydrated.materialize_messages(), vec![message]);
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
@@ -7463,12 +7464,12 @@ UU conflicted.rs",
         };
         let mut session = Session::new().with_workspace_root(root.clone());
         session.session_id = "cli-sync".to_string();
-        session.messages = vec![
+        session.replace_messages(vec![
             ConversationMessage::user_text("first"),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "second".to_string(),
             }]),
-        ];
+        ]);
 
         sync_cli_session_to_unified_store(&store, &handle, Some("test-model"), &session)
             .expect("initial sync should work");
@@ -7481,7 +7482,7 @@ UU conflicted.rs",
         assert_eq!(messages.len(), 2);
         assert_eq!(events.len(), 2);
 
-        session.messages.truncate(1);
+        session.truncate_messages(1);
         sync_cli_session_to_unified_store(&store, &handle, Some("test-model"), &session)
             .expect("second sync should replace store view");
         let messages = SHARED_RT

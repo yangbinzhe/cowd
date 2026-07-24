@@ -404,16 +404,14 @@ impl SessionKernel {
 
         record.model = session.model.clone().or(record.model);
         record.last_activity = now;
-        record.message_count = session.messages.len() as i64;
+        record.message_count = session.message_count() as i64;
         record.input_tokens = session
-            .messages
-            .iter()
+            .messages()
             .filter_map(|m| m.usage.as_ref())
             .map(|u| i64::from(u.input_tokens))
             .sum();
         record.output_tokens = session
-            .messages
-            .iter()
+            .messages()
             .filter_map(|m| m.usage.as_ref())
             .map(|u| i64::from(u.output_tokens))
             .sum();
@@ -429,8 +427,8 @@ impl SessionKernel {
             .delete_events_by_type_from(session_id, "message_appended", 0)
             .await?;
 
-        let mut message_events = Vec::with_capacity(session.messages.len());
-        for (sequence, message) in session.messages.iter().enumerate() {
+        let mut message_events = Vec::with_capacity(session.message_count());
+        for (sequence, message) in session.messages().enumerate() {
             let message_record = message.to_session_message(session_id, sequence);
             store.insert_message(&message_record).await?;
 

@@ -11,6 +11,7 @@ use fs2::FileExt;
 use model_protocol::usage::TokenUsage;
 
 use crate::json::{JsonError, JsonValue};
+use crate::{HistoryView, SessionHistory, SessionHistoryConfig};
 
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
@@ -197,7 +198,7 @@ pub struct Session {
     pub session_id: String,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
-    pub messages: Vec<ConversationMessage>,
+    history: SessionHistory,
     pub compaction: Option<SessionCompaction>,
     pub fork: Option<SessionFork>,
     pub workspace_root: Option<PathBuf>,
@@ -219,7 +220,7 @@ impl PartialEq for Session {
             && self.session_id == other.session_id
             && self.created_at_ms == other.created_at_ms
             && self.updated_at_ms == other.updated_at_ms
-            && self.messages == other.messages
+            && self.history == other.history
             && self.compaction == other.compaction
             && self.fork == other.fork
             && self.workspace_root == other.workspace_root
@@ -271,7 +272,7 @@ impl Session {
             session_id: generate_session_id(),
             created_at_ms: now,
             updated_at_ms: now,
-            messages: Vec::new(),
+            history: SessionHistory::default(),
             compaction: None,
             fork: None,
             workspace_root: None,
@@ -372,15 +373,15 @@ impl Session {
 
     pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
         self.touch();
-        self.messages.push(message);
+        self.history.append(message);
         let persist_result = {
-            let message_ref = self.messages.last().ok_or_else(|| {
+            let message_ref = self.history.last().ok_or_else(|| {
                 SessionError::Format("message was just pushed but missing".to_string())
             })?;
             self.append_persisted_message(message_ref)
         };
         if let Err(error) = persist_result {
-            self.messages.pop();
+            self.history.pop();
             return Err(error);
         }
         self.appended_since_snapshot.fetch_add(1, Ordering::Relaxed);
@@ -389,6 +390,60 @@ impl Session {
 
     pub fn push_user_text(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
         self.push_message(ConversationMessage::user_text(text))
+    }
+
+    #[must_use]
+    pub const fn history(&self) -> &SessionHistory {
+        &self.history
+    }
+
+    #[must_use]
+    pub fn messages(&self) -> impl DoubleEndedIterator<Item = &ConversationMessage> {
+        self.history.iter()
+    }
+
+    #[must_use]
+    pub const fn message_count(&self) -> usize {
+        self.history.len()
+    }
+
+    #[must_use]
+    pub fn message(&self, sequence: usize) -> Option<&ConversationMessage> {
+        self.history.get(sequence)
+    }
+
+    #[must_use]
+    pub fn messages_view(&self) -> HistoryView {
+        self.history.snapshot()
+    }
+
+    #[must_use]
+    pub fn messages_page(&self, offset: usize, limit: usize) -> HistoryView {
+        self.history.page(offset, limit)
+    }
+
+    #[must_use]
+    pub fn materialize_messages(&self) -> Vec<ConversationMessage> {
+        self.history.materialize()
+    }
+
+    pub fn replace_messages(&mut self, messages: Vec<ConversationMessage>) {
+        self.touch();
+        self.history.replace(messages);
+    }
+
+    pub fn extend_messages(&mut self, messages: impl IntoIterator<Item = ConversationMessage>) {
+        self.touch();
+        self.history.extend(messages);
+    }
+
+    pub fn truncate_messages(&mut self, len: usize) {
+        self.touch();
+        self.history.truncate(len);
+    }
+
+    pub fn configure_history(&mut self, config: SessionHistoryConfig) {
+        self.history.reconfigure(config);
     }
 
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
@@ -409,7 +464,7 @@ impl Session {
             session_id: generate_session_id(),
             created_at_ms: now,
             updated_at_ms: now,
-            messages: self.messages.clone(),
+            history: self.history.fork(),
             compaction: self.compaction.clone(),
             fork: Some(SessionFork {
                 parent_session_id: self.session_id.clone(),
@@ -445,12 +500,7 @@ impl Session {
         );
         object.insert(
             "messages".to_string(),
-            JsonValue::Array(
-                self.messages
-                    .iter()
-                    .map(ConversationMessage::to_json)
-                    .collect(),
-            ),
+            JsonValue::Array(self.messages().map(ConversationMessage::to_json).collect()),
         );
         if let Some(compaction) = &self.compaction {
             object.insert("compaction".to_string(), compaction.to_json()?);
@@ -538,7 +588,7 @@ impl Session {
             session_id,
             created_at_ms,
             updated_at_ms,
-            messages,
+            history: SessionHistory::from_messages(messages, SessionHistoryConfig::default()),
             compaction,
             fork,
             workspace_root,
@@ -641,7 +691,7 @@ impl Session {
             session_id: session_id.unwrap_or_else(generate_session_id),
             created_at_ms: created_at_ms.unwrap_or(now),
             updated_at_ms: updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
-            messages,
+            history: SessionHistory::from_messages(messages, SessionHistoryConfig::default()),
             compaction,
             fork,
             workspace_root,
@@ -683,8 +733,7 @@ impl Session {
                 .map(|entry| entry.to_jsonl_record().render()),
         );
         lines.extend(
-            self.messages
-                .iter()
+            self.messages()
                 .map(|message| message_record(message).render()),
         );
         let mut rendered = lines.join("\n");
@@ -1476,9 +1525,14 @@ mod tests {
         fs::remove_file(&path).expect("temp file should be removable");
 
         assert_eq!(restored, session);
-        assert_eq!(restored.messages[2].role, MessageRole::Tool);
+        assert_eq!(restored.message(2).expect("tool").role, MessageRole::Tool);
         assert_eq!(
-            restored.messages[1].usage.expect("usage").total_tokens(),
+            restored
+                .message(1)
+                .expect("assistant")
+                .usage
+                .expect("usage")
+                .total_tokens(),
             17
         );
         assert_eq!(restored.session_id, session.session_id);
@@ -1503,10 +1557,10 @@ mod tests {
         let restored = Session::load_from_path(&path).expect("legacy session should load");
         fs::remove_file(&path).expect("temp file should be removable");
 
-        assert_eq!(restored.messages.len(), 1);
+        assert_eq!(restored.message_count(), 1);
         assert_eq!(
-            restored.messages[0],
-            ConversationMessage::user_text("legacy")
+            restored.message(0).expect("message"),
+            &ConversationMessage::user_text("legacy")
         );
         assert!(!restored.session_id.is_empty());
     }
@@ -1530,8 +1584,11 @@ mod tests {
         let restored = Session::load_from_path(&path).expect("session should replay from jsonl");
         fs::remove_file(&path).expect("temp file should be removable");
 
-        assert_eq!(restored.messages.len(), 2);
-        assert_eq!(restored.messages[0], ConversationMessage::user_text("hi"));
+        assert_eq!(restored.message_count(), 2);
+        assert_eq!(
+            restored.message(0).expect("message"),
+            &ConversationMessage::user_text("hi")
+        );
     }
 
     #[test]
@@ -1579,7 +1636,10 @@ mod tests {
                 branch_name: Some("investigation".to_string()),
             })
         );
-        assert_eq!(restored.messages, forked.messages);
+        assert_eq!(
+            restored.materialize_messages(),
+            forked.materialize_messages()
+        );
     }
 
     #[test]

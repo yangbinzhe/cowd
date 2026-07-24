@@ -307,7 +307,9 @@ use crate::tool_invocation::{
 };
 use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
 use crate::PromptAssembly;
-use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
+use crate::{
+    HistoryView, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+};
 use model_protocol::usage::TokenUsage;
 
 /// Keep enough request capacity for fixed instructions, current history and a
@@ -349,38 +351,6 @@ fn provider_transport_policy(
         context_window,
         prompt_chars.saturating_add(message_chars),
     )
-}
-
-fn conversation_messages_token_estimate(messages: &[ConversationMessage]) -> u64 {
-    messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .fold(0u64, |total, block| match block {
-            ContentBlock::Text { text } => {
-                total.saturating_add(crate::context_ledger::estimate_text_tokens(text))
-            }
-            ContentBlock::Image {
-                media_type, data, ..
-            } => total
-                .saturating_add(crate::context_ledger::estimate_text_tokens(media_type))
-                .saturating_add((data.len() as u64).div_ceil(4)),
-            ContentBlock::Thinking { thinking, .. } => {
-                total.saturating_add(crate::context_ledger::estimate_text_tokens(thinking))
-            }
-            ContentBlock::ToolUse { id, name, input } => total
-                .saturating_add(crate::context_ledger::estimate_text_tokens(id))
-                .saturating_add(crate::context_ledger::estimate_text_tokens(name))
-                .saturating_add(crate::context_ledger::estimate_text_tokens(input)),
-            ContentBlock::ToolResult {
-                tool_use_id,
-                tool_name,
-                output,
-                ..
-            } => total
-                .saturating_add(crate::context_ledger::estimate_text_tokens(tool_use_id))
-                .saturating_add(crate::context_ledger::estimate_text_tokens(tool_name))
-                .saturating_add(crate::context_ledger::estimate_text_tokens(output)),
-        })
 }
 
 fn retrieve_tool_evidence_from_sandbox(
@@ -649,7 +619,7 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiRequest {
     pub prompt: PromptAssembly,
-    pub messages: Vec<ConversationMessage>,
+    pub messages: HistoryView,
     /// Runtime-selected primary model ID.
     pub model: String,
     /// Runtime-owned one-shot reasoning policy for this provider attempt.
@@ -665,6 +635,10 @@ pub struct ApiRequest {
 pub struct ProviderContextInventory {
     pub tool_count: usize,
     pub tool_schema_tokens: u64,
+    pub catalog_revision: u64,
+    pub exposure_revision: u64,
+    pub schema_fingerprint: u64,
+    pub provider_registry_revision: u64,
 }
 
 /// Streamed events emitted while processing a single assistant turn.
@@ -714,33 +688,6 @@ fn preview_chars(value: &str, max_chars: usize) -> String {
         preview.push_str("...");
     }
     preview
-}
-
-fn conversation_message_payload_bytes(messages: &[ConversationMessage]) -> usize {
-    messages.iter().fold(0usize, |total, message| {
-        message.blocks.iter().fold(total, |total, block| {
-            let bytes = match block {
-                ContentBlock::Text { text } => text.len(),
-                ContentBlock::Image {
-                    media_type,
-                    data,
-                    source_path,
-                } => media_type.len() + data.len() + source_path.as_deref().map_or(0, str::len),
-                ContentBlock::Thinking {
-                    thinking,
-                    signature,
-                } => thinking.len() + signature.as_deref().map_or(0, str::len),
-                ContentBlock::ToolUse { id, name, input } => id.len() + name.len() + input.len(),
-                ContentBlock::ToolResult {
-                    tool_use_id,
-                    tool_name,
-                    output,
-                    ..
-                } => tool_use_id.len() + tool_name.len() + output.len(),
-            };
-            total.saturating_add(bytes)
-        })
-    })
 }
 
 fn millis_since(start: Instant) -> u64 {
@@ -1441,6 +1388,7 @@ pub struct ConversationRuntime<C, T> {
     api_client: C,
     tool_executor: Arc<T>,
     permission_policy: PermissionPolicy,
+    permission_fingerprint: u64,
     system_prompt: Vec<String>,
     usage_tracker: UsageTracker,
     model_performance_registry: std::sync::Mutex<ModelPerformanceRegistry>,
@@ -1574,6 +1522,7 @@ pub struct ConversationRuntime<C, T> {
     /// normal model step must be able to restore the catalog rather than be
     /// rejected as an older projection by the provider client.
     tool_exposure_revision: AtomicU64,
+    request_compiler: crate::PreparedRequestCompiler,
     /// Stable evidence projections emitted during the active turn.
     turn_evidence_audits: std::sync::Mutex<Vec<EvidenceAuditProjection>>,
     /// Per-turn component accounting and tool-result lease consumption.
@@ -1635,14 +1584,18 @@ where
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn new_with_features(
-        session: Session,
+        mut session: Session,
         api_client: C,
         tool_executor: Arc<T>,
         permission_policy: PermissionPolicy,
         system_prompt: Vec<String>,
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
+        session.configure_history(feature_config.session_history());
         let usage_tracker = UsageTracker::from_session(&session);
+        let permission_fingerprint = model_protocol::fingerprint::stable_hash_bytes(
+            format!("{permission_policy:?}").as_bytes(),
+        );
         let subsystem_budget_ratio_bp = feature_config.context_budget().subsystem_budget_ratio_bp;
         let initial_window_resolution = feature_config.model().map_or(
             provider::ModelContextWindowResolution {
@@ -1750,6 +1703,7 @@ where
             api_client,
             tool_executor,
             permission_policy,
+            permission_fingerprint,
             system_prompt,
             usage_tracker,
             model_performance_registry: std::sync::Mutex::new(ModelPerformanceRegistry::new()),
@@ -1826,6 +1780,9 @@ where
             tool_exposure_state: std::sync::Mutex::new(None),
             active_skill_tool_refs: std::sync::Mutex::new(BTreeSet::new()),
             tool_exposure_revision: AtomicU64::new(0),
+            request_compiler: crate::PreparedRequestCompiler::new(
+                feature_config.session_history().request_cache_entries,
+            ),
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
                 initial_budget_plan.subsystem_budget_tokens,
@@ -2076,9 +2033,10 @@ where
         }
 
         let session = self.session();
+        let turn_index = session.message_count();
         let activation = SkillActivationEngine::activate(SkillActivationInput {
             session_id: session.session_id,
-            turn_index: session.messages.len(),
+            turn_index,
             query: user_input.to_string(),
             capability_refs: Vec::new(),
             available_profiles: self.skill_profiles.clone(),
@@ -2223,9 +2181,10 @@ where
         } else {
             evidence
         };
-        let messages = vec![ConversationMessage::user_text(format!(
+        let messages: HistoryView = vec![ConversationMessage::user_text(format!(
             "Original objective:\n{objective}\n\nChecked evidence receipts:\n{evidence}\n\nReturn the final answer now."
-        ))];
+        ))]
+        .into();
         let inventory = self.api_client.context_inventory();
         let mut last_error = None;
         let mut models_tried = Vec::new();
@@ -3145,7 +3104,7 @@ where
     fn pack_provider_attempt(
         &self,
         prompt: &PromptAssembly,
-        messages: &[ConversationMessage],
+        messages: &HistoryView,
         model: &str,
         inventory: ProviderContextInventory,
     ) -> Result<ApiRequest, RuntimeError> {
@@ -3160,10 +3119,14 @@ where
         let protocol_overhead_tokens =
             128u64.saturating_add(u64::from(inventory.tool_count as u32).saturating_mul(12));
         let safety_margin_tokens = (context_window_tokens / 100).clamp(128, 2_048);
-        let fixed_input_tokens =
-            crate::context_ledger::estimate_text_tokens(&prompt.trusted_system.join("\n\n"))
-                .saturating_add(conversation_messages_token_estimate(messages))
-                .saturating_add(inventory.tool_schema_tokens);
+        let prepared = self.request_compiler.prepare(
+            prompt,
+            messages,
+            inventory,
+            self.permission_fingerprint,
+            model,
+        );
+        let fixed_input_tokens = prepared.fixed_input_tokens;
         let mut budget = crate::context_ledger::RequestBudgetReport::for_attempt(
             model,
             context_window_tokens,
@@ -3193,7 +3156,7 @@ where
         }
         Ok(ApiRequest {
             prompt: packed_prompt,
-            messages: messages.to_vec(),
+            messages: prepared.history,
             model: model.to_string(),
             reasoning_effort_override: None,
             budget,
@@ -3766,7 +3729,7 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             self.dual_write_message(
                 &ConversationMessage::user_text(user_input.to_string()),
-                self.session().messages.len().wrapping_sub(1),
+                self.session().message_count().wrapping_sub(1),
             );
             self.activate_skills_for_turn(user_input).await?;
         }
@@ -3972,7 +3935,7 @@ where
             }
         };
         apply_runtime_controls(&mut prompt);
-        self.record_runtime_policy_decision(&decision, self.session().messages.len());
+        self.record_runtime_policy_decision(&decision, self.session().message_count());
         self.record_context_event(
             "evidence_plan",
             "runtime",
@@ -3990,14 +3953,14 @@ where
             8,
         );
         let request_clone_started = Instant::now();
-        let mut request_messages = self.session.read().await.messages.clone();
+        let mut request_messages = self.session.read().await.messages_view();
         crate::execution_core::performance::observe_duration(
             "request_history_clone_ms",
             request_clone_started.elapsed(),
         );
         crate::execution_core::performance::observe_bytes(
             "clone_bytes",
-            conversation_message_payload_bytes(&request_messages),
+            request_messages.weight().bytes,
         );
 
         // Compression is a request-preflight recovery path, never a fixed
@@ -4017,7 +3980,7 @@ where
                     "all provider candidates reject the required request context and no semantic compaction boundary is available",
                 ));
             }
-            request_messages = self.session.read().await.messages.clone();
+            request_messages = self.session.read().await.messages_view();
             prompt = self
                 .prepare_reality_context_with_budget_and_items(
                     user_input,
@@ -4101,7 +4064,7 @@ where
                         .saturating_add(request.budget.protocol_overhead_tokens),
                 });
             }
-            self.record_provider_context_request(&request, self.session().messages.len());
+            self.record_provider_context_request(&request, self.session().message_count());
             let attempt_budget = self.runtime_budget_plan_for_candidates(&[model.clone()]);
             let transport_policy = provider_transport_policy(
                 attempt_budget.model_context_window.min(u64::from(u32::MAX)) as u32,
@@ -4341,7 +4304,7 @@ where
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             self.dual_write_message(
                 &assistant_message,
-                self.session().messages.len().wrapping_sub(1),
+                self.session().message_count().wrapping_sub(1),
             );
             self.reconcile_provider_context_usage(usage);
             self.usage_tracker.record(usage);
@@ -4349,7 +4312,7 @@ where
                 callback.on_usage(&usage);
             }
             self.record_assistant_iteration(
-                self.session().messages.len(),
+                self.session().message_count(),
                 &assistant_message,
                 calls.len(),
             );
@@ -4434,7 +4397,7 @@ where
                     )
                 })
         });
-        self.record_governed_tool_plan(&plan, self.session().messages.len());
+        self.record_governed_tool_plan(&plan, self.session().message_count());
         let model_team_conflicts_with_admission = model_team_request_conflicts_with_admission(
             decision.strategy.selected_candidate,
             calls,
@@ -4550,7 +4513,7 @@ where
             self.satisfy_tool_strategy_gates(&plan, &decision, &mut validation)
                 .await;
         }
-        self.record_tool_strategy_validation(&validation, self.session().messages.len());
+        self.record_tool_strategy_validation(&validation, self.session().message_count());
         let mut result_map = std::collections::HashMap::new();
         let mut max_concurrency_observed = 0;
         let mut parallel_batches = 0;
@@ -4566,7 +4529,7 @@ where
                 .iter()
                 .filter(|batch| batch.max_concurrency > 1 && batch.indices.len() > 1)
                 .count();
-            self.record_tool_schedule(&plan, &requests, self.session().messages.len());
+            self.record_tool_schedule(&plan, &requests, self.session().message_count());
             for batch in &plan.batches {
                 self.execute_tool_schedule_batch(
                     batch,
@@ -4597,7 +4560,7 @@ where
                     .await
                     .push_message(message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(&message, self.session().messages.len().wrapping_sub(1));
+                self.dual_write_message(&message, self.session().message_count().wrapping_sub(1));
                 result_map.insert(call.id.clone(), (message, None));
             }
         }
@@ -4754,7 +4717,7 @@ where
             parallel_tool_batches,
         };
         self.record_turn_completed(&summary);
-        self.record_ai_kernel_trace_event(&summary.ai_kernel_trace, self.session().messages.len());
+        self.record_ai_kernel_trace_event(&summary.ai_kernel_trace, self.session().message_count());
         if let Some(ref cowd) = self.cowd_bus {
             cowd.emit(crate::cowd_event::CowdEvent::WriteAttemptsObserved {
                 paths: summary.write_attempt_paths.clone(),
@@ -5050,7 +5013,7 @@ where
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
                             self.dual_write_message(
                                 &denied,
-                                self.session().messages.len().wrapping_sub(1),
+                                self.session().message_count().wrapping_sub(1),
                             );
                             return Ok(denied);
                         }
@@ -5113,7 +5076,7 @@ where
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
                         self.dual_write_message(
                             &denied,
-                            self.session().messages.len().wrapping_sub(1),
+                            self.session().message_count().wrapping_sub(1),
                         );
                         return Ok(denied);
                     }
@@ -5130,7 +5093,7 @@ where
                 self.record_tool_invocation_event(
                     &invocation_record,
                     "tool.invocation.started",
-                    self.session().messages.len(),
+                    self.session().message_count(),
                 );
                 self.record_tool_started(iterations, tool_name);
                 self.emit_tool_started(tool_use_id, tool_name, &effective_input);
@@ -5471,7 +5434,7 @@ where
                     .await
                     .push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(&result, self.session().messages.len().wrapping_sub(1));
+                self.dual_write_message(&result, self.session().message_count().wrapping_sub(1));
                 if let Some(payload) = prepared_vision {
                     let image_message = vision_user_message(&payload);
                     self.session
@@ -5481,7 +5444,7 @@ where
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
                     self.dual_write_message(
                         &image_message,
-                        self.session().messages.len().wrapping_sub(1),
+                        self.session().message_count().wrapping_sub(1),
                     );
                 }
                 self.record_tool_invocation_event(
@@ -5491,7 +5454,7 @@ where
                     } else {
                         "tool.invocation.completed"
                     },
-                    self.session().messages.len().wrapping_sub(1),
+                    self.session().message_count().wrapping_sub(1),
                 );
                 self.record_tool_finished(iterations, &result);
                 Ok(result)
@@ -5522,7 +5485,7 @@ where
                     .await
                     .push_message(denied.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(&denied, self.session().messages.len().wrapping_sub(1));
+                self.dual_write_message(&denied, self.session().message_count().wrapping_sub(1));
                 Ok(denied)
             }
         }
@@ -5927,6 +5890,11 @@ where
         &mut self.api_client
     }
 
+    #[must_use]
+    pub fn request_compiler_stats(&self) -> crate::RequestCompilerStats {
+        self.request_compiler.stats()
+    }
+
     pub fn session_mut(&mut self) -> tokio::sync::RwLockWriteGuard<'_, Session> {
         self.session.blocking_write()
     }
@@ -5943,7 +5911,7 @@ where
         session
             .push_message(message.clone())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-        let sequence = session.messages.len().wrapping_sub(1);
+        let sequence = session.message_count().wrapping_sub(1);
         drop(session);
         self.dual_write_message(&message, sequence);
         Ok(())
@@ -5974,15 +5942,16 @@ where
         let Some(plan) = plan_session_compaction(&original_session, config) else {
             return Ok(None);
         };
+        let original_messages = original_session.materialize_messages();
 
         let source_messages = compacted_source_messages(
-            &original_session.messages,
+            &original_messages,
             plan.source_message_start,
             plan.source_message_end,
         );
         let raw_refs = source_message_evidence_refs(
             &original_session.session_id,
-            &original_session.messages,
+            &original_messages,
             plan.source_message_start,
             plan.source_message_end,
         );
@@ -6090,7 +6059,7 @@ where
         });
 
         tracing::info!(removed = result.removed_message_count, "compaction");
-        let compacted_len = result.compacted_session.messages.len();
+        let compacted_len = result.compacted_session.message_count();
         let compaction = result.compacted_session.compaction.clone().ok_or_else(|| {
             RuntimeError::new("semantic compaction did not produce a session compaction record")
         })?;
@@ -6421,8 +6390,7 @@ where
             .session
             .read()
             .await
-            .messages
-            .iter()
+            .messages()
             .enumerate()
             .map(|(idx, msg)| {
                 let role = match msg.role {
@@ -6694,8 +6662,7 @@ where
             .session
             .read()
             .await
-            .messages
-            .iter()
+            .messages()
             .enumerate()
             .map(|(idx, msg)| {
                 let role = match msg.role {
@@ -7295,7 +7262,7 @@ where
             crate::context_ledger::ContextComponentKind::ToolResult,
             receipt.receipt_tokens,
             access.map(|_| format!("tool://{}", raw_ref.id())),
-            self.session().messages.len(),
+            self.session().message_count(),
         );
         receipt
     }
@@ -7341,7 +7308,7 @@ where
         self.record_tool_invocation_event(
             &record,
             "tool.invocation.denied",
-            self.session().messages.len(),
+            self.session().message_count(),
         );
     }
 
@@ -9506,7 +9473,7 @@ mod tests {
     fn provider_transport_policy_scales_with_actual_request_size() {
         let small = ApiRequest {
             prompt: PromptAssembly::new(vec!["system".to_string()]),
-            messages: vec![ConversationMessage::user_text("status".to_string())],
+            messages: vec![ConversationMessage::user_text("status".to_string())].into(),
             model: "test".to_string(),
             reasoning_effort_override: None,
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
@@ -9515,7 +9482,7 @@ mod tests {
         };
         let large = ApiRequest {
             prompt: PromptAssembly::new(vec!["system".repeat(5_000)]),
-            messages: vec![ConversationMessage::user_text("evidence".repeat(10_000))],
+            messages: vec![ConversationMessage::user_text("evidence".repeat(10_000))].into(),
             model: "test".to_string(),
             reasoning_effort_override: None,
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
@@ -9554,14 +9521,17 @@ mod tests {
             });
         }
 
+        let history: crate::HistoryView =
+            vec![ConversationMessage::user_text("history ".repeat(300))].into();
         let request = runtime
             .pack_provider_attempt(
                 &prompt,
-                &[ConversationMessage::user_text("history ".repeat(300))],
+                &history,
                 "test",
                 super::ProviderContextInventory {
                     tool_count: 2,
                     tool_schema_tokens: 1_200,
+                    ..Default::default()
                 },
             )
             .expect("candidate request should fit after contextual packing");
@@ -9593,16 +9563,19 @@ mod tests {
         runtime.set_active_model("custom-model-with-generic-cap");
         runtime = runtime.with_model_context_window(context_window);
 
+        let history: crate::HistoryView = vec![ConversationMessage::user_text(
+            "current durable user turn ".repeat(20),
+        )]
+        .into();
         let request = runtime
             .pack_provider_attempt(
                 &PromptAssembly::new(vec!["production system policy ".repeat(400)]),
-                &[ConversationMessage::user_text(
-                    "current durable user turn ".repeat(20),
-                )],
+                &history,
                 "custom-model-with-generic-cap",
                 super::ProviderContextInventory {
                     tool_count: 3,
                     tool_schema_tokens: 1_740,
+                    ..Default::default()
                 },
             )
             .expect("production prompt and bootstrap schemas must reach a 16k custom model");
@@ -9906,7 +9879,7 @@ mod tests {
             .expect("memory manager"),
         );
         let mut session = Session::new();
-        session.messages = vec![
+        session.replace_messages(vec![
             ConversationMessage::user_text("old request ".repeat(200)),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "old response ".repeat(200),
@@ -9915,7 +9888,7 @@ mod tests {
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "recent assistant response".to_string(),
             }]),
-        ];
+        ]);
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().expect("session store"));
         store
             .create_session(&memory::SessionRecord {
@@ -9956,17 +9929,17 @@ mod tests {
         assert!(receipt.removed_message_count > 0);
         let compacted = runtime.session_async().await;
         assert_eq!(
-            compacted.messages.len(),
+            compacted.message_count(),
             3,
             "configured preserve_recent=2 must win"
         );
         assert!(matches!(
-            &compacted.messages[0].blocks[0],
+            &compacted.message(0).expect("summary").blocks[0],
             ContentBlock::Text { text }
                 if text.contains("Compressed Session Summary")
                     && !text.contains("Conversation summary:")
         ));
-        assert!(compacted.messages.iter().any(|message| {
+        assert!(compacted.messages().any(|message| {
             message.blocks.iter().any(|block| {
                 matches!(
                     block,
@@ -9979,7 +9952,7 @@ mod tests {
     #[tokio::test]
     async fn compaction_without_durable_session_store_retains_the_transcript() {
         let mut session = Session::new();
-        session.messages = vec![
+        session.replace_messages(vec![
             ConversationMessage::user_text("old request"),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "old response".to_string(),
@@ -9988,7 +9961,7 @@ mod tests {
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "recent response".to_string(),
             }]),
-        ];
+        ]);
         let before = session.clone();
         let mut runtime = ConversationRuntime::new(
             session,
@@ -10752,8 +10725,7 @@ mod tests {
 
         let mut session = Session::new();
         session
-            .messages
-            .push(crate::session::ConversationMessage::assistant_with_usage(
+            .push_message(crate::session::ConversationMessage::assistant_with_usage(
                 vec![ContentBlock::Text {
                     text: "earlier".to_string(),
                 }],
@@ -10763,7 +10735,8 @@ mod tests {
                     cache_creation_input_tokens: 2,
                     cache_read_input_tokens: 1,
                 }),
-            ));
+            ))
+            .expect("append prior usage");
 
         let runtime = ConversationRuntime::new(
             session,
@@ -10952,7 +10925,7 @@ mod tests {
         let events = api
             .stream_collect(ApiRequest {
                 prompt: PromptAssembly::default(),
-                messages: Vec::new(),
+                messages: Vec::new().into(),
                 model: "test".to_string(),
                 reasoning_effort_override: None,
                 budget: crate::context_ledger::RequestBudgetReport::for_attempt(

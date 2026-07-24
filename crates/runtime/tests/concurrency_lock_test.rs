@@ -35,7 +35,7 @@ async fn test_no_deadlock_under_concurrent_reads_and_writes() {
             for _ in 0..10 {
                 let guard = session.read().await;
                 let _session_id_len = guard.session_id.len();
-                let _msg_count = guard.messages.len();
+                let _msg_count = guard.message_count();
                 let _version = guard.version;
                 drop(guard);
             }
@@ -60,7 +60,7 @@ async fn test_no_deadlock_under_concurrent_reads_and_writes() {
                     }],
                     usage: None,
                 };
-                guard.messages.push(msg);
+                guard.push_message(msg).expect("append message");
                 guard.updated_at_ms = 0;
                 drop(guard);
             }
@@ -92,7 +92,7 @@ async fn test_no_deadlock_under_concurrent_reads_and_writes() {
     // Verify the session has the expected number of messages (10 writers × 5 msgs each)
     let final_session = session.read().await;
     assert_eq!(
-        final_session.messages.len(),
+        final_session.message_count(),
         50,
         "expected 50 messages from 10 writers × 5 messages each"
     );
@@ -116,7 +116,7 @@ async fn test_lock_contention_under_heavy_load() {
         handles.push(tokio::spawn(async move {
             let guard = session.read().await;
             let _sid = guard.session_id.clone();
-            let _msgs = guard.messages.len();
+            let _msgs = guard.message_count();
             drop(guard);
             i
         }));
@@ -134,7 +134,7 @@ async fn test_lock_contention_under_heavy_load() {
                 }],
                 usage: None,
             };
-            guard.messages.push(msg);
+            guard.push_message(msg).expect("append message");
             guard.updated_at_ms = j as u64;
             drop(guard);
             j
@@ -155,7 +155,7 @@ async fn test_lock_contention_under_heavy_load() {
 
     let final_session = session.read().await;
     assert_eq!(
-        final_session.messages.len(),
+        final_session.message_count(),
         write_count,
         "expected {write_count} messages from writers"
     );

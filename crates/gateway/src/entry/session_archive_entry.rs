@@ -7,7 +7,7 @@ use crate::CliOutputFormat;
 
 pub(crate) fn render_export_text(session: &Session) -> String {
     let mut lines = vec!["# Conversation Export".to_string(), String::new()];
-    for (index, message) in session.messages.iter().enumerate() {
+    for (index, message) in session.messages().enumerate() {
         let role = match message.role {
             MessageRole::System => "system",
             MessageRole::User => "user",
@@ -69,8 +69,7 @@ pub(crate) fn resolve_export_path(
 
 fn default_export_filename(session: &Session) -> String {
     let stem = session
-        .messages
-        .iter()
+        .messages()
         .find_map(|message| match message.role {
             MessageRole::User => message.blocks.iter().find_map(|block| match block {
                 ContentBlock::Text { text } => Some(text.as_str()),
@@ -119,7 +118,7 @@ pub(crate) fn run_export(
             "Export\n  Result           wrote markdown transcript\n  File             {}\n  Session          {}\n  Messages         {}",
             path.display(),
             handle.id,
-            session.messages.len(),
+            session.message_count(),
         );
         match output_format {
             CliOutputFormat::Text => println!("{report}"),
@@ -130,7 +129,7 @@ pub(crate) fn run_export(
                     "message": report,
                     "session_id": handle.id,
                     "file": path.display().to_string(),
-                    "messages": session.messages.len(),
+                    "messages": session.message_count(),
                 }))?
             ),
         }
@@ -150,7 +149,7 @@ pub(crate) fn run_export(
                 "kind": "export",
                 "session_id": handle.id,
                 "file": handle.path.display().to_string(),
-                "messages": session.messages.len(),
+                "messages": session.message_count(),
                 "markdown": markdown,
             }))?
         ),
@@ -168,7 +167,7 @@ pub(crate) fn render_session_markdown(
         String::new(),
         format!("- **Session**: `{session_id}`"),
         format!("- **File**: `{}`", session_path.display()),
-        format!("- **Messages**: {}", session.messages.len()),
+        format!("- **Messages**: {}", session.message_count()),
     ];
     if let Some(workspace_root) = session.workspace_root() {
         lines.push(format!("- **Workspace**: `{}`", workspace_root.display()));
@@ -190,7 +189,7 @@ pub(crate) fn render_session_markdown(
     lines.push("---".to_string());
     lines.push(String::new());
 
-    for (index, message) in session.messages.iter().enumerate() {
+    for (index, message) in session.messages().enumerate() {
         let role = match message.role {
             MessageRole::System => "System",
             MessageRole::User => "User",

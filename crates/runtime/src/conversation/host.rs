@@ -625,8 +625,8 @@ where
         None => None,
     };
     let session = runtime.session();
+    let turn_transcript_start = session.message_count();
     let session_id = session.session_id;
-    let turn_transcript_start = session.messages.len();
     let turn_ref = ingress
         .as_ref()
         .map(|ingress| ingress.turn_id.clone())
@@ -2997,7 +2997,7 @@ where
                 runtime.require_next_model_reasoning_effort(effort);
             }
         }
-        let transcript_len = runtime.session_async().await.messages.len();
+        let transcript_len = runtime.session_async().await.message_count();
         let result = if clean_terminal_synthesis {
             runtime
                 .execute_clean_terminal_synthesis(
@@ -3008,10 +3008,10 @@ where
         } else {
             runtime.execute_model_step(&content, first_step).await
         };
-        rollback_uncommitted_transcript(
-            &mut runtime.session_mut_async().await.messages,
-            transcript_len,
-        );
+        runtime
+            .session_mut_async()
+            .await
+            .truncate_messages(transcript_len);
         let consumed_inputs = runtime.take_consumed_session_inputs();
         let cowd_bus = runtime.cowd_bus().cloned();
         drop(runtime);
@@ -4516,8 +4516,7 @@ where
             .await
             .session_mut_async()
             .await
-            .messages
-            .extend(messages);
+            .extend_messages(messages);
         tracing::debug!(node_id = %ticket.node_id, "committed model transcript published");
         Ok(())
     }
@@ -4830,16 +4829,16 @@ where
             )
         } else {
             let mut runtime = self.runtime.lock().await;
-            let transcript_len = runtime.session_async().await.messages.len();
+            let transcript_len = runtime.session_async().await.message_count();
             let result = runtime
                 .execute_tool_batch_step(&calls, &prompter, iteration)
                 .await;
             // The legacy conversation engine writes tool messages eagerly. Roll them
             // back until the graph transition commits; after_commit publishes them.
-            rollback_uncommitted_transcript(
-                &mut runtime.session_mut_async().await.messages,
-                transcript_len,
-            );
+            runtime
+                .session_mut_async()
+                .await
+                .truncate_messages(transcript_len);
             drop(runtime);
             let result = result.map_err(|error| NodeExecutorError::Poll {
                 node_id: ticket.node_id.clone(),
@@ -5506,8 +5505,7 @@ where
             .await
             .session_mut_async()
             .await
-            .messages
-            .extend(messages);
+            .extend_messages(messages);
         Ok(())
     }
 }
@@ -6080,10 +6078,13 @@ where
                 let runtime = self.runtime.lock().await;
                 let session = runtime.session_async().await;
                 session
-                    .messages
-                    .get(turn_transcript_start..)
-                    .unwrap_or_default()
-                    .to_vec()
+                    .messages_page(
+                        turn_transcript_start,
+                        session
+                            .message_count()
+                            .saturating_sub(turn_transcript_start),
+                    )
+                    .materialize()
             };
             // The source ingress row and its Runtime request are committed in
             // one Gateway transaction before execution begins. Persisting it
@@ -7078,10 +7079,6 @@ fn explicit_model_step_limit(content: &str) -> Option<usize> {
 /// The legacy conversation engine appends provider/tool messages during the
 /// effect call. They are deliberately removed until Runner commits the node;
 /// `after_commit` is the only publisher to the parent transcript.
-fn rollback_uncommitted_transcript(messages: &mut Vec<ConversationMessage>, committed_len: usize) {
-    messages.truncate(committed_len);
-}
-
 fn resource_scopes_for_tool_calls(calls: &[ModelToolCall]) -> Vec<String> {
     // These scopes are descriptive graph/evaluation metadata, not execution
     // leases. ToolBatch container nodes deliberately skip ScopeLockManager in
@@ -9083,13 +9080,13 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let mut session = Session::new();
         session
-            .messages
-            .push(ConversationMessage::user_text("previous objective"));
+            .push_message(ConversationMessage::user_text("previous objective"))
+            .expect("append previous objective");
         session
-            .messages
-            .push(ConversationMessage::assistant(vec![ContentBlock::Text {
+            .push_message(ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "previous terminal answer".to_string(),
-            }]));
+            }]))
+            .expect("append previous answer");
         let runtime = crate::ConversationRuntime::new(
             session,
             ProtocolFailureThenFinalClient {
@@ -9144,7 +9141,7 @@ mod tests {
             .any(|fragment| fragment.contains("provider-protocol recovery")));
         drop(requests);
 
-        let transcript = runtime.session_async().await.messages;
+        let transcript = runtime.session_async().await.materialize_messages();
         assert_eq!(
             transcript
                 .iter()
@@ -10369,7 +10366,7 @@ mod tests {
             }]),
             ConversationMessage::tool_result("tool", "write", "done", false),
         ];
-        rollback_uncommitted_transcript(&mut messages, 1);
+        messages.truncate(1);
         assert_eq!(messages, vec![ConversationMessage::user_text("committed")]);
     }
 

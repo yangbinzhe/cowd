@@ -223,7 +223,7 @@ fn session_to_record(session: &Session, path: &Path) -> memory::store::session::
         model: session.model.clone(),
         created_at: now.clone(),
         last_activity: now,
-        message_count: session.messages.len() as i64,
+        message_count: session.message_count() as i64,
         reset_policy: "none".to_string(),
         metadata_json: Some(metadata.to_string()),
         input_tokens: 0,
@@ -263,21 +263,19 @@ pub(crate) fn sync_cli_session_to_unified_store(
             .or_else(|| model.map(std::string::ToString::to_string)),
         created_at,
         last_activity: now,
-        message_count: session.messages.len() as i64,
+        message_count: session.message_count() as i64,
         reset_policy: existing
             .as_ref()
             .map(|record| record.reset_policy.clone())
             .unwrap_or_else(|| "none".to_string()),
         metadata_json: Some(metadata.to_string()),
         input_tokens: session
-            .messages
-            .iter()
+            .messages()
             .filter_map(|message| message.usage.as_ref())
             .map(|usage| i64::from(usage.input_tokens))
             .sum(),
         output_tokens: session
-            .messages
-            .iter()
+            .messages()
             .filter_map(|message| message.usage.as_ref())
             .map(|usage| i64::from(usage.output_tokens))
             .sum(),
@@ -301,8 +299,7 @@ pub(crate) fn sync_cli_session_to_unified_store(
             .await?;
 
         let messages = session
-            .messages
-            .iter()
+            .messages()
             .enumerate()
             .map(|(sequence, message)| message.to_session_message(&session.session_id, sequence))
             .collect::<Vec<_>>();
@@ -310,7 +307,7 @@ pub(crate) fn sync_cli_session_to_unified_store(
             store.insert_messages_batch(&messages).await?;
         }
 
-        for (sequence, message) in session.messages.iter().enumerate() {
+        for (sequence, message) in session.messages().enumerate() {
             let message_json =
                 serde_json::from_str::<serde_json::Value>(&message.to_json().render())
                     .unwrap_or(serde_json::Value::Null);
@@ -508,7 +505,7 @@ pub(crate) fn hydrated_runtime_session(
         })?;
     session.session_id = record.session_id;
     session.model = record.model;
-    session.messages = messages;
+    session.replace_messages(messages);
     session.workspace_root = workspace_root;
     session.fork = parent_session_id.map(|parent_session_id| runtime::SessionFork {
         parent_session_id,
@@ -585,11 +582,19 @@ mod hydration_tests {
 
         assert_eq!(session.session_id, "hydrate-session");
         assert_eq!(session.model.as_deref(), Some("effective-model"));
-        assert_eq!(session.messages.len(), 2);
-        assert_eq!(session.messages[0].role, runtime::MessageRole::User);
-        assert_eq!(session.messages[1].role, runtime::MessageRole::Assistant);
+        assert_eq!(session.message_count(), 2);
         assert_eq!(
-            session.messages[1]
+            session.message(0).expect("user").role,
+            runtime::MessageRole::User
+        );
+        assert_eq!(
+            session.message(1).expect("assistant").role,
+            runtime::MessageRole::Assistant
+        );
+        assert_eq!(
+            session
+                .message(1)
+                .expect("assistant")
                 .usage
                 .as_ref()
                 .map(|usage| (usage.input_tokens, usage.output_tokens)),
@@ -659,8 +664,7 @@ mod hydration_tests {
         .expect("contiguous physical rows with causal metadata should hydrate");
 
         let text = session
-            .messages
-            .iter()
+            .messages()
             .map(|message| match message.blocks.first() {
                 Some(runtime::ContentBlock::Text { text }) => text.as_str(),
                 other => panic!("expected text block, got {other:?}"),
@@ -669,8 +673,7 @@ mod hydration_tests {
         assert_eq!(text, vec!["first", "first answer", "second"]);
         assert_eq!(
             session
-                .messages
-                .iter()
+                .messages()
                 .map(|message| message.role)
                 .collect::<Vec<_>>(),
             vec![

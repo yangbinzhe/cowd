@@ -74,7 +74,8 @@ pub(crate) fn run_deep_real_provider_review(
             role: runtime::MessageRole::User,
             blocks: vec![runtime::ContentBlock::Text { text: prompt }],
             usage: None,
-        }],
+        }]
+        .into(),
         model: model.clone(),
         reasoning_effort_override: None,
         budget: runtime::context_ledger::RequestBudgetReport::for_attempt(

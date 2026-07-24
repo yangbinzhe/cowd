@@ -51,21 +51,18 @@ pub struct CompactionPlan {
 /// Roughly estimates the token footprint of the current session transcript.
 #[must_use]
 pub fn estimate_session_tokens(session: &Session) -> usize {
-    session.messages.iter().map(estimate_message_tokens).sum()
+    session.messages().map(estimate_message_tokens).sum()
 }
 
 /// Returns `true` when the session exceeds the configured compaction budget.
 #[must_use]
 pub fn should_compact(session: &Session, config: CompactionConfig) -> bool {
     let start = compacted_summary_prefix_len(session);
-    let compactable = &session.messages[start..];
+    let compactable = session.messages().skip(start);
+    let compactable_len = session.message_count().saturating_sub(start);
 
-    compactable.len() > config.preserve_recent_messages
-        && compactable
-            .iter()
-            .map(estimate_message_tokens)
-            .sum::<usize>()
-            >= config.max_estimated_tokens
+    compactable_len > config.preserve_recent_messages
+        && compactable.map(estimate_message_tokens).sum::<usize>() >= config.max_estimated_tokens
 }
 
 /// Normalizes a compaction summary into user-facing continuation text.
@@ -124,7 +121,8 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         };
     };
 
-    let removed = &session.messages[plan.source_message_start..plan.source_message_end];
+    let messages = session.materialize_messages();
+    let removed = &messages[plan.source_message_start..plan.source_message_end];
     let summary = merge_compact_summaries(
         plan.existing_summary.as_deref(),
         &summarize_messages(removed),
@@ -144,13 +142,11 @@ pub fn plan_session_compaction(
     }
 
     let existing_summary = session
-        .messages
-        .first()
+        .message(0)
         .and_then(extract_existing_compacted_summary);
     let compacted_prefix_len = usize::from(existing_summary.is_some());
     let raw_keep_from = session
-        .messages
-        .len()
+        .message_count()
         .saturating_sub(config.preserve_recent_messages);
     // Ensure we do not split a tool-use / tool-result pair at the compaction
     // boundary. If the first preserved message is a user message whose first
@@ -171,7 +167,7 @@ pub fn plan_session_compaction(
             if k == 0 || k <= compacted_prefix_len {
                 break;
             }
-            let first_preserved = &session.messages[k];
+            let first_preserved = session.message(k)?;
             let starts_with_tool_result = first_preserved
                 .blocks
                 .first()
@@ -180,7 +176,7 @@ pub fn plan_session_compaction(
                 break;
             }
             // Check the message just before the current boundary.
-            let preceding = &session.messages[k - 1];
+            let preceding = session.message(k - 1)?;
             let preceding_has_tool_use = preceding
                 .blocks
                 .iter()
@@ -201,7 +197,7 @@ pub fn plan_session_compaction(
         source_message_end: keep_from,
         removed_message_count: keep_from.saturating_sub(compacted_prefix_len),
         existing_summary,
-        preserved_messages: session.messages[keep_from..].to_vec(),
+        preserved_messages: session.messages().skip(keep_from).cloned().collect(),
     })
 }
 
@@ -226,7 +222,7 @@ pub fn apply_compaction_summary(
     compacted_messages.extend(plan.preserved_messages.clone());
 
     let mut compacted_session = session.clone();
-    compacted_session.messages = compacted_messages;
+    compacted_session.replace_messages(compacted_messages);
     compacted_session.record_compaction(summary.clone(), plan.removed_message_count);
 
     CompactionResult {
@@ -242,8 +238,7 @@ pub fn apply_compaction_summary(
 fn compacted_summary_prefix_len(session: &Session) -> usize {
     usize::from(
         session
-            .messages
-            .first()
+            .message(0)
             .and_then(extract_existing_compacted_summary)
             .is_some(),
     )
@@ -660,7 +655,7 @@ mod tests {
     #[test]
     fn leaves_small_sessions_unchanged() {
         let mut session = Session::new();
-        session.messages = vec![ConversationMessage::user_text("hello")];
+        session.replace_messages(vec![ConversationMessage::user_text("hello")]);
 
         let result = compact_session(&session, CompactionConfig::default());
         assert_eq!(result.removed_message_count, 0);
@@ -672,7 +667,7 @@ mod tests {
     #[test]
     fn compacts_older_messages_into_a_system_summary() {
         let mut session = Session::new();
-        session.messages = vec![
+        session.replace_messages(vec![
             ConversationMessage::user_text("one ".repeat(200)),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "two ".repeat(200),
@@ -685,7 +680,7 @@ mod tests {
                 }],
                 usage: None,
             },
-        ];
+        ]);
 
         let result = compact_session(
             &session,
@@ -706,11 +701,11 @@ mod tests {
             result.removed_message_count
         );
         assert_eq!(
-            result.compacted_session.messages[0].role,
+            result.compacted_session.message(0).expect("summary").role,
             MessageRole::System
         );
         assert!(matches!(
-            &result.compacted_session.messages[0].blocks[0],
+            &result.compacted_session.message(0).expect("summary").blocks[0],
             ContentBlock::Text { text } if text.contains("Summary:")
         ));
         assert!(result.formatted_summary.contains("Scope:"));
@@ -737,7 +732,7 @@ mod tests {
     #[test]
     fn runtime_path_applies_one_caller_supplied_semantic_checkpoint() {
         let mut session = Session::new();
-        session.messages = vec![
+        session.replace_messages(vec![
             ConversationMessage::user_text("old request ".repeat(80)),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "old result ".repeat(80),
@@ -746,7 +741,7 @@ mod tests {
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "recent result".to_string(),
             }]),
-        ];
+        ]);
         let plan = plan_session_compaction(
             &session,
             CompactionConfig {
@@ -769,7 +764,7 @@ mod tests {
         );
         assert!(!result.summary.contains("Conversation summary:"));
         assert!(matches!(
-            &result.compacted_session.messages[0].blocks[0],
+            &result.compacted_session.message(0).expect("summary").blocks[0],
             ContentBlock::Text { text } if text.contains("Semantic checkpoint only")
         ));
     }
@@ -777,7 +772,7 @@ mod tests {
     #[test]
     fn keeps_previous_compacted_context_when_compacting_again() {
         let mut initial_session = Session::new();
-        initial_session.messages = vec![
+        initial_session.replace_messages(vec![
             ConversationMessage::user_text("Investigate rust/crates/runtime/src/compact.rs"),
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "I will inspect the compact flow.".to_string(),
@@ -786,7 +781,7 @@ mod tests {
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "Next: preserve prior summary context during auto compact.".to_string(),
             }]),
-        ];
+        ]);
         let config = CompactionConfig {
             preserve_recent_messages: 2,
             max_estimated_tokens: 1,
@@ -795,7 +790,7 @@ mod tests {
         };
 
         let first = compact_session(&initial_session, config);
-        let mut follow_up_messages = first.compacted_session.messages.clone();
+        let mut follow_up_messages = first.compacted_session.materialize_messages();
         follow_up_messages.extend([
             ConversationMessage::user_text("Please add regression tests for compaction."),
             ConversationMessage::assistant(vec![ContentBlock::Text {
@@ -804,7 +799,7 @@ mod tests {
         ]);
 
         let mut second_session = Session::new();
-        second_session.messages = follow_up_messages;
+        second_session.replace_messages(follow_up_messages);
         let second = compact_session(&second_session, config);
 
         assert!(second
@@ -820,13 +815,13 @@ mod tests {
             .formatted_summary
             .contains("Also update rust/crates/runtime/src/conversation.rs"));
         assert!(matches!(
-            &second.compacted_session.messages[0].blocks[0],
+            &second.compacted_session.message(0).expect("summary").blocks[0],
             ContentBlock::Text { text }
                 if text.contains("Previously compacted context:")
                     && text.contains("Newly compacted context:")
         ));
         assert!(matches!(
-            &second.compacted_session.messages[1].blocks[0],
+            &second.compacted_session.message(1).expect("recent").blocks[0],
             ContentBlock::Text { text } if text.contains("Please add regression tests for compaction.")
         ));
     }
@@ -835,7 +830,7 @@ mod tests {
     fn ignores_existing_compacted_summary_when_deciding_to_recompact() {
         let summary = "<summary>Conversation summary:\n- Scope: earlier work preserved.\n- Key timeline:\n  - user: large preserved context\n</summary>";
         let mut session = Session::new();
-        session.messages = vec![
+        session.replace_messages(vec![
             ConversationMessage {
                 role: MessageRole::System,
                 blocks: vec![ContentBlock::Text {
@@ -847,7 +842,7 @@ mod tests {
             ConversationMessage::assistant(vec![ContentBlock::Text {
                 text: "recent".to_string(),
             }]),
-        ];
+        ]);
 
         assert!(!should_compact(
             &session,
@@ -929,7 +924,7 @@ mod tests {
         // After compaction, no two consecutive messages should have the pattern
         // tool_result immediately following a non-assistant message (i.e. an
         // orphaned tool result without a preceding assistant ToolUse).
-        let messages = &result.compacted_session.messages;
+        let messages = result.compacted_session.materialize_messages();
         for i in 1..messages.len() {
             let curr_is_tool_result = messages[i]
                 .blocks

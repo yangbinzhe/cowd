@@ -124,6 +124,16 @@ impl PromptAssembly {
                 .sum::<usize>()
     }
 
+    #[must_use]
+    pub fn trusted_system_token_estimate(&self) -> u64 {
+        crate::context_ledger::estimate_text_tokens(&self.trusted_system.join("\n\n"))
+    }
+
+    #[must_use]
+    pub fn revision_fingerprint(&self) -> u64 {
+        model_protocol::fingerprint::stable_hash_bytes(format!("{self:?}").as_bytes())
+    }
+
     /// Select a request-local packet view against the model's real hard input
     /// capacity. Required conversation/task/handoff state is never silently
     /// dropped. Preferred facts, memories and knowledge compete next; optional

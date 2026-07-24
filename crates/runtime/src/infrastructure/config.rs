@@ -603,6 +603,7 @@ pub struct RuntimeFeatureConfig {
     memory: MemoryConfig,
     context_budget: ContextBudgetConfig,
     compression: CompressionConfig,
+    session_history: crate::SessionHistoryConfig,
     gateway: GatewayConfig,
     apps: AppsConfig,
     storage: StorageTopologyConfig,
@@ -1130,6 +1131,7 @@ impl ConfigLoader {
             memory: parse_optional_memory_config(&merged_value)?,
             context_budget: parse_optional_context_budget_config(&merged_value)?,
             compression: parse_optional_compression_config(&merged_value)?,
+            session_history: parse_optional_session_history_config(&merged_value)?,
             gateway: parse_optional_gateway_config(&merged_value)?,
             apps: parse_optional_apps_config(&merged_value)?,
             storage: parse_optional_storage_config(&merged_value)?,
@@ -1274,6 +1276,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn compression(&self) -> &CompressionConfig {
         &self.feature_config.compression
+    }
+
+    #[must_use]
+    pub fn session_history(&self) -> crate::SessionHistoryConfig {
+        self.feature_config.session_history
     }
 
     #[must_use]
@@ -1482,6 +1489,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn compression(&self) -> &CompressionConfig {
         &self.compression
+    }
+
+    #[must_use]
+    pub const fn session_history(&self) -> crate::SessionHistoryConfig {
+        self.session_history
     }
 
     #[must_use]
@@ -2343,6 +2355,41 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         )?
         .unwrap_or(MemoryConfig::default().coherence_threshold_bp),
     })
+}
+
+fn parse_optional_session_history_config(
+    root: &JsonValue,
+) -> Result<crate::SessionHistoryConfig, ConfigError> {
+    let defaults = crate::SessionHistoryConfig::default();
+    let Some(object) = root.as_object() else {
+        return Ok(defaults);
+    };
+    let Some(history_value) = object.get("session_history") else {
+        return Ok(defaults);
+    };
+    let history = expect_object(history_value, "merged settings.session_history")?;
+    let config = crate::SessionHistoryConfig {
+        chunk_messages: optional_usize(
+            history,
+            "chunk_messages",
+            "merged settings.session_history",
+        )?
+        .unwrap_or(defaults.chunk_messages),
+        chunk_bytes: optional_usize(history, "chunk_bytes", "merged settings.session_history")?
+            .unwrap_or(defaults.chunk_bytes),
+        request_cache_entries: optional_usize(
+            history,
+            "request_cache_entries",
+            "merged settings.session_history",
+        )?
+        .unwrap_or(defaults.request_cache_entries),
+    };
+    if config.chunk_messages == 0 || config.chunk_bytes == 0 || config.request_cache_entries == 0 {
+        return Err(ConfigError::Parse(
+            "merged settings.session_history values must be greater than zero".to_string(),
+        ));
+    }
+    Ok(config)
 }
 
 fn parse_optional_compression_config(root: &JsonValue) -> Result<CompressionConfig, ConfigError> {
@@ -3553,11 +3600,11 @@ mod tests {
     use super::{
         deep_merge_objects, parse_optional_compression_config,
         parse_optional_context_budget_config, parse_optional_model_context_windows,
-        parse_optional_storage_config, parse_permission_mode_label, redact_serde_json,
-        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport, ProviderProtocol,
-        ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-        RuntimePluginConfig, SessionCompactConfig, StorageBackendSelection,
-        COWD_SETTINGS_SCHEMA_NAME,
+        parse_optional_session_history_config, parse_optional_storage_config,
+        parse_permission_mode_label, redact_serde_json, ConfigLoader, ConfigSource, DomainProfile,
+        McpServerConfig, McpTransport, ProviderProtocol, ResolvedPermissionMode, RuntimeConfig,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
+        StorageBackendSelection, COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -4939,6 +4986,23 @@ gateway:
             .expect("context budget config should parse");
 
         assert_eq!(budget.subsystem_budget_ratio_bp, 6400);
+    }
+
+    #[test]
+    fn parses_session_history_chunk_and_request_cache_limits() {
+        let root = JsonValue::parse(
+            r#"{"session_history":{"chunk_messages":64,"chunk_bytes":131072,"request_cache_entries":8}}"#,
+        )
+        .expect("json should parse");
+        let history =
+            parse_optional_session_history_config(&root).expect("history config should parse");
+        assert_eq!(history.chunk_messages, 64);
+        assert_eq!(history.chunk_bytes, 131_072);
+        assert_eq!(history.request_cache_entries, 8);
+
+        let invalid =
+            JsonValue::parse(r#"{"session_history":{"request_cache_entries":0}}"#).unwrap();
+        assert!(parse_optional_session_history_config(&invalid).is_err());
     }
 
     #[test]

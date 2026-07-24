@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -88,6 +89,23 @@ pub struct ProviderRuntimeClient {
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    tool_schema_cache: Arc<std::sync::Mutex<Option<CompiledToolSchema>>>,
+    tool_schema_compilations: Arc<AtomicU64>,
+    tool_schema_cache_hits: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+struct CompiledToolSchema {
+    catalog_revision: u64,
+    exposure_revision: u64,
+    tools: Arc<[ToolDefinition]>,
+    inventory: ProviderContextInventory,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolSchemaCacheStats {
+    pub compilations: u64,
+    pub cache_hits: u64,
 }
 
 /// Bridges one provider request into the runtime's lazy `ApiClient` stream.
@@ -150,6 +168,9 @@ impl ProviderRuntimeClient {
             reasoning_effort: None,
             emit_output: false,
             stream_callback: None,
+            tool_schema_cache: Arc::new(std::sync::Mutex::new(None)),
+            tool_schema_compilations: Arc::new(AtomicU64::new(0)),
+            tool_schema_cache_hits: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -197,10 +218,67 @@ impl ProviderRuntimeClient {
             return;
         }
         self.tool_exposure = Some(projection);
+        if let Ok(mut cache) = self.tool_schema_cache.lock() {
+            *cache = None;
+        }
     }
 
     fn active_tool_definitions(&self) -> Vec<ToolDefinition> {
         tool_definitions_for_exposure(&self.tool_definitions, self.tool_exposure.as_ref())
+    }
+
+    fn compiled_tool_schema(&self) -> CompiledToolSchema {
+        let catalog_revision = self
+            .tool_exposure
+            .as_ref()
+            .map_or(0, |projection| projection.catalog_revision);
+        let exposure_revision = self
+            .tool_exposure
+            .as_ref()
+            .map_or(0, |projection| projection.exposure_revision);
+        let provider_registry_revision = self.registry.revision();
+        let mut cache = self
+            .tool_schema_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(compiled) = cache.as_ref().filter(|compiled| {
+            compiled.catalog_revision == catalog_revision
+                && compiled.exposure_revision == exposure_revision
+                && compiled.inventory.provider_registry_revision == provider_registry_revision
+        }) {
+            self.tool_schema_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return compiled.clone();
+        }
+        let tools: Arc<[ToolDefinition]> = self.active_tool_definitions().into();
+        let schema_json = serde_json::to_vec(tools.as_ref()).unwrap_or_default();
+        let inventory = ProviderContextInventory {
+            tool_count: tools.len(),
+            tool_schema_tokens: crate::context_ledger::estimate_text_tokens(
+                std::str::from_utf8(&schema_json).unwrap_or_default(),
+            ),
+            catalog_revision,
+            exposure_revision,
+            schema_fingerprint: model_protocol::fingerprint::stable_hash_bytes(&schema_json),
+            provider_registry_revision,
+        };
+        let compiled = CompiledToolSchema {
+            catalog_revision,
+            exposure_revision,
+            tools,
+            inventory,
+        };
+        *cache = Some(compiled.clone());
+        self.tool_schema_compilations
+            .fetch_add(1, Ordering::Relaxed);
+        compiled
+    }
+
+    #[must_use]
+    pub fn tool_schema_cache_stats(&self) -> ToolSchemaCacheStats {
+        ToolSchemaCacheStats {
+            compilations: self.tool_schema_compilations.load(Ordering::Relaxed),
+            cache_hits: self.tool_schema_cache_hits.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -293,14 +371,7 @@ impl ApiClient for ProviderRuntimeClient {
     }
 
     fn context_inventory(&self) -> ProviderContextInventory {
-        let tools = self.active_tool_definitions();
-        let tool_schema_tokens = serde_json::to_string(&tools)
-            .map(|json| crate::context_ledger::estimate_text_tokens(&json))
-            .unwrap_or(0);
-        ProviderContextInventory {
-            tool_count: tools.len(),
-            tool_schema_tokens,
-        }
+        self.compiled_tool_schema().inventory
     }
 }
 
@@ -318,9 +389,9 @@ impl ProviderRuntimeClient {
             .into_iter()
             .map(InputMessage::user_text)
             .collect::<Vec<_>>();
-        messages.extend(convert_messages(&request.messages));
+        messages.extend(convert_messages(request.messages.iter()));
         let system = request.prompt.trusted_system_text();
-        let active_tools = self.active_tool_definitions();
+        let active_tools = self.compiled_tool_schema().tools.to_vec();
         let tool_choice = (!active_tools.is_empty()).then_some(ToolChoice::Auto);
 
         // Runtime selects one candidate and owns the route/retry lifecycle.
@@ -813,9 +884,11 @@ async fn flush_pending_text(
     .await
 }
 
-fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
+fn convert_messages<'a>(
+    messages: impl IntoIterator<Item = &'a ConversationMessage>,
+) -> Vec<InputMessage> {
     messages
-        .iter()
+        .into_iter()
         .filter_map(|message| {
             let role = match message.role {
                 MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
@@ -996,6 +1069,59 @@ mod tests {
         );
         ProviderRuntimeClient::new(registry, "primary".to_string(), Vec::new())
             .expect("single selected model must be valid");
+    }
+
+    #[test]
+    fn tool_schema_cache_invalidates_only_on_relevant_revisions() {
+        let providers = |base_url: &str| ProvidersConfig {
+            providers: HashMap::from([(
+                "test".to_string(),
+                ProviderConfig {
+                    name: "test".to_string(),
+                    base_url: base_url.to_string(),
+                    api_key: "test".to_string(),
+                    models: vec!["primary".to_string()],
+                    protocol: Some("completions".to_string()),
+                },
+            )]),
+        };
+        let registry = Arc::new(ProviderRegistry::new(providers("https://one.test/v1")).unwrap());
+        let mut client = ProviderRuntimeClient::new(
+            Arc::clone(&registry),
+            "primary".to_string(),
+            vec![tool("read_file")],
+        )
+        .unwrap();
+        client.configure_tool_exposure(exposure(&[], &["read_file"], 1));
+
+        let first = client.compiled_tool_schema();
+        let second = client.compiled_tool_schema();
+        assert_eq!(first.inventory, second.inventory);
+        assert_eq!(
+            client.tool_schema_cache_stats(),
+            super::ToolSchemaCacheStats {
+                compilations: 1,
+                cache_hits: 1,
+            }
+        );
+
+        registry
+            .replace(providers("https://two.test/v1"))
+            .expect("valid provider reload");
+        let recompiled = client.compiled_tool_schema();
+        assert_eq!(recompiled.inventory.provider_registry_revision, 2);
+        assert_eq!(
+            client.tool_schema_cache_stats(),
+            super::ToolSchemaCacheStats {
+                compilations: 2,
+                cache_hits: 1,
+            }
+        );
+
+        client.configure_tool_exposure(exposure(&[], &["read_file"], 2));
+        let exposure_recompiled = client.compiled_tool_schema();
+        assert_eq!(exposure_recompiled.exposure_revision, 2);
+        assert_eq!(client.tool_schema_cache_stats().compilations, 3);
     }
 
     #[test]

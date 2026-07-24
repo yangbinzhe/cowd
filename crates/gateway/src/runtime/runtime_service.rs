@@ -2650,34 +2650,33 @@ impl RuntimeService {
             return None;
         }
         let session = runtime_guard.active_session_stats_session();
-        let messages = &session.messages;
 
-        let user_count = messages
-            .iter()
+        let user_count = session
+            .messages()
             .filter(|message| message.role == runtime::MessageRole::User)
             .count();
-        let assistant_count = messages
-            .iter()
+        let assistant_count = session
+            .messages()
             .filter(|message| message.role == runtime::MessageRole::Assistant)
             .count();
-        let tool_count = messages
-            .iter()
+        let tool_count = session
+            .messages()
             .filter(|message| message.role == runtime::MessageRole::Tool)
             .count();
 
-        let input: u32 = messages
-            .iter()
+        let input: u32 = session
+            .messages()
             .filter_map(|message| message.usage.as_ref())
             .map(|usage| usage.input_tokens)
             .sum();
-        let output: u32 = messages
-            .iter()
+        let output: u32 = session
+            .messages()
             .filter_map(|message| message.usage.as_ref())
             .map(|usage| usage.output_tokens)
             .sum();
 
         let mut tool_usage = HashMap::new();
-        for message in messages {
+        for message in session.messages() {
             if message.role == runtime::MessageRole::Assistant {
                 for block in &message.blocks {
                     if let runtime::ContentBlock::ToolUse { name, .. } = block {
@@ -2689,7 +2688,7 @@ impl RuntimeService {
 
         Some(SessionStatsSnapshot {
             session_id: session_id.to_string(),
-            message_count: messages.len(),
+            message_count: session.message_count(),
             message_counts: SessionMessageCounts {
                 user: user_count,
                 assistant: assistant_count,
@@ -2738,11 +2737,14 @@ impl RuntimeService {
         }
         let session = runtime_guard.session_async().await;
 
-        let all_messages: Vec<serde_json::Value> = session
-            .messages
+        let total = session.message_count();
+        let start = from_seq.unwrap_or(offset).min(total);
+        let page = session.messages_page(start, limit);
+        let messages: Vec<serde_json::Value> = page
             .iter()
             .enumerate()
-            .map(|(sequence, msg)| {
+            .map(|(page_index, msg)| {
+                let sequence = start + page_index;
                 let role = match msg.role {
                     runtime::MessageRole::System => "system",
                     runtime::MessageRole::User => "user",
@@ -2811,10 +2813,6 @@ impl RuntimeService {
                 value
             })
             .collect();
-        let total = all_messages.len();
-        let start = from_seq.unwrap_or(offset);
-        let messages: Vec<serde_json::Value> =
-            all_messages.into_iter().skip(start).take(limit).collect();
         let next_seq = (!messages.is_empty()).then_some(start + messages.len());
         let has_more = next_seq.map(|seq| seq < total).unwrap_or(start < total);
 

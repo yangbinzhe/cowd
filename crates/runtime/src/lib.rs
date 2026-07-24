@@ -127,6 +127,8 @@ pub mod recovery;
 pub mod recovery_recipes;
 #[path = "infrastructure/remote.rs"]
 mod remote;
+#[path = "conversation/request_compiler.rs"]
+mod request_compiler;
 #[path = "context/resources/mod.rs"]
 pub mod resources;
 #[path = "infrastructure/runtime_control.rs"]
@@ -176,6 +178,8 @@ pub mod cowd_event;
 pub mod cross_plane_policy;
 #[path = "agent/definition_registry.rs"]
 pub mod definition_registry;
+#[path = "session/history.rs"]
+mod session_history;
 pub use definition_registry::AgentDefinitionDraftReceipt;
 #[path = "infrastructure/eval_gate.rs"]
 pub mod eval_gate;
@@ -622,6 +626,7 @@ pub use remote::{
     RemoteSessionContext, UpstreamProxyBootstrap, UpstreamProxyState, DEFAULT_REMOTE_BASE_URL,
     DEFAULT_SESSION_TOKEN_PATH, DEFAULT_SYSTEM_CA_BUNDLE, NO_PROXY_HOSTS, UPSTREAM_PROXY_ENV_KEYS,
 };
+pub use request_compiler::{PreparedRequestBasis, PreparedRequestCompiler, RequestCompilerStats};
 pub use resources::{
     register_resource_from_path, render_resource_context_markdown, resource_hint,
     ResourceCapabilityIndex, ResourceCapabilitySnapshot, ResourceEvidence, ResourceHint,
@@ -661,6 +666,9 @@ pub use session_execution::{
     SessionHandoffResolution, SessionIngressExecutionReceipt, SessionIngressExecutor,
     SessionInputRouteReceipt, SessionInputRouteReport, SessionInputRouter, SessionInputRouterError,
     SessionRecoveryCandidate, SESSION_DISPATCH_EXECUTOR,
+};
+pub use session_history::{
+    HistoryCursor, HistoryView, HistoryWeight, SessionHistory, SessionHistoryConfig,
 };
 pub use session_input::{SessionInputRecord, SessionInputStream};
 pub use session_relation_graph::{
