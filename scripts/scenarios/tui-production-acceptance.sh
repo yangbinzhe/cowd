@@ -1280,7 +1280,7 @@ printf '10k_tail_visible_ms\t%s\n10k_rss_kib\t%s\n' \
   || fail "10k TUI RSS is ${tenk_rss_kib}KiB, above the 512MiB gate"
 
 tenk_search_started_ms="$(monotonic_ms)"
-send_raw tenk-reader /
+send_raw tenk-reader $'\006'
 send_raw tenk-reader 'V584-10K-EARLY-00000'
 send_raw tenk-reader $'\r'
 wait_capture tenk-reader 'V584-10K-EARLY-00000 durable history payload' 10k-search \

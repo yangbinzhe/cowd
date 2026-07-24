@@ -195,7 +195,9 @@ impl FocusTarget {
     fn hint(self) -> &'static str {
         match self {
             FocusTarget::Chat => "j/k scroll · / commands · Ctrl+P palette · Ctrl+B panels",
-            FocusTarget::Input => "Enter send · Alt+Enter/Ctrl+J newline · / commands · Esc clear",
+            FocusTarget::Input => {
+                "Enter send · Alt+Enter/Ctrl+J newline · Ctrl+F search · / commands · Esc clear"
+            }
             FocusTarget::Activity => "j/k scroll · PgUp/PgDn page · Esc close",
             FocusTarget::Sidebar => "Tab switch · j/k scroll · Esc close · /focus input",
             FocusTarget::TopicPanel(SidebarTopicPanel::Diff) => {

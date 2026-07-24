@@ -8,7 +8,7 @@
 //   3. Panel switch (Chat → Gateway → Files → Memory → Skills → Delegate)
 //   4. Session picker lifecycle
 //   5. Approval dialog lifecycle
-//   6. Search flow (/, type query, Enter, n/N navigation)
+//   6. Search flow (Ctrl+F, type query, Enter, F3/Shift+F3 navigation)
 //   7. Model switch (via action dispatch)
 //   8. Theme toggle dark↔light
 //   9. Diff viewer panel
@@ -485,20 +485,11 @@ fn integration_search_flow() {
     // Clear input to allow search activation via keybind engine
     state.input = crate::components::composer::model::ComposerModel::default();
 
-    // Use handle_input to route / through keybind engine
-    let handled = state.handle_input(key(KeyCode::Char('/')));
-    // / is bound to Action::Search
+    state.process_raw_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
     assert!(
-        handled || state.search_active,
-        "search should be activated by /"
+        state.search_active,
+        "search should be activated by Ctrl+F through the production input path"
     );
-
-    // If search wasn't activated by keybind, activate directly
-    if !state.search_active {
-        state.search_active = true;
-        state.search_query.clear();
-    }
-    assert!(state.search_active);
 
     // Type query characters (search_active routes to handle_search_key)
     state.process_raw_key(key(KeyCode::Char('w')));
@@ -513,11 +504,11 @@ fn integration_search_flow() {
     assert!(!state.search_active);
     assert!(!state.search_matches.is_empty());
 
-    if state.search_matches.len() > 1 {
-        let before = state.search_current;
-        state.search_next();
-        assert!(state.search_current != before || state.search_matches.len() == 1);
-    }
+    assert_eq!(state.search_matches.len(), 2);
+    state.process_raw_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+    assert_eq!(state.search_current, 1);
+    state.process_raw_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT));
+    assert_eq!(state.search_current, 0);
 
     state.cancel_search();
     assert!(state.search_query.is_empty());

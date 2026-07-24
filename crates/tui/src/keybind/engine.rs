@@ -447,7 +447,7 @@ pub fn default_bindings() -> KeyMap {
     // ── Search ──
     map.add_grouped(
         KeyChord {
-            keys: vec![KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)],
+            keys: vec![KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)],
         },
         Action::Search,
         "Search timeline",
@@ -455,7 +455,7 @@ pub fn default_bindings() -> KeyMap {
     );
     map.add_grouped(
         KeyChord {
-            keys: vec![KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)],
+            keys: vec![KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)],
         },
         Action::SearchNext,
         "Next search match",
@@ -463,7 +463,7 @@ pub fn default_bindings() -> KeyMap {
     );
     map.add_grouped(
         KeyChord {
-            keys: vec![KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE)],
+            keys: vec![KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT)],
         },
         Action::SearchPrev,
         "Previous search match",

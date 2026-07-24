@@ -88,7 +88,7 @@ impl Composer {
         );
         let running_hint = if active { " · Esc cancel" } else { "" };
         let block = Block::default().borders(Borders::ALL).title(format!(
-            " {} · Enter send · Ctrl+J newline · Ctrl+P actions{}{}{} ",
+            " {} · Enter send · Ctrl+J newline · Ctrl+F search · Ctrl+P actions{}{}{} ",
             self.mode_label, resource_hint, queue_hint, running_hint
         ));
         let layout = self.layout_for(input, area.width.saturating_sub(2));
