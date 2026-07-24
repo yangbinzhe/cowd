@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * Deterministic OpenAI-compatible provider used by the V584 production TUI
- * acceptance gate.  It records exactly which conversation roles/texts reached
+ * Deterministic OpenAI-compatible provider used by the V584 production
+ * acceptance gates. It records exactly which conversation roles/texts reached
  * the provider, streams in multiple chunks, reports usage and can deliberately
  * emit a split invalid DSML frame to verify the fail-closed protocol boundary.
  */
@@ -57,6 +57,60 @@ function responseFor(messages, tools) {
     .filter((text) => !text.startsWith("## Runtime context data\n"));
   const latest = userMessages.at(-1) ?? "";
   const prior = userMessages.slice(0, -1).join("\n");
+  const allUserText = userMessages.join("\n");
+
+  if (allUserText.includes("[cowd-e2e:explicit-team-negative]")) {
+    const teamRole = allUserText.match(/## Team role\s+Role:\s*([^\n]+)/)?.[1]?.trim();
+    if (teamRole === "researcher") {
+      const focus = allUserText.match(/\nFocus:\s*([^\n]+)/)?.[1]?.trim();
+      const suffix = allUserText.match(
+        /\[cowd-e2e:explicit-team-negative\]\s+([A-Za-z0-9.-]+)/,
+      )?.[1];
+      const focusRoots = {
+        "crates-gateway": "crates/gateway",
+        "crates-runtime": "crates/runtime",
+        "surfaces-webui": "surfaces/webui",
+      };
+      const focusRoot = focusRoots[focus];
+      const toolResultObserved = messages.some((message) => message?.role === "tool");
+      if (!toolResultObserved && focusRoot && suffix) {
+        const path = `${focusRoot}/e2e-team-${suffix}.md`;
+        return {
+          chunks: [
+            '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="read_file">',
+            `<｜｜DSML｜｜parameter name="path" string="true">${path}</｜｜DSML｜｜parameter>`,
+            "</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+          ],
+          finishReason: "stop",
+        };
+      }
+      return {
+        chunks: [
+          JSON.stringify({
+            findings: [`verified bounded focus ${focus ?? "unknown"}`],
+            evidence: [`read receipt for ${focusRoot ?? focus ?? "bounded focus"}`],
+            unresolved: ["none in deterministic acceptance scope"],
+          }),
+        ],
+        finishReason: "stop",
+      };
+    }
+    if (
+      latest.startsWith("Original objective:")
+      && latest.includes("Checked evidence receipts:")
+    ) {
+      return {
+        chunks: [
+          JSON.stringify({
+            summary: "three bounded Team focuses were executed and synthesized",
+            evidence: ["checked Team child receipts"],
+            unresolved: ["none in deterministic acceptance scope"],
+          }),
+        ],
+        finishReason: "stop",
+      };
+    }
+  }
 
   if (latest.includes("V584_TURN_1")) {
     const nonce = latest.match(/V584-NONCE-[A-Z0-9-]+/)?.[0] ?? "NONCE-MISSING";
