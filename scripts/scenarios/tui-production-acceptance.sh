@@ -838,7 +838,7 @@ pass "E8 simultaneous sessions remain causally and visually isolated"
 
 stop_gateway
 wait_capture writer \
-  'Reconnecting; syncing Runtime state|Disconnected; Runtime state may continue' \
+  'reconnect:[[:digit:]]+@|Gateway session stream interrupted; reconnecting with durable hydration' \
   e7-gateway-down \
   || fail "Gateway loss did not become visible in the active TUI"
 start_gateway || fail "Gateway did not restart on the same durable store"
