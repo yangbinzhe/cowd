@@ -74,11 +74,12 @@ function responseFor(messages, tools) {
       const focusRoot = focusRoots[focus];
       const toolResultObserved = messages.some((message) => message?.role === "tool");
       if (!toolResultObserved && focusRoot && suffix) {
-        const path = `${focusRoot}/e2e-team-${suffix}.md`;
+        const pattern = `e2e-team-${suffix}.md`;
         return {
           chunks: [
-            '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="read_file">',
-            `<｜｜DSML｜｜parameter name="path" string="true">${path}</｜｜DSML｜｜parameter>`,
+            '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="glob_search">',
+            `<｜｜DSML｜｜parameter name="pattern" string="true">${pattern}</｜｜DSML｜｜parameter>`,
+            `<｜｜DSML｜｜parameter name="path" string="true">${focusRoot}</｜｜DSML｜｜parameter>`,
             "</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
           ],
           finishReason: "stop",
@@ -88,7 +89,7 @@ function responseFor(messages, tools) {
         chunks: [
           JSON.stringify({
             findings: [`verified bounded focus ${focus ?? "unknown"}`],
-            evidence: [`read receipt for ${focusRoot ?? focus ?? "bounded focus"}`],
+            evidence: [`scoped discovery receipt for ${focusRoot ?? focus ?? "bounded focus"}`],
             unresolved: ["none in deterministic acceptance scope"],
           }),
         ],
