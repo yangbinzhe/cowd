@@ -43,6 +43,7 @@ pub(crate) struct StorageGatewaySnapshot {
     pub(crate) locks: Vec<StorageLockDiagnostics>,
     pub(crate) executors: Vec<storage::SqliteExecutorHealth>,
     pub(crate) postgres: Option<storage::PostgresExecutorHealth>,
+    pub(crate) session_execution: Option<memory::StorageExecutionPlaneStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +106,11 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
             .as_ref()
             .and_then(|selected| selected.postgres_executor.as_ref())
             .map(storage::PostgresExecutor::health),
+        session_execution: state
+            .services
+            .selected_storage
+            .as_ref()
+            .map(|selected| selected.session_store.execution_stats()),
     };
     let status = if runtime.session_kernel && runtime.event_bus {
         "healthy"

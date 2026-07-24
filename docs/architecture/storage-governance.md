@@ -38,6 +38,9 @@ reference; the resolved URL never enters config projection, health or cutover ev
 ```yaml
 storage:
   backend: postgres
+  sessionExecution:
+    workers: 8
+    queueCapacity: 64
   postgres:
     logicalIdentity: cowd-primary
     secretRef: env:COWD_POSTGRES_URL

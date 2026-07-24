@@ -126,6 +126,11 @@ approval:
 # registry、migration 和锁诊断；历史 .cowd/*.db 或 .cowd/*.sqlite 不会被静默移动。
 storage:
   backend: "sqlite"
+  # Session 同步后端只通过有界执行平面进入异步 Runtime。
+  # 默认值按机器并行度计算；仅在压测或资源隔离时显式覆盖。
+  # sessionExecution:
+  #   workers: 8
+  #   queueCapacity: 64
   root: "~/.cowd/storage"
   sqlite:
     session: "session.sqlite"

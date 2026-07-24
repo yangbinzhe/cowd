@@ -374,7 +374,8 @@ pub use config::{
     PlatformConfig as GatewayPlatformConfig, PostgresTopologyConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig,
     RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig, SessionResetPolicy,
-    StorageBackendSelection, StorageTopologyConfig, COWD_SETTINGS_SCHEMA_NAME,
+    SessionStorageExecutionConfig, StorageBackendSelection, StorageTopologyConfig,
+    COWD_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

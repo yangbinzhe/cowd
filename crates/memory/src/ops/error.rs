@@ -34,6 +34,21 @@ pub enum MemoryError {
 
     #[error("unexpected error: {0}")]
     Other(String),
+
+    #[error("session storage queue is full (workers={workers}, queue_capacity={queue_capacity})")]
+    StorageQueueFull {
+        workers: usize,
+        queue_capacity: usize,
+    },
+
+    #[error("session storage execution plane is shutting down")]
+    StoragePlaneShutdown,
+
+    #[error("session storage worker panicked; transaction outcome may be unknown")]
+    StorageWorkerPanic,
+
+    #[error("session storage worker join failed: {0}")]
+    StorageWorkerJoin(String),
 }
 
 /// Detect whether a `rusqlite::Error` indicates the disk is full.

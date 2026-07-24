@@ -643,11 +643,31 @@ impl Default for PostgresTopologyConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStorageExecutionConfig {
+    pub workers: usize,
+    pub queue_capacity: usize,
+}
+
+impl Default for SessionStorageExecutionConfig {
+    fn default() -> Self {
+        let workers = std::thread::available_parallelism()
+            .map_or(4, usize::from)
+            .clamp(2, 16);
+        Self {
+            workers,
+            queue_capacity: workers.saturating_mul(8),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageTopologyConfig {
     pub backend: StorageBackendSelection,
     pub postgres: Option<PostgresTopologyConfig>,
+    pub session_execution: SessionStorageExecutionConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -2571,12 +2591,45 @@ fn parse_optional_storage_config(root: &JsonValue) -> Result<StorageTopologyConf
             })
         })
         .transpose()?;
+    let session_execution = storage
+        .get("sessionExecution")
+        .map(|value| {
+            let value = expect_object(value, "merged settings.storage.sessionExecution")?;
+            let defaults = SessionStorageExecutionConfig::default();
+            let workers = optional_usize(
+                value,
+                "workers",
+                "merged settings.storage.sessionExecution",
+            )?
+            .unwrap_or(defaults.workers);
+            let queue_capacity = optional_usize(
+                value,
+                "queueCapacity",
+                "merged settings.storage.sessionExecution",
+            )?
+            .unwrap_or(defaults.queue_capacity);
+            if !(1..=64).contains(&workers) || !(1..=65_536).contains(&queue_capacity) {
+                return Err(ConfigError::Parse(
+                    "merged settings.storage.sessionExecution requires workers 1..64 and queueCapacity 1..65536".to_string(),
+                ));
+            }
+            Ok(SessionStorageExecutionConfig {
+                workers,
+                queue_capacity,
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
     if backend == StorageBackendSelection::Postgres && postgres.is_none() {
         return Err(ConfigError::Parse(
             "merged settings.storage.postgres is required when backend=postgres".to_string(),
         ));
     }
-    Ok(StorageTopologyConfig { backend, postgres })
+    Ok(StorageTopologyConfig {
+        backend,
+        postgres,
+        session_execution,
+    })
 }
 
 fn parse_optional_gate_auto_fix_config(root: &JsonValue) -> Result<GateAutoFixConfig, ConfigError> {
@@ -4821,13 +4874,17 @@ gateway:
         let defaults = parse_optional_storage_config(&JsonValue::parse("{}").unwrap()).unwrap();
         assert_eq!(defaults.backend, StorageBackendSelection::Sqlite);
         assert!(defaults.postgres.is_none());
+        assert!(defaults.session_execution.workers > 0);
+        assert!(defaults.session_execution.queue_capacity > 0);
 
         let postgres = JsonValue::parse(
-            r#"{"storage":{"backend":"postgres","postgres":{"logicalIdentity":"cowd-test","secretRef":"env:COWD_TEST_POSTGRES_URL","maxConnections":24,"minIdleConnections":3,"checkoutTimeoutMs":2500}}}"#,
+            r#"{"storage":{"backend":"postgres","sessionExecution":{"workers":6,"queueCapacity":72},"postgres":{"logicalIdentity":"cowd-test","secretRef":"env:COWD_TEST_POSTGRES_URL","maxConnections":24,"minIdleConnections":3,"checkoutTimeoutMs":2500}}}"#,
         )
         .unwrap();
         let selected = parse_optional_storage_config(&postgres).unwrap();
         assert_eq!(selected.backend, StorageBackendSelection::Postgres);
+        assert_eq!(selected.session_execution.workers, 6);
+        assert_eq!(selected.session_execution.queue_capacity, 72);
         let postgres = selected.postgres.unwrap();
         assert_eq!(postgres.secret_ref, "env:COWD_TEST_POSTGRES_URL");
         assert_eq!(postgres.max_connections, 24);
@@ -4839,5 +4896,10 @@ gateway:
         )
         .unwrap();
         assert!(parse_optional_storage_config(&invalid).is_err());
+        let invalid_execution = JsonValue::parse(
+            r#"{"storage":{"sessionExecution":{"workers":0,"queueCapacity":10}}}"#,
+        )
+        .unwrap();
+        assert!(parse_optional_storage_config(&invalid_execution).is_err());
     }
 }

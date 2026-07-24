@@ -26,6 +26,9 @@ use std::sync::Arc;
 
 use crate::runtime_event::{SessionDomainEvent, SessionDomainEventPage, SESSION_DOMAIN_EVENT_TYPE};
 use crate::session_backend::SharedSessionStoreBackend;
+use crate::session_execution_plane::{
+    StorageExecutionPlane, StorageExecutionPlaneConfig, StorageExecutionPlaneStats,
+};
 use crate::store::session::{
     OutboxFailureClass, SessionEvent, SessionListOptions, SessionListPage, SessionMessage,
     SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
@@ -55,6 +58,7 @@ use crate::store::Result;
 #[derive(Debug, Clone)]
 pub struct UnifiedSessionStore {
     inner: SharedSessionStoreBackend,
+    execution: Arc<StorageExecutionPlane>,
 }
 
 impl UnifiedSessionStore {
@@ -74,6 +78,19 @@ impl UnifiedSessionStore {
     /// Open a SQLite session database from an explicitly SQLite storage
     /// handle. PostgreSQL composition uses [`Self::from_backend`] instead.
     pub fn open_sqlite_storage_handle(handle: &storage::StorageHandle) -> Result<Self> {
+        Self::open_sqlite_storage_handle_with_execution_config(
+            handle,
+            StorageExecutionPlaneConfig::default(),
+        )
+    }
+
+    /// Open a SQLite session database with an explicit bounded execution
+    /// plane. Process composition roots use this constructor so SQLite and
+    /// PostgreSQL obey the same concurrency and overload policy.
+    pub fn open_sqlite_storage_handle_with_execution_config(
+        handle: &storage::StorageHandle,
+        config: StorageExecutionPlaneConfig,
+    ) -> Result<Self> {
         if handle.backend != storage::StorageBackendKind::Sqlite {
             return Err(crate::error::MemoryError::Store(format!(
                 "storage handle `{}` is not sqlite-backed",
@@ -81,7 +98,7 @@ impl UnifiedSessionStore {
             )));
         }
         let store = SqliteSessionStore::open_storage_handle(handle)?;
-        Ok(Self::from_backend(Arc::new(store)))
+        Self::from_backend_with_execution_config(Arc::new(store), config)
     }
 
     /// Open an in-memory session database (useful for testing).
@@ -95,12 +112,36 @@ impl UnifiedSessionStore {
     /// driver, URL, path, or adapter type to Gateway/Runtime callers.
     #[must_use]
     pub fn from_backend(inner: SharedSessionStoreBackend) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            execution: Arc::new(StorageExecutionPlane::default_plane()),
+        }
+    }
+
+    pub fn from_backend_with_execution_config(
+        inner: SharedSessionStoreBackend,
+        config: StorageExecutionPlaneConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner,
+            execution: Arc::new(StorageExecutionPlane::new(config)?),
+        })
     }
 
     #[must_use]
-    pub fn backend(&self) -> &SharedSessionStoreBackend {
-        &self.inner
+    pub fn execution_stats(&self) -> StorageExecutionPlaneStats {
+        self.execution.stats()
+    }
+
+    async fn execute<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn crate::session_backend::SessionStoreBackend) -> Result<T> + Send + 'static,
+    {
+        let backend = Arc::clone(&self.inner);
+        self.execution
+            .execute(move || operation(backend.as_ref()))
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -112,12 +153,16 @@ impl UnifiedSessionStore {
     /// Uses `INSERT OR IGNORE` so calling this for an already-existing session
     /// is a harmless no-op.
     pub async fn create_session(&self, session: &SessionRecord) -> Result<()> {
-        self.inner.create_session(session)
+        let session = session.clone();
+        self.execute(move |backend| backend.create_session(&session))
+            .await
     }
 
     /// Retrieve a session record by its ID, or `None` if not found.
     pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
-        self.inner.get_session(session_id)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_session(&session_id))
+            .await
     }
 
     /// Overwrite all mutable fields of an existing session record.
@@ -125,7 +170,9 @@ impl UnifiedSessionStore {
     /// `session_id` is used as the lookup key; the row is silently unchanged
     /// if it does not exist.
     pub async fn update_session(&self, session: &SessionRecord) -> Result<()> {
-        self.inner.update_session(session)
+        let session = session.clone();
+        self.execute(move |backend| backend.update_session(&session))
+            .await
     }
 
     /// Upsert a session record (insert or replace all fields).
@@ -133,7 +180,9 @@ impl UnifiedSessionStore {
     /// Equivalent to calling [`create_session`] then [`update_session`].  Use
     /// this when you don't know whether the row already exists.
     pub async fn upsert_session(&self, session: &SessionRecord) -> Result<()> {
-        self.inner.upsert_session(session)
+        let session = session.clone();
+        self.execute(move |backend| backend.upsert_session(&session))
+            .await
     }
 
     /// Atomically persist a Session record and its durable Mission lifecycle
@@ -143,13 +192,17 @@ impl UnifiedSessionStore {
         session: &SessionRecord,
         request: &SessionMissionOutboxRequest,
     ) -> Result<SessionMissionOutboxRecord> {
-        self.inner
-            .upsert_session_with_mission_outbox(session, request)
+        let session = session.clone();
+        let request = request.clone();
+        self.execute(move |backend| backend.upsert_session_with_mission_outbox(&session, &request))
+            .await
     }
 
     /// Permanently remove a session and all its memory associations.
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.inner.delete_session(session_id)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.delete_session(&session_id))
+            .await
     }
 
     /// Atomically delete a Session and queue the matching Mission close intent.
@@ -157,7 +210,9 @@ impl UnifiedSessionStore {
         &self,
         request: &SessionMissionOutboxRequest,
     ) -> Result<bool> {
-        self.inner.delete_session_with_mission_outbox(request)
+        let request = request.clone();
+        self.execute(move |backend| backend.delete_session_with_mission_outbox(&request))
+            .await
     }
 
     /// Mark a session as closed.
@@ -165,12 +220,14 @@ impl UnifiedSessionStore {
     /// Updates the session's status to `'closed'` and refreshes
     /// `last_activity`.  Messages are preserved for auditing.
     pub async fn mark_session_closed(&self, session_id: &str) -> Result<()> {
-        self.inner.mark_session_closed(session_id)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.mark_session_closed(&session_id))
+            .await
     }
 
     /// List all session records ordered by `last_activity DESC`.
     pub async fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
-        self.inner.list_sessions()
+        self.execute(|backend| backend.list_sessions()).await
     }
 
     /// List a filtered, sorted page of sessions directly in the backing store.
@@ -178,12 +235,32 @@ impl UnifiedSessionStore {
         &self,
         opts: &SessionListOptions<'_>,
     ) -> Result<SessionListPage> {
-        self.inner.list_sessions_page(opts)
+        let query = opts.query.map(str::to_string);
+        let model = opts.model.map(str::to_string);
+        let status = opts.status.map(str::to_string);
+        let sort = opts.sort.to_string();
+        let order = opts.order.to_string();
+        let limit = opts.limit;
+        let offset = opts.offset;
+        self.execute(move |backend| {
+            backend.list_sessions_page(&SessionListOptions {
+                query: query.as_deref(),
+                model: model.as_deref(),
+                status: status.as_deref(),
+                sort: &sort,
+                order: &order,
+                limit,
+                offset,
+            })
+        })
+        .await
     }
 
     /// List all sessions for a given platform, ordered by `last_activity DESC`.
     pub async fn list_sessions_by_platform(&self, platform: &str) -> Result<Vec<SessionRecord>> {
-        self.inner.list_sessions_by_platform(platform)
+        let platform = platform.to_string();
+        self.execute(move |backend| backend.list_sessions_by_platform(&platform))
+            .await
     }
 
     /// List sessions bound to one workspace root, ordered by `last_activity DESC`.
@@ -195,7 +272,9 @@ impl UnifiedSessionStore {
         &self,
         workspace_root: &str,
     ) -> Result<Vec<SessionRecord>> {
-        self.inner.list_sessions_by_workspace_root(workspace_root)
+        let workspace_root = workspace_root.to_string();
+        self.execute(move |backend| backend.list_sessions_by_workspace_root(&workspace_root))
+            .await
     }
 
     /// Search sessions using the selected backend's full-text capability.
@@ -207,7 +286,9 @@ impl UnifiedSessionStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SessionSearchResult>> {
-        self.inner.search_sessions(query, limit)
+        let query = query.to_string();
+        self.execute(move |backend| backend.search_sessions(&query, limit))
+            .await
     }
 
     /// Search sessions with platform filter.
@@ -217,8 +298,10 @@ impl UnifiedSessionStore {
         platform: &str,
         limit: usize,
     ) -> Result<Vec<SessionSearchResult>> {
-        self.inner
-            .search_sessions_by_platform(query, platform, limit)
+        let query = query.to_string();
+        let platform = platform.to_string();
+        self.execute(move |backend| backend.search_sessions_by_platform(&query, &platform, limit))
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -229,17 +312,25 @@ impl UnifiedSessionStore {
     ///
     /// `INSERT OR IGNORE` makes this idempotent.
     pub async fn associate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
-        self.inner.associate_memory(session_id, memory_id)
+        let session_id = session_id.to_string();
+        let memory_id = memory_id.to_string();
+        self.execute(move |backend| backend.associate_memory(&session_id, &memory_id))
+            .await
     }
 
     /// Return all memory IDs associated with `session_id`.
     pub async fn get_session_memories(&self, session_id: &str) -> Result<Vec<String>> {
-        self.inner.get_session_memories(session_id)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_session_memories(&session_id))
+            .await
     }
 
     /// Remove the association between a session and a memory.
     pub async fn disassociate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
-        self.inner.disassociate_memory(session_id, memory_id)
+        let session_id = session_id.to_string();
+        let memory_id = memory_id.to_string();
+        self.execute(move |backend| backend.disassociate_memory(&session_id, &memory_id))
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -248,7 +339,9 @@ impl UnifiedSessionStore {
 
     /// Append a mutation event to the session's event log.
     pub async fn append_event(&self, event: &SessionEvent) -> Result<()> {
-        self.inner.append_event(event)
+        let event = event.clone();
+        self.execute(move |backend| backend.append_event(&event))
+            .await
     }
 
     /// Atomically allocate the next session-local sequence and append an event.
@@ -256,7 +349,9 @@ impl UnifiedSessionStore {
         &self,
         event: &SessionEvent,
     ) -> Result<SessionEvent> {
-        self.inner.append_event_allocating_sequence(event)
+        let event = event.clone();
+        self.execute(move |backend| backend.append_event_allocating_sequence(&event))
+            .await
     }
 
     /// Atomically allocate contiguous sequences and append a same-session batch.
@@ -264,7 +359,9 @@ impl UnifiedSessionStore {
         &self,
         events: &[SessionEvent],
     ) -> Result<Vec<SessionEvent>> {
-        self.inner.append_events_allocating_sequence(events)
+        let events = events.to_vec();
+        self.execute(move |backend| backend.append_events_allocating_sequence(&events))
+            .await
     }
 
     /// Append a context envelope event unless the same envelope id already exists.
@@ -272,7 +369,9 @@ impl UnifiedSessionStore {
         &self,
         event: &SessionEvent,
     ) -> Result<bool> {
-        self.inner.append_context_envelope_event_if_absent(event)
+        let event = event.clone();
+        self.execute(move |backend| backend.append_context_envelope_event_if_absent(&event))
+            .await
     }
 
     /// Atomically de-duplicate a context envelope and allocate its sequence.
@@ -280,8 +379,11 @@ impl UnifiedSessionStore {
         &self,
         event: &SessionEvent,
     ) -> Result<Option<SessionEvent>> {
-        self.inner
-            .append_context_envelope_event_if_absent_allocating_sequence(event)
+        let event = event.clone();
+        self.execute(move |backend| {
+            backend.append_context_envelope_event_if_absent_allocating_sequence(&event)
+        })
+        .await
     }
 
     /// Append a canonical session-domain event to the session event log.
@@ -326,14 +428,22 @@ impl UnifiedSessionStore {
         for event in events {
             wire_events.push(event.to_session_event()?);
         }
-        self.inner
-            .append_events_allocating_sequence_if_checkpoint_absent(&wire_events, checkpoint_id)
-            .map(|result| result.is_some())
+        let checkpoint_id = checkpoint_id.to_string();
+        self.execute(move |backend| {
+            backend.append_events_allocating_sequence_if_checkpoint_absent(
+                &wire_events,
+                &checkpoint_id,
+            )
+        })
+        .await
+        .map(|result| result.is_some())
     }
 
     /// Retrieve events for a session starting from `from_seq` (inclusive).
     pub async fn get_events(&self, session_id: &str, from_seq: usize) -> Result<Vec<SessionEvent>> {
-        self.inner.get_events(session_id, from_seq)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_events(&session_id, from_seq))
+            .await
     }
 
     /// Retrieve at most `limit` events for a session from `from_seq`.
@@ -343,7 +453,9 @@ impl UnifiedSessionStore {
         from_seq: usize,
         limit: usize,
     ) -> Result<Vec<SessionEvent>> {
-        self.inner.get_events_limited(session_id, from_seq, limit)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_events_limited(&session_id, from_seq, limit))
+            .await
     }
 
     async fn get_session_domain_timeline_limited(
@@ -352,8 +464,11 @@ impl UnifiedSessionStore {
         from_seq: usize,
         limit: usize,
     ) -> Result<Vec<SessionEvent>> {
-        self.inner
-            .get_session_domain_timeline_limited(session_id, from_seq, limit)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| {
+            backend.get_session_domain_timeline_limited(&session_id, from_seq, limit)
+        })
+        .await
     }
 
     async fn count_session_domain_timeline_from(
@@ -361,8 +476,11 @@ impl UnifiedSessionStore {
         session_id: &str,
         from_seq: usize,
     ) -> Result<usize> {
-        self.inner
-            .count_session_domain_timeline_from(session_id, from_seq)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| {
+            backend.count_session_domain_timeline_from(&session_id, from_seq)
+        })
+        .await
     }
 
     /// Retrieve at most `limit` events of one type for a session.
@@ -373,13 +491,19 @@ impl UnifiedSessionStore {
         from_seq: usize,
         limit: usize,
     ) -> Result<Vec<SessionEvent>> {
-        self.inner
-            .get_events_by_type_limited(session_id, event_type, from_seq, limit)
+        let session_id = session_id.to_string();
+        let event_type = event_type.to_string();
+        self.execute(move |backend| {
+            backend.get_events_by_type_limited(&session_id, &event_type, from_seq, limit)
+        })
+        .await
     }
 
     /// Count events for a session from `from_seq`.
     pub async fn count_events_from(&self, session_id: &str, from_seq: usize) -> Result<usize> {
-        self.inner.count_events_from(session_id, from_seq)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.count_events_from(&session_id, from_seq))
+            .await
     }
 
     /// Count events of one type for a session from `from_seq`.
@@ -389,8 +513,12 @@ impl UnifiedSessionStore {
         event_type: &str,
         from_seq: usize,
     ) -> Result<usize> {
-        self.inner
-            .count_events_by_type_from(session_id, event_type, from_seq)
+        let session_id = session_id.to_string();
+        let event_type = event_type.to_string();
+        self.execute(move |backend| {
+            backend.count_events_by_type_from(&session_id, &event_type, from_seq)
+        })
+        .await
     }
 
     /// Retrieve a page of canonical session-domain events.
@@ -454,12 +582,16 @@ impl UnifiedSessionStore {
         &self,
         envelope_id: &str,
     ) -> Result<Option<SessionEvent>> {
-        self.inner.get_context_event_by_envelope_id(envelope_id)
+        let envelope_id = envelope_id.to_string();
+        self.execute(move |backend| backend.get_context_event_by_envelope_id(&envelope_id))
+            .await
     }
 
     /// Return the next append sequence for a session event.
     pub async fn next_event_sequence(&self, session_id: &str) -> Result<usize> {
-        self.inner.next_event_sequence(session_id)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.next_event_sequence(&session_id))
+            .await
     }
 
     /// Delete all events from `from_sequence` onward in a session.
@@ -470,7 +602,9 @@ impl UnifiedSessionStore {
         session_id: &str,
         from_sequence: usize,
     ) -> Result<usize> {
-        self.inner.delete_events_from(session_id, from_sequence)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.delete_events_from(&session_id, from_sequence))
+            .await
     }
 
     /// Delete events of one type from `from_sequence` onward in a session.
@@ -482,18 +616,26 @@ impl UnifiedSessionStore {
         event_type: &str,
         from_sequence: usize,
     ) -> Result<usize> {
-        self.inner
-            .delete_events_by_type_from(session_id, event_type, from_sequence)
+        let session_id = session_id.to_string();
+        let event_type = event_type.to_string();
+        self.execute(move |backend| {
+            backend.delete_events_by_type_from(&session_id, &event_type, from_sequence)
+        })
+        .await
     }
 
     /// Save a full-message-list snapshot at a given event index.
     pub async fn save_snapshot(&self, snapshot: &SessionSnapshot) -> Result<()> {
-        self.inner.save_snapshot(snapshot)
+        let snapshot = snapshot.clone();
+        self.execute(move |backend| backend.save_snapshot(&snapshot))
+            .await
     }
 
     /// Return the most recent snapshot for a session, or `None`.
     pub async fn get_latest_snapshot(&self, session_id: &str) -> Result<Option<SessionSnapshot>> {
-        self.inner.get_latest_snapshot(session_id)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_latest_snapshot(&session_id))
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -504,7 +646,9 @@ impl UnifiedSessionStore {
     ///
     /// Returns the number of sessions that were removed.
     pub async fn prune_before(&self, cutoff_iso8601: &str) -> Result<usize> {
-        self.inner.prune_before(cutoff_iso8601)
+        let cutoff_iso8601 = cutoff_iso8601.to_string();
+        self.execute(move |backend| backend.prune_before(&cutoff_iso8601))
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -513,7 +657,9 @@ impl UnifiedSessionStore {
 
     /// Insert a single message into a session.
     pub async fn insert_message(&self, msg: &SessionMessage) -> Result<()> {
-        self.inner.insert_message(msg)
+        let msg = msg.clone();
+        self.execute(move |backend| backend.insert_message(&msg))
+            .await
     }
 
     pub async fn append_terminal_message_idempotent(
@@ -524,13 +670,20 @@ impl UnifiedSessionStore {
         token_usage_json: Option<&str>,
         created_at_ms: u64,
     ) -> Result<(SessionMessage, bool)> {
-        self.inner.append_terminal_message_idempotent(
-            message_id,
-            session_id,
-            content_json,
-            token_usage_json,
-            created_at_ms,
-        )
+        let message_id = message_id.to_string();
+        let session_id = session_id.to_string();
+        let content_json = content_json.to_string();
+        let token_usage_json = token_usage_json.map(str::to_string);
+        self.execute(move |backend| {
+            backend.append_terminal_message_idempotent(
+                &message_id,
+                &session_id,
+                &content_json,
+                token_usage_json.as_deref(),
+                created_at_ms,
+            )
+        })
+        .await
     }
 
     /// Atomically materialize every message produced by a Runtime turn.
@@ -545,18 +698,27 @@ impl UnifiedSessionStore {
         messages: &[SessionMessage],
         created_at_ms: u64,
     ) -> Result<(Vec<SessionMessage>, bool)> {
-        self.inner.append_terminal_transcript_idempotent(
-            terminal_message_id,
-            ingress_message_id,
-            session_id,
-            messages,
-            created_at_ms,
-        )
+        let terminal_message_id = terminal_message_id.to_string();
+        let ingress_message_id = ingress_message_id.to_string();
+        let session_id = session_id.to_string();
+        let messages = messages.to_vec();
+        self.execute(move |backend| {
+            backend.append_terminal_transcript_idempotent(
+                &terminal_message_id,
+                &ingress_message_id,
+                &session_id,
+                &messages,
+                created_at_ms,
+            )
+        })
+        .await
     }
 
     /// Insert multiple messages into a session in a single batch.
     pub async fn insert_messages_batch(&self, messages: &[SessionMessage]) -> Result<()> {
-        self.inner.insert_messages_batch(messages)
+        let messages = messages.to_vec();
+        self.execute(move |backend| backend.insert_messages_batch(&messages))
+            .await
     }
 
     /// Persist a source message and Runtime ingress request atomically.
@@ -565,8 +727,10 @@ impl UnifiedSessionStore {
         message: &SessionMessage,
         request: &SessionRuntimeOutboxRequest,
     ) -> Result<SessionRuntimeOutboxRecord> {
-        self.inner
-            .append_message_with_runtime_outbox(message, request)
+        let message = message.clone();
+        let request = request.clone();
+        self.execute(move |backend| backend.append_message_with_runtime_outbox(&message, &request))
+            .await
     }
 
     /// Atomically allocate a message sequence and persist the Runtime ingress
@@ -579,13 +743,20 @@ impl UnifiedSessionStore {
         created_at_ms: u64,
         request: &SessionRuntimeOutboxRequest,
     ) -> Result<SessionRuntimeOutboxRecord> {
-        self.inner.append_ingress_with_runtime_outbox(
-            session_id,
-            role,
-            content_json,
-            created_at_ms,
-            request,
-        )
+        let session_id = session_id.to_string();
+        let role = role.to_string();
+        let content_json = content_json.map(str::to_string);
+        let request = request.clone();
+        self.execute(move |backend| {
+            backend.append_ingress_with_runtime_outbox(
+                &session_id,
+                &role,
+                content_json.as_deref(),
+                created_at_ms,
+                &request,
+            )
+        })
+        .await
     }
 
     pub async fn claim_session_runtime_outbox(
@@ -595,8 +766,11 @@ impl UnifiedSessionStore {
         lease_ms: u64,
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
-        self.inner
-            .claim_session_runtime_outbox(worker_id, now_ms, lease_ms, limit)
+        let worker_id = worker_id.to_string();
+        self.execute(move |backend| {
+            backend.claim_session_runtime_outbox(&worker_id, now_ms, lease_ms, limit)
+        })
+        .await
     }
 
     pub async fn ack_session_runtime_outbox(
@@ -607,13 +781,18 @@ impl UnifiedSessionStore {
         runtime_commit_cursor: u64,
         now_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord> {
-        self.inner.ack_session_runtime_outbox(
-            request_id,
-            worker_id,
-            expected_revision,
-            runtime_commit_cursor,
-            now_ms,
-        )
+        let request_id = request_id.to_string();
+        let worker_id = worker_id.to_string();
+        self.execute(move |backend| {
+            backend.ack_session_runtime_outbox(
+                &request_id,
+                &worker_id,
+                expected_revision,
+                runtime_commit_cursor,
+                now_ms,
+            )
+        })
+        .await
     }
 
     pub async fn renew_session_runtime_outbox_lease(
@@ -624,13 +803,18 @@ impl UnifiedSessionStore {
         now_ms: u64,
         lease_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord> {
-        self.inner.renew_session_runtime_outbox_lease(
-            request_id,
-            worker_id,
-            expected_revision,
-            now_ms,
-            lease_ms,
-        )
+        let request_id = request_id.to_string();
+        let worker_id = worker_id.to_string();
+        self.execute(move |backend| {
+            backend.renew_session_runtime_outbox_lease(
+                &request_id,
+                &worker_id,
+                expected_revision,
+                now_ms,
+                lease_ms,
+            )
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -645,16 +829,22 @@ impl UnifiedSessionStore {
         max_attempts: u32,
         now_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord> {
-        self.inner.fail_session_runtime_outbox(
-            request_id,
-            worker_id,
-            expected_revision,
-            failure_class,
-            error,
-            retry_at_ms,
-            max_attempts,
-            now_ms,
-        )
+        let request_id = request_id.to_string();
+        let worker_id = worker_id.to_string();
+        let error = error.to_string();
+        self.execute(move |backend| {
+            backend.fail_session_runtime_outbox(
+                &request_id,
+                &worker_id,
+                expected_revision,
+                failure_class,
+                &error,
+                retry_at_ms,
+                max_attempts,
+                now_ms,
+            )
+        })
+        .await
     }
 
     pub async fn retry_blocked_session_runtime_outbox(
@@ -665,20 +855,28 @@ impl UnifiedSessionStore {
         reason: &str,
         now_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord> {
-        self.inner.retry_blocked_session_runtime_outbox(
-            request_id,
-            expected_revision,
-            actor,
-            reason,
-            now_ms,
-        )
+        let request_id = request_id.to_string();
+        let actor = actor.to_string();
+        let reason = reason.to_string();
+        self.execute(move |backend| {
+            backend.retry_blocked_session_runtime_outbox(
+                &request_id,
+                expected_revision,
+                &actor,
+                &reason,
+                now_ms,
+            )
+        })
+        .await
     }
 
     pub async fn get_session_runtime_outbox(
         &self,
         request_id: &str,
     ) -> Result<Option<SessionRuntimeOutboxRecord>> {
-        self.inner.get_session_runtime_outbox(request_id)
+        let request_id = request_id.to_string();
+        self.execute(move |backend| backend.get_session_runtime_outbox(&request_id))
+            .await
     }
 
     pub async fn session_runtime_outbox_for_session(
@@ -686,26 +884,30 @@ impl UnifiedSessionStore {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
-        self.inner
-            .session_runtime_outbox_for_session(session_id, limit)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.session_runtime_outbox_for_session(&session_id, limit))
+            .await
     }
 
     pub async fn active_session_runtime_outbox(
         &self,
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
-        self.inner.active_session_runtime_outbox(limit)
+        self.execute(move |backend| backend.active_session_runtime_outbox(limit))
+            .await
     }
 
     pub async fn session_runtime_outbox_health(&self) -> Result<SessionRuntimeOutboxHealth> {
-        self.inner.session_runtime_outbox_health()
+        self.execute(|backend| backend.session_runtime_outbox_health())
+            .await
     }
 
     pub async fn blocked_session_runtime_outbox(
         &self,
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
-        self.inner.blocked_session_runtime_outbox(limit)
+        self.execute(move |backend| backend.blocked_session_runtime_outbox(limit))
+            .await
     }
 
     pub async fn claim_session_mission_outbox(
@@ -716,8 +918,18 @@ impl UnifiedSessionStore {
         lease_ms: u64,
         limit: usize,
     ) -> Result<Vec<SessionMissionOutboxRecord>> {
-        self.inner
-            .claim_session_mission_outbox(workspace_key, worker_id, now_ms, lease_ms, limit)
+        let workspace_key = workspace_key.to_string();
+        let worker_id = worker_id.to_string();
+        self.execute(move |backend| {
+            backend.claim_session_mission_outbox(
+                &workspace_key,
+                &worker_id,
+                now_ms,
+                lease_ms,
+                limit,
+            )
+        })
+        .await
     }
 
     pub async fn ack_session_mission_outbox(
@@ -727,8 +939,12 @@ impl UnifiedSessionStore {
         expected_revision: u64,
         now_ms: u64,
     ) -> Result<SessionMissionOutboxRecord> {
-        self.inner
-            .ack_session_mission_outbox(request_id, worker_id, expected_revision, now_ms)
+        let request_id = request_id.to_string();
+        let worker_id = worker_id.to_string();
+        self.execute(move |backend| {
+            backend.ack_session_mission_outbox(&request_id, &worker_id, expected_revision, now_ms)
+        })
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -743,23 +959,31 @@ impl UnifiedSessionStore {
         max_attempts: u32,
         now_ms: u64,
     ) -> Result<SessionMissionOutboxRecord> {
-        self.inner.fail_session_mission_outbox(
-            request_id,
-            worker_id,
-            expected_revision,
-            failure_class,
-            error,
-            retry_at_ms,
-            max_attempts,
-            now_ms,
-        )
+        let request_id = request_id.to_string();
+        let worker_id = worker_id.to_string();
+        let error = error.to_string();
+        self.execute(move |backend| {
+            backend.fail_session_mission_outbox(
+                &request_id,
+                &worker_id,
+                expected_revision,
+                failure_class,
+                &error,
+                retry_at_ms,
+                max_attempts,
+                now_ms,
+            )
+        })
+        .await
     }
 
     pub async fn get_session_mission_outbox(
         &self,
         request_id: &str,
     ) -> Result<Option<SessionMissionOutboxRecord>> {
-        self.inner.get_session_mission_outbox(request_id)
+        let request_id = request_id.to_string();
+        self.execute(move |backend| backend.get_session_mission_outbox(&request_id))
+            .await
     }
 
     /// Retrieve messages for a session with pagination.
@@ -769,7 +993,9 @@ impl UnifiedSessionStore {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        self.inner.get_messages(session_id, offset, limit)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_messages(&session_id, offset, limit))
+            .await
     }
 
     /// Retrieve messages for a session starting at `from_sequence`.
@@ -779,18 +1005,25 @@ impl UnifiedSessionStore {
         from_sequence: usize,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        self.inner
-            .get_messages_from_sequence(session_id, from_sequence, limit)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| {
+            backend.get_messages_from_sequence(&session_id, from_sequence, limit)
+        })
+        .await
     }
 
     /// Retrieve ALL messages for a session (unbounded, no pagination).
     pub async fn get_all_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
-        self.inner.get_all_messages(session_id)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_all_messages(&session_id))
+            .await
     }
 
     /// Get the total number of messages in a session.
     pub async fn get_message_count(&self, session_id: &str) -> Result<usize> {
-        self.inner.get_message_count(session_id)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_message_count(&session_id))
+            .await
     }
 
     /// Delete all messages from `from_sequence` onward in a session.
@@ -801,7 +1034,9 @@ impl UnifiedSessionStore {
         session_id: &str,
         from_sequence: usize,
     ) -> Result<usize> {
-        self.inner.delete_messages_from(session_id, from_sequence)
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.delete_messages_from(&session_id, from_sequence))
+            .await
     }
 
     /// Search messages using FTS5 full-text search.
@@ -813,7 +1048,10 @@ impl UnifiedSessionStore {
         session_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        self.inner.search_messages(query, session_id, limit)
+        let query = query.to_string();
+        let session_id = session_id.map(str::to_string);
+        self.execute(move |backend| backend.search_messages(&query, session_id.as_deref(), limit))
+            .await
     }
 
     /// Search a pre-authorized set of sessions in one FTS query.  The caller
@@ -825,8 +1063,12 @@ impl UnifiedSessionStore {
         session_ids: &[String],
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        self.inner
-            .search_messages_in_sessions(query, session_ids, limit)
+        let query = query.to_string();
+        let session_ids = session_ids.to_vec();
+        self.execute(move |backend| {
+            backend.search_messages_in_sessions(&query, &session_ids, limit)
+        })
+        .await
     }
 }
 

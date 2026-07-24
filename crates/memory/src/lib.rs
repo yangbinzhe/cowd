@@ -117,6 +117,8 @@ pub mod search;
 pub mod seeds;
 #[path = "session/backend.rs"]
 pub mod session_backend;
+#[path = "session/execution_plane.rs"]
+mod session_execution_plane;
 #[path = "session/session_resume.rs"]
 pub mod session_resume;
 #[path = "session/session_store.rs"]
@@ -215,6 +217,7 @@ pub use runtime_event::{
 };
 pub use search::{BM25Scorer, HybridSearcher, SearchResult as HybridSearchResult};
 pub use session_backend::{SessionStoreBackend, SharedSessionStoreBackend};
+pub use session_execution_plane::{StorageExecutionPlaneConfig, StorageExecutionPlaneStats};
 pub use session_resume::SessionResume;
 pub use session_store::UnifiedSessionStore;
 pub use state_rebuilder::{

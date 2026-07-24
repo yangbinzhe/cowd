@@ -63,7 +63,9 @@ impl SelectedStorageTopology {
     ) -> Result<Self, String> {
         let registry = base_registry(config_home, workspace_root)?;
         match config.backend {
-            runtime::StorageBackendSelection::Sqlite => Self::sqlite(registry),
+            runtime::StorageBackendSelection::Sqlite => {
+                Self::sqlite(registry, config.session_execution)
+            }
             runtime::StorageBackendSelection::Postgres => {
                 if let Some(apps) = activation_apps {
                     crate::storage_cutover::validate_active_manifest(
@@ -77,7 +79,8 @@ impl SelectedStorageTopology {
                     "storage.backend=postgres requires storage.postgres".to_string()
                 })?;
                 let executor = connect_postgres(postgres)?;
-                std::thread::spawn(move || Self::postgres(registry, executor))
+                let session_execution = config.session_execution;
+                std::thread::spawn(move || Self::postgres(registry, executor, session_execution))
                     .join()
                     .map_err(|_| {
                         "PostgreSQL domain adapter initialization thread panicked".to_string()
@@ -86,7 +89,10 @@ impl SelectedStorageTopology {
         }
     }
 
-    fn sqlite(registry: StorageRegistry) -> Result<Self, String> {
+    fn sqlite(
+        registry: StorageRegistry,
+        session_execution: runtime::SessionStorageExecutionConfig,
+    ) -> Result<Self, String> {
         registry.ensure_directories().map_err(stringify)?;
         let session_endpoint = endpoint(&registry, &StorageDomainId::Session, None)?;
         let memory_endpoint = endpoint(&registry, &StorageDomainId::Memory, None)?;
@@ -112,8 +118,14 @@ impl SelectedStorageTopology {
         )?;
 
         let session_store = Arc::new(
-            UnifiedSessionStore::open_sqlite_storage_handle(&session_endpoint.as_handle())
-                .map_err(stringify)?,
+            UnifiedSessionStore::open_sqlite_storage_handle_with_execution_config(
+                &session_endpoint.as_handle(),
+                memory::StorageExecutionPlaneConfig {
+                    workers: session_execution.workers,
+                    queue_capacity: session_execution.queue_capacity,
+                },
+            )
+            .map_err(stringify)?,
         );
         let memory_store: Arc<dyn MemoryStore> = Arc::new(
             memory::store::sqlite::SqliteStore::open_storage_handle(&memory_endpoint.as_handle())
@@ -180,7 +192,11 @@ impl SelectedStorageTopology {
         })
     }
 
-    fn postgres(mut registry: StorageRegistry, executor: PostgresExecutor) -> Result<Self, String> {
+    fn postgres(
+        mut registry: StorageRegistry,
+        executor: PostgresExecutor,
+        session_execution: runtime::SessionStorageExecutionConfig,
+    ) -> Result<Self, String> {
         replace_business_endpoints_with_postgres(&mut registry)?;
         let workspace_scope = workspace_scope(&registry)?;
         let connector_endpoint = endpoint(
@@ -191,7 +207,16 @@ impl SelectedStorageTopology {
 
         let session =
             session_postgres::PostgresSessionStore::new(executor.clone()).map_err(stringify)?;
-        let session_store = Arc::new(UnifiedSessionStore::from_backend(Arc::new(session)));
+        let session_store = Arc::new(
+            UnifiedSessionStore::from_backend_with_execution_config(
+                Arc::new(session),
+                memory::StorageExecutionPlaneConfig {
+                    workers: session_execution.workers,
+                    queue_capacity: session_execution.queue_capacity,
+                },
+            )
+            .map_err(stringify)?,
+        );
         let memory_store: Arc<dyn MemoryStore> = Arc::new(
             memory_postgres::PostgresMemoryStore::new(executor.clone()).map_err(stringify)?,
         );
@@ -430,6 +455,7 @@ mod tests {
                 secret_ref: "env:THIS_MUST_NOT_BE_READ".to_string(),
                 ..runtime::PostgresTopologyConfig::default()
             }),
+            ..runtime::StorageTopologyConfig::default()
         };
         let error = SelectedStorageTopology::compose_for_runtime(
             &config,

@@ -3824,12 +3824,20 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 
     use memory::{SessionStoreBackend, UnifiedSessionStore};
     use storage::StaticSecretRefResolver;
 
     use super::*;
+
+    fn postgres_test_guard() -> MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn session(id: &str) -> SessionRecord {
         SessionRecord {
@@ -3925,8 +3933,9 @@ mod tests {
         assert_eq!(first.snapshots.len(), 1);
     }
 
-    #[test]
-    fn postgres_adapter_real_copy_fences_and_injected_facade() {
+    #[tokio::test]
+    async fn postgres_adapter_real_copy_fences_and_injected_facade() {
+        let _guard = postgres_test_guard();
         let Some(target) = real_store() else {
             eprintln!("skipping real PostgreSQL session test: COWD_TEST_POSTGRES_URL is not set");
             return;
@@ -3957,9 +3966,9 @@ mod tests {
         let injected = UnifiedSessionStore::from_backend(Arc::new(target.clone()));
         assert_eq!(
             injected
-                .backend()
                 .list_sessions()
-                .expect("injected read")
+                .await
+                .expect("injected facade read")
                 .len(),
             target.list_sessions().unwrap().len()
         );
@@ -3970,7 +3979,7 @@ mod tests {
             sequence: 0,
             created_at_ms: 5,
         };
-        let backend: Arc<dyn SessionStoreBackend> = Arc::new(target);
+        let backend: Arc<dyn SessionStoreBackend> = Arc::new(target.clone());
         let gate = Arc::new(Barrier::new(2));
         let workers = (0..2)
             .map(|_| {
@@ -3991,10 +4000,14 @@ mod tests {
             .collect::<Vec<_>>();
         sequences.sort_unstable();
         assert_eq!(sequences, vec![0, 1]);
+        target
+            .delete_session("migration-session")
+            .expect("delete isolated migration session");
     }
 
     #[test]
     fn postgres_terminal_transcript_preserves_published_cursor_and_is_idempotent() {
+        let _guard = postgres_test_guard();
         let Some(store) = real_store() else {
             eprintln!("skipping real PostgreSQL session test: COWD_TEST_POSTGRES_URL is not set");
             return;
@@ -4105,6 +4118,7 @@ mod tests {
 
     #[test]
     fn postgres_concurrent_store_startup_serializes_preflight_and_migrations() {
+        let _guard = postgres_test_guard();
         let Some(url) = std::env::var("COWD_TEST_POSTGRES_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
