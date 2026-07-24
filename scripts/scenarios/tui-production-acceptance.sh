@@ -81,15 +81,33 @@ pass() {
   printf 'PASS\t%s\n' "$*" | tee -a "$SUMMARY"
 }
 
+on_unexpected_error() {
+  local status="$1"
+  local line="$2"
+  local command="$3"
+  trap - ERR
+  printf 'FAIL\tunexpected shell error at line %s (exit %s): %s\n' \
+    "$line" "$status" "$command" | tee -a "$SUMMARY" >&2
+  exit "$status"
+}
+trap 'on_unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
 capture() {
   local target="$1"
   local name="$2"
   local session="${TUI_SCREEN[$target]:-}"
   [[ -n "$session" ]] || return 1
-  rm -f "$ARTIFACT_DIR/$name.txt"
-  screen -S "$session" -X hardcopy -h "$ARTIFACT_DIR/$name.txt" \
-    >/dev/null 2>&1
-  [[ -f "$ARTIFACT_DIR/$name.txt" ]]
+  for _ in {1..10}; do
+    rm -f "$ARTIFACT_DIR/$name.txt"
+    if screen -S "$session" -X hardcopy -h "$ARTIFACT_DIR/$name.txt" \
+      >/dev/null 2>&1 \
+      && [[ -f "$ARTIFACT_DIR/$name.txt" ]]; then
+      return 0
+    fi
+    tui_alive "$target" || return 1
+    sleep 0.02
+  done
+  return 1
 }
 
 capture_utf8() {
@@ -124,7 +142,11 @@ wait_capture() {
   local pattern="$2"
   local name="$3"
   for _ in {1..240}; do
-    capture "$target" "$name"
+    if ! capture "$target" "$name"; then
+      tui_alive "$target" || return 1
+      sleep 0.05
+      continue
+    fi
     if rg -q "$pattern" "$ARTIFACT_DIR/$name.txt"; then
       return 0
     fi
@@ -307,6 +329,20 @@ stop_tui() {
   if kill -0 "$pid" >/dev/null 2>&1; then
     screen -S "$session" -X quit >/dev/null 2>&1 || true
   fi
+  for _ in {1..20}; do
+    kill -0 "$pid" >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+  fi
+  for _ in {1..20}; do
+    kill -0 "$pid" >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill -KILL "$pid" >/dev/null 2>&1 || true
+  fi
   wait "$pid" >/dev/null 2>&1 || true
   unset 'TUI_SCREEN[$target]'
   unset 'TUI_DRIVER_PID[$target]'
@@ -330,15 +366,14 @@ done
   echo "missing executable $BIN; build cowd with --features full first" >&2
   exit 1
 }
-ss -ltn | rg -q ":($GATEWAY_PORT|$PROVIDER_PORT)\\b" \
-  && fail "acceptance ports are already occupied"
-
 mkdir -p "$ARTIFACT_DIR" "$CONFIG_HOME" "$HOME_DIR/.cowd" "$WORKSPACE/.cowd"
 : >"$PROVIDER_LOG"
 : >"$PROVIDER_STDOUT"
 : >"$GATEWAY_LOG"
 : >"$SUMMARY"
 : >"$PERFORMANCE"
+ss -ltn | rg -q ":($GATEWAY_PORT|$PROVIDER_PORT)\\b" \
+  && fail "acceptance ports are already occupied"
 
 node --check "$ROOT/scripts/fixtures/v584-tui-provider.mjs" \
   >"$ARTIFACT_DIR/provider-node-check.txt" 2>&1
@@ -426,12 +461,14 @@ wait_capture writer ' Command Palette ' boot-palette \
   || fail "new-session action palette did not respond"
 send_raw writer $'\033'
 sleep 0.1
-capture writer boot-palette-closed
+capture writer boot-palette-closed \
+  || fail "new-session screen could not be captured after closing the palette"
 rg -q ' Command Palette ' "$ARTIFACT_DIR/boot-palette-closed.txt" \
   && fail "Escape did not close the command palette"
 resize_tui writer 90 32
 sleep 0.2
-capture writer boot-resized
+capture writer boot-resized \
+  || fail "new-session resized screen could not be captured"
 rg -q "$MODEL" "$ARTIFACT_DIR/boot-resized.txt" \
   || fail "new-session resize lost the requested model"
 resize_tui writer 120 40
@@ -498,7 +535,8 @@ for size in 40x24 60x30 90x32 120x40 200x52; do
   send_raw writer $'\033'
   send_raw writer $'\033[F'
   sleep 0.15
-  capture writer "width-$size-tail"
+  capture writer "width-$size-tail" \
+    || fail "long-response tail could not be captured at terminal size $size"
   cp "$ARTIFACT_DIR/width-$size-tail.txt" "$ARTIFACT_DIR/width-$size.txt"
   rg -q 'END-OF-LONG-RESPONSE' "$ARTIFACT_DIR/width-$size.txt" \
     || fail "long-response tail disappeared at terminal size $size"
@@ -506,14 +544,16 @@ for size in 40x24 60x30 90x32 120x40 200x52; do
     || fail "long response rendered more than once at terminal size $size"
   send_raw writer $'\033[H'
   sleep 0.15
-  capture writer "width-$size-head"
+  capture writer "width-$size-head" \
+    || fail "long-response head could not be captured at terminal size $size"
   rg -q 'V584-LONG-BEGIN' "$ARTIFACT_DIR/width-$size-head.txt" \
     || fail "long-response Home navigation could not reach its head at $size"
   rg -q 'ROW-00.*中文|ROW-00' "$ARTIFACT_DIR/width-$size-head.txt" \
     || fail "long-response first CJK/URL/JSON/code matrix row was not reachable at $size"
   send_raw writer $'\033[F'
   sleep 0.15
-  capture writer "width-$size-return-tail"
+  capture writer "width-$size-return-tail" \
+    || fail "long-response return tail could not be captured at terminal size $size"
   rg -q 'ROW-47|END-OF-LONG-RESPONSE' "$ARTIFACT_DIR/width-$size-return-tail.txt" \
     || fail "long-response End navigation did not return to the canonical tail at $size"
 done
@@ -524,7 +564,8 @@ slow_started_ms="$(monotonic_ms)"
 send_prompt writer "V584_SLOW_STATUS prove active execution is visible"
 partial_visible=0
 for _ in {1..100}; do
-  capture writer slow-in-progress
+  capture writer slow-in-progress \
+    || fail "slow-turn in-progress screen could not be captured"
   if rg -q 'V584-SLOW-BEGIN' "$ARTIFACT_DIR/slow-in-progress.txt"; then
     partial_visible=1
     break
@@ -746,8 +787,10 @@ send_prompt writer "V584_OBSERVER_SYNC publish one answer to both terminals"
 writer_partial=0
 observer_partial=0
 for _ in {1..80}; do
-  capture writer writer-sync-progress
-  capture observer observer-sync-progress
+  capture writer writer-sync-progress \
+    || fail "writer collaborative progress screen could not be captured"
+  capture observer observer-sync-progress \
+    || fail "observer collaborative progress screen could not be captured"
   if rg -q 'V584-OBSERVER-SYNC-BEGIN' "$ARTIFACT_DIR/writer-sync-progress.txt"; then
     writer_partial=1
   fi
@@ -1117,7 +1160,8 @@ start_tui old-reader "$OLD_SESSION_ID" "tui:v584-old-reader" 120 40
 wait_capture old-reader 'read-only|lease unavailable|writer lease' old-session-screen \
   || fail "old session did not attach in visibly non-mutating mode"
 sleep 2
-capture old-reader old-session-hydrated
+capture old-reader old-session-hydrated \
+  || fail "old-session hydrated screen could not be captured"
 rg -Fq "$old_fragment" "$ARTIFACT_DIR/old-session-hydrated.txt" \
   || fail "old-session durable assistant tail was not rendered by TUI"
 message_page "$OLD_SESSION_ID" "$ARTIFACT_DIR/old-session-messages-after.json"
