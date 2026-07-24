@@ -395,11 +395,11 @@ import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
 expected_sha, expected_date = sys.argv[2:]
-assert re.search(r"(?m)^\s*Version\s+0\.9\.584\s*$", text), text
+assert re.search(r"(?m)^\s*Version\s+0\.9\.585\s*$", text), text
 assert re.search(rf"(?m)^\s*Git SHA\s+{re.escape(expected_sha)}\s*$", text), text
 assert re.search(rf"(?m)^\s*Build date\s+{re.escape(expected_date)}\s*$", text), text
 PY
-pass "binary reports version 0.9.584 from commit $EXPECTED_GIT_SHA built $EXPECTED_BUILD_DATE"
+pass "binary reports version 0.9.585 from commit $EXPECTED_GIT_SHA built $EXPECTED_BUILD_DATE"
 
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "$MODEL"
@@ -449,8 +449,8 @@ pass "isolated provider and Gateway are healthy"
 start_tui writer "$SESSION_A" "tui:v584-writer" 120 40
 wait_capture writer "$MODEL" boot \
   || fail "writer TUI did not render the requested model"
-rg -q '0\.9\.584' "$ARTIFACT_DIR/boot.txt" \
-  || fail "writer TUI did not render version 0.9.584"
+rg -q '0\.9\.585' "$ARTIFACT_DIR/boot.txt" \
+  || fail "writer TUI did not render version 0.9.585"
 rg -q 'idle|ready' "$ARTIFACT_DIR/boot.txt" \
   || fail "writer TUI did not expose an idle/ready state"
 capture_utf8 writer boot-utf8 \
