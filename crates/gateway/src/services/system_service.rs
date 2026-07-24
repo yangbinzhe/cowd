@@ -40,16 +40,23 @@ pub(crate) struct ToolOperationReceipt {
 }
 
 impl SystemService {
-    pub(crate) fn tool_catalog(&self, tools: Vec<ToolDefinition>) -> serde_json::Value {
+    pub(crate) fn tool_catalog(
+        &self,
+        host: &ToolHost,
+        tools: Vec<ToolDefinition>,
+    ) -> serde_json::Value {
+        let lease = host.pin_snapshot();
         let rows: Vec<serde_json::Value> = tools
             .iter()
             .map(|tool| {
                 let profile = tool_execution_profile(&tool.name);
+                let effect = lease.describe_effect(&tool.name, &serde_json::json!({}));
+                let safety_category = ToolSafetyCategory::from_effect(&effect);
                 serde_json::json!({
                     "name": tool.name,
                     "description": tool.description,
                     "enabled": true,
-                    "safety_category": profile.safety_category,
+                    "safety_category": safety_category,
                     "cache_policy": profile.cache_policy,
                     "prepared_readonly_supported": profile.prepared_readonly_supported,
                     "max_concurrency": profile.max_concurrency,
@@ -61,9 +68,13 @@ impl SystemService {
         serde_json::json!({ "tools": rows, "count": rows.len() })
     }
 
-    pub(crate) fn is_prepared_readonly_tool(&self, tool_name: &str) -> bool {
+    pub(crate) fn is_prepared_readonly_tool(&self, host: &ToolHost, tool_name: &str) -> bool {
         let profile = tool_execution_profile(tool_name);
-        profile.safety_category == ToolSafetyCategory::ReadOnly
+        ToolSafetyCategory::from_effect(
+            &host
+                .pin_snapshot()
+                .describe_effect(tool_name, &serde_json::json!({})),
+        ) == ToolSafetyCategory::ReadOnly
             && profile.prepared_readonly_supported
     }
 

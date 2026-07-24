@@ -78,6 +78,10 @@ pub struct ToolOutputRef {
 pub struct ToolInvocationRecord {
     pub contract_version: u32,
     pub invocation_id: String,
+    #[serde(default)]
+    pub governed_plan_id: Option<String>,
+    #[serde(default)]
+    pub governed_plan_revision: Option<u64>,
     pub session_id: String,
     pub turn_index: usize,
     pub tool_call_id: String,
@@ -123,6 +127,8 @@ impl ToolInvocationRecord {
         Self {
             contract_version: TOOL_CONTRACT_VERSION,
             invocation_id: format!("tool-inv-{}", Uuid::new_v4()),
+            governed_plan_id: None,
+            governed_plan_revision: None,
             session_id: session_id.into(),
             turn_index,
             tool_call_id: tool_call_id.into(),
@@ -150,6 +156,13 @@ impl ToolInvocationRecord {
             is_error: None,
             failure_kind: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_governed_plan(mut self, plan_id: impl Into<String>, plan_revision: u64) -> Self {
+        self.governed_plan_id = Some(plan_id.into());
+        self.governed_plan_revision = Some(plan_revision);
+        self
     }
 
     #[must_use]

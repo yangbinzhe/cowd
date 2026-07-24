@@ -7,6 +7,8 @@ use crate::tool_orchestrator::ToolSafetyCategory;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeToolExecutionRequest {
+    pub governed_plan_id: String,
+    pub governed_plan_revision: u64,
     pub idempotency_key: String,
     pub tool_use_id: String,
     pub tool_name: String,
@@ -46,11 +48,13 @@ impl RuntimeToolExecutionRequest {
     #[must_use]
     pub fn from_tool_request(request: &ToolRequest) -> Self {
         Self {
+            governed_plan_id: "offline-unknown".to_string(),
+            governed_plan_revision: 0,
             idempotency_key: request.tool_use_id.clone(),
             tool_use_id: request.tool_use_id.clone(),
             tool_name: request.tool_name.clone(),
             input: request.input.clone(),
-            category: ToolSafetyCategory::from_tool_name(&request.tool_name),
+            category: ToolSafetyCategory::Destructive,
             authorization: None,
             session_id: None,
             model_lease: None,

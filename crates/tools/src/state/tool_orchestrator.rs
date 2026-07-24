@@ -8,20 +8,20 @@ use std::hash::{Hash, Hasher};
 
 use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
 use harness_contract::tool::{
-    ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency, ToolPermissionMode,
+    ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolEffectResolverSpec,
+    ToolIdempotency, ToolPermissionMode,
 };
 use serde_json::Value;
 
 /// Derive the effective effect from the concrete tool input.
 #[must_use]
-pub fn describe_tool_effect(
+pub fn resolve_registered_tool_effect(
+    resolver: &ToolEffectResolverSpec,
     tool_id: &str,
     input: &Value,
     catalog_permission: ToolPermissionMode,
-    catalog_known: bool,
 ) -> ToolEffectDescriptor {
-    let normalized = normalize_tool_name(tool_id);
-    let mut properties = intrinsic_properties(&normalized, input, catalog_known);
+    let mut properties = resolve_effect_properties(resolver, tool_id, input);
     properties.required_permission =
         stricter_permission(properties.required_permission, catalog_permission);
 
@@ -54,16 +54,11 @@ struct EffectProperties {
     mutates_system: bool,
 }
 
-fn intrinsic_properties(name: &str, input: &Value, catalog_known: bool) -> EffectProperties {
-    if matches!(name, "bash" | "powershell" | "repl" | "execute_code") {
-        let command = input
-            .get("command")
-            .or_else(|| input.get("code"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        return command_effect(command);
-    }
-
+fn resolve_effect_properties(
+    resolver: &ToolEffectResolverSpec,
+    tool_id: &str,
+    input: &Value,
+) -> EffectProperties {
     let target = resource_target(input);
     let read_scope = || {
         scope(
@@ -80,46 +75,38 @@ fn intrinsic_properties(name: &str, input: &Value, catalog_known: bool) -> Effec
         )
     };
 
-    match name {
-        "read_file"
-        | "read_many"
-        | "glob_search"
-        | "glob_many"
-        | "grep_search"
-        | "grep_many"
-        | "workspace_snapshot"
-        | "tool_batch_readonly"
-        | "tool_cache_stats"
-        | "mutation_preview"
-        | "edit_many_preview"
-        | "patch_plan"
-        | "checkpoint_list"
-        | "checkpoint_diff"
-        | "question"
-        | "ask_user_question"
-        | "tool_search"
-        | "runtime_capabilities"
-        | "evidence_retrieve"
-        | "lsp"
-        | "list_mcp_resources"
-        | "read_mcp_resource" => EffectProperties {
+    match resolver.resolver_id.as_str() {
+        "builtin.command" => {
+            let command = input
+                .get("command")
+                .or_else(|| input.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            command_effect(command)
+        }
+        "builtin.readonly" => EffectProperties {
             effect_kind: ToolEffectKind::Read,
             idempotency: ToolIdempotency::Idempotent,
             scopes: vec![read_scope()],
             required_permission: ToolPermissionMode::ReadOnly,
             approval_class: ToolApprovalClass::None,
             uses_network: false,
-            spawns_process: name == "lsp",
+            spawns_process: false,
             mutates_packages: false,
             mutates_system: false,
         },
-        "write_file"
-        | "edit_file"
-        | "apply_patch_transaction"
-        | "checkpoint_create"
-        | "checkpoint_restore"
-        | "notebook_edit"
-        | "todo_write" => EffectProperties {
+        "builtin.readonly_process" => EffectProperties {
+            effect_kind: ToolEffectKind::Read,
+            idempotency: ToolIdempotency::Idempotent,
+            scopes: vec![read_scope()],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+        },
+        "builtin.workspace_write" => EffectProperties {
             effect_kind: ToolEffectKind::Write,
             idempotency: ToolIdempotency::IdempotentWithKey,
             scopes: vec![write_scope()],
@@ -130,7 +117,7 @@ fn intrinsic_properties(name: &str, input: &Value, catalog_known: bool) -> Effec
             mutates_packages: false,
             mutates_system: false,
         },
-        "web_fetch" | "web_search" | "remote_trigger" => EffectProperties {
+        "builtin.network" => EffectProperties {
             effect_kind: ToolEffectKind::Network,
             idempotency: ToolIdempotency::Unknown,
             scopes: vec![scope(
@@ -145,7 +132,22 @@ fn intrinsic_properties(name: &str, input: &Value, catalog_known: bool) -> Effec
             mutates_packages: false,
             mutates_system: false,
         },
-        "mcp" | "mcp_auth" => EffectProperties {
+        "builtin.process" => EffectProperties {
+            effect_kind: ToolEffectKind::Process,
+            idempotency: ToolIdempotency::Idempotent,
+            scopes: vec![scope(
+                PermissionResource::Tool,
+                PermissionOperation::Execute,
+                target,
+            )],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        },
+        "builtin.external_unknown" => EffectProperties {
             effect_kind: ToolEffectKind::Unknown,
             idempotency: ToolIdempotency::Unknown,
             scopes: vec![scope(
@@ -160,8 +162,7 @@ fn intrinsic_properties(name: &str, input: &Value, catalog_known: bool) -> Effec
             mutates_packages: false,
             mutates_system: false,
         },
-        _ if !catalog_known => conservative_unknown(tool_id_target(name, input)),
-        _ => conservative_unknown(tool_id_target(name, input)),
+        _ => conservative_unknown(tool_id_target(tool_id, input)),
     }
 }
 
@@ -306,10 +307,6 @@ fn tool_id_target(name: &str, input: &Value) -> Option<String> {
     resource_target(input).or_else(|| Some(name.to_string()))
 }
 
-fn normalize_tool_name(name: &str) -> String {
-    name.trim().replace('-', "_").to_ascii_lowercase()
-}
-
 fn stricter_permission(left: ToolPermissionMode, right: ToolPermissionMode) -> ToolPermissionMode {
     if permission_rank(left) >= permission_rank(right) {
         left
@@ -377,17 +374,21 @@ mod tests {
 
     #[test]
     fn bash_effect_escalates_with_effective_command() {
-        let read = describe_tool_effect(
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.command".to_string(),
+            resolver_version: 1,
+        };
+        let read = resolve_registered_tool_effect(
+            &resolver,
             "bash",
             &json!({"command": "git status"}),
             ToolPermissionMode::ReadOnly,
-            true,
         );
-        let destructive = describe_tool_effect(
+        let destructive = resolve_registered_tool_effect(
+            &resolver,
             "bash",
             &json!({"command": "rm -rf target"}),
             ToolPermissionMode::ReadOnly,
-            true,
         );
         assert_eq!(read.effect_kind, ToolEffectKind::Process);
         assert_eq!(destructive.effect_kind, ToolEffectKind::Destructive);
@@ -400,11 +401,14 @@ mod tests {
 
     #[test]
     fn unknown_tool_is_conservative() {
-        let descriptor = describe_tool_effect(
+        let descriptor = resolve_registered_tool_effect(
+            &ToolEffectResolverSpec {
+                resolver_id: "plugin.unknown".to_string(),
+                resolver_version: 1,
+            },
             "plugin_tool",
             &json!({}),
             ToolPermissionMode::ReadOnly,
-            false,
         );
         assert_eq!(descriptor.effect_kind, ToolEffectKind::Unknown);
         assert_eq!(

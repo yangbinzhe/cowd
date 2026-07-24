@@ -22,13 +22,11 @@ use harness_contract::harness::{
     CowdNativeHarness, HarnessAdapter, HarnessTurnInput, HarnessTurnReceipt,
 };
 use harness_contract::policy::{
-    agent_spec_policy_receipts, behavior_policy_receipt, tool_transaction_policy_receipts,
+    agent_spec_policy_receipts, behavior_policy_receipt, governed_tool_policy_receipts,
     PolicyReceipt,
 };
 use harness_contract::strategy::{StrategyDecision, StrategyInput};
-use harness_contract::tool::{
-    ToolOperation, ToolRisk, ToolTransactionPlan, ToolTransactionPlanner, ToolTransactionReceipt,
-};
+use harness_contract::tool::{GovernedToolPlanProjection, ToolApprovalClass, ToolEffectKind};
 use harness_contract::verification::{
     Claim, ClaimKind, Evidence, EvidenceKind, VerificationLedger, VerificationReport,
 };
@@ -48,8 +46,8 @@ pub struct RuntimeAiKernelTrace {
     pub context_envelope_id: Option<String>,
     pub context_alignment: Option<ContextAlignmentReport>,
     pub prompt_plan: PromptAssemblyPlan,
-    pub tool_transaction: Option<ToolTransactionPlan>,
-    pub tool_receipt: Option<ToolTransactionReceipt>,
+    pub governed_tool_plans: Vec<GovernedToolPlanProjection>,
+    pub tool_receipt: Option<GovernedToolExecutionSummary>,
     pub verification_report: VerificationReport,
     pub verification_blocked: bool,
     pub trajectory: Trajectory,
@@ -64,13 +62,21 @@ pub struct RuntimeAiKernelTrace {
     pub behavior_policy: BehaviorPolicyDecision,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedToolExecutionSummary {
+    pub plan_ids: Vec<String>,
+    pub completed_operations: usize,
+    pub failed_operations: usize,
+    pub checkpoint_created: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeAiKernel {
     user_input: String,
     execution_decision: RuntimeExecutionDecision,
     collaboration_decision: CollaborationDecision,
     context_epoch: ContextEpoch,
-    tool_transaction: Option<ToolTransactionPlan>,
+    governed_tool_plans: Vec<GovernedToolPlanProjection>,
     execution_graph: Option<ExecutionGraph>,
     verification: VerificationLedger,
     behavior_policy: BehaviorPolicyDecision,
@@ -138,7 +144,7 @@ impl RuntimeAiKernel {
             execution_decision,
             collaboration_decision,
             context_epoch,
-            tool_transaction: None,
+            governed_tool_plans: Vec::new(),
             execution_graph,
             verification: VerificationLedger::new(),
             behavior_policy,
@@ -160,35 +166,24 @@ impl RuntimeAiKernel {
         &self.context_epoch
     }
 
-    pub fn record_tool_requests(&mut self, requests: &[(String, String, String)]) {
-        if requests.is_empty() {
+    pub fn record_governed_tool_plan(&mut self, plan: GovernedToolPlanProjection) {
+        if plan.invocations.is_empty() {
             return;
         }
-        let operations = requests
-            .iter()
-            .map(|(_, name, input)| operation_from_tool(name, input))
-            .collect::<Vec<_>>();
-        match ToolTransactionPlanner.plan(operations) {
-            Ok(plan) => {
-                let evidence_id = self.verification.add_evidence(Evidence::new(
-                    EvidenceKind::ToolResult,
-                    format!("planned {} tool transaction batches", plan.batches.len()),
-                ));
-                let claim_id = self.verification.add_claim(Claim::required(
-                    ClaimKind::DesignDecision,
-                    "tool execution was planned through transaction policy",
-                ));
-                let _ = self.verification.support_claim(&claim_id, &evidence_id);
-                self.tool_transaction = Some(plan);
-            }
-            Err(error) => {
-                let claim_id = self.verification.add_claim(Claim::required(
-                    ClaimKind::Limitation,
-                    format!("tool transaction planning failed: {error}"),
-                ));
-                let _ = self.verification.mark_not_run(&claim_id);
-            }
-        }
+        let evidence_id = self.verification.add_evidence(Evidence::new(
+            EvidenceKind::ToolResult,
+            format!(
+                "governed plan {} prepared {} tool invocations",
+                plan.plan_id,
+                plan.invocations.len()
+            ),
+        ));
+        let claim_id = self.verification.add_claim(Claim::required(
+            ClaimKind::DesignDecision,
+            "tool execution used the Runtime governed plan",
+        ));
+        let _ = self.verification.support_claim(&claim_id, &evidence_id);
+        self.governed_tool_plans.push(plan);
     }
 
     pub fn record_context_envelope(
@@ -242,13 +237,17 @@ impl RuntimeAiKernel {
             ));
         }
 
-        let tool_receipt = self.tool_transaction.as_ref().map(|plan| {
-            plan.receipt(
-                completed_tool_results,
-                failed_tool_results,
-                self.checkpoint_created,
-            )
-        });
+        let tool_receipt =
+            (!self.governed_tool_plans.is_empty()).then(|| GovernedToolExecutionSummary {
+                plan_ids: self
+                    .governed_tool_plans
+                    .iter()
+                    .map(|plan| plan.plan_id.clone())
+                    .collect(),
+                completed_operations: completed_tool_results,
+                failed_operations: failed_tool_results,
+                checkpoint_created: self.checkpoint_created,
+            });
         let verification_report = self.verification.report();
         let verification_blocked = !verification_report.can_finalize;
         let prompt_plan = self.context_epoch.prompt_assembly_plan();
@@ -305,16 +304,22 @@ impl RuntimeAiKernel {
             require_all_pass: true,
         }
         .evaluate(&bench_report);
-        let tool_requires_checkpoint = self
-            .tool_transaction
-            .as_ref()
-            .map(|plan| plan.requires_checkpoint)
-            .unwrap_or(false);
-        let tool_requires_human_confirm = self
-            .tool_transaction
-            .as_ref()
-            .map(|plan| plan.requires_human_confirm)
-            .unwrap_or(false);
+        let tool_requires_checkpoint = self.governed_tool_plans.iter().any(|plan| {
+            plan.invocations
+                .iter()
+                .any(|invocation| !matches!(invocation.effect.effect_kind, ToolEffectKind::Read))
+        });
+        let tool_requires_human_confirm = self.governed_tool_plans.iter().any(|plan| {
+            plan.invocations.iter().any(|invocation| {
+                matches!(
+                    invocation.effect.approval_class,
+                    ToolApprovalClass::User | ToolApprovalClass::Administrator
+                ) || matches!(
+                    invocation.effect.effect_kind,
+                    ToolEffectKind::Destructive | ToolEffectKind::Unknown
+                )
+            })
+        });
         let execution_graph_quality = self.execution_graph.as_ref().map(execution_graph_quality);
         let agent_spec = harness_contract::agent::AgentSpec::for_turn(
             &self.user_input,
@@ -322,8 +327,13 @@ impl RuntimeAiKernel {
             self.execution_decision.strategy.understanding.risk,
         );
         let mut policy_receipts = agent_spec_policy_receipts(&agent_spec);
-        policy_receipts.extend(tool_transaction_policy_receipts(
-            self.tool_transaction.as_ref().map(|plan| plan.id.as_str()),
+        let governed_tool_plan_ids = self
+            .governed_tool_plans
+            .iter()
+            .map(|plan| plan.plan_id.clone())
+            .collect::<Vec<_>>();
+        policy_receipts.extend(governed_tool_policy_receipts(
+            &governed_tool_plan_ids,
             tool_requires_checkpoint,
             tool_requires_human_confirm,
         ));
@@ -388,11 +398,11 @@ impl RuntimeAiKernel {
                 .push("prefer minimal scope and reuse existing platform capabilities".to_string());
         }
         let mut evidence_refs = Vec::new();
-        if let Some(plan) = &self.tool_transaction {
+        for plan in &self.governed_tool_plans {
             evidence_refs.push(GrowthEvidenceRef::new(
-                "tool_transaction",
-                plan.id.clone(),
-                "AI kernel tool transaction plan",
+                "governed_tool_plan",
+                plan.plan_id.clone(),
+                "Runtime governed tool execution plan",
             ));
         }
         if let Some(graph) = &self.execution_graph {
@@ -416,7 +426,7 @@ impl RuntimeAiKernel {
                     agent_spec: agent_spec.clone(),
                     strategy: self.execution_decision.strategy.clone(),
                     context_epoch: self.context_epoch.clone(),
-                    tool_plan: self.tool_transaction.clone(),
+                    governed_tool_plans: self.governed_tool_plans.clone(),
                     policy_context: policy_receipts
                         .iter()
                         .map(|receipt| receipt.id.clone())
@@ -440,7 +450,7 @@ impl RuntimeAiKernel {
                     .as_str()
                     .to_string(),
                 context_epoch_id: self.context_epoch.epoch_id.clone(),
-                tool_transaction_id: self.tool_transaction.as_ref().map(|plan| plan.id.clone()),
+                governed_tool_plan_ids: governed_tool_plan_ids.clone(),
                 verification_can_finalize: verification_report.can_finalize,
                 policy_receipts: Vec::new(),
                 output_summary: format!("harness receipt degraded: {error}"),
@@ -452,7 +462,7 @@ impl RuntimeAiKernel {
             context_envelope_id: self.context_envelope_id,
             context_alignment,
             prompt_plan,
-            tool_transaction: self.tool_transaction,
+            governed_tool_plans: self.governed_tool_plans,
             tool_receipt,
             verification_report,
             verification_blocked,
@@ -629,52 +639,6 @@ fn graph_nodes_in_status(graph: &ExecutionGraph, expected: ExecutionNodeStatus) 
         .count()
 }
 
-fn operation_from_tool(name: &str, input: &str) -> ToolOperation {
-    let lowered = name.to_ascii_lowercase();
-    let path = extract_path(input);
-    if lowered.contains("read")
-        || lowered.contains("grep")
-        || lowered.contains("glob")
-        || lowered.contains("list")
-        || lowered.contains("search")
-    {
-        ToolOperation::read(name, path)
-    } else {
-        ToolOperation::write(name, tool_risk_for(name, input), path)
-    }
-}
-
-fn tool_risk_for(name: &str, input: &str) -> ToolRisk {
-    let text = format!(
-        "{} {}",
-        name.to_ascii_lowercase(),
-        input.to_ascii_lowercase()
-    );
-    if text.contains("reset --hard") || text.contains("force push") || text.contains("drop table") {
-        ToolRisk::Critical
-    } else if text.contains("delete") || text.contains("rm ") || text.contains("write") {
-        ToolRisk::High
-    } else if text.contains("edit") || text.contains("patch") {
-        ToolRisk::Medium
-    } else {
-        ToolRisk::Low
-    }
-}
-
-fn extract_path(input: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
-    value
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            value
-                .get("file")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-}
-
 fn context_mode_for_profile(profile: ContextProfile) -> ContextMode {
     match profile {
         ContextProfile::SoloGoal | ContextProfile::YoloGoal => ContextMode::Goal,
@@ -794,22 +758,51 @@ mod tests {
     }
 
     #[test]
-    fn runtime_kernel_records_tool_transaction_plan() {
+    fn runtime_kernel_records_governed_tool_plan() {
         let mut kernel = RuntimeAiKernel::begin_turn(
             "session-1",
             "modify one file",
             ContextProfile::MainTurn,
             &[],
         );
-        kernel.record_tool_requests(&[(
-            "tool-1".to_string(),
-            "apply_patch".to_string(),
-            r#"{"path":"src/lib.rs"}"#.to_string(),
-        )]);
+        kernel.record_governed_tool_plan(GovernedToolPlanProjection {
+            contract_version: 1,
+            plan_id: "plan-1".to_string(),
+            revision: 1,
+            catalog_revision: 7,
+            invocations: vec![harness_contract::tool::GovernedToolInvocation {
+                contract_version: 1,
+                invocation_id: "tool-1".to_string(),
+                intent: harness_contract::tool::ToolIntent {
+                    invocation_id: "tool-1".to_string(),
+                    tool_name: "apply_patch".to_string(),
+                    normalized_input: serde_json::json!({"path": "src/lib.rs"}),
+                },
+                effect: harness_contract::tool::ToolEffectDescriptor {
+                    tool_id: "apply_patch".to_string(),
+                    descriptor_hash: "sha256:fixture".to_string(),
+                    effect_kind: ToolEffectKind::Write,
+                    idempotency: harness_contract::tool::ToolIdempotency::IdempotentWithKey,
+                    scopes: Vec::new(),
+                    required_permission: harness_contract::tool::ToolPermissionMode::WorkspaceWrite,
+                    approval_class: ToolApprovalClass::Policy,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                },
+                resource_demand: harness_contract::tool::ResourceDemand::default(),
+                explicit_dependencies: Vec::new(),
+                catalog_revision: 7,
+                descriptor_set_hash: "sha256:catalog".to_string(),
+                idempotency_key: "tool-1".to_string(),
+            }],
+            dependencies: Vec::new(),
+        });
 
         let trace = kernel.finalize("changed", 1, 0);
 
-        assert!(trace.tool_transaction.is_some());
+        assert_eq!(trace.governed_tool_plans.len(), 1);
         assert!(trace.tool_receipt.is_some());
         assert!(!trace.learning_record.signals.is_empty());
         assert!(!trace.growth_event.evidence_refs.is_empty());

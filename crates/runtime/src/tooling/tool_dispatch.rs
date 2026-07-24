@@ -1,4 +1,3 @@
-use crate::execution_scheduler::schedule_tool_requests;
 use crate::session::ConversationMessage;
 use crate::tool_orchestrator::ToolSafetyCategory;
 use std::collections::HashMap;
@@ -16,14 +15,6 @@ pub struct ToolDispatchResult {
     pub message: Result<ConversationMessage, String>,
     pub category: ToolSafetyCategory,
     pub duration_ms: u64,
-}
-
-pub fn categorize(requests: &[ToolRequest]) -> (Vec<usize>, Vec<usize>) {
-    let schedule = schedule_tool_requests(requests);
-    (
-        schedule.parallel_read_indices(),
-        schedule.remaining_indices(),
-    )
 }
 
 pub fn reorder_in_original(

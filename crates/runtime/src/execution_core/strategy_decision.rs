@@ -599,7 +599,7 @@ fn expected_projection_for(action: &str) -> &'static [&'static str] {
             "mission.evidence_projection",
         ],
         "request_parallel_tools" | "request_rewoo_evidence" => &[
-            "runtime.tool_dag",
+            "runtime.tool_intents",
             "runtime.tool_schedule",
             "runtime.evidence_refs",
         ],

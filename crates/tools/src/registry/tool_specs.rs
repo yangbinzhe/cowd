@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 
 use crate::permissions::PermissionMode;
+use harness_contract::tool::ToolEffectResolverSpec;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
@@ -8,6 +9,57 @@ pub struct ToolSpec {
     pub description: &'static str,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
+}
+
+/// Effect behavior is selected by the registration manifest, not inferred by
+/// Runtime from a tool name. Families keep input-sensitive logic reusable
+/// without turning the executor into a second catalog.
+#[must_use]
+pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
+    let resolver_id = match normalize_tool_name(name).as_str() {
+        "bash" | "powershell" | "repl" | "execute_code" => "builtin.command",
+        "read_file"
+        | "read_many"
+        | "glob_search"
+        | "glob_many"
+        | "grep_search"
+        | "grep_many"
+        | "workspace_snapshot"
+        | "tool_batch_readonly"
+        | "tool_cache_stats"
+        | "mutation_preview"
+        | "edit_many_preview"
+        | "patch_plan"
+        | "checkpoint_list"
+        | "checkpoint_diff"
+        | "question"
+        | "ask_user_question"
+        | "tool_search"
+        | "structured_output"
+        | "testing_permission" => "builtin.readonly",
+        "lsp" => "builtin.readonly_process",
+        "vision_analyze" => "builtin.readonly_process",
+        "write_file"
+        | "edit_file"
+        | "apply_patch_transaction"
+        | "checkpoint_create"
+        | "checkpoint_restore"
+        | "notebook_edit"
+        | "todo_write"
+        | "config"
+        | "enter_plan_mode"
+        | "exit_plan_mode" => "builtin.workspace_write",
+        "web_fetch" | "web_search" | "remote_trigger" | "send_user_message" => "builtin.network",
+        "sleep" => "builtin.process",
+        "list_mcp_resources" | "read_mcp_resource" | "mcp_auth" | "mcp" => {
+            "builtin.external_unknown"
+        }
+        _ => "builtin.unknown",
+    };
+    ToolEffectResolverSpec {
+        resolver_id: resolver_id.to_string(),
+        resolver_version: 1,
+    }
 }
 
 pub(crate) fn normalize_tool_name(value: &str) -> String {

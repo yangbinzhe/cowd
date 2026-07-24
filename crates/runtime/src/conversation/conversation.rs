@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use fact_kernel::FactExtractionTokenUsage;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::RwLock;
 
 /// T35: Lightweight cancellation token (tokio-util not available in dep tree).
 #[derive(Default, Debug)]
@@ -289,6 +289,9 @@ use crate::fact_extraction::{
     RuntimeFactExtractionPolicy, RuntimeFactExtractionScheduler, RuntimeFactExtractionTrigger,
     RuntimeFactExtractor,
 };
+use crate::governed_tool_plan::{
+    GovernedToolCompiler, GovernedToolPlan, GovernedToolPolicyValidationReport,
+};
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::knowledge_activation::KnowledgeActivationRuntime;
 use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
@@ -299,7 +302,6 @@ use crate::skill::{
     memory_candidate_from_skill_activation, skill_memory_candidate_session_event,
     RuntimeSkillPromptAsset, SkillActivationEngine, SkillActivationInput, SkillMemoryPolicy,
 };
-use crate::tool_execution_plan::{ToolExecutionPlan, ToolExecutionPolicyValidationReport};
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
@@ -379,6 +381,68 @@ fn conversation_messages_token_estimate(messages: &[ConversationMessage]) -> u64
                 .saturating_add(crate::context_ledger::estimate_text_tokens(tool_name))
                 .saturating_add(crate::context_ledger::estimate_text_tokens(output)),
         })
+}
+
+fn retrieve_tool_evidence_from_sandbox(
+    sandbox: Option<&Arc<std::sync::Mutex<memory::ToolOutputSandbox>>>,
+    input: &str,
+) -> Result<String, String> {
+    let request: serde_json::Value = serde_json::from_str(input)
+        .map_err(|error| format!("invalid evidence retrieval input: {error}"))?;
+    let evidence_ref = request
+        .get("evidence_ref")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "evidence_ref is required".to_string())?;
+    let evidence_id = evidence_ref.strip_prefix("tool://").unwrap_or(evidence_ref);
+    let query = request
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let limit = request
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(4)
+        .clamp(1, 16) as usize;
+    let sandbox = sandbox.ok_or_else(|| "tool evidence sandbox is unavailable".to_string())?;
+    let sandbox = sandbox
+        .lock()
+        .map_err(|_| "tool evidence sandbox lock poisoned".to_string())?;
+    let mut snippets = if query.is_empty() {
+        sandbox.read(evidence_id, limit)
+    } else {
+        sandbox.search(evidence_id, query, limit)
+    };
+    if snippets.is_empty() && !query.is_empty() {
+        let normalized_query = query
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if normalized_query != query && !normalized_query.is_empty() {
+            snippets = sandbox.search(evidence_id, &normalized_query, limit);
+        }
+    }
+    if snippets.is_empty() {
+        return Err(format!(
+            "no indexed evidence matched `{evidence_ref}`; use the session evidence API for the immutable raw payload"
+        ));
+    }
+    serde_json::to_string_pretty(
+        &snippets
+            .iter()
+            .map(|snippet| {
+                serde_json::json!({
+                    "range_start": snippet.line_start,
+                    "range_end": snippet.line_end,
+                    "content": snippet.content,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| format!("evidence retrieval serialization failed: {error}"))
 }
 
 fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelStepIntent {
@@ -869,12 +933,76 @@ pub trait ToolExecutor: Send + Sync + 'static {
         fallback_tool_discovery_receipt(self.available_tool_names())
     }
 
-    fn describe_tool_effect(
+    fn registered_tool_effect(
         &self,
         _tool_name: &str,
         _input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
         None
+    }
+
+    fn prepare_governed_invocations(
+        &self,
+        requests: &[crate::tool_dispatch::ToolRequest],
+    ) -> Vec<harness_contract::tool::GovernedToolInvocation> {
+        let catalog_revision = self.tool_discovery_receipt().catalog_revision;
+        requests
+            .iter()
+            .filter_map(|request| {
+                let input = serde_json::from_str::<serde_json::Value>(&request.input).ok()?;
+                let effect = self.registered_tool_effect(&request.tool_name, &input)?;
+                Some(harness_contract::tool::GovernedToolInvocation {
+                    contract_version: 1,
+                    invocation_id: request.tool_use_id.clone(),
+                    intent: harness_contract::tool::ToolIntent {
+                        invocation_id: request.tool_use_id.clone(),
+                        tool_name: request.tool_name.clone(),
+                        normalized_input: input,
+                    },
+                    resource_demand: harness_contract::tool::ResourceDemand {
+                        tool_slots: 1,
+                        process_slots: u32::from(effect.spawns_process),
+                        network_slots: u32::from(effect.uses_network),
+                        cpu_weight: if effect.spawns_process { 2 } else { 1 },
+                        memory_bytes: 0,
+                        scopes: effect
+                            .scopes
+                            .iter()
+                            .filter_map(|scope| {
+                                scope.target.clone().map(|key| {
+                                    harness_contract::tool::ResourceScopeDemand {
+                                        key,
+                                        access: if scope.operation
+                                            == harness_contract::policy::PermissionOperation::Read
+                                        {
+                                            harness_contract::tool::ResourceAccess::Read
+                                        } else {
+                                            harness_contract::tool::ResourceAccess::Write
+                                        },
+                                    }
+                                })
+                            })
+                            .collect(),
+                    },
+                    explicit_dependencies: request
+                        .depends_on
+                        .iter()
+                        .map(|depends_on| harness_contract::tool::ToolDependency {
+                            invocation_id: request.tool_use_id.clone(),
+                            depends_on: depends_on.clone(),
+                            reason: "model_explicit_dependency".to_string(),
+                        })
+                        .collect(),
+                    catalog_revision,
+                    descriptor_set_hash: effect.descriptor_hash.clone(),
+                    idempotency_key: format!(
+                        "{}:{}:{}",
+                        request.tool_name, request.tool_use_id, effect.descriptor_hash
+                    ),
+                    effect,
+                })
+            })
+            .collect()
     }
 
     fn execute_authorized(
@@ -1400,6 +1528,11 @@ pub struct ConversationRuntime<C, T> {
     tool_trace_context_items: std::sync::Mutex<Vec<ContextItem>>,
     /// Governance observations produced by tool calls in the active turn.
     turn_tool_observations: std::sync::Mutex<Vec<ToolObservation>>,
+    /// Stable projections emitted by the sole governed Tool compiler during
+    /// the active turn. Finalization forwards these exact plan identities to
+    /// harness, policy, evidence, and growth receipts.
+    turn_governed_tool_plans:
+        std::sync::Mutex<Vec<harness_contract::tool::GovernedToolPlanProjection>>,
     /// Sole strategy identity for the admitted turn. Host creates it before
     /// graph compilation; every later checkpoint reads or revises this state.
     active_turn_strategy:
@@ -1427,15 +1560,8 @@ pub struct ConversationRuntime<C, T> {
     /// Knowledge activation report prepared from the active memory packet.
     turn_knowledge_report:
         std::sync::Mutex<Option<harness_contract::knowledge::KnowledgeTurnReport>>,
-    /// T4: Semaphore for WriteLocal tool concurrency (permits: 4).
-    write_semaphore: Arc<Semaphore>,
-    /// T4: Semaphore for Network tool concurrency (permits: 3).
-    network_semaphore: Arc<Semaphore>,
-    /// T4: Semaphore for Destructive tool concurrency (permits: 1).
-    destructive_semaphore: Arc<Semaphore>,
-    /// Per-turn ReadOnly admission. The process-wide permit is acquired in
-    /// addition to this one for every category.
-    default_semaphore: Arc<Semaphore>,
+    /// Sole bounded execution boundary for synchronous Tool implementations.
+    tool_execution_plane: Arc<crate::ToolExecutionPlane>,
     /// 普通 Conversation 与 ExecutionGraph 共享的 Provider admission owner。
     /// Graph-owned child host 已由外层 node lease 覆盖，因此不会重复申请。
     provider_admission: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
@@ -1668,6 +1794,7 @@ where
             next_model_reasoning_effort: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
             turn_tool_observations: std::sync::Mutex::new(Vec::new()),
+            turn_governed_tool_plans: std::sync::Mutex::new(Vec::new()),
             active_turn_strategy: std::sync::Mutex::new(None),
             tool_exposure_state: std::sync::Mutex::new(None),
             active_skill_tool_refs: std::sync::Mutex::new(BTreeSet::new()),
@@ -1680,17 +1807,60 @@ where
             last_context_turn_report: std::sync::Mutex::new(None),
             turn_preflight_compaction: std::sync::Mutex::new(None),
             turn_knowledge_report: std::sync::Mutex::new(None),
-            write_semaphore: Arc::new(Semaphore::new(
-                crate::tool_orchestrator::ToolSafetyCategory::WriteLocal.max_concurrency(),
-            )),
-            network_semaphore: Arc::new(Semaphore::new(
-                crate::tool_orchestrator::ToolSafetyCategory::Network.max_concurrency(),
-            )),
-            destructive_semaphore: Arc::new(Semaphore::new(
-                crate::tool_orchestrator::ToolSafetyCategory::Destructive.max_concurrency(),
-            )),
-            default_semaphore: Arc::new(Semaphore::new(
-                crate::execution_scheduler::DEFAULT_PARALLEL_READ_CONCURRENCY,
+            tool_execution_plane: Arc::new(crate::ToolExecutionPlane::new(
+                Arc::new(crate::execution_core::graph::ExecutionResourceManager::new(
+                    [
+                        (
+                            crate::execution_core::graph::ExecutionResourceKind::Tool,
+                            crate::execution_core::graph::ResourceQuota {
+                                minimum: 1,
+                                target: 8,
+                                maximum: 64,
+                            },
+                        ),
+                        (
+                            crate::execution_core::graph::ExecutionResourceKind::Custom(
+                                "tool.process".to_string(),
+                            ),
+                            crate::execution_core::graph::ResourceQuota {
+                                minimum: 1,
+                                target: 4,
+                                maximum: 16,
+                            },
+                        ),
+                        (
+                            crate::execution_core::graph::ExecutionResourceKind::Custom(
+                                "tool.network".to_string(),
+                            ),
+                            crate::execution_core::graph::ResourceQuota {
+                                minimum: 1,
+                                target: 8,
+                                maximum: 32,
+                            },
+                        ),
+                        (
+                            crate::execution_core::graph::ExecutionResourceKind::Custom(
+                                "tool.cpu".to_string(),
+                            ),
+                            crate::execution_core::graph::ResourceQuota {
+                                minimum: 1,
+                                target: 16,
+                                maximum: 64,
+                            },
+                        ),
+                        (
+                            crate::execution_core::graph::ExecutionResourceKind::Custom(
+                                "tool.memory_mib".to_string(),
+                            ),
+                            crate::execution_core::graph::ResourceQuota {
+                                minimum: 64,
+                                target: 2_048,
+                                maximum: 16_384,
+                            },
+                        ),
+                    ],
+                )),
+                Arc::new(crate::execution_core::graph::ScopeLockManager::new()),
             )),
             provider_admission: None,
             tool_timeout: Some(Duration::from_secs(120)),
@@ -1714,6 +1884,12 @@ where
         manager: Arc<crate::execution_core::graph::ExecutionResourceManager>,
     ) -> Self {
         self.provider_admission = Some(manager);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_execution_plane(mut self, plane: Arc<crate::ToolExecutionPlane>) -> Self {
+        self.tool_execution_plane = plane;
         self
     }
 
@@ -3535,6 +3711,9 @@ where
         let started_at = Instant::now();
         if first_step {
             self.clear_turn_tool_observations();
+            if let Ok(mut plans) = self.turn_governed_tool_plans.lock() {
+                plans.clear();
+            }
             if let Ok(mut preflight_compaction) = self.turn_preflight_compaction.lock() {
                 *preflight_compaction = None;
             }
@@ -4186,7 +4365,6 @@ where
         if self.cancellation_token.is_cancelled() {
             return Err(RuntimeError::new("turn cancelled before tool execution"));
         }
-        use crate::execution_scheduler::schedule_tool_execution_plan_for_decision;
         use crate::tool_dispatch::ToolRequest;
 
         let mut requests = calls
@@ -4207,10 +4385,23 @@ where
             .active_turn_strategy()
             .map(|state| state.decision)
             .ok_or_else(|| RuntimeError::new("tool batch has no admitted turn strategy"))?;
-        let plan = ToolExecutionPlan::from_requests_with_classifier(&requests, |name, input| {
-            self.tool_executor.classify_tool_safety(name, input)
+        let prepared = self.tool_executor.prepare_governed_invocations(&requests);
+        let mut plan = GovernedToolCompiler.compile(&requests, None, |name, input| {
+            prepared
+                .iter()
+                .find(|invocation| {
+                    invocation.intent.tool_name == name
+                        && invocation.intent.normalized_input == *input
+                })
+                .map(|invocation| {
+                    (
+                        invocation.effect.clone(),
+                        invocation.catalog_revision,
+                        invocation.descriptor_set_hash.clone(),
+                    )
+                })
         });
-        self.record_tool_execution_plan(&plan, self.session().messages.len());
+        self.record_governed_tool_plan(&plan, self.session().messages.len());
         let model_team_conflicts_with_admission = model_team_request_conflicts_with_admission(
             decision.strategy.selected_candidate,
             calls,
@@ -4313,6 +4504,7 @@ where
             decision.compile_target = crate::execution_core::RuntimeCompileTarget::ExecutionGraph;
         }
         self.tool_executor.bind_execution_decision(decision.clone());
+        plan.apply_execution_decision(&requests, &decision);
         let mut validation = plan.validate_against_execution_decision(&decision);
         if model_team_conflicts_with_admission {
             validation.allowed = false;
@@ -4330,23 +4522,22 @@ where
         let mut max_concurrency_observed = 0;
         let mut parallel_batches = 0;
         if validation.allowed {
-            let schedule = schedule_tool_execution_plan_for_decision(&requests, &plan, &decision);
-            max_concurrency_observed = schedule
+            max_concurrency_observed = plan
                 .batches
                 .iter()
                 .map(|batch| batch.max_concurrency.min(batch.indices.len()))
                 .max()
                 .unwrap_or(0);
-            parallel_batches = schedule
+            parallel_batches = plan
                 .batches
                 .iter()
                 .filter(|batch| batch.max_concurrency > 1 && batch.indices.len() > 1)
                 .count();
-            self.record_tool_schedule(&schedule, &requests, self.session().messages.len());
-            for batch in &schedule.batches {
+            self.record_tool_schedule(&plan, &requests, self.session().messages.len());
+            for batch in &plan.batches {
                 self.execute_tool_schedule_batch(
                     batch,
-                    &requests,
+                    &plan,
                     &pending,
                     prompter,
                     iteration,
@@ -4435,6 +4626,11 @@ where
             &self.system_prompt,
             decision,
         );
+        if let Ok(plans) = self.turn_governed_tool_plans.lock() {
+            for plan in plans.iter().cloned() {
+                kernel.record_governed_tool_plan(plan);
+            }
+        }
         if !matches!(
             terminal_completion,
             harness_contract::goal::GoalCompletion::Satisfied
@@ -4546,9 +4742,9 @@ where
 
     async fn satisfy_tool_strategy_gates(
         &self,
-        execution_plan: &ToolExecutionPlan,
+        execution_plan: &GovernedToolPlan,
         execution_decision: &crate::execution_core::RuntimeExecutionDecision,
-        validation: &mut ToolExecutionPolicyValidationReport,
+        validation: &mut GovernedToolPolicyValidationReport,
     ) {
         if validation.requires_approval {
             let Some(gate) = &self.approval_gate else {
@@ -4638,9 +4834,6 @@ where
         })
         .to_string();
         let executor = Arc::clone(&self.tool_executor);
-        let timeout = self.tool_timeout.unwrap_or_else(|| {
-            Duration::from_secs(crate::tool_execution_profile("checkpoint_create").timeout_secs)
-        });
         let checkpoint_value = match serde_json::from_str::<serde_json::Value>(&checkpoint_input) {
             Ok(value) => value,
             Err(error) => {
@@ -4652,7 +4845,7 @@ where
             }
         };
         let Some(descriptor) =
-            executor.describe_tool_effect("checkpoint_create", &checkpoint_value)
+            executor.registered_tool_effect("checkpoint_create", &checkpoint_value)
         else {
             validation.allowed = false;
             validation
@@ -4660,6 +4853,11 @@ where
                 .push("checkpoint_create_missing_effect_descriptor".to_string());
             return;
         };
+        let timeout = self.tool_timeout.unwrap_or_else(|| {
+            Duration::from_secs(
+                crate::ToolSafetyCategory::from_effect(&descriptor).default_timeout_secs(),
+            )
+        });
         let authorization = match crate::ToolPolicy.authorize(
             &descriptor,
             format!(
@@ -4679,19 +4877,19 @@ where
                 return;
             }
         };
-        let result = tokio::time::timeout(
-            timeout,
-            tokio::task::spawn_blocking(move || {
+        let checkpoint_demand = crate::governed_tool_plan::resource_demand_from_effect(&descriptor);
+        let result = self
+            .tool_execution_plane
+            .execute(&checkpoint_demand, Some(timeout), move || {
                 executor.execute_authorized(
                     &authorization.authorization,
                     "checkpoint_create",
                     &checkpoint_input,
                 )
-            }),
-        )
-        .await;
+            })
+            .await;
         match result {
-            Ok(Ok(Ok(output))) => {
+            Ok(Ok(output)) => {
                 validation.checkpoint_created = true;
                 tracing::info!(
                     strategy_lease_id = %execution_decision.lease.lease_id,
@@ -4699,24 +4897,17 @@ where
                     "strategy checkpoint created before mutation"
                 );
             }
-            Ok(Ok(Err(error))) => {
+            Ok(Err(error)) => {
                 validation.allowed = false;
                 validation
                     .findings
                     .push(format!("checkpoint_creation_failed:{error}"));
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 validation.allowed = false;
                 validation
                     .findings
-                    .push(format!("checkpoint_creation_panicked:{error}"));
-            }
-            Err(_) => {
-                validation.allowed = false;
-                validation.findings.push(format!(
-                    "checkpoint_creation_timed_out:{}s",
-                    timeout.as_secs()
-                ));
+                    .push(format!("checkpoint_execution_failed:{error}"));
             }
         }
     }
@@ -4724,13 +4915,16 @@ where
     /// Extract the per-tool execution logic from run_turn for reuse.
     async fn execute_single_tool(
         &self,
-        tool_use_id: &str,
-        tool_name: &str,
+        task: &crate::governed_tool_plan::GovernedToolPlanTask,
+        plan_id: &str,
+        plan_revision: u64,
         input: &str,
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
         strategy_approval_satisfied: bool,
     ) -> Result<ConversationMessage, RuntimeError> {
+        let tool_use_id = task.tool_call_id.as_str();
+        let tool_name = task.tool_name.as_str();
         let pre_hook_result = self.run_pre_tool_use_hook(tool_name, input);
         let effective_input = pre_hook_result
             .updated_input()
@@ -4892,12 +5086,14 @@ where
                     }
                 }
 
-                let invocation_record = self.start_tool_invocation_record(
-                    tool_use_id,
-                    tool_name,
-                    &effective_input,
-                    iterations,
-                );
+                let invocation_record = self
+                    .start_tool_invocation_record(
+                        tool_use_id,
+                        tool_name,
+                        &effective_input,
+                        iterations,
+                    )
+                    .with_governed_plan(plan_id, plan_revision);
                 self.record_tool_invocation_event(
                     &invocation_record,
                     "tool.invocation.started",
@@ -4916,73 +5112,71 @@ where
                 let tname_for_err = tname.clone();
                 let tinput = effective_input.clone();
                 let profile_timeout =
-                    Duration::from_secs(crate::tool_execution_profile(tool_name).timeout_secs);
+                    Duration::from_secs(task.safety_category.default_timeout_secs());
                 let tool_timeout = self
                     .tool_timeout
                     .map_or(profile_timeout, |t| t.min(profile_timeout));
-                let (output, mut is_error, mut failure_kind) = if tool_name == "evidence_retrieve" {
-                    match self.retrieve_tool_evidence(&effective_input) {
-                        Ok(output) => (output, false, None),
-                        Err(error) => (error, true, Some(ToolFailureKind::ExecutionError)),
-                    }
-                } else {
-                    let tool_exec = Arc::clone(&self.tool_executor);
-                    let parsed_input = serde_json::from_str::<serde_json::Value>(&tinput)
-                        .unwrap_or(serde_json::Value::Null);
-                    let authorization = tool_exec
-                        .describe_tool_effect(&tname, &parsed_input)
-                        .map(|descriptor| {
-                            crate::ToolPolicy.authorize(
-                                &descriptor,
-                                format!("{}:{tool_use_id}:{iterations}", self.session().session_id),
-                                self.permission_policy.active_mode(),
-                                tool_timeout.as_secs(),
+                let tool_exec = Arc::clone(&self.tool_executor);
+                let authorization = crate::ToolPolicy
+                    .authorize(
+                        &task.effect,
+                        format!(
+                            "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
+                            self.session().session_id
+                        ),
+                        self.permission_policy.active_mode(),
+                        tool_timeout.as_secs(),
+                    )
+                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                let evidence_sandbox = self.tool_output_sandbox.clone();
+                let is_evidence_retrieve = tool_name == "evidence_retrieve";
+                let demand = task.resource_demand.clone();
+                let plane = Arc::clone(&self.tool_execution_plane);
+                let execution = plane
+                    .execute(&demand, Some(tool_timeout), move || {
+                        if is_evidence_retrieve {
+                            return retrieve_tool_evidence_from_sandbox(
+                                evidence_sandbox.as_ref(),
+                                &tinput,
                             )
-                        })
-                        .transpose()
-                        .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    match tokio::time::timeout(
-                        tool_timeout,
-                        tokio::task::spawn_blocking(move || match authorization.as_ref() {
-                            Some(decision) => tool_exec.execute_authorized(
-                                &decision.authorization,
+                            .map_err(ToolError::new);
+                        }
+                        if matches!(tname.as_str(), "ToolSearch" | "runtime_capabilities") {
+                            tool_exec.execute(&tname, &tinput)
+                        } else {
+                            tool_exec.execute_authorized(
+                                &authorization.authorization,
                                 &tname,
                                 &tinput,
-                            ),
-                            None if matches!(
-                                tname.as_str(),
-                                "ToolSearch" | "runtime_capabilities"
-                            ) =>
-                            {
-                                tool_exec.execute(&tname, &tinput)
-                            }
-                            None => Err(ToolError::new(format!(
-                                "tool `{tname}` is missing a Runtime authorization descriptor"
-                            ))),
-                        }),
-                    )
-                    .await
-                    {
-                        Ok(Ok(Ok(output))) => (output, false, None),
-                        Ok(Ok(Err(error))) => (
-                            error.to_string(),
-                            true,
-                            Some(ToolFailureKind::ExecutionError),
-                        ),
-                        Ok(Err(join_error)) => (
-                            format!("tool execution panicked: {join_error}"),
-                            true,
-                            Some(ToolFailureKind::Panic),
-                        ),
-                        Err(_elapsed) => {
-                            tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution timed out, returning partial result");
-                            (
-                                format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
-                                true,
-                                Some(ToolFailureKind::Timeout),
                             )
                         }
+                    })
+                    .await;
+                let (output, mut is_error, mut failure_kind) = match execution {
+                    Ok(Ok(output)) => (output, false, None),
+                    Ok(Err(error)) => (
+                        error.to_string(),
+                        true,
+                        Some(ToolFailureKind::ExecutionError),
+                    ),
+                    Err(crate::ToolExecutionPlaneError::TimedOut(_)) => {
+                        tracing::warn!(tool = %tname_for_err, timeout_secs = tool_timeout.as_secs(), "tool execution waiter timed out; started operation remains fenced");
+                        (
+                            format!("tool `{tname_for_err}` timed out after {tool_timeout:?}"),
+                            true,
+                            Some(ToolFailureKind::Timeout),
+                        )
                     }
+                    Err(crate::ToolExecutionPlaneError::Panicked) => (
+                        "tool execution panicked".to_string(),
+                        true,
+                        Some(ToolFailureKind::Panic),
+                    ),
+                    Err(error) => (
+                        error.to_string(),
+                        true,
+                        Some(ToolFailureKind::ExecutionError),
+                    ),
                 };
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 self.hook_runner
@@ -5189,8 +5383,8 @@ where
 
     async fn execute_tool_schedule_batch(
         &self,
-        batch: &crate::execution_scheduler::ExecutionBatch,
-        _requests: &[crate::tool_dispatch::ToolRequest],
+        batch: &crate::governed_tool_plan::GovernedExecutionBatch,
+        plan: &GovernedToolPlan,
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
@@ -5198,48 +5392,49 @@ where
         result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
     ) -> Result<(), RuntimeError> {
         match batch.mode {
-            crate::execution_scheduler::ExecutionBatchMode::Wave
-            | crate::execution_scheduler::ExecutionBatchMode::SerialStrategy => {
+            crate::governed_tool_plan::GovernedExecutionBatchMode::DependencyWave
+            | crate::governed_tool_plan::GovernedExecutionBatchMode::SerialStrategy => {
                 self.execute_tool_indices_serial_into_map(
                     &batch.indices,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
-                    true,
                     strategy_approval_satisfied,
                     result_map,
                 )
                 .await
             }
-            crate::execution_scheduler::ExecutionBatchMode::ParallelRead => {
+            crate::governed_tool_plan::GovernedExecutionBatchMode::ParallelRead => {
                 self.execute_tool_indices_concurrently_into_map(
                     &batch.indices,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
                     batch.max_concurrency,
-                    true,
                     strategy_approval_satisfied,
                     result_map,
                 )
                 .await
             }
-            crate::execution_scheduler::ExecutionBatchMode::LimitedNetwork => {
+            crate::governed_tool_plan::GovernedExecutionBatchMode::LimitedNetwork => {
                 self.execute_tool_indices_concurrently_into_map(
                     &batch.indices,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
                     batch.max_concurrency,
-                    true,
                     strategy_approval_satisfied,
                     result_map,
                 )
                 .await
             }
-            crate::execution_scheduler::ExecutionBatchMode::LimitedWrite => {
+            crate::governed_tool_plan::GovernedExecutionBatchMode::LimitedWrite => {
                 self.execute_write_scope_groups_into_map(
                     batch,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
@@ -5248,13 +5443,13 @@ where
                 )
                 .await
             }
-            crate::execution_scheduler::ExecutionBatchMode::SerialDestructive => {
+            crate::governed_tool_plan::GovernedExecutionBatchMode::SerialDestructive => {
                 self.execute_tool_indices_serial_into_map(
                     &batch.indices,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
-                    true,
                     strategy_approval_satisfied,
                     result_map,
                 )
@@ -5266,11 +5461,11 @@ where
     async fn execute_tool_indices_concurrently_into_map(
         &self,
         indices: &[usize],
+        plan: &GovernedToolPlan,
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
         max_concurrency: usize,
-        acquire_category_permit: bool,
         strategy_approval_satisfied: bool,
         result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
     ) -> Result<(), RuntimeError> {
@@ -5282,10 +5477,10 @@ where
             for &idx in chunk {
                 futures.push(self.execute_tool_index_collect(
                     idx,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
-                    acquire_category_permit,
                     strategy_approval_satisfied,
                 ));
             }
@@ -5299,7 +5494,8 @@ where
 
     async fn execute_write_scope_groups_into_map(
         &self,
-        batch: &crate::execution_scheduler::ExecutionBatch,
+        batch: &crate::governed_tool_plan::GovernedExecutionBatch,
+        plan: &GovernedToolPlan,
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
@@ -5312,11 +5508,11 @@ where
             return self
                 .execute_tool_indices_concurrently_into_map(
                     &batch.indices,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
                     batch.max_concurrency,
-                    true,
                     strategy_approval_satisfied,
                     result_map,
                 )
@@ -5329,10 +5525,10 @@ where
             for group in chunk {
                 futures.push(self.execute_tool_indices_serial_collect(
                     &group.indices,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
-                    true,
                     strategy_approval_satisfied,
                 ));
             }
@@ -5348,20 +5544,20 @@ where
     async fn execute_tool_indices_serial_into_map(
         &self,
         indices: &[usize],
+        plan: &GovernedToolPlan,
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
-        acquire_category_permit: bool,
         strategy_approval_satisfied: bool,
         result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
     ) -> Result<(), RuntimeError> {
         for (id, message) in self
             .execute_tool_indices_serial_collect(
                 indices,
+                plan,
                 pending_tool_uses,
                 prompter,
                 iterations,
-                acquire_category_permit,
                 strategy_approval_satisfied,
             )
             .await?
@@ -5374,10 +5570,10 @@ where
     async fn execute_tool_indices_serial_collect(
         &self,
         indices: &[usize],
+        plan: &GovernedToolPlan,
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
-        acquire_category_permit: bool,
         strategy_approval_satisfied: bool,
     ) -> Result<Vec<(String, (ConversationMessage, Option<String>))>, RuntimeError> {
         let mut results = Vec::with_capacity(indices.len());
@@ -5385,10 +5581,10 @@ where
             results.push(
                 self.execute_tool_index_collect(
                     idx,
+                    plan,
                     pending_tool_uses,
                     prompter,
                     iterations,
-                    acquire_category_permit,
                     strategy_approval_satisfied,
                 )
                 .await?,
@@ -5400,46 +5596,32 @@ where
     async fn execute_tool_index_collect(
         &self,
         idx: usize,
+        plan: &GovernedToolPlan,
         pending_tool_uses: &[(String, String, String)],
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
-        acquire_category_permit: bool,
         strategy_approval_satisfied: bool,
     ) -> Result<(String, (ConversationMessage, Option<String>)), RuntimeError> {
-        let Some((tool_use_id, tool_name, input)) = pending_tool_uses.get(idx) else {
+        let Some((_, _, input)) = pending_tool_uses.get(idx) else {
             return Err(RuntimeError::new(format!(
                 "tool schedule referenced missing tool index {idx}"
             )));
         };
 
-        let _process_permit = crate::execution_scheduler::acquire_process_tool_permit()
-            .await
-            .map_err(RuntimeError::new)?;
-        let result_msg = if acquire_category_permit {
-            let sem = self.tool_category_semaphore(tool_name, input);
-            let _permit = sem.acquire().await.map_err(|error| {
-                RuntimeError::new(format!("tool category semaphore closed: {error}"))
-            })?;
-            self.execute_single_tool(
-                tool_use_id,
-                tool_name,
+        let task = plan.tasks.get(idx).ok_or_else(|| {
+            RuntimeError::new(format!("governed plan referenced missing tool index {idx}"))
+        })?;
+        let result_msg = self
+            .execute_single_tool(
+                task,
+                &plan.plan_id,
+                plan.revision,
                 input,
                 prompter,
                 iterations,
                 strategy_approval_satisfied,
             )
-            .await?
-        } else {
-            self.execute_single_tool(
-                tool_use_id,
-                tool_name,
-                input,
-                prompter,
-                iterations,
-                strategy_approval_satisfied,
-            )
-            .await?
-        };
+            .await?;
         Ok(self.collect_tool_result_message(result_msg))
     }
 
@@ -5460,21 +5642,6 @@ where
             (callback.on_tool_result)(&tool_name, output)
         });
         (msg_id, (result_msg, inject))
-    }
-
-    fn tool_category_semaphore(&self, tool_name: &str, input: &str) -> &Semaphore {
-        let category = self
-            .tool_executor
-            .classify_tool_safety(tool_name, input)
-            .unwrap_or_else(|| crate::classify_tool_request(tool_name, input));
-        match category {
-            crate::tool_orchestrator::ToolSafetyCategory::WriteLocal => &self.write_semaphore,
-            crate::tool_orchestrator::ToolSafetyCategory::Network => &self.network_semaphore,
-            crate::tool_orchestrator::ToolSafetyCategory::Destructive => {
-                &self.destructive_semaphore
-            }
-            crate::tool_orchestrator::ToolSafetyCategory::ReadOnly => &self.default_semaphore,
-        }
     }
 
     /// Compact the active transcript through the sole semantic checkpoint
@@ -6540,67 +6707,6 @@ where
         }
     }
 
-    fn retrieve_tool_evidence(&self, input: &str) -> Result<String, String> {
-        let request: serde_json::Value = serde_json::from_str(input)
-            .map_err(|error| format!("invalid evidence retrieval input: {error}"))?;
-        let evidence_ref = request
-            .get("evidence_ref")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "evidence_ref is required".to_string())?;
-        let evidence_id = evidence_ref.strip_prefix("tool://").unwrap_or(evidence_ref);
-        let query = request
-            .get("query")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-        let limit = request
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(4)
-            .clamp(1, 16) as usize;
-        let Some(sandbox) = self.tool_output_sandbox.as_ref() else {
-            return Err("tool evidence sandbox is unavailable".to_string());
-        };
-        let sandbox = sandbox
-            .lock()
-            .map_err(|_| "tool evidence sandbox lock poisoned".to_string())?;
-        let mut snippets = if query.is_empty() {
-            sandbox.read(evidence_id, limit)
-        } else {
-            sandbox.search(evidence_id, query, limit)
-        };
-        if snippets.is_empty() && !query.is_empty() {
-            let normalized_query = query
-                .split(|character: char| !character.is_alphanumeric())
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            if normalized_query != query && !normalized_query.is_empty() {
-                snippets = sandbox.search(evidence_id, &normalized_query, limit);
-            }
-        }
-        if snippets.is_empty() {
-            return Err(format!(
-                "no indexed evidence matched `{evidence_ref}`; use the session evidence API for the immutable raw payload"
-            ));
-        }
-        serde_json::to_string_pretty(
-            &snippets
-                .iter()
-                .map(|snippet| {
-                    serde_json::json!({
-                        "range_start": snippet.line_start,
-                        "range_end": snippet.line_end,
-                        "content": snippet.content,
-                    })
-                })
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| format!("evidence retrieval serialization failed: {error}"))
-    }
-
     fn record_context_component(
         &self,
         component: crate::context_ledger::ContextComponentKind,
@@ -6611,6 +6717,11 @@ where
         if let Ok(mut ledger) = self.turn_context_ledger.lock() {
             ledger.record(component, tokens, reference, request_sequence);
         }
+    }
+
+    #[cfg(test)]
+    fn retrieve_tool_evidence(&self, input: &str) -> Result<String, String> {
+        retrieve_tool_evidence_from_sandbox(self.tool_output_sandbox.as_ref(), input)
     }
 
     fn record_provider_context_request(&self, request: &ApiRequest, request_sequence: usize) {
@@ -6964,10 +7075,12 @@ where
         iterations: usize,
     ) -> ToolInvocationRecord {
         let session_id = self.session().session_id;
-        let safety_category = self
-            .tool_executor
-            .classify_tool_safety(tool_name, input)
-            .unwrap_or_else(|| crate::classify_tool_request(tool_name, input));
+        let safety_category = serde_json::from_str::<serde_json::Value>(input)
+            .ok()
+            .and_then(|input| self.tool_executor.registered_tool_effect(tool_name, &input))
+            .map_or(crate::ToolSafetyCategory::Destructive, |effect| {
+                crate::ToolSafetyCategory::from_effect(&effect)
+            });
         ToolInvocationRecord::started(
             session_id,
             iterations,
@@ -7004,33 +7117,43 @@ where
         kind: &'static str,
         _sequence: usize,
     ) {
+        let mut refs = vec![
+            RuntimeEventRef {
+                kind: "tool_invocation".to_string(),
+                id: record.invocation_id.clone(),
+            },
+            RuntimeEventRef {
+                kind: "tool_call".to_string(),
+                id: record.tool_call_id.clone(),
+            },
+        ];
+        if let Some(plan_id) = &record.governed_plan_id {
+            refs.push(RuntimeEventRef {
+                kind: "governed_tool_plan".to_string(),
+                id: plan_id.clone(),
+            });
+        }
         self.append_execution_runtime_event(
             RuntimeEventScope::Tool,
             kind,
             Some(record.status.as_str().to_string()),
-            vec![
-                RuntimeEventRef {
-                    kind: "tool_invocation".to_string(),
-                    id: record.invocation_id.clone(),
-                },
-                RuntimeEventRef {
-                    kind: "tool_call".to_string(),
-                    id: record.tool_call_id.clone(),
-                },
-            ],
+            refs,
             serde_json::to_value(record).unwrap_or_else(
                 |error| serde_json::json!({ "serialization_error": error.to_string() }),
             ),
         );
     }
 
-    fn record_tool_execution_plan(&self, plan: &ToolExecutionPlan, _sequence: usize) {
+    fn record_governed_tool_plan(&self, plan: &GovernedToolPlan, _sequence: usize) {
+        if let Ok(mut plans) = self.turn_governed_tool_plans.lock() {
+            plans.push(plan.projection());
+        }
         self.append_execution_runtime_event(
             RuntimeEventScope::Tool,
             "tool.execution_plan.created",
             Some("planned".to_string()),
             vec![RuntimeEventRef {
-                kind: "tool_execution_plan".to_string(),
+                kind: "governed_tool_plan".to_string(),
                 id: plan.plan_id.clone(),
             }],
             serde_json::to_value(plan).unwrap_or_else(
@@ -7041,7 +7164,7 @@ where
 
     fn record_tool_strategy_validation(
         &self,
-        report: &ToolExecutionPolicyValidationReport,
+        report: &GovernedToolPolicyValidationReport,
         _sequence: usize,
     ) {
         self.append_execution_runtime_event(
@@ -7064,7 +7187,7 @@ where
 
     fn record_tool_schedule(
         &self,
-        schedule: &crate::execution_scheduler::ToolSchedule,
+        plan: &GovernedToolPlan,
         requests: &[crate::tool_dispatch::ToolRequest],
         _sequence: usize,
     ) {
@@ -7080,7 +7203,9 @@ where
                 })
                 .collect(),
             serde_json::json!({
-                "schedule": schedule,
+                "plan_id": plan.plan_id,
+                "plan_revision": plan.revision,
+                "schedule": plan.batches,
                 "tool_count": requests.len(),
             }),
         );
@@ -7124,20 +7249,20 @@ where
                 "not_run_count": trace.verification_report.not_run_claims.len(),
                 "matrix_missing_evidence": matrix_missing_evidence(trace),
             },
-            "tool_transaction": trace.tool_transaction.as_ref().map(|plan| serde_json::json!({
-                "id": plan.id,
-                "batch_count": plan.batches.len(),
-                "requires_checkpoint": plan.requires_checkpoint,
-                "requires_human_confirm": plan.requires_human_confirm,
-                "warning_count": plan.warnings.len(),
-            })),
+            "governed_tool_plans": trace.governed_tool_plans.iter().map(|plan| serde_json::json!({
+                "id": plan.plan_id,
+                "revision": plan.revision,
+                "catalog_revision": plan.catalog_revision,
+                "invocation_count": plan.invocations.len(),
+                "dependency_count": plan.dependencies.len(),
+            })).collect::<Vec<_>>(),
             "harness": {
                 "receipt_id": trace.harness_receipt.id,
                 "harness_id": trace.harness_receipt.harness_id,
                 "agent_spec_id": trace.harness_receipt.agent_spec_id,
                 "strategy_pattern": trace.harness_receipt.strategy_pattern,
                 "context_epoch_id": trace.harness_receipt.context_epoch_id,
-                "tool_transaction_id": trace.harness_receipt.tool_transaction_id,
+                "governed_tool_plan_ids": trace.harness_receipt.governed_tool_plan_ids,
                 "verification_can_finalize": trace.harness_receipt.verification_can_finalize,
                 "policy_receipts": trace.harness_receipt.policy_receipts,
                 "output_summary": trace.harness_receipt.output_summary,
@@ -8404,7 +8529,7 @@ fn bounded_tool_concurrency(max_concurrency: usize, item_count: usize) -> usize 
     max_concurrency
         .max(1)
         .min(item_count)
-        .min(crate::execution_scheduler::MAX_PARALLEL_READ_CONCURRENCY)
+        .min(crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY)
 }
 
 fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {
@@ -8706,7 +8831,7 @@ impl ToolExecutor for StaticToolExecutor {
             .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
     }
 
-    fn describe_tool_effect(
+    fn registered_tool_effect(
         &self,
         tool_name: &str,
         _input: &serde_json::Value,
@@ -10242,7 +10367,7 @@ mod tests {
             input: r#"{"path":"src/lib.rs","content":"x"}"#.to_string(),
             depends_on: Vec::new(),
         }];
-        let plan = crate::tool_execution_plan::ToolExecutionPlan::from_requests(&requests);
+        let plan = crate::governed_tool_plan::GovernedToolPlan::from_requests(&requests);
         let mut decision =
             crate::execution_core::build_runtime_execution_decision("实现并修改这个文件", None);
         decision.strategy.pattern = ExecutionPattern::Execute;

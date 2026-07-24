@@ -1,6 +1,12 @@
-//! Explainable tool execution planning for batched tool requests.
+//! Canonical governed plan for batched tool requests.
 
 use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
+use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+use harness_contract::tool::{
+    GovernedToolInvocation, GovernedToolPlanProjection, ResourceAccess, ResourceDemand,
+    ResourceScopeDemand, ToolDependency, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+    ToolIntent,
+};
 use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -9,20 +15,21 @@ use uuid::Uuid;
 
 use crate::execution_core::{RuntimeCompileTarget, RuntimeExecutionDecision};
 use crate::tool_dispatch::ToolRequest;
-use crate::tool_orchestrator::{classify_tool_request, ToolSafetyCategory};
+use crate::tool_orchestrator::ToolSafetyCategory;
 
-pub const TOOL_EXECUTION_PLAN_CONTRACT_VERSION: u32 = 2;
+pub const GOVERNED_TOOL_PLAN_CONTRACT_VERSION: u32 = 3;
+pub const DEFAULT_PARALLEL_TOOL_CONCURRENCY: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolExecutionMode {
+pub enum GovernedToolExecutionMode {
     ParallelRead,
     LimitedParallel,
     SerialDestructive,
     Wave,
 }
 
-impl ToolExecutionMode {
+impl GovernedToolExecutionMode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -107,10 +114,11 @@ pub struct ToolConflict {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolExecutionPlanTask {
+pub struct GovernedToolPlanTask {
     pub contract_version: u32,
     pub tool_call_id: String,
     pub tool_name: String,
+    pub normalized_input: Value,
     pub idempotency_key: String,
     pub model_visible_name: String,
     pub can_parallelize: bool,
@@ -122,24 +130,57 @@ pub struct ToolExecutionPlanTask {
     pub output_budget_class: String,
     pub conflicts: Vec<ToolConflict>,
     pub reason: String,
-    pub execution_mode: ToolExecutionMode,
+    pub execution_mode: GovernedToolExecutionMode,
     pub depends_on: Vec<String>,
     pub max_concurrency: usize,
+    pub effect: ToolEffectDescriptor,
+    pub resource_demand: ResourceDemand,
+    pub catalog_revision: u64,
+    pub descriptor_set_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedExecutionBatchMode {
+    ParallelRead,
+    SerialStrategy,
+    LimitedWrite,
+    LimitedNetwork,
+    SerialDestructive,
+    DependencyWave,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolExecutionPlan {
+pub struct GovernedExecutionScopeGroup {
+    pub scope: String,
+    pub indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedExecutionBatch {
+    pub mode: GovernedExecutionBatchMode,
+    pub indices: Vec<usize>,
+    pub max_concurrency: usize,
+    pub reason: String,
+    pub scope_groups: Vec<GovernedExecutionScopeGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedToolPlan {
     pub plan_id: String,
+    pub revision: u64,
+    pub catalog_revision: u64,
     pub task_count: usize,
     pub parallel_read_count: usize,
     pub limited_count: usize,
     pub destructive_count: usize,
     pub wave_count: usize,
-    pub tasks: Vec<ToolExecutionPlanTask>,
+    pub tasks: Vec<GovernedToolPlanTask>,
+    pub batches: Vec<GovernedExecutionBatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolExecutionPolicyValidationReport {
+pub struct GovernedToolPolicyValidationReport {
     pub allowed: bool,
     pub findings: Vec<String>,
     pub lease_id: String,
@@ -149,16 +190,47 @@ pub struct ToolExecutionPolicyValidationReport {
     pub checkpoint_created: bool,
 }
 
-impl ToolExecutionPlan {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GovernedToolCompiler;
+
+impl GovernedToolCompiler {
+    #[must_use]
+    pub fn compile(
+        &self,
+        requests: &[ToolRequest],
+        decision: Option<&RuntimeExecutionDecision>,
+        describe_registered_tool: impl Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
+    ) -> GovernedToolPlan {
+        GovernedToolPlan::compile(requests, decision, describe_registered_tool)
+    }
+}
+
+impl GovernedToolPlan {
+    /// Conservative fallback retained for isolated tests and offline planning.
+    /// Production callers must use `GovernedToolCompiler` with a pinned
+    /// registration descriptor.
     #[must_use]
     pub fn from_requests(requests: &[ToolRequest]) -> Self {
-        Self::from_requests_with_classifier(requests, |_, _| None)
+        #[cfg(test)]
+        {
+            return Self::compile(requests, None, |name, input| {
+                Some((fixture_effect(name, input), 1, "test-fixture".to_string()))
+            });
+        }
+        #[cfg(not(test))]
+        Self::compile(requests, None, |name, input| {
+            Some((
+                unknown_effect(name, input),
+                0,
+                "offline-unknown".to_string(),
+            ))
+        })
     }
 
-    #[must_use]
-    pub fn from_requests_with_classifier(
+    fn compile(
         requests: &[ToolRequest],
-        classify_registered_tool: impl Fn(&str, &str) -> Option<ToolSafetyCategory>,
+        decision: Option<&RuntimeExecutionDecision>,
+        describe_registered_tool: impl Fn(&str, &Value) -> Option<(ToolEffectDescriptor, u64, String)>,
     ) -> Self {
         let mut parallel_read_count = 0;
         let mut limited_count = 0;
@@ -168,43 +240,51 @@ impl ToolExecutionPlan {
         let mut tasks = requests
             .iter()
             .map(|request| {
-                let builtin_category = classify_tool_request(&request.tool_name, &request.input);
-                let safety_category = if builtin_category == ToolSafetyCategory::WriteLocal {
-                    classify_registered_tool(&request.tool_name, &request.input)
-                        .unwrap_or(builtin_category)
-                } else {
-                    builtin_category
-                };
-                let analysis = analyze_request(request, safety_category);
+                let normalized_input =
+                    serde_json::from_str::<Value>(&request.input).unwrap_or(Value::Null);
+                let (effect, catalog_revision, descriptor_set_hash) =
+                    describe_registered_tool(&request.tool_name, &normalized_input).unwrap_or_else(
+                        || {
+                            (
+                                unknown_effect(&request.tool_name, &normalized_input),
+                                0,
+                                "missing-descriptor".to_string(),
+                            )
+                        },
+                    );
+                let safety_category = ToolSafetyCategory::from_effect(&effect);
+                let analysis = analyze_request(request, &effect, safety_category);
                 let execution_mode = if !request.depends_on.is_empty() {
                     wave_count += 1;
-                    ToolExecutionMode::Wave
+                    GovernedToolExecutionMode::Wave
                 } else {
                     match safety_category {
                         ToolSafetyCategory::ReadOnly => {
                             parallel_read_count += 1;
-                            ToolExecutionMode::ParallelRead
+                            GovernedToolExecutionMode::ParallelRead
                         }
                         ToolSafetyCategory::Destructive => {
                             destructive_count += 1;
-                            ToolExecutionMode::SerialDestructive
+                            GovernedToolExecutionMode::SerialDestructive
                         }
                         ToolSafetyCategory::WriteLocal | ToolSafetyCategory::Network => {
                             limited_count += 1;
-                            ToolExecutionMode::LimitedParallel
+                            GovernedToolExecutionMode::LimitedParallel
                         }
                     }
                 };
 
-                ToolExecutionPlanTask {
-                    contract_version: TOOL_EXECUTION_PLAN_CONTRACT_VERSION,
+                GovernedToolPlanTask {
+                    contract_version: GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
                     tool_call_id: request.tool_use_id.clone(),
                     tool_name: request.tool_name.clone(),
+                    normalized_input,
                     idempotency_key: tool_plan_idempotency_key(request),
                     model_visible_name: model_visible_tool_name(&request.tool_name),
                     can_parallelize: matches!(
                         execution_mode,
-                        ToolExecutionMode::ParallelRead | ToolExecutionMode::LimitedParallel
+                        GovernedToolExecutionMode::ParallelRead
+                            | GovernedToolExecutionMode::LimitedParallel
                     ),
                     safety_category,
                     purity: analysis.purity,
@@ -217,9 +297,13 @@ impl ToolExecutionPlan {
                     execution_mode,
                     depends_on: request.depends_on.clone(),
                     max_concurrency: match execution_mode {
-                        ToolExecutionMode::Wave => 8,
+                        GovernedToolExecutionMode::Wave => 8,
                         _ => safety_category.max_concurrency(),
                     },
+                    resource_demand: resource_demand_from_effect(&effect),
+                    effect,
+                    catalog_revision,
+                    descriptor_set_hash,
                 }
             })
             .collect::<Vec<_>>();
@@ -228,30 +312,93 @@ impl ToolExecutionPlan {
             task.can_parallelize = task.conflicts.is_empty()
                 && matches!(
                     task.execution_mode,
-                    ToolExecutionMode::ParallelRead | ToolExecutionMode::LimitedParallel
+                    GovernedToolExecutionMode::ParallelRead
+                        | GovernedToolExecutionMode::LimitedParallel
                 );
         }
 
-        Self {
+        let catalog_revision = tasks
+            .iter()
+            .map(|task| task.catalog_revision)
+            .max()
+            .unwrap_or(0);
+        let mut plan = Self {
             plan_id: format!("tool-plan-{}", Uuid::new_v4()),
+            revision: 1,
+            catalog_revision,
             task_count: tasks.len(),
             parallel_read_count,
             limited_count,
             destructive_count,
             wave_count,
             tasks,
+            batches: Vec::new(),
+        };
+        plan.batches = build_execution_batches(&plan, requests, decision);
+        plan
+    }
+
+    #[must_use]
+    pub fn projection(&self) -> GovernedToolPlanProjection {
+        let invocations = self
+            .tasks
+            .iter()
+            .map(|task| GovernedToolInvocation {
+                contract_version: task.contract_version,
+                invocation_id: task.tool_call_id.clone(),
+                intent: ToolIntent {
+                    invocation_id: task.tool_call_id.clone(),
+                    tool_name: task.tool_name.clone(),
+                    normalized_input: task.normalized_input.clone(),
+                },
+                effect: task.effect.clone(),
+                resource_demand: task.resource_demand.clone(),
+                explicit_dependencies: task
+                    .depends_on
+                    .iter()
+                    .map(|depends_on| ToolDependency {
+                        invocation_id: task.tool_call_id.clone(),
+                        depends_on: depends_on.clone(),
+                        reason: "model_explicit_dependency".to_string(),
+                    })
+                    .collect(),
+                catalog_revision: task.catalog_revision,
+                descriptor_set_hash: task.descriptor_set_hash.clone(),
+                idempotency_key: task.idempotency_key.clone(),
+            })
+            .collect::<Vec<_>>();
+        let dependencies = invocations
+            .iter()
+            .flat_map(|invocation| invocation.explicit_dependencies.clone())
+            .collect();
+        GovernedToolPlanProjection {
+            contract_version: GOVERNED_TOOL_PLAN_CONTRACT_VERSION,
+            plan_id: self.plan_id.clone(),
+            revision: self.revision,
+            catalog_revision: self.catalog_revision,
+            invocations,
+            dependencies,
         }
+    }
+
+    pub fn apply_execution_decision(
+        &mut self,
+        requests: &[ToolRequest],
+        decision: &RuntimeExecutionDecision,
+    ) {
+        self.revision = self.revision.saturating_add(1);
+        self.batches = build_execution_batches(self, requests, Some(decision));
     }
 
     #[must_use]
     pub fn validate_against_execution_decision(
         &self,
         decision: &RuntimeExecutionDecision,
-    ) -> ToolExecutionPolicyValidationReport {
+    ) -> GovernedToolPolicyValidationReport {
         let mut findings = Vec::new();
         if !decision.executable {
             findings.push("execution_decision_not_executable".to_string());
-            return ToolExecutionPolicyValidationReport {
+            return GovernedToolPolicyValidationReport {
                 allowed: false,
                 findings,
                 lease_id: decision.lease.lease_id.clone(),
@@ -335,7 +482,7 @@ impl ToolExecutionPlan {
             );
         }
 
-        ToolExecutionPolicyValidationReport {
+        GovernedToolPolicyValidationReport {
             allowed: findings.is_empty(),
             findings,
             lease_id: decision.lease.lease_id.clone(),
@@ -355,12 +502,15 @@ impl ToolExecutionPlan {
     ) -> SessionDomainEvent {
         let payload = serde_json::json!({
             "plan_id": self.plan_id,
+            "plan_revision": self.revision,
+            "catalog_revision": self.catalog_revision,
             "task_count": self.task_count,
             "parallel_read_count": self.parallel_read_count,
             "limited_count": self.limited_count,
             "destructive_count": self.destructive_count,
             "wave_count": self.wave_count,
             "tasks": self.tasks,
+            "batches": self.batches,
         });
         let mut event = SessionDomainEvent::new(
             session_id,
@@ -399,7 +549,7 @@ fn compile_target_allows_category(
     }
 }
 
-fn is_mutation(task: &ToolExecutionPlanTask) -> bool {
+fn is_mutation(task: &GovernedToolPlanTask) -> bool {
     matches!(
         task.safety_category,
         ToolSafetyCategory::WriteLocal | ToolSafetyCategory::Destructive
@@ -418,7 +568,7 @@ fn uses_inner_runtime_validator(tool_name: &str) -> bool {
     )
 }
 
-fn has_single_known_mutation_path(tasks: &[&ToolExecutionPlanTask]) -> bool {
+fn has_single_known_mutation_path(tasks: &[&GovernedToolPlanTask]) -> bool {
     let mut bounded_path: Option<&str> = None;
     for task in tasks.iter().copied().filter(|task| is_mutation(task)) {
         if task.resource_scope.unknown || task.resource_scope.kind != "paths" {
@@ -444,6 +594,228 @@ fn push_finding(findings: &mut Vec<String>, finding: &str) {
     }
 }
 
+fn unknown_effect(tool_name: &str, input: &Value) -> ToolEffectDescriptor {
+    let target = input
+        .get("path")
+        .or_else(|| input.get("url"))
+        .or_else(|| input.get("target"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut hasher = Sha256::new();
+    hasher.update(tool_name.as_bytes());
+    hasher.update(serde_json::to_vec(input).unwrap_or_default());
+    ToolEffectDescriptor {
+        tool_id: tool_name.to_string(),
+        descriptor_hash: format!("{:x}", hasher.finalize()),
+        effect_kind: ToolEffectKind::Unknown,
+        idempotency: ToolIdempotency::Unknown,
+        scopes: vec![PermissionScope {
+            resource: PermissionResource::Tool,
+            operation: PermissionOperation::Call,
+            target,
+        }],
+        required_permission: harness_contract::tool::ToolPermissionMode::DangerFullAccess,
+        approval_class: harness_contract::tool::ToolApprovalClass::User,
+        uses_network: true,
+        spawns_process: true,
+        mutates_packages: false,
+        mutates_system: false,
+    }
+}
+
+pub(crate) fn resource_demand_from_effect(effect: &ToolEffectDescriptor) -> ResourceDemand {
+    let mut scopes = effect
+        .scopes
+        .iter()
+        .filter_map(|scope| {
+            scope.target.clone().map(|key| ResourceScopeDemand {
+                key,
+                access: if scope.operation == PermissionOperation::Read {
+                    ResourceAccess::Read
+                } else {
+                    ResourceAccess::Write
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_by(|left, right| left.key.cmp(&right.key));
+    scopes.dedup();
+    ResourceDemand {
+        tool_slots: 1,
+        process_slots: u32::from(effect.spawns_process),
+        network_slots: u32::from(effect.uses_network),
+        cpu_weight: if effect.spawns_process { 2 } else { 1 },
+        memory_bytes: 0,
+        scopes,
+    }
+}
+
+fn build_execution_batches(
+    plan: &GovernedToolPlan,
+    requests: &[ToolRequest],
+    decision: Option<&RuntimeExecutionDecision>,
+) -> Vec<GovernedExecutionBatch> {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    let id_to_index = requests
+        .iter()
+        .enumerate()
+        .map(|(index, request)| (request.tool_use_id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut memo = HashMap::new();
+    let mut waves = BTreeMap::<usize, Vec<usize>>::new();
+    for index in 0..plan.tasks.len() {
+        let depth = dependency_depth(index, plan, &id_to_index, &mut memo, &mut BTreeSet::new());
+        waves.entry(depth).or_default().push(index);
+    }
+    let direct = decision.is_some_and(|decision| {
+        decision.strategy.selected_candidate
+            == harness_contract::strategy::ExecutionCandidateKind::Direct
+    });
+    let mut batches = Vec::new();
+    for (depth, indices) in waves {
+        if direct {
+            for index in indices {
+                push_execution_batch(
+                    &mut batches,
+                    GovernedExecutionBatchMode::SerialStrategy,
+                    vec![index],
+                    1,
+                    format!("direct strategy dependency depth {depth}"),
+                    plan,
+                );
+            }
+            continue;
+        }
+
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        let mut network = Vec::new();
+        let mut destructive = Vec::new();
+        for index in indices {
+            match plan.tasks[index].safety_category {
+                ToolSafetyCategory::ReadOnly => reads.push(index),
+                ToolSafetyCategory::WriteLocal => writes.push(index),
+                ToolSafetyCategory::Network => network.push(index),
+                ToolSafetyCategory::Destructive => destructive.push(index),
+            }
+        }
+        let mode_for = |normal, dependency| if depth == 0 { normal } else { dependency };
+        push_execution_batch(
+            &mut batches,
+            mode_for(
+                GovernedExecutionBatchMode::ParallelRead,
+                GovernedExecutionBatchMode::DependencyWave,
+            ),
+            reads,
+            DEFAULT_PARALLEL_TOOL_CONCURRENCY,
+            format!("governed read wave {depth}"),
+            plan,
+        );
+        push_execution_batch(
+            &mut batches,
+            mode_for(
+                GovernedExecutionBatchMode::LimitedNetwork,
+                GovernedExecutionBatchMode::DependencyWave,
+            ),
+            network,
+            3,
+            format!("governed network wave {depth}"),
+            plan,
+        );
+        push_execution_batch(
+            &mut batches,
+            mode_for(
+                GovernedExecutionBatchMode::LimitedWrite,
+                GovernedExecutionBatchMode::DependencyWave,
+            ),
+            writes,
+            4,
+            format!("governed mutation wave {depth}"),
+            plan,
+        );
+        for index in destructive {
+            push_execution_batch(
+                &mut batches,
+                GovernedExecutionBatchMode::SerialDestructive,
+                vec![index],
+                1,
+                format!("governed destructive wave {depth}"),
+                plan,
+            );
+        }
+    }
+    batches
+}
+
+fn dependency_depth<'a>(
+    index: usize,
+    plan: &GovernedToolPlan,
+    id_to_index: &std::collections::BTreeMap<&'a str, usize>,
+    memo: &mut std::collections::HashMap<usize, usize>,
+    visiting: &mut std::collections::BTreeSet<usize>,
+) -> usize {
+    if let Some(depth) = memo.get(&index) {
+        return *depth;
+    }
+    if !visiting.insert(index) {
+        return 1;
+    }
+    let depth = plan.tasks.get(index).map_or(1, |task| {
+        task.depends_on
+            .iter()
+            .map(|dependency| {
+                id_to_index
+                    .get(dependency.as_str())
+                    .map_or(0, |dependency_index| {
+                        dependency_depth(*dependency_index, plan, id_to_index, memo, visiting)
+                    })
+            })
+            .max()
+            .map_or(0, |depth| depth.saturating_add(1))
+    });
+    visiting.remove(&index);
+    memo.insert(index, depth);
+    depth
+}
+
+fn push_execution_batch(
+    batches: &mut Vec<GovernedExecutionBatch>,
+    mode: GovernedExecutionBatchMode,
+    indices: Vec<usize>,
+    max_concurrency: usize,
+    reason: String,
+    plan: &GovernedToolPlan,
+) {
+    if indices.is_empty() {
+        return;
+    }
+    let mut groups = std::collections::BTreeMap::<String, Vec<usize>>::new();
+    for index in &indices {
+        let task = &plan.tasks[*index];
+        let scope = if task.resource_scope.unknown {
+            "unknown".to_string()
+        } else if task.resource_scope.network {
+            "network".to_string()
+        } else if task.resource_scope.paths.is_empty() {
+            task.resource_scope.kind.clone()
+        } else {
+            task.resource_scope.paths.join("|")
+        };
+        groups.entry(scope).or_default().push(*index);
+    }
+    batches.push(GovernedExecutionBatch {
+        mode,
+        indices,
+        max_concurrency,
+        reason,
+        scope_groups: groups
+            .into_iter()
+            .map(|(scope, indices)| GovernedExecutionScopeGroup { scope, indices })
+            .collect(),
+    });
+}
+
 struct ToolRequestAnalysis {
     purity: ToolPurity,
     resource_scope: ToolResourceScope,
@@ -455,22 +827,28 @@ struct ToolRequestAnalysis {
 
 fn analyze_request(
     request: &ToolRequest,
+    effect: &ToolEffectDescriptor,
     safety_category: ToolSafetyCategory,
 ) -> ToolRequestAnalysis {
-    let input = serde_json::from_str::<Value>(&request.input).unwrap_or(Value::Null);
-    let purity = match safety_category {
-        ToolSafetyCategory::ReadOnly => ToolPurity::ReadOnlyIdempotent,
-        ToolSafetyCategory::WriteLocal => ToolPurity::LocalMutation,
-        ToolSafetyCategory::Network => ToolPurity::Network,
-        ToolSafetyCategory::Destructive => ToolPurity::RuntimeSideEffect,
+    let purity = match (effect.effect_kind, effect.idempotency) {
+        (ToolEffectKind::Read, ToolIdempotency::Idempotent) => ToolPurity::ReadOnlyIdempotent,
+        (ToolEffectKind::Write, _) => ToolPurity::LocalMutation,
+        (ToolEffectKind::Network, _) => ToolPurity::Network,
+        (
+            ToolEffectKind::Process
+            | ToolEffectKind::Package
+            | ToolEffectKind::System
+            | ToolEffectKind::Destructive,
+            _,
+        ) => ToolPurity::RuntimeSideEffect,
+        _ => ToolPurity::Unknown,
     };
-    let resource_scope = resource_scope_for(&request.tool_name, &input, safety_category);
-    let authority_set = match safety_category {
-        ToolSafetyCategory::ReadOnly => vec!["workspace.read".to_string()],
-        ToolSafetyCategory::WriteLocal => vec!["workspace.write".to_string()],
-        ToolSafetyCategory::Network => vec!["network".to_string()],
-        ToolSafetyCategory::Destructive => vec!["runtime.control".to_string()],
-    };
+    let resource_scope = resource_scope_from_effect(effect);
+    let authority_set = effect
+        .scopes
+        .iter()
+        .map(|scope| format!("{:?}.{:?}", scope.resource, scope.operation).to_ascii_lowercase())
+        .collect();
     let side_effect_class = match purity {
         ToolPurity::ReadOnlyIdempotent => "none",
         ToolPurity::LocalMutation => "local_mutation",
@@ -479,20 +857,25 @@ fn analyze_request(
         ToolPurity::Unknown => "unknown",
     }
     .to_string();
-    let output_budget_class = match request.tool_name.as_str() {
-        "read_many" | "grep_many" | "glob_many" | "tool_batch_readonly" => "batch",
-        "workspace_snapshot" => "summary",
-        _ => match safety_category {
-            ToolSafetyCategory::ReadOnly => "normal",
-            _ => "mutation",
-        },
+    let output_budget_class = if request
+        .tool_name
+        .eq_ignore_ascii_case("tool_batch_readonly")
+    {
+        "batch"
+    } else if effect.effect_kind == ToolEffectKind::Read {
+        "normal"
+    } else {
+        "mutation"
     }
     .to_string();
     let reason = format!(
         "{} tool planned as {} with {} resource scope",
         side_effect_class,
-        ToolExecutionMode::from_safety_and_deps(safety_category, !request.depends_on.is_empty())
-            .as_str(),
+        GovernedToolExecutionMode::from_safety_and_deps(
+            safety_category,
+            !request.depends_on.is_empty()
+        )
+        .as_str(),
         resource_scope.kind
     );
 
@@ -506,7 +889,7 @@ fn analyze_request(
     }
 }
 
-impl ToolExecutionMode {
+impl GovernedToolExecutionMode {
     fn from_safety_and_deps(safety_category: ToolSafetyCategory, has_deps: bool) -> Self {
         if has_deps {
             return Self::Wave;
@@ -519,85 +902,35 @@ impl ToolExecutionMode {
     }
 }
 
-fn resource_scope_for(
-    tool_name: &str,
-    input: &Value,
-    safety_category: ToolSafetyCategory,
-) -> ToolResourceScope {
-    match tool_name {
-        // These calls mutate Runtime-owned state, not workspace files. Giving
-        // them a workspace-wide write scope makes a parent ToolBatch hold the
-        // file lock while `runtime_orchestrate` executes a child graph. That
-        // deadlocks a legitimate child read (for example workspace_snapshot)
-        // behind its own parent. Runtime/state authority is still governed by
-        // the tool contract and inner validator; it is simply not a filesystem
-        // ownership claim.
-        "TodoWrite" | "todo_write" | "session_create" | "memory_create" | "memory_delete" => {
-            ToolResourceScope::runtime()
-        }
-        "read_file" | "write_file" | "edit_file" => input
-            .get("path")
-            .or_else(|| input.get("file_path"))
-            .or_else(|| input.get("file"))
-            .and_then(Value::as_str)
-            .map(|path| ToolResourceScope::paths(vec![normalize_resource_path(path)]))
-            .unwrap_or_else(ToolResourceScope::unknown),
-        "read_many" => ToolResourceScope::paths(extract_array_paths(input, "files", "path")),
-        "grep_search" | "glob_search" => input
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| ToolResourceScope::paths(vec![normalize_resource_path(path)]))
-            .unwrap_or_else(ToolResourceScope::workspace),
-        "grep_many" => {
-            let paths = extract_array_paths(input, "searches", "path");
-            if paths.is_empty() {
-                ToolResourceScope::workspace()
-            } else {
-                ToolResourceScope::paths(paths)
-            }
-        }
-        "glob_many" => {
-            let paths = extract_array_paths(input, "patterns", "path");
-            if paths.is_empty() {
-                ToolResourceScope::workspace()
-            } else {
-                ToolResourceScope::paths(paths)
-            }
-        }
-        "workspace_snapshot" | "tool_batch_readonly" => ToolResourceScope::workspace(),
-        "WebFetch" | "WebSearch" | "web_fetch" | "web_search" => ToolResourceScope::network(),
-        _ => match safety_category {
-            ToolSafetyCategory::ReadOnly => ToolResourceScope::workspace(),
-            ToolSafetyCategory::Network => ToolResourceScope::network(),
-            ToolSafetyCategory::Destructive => ToolResourceScope::runtime(),
-            ToolSafetyCategory::WriteLocal => ToolResourceScope::unknown(),
-        },
+pub(crate) fn resource_scope_from_effect(effect: &ToolEffectDescriptor) -> ToolResourceScope {
+    if effect.effect_kind == ToolEffectKind::Unknown {
+        return ToolResourceScope::unknown();
     }
-}
-
-/// Resolve the same concrete resource footprint used by graph scheduling for
-/// one delegated tool call. Child Agent executors use this at the final tool
-/// boundary so a graph lock cannot be mistaken for authorization.
-pub(crate) fn resource_scope_for_tool_request(
-    tool_name: &str,
-    input: &Value,
-    safety_category: ToolSafetyCategory,
-) -> ToolResourceScope {
-    resource_scope_for(tool_name, input, safety_category)
-}
-
-fn extract_array_paths(input: &Value, array_key: &str, path_key: &str) -> Vec<String> {
-    input
-        .get(array_key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get(path_key).and_then(Value::as_str))
-                .map(normalize_resource_path)
-                .collect()
-        })
-        .unwrap_or_default()
+    if effect.uses_network {
+        return ToolResourceScope::network();
+    }
+    if matches!(
+        effect.effect_kind,
+        ToolEffectKind::Process
+            | ToolEffectKind::Package
+            | ToolEffectKind::System
+            | ToolEffectKind::Destructive
+    ) {
+        return ToolResourceScope::runtime();
+    }
+    let mut paths = effect
+        .scopes
+        .iter()
+        .filter_map(|scope| scope.target.as_deref())
+        .map(normalize_resource_path)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    if paths.is_empty() {
+        ToolResourceScope::workspace()
+    } else {
+        ToolResourceScope::paths(paths)
+    }
 }
 
 fn normalize_resource_path(path: &str) -> String {
@@ -620,14 +953,14 @@ fn tool_plan_idempotency_key(request: &ToolRequest) -> String {
         hasher.update([0]);
     }
     let digest = format!("{:x}", hasher.finalize());
-    format!("tool-plan-task:v{TOOL_EXECUTION_PLAN_CONTRACT_VERSION}:{digest}")
+    format!("tool-plan-task:v{GOVERNED_TOOL_PLAN_CONTRACT_VERSION}:{digest}")
 }
 
 fn model_visible_tool_name(tool_name: &str) -> String {
     tool_name.trim().replace('_', " ")
 }
 
-fn annotate_conflicts(tasks: &mut [ToolExecutionPlanTask]) {
+fn annotate_conflicts(tasks: &mut [GovernedToolPlanTask]) {
     for left in 0..tasks.len() {
         for right in (left + 1)..tasks.len() {
             if let Some((kind, reason)) = conflict_between(&tasks[left], &tasks[right]) {
@@ -649,8 +982,8 @@ fn annotate_conflicts(tasks: &mut [ToolExecutionPlanTask]) {
 }
 
 fn conflict_between(
-    left: &ToolExecutionPlanTask,
-    right: &ToolExecutionPlanTask,
+    left: &GovernedToolPlanTask,
+    right: &GovernedToolPlanTask,
 ) -> Option<(String, String)> {
     if left.purity == ToolPurity::ReadOnlyIdempotent
         && right.purity == ToolPurity::ReadOnlyIdempotent
@@ -690,6 +1023,79 @@ fn paths_overlap(left: &str, right: &str) -> bool {
         || right == "."
         || left.starts_with(&format!("{right}/"))
         || right.starts_with(&format!("{left}/"))
+}
+
+#[cfg(test)]
+fn fixture_effect(tool_name: &str, input: &Value) -> ToolEffectDescriptor {
+    let category =
+        crate::classify_tool_request(tool_name, &serde_json::to_string(input).unwrap_or_default());
+    let mut effect = unknown_effect(tool_name, input);
+    let normalized = tool_name.trim().replace('-', "_").to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "todo_write" | "todowrite" | "runtime_orchestrate" | "runtimeorchestrate"
+    ) {
+        effect.effect_kind = ToolEffectKind::System;
+        effect.idempotency = ToolIdempotency::IdempotentWithKey;
+        effect.uses_network = false;
+        effect.spawns_process = false;
+        effect.scopes = vec![PermissionScope {
+            resource: PermissionResource::Tool,
+            operation: PermissionOperation::Control,
+            target: None,
+        }];
+        return effect;
+    }
+    effect.effect_kind = match category {
+        ToolSafetyCategory::ReadOnly => ToolEffectKind::Read,
+        ToolSafetyCategory::WriteLocal => ToolEffectKind::Write,
+        ToolSafetyCategory::Network => ToolEffectKind::Network,
+        ToolSafetyCategory::Destructive => ToolEffectKind::Destructive,
+    };
+    effect.idempotency = if category == ToolSafetyCategory::ReadOnly {
+        ToolIdempotency::Idempotent
+    } else {
+        ToolIdempotency::IdempotentWithKey
+    };
+    effect.uses_network = category == ToolSafetyCategory::Network;
+    effect.spawns_process = category == ToolSafetyCategory::Destructive;
+    effect.required_permission = match category {
+        ToolSafetyCategory::ReadOnly => harness_contract::tool::ToolPermissionMode::ReadOnly,
+        ToolSafetyCategory::WriteLocal => {
+            harness_contract::tool::ToolPermissionMode::WorkspaceWrite
+        }
+        ToolSafetyCategory::Network | ToolSafetyCategory::Destructive => {
+            harness_contract::tool::ToolPermissionMode::DangerFullAccess
+        }
+    };
+    effect.approval_class = if category == ToolSafetyCategory::ReadOnly {
+        harness_contract::tool::ToolApprovalClass::None
+    } else {
+        harness_contract::tool::ToolApprovalClass::Policy
+    };
+    effect.scopes = vec![PermissionScope {
+        resource: match category {
+            ToolSafetyCategory::ReadOnly | ToolSafetyCategory::WriteLocal => {
+                PermissionResource::File
+            }
+            ToolSafetyCategory::Network => PermissionResource::Network,
+            ToolSafetyCategory::Destructive => PermissionResource::Tool,
+        },
+        operation: match category {
+            ToolSafetyCategory::ReadOnly => PermissionOperation::Read,
+            ToolSafetyCategory::WriteLocal => PermissionOperation::Write,
+            ToolSafetyCategory::Network => PermissionOperation::Call,
+            ToolSafetyCategory::Destructive => PermissionOperation::Execute,
+        },
+        target: input
+            .get("path")
+            .or_else(|| input.get("file"))
+            .or_else(|| input.get("file_path"))
+            .or_else(|| input.get("url"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }];
+    effect
 }
 
 #[cfg(test)]
@@ -735,7 +1141,7 @@ mod tests {
 
     #[test]
     fn tool_contract_plan_classifies_parallel_limited_and_destructive_tools() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             request("read-1", "read", Vec::new()),
             request("write-1", "write", Vec::new()),
             request("rm-1", "rm", Vec::new()),
@@ -747,40 +1153,43 @@ mod tests {
         assert_eq!(plan.destructive_count, 1);
         assert_eq!(
             plan.tasks[0].execution_mode,
-            ToolExecutionMode::ParallelRead
+            GovernedToolExecutionMode::ParallelRead
         );
         assert_eq!(
             plan.tasks[0].contract_version,
-            TOOL_EXECUTION_PLAN_CONTRACT_VERSION
+            GOVERNED_TOOL_PLAN_CONTRACT_VERSION
         );
         assert!(plan.tasks[0]
             .idempotency_key
-            .starts_with("tool-plan-task:v2:"));
+            .starts_with("tool-plan-task:v3:"));
         assert_eq!(plan.tasks[0].model_visible_name, "read");
         assert!(!plan.tasks[0].can_parallelize);
         assert_eq!(
             plan.tasks[2].execution_mode,
-            ToolExecutionMode::SerialDestructive
+            GovernedToolExecutionMode::SerialDestructive
         );
         assert!(!plan.tasks[2].can_parallelize);
     }
 
     #[test]
     fn dependency_tasks_are_planned_as_wave_tasks() {
-        let plan = ToolExecutionPlan::from_requests(&[request(
+        let plan = GovernedToolPlan::from_requests(&[request(
             "write-2",
             "write",
             vec!["read-1".to_string()],
         )]);
 
         assert_eq!(plan.wave_count, 1);
-        assert_eq!(plan.tasks[0].execution_mode, ToolExecutionMode::Wave);
+        assert_eq!(
+            plan.tasks[0].execution_mode,
+            GovernedToolExecutionMode::Wave
+        );
         assert_eq!(plan.tasks[0].max_concurrency, 8);
     }
 
     #[test]
     fn tool_contract_readonly_batch_can_parallelize_without_conflicts() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             request("read-1", "read_file", Vec::new()),
             request("read-2", "grep_search", Vec::new()),
         ]);
@@ -789,12 +1198,12 @@ mod tests {
         assert!(plan
             .tasks
             .iter()
-            .all(|task| task.contract_version == TOOL_EXECUTION_PLAN_CONTRACT_VERSION));
+            .all(|task| task.contract_version == GOVERNED_TOOL_PLAN_CONTRACT_VERSION));
     }
 
     #[test]
     fn plan_event_refs_all_tool_calls() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             request("read-1", "read", Vec::new()),
             request("write-1", "write", Vec::new()),
         ]);
@@ -805,16 +1214,16 @@ mod tests {
         assert_eq!(event.status.as_deref(), Some("planned"));
         assert_eq!(event.refs.len(), 2);
         assert_eq!(event.payload["task_count"], 2);
-        assert_eq!(event.payload["tasks"][0]["contract_version"], 2);
+        assert_eq!(event.payload["tasks"][0]["contract_version"], 3);
         assert!(event.payload["tasks"][0]["idempotency_key"]
             .as_str()
             .unwrap()
-            .starts_with("tool-plan-task:v2:"));
+            .starts_with("tool-plan-task:v3:"));
     }
 
     #[test]
     fn plan_records_resource_scope_and_authority_metadata() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             ToolRequest {
                 tool_use_id: "read-1".to_string(),
                 tool_name: "read_file".to_string(),
@@ -832,16 +1241,16 @@ mod tests {
         assert_eq!(plan.tasks[0].purity, ToolPurity::ReadOnlyIdempotent);
         assert_eq!(plan.tasks[0].resource_scope.kind, "paths");
         assert_eq!(plan.tasks[0].resource_scope.paths, vec!["src/lib.rs"]);
-        assert_eq!(plan.tasks[0].authority_set, vec!["workspace.read"]);
+        assert_eq!(plan.tasks[0].authority_set, vec!["file.read"]);
         assert_eq!(plan.tasks[0].output_budget_class, "normal");
         assert_eq!(plan.tasks[1].purity, ToolPurity::Network);
         assert_eq!(plan.tasks[1].resource_scope.kind, "network");
-        assert_eq!(plan.tasks[1].authority_set, vec!["network"]);
+        assert_eq!(plan.tasks[1].authority_set, vec!["network.call"]);
     }
 
     #[test]
     fn read_file_accepts_the_registered_file_path_argument_alias() {
-        let plan = ToolExecutionPlan::from_requests(&[ToolRequest {
+        let plan = GovernedToolPlan::from_requests(&[ToolRequest {
             tool_use_id: "read-file-path".to_string(),
             tool_name: "read_file".to_string(),
             input: r#"{"file_path":"crates/runtime/src/lib.rs"}"#.to_string(),
@@ -858,7 +1267,7 @@ mod tests {
 
     #[test]
     fn plan_marks_overlapping_write_conflicts() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             ToolRequest {
                 tool_use_id: "write-1".to_string(),
                 tool_name: "write_file".to_string(),
@@ -882,7 +1291,7 @@ mod tests {
 
     #[test]
     fn independent_file_writes_remain_parallelizable() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             ToolRequest {
                 tool_use_id: "write-a".to_string(),
                 tool_name: "write_file".to_string(),
@@ -903,7 +1312,7 @@ mod tests {
 
     #[test]
     fn read_only_batch_tools_get_batch_budget_class() {
-        let plan = ToolExecutionPlan::from_requests(&[ToolRequest {
+        let plan = GovernedToolPlan::from_requests(&[ToolRequest {
             tool_use_id: "batch-1".to_string(),
             tool_name: "tool_batch_readonly".to_string(),
             input: r#"{"calls":[]}"#.to_string(),
@@ -918,10 +1327,10 @@ mod tests {
     #[test]
     fn compile_targets_enforce_normal_tool_categories() {
         let read_plan =
-            ToolExecutionPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
+            GovernedToolPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
         let network_plan =
-            ToolExecutionPlan::from_requests(&[request("network-1", "WebSearch", Vec::new())]);
-        let write_plan = ToolExecutionPlan::from_requests(&[request_with_input(
+            GovernedToolPlan::from_requests(&[request("network-1", "WebSearch", Vec::new())]);
+        let write_plan = GovernedToolPlan::from_requests(&[request_with_input(
             "write-1",
             "write_file",
             r#"{"path":"src/lib.rs","content":"x"}"#,
@@ -984,7 +1393,7 @@ mod tests {
 
     #[test]
     fn execution_graph_mutation_requires_typed_gates_and_modifiers() {
-        let plan = ToolExecutionPlan::from_requests(&[request_with_input(
+        let plan = GovernedToolPlan::from_requests(&[request_with_input(
             "write-1",
             "write_file",
             r#"{"path":"src/lib.rs","content":"x"}"#,
@@ -1055,7 +1464,7 @@ mod tests {
     #[test]
     fn network_tools_require_external_research_modifier() {
         let plan =
-            ToolExecutionPlan::from_requests(&[request("network-1", "WebSearch", Vec::new())]);
+            GovernedToolPlan::from_requests(&[request("network-1", "WebSearch", Vec::new())]);
         let without_research =
             execution_decision(RuntimeCompileTarget::EvidenceGraph, TaskRisk::Low, &[], &[]);
 
@@ -1079,15 +1488,24 @@ mod tests {
 
     #[test]
     fn registered_read_only_tool_metadata_overrides_unknown_tool_fallback() {
-        let plan = ToolExecutionPlan::from_requests_with_classifier(
+        let plan = GovernedToolCompiler.compile(
             &[request("plugin-read", "company_catalog_lookup", Vec::new())],
-            |name, _| (name == "company_catalog_lookup").then_some(ToolSafetyCategory::ReadOnly),
+            None,
+            |name, input| {
+                let mut effect = fixture_effect(name, input);
+                effect.effect_kind = ToolEffectKind::Read;
+                effect.idempotency = ToolIdempotency::Idempotent;
+                effect.required_permission = harness_contract::tool::ToolPermissionMode::ReadOnly;
+                effect.uses_network = false;
+                effect.spawns_process = false;
+                Some((effect, 1, "plugin-test".to_string()))
+            },
         );
 
         assert_eq!(plan.tasks[0].safety_category, ToolSafetyCategory::ReadOnly);
         assert_eq!(
             plan.tasks[0].execution_mode,
-            ToolExecutionMode::ParallelRead
+            GovernedToolExecutionMode::ParallelRead
         );
         let decision =
             execution_decision(RuntimeCompileTarget::EvidenceGraph, TaskRisk::Low, &[], &[]);
@@ -1105,7 +1523,7 @@ mod tests {
             ],
             &[ExecutionPolicyGate::Permission],
         );
-        let one_path = ToolExecutionPlan::from_requests(&[
+        let one_path = GovernedToolPlan::from_requests(&[
             request_with_input(
                 "write-1",
                 "write_file",
@@ -1125,7 +1543,7 @@ mod tests {
                 .allowed
         );
 
-        let multiple_paths = ToolExecutionPlan::from_requests(&[
+        let multiple_paths = GovernedToolPlan::from_requests(&[
             request_with_input(
                 "write-1",
                 "write_file",
@@ -1147,7 +1565,7 @@ mod tests {
         );
 
         let unknown_path =
-            ToolExecutionPlan::from_requests(&[request("custom-1", "custom_mutation", Vec::new())]);
+            GovernedToolPlan::from_requests(&[request("custom-1", "custom_mutation", Vec::new())]);
         assert_eq!(
             unknown_path
                 .validate_against_execution_decision(&decision)
@@ -1158,7 +1576,7 @@ mod tests {
 
     #[test]
     fn runtime_entry_tools_defer_to_their_inner_validators() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             request("capabilities-1", "RuntimeCapabilities", Vec::new()),
             request("orchestrate-1", "runtime_orchestrate", Vec::new()),
         ]);
@@ -1170,7 +1588,7 @@ mod tests {
 
     #[test]
     fn runtime_state_updates_do_not_claim_a_workspace_write_scope() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             request("todo-1", "TodoWrite", Vec::new()),
             request("orchestrate-1", "runtime_orchestrate", Vec::new()),
         ]);
@@ -1187,7 +1605,7 @@ mod tests {
 
     #[test]
     fn non_executable_decision_is_rejected_with_serializable_lease_report() {
-        let plan = ToolExecutionPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
+        let plan = GovernedToolPlan::from_requests(&[request("read-1", "read_file", Vec::new())]);
         let mut decision =
             execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
         decision.executable = false;
@@ -1205,7 +1623,7 @@ mod tests {
 
     #[test]
     fn plan_uses_request_level_bash_classification() {
-        let plan = ToolExecutionPlan::from_requests(&[
+        let plan = GovernedToolPlan::from_requests(&[
             request_with_input(
                 "bash-read",
                 "bash",

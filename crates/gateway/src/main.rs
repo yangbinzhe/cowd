@@ -8351,7 +8351,7 @@ UU conflicted.rs",
             let value: serde_json::Value =
                 serde_json::from_str(input).expect("tool input should be valid JSON");
             let descriptor = executor
-                .describe_tool_effect(tool_name, &value)
+                .registered_tool_effect(tool_name, &value)
                 .expect("registered tool should describe its effect");
             let authorization = runtime::ToolPolicy
                 .authorize(

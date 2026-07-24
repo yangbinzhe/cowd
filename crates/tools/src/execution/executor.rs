@@ -27,8 +27,8 @@ use crate::mutation_plan::{
 use crate::path_policy::WorkspacePathPolicy;
 use crate::permissions::{EnforcementResult, PermissionEnforcer, PermissionMode};
 use crate::prepared::{
-    prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedToolCall, PreparedToolInvocation,
-    ToolExecutionContext,
+    prepare_readonly_invocations, PreparedReadonlyLeaf, PreparedReadonlyLeafInvocation,
+    PreparedToolCall, ToolExecutionContext,
 };
 use crate::stale_branch::{check_freshness, BranchFreshness};
 use crate::ToolHostLease;
@@ -1465,7 +1465,7 @@ fn calls_support_prepared_readonly(calls: &[ToolBatchReadonlyCallInput]) -> bool
         .all(|call| is_prepared_readonly_tool(&call.name))
 }
 
-fn prepared_leaf_input(prepared: &PreparedToolInvocation) -> &Value {
+fn prepared_leaf_input(prepared: &PreparedReadonlyLeafInvocation) -> &Value {
     match &prepared.leaf {
         PreparedReadonlyLeaf::ReadFile(input)
         | PreparedReadonlyLeaf::GlobSearch(input)
@@ -1477,7 +1477,7 @@ fn prepared_leaf_input(prepared: &PreparedToolInvocation) -> &Value {
 
 fn execute_prepared_readonly_leaf(
     lease: &ToolHostLease,
-    prepared: PreparedToolInvocation,
+    prepared: PreparedReadonlyLeafInvocation,
 ) -> Result<Value, String> {
     let output = match prepared.leaf {
         PreparedReadonlyLeaf::ReadFile(input) => {

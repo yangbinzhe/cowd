@@ -47,6 +47,21 @@ pub struct ToolExecutionProfile {
 }
 
 impl ToolSafetyCategory {
+    #[must_use]
+    pub const fn from_effect(effect: &harness_contract::tool::ToolEffectDescriptor) -> Self {
+        use harness_contract::tool::ToolEffectKind;
+        match effect.effect_kind {
+            ToolEffectKind::Read => Self::ReadOnly,
+            ToolEffectKind::Write => Self::WriteLocal,
+            ToolEffectKind::Network => Self::Network,
+            ToolEffectKind::Process
+            | ToolEffectKind::Package
+            | ToolEffectKind::System
+            | ToolEffectKind::Destructive
+            | ToolEffectKind::Unknown => Self::Destructive,
+        }
+    }
+
     /// Classify a tool by name using a built-in mapping.
     pub fn from_tool_name(name: &str) -> Self {
         let normalized = normalize_tool_name_for_safety(name);
@@ -167,7 +182,7 @@ impl ToolSafetyCategory {
             // This profile is consumed by native calls as well as batch/many
             // tools.  It must agree with the scheduler's normal per-turn
             // cap; an unbounded profile here bypassed the plan budget.
-            Self::ReadOnly => crate::execution_scheduler::DEFAULT_PARALLEL_READ_CONCURRENCY,
+            Self::ReadOnly => crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY,
             Self::WriteLocal => 4,
             Self::Network => 3,
             Self::Destructive => 1,

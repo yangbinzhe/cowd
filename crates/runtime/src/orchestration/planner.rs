@@ -12,7 +12,7 @@ use crate::execution_core::rewoo_plan::{
 use crate::execution_core::strategy_decision::{
     RuntimeExecutionDecision, StrategyDecisionEngine, StrategyResourceHealth,
 };
-use crate::execution_core::tool_dag::{tool_dag_from_rewoo, ToolDagPlan};
+use crate::execution_core::tool_intents::{tool_intents_from_rewoo, ToolIntentGraph};
 use crate::orchestration::request::RuntimeOrchestrationRequest;
 use crate::{CollaborationDecision, CollaborationTemplateMatcher};
 
@@ -23,7 +23,7 @@ pub struct RuntimeOrchestrationPlan {
     pub collaboration_decision: CollaborationDecision,
     pub pattern_catalog: ExecutionPatternCatalog,
     pub rewoo_plan: RewooEvidencePlan,
-    pub tool_dag: ToolDagPlan,
+    pub tool_intents: ToolIntentGraph,
     pub deliberation_plan: DeliberationPlan,
 }
 
@@ -87,7 +87,7 @@ pub(crate) fn plan_runtime_orchestration_with_decision_and_resources(
         &execution_decision.strategy.understanding,
     );
     let rewoo_plan = rewoo_plan_for_intent_with_evidence_plan(&request.intent, evidence_plan);
-    let tool_dag = tool_dag_from_rewoo(&rewoo_plan);
+    let tool_intents = tool_intents_from_rewoo(&rewoo_plan);
     RuntimeOrchestrationPlan {
         execution_decision,
         model_proposal,
@@ -95,7 +95,7 @@ pub(crate) fn plan_runtime_orchestration_with_decision_and_resources(
         pattern_catalog: ExecutionPatternCatalog::current(),
         deliberation_plan: DeliberationPlan::for_objective(&request.intent),
         rewoo_plan,
-        tool_dag,
+        tool_intents,
     }
 }
 

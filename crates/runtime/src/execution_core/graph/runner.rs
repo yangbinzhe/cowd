@@ -72,7 +72,7 @@ struct ActiveNode {
 }
 
 struct NodeResourceGuards {
-    resource: ExecutionResourceLease,
+    resource: Option<ExecutionResourceLease>,
     scope: Option<ScopeLockLease>,
     worktree: Option<WorktreeLease>,
 }
@@ -83,7 +83,11 @@ impl NodeResourceGuards {
             executor_kind: ticket.executor_kind.clone(),
             ticket_idempotency_key: ticket.idempotency_key.clone(),
             attempt: ticket.attempt,
-            resource_lease_refs: vec![self.resource.id().to_string()],
+            resource_lease_refs: self
+                .resource
+                .as_ref()
+                .map(|resource| vec![resource.id().to_string()])
+                .unwrap_or_default(),
             scope_lease_ref: self.scope.as_ref().map(|lease| lease.id().to_string()),
             worktree_lease_ref: self
                 .worktree
@@ -482,8 +486,14 @@ impl ExecutionGraphRunner {
             })
             .await?;
         let binding = resources.binding(&ticket);
-        let resource_kind = resources.resource.kind().clone();
-        let resource_queue_wait = resources.resource.queue_wait();
+        let resource_kind = resources
+            .resource
+            .as_ref()
+            .map(|resource| resource.kind().clone());
+        let resource_queue_wait = resources
+            .resource
+            .as_ref()
+            .map_or(Duration::ZERO, ExecutionResourceLease::queue_wait);
         self.active.lock().await.insert(
             (ticket.graph_id.clone(), ticket.node_id.clone()),
             ActiveNode {
@@ -557,30 +567,32 @@ impl ExecutionGraphRunner {
         }
         let resource_started = std::time::Instant::now();
         let outcome = executor.poll_or_await(&ticket).await;
-        let pressure_snapshot = self.resource_manager.snapshot(&resource_kind).ok();
-        let _ = self.resource_manager.observe_runtime_pressure(
-            &resource_kind,
-            crate::execution_core::graph::ResourceObservation {
-                queue_wait: resource_queue_wait,
-                service_time: resource_started.elapsed(),
-                producer_wait: std::time::Duration::ZERO,
-                queue_depth: pressure_snapshot
-                    .as_ref()
-                    .map_or(0, |snapshot| snapshot.queued_waiters),
-                saturation: pressure_snapshot.as_ref().map_or(0.0, |snapshot| {
-                    if snapshot.effective_limit == 0 {
-                        1.0
+        if let Some(resource_kind) = resource_kind {
+            let pressure_snapshot = self.resource_manager.snapshot(&resource_kind).ok();
+            let _ = self.resource_manager.observe_runtime_pressure(
+                &resource_kind,
+                crate::execution_core::graph::ResourceObservation {
+                    queue_wait: resource_queue_wait,
+                    service_time: resource_started.elapsed(),
+                    producer_wait: std::time::Duration::ZERO,
+                    queue_depth: pressure_snapshot
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.queued_waiters),
+                    saturation: pressure_snapshot.as_ref().map_or(0.0, |snapshot| {
+                        if snapshot.effective_limit == 0 {
+                            1.0
+                        } else {
+                            snapshot.active_leases as f32 / snapshot.effective_limit as f32
+                        }
+                    }),
+                    result_class: if outcome.is_err() {
+                        crate::execution_core::graph::ResourceResultClass::Failed
                     } else {
-                        snapshot.active_leases as f32 / snapshot.effective_limit as f32
-                    }
-                }),
-                result_class: if outcome.is_err() {
-                    crate::execution_core::graph::ResourceResultClass::Failed
-                } else {
-                    crate::execution_core::graph::ResourceResultClass::Completed
+                        crate::execution_core::graph::ResourceResultClass::Completed
+                    },
                 },
-            },
-        );
+            );
+        }
         let outcome = outcome?;
         self.commit_service
             .commit_execution_effect(&ticket, &outcome)?;
@@ -600,6 +612,33 @@ impl ExecutionGraphRunner {
             }
             harness_contract::execution_graph::ExecutionNodeKind::AgentTask => {
                 ExecutionResourceKind::Agent
+            }
+            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => {
+                // ToolBatch is a container. Each leaf invocation is admitted
+                // by ToolExecutionPlane; taking a second Tool lease here can
+                // deadlock a one-slot quota.
+                // The container contract must still be validated so malformed
+                // paths become durable blockers before any leaf can execute.
+                for scope in &node.resource_scopes {
+                    if let Some(path) = scope
+                        .strip_prefix("read:")
+                        .or_else(|| scope.strip_prefix("write:"))
+                    {
+                        let _ = self.scoped_resource_for_path(&node.id, path)?;
+                    } else if let Some(path) = scope.strip_prefix("worktree:") {
+                        validate_worktree_path(&self.workspace_root, path).map_err(|reason| {
+                            ExecutionRunnerError::Resource {
+                                node_id: node.id.clone(),
+                                reason,
+                            }
+                        })?;
+                    }
+                }
+                return Ok(NodeResourceGuards {
+                    resource: None,
+                    scope: None,
+                    worktree: None,
+                });
             }
             _ => ExecutionResourceKind::Tool,
         };
@@ -673,7 +712,7 @@ impl ExecutionGraphRunner {
                 reason: error.to_string(),
             })?;
         Ok(NodeResourceGuards {
-            resource,
+            resource: Some(resource),
             scope,
             worktree,
         })

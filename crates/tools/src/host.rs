@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use harness_contract::tool::{
+    GovernedToolInvocation, ResourceAccess, ResourceDemand, ResourceScopeDemand, ToolDependency,
     ToolDiscoveryReceipt, ToolEffectDescriptor, ToolExecutionAuthorization, ToolIdempotency,
-    ToolPermissionMode,
+    ToolIntent, ToolPermissionMode,
 };
 use mcp::McpService;
 use serde_json::Value;
@@ -16,7 +17,7 @@ use serde_json::Value;
 use crate::lsp_client::LspRegistry;
 use crate::path_policy::WorkspacePathPolicy;
 use crate::tool_cache::{ToolCache, ToolCacheStats};
-use crate::tool_orchestrator::describe_tool_effect;
+use crate::tool_orchestrator::resolve_registered_tool_effect;
 use crate::ToolCatalog;
 
 /// Immutable implementation snapshot pinned for one request.
@@ -265,13 +266,51 @@ impl ToolHostLease {
 
     #[must_use]
     pub fn describe_effect(&self, tool_id: &str, input: &Value) -> ToolEffectDescriptor {
-        let catalog_known = self.snapshot.catalog.contains(tool_id);
         let permission = self
             .snapshot
             .catalog
             .required_permission(tool_id)
             .unwrap_or(ToolPermissionMode::DangerFullAccess);
-        describe_tool_effect(tool_id, input, permission, catalog_known)
+        let resolver = self.snapshot.catalog.effect_resolver(tool_id);
+        resolve_registered_tool_effect(&resolver, tool_id, input, permission)
+    }
+
+    /// Prepare one immutable governed invocation from the pinned catalog
+    /// revision. Runtime consumes this descriptor directly and never re-infers
+    /// effect or resource behavior from a tool name.
+    #[must_use]
+    pub fn prepare_governed_invocation(
+        &self,
+        invocation_id: impl Into<String>,
+        tool_id: &str,
+        input: &Value,
+        depends_on: &[String],
+    ) -> GovernedToolInvocation {
+        let invocation_id = invocation_id.into();
+        let effect = self.describe_effect(tool_id, input);
+        let explicit_dependencies = depends_on
+            .iter()
+            .map(|dependency| ToolDependency {
+                invocation_id: invocation_id.clone(),
+                depends_on: dependency.clone(),
+                reason: "model_explicit_dependency".to_string(),
+            })
+            .collect();
+        GovernedToolInvocation {
+            contract_version: 1,
+            invocation_id: invocation_id.clone(),
+            intent: ToolIntent {
+                invocation_id: invocation_id.clone(),
+                tool_name: tool_id.to_string(),
+                normalized_input: canonicalize_json(input),
+            },
+            resource_demand: resource_demand_for_effect(&effect),
+            idempotency_key: format!("{tool_id}:{invocation_id}:{}", effect.descriptor_hash),
+            effect,
+            explicit_dependencies,
+            catalog_revision: self.revision,
+            descriptor_set_hash: self.snapshot.descriptor_set_hash.clone(),
+        }
     }
 
     pub fn execute(
@@ -387,8 +426,54 @@ fn descriptor_set_hash(catalog: &ToolCatalog) -> String {
             .unwrap_or_default()
             .hash(&mut hasher);
         definition.required_permission.as_str().hash(&mut hasher);
+        let resolver = catalog.effect_resolver(&definition.name);
+        resolver.resolver_id.hash(&mut hasher);
+        resolver.resolver_version.hash(&mut hasher);
     }
     format!("{:016x}", hasher.finish())
+}
+
+fn resource_demand_for_effect(effect: &ToolEffectDescriptor) -> ResourceDemand {
+    let mut scopes = effect
+        .scopes
+        .iter()
+        .filter_map(|scope| {
+            scope.target.clone().map(|key| ResourceScopeDemand {
+                key,
+                access: if scope.operation == harness_contract::policy::PermissionOperation::Read {
+                    ResourceAccess::Read
+                } else {
+                    ResourceAccess::Write
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_by(|left, right| left.key.cmp(&right.key));
+    scopes.dedup();
+    ResourceDemand {
+        tool_slots: 1,
+        process_slots: u32::from(effect.spawns_process),
+        network_slots: u32::from(effect.uses_network),
+        cpu_weight: if effect.spawns_process { 2 } else { 1 },
+        memory_bytes: 0,
+        scopes,
+    }
+}
+
+fn canonicalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            let mut normalized = serde_json::Map::new();
+            for key in keys {
+                normalized.insert(key.clone(), canonicalize_json(&map[key]));
+            }
+            Value::Object(normalized)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json).collect()),
+        _ => value.clone(),
+    }
 }
 
 fn parse_mcp_runtime_id(tool_id: &str) -> Option<(&str, &str)> {

@@ -582,6 +582,7 @@ pub struct RuntimeServices {
     mission_evidence: Arc<MissionEvidenceBus>,
     conflict_resolver: Arc<ConflictArbiter>,
     resource_manager: Arc<ExecutionResourceManager>,
+    tool_execution_plane: Arc<crate::ToolExecutionPlane>,
     scope_locks: Arc<ScopeLockManager>,
     worktree_leases: Arc<WorktreeLeaseManager>,
     definition_registry: Arc<RuntimeDefinitionRegistry>,
@@ -754,6 +755,10 @@ impl RuntimeServices {
         )?;
         let commit_service = ExecutionCommitService::new(Arc::clone(&event_store));
         let resource_manager = Arc::new(ExecutionResourceManager::new(resource_quotas));
+        let tool_execution_plane = Arc::new(crate::ToolExecutionPlane::new(
+            Arc::clone(&resource_manager),
+            Arc::clone(&scope_locks),
+        ));
         let graph_runner = Arc::new(ExecutionGraphRunner::new(
             Arc::clone(&executor_registry),
             graph_state_store.clone(),
@@ -845,6 +850,7 @@ impl RuntimeServices {
             mission_evidence,
             conflict_resolver,
             resource_manager,
+            tool_execution_plane,
             scope_locks,
             worktree_leases,
             definition_registry,
@@ -1947,7 +1953,7 @@ impl RuntimeServices {
         scenario
             .validate()
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        validate_evolution_scenario_isolation(scenario)?;
+        validate_evolution_scenario_isolation(scenario, self.tool_execution_host.as_deref())?;
         let candidate = self.evolution_candidate(candidate_id)?;
         let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject
         else {
@@ -2047,7 +2053,7 @@ impl RuntimeServices {
         scenario
             .validate()
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        validate_evolution_scenario_isolation(scenario)?;
+        validate_evolution_scenario_isolation(scenario, self.tool_execution_host.as_deref())?;
         let candidate = self.evolution_candidate(candidate_id)?;
         let crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } = &candidate.subject
         else {
@@ -2246,6 +2252,9 @@ impl RuntimeServices {
     }
     pub fn resource_manager(&self) -> &Arc<ExecutionResourceManager> {
         &self.resource_manager
+    }
+    pub fn tool_execution_plane(&self) -> &Arc<crate::ToolExecutionPlane> {
+        &self.tool_execution_plane
     }
     pub fn scope_locks(&self) -> &Arc<ScopeLockManager> {
         &self.scope_locks
@@ -3119,6 +3128,7 @@ fn ensure_team_evaluation_contract_noninferior(
 /// effect receipt yet.
 fn validate_evolution_scenario_isolation(
     scenario: &EvaluationScenarioSpec,
+    tool_host: Option<&dyn crate::RuntimeExecutionHost>,
 ) -> Result<(), RuntimeServicesError> {
     if !scenario.allowed_skills.is_empty() {
         return Err(RuntimeServicesError::Invariant(
@@ -3130,7 +3140,14 @@ fn validate_evolution_scenario_isolation(
         .allowed_tools
         .iter()
         .filter(|tool| {
-            crate::ToolSafetyCategory::from_tool_name(tool) != crate::ToolSafetyCategory::ReadOnly
+            tool_host
+                .and_then(|host| {
+                    host.delegated_tool_effect_descriptor(tool, &serde_json::json!({}))
+                })
+                .is_none_or(|effect| {
+                    crate::ToolSafetyCategory::from_effect(&effect)
+                        != crate::ToolSafetyCategory::ReadOnly
+                })
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -3324,6 +3341,38 @@ fn default_resource_quotas() -> Vec<(ExecutionResourceKind, ResourceQuota)> {
                 minimum: 1,
                 target: 8,
                 maximum: 64,
+            },
+        ),
+        (
+            ExecutionResourceKind::Custom("tool.process".to_string()),
+            ResourceQuota {
+                minimum: 1,
+                target: 4,
+                maximum: 16,
+            },
+        ),
+        (
+            ExecutionResourceKind::Custom("tool.network".to_string()),
+            ResourceQuota {
+                minimum: 1,
+                target: 8,
+                maximum: 32,
+            },
+        ),
+        (
+            ExecutionResourceKind::Custom("tool.cpu".to_string()),
+            ResourceQuota {
+                minimum: 1,
+                target: 16,
+                maximum: 64,
+            },
+        ),
+        (
+            ExecutionResourceKind::Custom("tool.memory_mib".to_string()),
+            ResourceQuota {
+                minimum: 64,
+                target: 2_048,
+                maximum: 16_384,
             },
         ),
     ]

@@ -157,7 +157,9 @@ where
             config.memory_read_scopes,
         );
         if root_provider_owner {
-            runtime = runtime.with_provider_admission(Arc::clone(services.resource_manager()));
+            runtime = runtime
+                .with_provider_admission(Arc::clone(services.resource_manager()))
+                .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
         }
         if let Some(memory_manager) = services.memory_manager() {
             runtime = runtime.with_memory_manager(memory_manager);
@@ -4695,10 +4697,10 @@ where
         // runtime. These are necessary for delegated agent tool calls that
         // travel through the governed path, because the Gateway's ToolHost
         // must verify the same descriptor before execution.
-        let tool_authorizations: std::collections::HashMap<
-            String,
-            harness_contract::tool::ToolExecutionAuthorization,
-        > = {
+        let (tool_authorizations, prepared_tool_invocations): (
+            std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
+            std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
+        ) = {
             let runtime = self.runtime.lock().await;
             let tool_exec = Arc::clone(runtime.tool_executor());
             let active_mode = runtime.permission_policy().active_mode();
@@ -4706,12 +4708,25 @@ where
                 .tool_timeout()
                 .unwrap_or_else(|| std::time::Duration::from_secs(60));
             drop(runtime);
+            let requests = calls
+                .iter()
+                .map(|call| crate::tool_dispatch::ToolRequest {
+                    tool_use_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    input: call.input.clone(),
+                    depends_on: call.depends_on.clone(),
+                })
+                .collect::<Vec<_>>();
+            let prepared = tool_exec.prepare_governed_invocations(&requests);
             let mut auths = std::collections::HashMap::new();
+            let mut prepared_by_id = std::collections::HashMap::new();
             for call in &calls {
-                let parsed_input: serde_json::Value =
-                    serde_json::from_str(&call.input).unwrap_or(serde_json::Value::Null);
-                if let Some(descriptor) = tool_exec.describe_tool_effect(&call.name, &parsed_input)
+                if let Some(invocation) = prepared
+                    .iter()
+                    .find(|invocation| invocation.invocation_id == call.id)
                 {
+                    let descriptor = invocation.effect.clone();
+                    prepared_by_id.insert(call.id.clone(), invocation.clone());
                     let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
                     if let Ok(decision) = crate::ToolPolicy.authorize(
                         &descriptor,
@@ -4723,7 +4738,7 @@ where
                     }
                 }
             }
-            auths
+            (auths, prepared_by_id)
         };
         let governed_host = if delegated_agent_role {
             None
@@ -4738,7 +4753,9 @@ where
                 model_lease.as_deref(),
                 ticket,
                 &tool_authorizations,
+                &prepared_tool_invocations,
                 &execution_decision,
+                self.services.tool_execution_plane(),
             )
             .await;
             let orchestration_terminal_summary = completed_orchestration_terminal_summary(
@@ -5602,7 +5619,12 @@ async fn execute_governed_runtime_tool_batch(
         String,
         harness_contract::tool::ToolExecutionAuthorization,
     >,
+    prepared_invocations: &std::collections::HashMap<
+        String,
+        harness_contract::tool::GovernedToolInvocation,
+    >,
     decision: &crate::execution_core::RuntimeExecutionDecision,
+    execution_plane: &Arc<crate::ToolExecutionPlane>,
 ) -> GovernedToolBatchResult {
     let requests = calls
         .iter()
@@ -5613,24 +5635,38 @@ async fn execute_governed_runtime_tool_batch(
             depends_on: call.depends_on.clone(),
         })
         .collect::<Vec<_>>();
-    let plan = crate::tool_execution_plan::ToolExecutionPlan::from_requests(&requests);
-    let schedule = crate::execution_scheduler::schedule_tool_execution_plan_for_decision(
-        &requests, &plan, decision,
-    );
-    let max_concurrency_observed = schedule
+    let plan = crate::GovernedToolCompiler.compile(&requests, Some(decision), |name, input| {
+        requests
+            .iter()
+            .find(|request| {
+                request.tool_name == name
+                    && serde_json::from_str::<serde_json::Value>(&request.input)
+                        .unwrap_or(serde_json::Value::Null)
+                        == *input
+            })
+            .and_then(|request| prepared_invocations.get(&request.tool_use_id))
+            .map(|invocation| {
+                (
+                    invocation.effect.clone(),
+                    invocation.catalog_revision,
+                    invocation.descriptor_set_hash.clone(),
+                )
+            })
+    });
+    let max_concurrency_observed = plan
         .batches
         .iter()
         .map(|batch| batch.max_concurrency.min(batch.indices.len()))
         .max()
         .unwrap_or(0);
-    let parallel_batches = schedule
+    let parallel_batches = plan
         .batches
         .iter()
         .filter(|batch| batch.max_concurrency > 1 && batch.indices.len() > 1)
         .count();
     let mut results = vec![None; calls.len()];
 
-    for batch in schedule.batches {
+    for batch in plan.batches.clone() {
         let parallel = batch.max_concurrency > 1
             && batch.indices.len() > 1
             && batch.indices.iter().all(|index| {
@@ -5642,24 +5678,24 @@ async fn execute_governed_runtime_tool_batch(
             let limit = batch.max_concurrency.min(batch.indices.len()).max(1);
             let completed = stream::iter(batch.indices.into_iter().map(|index| {
                 let host = Arc::clone(&host);
+                let execution_plane = Arc::clone(execution_plane);
+                let demand = plan.tasks[index].resource_demand.clone();
                 let authorization = tool_authorizations.get(&calls[index].id).cloned();
                 let request = bound_runtime_tool_request(
                     &calls[index],
+                    &plan.tasks[index],
+                    &plan.plan_id,
+                    plan.revision,
                     session_id,
                     model_lease,
                     ticket,
                     authorization,
                 );
                 async move {
-                    let _permit =
-                        match crate::execution_scheduler::acquire_process_tool_permit().await {
-                            Ok(permit) => permit,
-                            Err(error) => return (index, Err(error)),
-                        };
-                    let joined =
-                        tokio::task::spawn_blocking(move || host.execute_runtime_tool(&request))
-                            .await;
-                    (index, joined.map_err(|error| error.to_string()))
+                    let executed = execution_plane
+                        .execute(&demand, None, move || host.execute_runtime_tool(&request))
+                        .await;
+                    (index, executed.map_err(|error| error.to_string()))
                 }
             }))
             .buffer_unordered(limit)
@@ -5678,24 +5714,33 @@ async fn execute_governed_runtime_tool_batch(
             }
         } else {
             for index in batch.indices {
+                let host = Arc::clone(&host);
                 let authorization = tool_authorizations.get(&calls[index].id).cloned();
                 let request = bound_runtime_tool_request(
                     &calls[index],
+                    &plan.tasks[index],
+                    &plan.plan_id,
+                    plan.revision,
                     session_id,
                     model_lease,
                     ticket,
                     authorization,
                 );
-                let permit = crate::execution_scheduler::acquire_process_tool_permit().await;
-                results[index] = Some(match permit {
-                    Ok(_permit) => tool_outcome_message(host.execute_runtime_tool(&request)),
-                    Err(error) => ConversationMessage::tool_result(
-                        calls[index].id.clone(),
-                        calls[index].name.clone(),
-                        format!("governed tool execution failed: {error}"),
-                        true,
-                    ),
-                });
+                let demand = plan.tasks[index].resource_demand.clone();
+                results[index] = Some(
+                    match execution_plane
+                        .execute(&demand, None, move || host.execute_runtime_tool(&request))
+                        .await
+                    {
+                        Ok(outcome) => tool_outcome_message(outcome),
+                        Err(error) => ConversationMessage::tool_result(
+                            calls[index].id.clone(),
+                            calls[index].name.clone(),
+                            format!("governed tool execution failed: {error}"),
+                            true,
+                        ),
+                    },
+                );
             }
         }
     }
@@ -5723,17 +5768,22 @@ async fn execute_governed_runtime_tool_batch(
 
 fn bound_runtime_tool_request(
     call: &ModelToolCall,
+    task: &crate::GovernedToolPlanTask,
+    plan_id: &str,
+    plan_revision: u64,
     session_id: &str,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
     authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
 ) -> crate::RuntimeToolExecutionRequest {
     crate::RuntimeToolExecutionRequest {
+        governed_plan_id: plan_id.to_string(),
+        governed_plan_revision: plan_revision,
         idempotency_key: format!("{}:{}", ticket.idempotency_key, call.id),
         tool_use_id: call.id.clone(),
         tool_name: call.name.clone(),
         input: call.input.clone(),
-        category: crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(&call.name),
+        category: task.safety_category,
         authorization,
         session_id: Some(session_id.to_string()),
         model_lease: model_lease.map(ToString::to_string),
@@ -6844,46 +6894,37 @@ fn rollback_uncommitted_transcript(messages: &mut Vec<ConversationMessage>, comm
 }
 
 fn resource_scopes_for_tool_calls(calls: &[ModelToolCall]) -> Vec<String> {
-    use crate::tool_dispatch::ToolRequest;
-    let requests = calls
-        .iter()
-        .map(|call| ToolRequest {
-            tool_use_id: call.id.clone(),
-            tool_name: call.name.clone(),
-            input: call.input.clone(),
-            depends_on: call.depends_on.clone(),
-        })
-        .collect::<Vec<_>>();
-    let plan = crate::tool_execution_plan::ToolExecutionPlan::from_requests(&requests);
-    let mut scopes = Vec::new();
-    for task in plan.tasks {
-        let access = if task.purity == crate::tool_execution_plan::ToolPurity::ReadOnlyIdempotent {
-            "read"
-        } else {
-            "write"
-        };
-        scopes.extend(
-            task.resource_scope
-                .paths
-                .into_iter()
-                .map(|path| format!("{access}:{path}")),
-        );
-        if task.resource_scope.network {
-            scopes.push("network:*".to_string());
-        }
-        if task.resource_scope.unknown {
-            scopes.push("write:.".to_string());
-        }
-    }
+    // These scopes are descriptive graph/evaluation metadata, not execution
+    // leases. ToolBatch container nodes deliberately skip ScopeLockManager in
+    // GraphRunner; each leaf acquires its authoritative descriptor-derived
+    // ResourceDemand through ToolExecutionPlane.
     let mut paths = std::collections::BTreeMap::<String, bool>::new();
     let mut other = Vec::new();
-    for scope in scopes {
-        if let Some(path) = scope.strip_prefix("write:") {
-            paths.insert(path.to_string(), true);
-        } else if let Some(path) = scope.strip_prefix("read:") {
-            paths.entry(path.to_string()).or_insert(false);
-        } else {
-            other.push(scope);
+    for call in calls {
+        let Ok(input) = serde_json::from_str::<serde_json::Value>(&call.input) else {
+            continue;
+        };
+        let Some(effect) = graph_metadata_effect(&call.name, &input) else {
+            continue;
+        };
+        let access = effect.effect_kind != harness_contract::tool::ToolEffectKind::Read;
+        for scope in effect.scopes {
+            let Some(target) = scope.target else {
+                continue;
+            };
+            match scope.resource {
+                harness_contract::policy::PermissionResource::File
+                | harness_contract::policy::PermissionResource::Tool => {
+                    paths
+                        .entry(target)
+                        .and_modify(|write| *write |= access)
+                        .or_insert(access);
+                }
+                harness_contract::policy::PermissionResource::Network => {
+                    other.push("network:*".to_string());
+                }
+                _ => {}
+            }
         }
     }
     other.extend(
@@ -6894,6 +6935,90 @@ fn resource_scopes_for_tool_calls(calls: &[ModelToolCall]) -> Vec<String> {
     other.sort();
     other.dedup();
     other
+}
+
+fn graph_metadata_effect(
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+    use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+    use harness_contract::tool::{
+        ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+        ToolPermissionMode,
+    };
+
+    // This bridge only materializes model-declared paths before the registered
+    // ToolHost is entered. It is not an execution safety fallback: unknown or
+    // pathless tools emit no graph scope and remain an Unknown barrier in the
+    // governed compiler.
+    let normalized = tool_name.trim().replace('-', "_").to_ascii_lowercase();
+    let effect_kind = match normalized.as_str() {
+        "read_file" | "read_many" | "grep_search" | "grep_many" | "glob_search" | "glob_many"
+        | "workspace_snapshot" => ToolEffectKind::Read,
+        "write_file" | "edit_file" | "apply_patch_transaction" | "notebook_edit" => {
+            ToolEffectKind::Write
+        }
+        _ => return None,
+    };
+    let mut targets = Vec::new();
+    collect_graph_resource_targets(input, &mut targets);
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return None;
+    }
+    let operation = if effect_kind == ToolEffectKind::Read {
+        PermissionOperation::Read
+    } else {
+        PermissionOperation::Write
+    };
+    Some(ToolEffectDescriptor {
+        tool_id: tool_name.to_string(),
+        descriptor_hash: "graph-metadata-only".to_string(),
+        effect_kind,
+        idempotency: ToolIdempotency::Unknown,
+        scopes: targets
+            .into_iter()
+            .map(|target| PermissionScope {
+                resource: PermissionResource::File,
+                operation: operation.clone(),
+                target: Some(target),
+            })
+            .collect(),
+        required_permission: if effect_kind == ToolEffectKind::Read {
+            ToolPermissionMode::ReadOnly
+        } else {
+            ToolPermissionMode::WorkspaceWrite
+        },
+        approval_class: ToolApprovalClass::None,
+        uses_network: false,
+        spawns_process: false,
+        mutates_packages: false,
+        mutates_system: false,
+    })
+}
+
+fn collect_graph_resource_targets(value: &serde_json::Value, targets: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_graph_resource_targets(value, targets);
+            }
+        }
+        serde_json::Value::Object(values) => {
+            for field in ["path", "file_path", "file", "notebook_path"] {
+                if let Some(path) = values.get(field).and_then(serde_json::Value::as_str) {
+                    targets.push(path.to_string());
+                }
+            }
+            for field in ["files", "edits", "calls", "searches"] {
+                if let Some(value) = values.get(field) {
+                    collect_graph_resource_targets(value, targets);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Compile model-provided paths into graph lock scopes without turning a bad
@@ -8297,7 +8422,7 @@ mod tests {
             true
         }
 
-        fn describe_tool_effect(
+        fn registered_tool_effect(
             &self,
             name: &str,
             _input: &serde_json::Value,
@@ -8602,7 +8727,7 @@ mod tests {
             ]
         }
 
-        fn describe_tool_effect(
+        fn registered_tool_effect(
             &self,
             name: &str,
             _input: &serde_json::Value,
@@ -9354,6 +9479,52 @@ mod tests {
                 .modifiers
                 .push(harness_contract::core::ExecutionModifier::Parallel);
         }
+        let tool_effects = calls
+            .iter()
+            .map(|call| {
+                let normalized_input =
+                    serde_json::from_str::<serde_json::Value>(&call.input).unwrap();
+                let effect = harness_contract::tool::ToolEffectDescriptor {
+                    tool_id: call.name.clone(),
+                    descriptor_hash: format!("descriptor-{}", call.id),
+                    effect_kind: harness_contract::tool::ToolEffectKind::Read,
+                    idempotency: harness_contract::tool::ToolIdempotency::Idempotent,
+                    scopes: vec![harness_contract::policy::PermissionScope {
+                        resource: harness_contract::policy::PermissionResource::Tool,
+                        operation: harness_contract::policy::PermissionOperation::Read,
+                        target: normalized_input
+                            .get("path")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    }],
+                    required_permission: harness_contract::tool::ToolPermissionMode::ReadOnly,
+                    approval_class: harness_contract::tool::ToolApprovalClass::None,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                };
+                (
+                    call.id.clone(),
+                    harness_contract::tool::GovernedToolInvocation {
+                        contract_version: 1,
+                        invocation_id: call.id.clone(),
+                        intent: harness_contract::tool::ToolIntent {
+                            invocation_id: call.id.clone(),
+                            tool_name: call.name.clone(),
+                            normalized_input,
+                        },
+                        effect: effect.clone(),
+                        resource_demand: harness_contract::tool::ResourceDemand::default(),
+                        explicit_dependencies: Vec::new(),
+                        catalog_revision: 1,
+                        descriptor_set_hash: "test".to_string(),
+                        idempotency_key: format!("{}:{}", call.name, call.id),
+                    },
+                )
+            })
+            .collect();
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let governed = execute_governed_runtime_tool_batch(
             host,
             &calls,
@@ -9361,7 +9532,9 @@ mod tests {
             None,
             &ticket,
             &std::collections::HashMap::new(),
+            &tool_effects,
             &decision,
+            services.tool_execution_plane(),
         )
         .await;
         let messages = governed.messages;
@@ -9369,13 +9542,13 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) >= 2);
         assert!(
             peak.load(Ordering::SeqCst)
-                <= crate::execution_scheduler::DEFAULT_PARALLEL_READ_CONCURRENCY,
+                <= crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY,
             "the graph route must obey the same per-turn read fan-out cap"
         );
         assert_eq!(messages.len(), 40);
         assert_eq!(
             governed.max_concurrency_observed,
-            crate::execution_scheduler::DEFAULT_PARALLEL_READ_CONCURRENCY
+            crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
         );
         assert_eq!(governed.parallel_batches, 1);
         assert!(matches!(

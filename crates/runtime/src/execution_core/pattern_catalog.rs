@@ -63,7 +63,7 @@ impl ExecutionPatternCatalog {
                     ],
                     &["irreversible mutation", "evidence already sufficient"],
                     &["cowd/parallel-research-synthesis"],
-                    &["tool_dag", "evidence_ledger"],
+                    &["tool_intents", "evidence_ledger"],
                     RuntimeCompileTarget::EvidenceGraph,
                 ),
                 spec(
@@ -81,7 +81,7 @@ impl ExecutionPatternCatalog {
                         "execute_review",
                         "implementation_review_fix",
                     ],
-                    &["tool_dag", "agent_runtime", "verification"],
+                    &["tool_intents", "agent_runtime", "verification"],
                     RuntimeCompileTarget::ExecutionGraph,
                 ),
                 spec(

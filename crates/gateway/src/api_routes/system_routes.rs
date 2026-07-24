@@ -255,6 +255,11 @@ fn accumulate_usage_bucket(
 }
 
 async fn tools_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    let tool_host = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.tool_host());
     let definitions = state
         .services
         .runtime
@@ -268,7 +273,13 @@ async fn tools_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoR
                 .definitions(None)
         })
         .unwrap_or_else(|| state.tool_registry.definitions(None));
-    Json(state.services.system.tool_catalog(definitions))
+    let tool_host = tool_host.unwrap_or_else(|| {
+        Arc::new(tools::ToolHost::builtin(
+            "gateway-catalog",
+            &state.workspace_root,
+        ))
+    });
+    Json(state.services.system.tool_catalog(&tool_host, definitions))
 }
 
 fn runtime_tool_host(
@@ -329,13 +340,18 @@ async fn tool_batch_readonly_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<ToolBatchReadonlyRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let tool_host = runtime_tool_host(&state)?;
     for call in &body.calls {
         let name = call
             .get("name")
             .and_then(serde_json::Value::as_str)
             .map(normalize_tool_name)
             .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "batch call name is required"))?;
-        if !state.services.system.is_prepared_readonly_tool(&name) {
+        if !state
+            .services
+            .system
+            .is_prepared_readonly_tool(&tool_host, &name)
+        {
             return Err(api_error(
                 StatusCode::FORBIDDEN,
                 format!("tool_batch_readonly rejects non read-only tool `{name}`"),
@@ -347,7 +363,6 @@ async fn tool_batch_readonly_handler(
             .unwrap_or_else(|| serde_json::json!({}));
         ensure_tool_input_within_workspace(&state, &state.workspace_root, input)?;
     }
-    let tool_host = runtime_tool_host(&state)?;
     let receipt = state
         .services
         .system

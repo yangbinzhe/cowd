@@ -28,7 +28,7 @@ pub(crate) enum PreparedReadonlyLeaf {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PreparedToolInvocation {
+pub(crate) struct PreparedReadonlyLeafInvocation {
     pub call_id: String,
     pub original_name: String,
     pub normalized_name: String,
@@ -63,7 +63,7 @@ impl PreparedToolError {
 pub(crate) fn prepare_readonly_invocations(
     context: &ToolExecutionContext,
     calls: &[PreparedToolCall],
-) -> Result<Vec<PreparedToolInvocation>, PreparedToolError> {
+) -> Result<Vec<PreparedReadonlyLeafInvocation>, PreparedToolError> {
     calls
         .iter()
         .enumerate()
@@ -75,7 +75,7 @@ fn prepare_readonly_invocation(
     context: &ToolExecutionContext,
     index: usize,
     call: &PreparedToolCall,
-) -> Result<PreparedToolInvocation, PreparedToolError> {
+) -> Result<PreparedReadonlyLeafInvocation, PreparedToolError> {
     let normalized_name = normalize_tool_name(&call.name);
     let leaf = match normalized_name.as_str() {
         "read_file" => PreparedReadonlyLeaf::ReadFile(call.input.clone()),
@@ -91,7 +91,7 @@ fn prepare_readonly_invocation(
         }
     };
 
-    Ok(PreparedToolInvocation {
+    Ok(PreparedReadonlyLeafInvocation {
         call_id: format!("{}:prepared:{index}", context.turn_id),
         original_name: call.name.clone(),
         normalized_name: normalized_name.clone(),

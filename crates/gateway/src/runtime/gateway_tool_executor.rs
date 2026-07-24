@@ -715,7 +715,7 @@ impl ToolExecutor for GatewayToolExecutor {
         !self.available_tool_names().is_empty()
     }
 
-    fn describe_tool_effect(
+    fn registered_tool_effect(
         &self,
         tool_name: &str,
         input: &serde_json::Value,
@@ -725,6 +725,26 @@ impl ToolExecutor for GatewayToolExecutor {
                 .pin_snapshot()
                 .describe_effect(tool_name, input),
         )
+    }
+
+    fn prepare_governed_invocations(
+        &self,
+        requests: &[runtime::tool_dispatch::ToolRequest],
+    ) -> Vec<harness_contract::tool::GovernedToolInvocation> {
+        let lease = self.tool_host.pin_snapshot();
+        requests
+            .iter()
+            .map(|request| {
+                let input = serde_json::from_str::<serde_json::Value>(&request.input)
+                    .unwrap_or(serde_json::Value::Null);
+                lease.prepare_governed_invocation(
+                    request.tool_use_id.clone(),
+                    &request.tool_name,
+                    &input,
+                    &request.depends_on,
+                )
+            })
+            .collect()
     }
 
     fn execute_authorized(
@@ -784,7 +804,10 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         &self,
         request: &runtime::RuntimeToolExecutionRequest,
     ) -> runtime::RuntimeToolExecutionOutcome {
-        let evidence_ref = format!("gateway-tool:{}", request.tool_use_id);
+        let evidence_ref = format!(
+            "gateway-tool:{}:{}:{}",
+            request.governed_plan_id, request.governed_plan_revision, request.tool_use_id
+        );
         if request.evaluation_isolated && request.category != runtime::ToolSafetyCategory::ReadOnly
         {
             return runtime::RuntimeToolExecutionOutcome {

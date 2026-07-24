@@ -187,10 +187,10 @@ pub mod execution_core;
 pub mod execution_live;
 #[path = "projection/mod.rs"]
 pub mod execution_projection;
-#[path = "infrastructure/execution_scheduler.rs"]
-pub mod execution_scheduler;
 #[path = "context/fact_extraction.rs"]
 pub mod fact_extraction;
+#[path = "tooling/governed_tool_plan.rs"]
+pub mod governed_tool_plan;
 #[path = "session/input_classifier.rs"]
 pub mod input_classifier;
 #[path = "agent/intent_planner.rs"]
@@ -290,8 +290,8 @@ pub mod team_runtime;
 pub mod team_working_state;
 #[path = "tooling/tool_dispatch.rs"]
 pub mod tool_dispatch;
-#[path = "tooling/tool_execution_plan.rs"]
-pub mod tool_execution_plan;
+#[path = "tooling/tool_execution_plane.rs"]
+pub mod tool_execution_plane;
 #[path = "tooling/tool_host.rs"]
 pub mod tool_host;
 #[path = "tooling/tool_invocation.rs"]
@@ -417,7 +417,7 @@ pub use execution_core::{
     action_selection_report_for_decision, build_runtime_action_selection_report,
     build_runtime_execution_decision, execution_pattern_catalog_response, rewoo_plan_for_intent,
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
-    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
+    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_intents_from_rewoo,
     CrossPlaneRuntimeError, CrossPlaneRuntimeService, DeliberationMode, DeliberationPlan,
     ExecutionCommitService, ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphHost,
     ExecutionGraphHostReceipt, ExecutionGraphRunner, ExecutionGraphStateStore,
@@ -429,8 +429,9 @@ pub use execution_core::{
     RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, RuntimeServices,
     RuntimeServicesBuilder, RuntimeServicesError, SessionTerminalDeliveryPort,
     StrategyDecisionEngine, StrategyLease, StrategyResourceHealth, TaskLifecycleEvent,
-    TaskLifecycleKind, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,
-    ToolDagTask, TurnStrategyActualOutcome, TurnStrategyDecisionState, TurnStrategyDecisionStatus,
+    TaskLifecycleKind, ToolIntentDependency, ToolIntentDependencyKind, ToolIntentGraph,
+    ToolIntentNode, TurnStrategyActualOutcome, TurnStrategyDecisionState,
+    TurnStrategyDecisionStatus,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -491,6 +492,10 @@ pub use evolution::{
 };
 #[cfg(feature = "test-fixtures")]
 pub use execution_core::RuntimeFixtureEventPort;
+pub use governed_tool_plan::{
+    GovernedExecutionBatch, GovernedExecutionBatchMode, GovernedToolCompiler,
+    GovernedToolExecutionMode, GovernedToolPlan, GovernedToolPlanTask,
+};
 pub use harness_contract::turn::{
     InputRelationKind, InputRelationProposal, SessionDispatchAction, SessionDispatchCommand,
     SessionDispatchReceipt, SessionHandoff, SessionResultPacket,
@@ -687,7 +692,9 @@ pub use team_runtime::TeamRuntime;
 pub use team_working_state::{
     FocusOverlapAssessment, TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStateKind,
 };
-pub use tool_execution_plan::{ToolExecutionMode, ToolExecutionPlan, ToolExecutionPlanTask};
+pub use tool_execution_plane::{
+    ToolExecutionPlane, ToolExecutionPlaneError, ToolExecutionPlaneStats,
+};
 pub use tool_host::{
     RuntimeExecutionHost, RuntimeToolExecutionOutcome, RuntimeToolExecutionRequest,
     RuntimeToolExecutionStatus,

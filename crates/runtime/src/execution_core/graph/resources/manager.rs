@@ -139,6 +139,14 @@ pub enum ResourceAcquireError {
     },
     #[error("resource kind is not configured: {0:?}")]
     UnknownResource(ExecutionResourceKind),
+    #[error("resource demand {demand} exceeds {kind:?} maximum quota {maximum}")]
+    DemandExceedsQuota {
+        kind: ExecutionResourceKind,
+        demand: usize,
+        maximum: usize,
+    },
+    #[error("resource waiter registration was lost before acquisition")]
+    RegistrationLost,
     #[error("timed out waiting for resource {kind:?} after {waited_ms} ms")]
     TimedOut {
         kind: ExecutionResourceKind,
@@ -152,10 +160,21 @@ pub enum ResourceAcquireError {
 struct ResourceState {
     quota: ResourceQuota,
     effective_limit: usize,
-    active: HashMap<Uuid, Instant>,
-    waiters: VecDeque<Uuid>,
+    active: HashMap<Uuid, ActiveResourceDemand>,
     queue_wait_ms: VecDeque<u64>,
     run_ms: VecDeque<u64>,
+}
+
+#[derive(Debug)]
+struct ActiveResourceDemand {
+    started: Instant,
+    weight: usize,
+}
+
+#[derive(Debug)]
+struct PendingResourceDemand {
+    id: Uuid,
+    demands: Vec<(ExecutionResourceKind, usize)>,
 }
 
 const LATENCY_SAMPLE_CAPACITY: usize = 256;
@@ -163,6 +182,7 @@ const LATENCY_SAMPLE_CAPACITY: usize = 256;
 #[derive(Debug, Default)]
 struct ManagerState {
     resources: HashMap<ExecutionResourceKind, ResourceState>,
+    waiters: VecDeque<PendingResourceDemand>,
 }
 
 #[derive(Debug, Default)]
@@ -196,7 +216,6 @@ impl ExecutionResourceManager {
                         quota,
                         effective_limit: quota.target,
                         active: HashMap::new(),
-                        waiters: VecDeque::new(),
                         queue_wait_ms: VecDeque::new(),
                         run_ms: VecDeque::new(),
                     },
@@ -205,7 +224,10 @@ impl ExecutionResourceManager {
             .collect();
         Self {
             shared: Arc::new(Shared {
-                state: Mutex::new(ManagerState { resources }),
+                state: Mutex::new(ManagerState {
+                    resources,
+                    waiters: VecDeque::new(),
+                }),
                 adaptive: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
             }),
@@ -228,6 +250,7 @@ impl ExecutionResourceManager {
                 .state
                 .lock()
                 .map_err(|_| ResourceAcquireError::Poisoned)?;
+            let queued_waiters = queued_waiter_count(&guard.waiters, kind);
             let state = guard
                 .resources
                 .get_mut(kind)
@@ -236,7 +259,7 @@ impl ExecutionResourceManager {
             let desired =
                 state.quota.maximum - ((span as f32 * pressure.score()).round() as usize).min(span);
             state.effective_limit = desired.clamp(state.quota.minimum, state.quota.maximum);
-            snapshot_for(kind.clone(), state)
+            snapshot_for(kind.clone(), state, queued_waiters)
         };
         self.shared.changed.notify_waiters();
         Ok(snapshot)
@@ -322,13 +345,14 @@ impl ExecutionResourceManager {
                 .state
                 .lock()
                 .map_err(|_| ResourceAcquireError::Poisoned)?;
+            let queued_waiters = queued_waiter_count(&guard.waiters, kind);
             let state = guard
                 .resources
                 .get_mut(kind)
                 .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
             state.quota = quota;
             state.effective_limit = quota.target;
-            snapshot_for(kind.clone(), state)
+            snapshot_for(kind.clone(), state, queued_waiters)
         };
         self.shared.changed.notify_waiters();
         Ok(snapshot)
@@ -339,6 +363,20 @@ impl ExecutionResourceManager {
         kind: ExecutionResourceKind,
         timeout: Option<Duration>,
     ) -> Result<ExecutionResourceLease, ResourceAcquireError> {
+        self.acquire_bundle([(kind, 1)], timeout).await
+    }
+
+    /// Atomically acquires a weighted set of resource families.
+    ///
+    /// A waiter may bypass an earlier waiter only when their demand sets are
+    /// disjoint. This preserves FIFO fairness for contended resources without
+    /// serializing independent Provider, Agent, Tool, process, or network work.
+    pub async fn acquire_bundle(
+        &self,
+        demands: impl IntoIterator<Item = (ExecutionResourceKind, usize)>,
+        timeout: Option<Duration>,
+    ) -> Result<ExecutionResourceLease, ResourceAcquireError> {
+        let demands = normalize_demands(demands);
         let waiter_id = Uuid::new_v4();
         {
             let mut guard = self
@@ -346,16 +384,27 @@ impl ExecutionResourceManager {
                 .state
                 .lock()
                 .map_err(|_| ResourceAcquireError::Poisoned)?;
-            let state = guard
-                .resources
-                .get_mut(&kind)
-                .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
-            state.waiters.push_back(waiter_id);
+            for (kind, weight) in &demands {
+                let state = guard
+                    .resources
+                    .get(kind)
+                    .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
+                if *weight > state.quota.maximum {
+                    return Err(ResourceAcquireError::DemandExceedsQuota {
+                        kind: kind.clone(),
+                        demand: *weight,
+                        maximum: state.quota.maximum,
+                    });
+                }
+            }
+            guard.waiters.push_back(PendingResourceDemand {
+                id: waiter_id,
+                demands: demands.clone(),
+            });
         }
 
         let mut registration = WaiterRegistration {
             shared: Arc::clone(&self.shared),
-            kind: kind.clone(),
             waiter_id,
             active: true,
         };
@@ -369,15 +418,40 @@ impl ExecutionResourceManager {
                     .state
                     .lock()
                     .map_err(|_| ResourceAcquireError::Poisoned)?;
-                let state = guard
-                    .resources
-                    .get_mut(&kind)
-                    .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
-                let is_front = state.waiters.front().copied() == Some(waiter_id);
-                if is_front && state.active.len() < state.effective_limit {
-                    state.waiters.pop_front();
-                    observe_latency(&mut state.queue_wait_ms, duration_millis(started.elapsed()));
-                    state.active.insert(waiter_id, Instant::now());
+                let position = guard
+                    .waiters
+                    .iter()
+                    .position(|waiter| waiter.id == waiter_id)
+                    .ok_or(ResourceAcquireError::RegistrationLost)?;
+                let blocked_by_earlier_conflict = guard
+                    .waiters
+                    .iter()
+                    .take(position)
+                    .any(|earlier| demand_sets_overlap(&demands, &earlier.demands));
+                let has_capacity = demands.iter().all(|(kind, weight)| {
+                    guard.resources.get(kind).is_some_and(|state| {
+                        active_weight(state).saturating_add(*weight) <= state.effective_limit
+                    })
+                });
+                if !blocked_by_earlier_conflict && has_capacity {
+                    guard.waiters.remove(position);
+                    for (kind, weight) in &demands {
+                        let state = guard
+                            .resources
+                            .get_mut(kind)
+                            .expect("validated resource demand");
+                        observe_latency(
+                            &mut state.queue_wait_ms,
+                            duration_millis(started.elapsed()),
+                        );
+                        state.active.insert(
+                            waiter_id,
+                            ActiveResourceDemand {
+                                started: Instant::now(),
+                                weight: *weight,
+                            },
+                        );
+                    }
                     true
                 } else {
                     false
@@ -388,7 +462,7 @@ impl ExecutionResourceManager {
                 registration.active = false;
                 return Ok(ExecutionResourceLease {
                     shared: Arc::clone(&self.shared),
-                    kind,
+                    demands,
                     lease_id: waiter_id,
                     queue_wait: started.elapsed(),
                     released: false,
@@ -398,13 +472,13 @@ impl ExecutionResourceManager {
             if let Some(limit) = timeout {
                 let Some(remaining) = limit.checked_sub(started.elapsed()) else {
                     return Err(ResourceAcquireError::TimedOut {
-                        kind,
+                        kind: demands[0].0.clone(),
                         waited_ms: duration_millis(limit),
                     });
                 };
                 if tokio::time::timeout(remaining, notified).await.is_err() {
                     return Err(ResourceAcquireError::TimedOut {
-                        kind,
+                        kind: demands[0].0.clone(),
                         waited_ms: duration_millis(limit),
                     });
                 }
@@ -427,7 +501,11 @@ impl ExecutionResourceManager {
             .resources
             .get(kind)
             .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
-        Ok(snapshot_for(kind.clone(), state))
+        Ok(snapshot_for(
+            kind.clone(),
+            state,
+            queued_waiter_count(&guard.waiters, kind),
+        ))
     }
 
     pub fn snapshots(&self) -> Result<Vec<ExecutionResourceSnapshot>, ResourceAcquireError> {
@@ -439,7 +517,13 @@ impl ExecutionResourceManager {
         let mut snapshots = guard
             .resources
             .iter()
-            .map(|(kind, state)| snapshot_for(kind.clone(), state))
+            .map(|(kind, state)| {
+                snapshot_for(
+                    kind.clone(),
+                    state,
+                    queued_waiter_count(&guard.waiters, kind),
+                )
+            })
             .collect::<Vec<_>>();
         snapshots
             .sort_by(|left, right| format!("{:?}", left.kind).cmp(&format!("{:?}", right.kind)));
@@ -449,7 +533,7 @@ impl ExecutionResourceManager {
 
 pub struct ExecutionResourceLease {
     shared: Arc<Shared>,
-    kind: ExecutionResourceKind,
+    demands: Vec<(ExecutionResourceKind, usize)>,
     lease_id: Uuid,
     queue_wait: Duration,
     released: bool,
@@ -461,7 +545,12 @@ impl ExecutionResourceLease {
     }
 
     pub fn kind(&self) -> &ExecutionResourceKind {
-        &self.kind
+        &self.demands[0].0
+    }
+
+    #[must_use]
+    pub fn demands(&self) -> &[(ExecutionResourceKind, usize)] {
+        &self.demands
     }
 
     #[must_use]
@@ -478,9 +567,14 @@ impl ExecutionResourceLease {
             return;
         }
         if let Ok(mut guard) = self.shared.state.lock() {
-            if let Some(state) = guard.resources.get_mut(&self.kind) {
-                if let Some(started) = state.active.remove(&self.lease_id) {
-                    observe_latency(&mut state.run_ms, duration_millis(started.elapsed()));
+            for (kind, _) in &self.demands {
+                if let Some(state) = guard.resources.get_mut(kind) {
+                    if let Some(active) = state.active.remove(&self.lease_id) {
+                        observe_latency(
+                            &mut state.run_ms,
+                            duration_millis(active.started.elapsed()),
+                        );
+                    }
                 }
             }
         }
@@ -497,7 +591,6 @@ impl Drop for ExecutionResourceLease {
 
 struct WaiterRegistration {
     shared: Arc<Shared>,
-    kind: ExecutionResourceKind,
     waiter_id: Uuid,
     active: bool,
 }
@@ -508,26 +601,68 @@ impl Drop for WaiterRegistration {
             return;
         }
         if let Ok(mut guard) = self.shared.state.lock() {
-            if let Some(state) = guard.resources.get_mut(&self.kind) {
-                state.waiters.retain(|id| *id != self.waiter_id);
-            }
+            guard.waiters.retain(|waiter| waiter.id != self.waiter_id);
         }
         self.shared.changed.notify_waiters();
     }
 }
 
-fn snapshot_for(kind: ExecutionResourceKind, state: &ResourceState) -> ExecutionResourceSnapshot {
+fn snapshot_for(
+    kind: ExecutionResourceKind,
+    state: &ResourceState,
+    queued_waiters: usize,
+) -> ExecutionResourceSnapshot {
     ExecutionResourceSnapshot {
-        kind,
+        kind: kind.clone(),
         minimum: state.quota.minimum,
         target: state.quota.target,
         maximum: state.quota.maximum,
         effective_limit: state.effective_limit,
-        active_leases: state.active.len(),
-        queued_waiters: state.waiters.len(),
+        active_leases: active_weight(state),
+        queued_waiters,
         queue_wait: latency_snapshot(&state.queue_wait_ms),
         run: latency_snapshot(&state.run_ms),
     }
+}
+
+fn queued_waiter_count(
+    waiters: &VecDeque<PendingResourceDemand>,
+    kind: &ExecutionResourceKind,
+) -> usize {
+    waiters
+        .iter()
+        .filter(|waiter| waiter.demands.iter().any(|(demand, _)| demand == kind))
+        .count()
+}
+
+fn active_weight(state: &ResourceState) -> usize {
+    state.active.values().map(|active| active.weight).sum()
+}
+
+fn normalize_demands(
+    demands: impl IntoIterator<Item = (ExecutionResourceKind, usize)>,
+) -> Vec<(ExecutionResourceKind, usize)> {
+    let mut normalized = HashMap::<ExecutionResourceKind, usize>::new();
+    for (kind, weight) in demands {
+        if weight > 0 {
+            let entry = normalized.entry(kind).or_default();
+            *entry = entry.saturating_add(weight);
+        }
+    }
+    let mut normalized = normalized.into_iter().collect::<Vec<_>>();
+    normalized.sort_by(|left, right| format!("{:?}", left.0).cmp(&format!("{:?}", right.0)));
+    if normalized.is_empty() {
+        normalized.push((ExecutionResourceKind::Tool, 1));
+    }
+    normalized
+}
+
+fn demand_sets_overlap(
+    left: &[(ExecutionResourceKind, usize)],
+    right: &[(ExecutionResourceKind, usize)],
+) -> bool {
+    left.iter()
+        .any(|(left, _)| right.iter().any(|(right, _)| left == right))
 }
 
 fn observe_latency(values: &mut VecDeque<u64>, value: u64) {
@@ -719,6 +854,73 @@ mod tests {
                 .queued_waiters,
             0
         );
+    }
+
+    #[tokio::test]
+    async fn bundle_acquisition_is_atomic_across_resource_families() {
+        let process = ExecutionResourceKind::Custom("tool.process".to_string());
+        let manager = ExecutionResourceManager::new([
+            (
+                ExecutionResourceKind::Tool,
+                ResourceQuota::new(1, 2, 2).unwrap(),
+            ),
+            (process.clone(), ResourceQuota::new(1, 1, 1).unwrap()),
+        ]);
+        let first = manager
+            .acquire_bundle(
+                [(ExecutionResourceKind::Tool, 1), (process.clone(), 1)],
+                None,
+            )
+            .await
+            .unwrap();
+        let waiting = {
+            let manager = manager.clone();
+            let process = process.clone();
+            tokio::spawn(async move {
+                manager
+                    .acquire_bundle(
+                        [(ExecutionResourceKind::Tool, 1), (process, 1)],
+                        Some(Duration::from_secs(1)),
+                    )
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Tool)
+                .unwrap()
+                .active_leases,
+            1,
+            "blocked bundles must not reserve a partial Tool lease"
+        );
+        drop(first);
+        assert!(waiting.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn disjoint_waiter_can_bypass_without_starving_contended_fifo() {
+        let tool = ExecutionResourceKind::Tool;
+        let network = ExecutionResourceKind::Custom("tool.network".to_string());
+        let manager = ExecutionResourceManager::new([
+            (tool.clone(), ResourceQuota::new(1, 1, 1).unwrap()),
+            (network.clone(), ResourceQuota::new(1, 1, 1).unwrap()),
+        ]);
+        let occupied = manager.acquire(tool.clone(), None).await.unwrap();
+        let blocked = {
+            let manager = manager.clone();
+            let tool = tool.clone();
+            tokio::spawn(async move { manager.acquire(tool, None).await })
+        };
+        tokio::task::yield_now().await;
+        let disjoint = manager
+            .acquire(network, Some(Duration::from_millis(100)))
+            .await
+            .expect("disjoint resource may bypass");
+        assert!(!blocked.is_finished());
+        drop(disjoint);
+        drop(occupied);
+        assert!(blocked.await.unwrap().is_ok());
     }
 
     #[tokio::test]

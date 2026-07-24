@@ -872,7 +872,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         }
     }
 
-    fn describe_tool_effect(
+    fn registered_tool_effect(
         &self,
         tool_name: &str,
         input: &serde_json::Value,
@@ -941,11 +941,15 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     fn classify_tool_safety(
         &self,
         tool_name: &str,
-        _input: &str,
+        input: &str,
     ) -> Option<crate::ToolSafetyCategory> {
-        self.allowed_tools
-            .contains(tool_name)
-            .then(|| crate::ToolSafetyCategory::from_tool_name(tool_name))
+        if !self.allowed_tools.contains(tool_name) {
+            return None;
+        }
+        let input = serde_json::from_str::<serde_json::Value>(input).ok()?;
+        self.host
+            .delegated_tool_effect_descriptor(tool_name, &input)
+            .map(|effect| crate::ToolSafetyCategory::from_effect(&effect))
     }
 }
 
@@ -997,6 +1001,8 @@ impl ScopedRuntimeToolExecutor {
             ));
         }
         let request = RuntimeToolExecutionRequest {
+            governed_plan_id: self.execution_id.clone(),
+            governed_plan_revision: 1,
             idempotency_key: authorization
                 .idempotency_key
                 .clone()
@@ -1061,11 +1067,7 @@ impl ScopedRuntimeToolExecutor {
                 "tool `{tool_name}` cannot prove a bounded Team resource scope"
             )));
         }
-        let requested = crate::tool_execution_plan::resource_scope_for_tool_request(
-            tool_name,
-            &input,
-            crate::ToolSafetyCategory::from_tool_name(tool_name),
-        );
+        let requested = crate::governed_tool_plan::resource_scope_from_effect(&descriptor);
         if requested.network {
             return allowed_scopes
                 .iter()
@@ -1108,11 +1110,7 @@ impl ScopedRuntimeToolExecutor {
             .host
             .delegated_tool_effect_descriptor(tool_name, &parsed_input)
             .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
-        let requested = crate::tool_execution_plan::resource_scope_for_tool_request(
-            tool_name,
-            &parsed_input,
-            crate::ToolSafetyCategory::from_tool_name(tool_name),
-        );
+        let requested = crate::governed_tool_plan::resource_scope_from_effect(&descriptor);
         let sequence = self
             .next_receipt_sequence
             .fetch_add(1, Ordering::SeqCst)
@@ -1137,11 +1135,13 @@ impl ScopedRuntimeToolExecutor {
                 )
             });
         let request = RuntimeToolExecutionRequest {
+            governed_plan_id: self.execution_id.clone(),
+            governed_plan_revision: sequence,
             idempotency_key,
             tool_use_id: format!("agent-tool:{}", uuid::Uuid::new_v4()),
             tool_name: tool_name.to_string(),
             input: input.to_string(),
-            category: crate::ToolSafetyCategory::from_tool_name(tool_name),
+            category: crate::ToolSafetyCategory::from_effect(&descriptor),
             authorization,
             session_id: Some(self.session_id.clone()),
             model_lease: Some(self.model_lease.clone()),
@@ -1212,17 +1212,11 @@ fn normalize_workspace_internal_resource_paths(
 /// authorization descriptor without treating the safe relative rewrite as a
 /// stale or escalated effect.
 fn normalize_workspace_internal_resource_value(
-    tool_name: &str,
+    _tool_name: &str,
     mut parsed: serde_json::Value,
     workspace_root: &std::path::Path,
 ) -> serde_json::Value {
-    let requested = crate::tool_execution_plan::resource_scope_for_tool_request(
-        tool_name,
-        &parsed,
-        crate::ToolSafetyCategory::from_tool_name(tool_name),
-    );
-    let replacements = requested
-        .paths
+    let replacements = resource_paths_from_input(&parsed)
         .iter()
         .filter_map(|path| {
             let absolute = std::path::Path::new(path);
@@ -1263,6 +1257,35 @@ fn normalize_workspace_internal_resource_value(
 
     rewrite(&mut parsed, &replacements);
     parsed
+}
+
+fn resource_paths_from_input(input: &serde_json::Value) -> Vec<String> {
+    fn collect(value: &serde_json::Value, paths: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if matches!(key.as_str(), "path" | "file" | "file_path") {
+                        if let Some(path) = value.as_str() {
+                            paths.push(path.trim().replace('\\', "/"));
+                        }
+                    } else {
+                        collect(value, paths);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, paths);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut paths = Vec::new();
+    collect(input, &mut paths);
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn workspace_file_sha256(workspace_root: &std::path::Path, relative: &str) -> Option<String> {
@@ -2112,9 +2135,9 @@ mod tests {
         fn delegated_tool_effect_descriptor(
             &self,
             tool_name: &str,
-            _input: &serde_json::Value,
+            input: &serde_json::Value,
         ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-            test_tool_descriptor(tool_name)
+            test_tool_descriptor_for_input(tool_name, input)
         }
     }
 
@@ -2150,9 +2173,9 @@ mod tests {
         fn delegated_tool_effect_descriptor(
             &self,
             tool_name: &str,
-            _input: &serde_json::Value,
+            input: &serde_json::Value,
         ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-            test_tool_descriptor(tool_name)
+            test_tool_descriptor_for_input(tool_name, input)
         }
     }
 
@@ -2163,7 +2186,7 @@ mod tests {
             tool_name: &str,
             input: &serde_json::Value,
         ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-            let mut descriptor = test_tool_descriptor(tool_name)?;
+            let mut descriptor = test_tool_descriptor_for_input(tool_name, input)?;
             let encoded = serde_json::to_vec(input).ok()?;
             descriptor.descriptor_hash = format!("input:{:x}", Sha256::digest(encoded));
             Some(descriptor)
@@ -2209,8 +2232,9 @@ mod tests {
         }
     }
 
-    fn test_tool_descriptor(
+    fn test_tool_descriptor_for_input(
         tool_name: &str,
+        input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
         use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
         use harness_contract::tool::{
@@ -2236,7 +2260,15 @@ mod tests {
             descriptor_hash: format!("test-host:{tool_name}"),
             effect_kind,
             idempotency: ToolIdempotency::Idempotent,
-            scopes: vec![PermissionScope::new(PermissionResource::File, operation)],
+            scopes: vec![PermissionScope {
+                resource: PermissionResource::File,
+                operation,
+                target: input
+                    .get("path")
+                    .or_else(|| input.get("file_path"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            }],
             required_permission,
             approval_class: ToolApprovalClass::None,
             uses_network: false,
@@ -2412,7 +2444,11 @@ mod tests {
             .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
             .is_err());
 
-        let descriptor = test_tool_descriptor("read_file").expect("read descriptor");
+        let descriptor = test_tool_descriptor_for_input(
+            "read_file",
+            &serde_json::json!({"path": "crates/runtime/src/lib.rs"}),
+        )
+        .expect("read descriptor");
         let authorization = harness_contract::tool::ToolExecutionAuthorization {
             request_id: "absolute-read".into(),
             tool_id: "read_file".into(),
@@ -2458,7 +2494,7 @@ mod tests {
         };
         let absolute_value = serde_json::json!({"path": target});
         let descriptor = executor
-            .describe_tool_effect("read_file", &absolute_value)
+            .registered_tool_effect("read_file", &absolute_value)
             .expect("normalized effect descriptor");
         let authorization = crate::ToolPolicy
             .authorize(
@@ -2591,7 +2627,7 @@ mod tests {
             receipts: Mutex::new(Vec::new()),
         };
         let descriptor = executor
-            .describe_tool_effect("checkpoint_create", &serde_json::json!({"label": "guard"}))
+            .registered_tool_effect("checkpoint_create", &serde_json::json!({"label": "guard"}))
             .expect("Runtime guard must see the hidden checkpoint descriptor");
         let authorization = crate::ToolPolicy
             .authorize(
@@ -2679,7 +2715,7 @@ mod tests {
             receipts: Mutex::new(Vec::new()),
         };
         let descriptor = executor
-            .describe_tool_effect("read_file", &serde_json::json!({"path": "README.md"}))
+            .registered_tool_effect("read_file", &serde_json::json!({"path": "README.md"}))
             .expect("allow-listed delegated tool must describe its effect");
         let authorization = crate::ToolPolicy
             .authorize(&descriptor, "agent-test", PermissionMode::ReadOnly, 30)

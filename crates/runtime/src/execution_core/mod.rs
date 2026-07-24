@@ -21,7 +21,7 @@ pub mod rewoo_plan;
 pub mod safety_fuse;
 pub mod services;
 pub mod strategy_decision;
-pub mod tool_dag;
+pub mod tool_intents;
 
 pub use cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 pub use deliberation::{DeliberationMode, DeliberationPlan};
@@ -76,7 +76,7 @@ pub use strategy_decision::{
     StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome, TurnStrategyDecisionState,
     TurnStrategyDecisionStatus,
 };
-pub use tool_dag::{
-    tool_dag_from_rewoo, ToolDagEdge, ToolDagEdgeKind, ToolDagPlan, ToolDagSafetySummary,
-    ToolDagTask,
+pub use tool_intents::{
+    tool_intents_from_rewoo, ToolIntentDependency, ToolIntentDependencyKind, ToolIntentGraph,
+    ToolIntentNode,
 };

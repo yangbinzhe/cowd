@@ -12,7 +12,7 @@ use crate::execution_core::ProtocolRegistry;
 use crate::execution_core::{
     action_selection_report_for_decision, build_runtime_execution_decision,
     execution_pattern_catalog_response, rewoo_plan_for_intent_with_evidence_plan,
-    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_dag_from_rewoo,
+    runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_intents_from_rewoo,
     RuntimeExecutionDecision,
 };
 
@@ -208,7 +208,7 @@ impl RuntimeCapabilityCatalog {
                             "Batch independent read-only tools and serialize write/destructive tools.",
                             "Several evidence items can be gathered independently.",
                             "Tool safety classes and dependency edges determine the schedule.",
-                            &["tool_dag", "schedule", "tool_evidence_refs"],
+                            &["tool_intents", "schedule", "tool_evidence_refs"],
                         ),
                         operation(
                             "continue_single",
@@ -269,7 +269,7 @@ impl RuntimeCapabilityCatalog {
                     "request_parallel_tools",
                     "Independent read-only evidence can be gathered faster as a scheduler batch.",
                     &["intent", "capabilities optional"],
-                    &["tool_dag", "schedule"],
+                    &["tool_intents", "schedule"],
                 ),
                 action_contract(
                     "ask_approval",
@@ -510,7 +510,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     let action_selection =
         action_selection_report_for_decision(&execution_decision, context_profile);
     let rewoo_plan = rewoo_plan_for_intent_with_evidence_plan(intent, evidence_plan.clone());
-    let tool_dag = tool_dag_from_rewoo(&rewoo_plan);
+    let tool_intents = tool_intents_from_rewoo(&rewoo_plan);
     let requested_detail = detail.map(str::trim).filter(|value| !value.is_empty());
     let detail_value = requested_detail
         .filter(|value| CAPABILITY_DETAILS.contains(value))
@@ -594,7 +594,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
             "prefer_batch_readonly": true,
             "prefer_full_or_batch_read_for_small_docs": true,
             "model_callable_tools": model_callable_tools,
-            "runtime_owned_affordances": ["execution_patterns", "rewoo_evidence", "tool_dag", "subagent", "team", "mission", "session", "verification", "deliberation", "reflexion"],
+            "runtime_owned_affordances": ["execution_patterns", "rewoo_evidence", "tool_intents", "subagent", "team", "mission", "session", "verification", "deliberation", "reflexion"],
             "runtime_orchestrate_is_stateful": true,
             "use_or_request_subagents_for_independent_domains": true,
             "avoid_repeated_overlapping_reads": true,
@@ -604,7 +604,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         "advanced_execution": {
             "available_on_detail": "orchestration_options",
             "rewoo_available": true,
-            "tool_dag_available": true,
+            "tool_intents_available": true,
         }
     });
 
@@ -637,7 +637,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
                 .collect();
             response["advanced_execution"] = json!({
                 "rewoo_candidate": rewoo_plan,
-                "tool_dag_candidate": tool_dag,
+                "tool_intents_candidate": tool_intents,
                 "action_plane": action_plane,
                 "orchestration_summary": {
                     "team_templates": team_template_compact,

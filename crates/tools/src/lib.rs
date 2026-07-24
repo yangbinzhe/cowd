@@ -28,7 +28,7 @@ pub(crate) fn test_process_environment_lock() -> &'static std::sync::Mutex<()> {
 }
 
 // Re-exports from split modules
-pub use tool_specs::{mvp_tool_specs, ToolSpec};
+pub use tool_specs::{builtin_effect_resolver_spec, mvp_tool_specs, ToolSpec};
 pub(crate) use tool_specs::{normalize_tool_name, permission_mode_from_plugin};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -328,6 +328,28 @@ impl ToolCatalog {
             .find_map(|(candidate, permission)| {
                 (candidate == name).then_some(kernel_permission_mode(permission))
             })
+    }
+
+    #[must_use]
+    pub fn effect_resolver(&self, name: &str) -> harness_contract::tool::ToolEffectResolverSpec {
+        if mvp_tool_specs().iter().any(|spec| spec.name == name) {
+            return builtin_effect_resolver_spec(name);
+        }
+        let source = if self.has_runtime_tool(name) {
+            "runtime"
+        } else if self
+            .plugin_tools
+            .iter()
+            .any(|tool| tool.definition().name == name)
+        {
+            "plugin"
+        } else {
+            "unregistered"
+        };
+        harness_contract::tool::ToolEffectResolverSpec {
+            resolver_id: format!("{source}.unknown"),
+            resolver_version: 1,
+        }
     }
 
     #[must_use]

@@ -6,7 +6,7 @@
 use crate::agent::{AgentExecutorKind, AgentSpec};
 use crate::context::ContextEpoch;
 use crate::strategy::StrategyDecision;
-use crate::tool::ToolTransactionPlan;
+use crate::tool::GovernedToolPlanProjection;
 use crate::verification::VerificationReport;
 use serde::{Deserialize, Serialize};
 
@@ -27,7 +27,7 @@ pub struct HarnessTurnInput {
     pub agent_spec: AgentSpec,
     pub strategy: StrategyDecision,
     pub context_epoch: ContextEpoch,
-    pub tool_plan: Option<ToolTransactionPlan>,
+    pub governed_tool_plans: Vec<GovernedToolPlanProjection>,
     pub policy_context: Vec<String>,
 }
 
@@ -38,7 +38,7 @@ pub struct HarnessTurnReceipt {
     pub agent_spec_id: String,
     pub strategy_pattern: String,
     pub context_epoch_id: String,
-    pub tool_transaction_id: Option<String>,
+    pub governed_tool_plan_ids: Vec<String>,
     pub verification_can_finalize: bool,
     pub policy_receipts: Vec<String>,
     pub output_summary: String,
@@ -69,7 +69,7 @@ impl HarnessAdapter for CowdNativeHarness {
             executor_kind: AgentExecutorKind::CowdNative,
             capabilities: vec![
                 "runtime_ai_kernel".to_string(),
-                "tool_transaction".to_string(),
+                "governed_tool_execution".to_string(),
                 "verification".to_string(),
                 "growth_trace".to_string(),
             ],
@@ -98,7 +98,11 @@ impl HarnessAdapter for CowdNativeHarness {
             agent_spec_id: input.agent_spec.id,
             strategy_pattern: input.strategy.pattern.as_str().to_string(),
             context_epoch_id: input.context_epoch.epoch_id,
-            tool_transaction_id: input.tool_plan.map(|plan| plan.id),
+            governed_tool_plan_ids: input
+                .governed_tool_plans
+                .into_iter()
+                .map(|plan| plan.plan_id)
+                .collect(),
             verification_can_finalize: verification.can_finalize,
             policy_receipts: input.policy_context,
             output_summary: output_summary.into(),

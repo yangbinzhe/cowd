@@ -73,8 +73,8 @@ impl PolicyReceipt {
 }
 
 #[must_use]
-pub fn tool_transaction_policy_receipts(
-    transaction_id: Option<&str>,
+pub fn governed_tool_policy_receipts(
+    plan_ids: &[String],
     requires_checkpoint: bool,
     requires_human_confirm: bool,
 ) -> Vec<PolicyReceipt> {
@@ -84,16 +84,20 @@ pub fn tool_transaction_policy_receipts(
     } else {
         PolicyDecisionKind::Allow
     };
-    let mut receipt = PolicyReceipt::new(PolicyScope::Tool, decision, "tool_transaction_policy");
-    if let Some(transaction_id) = transaction_id {
-        receipt = receipt.with_evidence_ref(format!("tool_transaction:{transaction_id}"));
+    let mut receipt = PolicyReceipt::new(
+        PolicyScope::Tool,
+        decision,
+        "governed_tool_execution_policy",
+    );
+    for plan_id in plan_ids {
+        receipt = receipt.with_evidence_ref(format!("governed_tool_plan:{plan_id}"));
     }
     if requires_human_confirm {
         receipt = receipt.with_reason("critical tool path requires human confirmation");
     } else if requires_checkpoint {
         receipt = receipt.with_reason("write path requires checkpoint receipt");
     } else {
-        receipt = receipt.with_reason("tool transaction is allowed by current policy");
+        receipt = receipt.with_reason("governed tool execution is allowed by current policy");
     }
     receipts.push(receipt);
     receipts
@@ -175,10 +179,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn critical_tool_transaction_maps_to_ask() {
-        let receipts = tool_transaction_policy_receipts(Some("tx-1"), true, true);
+    fn critical_governed_tool_plan_maps_to_ask() {
+        let receipts = governed_tool_policy_receipts(&["plan-1".to_string()], true, true);
         assert_eq!(receipts[0].decision, PolicyDecisionKind::Ask);
-        assert!(receipts[0].evidence_refs[0].contains("tx-1"));
+        assert!(receipts[0].evidence_refs[0].contains("plan-1"));
     }
 
     #[test]
