@@ -37,6 +37,7 @@ SESSION_STREAM_PID=""
 WEBUI_STREAM_PID=""
 declare -A TUI_SCREEN=()
 declare -A TUI_DRIVER_PID=()
+declare -A TUI_UTF8_LOG=()
 
 auth_curl() {
   command curl -fsS -H "Authorization: Bearer $TOKEN" "$@"
@@ -89,6 +90,33 @@ capture() {
   screen -S "$session" -X hardcopy -h "$ARTIFACT_DIR/$name.txt" \
     >/dev/null 2>&1
   [[ -f "$ARTIFACT_DIR/$name.txt" ]]
+}
+
+capture_utf8() {
+  local target="$1"
+  local name="$2"
+  local session="${TUI_SCREEN[$target]:-}"
+  local log_path="${TUI_UTF8_LOG[$target]:-}"
+  [[ -n "$session" && -n "$log_path" && -f "$log_path" ]] || return 1
+  screen -S "$session" -X logfile flush 0 >/dev/null 2>&1 || return 1
+  python3 - "$log_path" "$ARTIFACT_DIR/$name.txt" <<'PY'
+import pathlib
+import re
+import sys
+
+raw = pathlib.Path(sys.argv[1]).read_bytes().decode("utf-8", errors="replace")
+raw = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", raw)
+raw = re.sub(r"\x1b[P^_].*?\x1b\\", "", raw, flags=re.DOTALL)
+raw = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw)
+raw = re.sub(r"\x1b[@-_]", "", raw)
+text = "".join(
+    character
+    if character in "\n\r\t" or ord(character) >= 32
+    else " "
+    for character in raw
+)
+pathlib.Path(sys.argv[2]).write_text(text.replace("\r", "\n"), encoding="utf-8")
+PY
 }
 
 wait_capture() {
@@ -192,12 +220,15 @@ start_tui() {
   local height="$5"
   local screen_name="$SCREEN_PREFIX-$target"
   local driver_log="$ARTIFACT_DIR/$target-screen-driver.log"
+  local utf8_log="$ARTIFACT_DIR/$target-screen-utf8.log"
   [[ -z "${TUI_SCREEN[$target]:-}" ]] \
     || fail "TUI PTY target $target is already active"
   (
     cd "$WORKSPACE"
     exec screen \
       -D -m \
+      -L \
+      -Logfile "$utf8_log" \
       -S "$screen_name" \
       -c /dev/null \
       -T xterm-256color \
@@ -215,8 +246,10 @@ start_tui() {
   ) >>"$driver_log" 2>&1 &
   TUI_SCREEN["$target"]="$screen_name"
   TUI_DRIVER_PID["$target"]=$!
+  TUI_UTF8_LOG["$target"]="$utf8_log"
   for _ in {1..80}; do
     if screen -S "$screen_name" -Q windows >/dev/null 2>&1; then
+      screen -S "$screen_name" -X logfile flush 0 >/dev/null 2>&1
       screen -S "$screen_name" -X width "$width" "$height" \
         >/dev/null 2>&1
       return 0
@@ -277,6 +310,7 @@ stop_tui() {
   wait "$pid" >/dev/null 2>&1 || true
   unset 'TUI_SCREEN[$target]'
   unset 'TUI_DRIVER_PID[$target]'
+  unset 'TUI_UTF8_LOG[$target]'
 }
 
 send_prompt() {
@@ -383,7 +417,9 @@ rg -q '0\.9\.584' "$ARTIFACT_DIR/boot.txt" \
   || fail "writer TUI did not render version 0.9.584"
 rg -q 'idle|ready' "$ARTIFACT_DIR/boot.txt" \
   || fail "writer TUI did not expose an idle/ready state"
-rg -q 'ctx[[:space:]]+—|context[[:space:]]+—' "$ARTIFACT_DIR/boot.txt" \
+capture_utf8 writer boot-utf8 \
+  || fail "writer TUI UTF-8 transcript could not be captured"
+rg -q 'ctx[[:space:]]+—|context[[:space:]]+—' "$ARTIFACT_DIR/boot-utf8.txt" \
   || fail "unknown new-session context metric was not rendered as —"
 send_raw writer $'\020'
 wait_capture writer ' Command Palette ' boot-palette \
@@ -512,6 +548,8 @@ wait_message "$SESSION_A" "V584-SLOW-END" \
   || fail "slow streaming response did not complete"
 wait_capture writer 'V584-SLOW-END' slow-complete \
   || fail "slow streaming completion was not rendered"
+capture_utf8 writer slow-complete-utf8 \
+  || fail "slow completion UTF-8 transcript could not be captured"
 auth_curl "$BASE_URL/api/sessions/$SESSION_A/execution" \
   >"$ARTIFACT_DIR/slow-execution-index.json"
 slow_execution_id="$(
@@ -531,7 +569,7 @@ rg -q "$MODEL" "$ARTIFACT_DIR/slow-complete.txt" \
   || fail "effective model disappeared after a real turn"
 python3 - \
   "$ARTIFACT_DIR/slow-execution-projection.json" \
-  "$ARTIFACT_DIR/slow-complete.txt" \
+  "$ARTIFACT_DIR/slow-complete-utf8.txt" \
   "$MODEL" <<'PY'
 import json
 import sys
@@ -768,13 +806,15 @@ wait_message "$SESSION_A" "V584-DSML-TOOL-COMPLETE" \
   || fail "valid DSML did not become a real tool call followed by a terminal answer"
 wait_capture writer 'V584-DSML-TOOL-COMPLETE' valid-dsml \
   || fail "valid DSML tool completion was not rendered"
+capture_utf8 writer valid-dsml-utf8 \
+  || fail "valid DSML UTF-8 transcript could not be captured"
 message_page "$SESSION_A" "$ARTIFACT_DIR/valid-dsml-messages.json"
 auth_curl "$BASE_URL/api/sessions/$SESSION_A/projection" \
   >"$ARTIFACT_DIR/valid-dsml-projection.json"
 python3 - \
   "$ARTIFACT_DIR/valid-dsml-messages.json" \
   "$ARTIFACT_DIR/valid-dsml-projection.json" \
-  "$ARTIFACT_DIR/valid-dsml.txt" <<'PY'
+  "$ARTIFACT_DIR/valid-dsml-utf8.txt" <<'PY'
 import json
 import re
 import sys
