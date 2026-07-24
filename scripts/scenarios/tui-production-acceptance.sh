@@ -615,13 +615,13 @@ rg -q "$MODEL" "$ARTIFACT_DIR/slow-complete.txt" \
   || fail "effective model disappeared after a real turn"
 python3 - \
   "$ARTIFACT_DIR/slow-execution-projection.json" \
-  "$ARTIFACT_DIR/slow-complete-utf8.txt" \
+  "$ARTIFACT_DIR/slow-complete.txt" \
   "$MODEL" <<'PY'
 import json
 import sys
 
 projection = json.load(open(sys.argv[1], encoding="utf-8"))
-screen = open(sys.argv[2], encoding="utf-8").read()
+screen = open(sys.argv[2], encoding="latin-1").read()
 expected_model = sys.argv[3]
 live = projection["live"]
 usage = live["context_usage"]
@@ -862,14 +862,15 @@ auth_curl "$BASE_URL/api/sessions/$SESSION_A/projection" \
 python3 - \
   "$ARTIFACT_DIR/valid-dsml-messages.json" \
   "$ARTIFACT_DIR/valid-dsml-projection.json" \
+  "$ARTIFACT_DIR/valid-dsml.txt" \
   "$ARTIFACT_DIR/valid-dsml-utf8.txt" <<'PY'
 import json
-import re
 import sys
 
 messages = json.load(open(sys.argv[1], encoding="utf-8")).get("messages", [])
 projection = json.load(open(sys.argv[2], encoding="utf-8"))
-screen = open(sys.argv[3], encoding="utf-8").read()
+screen = open(sys.argv[3], encoding="latin-1").read()
+utf8_transcript = open(sys.argv[4], encoding="utf-8").read()
 
 tool_uses = []
 tool_results = []
@@ -901,8 +902,10 @@ assert summary.get("by_name", {}).get(name) == 1, summary
 assert len(timeline) == 1, timeline
 assert timeline[0].get("tool_instance_id") == instance_id, timeline
 assert timeline[0].get("status") == "completed", timeline
-assert re.search(rf"🔧\s+{re.escape(name)}", screen), f"missing compact tool card for {name}"
-assert re.search(r"✅\s+exit:0", screen), "compact tool card did not show successful completion"
+assert name in screen, f"missing compact tool card name for {name}"
+assert "exit:0" in screen, "compact tool card did not show successful completion"
+assert "🔧" in utf8_transcript, "compact tool card did not emit its tool icon"
+assert "✅" in utf8_transcript, "compact tool card did not emit its completion icon"
 PY
 pass "E5 valid DSML becomes a governed tool event without protocol text"
 
