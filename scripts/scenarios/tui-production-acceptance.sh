@@ -1228,7 +1228,15 @@ SELECT
   1,
   NULL,
   NULL,
-  json_object('input_tokens', 50, 'output_tokens', 50, 'total_tokens', 100),
+  CASE
+    WHEN n % 2 = 1 THEN json_object(
+      'input_tokens', 50,
+      'output_tokens', 50,
+      'cache_creation_input_tokens', 0,
+      'cache_read_input_tokens', 0
+    )
+    ELSE NULL
+  END,
   1700000000000 + n
 FROM seq;
 SQL
