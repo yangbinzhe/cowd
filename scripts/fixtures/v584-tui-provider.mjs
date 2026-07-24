@@ -96,6 +96,18 @@ function responseFor(messages, tools) {
         finishReason: "stop",
       };
     }
+    if (teamRole === "synthesizer") {
+      return {
+        chunks: [
+          JSON.stringify({
+            summary: "three bounded Team focuses were executed and synthesized",
+            evidence: ["checked Team child receipts"],
+            unresolved: ["none in deterministic acceptance scope"],
+          }),
+        ],
+        finishReason: "stop",
+      };
+    }
     if (
       latest.startsWith("Original objective:")
       && latest.includes("Checked evidence receipts:")
