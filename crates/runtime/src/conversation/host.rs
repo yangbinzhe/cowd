@@ -130,8 +130,9 @@ where
         let system_prompt = canonical_host_system_prompt(config.system_prompt);
         let mut runtime = crate::ConversationRuntime::new_with_features(
             config.session,
-            ProviderRuntimeClient::new(
+            ProviderRuntimeClient::new_with_transport_pool(
                 Arc::clone(&config.provider_registry),
+                Arc::clone(services.provider_transport_pool()),
                 active_model.clone(),
                 config.tool_definitions,
             )?
@@ -641,7 +642,6 @@ where
             next_resource_scopes: Vec::new(),
             assistant_messages: Vec::new(),
             tool_results: Vec::new(),
-            prompt_cache_events: Vec::new(),
             iterations: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -2523,7 +2523,6 @@ struct TurnGraphState {
     next_resource_scopes: Vec<String>,
     assistant_messages: Vec<ConversationMessage>,
     tool_results: Vec<ConversationMessage>,
-    prompt_cache_events: Vec<crate::PromptCacheEvent>,
     iterations: usize,
     input_tokens: u64,
     output_tokens: u64,
@@ -3091,7 +3090,6 @@ where
                         novelty: if step.usage.output_tokens > 0 { 70 } else { 0 },
                     },
                 );
-                state.prompt_cache_events.extend(step.prompt_cache_events);
                 state
                     .assistant_messages
                     .push(step.assistant_message.clone());
@@ -5964,7 +5962,6 @@ where
             content,
             assistant_messages,
             tool_results,
-            prompt_cache_events,
             iterations,
             model,
             models_used,
@@ -5983,7 +5980,6 @@ where
                 state.content.clone(),
                 std::mem::take(&mut state.assistant_messages),
                 std::mem::take(&mut state.tool_results),
-                std::mem::take(&mut state.prompt_cache_events),
                 state.iterations,
                 state.model.clone(),
                 state.models_used.clone(),
@@ -6007,7 +6003,6 @@ where
                 final_answer,
                 assistant_messages,
                 tool_results,
-                prompt_cache_events,
                 iterations,
                 model,
                 models_used,

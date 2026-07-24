@@ -133,8 +133,7 @@ use provider as provider_crate;
 #[cfg(test)]
 use provider_crate::{
     resolve_startup_auth_source, AuthSource, ImageSource, InputContentBlock, InputMessage,
-    MessageResponse, OutputContentBlock, ProviderClient as ApiProviderClient,
-    ToolResultContentBlock,
+    MessageResponse, OutputContentBlock, ToolResultContentBlock,
 };
 
 #[cfg(test)]
@@ -145,8 +144,6 @@ use crate::command::slash::{
 };
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use runtime::ContextProfile;
-#[cfg(test)]
-use runtime::PromptCacheEvent;
 use runtime::{
     check_base_commit, format_stale_base_warning, load_system_prompt, resolve_expected_base,
     resolve_sandbox_status, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
@@ -3903,22 +3900,6 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
         .collect()
 }
 
-fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
-    summary
-        .prompt_cache_events
-        .iter()
-        .map(|event| {
-            json!({
-                "unexpected": event.unexpected,
-                "reason": event.reason,
-                "previous_cache_read_input_tokens": event.previous_cache_read_input_tokens,
-                "current_cache_read_input_tokens": event.current_cache_read_input_tokens,
-                "token_drop": event.token_drop,
-            })
-        })
-        .collect()
-}
-
 /// Slash commands that are registered in the spec list but not yet implemented
 /// in this build. Used to filter terminal completions and help output so the
 /// discovery surface only shows commands that actually work (ROADMAP #39).
@@ -4610,34 +4591,6 @@ fn response_to_events(
     events.push(AssistantEvent::Usage(response.usage.token_usage()));
     events.push(AssistantEvent::MessageStop);
     Ok(events)
-}
-
-#[cfg(test)]
-fn push_prompt_cache_record(client: &ApiProviderClient, events: &mut Vec<AssistantEvent>) {
-    // `ApiProviderClient::take_last_prompt_cache_record` is a pass-through
-    // to the Anthropic variant and returns `None` for OpenAI-compat /
-    // xAI variants, which do not have a prompt cache. So this helper
-    // remains a no-op on non-Anthropic providers without any extra
-    // branching here.
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
-        }
-    }
-}
-
-#[cfg(test)]
-fn prompt_cache_record_to_runtime_event(
-    record: provider_crate::PromptCacheRecord,
-) -> Option<PromptCacheEvent> {
-    let cache_break = record.cache_break?;
-    Some(PromptCacheEvent {
-        unexpected: cache_break.unexpected,
-        reason: cache_break.reason,
-        previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
-        current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
-        token_drop: cache_break.token_drop,
-    })
 }
 
 pub(crate) fn permission_policy(

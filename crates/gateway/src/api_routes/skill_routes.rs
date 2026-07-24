@@ -199,9 +199,24 @@ async fn skill_translate_handler(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(crate::DEFAULT_MODEL)
         .to_string();
+    let runtime_services = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_services())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime services are unavailable".to_string(),
+            )
+        })?;
+    let (_, http) = runtime_services
+        .provider_transport_pool()
+        .checkout_default()
+        .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
     let client = match runtime_config.providers().resolve_full(&model) {
-        Some(provider) => ProviderClient::from_config(provider),
-        None => ProviderClient::from_model(&model),
+        Some(provider) => ProviderClient::from_config_with_http(provider, http),
+        None => ProviderClient::from_model_with_http(&model, http),
     }
     .map_err(|error| api_error(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
 

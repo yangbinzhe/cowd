@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use harness_contract::knowledge::KnowledgeTurnReport;
 use serde::{Deserialize, Serialize};
 
-use model_protocol::prompt_cache::stable_hash_bytes;
+use model_protocol::fingerprint::stable_hash_bytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContextMode {

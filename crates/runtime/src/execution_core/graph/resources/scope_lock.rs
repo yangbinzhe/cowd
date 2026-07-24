@@ -382,7 +382,7 @@ fn try_process_locks(
 }
 
 fn stable_key_hash(value: &str) -> u64 {
-    model_protocol::prompt_cache::stable_hash_bytes(value.as_bytes())
+    model_protocol::fingerprint::stable_hash_bytes(value.as_bytes())
 }
 
 fn scope_io(path: &Path, source: std::io::Error) -> ScopeLockError {

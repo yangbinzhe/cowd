@@ -483,6 +483,7 @@ impl ExecutionGraphRunner {
             .await?;
         let binding = resources.binding(&ticket);
         let resource_kind = resources.resource.kind().clone();
+        let resource_queue_wait = resources.resource.queue_wait();
         self.active.lock().await.insert(
             (ticket.graph_id.clone(), ticket.node_id.clone()),
             ActiveNode {
@@ -556,10 +557,29 @@ impl ExecutionGraphRunner {
         }
         let resource_started = std::time::Instant::now();
         let outcome = executor.poll_or_await(&ticket).await;
+        let pressure_snapshot = self.resource_manager.snapshot(&resource_kind).ok();
         let _ = self.resource_manager.observe_runtime_pressure(
             &resource_kind,
-            resource_started.elapsed(),
-            outcome.is_err(),
+            crate::execution_core::graph::ResourceObservation {
+                queue_wait: resource_queue_wait,
+                service_time: resource_started.elapsed(),
+                producer_wait: std::time::Duration::ZERO,
+                queue_depth: pressure_snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.queued_waiters),
+                saturation: pressure_snapshot.as_ref().map_or(0.0, |snapshot| {
+                    if snapshot.effective_limit == 0 {
+                        1.0
+                    } else {
+                        snapshot.active_leases as f32 / snapshot.effective_limit as f32
+                    }
+                }),
+                result_class: if outcome.is_err() {
+                    crate::execution_core::graph::ResourceResultClass::Failed
+                } else {
+                    crate::execution_core::graph::ResourceResultClass::Completed
+                },
+            },
         );
         let outcome = outcome?;
         self.commit_service

@@ -624,7 +624,6 @@ pub enum AssistantEvent {
         input: String,
     },
     Usage(TokenUsage),
-    PromptCache(PromptCacheEvent),
     MessageStop,
     /// P0-2: Tool execution lifecycle events for real-time SSE visualization
     ToolStart {
@@ -643,16 +642,6 @@ pub enum AssistantEvent {
         result_summary: String,
         exit_code: Option<i32>,
     },
-}
-
-/// Prompt-cache telemetry captured from the provider response stream.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PromptCacheEvent {
-    pub unexpected: bool,
-    pub reason: String,
-    pub previous_cache_read_input_tokens: u32,
-    pub current_cache_read_input_tokens: u32,
-    pub token_drop: u32,
 }
 
 fn preview_chars(value: &str, max_chars: usize) -> String {
@@ -1056,7 +1045,6 @@ pub struct TurnSummary {
     pub terminal_completion: harness_contract::goal::GoalCompletion,
     pub assistant_messages: Vec<ConversationMessage>,
     pub tool_results: Vec<ConversationMessage>,
-    pub prompt_cache_events: Vec<PromptCacheEvent>,
     pub iterations: usize,
     pub usage: TokenUsage,
     pub model_telemetry: crate::cowd_event::RunModelTelemetry,
@@ -1099,7 +1087,6 @@ pub struct ModelStepResult {
     pub intent: ModelStepIntent,
     pub assistant_message: ConversationMessage,
     pub usage: TokenUsage,
-    pub prompt_cache_events: Vec<PromptCacheEvent>,
     pub model: Option<String>,
     /// Ordered provider/model candidates actually attempted for this
     /// successful step, including failed fallbacks before the winner.
@@ -2086,7 +2073,6 @@ where
             let mut signature = String::new();
             let mut calls = Vec::new();
             let mut usage = TokenUsage::default();
-            let mut cache_events = Vec::new();
             let mut effective_model = None;
             let mut failed = None;
             let mut first_event_at = None;
@@ -2121,7 +2107,6 @@ where
                         });
                     }
                     Ok(AssistantEvent::Usage(value)) => usage = value,
-                    Ok(AssistantEvent::PromptCache(value)) => cache_events.push(value),
                     Ok(AssistantEvent::MessageStop) => break,
                     Ok(
                         AssistantEvent::ToolStart { .. }
@@ -2175,7 +2160,6 @@ where
                     usage: Some(usage),
                 },
                 usage,
-                prompt_cache_events: cache_events,
                 model: effective_model,
                 models_used: models_tried.clone(),
                 first_token_latency_ms: first_event_at.map(|first| {
@@ -3914,8 +3898,8 @@ where
             let idle_timeout = transport_policy.idle_timeout;
             let heartbeat_grace = transport_policy.heartbeat_grace;
             let cancellation = self.cancellation_token.clone();
+            let provider_queue_started = Instant::now();
             let provider_lease = if let Some(manager) = &self.provider_admission {
-                let provider_queue_started = Instant::now();
                 let acquire = manager.acquire(
                     crate::execution_core::graph::ExecutionResourceKind::Provider,
                     Some(Duration::from_secs(30)),
@@ -3936,6 +3920,7 @@ where
             } else {
                 None
             };
+            let provider_queue_wait = provider_queue_started.elapsed();
             let provider_started = Instant::now();
             let mut stream = self.api_client.stream(request);
             let stream_started = Instant::now();
@@ -3945,7 +3930,6 @@ where
             let mut signature = None;
             let mut calls = Vec::new();
             let mut usage = TokenUsage::default();
-            let mut cache_events = Vec::new();
             let mut failed = None;
             let mut first_event_at = None;
             let mut first_text_delta_observed = false;
@@ -4044,7 +4028,6 @@ where
                     Ok(AssistantEvent::Usage(value)) => {
                         usage = value;
                     }
-                    Ok(AssistantEvent::PromptCache(value)) => cache_events.push(value),
                     Ok(AssistantEvent::MessageStop) => break,
                     Ok(
                         AssistantEvent::ToolStart { .. }
@@ -4067,10 +4050,31 @@ where
                 provider_started.elapsed(),
             );
             if let Some(manager) = &self.provider_admission {
+                let pressure_snapshot = manager
+                    .snapshot(&crate::execution_core::graph::ExecutionResourceKind::Provider)
+                    .ok();
                 let _ = manager.observe_runtime_pressure(
                     &crate::execution_core::graph::ExecutionResourceKind::Provider,
-                    provider_started.elapsed(),
-                    failed.is_some(),
+                    crate::execution_core::graph::ResourceObservation {
+                        queue_wait: provider_queue_wait,
+                        service_time: provider_started.elapsed(),
+                        producer_wait: Duration::ZERO,
+                        queue_depth: pressure_snapshot
+                            .as_ref()
+                            .map_or(0, |snapshot| snapshot.queued_waiters),
+                        saturation: pressure_snapshot.as_ref().map_or(0.0, |snapshot| {
+                            if snapshot.effective_limit == 0 {
+                                1.0
+                            } else {
+                                snapshot.active_leases as f32 / snapshot.effective_limit as f32
+                            }
+                        }),
+                        result_class: if failed.is_some() {
+                            crate::execution_core::graph::ResourceResultClass::Failed
+                        } else {
+                            crate::execution_core::graph::ResourceResultClass::Completed
+                        },
+                    },
                 );
             }
             drop(provider_lease);
@@ -4155,7 +4159,6 @@ where
                 intent,
                 assistant_message,
                 usage,
-                prompt_cache_events: cache_events,
                 // Preserve the model that actually produced the provider stream,
                 // not merely Runtime's preferred candidate.
                 model: effective_model,
@@ -4397,7 +4400,6 @@ where
         final_answer: String,
         assistant_messages: Vec<ConversationMessage>,
         tool_results: Vec<ConversationMessage>,
-        prompt_cache_events: Vec<PromptCacheEvent>,
         iterations: usize,
         model: Option<String>,
         models_used: Vec<String>,
@@ -4511,7 +4513,6 @@ where
             terminal_completion,
             assistant_messages,
             tool_results,
-            prompt_cache_events,
             iterations,
             usage,
             model_telemetry: telemetry,
@@ -6041,10 +6042,6 @@ where
             "tool_results".to_string(),
             Value::from(summary.tool_results.len() as u64),
         );
-        attributes.insert(
-            "prompt_cache_events".to_string(),
-            Value::from(summary.prompt_cache_events.len() as u64),
-        );
         session_tracer.record("turn_completed", attributes);
     }
 
@@ -6509,7 +6506,7 @@ where
         };
         let content_hash = format!(
             "{:016x}",
-            model_protocol::prompt_cache::stable_hash_bytes(output.as_bytes())
+            model_protocol::fingerprint::stable_hash_bytes(output.as_bytes())
         );
         let summary = if let Some(access) = access {
             let evidence = memory::types::CanonicalRawEvidence::new(
@@ -6774,7 +6771,7 @@ where
         duration_ms: u64,
         source_evidence_ref: Option<&str>,
     ) -> (EvidenceRef, Option<EvidenceAccessRef>) {
-        let content_hash = model_protocol::prompt_cache::stable_hash_bytes(output.as_bytes());
+        let content_hash = model_protocol::fingerprint::stable_hash_bytes(output.as_bytes());
         let evidence_id = format!("tool-raw-{tool_use_id}-{content_hash:016x}");
         let evidence_ref = EvidenceRef::new("tool", evidence_id.clone());
         if let Some(access) = self.existing_evidence_access(&evidence_ref) {
@@ -6841,7 +6838,7 @@ where
     ) -> ConversationMessage {
         let input_hash = format!(
             "{:016x}",
-            model_protocol::prompt_cache::stable_hash_bytes(input.as_bytes())
+            model_protocol::fingerprint::stable_hash_bytes(input.as_bytes())
         );
         let source_evidence_ref = format!("runtime-tool:{tool_use_id}");
         let (raw_ref, raw_access) = self

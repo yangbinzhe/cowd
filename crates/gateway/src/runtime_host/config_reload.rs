@@ -592,6 +592,41 @@ pub(crate) fn apply_runtime_providers(
         });
     };
     let provider_registry = runtime_service.provider_registry();
+    if let Err(error) = runtime_service
+        .runtime_services()
+        .provider_transport_pool()
+        .checkout_default()
+    {
+        let retained_revision = provider_registry.revision();
+        tracing::warn!(
+            target: "cowd.runtime.provider",
+            applied = false,
+            source,
+            retained_revision,
+            error = %error,
+            "runtime provider reload rejected by transport preflight; retaining last valid snapshot"
+        );
+        return serde_json::json!({
+            "kind": "runtime_provider_reload",
+            "status": "invalid",
+            "applied": false,
+            "source": source,
+            "retained_revision": retained_revision,
+            "catalog_generation": catalog_generation,
+            "catalog_updated": catalog_updated,
+            "catalog": catalog_report,
+            "provider_count": provider_count,
+            "provider_model_count": provider_model_count,
+            "provider_names": provider_names,
+            "configured_model": configured_model,
+            "configured_model_provider": configured_model_provider,
+            "configured_model_resolved": configured_model_resolved,
+            "diagnostics": {
+                "errors": [format!("provider transport preflight failed: {error}")],
+                "warnings": [],
+            },
+        });
+    }
     let update = match provider_registry.replace(providers) {
         Ok(update) => update,
         Err(rejected) => {

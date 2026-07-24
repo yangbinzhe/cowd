@@ -1100,7 +1100,7 @@ impl RuntimeService {
                         .map(|session_id| format!("session://{session_id}")),
                     state_hash: format!(
                         "{:016x}",
-                        model_protocol::prompt_cache::stable_hash_bytes(&payload)
+                        model_protocol::fingerprint::stable_hash_bytes(&payload)
                     ),
                 }
             })
@@ -2947,7 +2947,7 @@ fn upgrade_carrier_record(
         state_ref,
         state_hash: format!(
             "{:016x}",
-            model_protocol::prompt_cache::stable_hash_bytes(&payload)
+            model_protocol::fingerprint::stable_hash_bytes(&payload)
         ),
     }
 }

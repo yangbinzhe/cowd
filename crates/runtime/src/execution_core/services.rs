@@ -593,6 +593,7 @@ pub struct RuntimeServices {
     session_relations: Arc<SessionRelationGraph>,
     goal_store: Arc<GoalStore>,
     provider_registry: Arc<crate::ProviderRegistry>,
+    provider_transport_pool: Arc<crate::ProviderTransportPool>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
@@ -702,6 +703,7 @@ impl RuntimeServices {
         definition_registry: Arc<RuntimeDefinitionRegistry>,
     ) -> Result<Self, RuntimeServicesError> {
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
+        let provider_transport_pool = Arc::new(crate::ProviderTransportPool::default());
         let graph_state_store = ExecutionGraphStateStore::new(Arc::clone(&event_store));
         let model_step_executor = Arc::new(ScopedNodeExecutor::new("inline_model"));
         let tool_batch_executor = Arc::new(ScopedNodeExecutor::new("tool_batch"));
@@ -854,6 +856,7 @@ impl RuntimeServices {
             session_relations,
             goal_store,
             provider_registry,
+            provider_transport_pool,
             tool_execution_host,
             memory_manager,
             evolution_eval_runner,
@@ -3062,6 +3065,9 @@ impl RuntimeServices {
     }
     pub fn provider_registry(&self) -> &Arc<crate::ProviderRegistry> {
         &self.provider_registry
+    }
+    pub fn provider_transport_pool(&self) -> &Arc<crate::ProviderTransportPool> {
+        &self.provider_transport_pool
     }
     pub fn tool_execution_host(&self) -> Option<&Arc<dyn crate::RuntimeExecutionHost>> {
         self.tool_execution_host.as_ref()

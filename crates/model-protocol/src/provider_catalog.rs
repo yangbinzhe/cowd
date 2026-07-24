@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    fingerprint::hash_serializable,
     model_registry::ModelRegistry,
-    prompt_cache::hash_serializable,
     provider_config::{ProviderProtocol, ProvidersConfig},
 };
 

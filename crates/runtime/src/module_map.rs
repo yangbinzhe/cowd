@@ -96,7 +96,6 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("provider_runtime_client", Provider, "runtime", true),
         RuntimeModuleDescriptor::public("provider_transport_policy", Provider, "runtime", false),
         RuntimeModuleDescriptor::public("provider_registry", Provider, "runtime", false),
-        RuntimeModuleDescriptor::public("provider_pool", Provider, "runtime", false),
         RuntimeModuleDescriptor::public("tool_dispatch", Tooling, "runtime", true),
         RuntimeModuleDescriptor::public("tool_execution_plan", Tooling, "runtime", false),
         RuntimeModuleDescriptor::public("tool_host", Tooling, "runtime", true),

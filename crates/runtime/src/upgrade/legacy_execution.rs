@@ -508,7 +508,7 @@ fn upgrade_stream_id(workspace_id: &str) -> String {
 fn stable_hash(bytes: &[u8]) -> String {
     format!(
         "{:016x}",
-        model_protocol::prompt_cache::stable_hash_bytes(bytes)
+        model_protocol::fingerprint::stable_hash_bytes(bytes)
     )
 }
 

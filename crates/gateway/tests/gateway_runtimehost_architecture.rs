@@ -1090,42 +1090,44 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
 }
 
 #[test]
-fn prompt_cache_is_owned_by_model_protocol_boundary() {
+fn provider_transport_and_fingerprint_have_single_owners() {
     let model_protocol_manifest = read_repo("crates/model-protocol/Cargo.toml");
     let model_protocol_source = read_repo("crates/model-protocol/src/lib.rs");
     assert!(model_protocol_manifest.contains("name = \"model-protocol\""));
     assert!(
-        model_protocol_source.contains("pub mod prompt_cache"),
-        "model-protocol must own prompt cache protocol semantics"
+        model_protocol_source.contains("pub mod fingerprint"),
+        "model-protocol must own stable fingerprint semantics"
     );
 
     assert!(
         !repo_root()
-            .join("crates/runtime/src/prompt_cache.rs")
+            .join("crates/model-protocol/src/prompt_cache.rs")
             .exists(),
-        "runtime must not retain a prompt_cache compatibility module"
+        "model-protocol must not retain the removed local completion cache"
     );
 
     let provider_manifest = read_repo("crates/provider/Cargo.toml");
     let provider_source = [
         read_repo("crates/provider/src/lib.rs"),
         read_repo("crates/provider/src/client.rs"),
-        read_repo("crates/provider/src/cached_client.rs"),
         read_repo("crates/provider/src/providers/anthropic.rs"),
     ]
     .join("\n");
     assert!(
         manifest_dependencies(&provider_manifest)
             .contains("model-protocol = { path = \"../model-protocol\" }"),
-        "provider must depend on model-protocol for prompt cache contracts"
+        "provider must depend on model-protocol for protocol fingerprints"
     );
     assert!(
-        provider_source.contains("model_protocol::prompt_cache"),
-        "provider must import prompt cache contracts from model-protocol"
+        !provider_source.contains("PromptCache")
+            && !provider_source.contains("CachedProviderClient")
+            && !provider_source.contains("lookup_completion"),
+        "provider must not retain local full-completion caching"
     );
     assert!(
-        !provider_source.contains("runtime::prompt_cache"),
-        "provider must not import prompt cache contracts from runtime"
+        read_repo("crates/runtime/src/provider/transport_pool.rs")
+            .contains("pub struct ProviderTransportPool"),
+        "Runtime must own the shared request-stateless provider transport pool"
     );
 }
 

@@ -10,7 +10,7 @@ const NO_PROXY_KEYS: [&str; 2] = ["NO_PROXY", "no_proxy"];
 ///
 /// When `proxy_url` is set it acts as a single catch-all proxy for both
 /// HTTP and HTTPS traffic, taking precedence over the per-scheme fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {
     pub http_proxy: Option<String>,
     pub https_proxy: Option<String>,
@@ -62,16 +62,6 @@ impl ProxyConfig {
 /// configured the client behaves identically to `reqwest::Client::new()`.
 pub fn build_http_client() -> Result<reqwest::Client, ApiError> {
     build_http_client_with(&ProxyConfig::from_env())
-}
-
-/// Infallible counterpart to [`build_http_client`] for constructors that
-/// historically returned `Self` rather than `Result<Self, _>`. When the proxy
-/// configuration is malformed we fall back to a default client so that
-/// callers retain the previous behaviour and the failure surfaces on the
-/// first outbound request instead of at construction time.
-#[must_use]
-pub fn build_http_client_or_default() -> reqwest::Client {
-    build_http_client().unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// Build a `reqwest::Client` from an explicit [`ProxyConfig`]. Used by tests

@@ -2,12 +2,12 @@
 mod perf {
     use std::time::Instant;
 
-    use crate::build_http_client_or_default;
+    use crate::build_http_client;
 
     #[test]
     fn http_client_creation_is_fast() {
         let start = Instant::now();
-        let client = build_http_client_or_default();
+        let client = build_http_client().expect("HTTP client");
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_millis() < 2000,

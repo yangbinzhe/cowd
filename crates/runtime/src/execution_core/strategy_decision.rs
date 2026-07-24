@@ -486,7 +486,7 @@ fn build_runtime_execution_decision_inner(
         resource_health,
         lease: StrategyLease {
             lease_id: format!("strategy-lease-{}", Uuid::new_v4()),
-            input_fingerprint: model_protocol::prompt_cache::stable_hash_bytes(
+            input_fingerprint: model_protocol::fingerprint::stable_hash_bytes(
                 user_input.as_bytes(),
             ),
             locked_pattern: recommended_pattern,

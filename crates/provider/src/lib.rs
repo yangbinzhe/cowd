@@ -9,7 +9,6 @@
     )
 )]
 
-mod cached_client;
 mod client;
 mod error;
 mod http_client;
@@ -17,20 +16,12 @@ mod providers;
 mod sse;
 mod types;
 
-pub use cached_client::CachedProviderClient;
 pub use client::{
     oauth_token_is_expired, read_base_url, read_xai_base_url, resolve_saved_oauth_token,
     resolve_startup_auth_source, MessageStream, OAuthTokenSet, ProviderClient,
 };
 pub use error::{ApiError, CompatibilityToolProtocolFailure};
-pub use http_client::{
-    build_http_client, build_http_client_or_default, build_http_client_with, ProxyConfig,
-};
-// Re-export PromptCache types from model-protocol for backward compatibility.
-pub use model_protocol::prompt_cache::{
-    CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,
-    PromptCacheStats,
-};
+pub use http_client::{build_http_client, build_http_client_with, ProxyConfig};
 pub use model_protocol::provider_catalog::{
     ProviderCatalog, ProviderCatalogInput, ProviderCatalogModel, ProviderCatalogProfile,
     ProviderCatalogProvider, ProviderCatalogSource, ProviderCatalogTransform,

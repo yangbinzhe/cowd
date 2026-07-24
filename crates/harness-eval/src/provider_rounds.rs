@@ -124,16 +124,6 @@ fn provider_event_json(event: &runtime::AssistantEvent) -> Value {
                 "total_tokens": usage.total_tokens()
             })
         }
-        runtime::AssistantEvent::PromptCache(cache) => {
-            json!({
-                "kind": "prompt_cache",
-                "unexpected": cache.unexpected,
-                "reason": cache.reason,
-                "previous_cache_read_input_tokens": cache.previous_cache_read_input_tokens,
-                "current_cache_read_input_tokens": cache.current_cache_read_input_tokens,
-                "token_drop": cache.token_drop
-            })
-        }
         runtime::AssistantEvent::MessageStop => json!({"kind": "message_stop"}),
         runtime::AssistantEvent::ToolStart { id, name, preview } => {
             json!({"kind": "tool_start", "id": id, "name": name, "preview": preview})

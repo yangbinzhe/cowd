@@ -121,8 +121,6 @@ mod policy_engine;
 mod prompt;
 #[path = "conversation/prompt_assembly.rs"]
 mod prompt_assembly;
-#[path = "provider/provider_pool.rs"]
-pub mod provider_pool;
 #[path = "recovery/recovery.rs"]
 pub mod recovery;
 #[path = "recovery/recovery_recipes.rs"]
@@ -217,6 +215,8 @@ pub mod provider_registry;
 pub mod provider_runtime_client;
 #[path = "provider/transport_policy.rs"]
 pub mod provider_transport_policy;
+#[path = "provider/transport_pool.rs"]
+pub mod provider_transport_pool;
 #[path = "infrastructure/quality_gate.rs"]
 pub mod quality_gate;
 #[path = "context/reality_decision.rs"]
@@ -391,7 +391,7 @@ pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall}
 pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 pub use conversation::{
     build_cc_memory_config, image_user_message_from_path, ApiClient, ApiRequest, AssistantEvent,
-    AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback, PromptCacheEvent,
+    AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback,
     ProviderContextInventory, RuntimeError, StaticToolExecutor, ToolCallback, ToolError,
     ToolExecutor, TurnSummary,
 };
@@ -581,7 +581,11 @@ pub use provider_runtime_client::{
     push_provider_output_block, ProviderOutputContentBlock, ProviderRuntimeClient,
     ProviderToolDefinition,
 };
+pub use provider_runtime_client::{ProviderRequestContext, ResolvedProviderProfile};
 pub use provider_transport_policy::ProviderTransportPolicy;
+pub use provider_transport_pool::{
+    ProviderTransportPool, ProviderTransportPoolStats, TransportProfileFingerprint,
+};
 pub use reality_decision::{
     RealityContextBudgetPlan, RealityFactPlan, RealityFactPlanItem, RealityKnowledgeDecision,
     RealityMemoryDecision, RealityRecallQualityReport, RealityRuntimeDecision,

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use model_protocol::prompt_cache::stable_hash_bytes;
+use model_protocol::fingerprint::stable_hash_bytes;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_CHARS: usize = 1_200;

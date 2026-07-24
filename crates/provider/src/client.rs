@@ -5,7 +5,6 @@ use crate::providers::openai_compat::{
 };
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
-use model_protocol::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use model_protocol::provider_config::ProviderConfig;
 use model_protocol::provider_config::ProviderProtocol;
 
@@ -22,19 +21,47 @@ impl ProviderClient {
         Self::from_model_with_anthropic_auth(model, None)
     }
 
+    pub fn from_model_with_http(model: &str, http: reqwest::Client) -> Result<Self, ApiError> {
+        Self::from_model_with_anthropic_auth_and_http(model, None, http)
+    }
+
     pub fn from_model_with_anthropic_auth(
         model: &str,
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
+        Self::from_model_with_anthropic_auth_and_http(
+            model,
+            anthropic_auth,
+            crate::http_client::build_http_client()?,
+        )
+    }
+
+    fn from_model_with_anthropic_auth_and_http(
+        model: &str,
+        anthropic_auth: Option<AuthSource>,
+        http: reqwest::Client,
+    ) -> Result<Self, ApiError> {
         let resolved_model = model.trim();
         match providers::detect_provider_kind(resolved_model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
-                Some(auth) => AnthropicClient::from_auth(auth),
-                None => AnthropicClient::from_env()?,
+                Some(auth) => AnthropicClient::from_auth_with_http(auth, http),
+                None => {
+                    AnthropicClient::from_auth_with_http(AuthSource::from_env_or_saved()?, http)
+                        .with_base_url(anthropic::read_base_url())
+                }
             })),
-            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::xai(),
-            )?)),
+            ProviderKind::Xai => {
+                let config = OpenAiCompatConfig::xai();
+                let Some(api_key) = openai_compat::read_env_api_key(config)? else {
+                    return Err(ApiError::missing_credentials(
+                        config.provider_name,
+                        config.credential_env_vars(),
+                    ));
+                };
+                Ok(Self::Xai(OpenAiCompatClient::new_with_http(
+                    api_key, config, http,
+                )))
+            }
             ProviderKind::OpenAi => {
                 // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
                 // speak the OpenAI wire format, but they need the DashScope config which
@@ -61,20 +88,35 @@ impl ProviderClient {
                 } else {
                     config
                 };
-                Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+                let Some(api_key) = openai_compat::read_env_api_key(config)? else {
+                    return Err(ApiError::missing_credentials(
+                        config.provider_name,
+                        config.credential_env_vars(),
+                    ));
+                };
+                Ok(Self::OpenAi(OpenAiCompatClient::new_with_http(
+                    api_key, config, http,
+                )))
             }
         }
     }
 
     /// 从配置文件 ProviderConfig 直接构造，不读任何环境变量。
     pub fn from_config(provider: &ProviderConfig) -> Result<Self, ApiError> {
+        Self::from_config_with_http(provider, crate::http_client::build_http_client()?)
+    }
+
+    pub fn from_config_with_http(
+        provider: &ProviderConfig,
+        http: reqwest::Client,
+    ) -> Result<Self, ApiError> {
         let protocol = ProviderProtocol::effective_for_provider(provider).map_err(|reason| {
             ApiError::InvalidProviderConfig {
                 provider: provider.name.clone(),
                 reason,
             }
         })?;
-        Self::from_config_with_effective_protocol(provider, protocol)
+        Self::from_config_with_effective_protocol_and_http(provider, protocol, http)
     }
 
     /// 从配置直接构造，不读任何环境变量。
@@ -82,11 +124,24 @@ impl ProviderClient {
         provider: &ProviderConfig,
         protocol: ProviderProtocol,
     ) -> Result<Self, ApiError> {
+        Self::from_config_with_effective_protocol_and_http(
+            provider,
+            protocol,
+            crate::http_client::build_http_client()?,
+        )
+    }
+
+    pub fn from_config_with_effective_protocol_and_http(
+        provider: &ProviderConfig,
+        protocol: ProviderProtocol,
+        http: reqwest::Client,
+    ) -> Result<Self, ApiError> {
         match protocol {
             ProviderProtocol::Anthropic => {
                 let auth = AuthSource::ApiKey(provider.api_key.clone());
                 Ok(Self::Anthropic(
-                    AnthropicClient::from_auth(auth).with_base_url(&provider.base_url),
+                    AnthropicClient::from_auth_with_http(auth, http)
+                        .with_base_url(&provider.base_url),
                 ))
             }
             ProviderProtocol::Completions | ProviderProtocol::Responses => {
@@ -101,12 +156,15 @@ impl ProviderClient {
                         });
                     }
                 };
-                Ok(Self::OpenAi(OpenAiCompatClient::new_custom_with_protocol(
-                    provider.api_key.clone(),
-                    url,
-                    &provider.name,
-                    wire_protocol,
-                )))
+                Ok(Self::OpenAi(
+                    OpenAiCompatClient::new_custom_with_protocol_and_http(
+                        provider.api_key.clone(),
+                        url,
+                        &provider.name,
+                        wire_protocol,
+                        http,
+                    ),
+                ))
             }
         }
     }
@@ -132,30 +190,6 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
-        }
-    }
-
-    #[must_use]
-    pub fn with_prompt_cache(self, prompt_cache: PromptCache) -> Self {
-        match self {
-            Self::Anthropic(client) => Self::Anthropic(client.with_prompt_cache(prompt_cache)),
-            other => other,
-        }
-    }
-
-    #[must_use]
-    pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
-        match self {
-            Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
-        }
-    }
-
-    #[must_use]
-    pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
-        match self {
-            Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
         }
     }
 

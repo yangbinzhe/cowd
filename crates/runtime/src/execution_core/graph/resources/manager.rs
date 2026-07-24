@@ -54,6 +54,43 @@ pub struct ResourcePressure {
     pub latency_pressure: f32,
 }
 
+/// One completed resource operation, split into capacity and service signals.
+///
+/// Service latency is retained for diagnostics but deliberately does not
+/// reduce concurrency on its own. Capacity adapts only when work waited for
+/// admission, the resource was saturated, or a bounded producer was blocked.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResourceObservation {
+    pub queue_wait: Duration,
+    pub service_time: Duration,
+    pub producer_wait: Duration,
+    pub queue_depth: usize,
+    pub saturation: f32,
+    pub result_class: ResourceResultClass,
+}
+
+impl ResourceObservation {
+    #[must_use]
+    pub fn completed(service_time: Duration) -> Self {
+        Self {
+            queue_wait: Duration::ZERO,
+            service_time,
+            producer_wait: Duration::ZERO,
+            queue_depth: 0,
+            saturation: 0.0,
+            result_class: ResourceResultClass::Completed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceResultClass {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 impl ResourcePressure {
     pub const HEALTHY: Self = Self {
         saturation: 0.0,
@@ -211,20 +248,25 @@ impl ExecutionResourceManager {
     pub fn observe_runtime_pressure(
         &self,
         kind: &ExecutionResourceKind,
-        latency: Duration,
-        failed: bool,
+        observation: ResourceObservation,
     ) -> Result<ExecutionResourceSnapshot, ResourceAcquireError> {
         let snapshot = self.snapshot(kind)?;
-        let saturation = if snapshot.effective_limit == 0 {
+        let observed_saturation = if snapshot.effective_limit == 0 {
             1.0
         } else {
             (snapshot.active_leases + snapshot.queued_waiters) as f32
                 / snapshot.effective_limit as f32
         }
         .clamp(0.0, 1.0);
-        let latency_pressure = (latency.as_secs_f32() / 60.0).clamp(0.0, 1.0);
-        let pressured = failed || saturation >= 1.0 || latency_pressure >= 0.5;
-        let healthy = !failed && snapshot.queued_waiters == 0 && latency_pressure < 0.15;
+        let saturation = observation
+            .saturation
+            .max(observed_saturation)
+            .clamp(0.0, 1.0);
+        let queue_pressure =
+            observation.queue_depth > 0 || observation.queue_wait >= Duration::from_millis(250);
+        let producer_pressure = observation.producer_wait >= Duration::from_millis(50);
+        let pressured = saturation >= 1.0 && (queue_pressure || producer_pressure);
+        let healthy = !queue_pressure && !producer_pressure && snapshot.queued_waiters == 0;
         let adjustment = {
             let mut states = self
                 .shared
@@ -249,8 +291,8 @@ impl ExecutionResourceManager {
                 state.pressure_streak = 0;
                 Some(ResourcePressure {
                     saturation,
-                    failure_rate: if failed { 1.0 } else { 0.0 },
-                    latency_pressure,
+                    failure_rate: 0.0,
+                    latency_pressure: if producer_pressure { 1.0 } else { 0.0 },
                 })
             } else if cooldown_ready && state.healthy_streak >= 8 {
                 state.healthy_streak = 0;
@@ -348,6 +390,7 @@ impl ExecutionResourceManager {
                     shared: Arc::clone(&self.shared),
                     kind,
                     lease_id: waiter_id,
+                    queue_wait: started.elapsed(),
                     released: false,
                 });
             }
@@ -408,6 +451,7 @@ pub struct ExecutionResourceLease {
     shared: Arc<Shared>,
     kind: ExecutionResourceKind,
     lease_id: Uuid,
+    queue_wait: Duration,
     released: bool,
 }
 
@@ -418,6 +462,11 @@ impl ExecutionResourceLease {
 
     pub fn kind(&self) -> &ExecutionResourceKind {
         &self.kind
+    }
+
+    #[must_use]
+    pub fn queue_wait(&self) -> Duration {
+        self.queue_wait
     }
 
     pub fn release(mut self) {
@@ -530,8 +579,14 @@ mod tests {
             let snapshot = manager
                 .observe_runtime_pressure(
                     &ExecutionResourceKind::Provider,
-                    Duration::from_secs(60),
-                    true,
+                    ResourceObservation {
+                        queue_wait: Duration::from_secs(1),
+                        service_time: Duration::from_secs(60),
+                        producer_wait: Duration::ZERO,
+                        queue_depth: 1,
+                        saturation: 1.0,
+                        result_class: ResourceResultClass::Failed,
+                    },
                 )
                 .unwrap();
             assert_eq!(snapshot.effective_limit, 4);
@@ -539,8 +594,14 @@ mod tests {
         let pressured = manager
             .observe_runtime_pressure(
                 &ExecutionResourceKind::Provider,
-                Duration::from_secs(60),
-                true,
+                ResourceObservation {
+                    queue_wait: Duration::from_secs(1),
+                    service_time: Duration::from_secs(60),
+                    producer_wait: Duration::ZERO,
+                    queue_depth: 1,
+                    saturation: 1.0,
+                    result_class: ResourceResultClass::Failed,
+                },
             )
             .unwrap();
         assert!(pressured.effective_limit < 4);
@@ -548,11 +609,27 @@ mod tests {
             let stable = manager
                 .observe_runtime_pressure(
                     &ExecutionResourceKind::Provider,
-                    Duration::from_millis(1),
-                    false,
+                    ResourceObservation::completed(Duration::from_millis(1)),
                 )
                 .unwrap();
             assert_eq!(stable.effective_limit, pressured.effective_limit);
+        }
+    }
+
+    #[test]
+    fn slow_service_without_capacity_pressure_does_not_reduce_limit() {
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 4, 4).unwrap(),
+        )]);
+        for _ in 0..8 {
+            let snapshot = manager
+                .observe_runtime_pressure(
+                    &ExecutionResourceKind::Provider,
+                    ResourceObservation::completed(Duration::from_secs(60)),
+                )
+                .unwrap();
+            assert_eq!(snapshot.effective_limit, 4);
         }
     }
 

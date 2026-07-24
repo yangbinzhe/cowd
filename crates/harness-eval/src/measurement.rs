@@ -75,6 +75,11 @@ pub(crate) const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "harness-eval",
     ),
     duration_metric(
+        "provider_producer_wait_ms",
+        "runtime bounded provider event stream",
+        "harness-eval",
+    ),
+    duration_metric(
         "provider_service_ms",
         "runtime provider boundary",
         "harness-eval",

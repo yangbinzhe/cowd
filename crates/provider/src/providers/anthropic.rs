@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use model_protocol::oauth::OAuthTokenSet;
@@ -16,12 +15,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::error::ApiError;
-use crate::http_client::build_http_client_or_default;
-use model_protocol::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{anthropic_missing_credentials, model_token_limit, Provider, ProviderFuture};
 use crate::sse::SseParser;
-use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
+use crate::types::{MessageRequest, MessageResponse, StreamEvent};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const REQUEST_ID_HEADER: &str = "request-id";
@@ -112,15 +109,18 @@ pub struct AnthropicClient {
     max_backoff: Duration,
     request_profile: AnthropicRequestProfile,
     session_tracer: Option<SessionTracer>,
-    prompt_cache: Option<PromptCache>,
-    last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
 impl AnthropicClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::new_with_http(api_key, reqwest::Client::new())
+    }
+
+    #[must_use]
+    pub fn new_with_http(api_key: impl Into<String>, http: reqwest::Client) -> Self {
         Self {
-            http: build_http_client_or_default(),
+            http,
             auth: AuthSource::ApiKey(api_key.into()),
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -128,15 +128,18 @@ impl AnthropicClient {
             max_backoff: DEFAULT_MAX_BACKOFF,
             request_profile: AnthropicRequestProfile::default(),
             session_tracer: None,
-            prompt_cache: None,
-            last_prompt_cache_record: Arc::new(Mutex::new(None)),
         }
     }
 
     #[must_use]
     pub fn from_auth(auth: AuthSource) -> Self {
+        Self::from_auth_with_http(auth, reqwest::Client::new())
+    }
+
+    #[must_use]
+    pub fn from_auth_with_http(auth: AuthSource, http: reqwest::Client) -> Self {
         Self {
-            http: build_http_client_or_default(),
+            http,
             auth,
             base_url: DEFAULT_BASE_URL.to_string(),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -144,13 +147,15 @@ impl AnthropicClient {
             max_backoff: DEFAULT_MAX_BACKOFF,
             request_profile: AnthropicRequestProfile::default(),
             session_tracer: None,
-            prompt_cache: None,
-            last_prompt_cache_record: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn from_env() -> Result<Self, ApiError> {
-        Ok(Self::from_auth(AuthSource::from_env_or_saved()?).with_base_url(read_base_url()))
+        Ok(Self::from_auth_with_http(
+            AuthSource::from_env_or_saved()?,
+            crate::http_client::build_http_client()?,
+        )
+        .with_base_url(read_base_url()))
     }
 
     #[must_use]
@@ -228,17 +233,6 @@ impl AnthropicClient {
     }
 
     #[must_use]
-    pub fn with_prompt_cache(mut self, prompt_cache: PromptCache) -> Self {
-        self.prompt_cache = Some(prompt_cache);
-        self
-    }
-
-    #[must_use]
-    pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
-        self.prompt_cache.as_ref().map(PromptCache::stats)
-    }
-
-    #[must_use]
     pub fn request_profile(&self) -> &AnthropicRequestProfile {
         &self.request_profile
     }
@@ -246,19 +240,6 @@ impl AnthropicClient {
     #[must_use]
     pub fn session_tracer(&self) -> Option<&SessionTracer> {
         self.session_tracer.as_ref()
-    }
-
-    #[must_use]
-    pub fn prompt_cache(&self) -> Option<&PromptCache> {
-        self.prompt_cache.as_ref()
-    }
-
-    #[must_use]
-    pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
-        self.last_prompt_cache_record
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
     }
 
     #[must_use]
@@ -281,15 +262,6 @@ impl AnthropicClient {
             ..request.clone()
         };
 
-        if let Some(prompt_cache) = &self.prompt_cache {
-            let cache_key = crate::cached_client::CachedProviderClient::compute_cache_key(&request);
-            if let Some(cached_json) = prompt_cache.lookup_completion(&cache_key) {
-                if let Ok(response) = serde_json::from_value::<MessageResponse>(cached_json) {
-                    return Ok(response);
-                }
-            }
-        }
-
         self.preflight_message_request(&request).await?;
 
         let http_response = self.send_with_retry(&request).await?;
@@ -302,29 +274,6 @@ impl AnthropicClient {
             response.request_id = request_id;
         }
 
-        if let Some(prompt_cache) = &self.prompt_cache {
-            let cache_key = crate::cached_client::CachedProviderClient::compute_cache_key(&request);
-            let fingerprints = model_protocol::prompt_cache::RequestFingerprintHashes {
-                model: model_protocol::prompt_cache::hash_serializable(&request.model),
-                system: model_protocol::prompt_cache::hash_serializable(&request.system),
-                tools: model_protocol::prompt_cache::hash_serializable(&request.tools),
-                messages: model_protocol::prompt_cache::hash_serializable(&request.messages),
-            };
-            let cache_usage = model_protocol::prompt_cache::CacheUsage {
-                input_tokens: response.usage.input_tokens,
-                cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-                cache_read_input_tokens: response.usage.cache_read_input_tokens,
-                output_tokens: response.usage.output_tokens,
-            };
-            let response_json = serde_json::to_value(&response).unwrap_or_default();
-            let record = prompt_cache.record_response(
-                &cache_key,
-                &response_json,
-                &cache_usage,
-                &fingerprints,
-            );
-            self.store_last_prompt_cache_record(record);
-        }
         if let Some(session_tracer) = &self.session_tracer {
             session_tracer.record_analytics(
                 AnalyticsEvent::new("api", "message_usage")
@@ -364,11 +313,6 @@ impl AnthropicClient {
             parser: SseParser::new().with_context("Anthropic", request.model.clone()),
             pending: VecDeque::new(),
             done: false,
-            request: request.clone(),
-            prompt_cache: self.prompt_cache.clone(),
-            latest_usage: None,
-            usage_recorded: false,
-            last_prompt_cache_record: Arc::clone(&self.last_prompt_cache_record),
         })
     }
 
@@ -572,13 +516,6 @@ impl AnthropicClient {
                 Map::new(),
             );
         }
-    }
-
-    fn store_last_prompt_cache_record(&self, record: PromptCacheRecord) {
-        *self
-            .last_prompt_cache_record
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -817,11 +754,6 @@ pub struct MessageStream {
     parser: SseParser,
     pending: VecDeque<StreamEvent>,
     done: bool,
-    request: MessageRequest,
-    prompt_cache: Option<PromptCache>,
-    latest_usage: Option<Usage>,
-    usage_recorded: bool,
-    last_prompt_cache_record: Arc<Mutex<Option<PromptCacheRecord>>>,
 }
 
 impl MessageStream {
@@ -833,7 +765,6 @@ impl MessageStream {
     pub async fn next_event(&mut self) -> Result<Option<StreamEvent>, ApiError> {
         loop {
             if let Some(event) = self.pending.pop_front() {
-                self.observe_event(&event);
                 return Ok(Some(event));
             }
 
@@ -854,54 +785,6 @@ impl MessageStream {
                     self.done = true;
                 }
             }
-        }
-    }
-
-    fn observe_event(&mut self, event: &StreamEvent) {
-        match event {
-            StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => {
-                self.latest_usage = Some(usage.clone());
-            }
-            StreamEvent::MessageStop(_) => {
-                if !self.usage_recorded {
-                    if let (Some(prompt_cache), Some(usage)) =
-                        (&self.prompt_cache, self.latest_usage.as_ref())
-                    {
-                        let cache_key =
-                            crate::cached_client::CachedProviderClient::compute_cache_key(
-                                &self.request,
-                            );
-                        let fingerprints = model_protocol::prompt_cache::RequestFingerprintHashes {
-                            model: model_protocol::prompt_cache::hash_serializable(
-                                &self.request.model,
-                            ),
-                            system: model_protocol::prompt_cache::hash_serializable(
-                                &self.request.system,
-                            ),
-                            tools: model_protocol::prompt_cache::hash_serializable(
-                                &self.request.tools,
-                            ),
-                            messages: model_protocol::prompt_cache::hash_serializable(
-                                &self.request.messages,
-                            ),
-                        };
-                        let cache_usage = model_protocol::prompt_cache::CacheUsage {
-                            input_tokens: usage.input_tokens,
-                            cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                            cache_read_input_tokens: usage.cache_read_input_tokens,
-                            output_tokens: usage.output_tokens,
-                        };
-                        let record =
-                            prompt_cache.record_usage(&cache_key, &cache_usage, &fingerprints);
-                        *self
-                            .last_prompt_cache_record
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
-                    }
-                    self.usage_recorded = true;
-                }
-            }
-            _ => {}
         }
     }
 }

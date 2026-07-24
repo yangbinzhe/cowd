@@ -3,21 +3,25 @@ use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
-use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use harness_contract::tool::ToolExposureProjection;
 use provider::{
     ApiError, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolDefinition, ToolResultContentBlock,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ApiClient, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage, MessageRole,
-    PromptCacheEvent, ProviderContextInventory, RuntimeError,
+    ProviderContextInventory, RuntimeError,
 };
 
 use crate::provider_registry::{ProviderRegistry, ProviderRegistrySnapshot};
+
+const PROVIDER_EVENT_QUEUE_CAPACITY: usize = 64;
+const MAX_COALESCED_TEXT_BYTES: usize = 64 * 1024;
 
 pub use provider::OutputContentBlock as ProviderOutputContentBlock;
 pub use provider::ToolDefinition as ProviderToolDefinition;
@@ -52,11 +56,33 @@ fn request_reasoning_effort(
 struct ProviderEntry {
     model: String,
     client: ProviderClient,
+    request_context: ProviderRequestContext,
+}
+
+/// Immutable provider configuration selected for one request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedProviderProfile {
+    pub registry_revision: u64,
+    pub provider_name: String,
+    pub model: String,
+    pub base_url: Option<String>,
+    pub protocol: Option<String>,
+}
+
+/// Request-local provider state. It is created after pinning a registry
+/// snapshot and is never stored in a shared transport/client slot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRequestContext {
+    pub request_id: String,
+    pub profile: ResolvedProviderProfile,
+    pub transport_fingerprint: crate::TransportProfileFingerprint,
+    pub attempt: u32,
 }
 
 #[derive(Clone)]
 pub struct ProviderRuntimeClient {
     registry: Arc<ProviderRegistry>,
+    transport_pool: Arc<crate::ProviderTransportPool>,
     tool_definitions: Vec<ToolDefinition>,
     tool_exposure: Option<ToolExposureProjection>,
     reasoning_effort: Option<String>,
@@ -71,7 +97,7 @@ pub struct ProviderRuntimeClient {
 /// expose each upstream event immediately while still aborting the request
 /// when the consumer applies a transport timeout or the turn is cancelled.
 struct ProviderEventStream {
-    receiver: UnboundedReceiver<Result<AssistantEvent, RuntimeError>>,
+    receiver: tokio::sync::mpsc::Receiver<Result<AssistantEvent, RuntimeError>>,
     producer: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -79,7 +105,7 @@ impl futures::Stream for ProviderEventStream {
     type Item = Result<AssistantEvent, RuntimeError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_next(cx)
+        self.receiver.poll_recv(cx)
     }
 }
 
@@ -100,10 +126,25 @@ impl ProviderRuntimeClient {
         model: String,
         tool_definitions: Vec<ToolDefinition>,
     ) -> Result<Self, String> {
+        Self::new_with_transport_pool(
+            registry,
+            Arc::new(crate::ProviderTransportPool::default()),
+            model,
+            tool_definitions,
+        )
+    }
+
+    pub fn new_with_transport_pool(
+        registry: Arc<ProviderRegistry>,
+        transport_pool: Arc<crate::ProviderTransportPool>,
+        model: String,
+        tool_definitions: Vec<ToolDefinition>,
+    ) -> Result<Self, String> {
         let snapshot = registry.pin();
-        build_provider_entry(&snapshot, &model)?;
+        build_provider_entry(&snapshot, &transport_pool, &model)?;
         Ok(Self {
             registry,
+            transport_pool,
             tool_definitions,
             tool_exposure: None,
             reasoning_effort: None,
@@ -185,21 +226,54 @@ fn tool_definitions_for_exposure(
 
 fn build_provider_entry(
     snapshot: &ProviderRegistrySnapshot,
+    transport_pool: &crate::ProviderTransportPool,
     model: &str,
 ) -> Result<ProviderEntry, String> {
     let resolved = model.trim().to_string();
-    let client = match snapshot.resolve(&resolved) {
-        Some(provider) => ProviderClient::from_config(provider).map_err(|e| e.to_string())?,
+    let (transport_fingerprint, http) = transport_pool
+        .checkout_default()
+        .map_err(|error| error.to_string())?;
+    let (client, provider_name, base_url, protocol) = match snapshot.resolve(&resolved) {
+        Some(provider) => {
+            let protocol = crate::config::ProviderProtocol::effective_for_provider(provider)
+                .map_err(|error| error.to_string())?;
+            (
+                ProviderClient::from_config_with_effective_protocol_and_http(
+                    provider, protocol, http,
+                )
+                .map_err(|e| e.to_string())?,
+                provider.name.clone(),
+                Some(provider.base_url.clone()),
+                Some(protocol.as_str().to_string()),
+            )
+        }
         None => {
             tracing::warn!(
                 "model '{resolved}' not in providers config, falling back to environment variables"
             );
-            ProviderClient::from_model(&resolved).map_err(|e| e.to_string())?
+            (
+                ProviderClient::from_model_with_http(&resolved, http).map_err(|e| e.to_string())?,
+                "environment".to_string(),
+                None,
+                None,
+            )
         }
     };
     Ok(ProviderEntry {
-        model: resolved,
+        model: resolved.clone(),
         client,
+        request_context: ProviderRequestContext {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            profile: ResolvedProviderProfile {
+                registry_revision: snapshot.revision(),
+                provider_name,
+                model: resolved,
+                base_url,
+                protocol,
+            },
+            transport_fingerprint,
+            attempt: 1,
+        },
     })
 }
 
@@ -251,25 +325,26 @@ impl ProviderRuntimeClient {
 
         // Runtime selects one candidate and owns the route/retry lifecycle.
         // This adapter owns exactly one pinned wire-protocol attempt.
-        let entry = match build_provider_entry(&provider_snapshot, &request.model) {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!(
-                    model = %request.model,
-                    registry_revision = provider_snapshot.revision(),
-                    configured_providers = ?provider_snapshot.provider_names(),
-                    error = %error,
-                    "provider request could not resolve a configured runtime client"
-                );
-                return Box::pin(futures::stream::once(async move {
-                    Err(RuntimeError::new(format!(
-                        "provider candidate `{}` is unavailable: {error}",
-                        request.model
-                    )))
-                }));
-            }
-        };
-        let (sender, receiver) = mpsc::unbounded();
+        let entry =
+            match build_provider_entry(&provider_snapshot, &self.transport_pool, &request.model) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(
+                        model = %request.model,
+                        registry_revision = provider_snapshot.revision(),
+                        configured_providers = ?provider_snapshot.provider_names(),
+                        error = %error,
+                        "provider request could not resolve a configured runtime client"
+                    );
+                    return Box::pin(futures::stream::once(async move {
+                        Err(RuntimeError::new(format!(
+                            "provider candidate `{}` is unavailable: {error}",
+                            request.model
+                        )))
+                    }));
+                }
+            };
+        let (sender, receiver) = tokio::sync::mpsc::channel(PROVIDER_EVENT_QUEUE_CAPACITY);
         let reasoning_effort = request_reasoning_effort(
             &entry.model,
             request.reasoning_effort_override.clone(),
@@ -306,7 +381,7 @@ impl ProviderRuntimeClient {
                     model = %entry.model,
                     "provider stream was created outside an active Tokio runtime"
                 );
-                let _ = sender.unbounded_send(Err(RuntimeError::new(
+                let _ = sender.try_send(Err(RuntimeError::new(
                     "provider stream requires an active Tokio runtime",
                 )));
                 None
@@ -328,8 +403,18 @@ async fn forward_provider_attempt(
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
-    sender: UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+    sender: tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) {
+    let request_context = &entry.request_context;
+    tracing::debug!(
+        provider_request_id = %request_context.request_id,
+        provider = %request_context.profile.provider_name,
+        model = %request_context.profile.model,
+        registry_revision = request_context.profile.registry_revision,
+        transport_fingerprint = request_context.transport_fingerprint.0,
+        attempt = request_context.attempt,
+        "starting request-local provider attempt"
+    );
     let message_request = MessageRequest {
         model: entry.model.clone(),
         max_tokens,
@@ -360,11 +445,13 @@ async fn forward_provider_attempt(
         );
         let provider_context_window_limit = error.error.context_window_limit_hint();
         let provider_tool_protocol_failure = error.error.is_compatibility_tool_protocol_failure();
-        let _ = sender.unbounded_send(Err(RuntimeError::with_provider_failure_metadata(
-            error.error.to_string(),
-            provider_context_window_limit,
-            provider_tool_protocol_failure,
-        )));
+        let _ = sender
+            .send(Err(RuntimeError::with_provider_failure_metadata(
+                error.error.to_string(),
+                provider_context_window_limit,
+                provider_tool_protocol_failure,
+            )))
+            .await;
     }
 }
 
@@ -403,7 +490,7 @@ async fn forward_provider_stream(
     effective_model: &str,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
-    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let mut stream = client
         .stream_message(message_request)
@@ -413,6 +500,7 @@ async fn forward_provider_stream(
     let mut saw_stop = false;
     let mut emitted = false;
     let mut provider_model_emitted = false;
+    let mut pending_text = String::new();
 
     while let Some(event) = stream
         .next_event()
@@ -428,22 +516,48 @@ async fn forward_provider_stream(
                 emit_output,
                 &stream_callback,
                 &mut emitted,
-            ) {
+            )
+            .await
+            {
                 return Ok(ForwardedProviderStream::ConsumerDropped);
             }
             provider_model_emitted = true;
         }
         match event {
             ApiStreamEvent::MessageStart(start) => {
+                if !flush_pending_text(
+                    sender,
+                    &mut pending_text,
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                )
+                .await
+                {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
                 let mut events = Vec::new();
                 for block in start.message.content {
                     push_provider_output_block(block, 0, &mut events, &mut pending_tools, true);
                 }
-                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted)
+                    .await
+                {
                     return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
             }
             ApiStreamEvent::ContentBlockStart(start) => {
+                if !flush_pending_text(
+                    sender,
+                    &mut pending_text,
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                )
+                .await
+                {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
                 let mut events = Vec::new();
                 push_provider_output_block(
                     start.content_block,
@@ -452,20 +566,24 @@ async fn forward_provider_stream(
                     &mut pending_tools,
                     true,
                 );
-                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+                if !forward_events(sender, events, emit_output, &stream_callback, &mut emitted)
+                    .await
+                {
                     return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
             }
             ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                 ContentBlockDelta::TextDelta { text } => {
                     if !text.is_empty()
-                        && !forward_event(
+                        && !forward_text_delta(
                             sender,
-                            AssistantEvent::TextDelta(text),
+                            text,
+                            &mut pending_text,
                             emit_output,
                             &stream_callback,
                             &mut emitted,
                         )
+                        .await
                     {
                         return Ok(ForwardedProviderStream::ConsumerDropped);
                     }
@@ -479,6 +597,17 @@ async fn forward_provider_stream(
                 | ContentBlockDelta::SignatureDelta { .. } => {}
             },
             ApiStreamEvent::ContentBlockStop(stop) => {
+                if !flush_pending_text(
+                    sender,
+                    &mut pending_text,
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                )
+                .await
+                {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
                 if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
                     if !forward_event(
                         sender,
@@ -486,23 +615,49 @@ async fn forward_provider_stream(
                         emit_output,
                         &stream_callback,
                         &mut emitted,
-                    ) {
+                    )
+                    .await
+                    {
                         return Ok(ForwardedProviderStream::ConsumerDropped);
                     }
                 }
             }
             ApiStreamEvent::MessageDelta(delta) => {
+                if !flush_pending_text(
+                    sender,
+                    &mut pending_text,
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                )
+                .await
+                {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
                 if !forward_event(
                     sender,
                     AssistantEvent::Usage(delta.usage.token_usage()),
                     emit_output,
                     &stream_callback,
                     &mut emitted,
-                ) {
+                )
+                .await
+                {
                     return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
             }
             ApiStreamEvent::MessageStop(_) => {
+                if !flush_pending_text(
+                    sender,
+                    &mut pending_text,
+                    emit_output,
+                    &stream_callback,
+                    &mut emitted,
+                )
+                .await
+                {
+                    return Ok(ForwardedProviderStream::ConsumerDropped);
+                }
                 saw_stop = true;
                 if !forward_event(
                     sender,
@@ -510,22 +665,24 @@ async fn forward_provider_stream(
                     emit_output,
                     &stream_callback,
                     &mut emitted,
-                ) {
+                )
+                .await
+                {
                     return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
             }
         }
     }
 
-    let mut prompt_cache_events = Vec::new();
-    push_prompt_cache_record(client, &mut prompt_cache_events);
-    if !forward_events(
+    if !flush_pending_text(
         sender,
-        prompt_cache_events,
+        &mut pending_text,
         emit_output,
         &stream_callback,
         &mut emitted,
-    ) {
+    )
+    .await
+    {
         return Ok(ForwardedProviderStream::ConsumerDropped);
     }
 
@@ -539,7 +696,9 @@ async fn forward_provider_stream(
             emit_output,
             &stream_callback,
             &mut emitted,
-        ) {
+        )
+        .await
+        {
             Ok(ForwardedProviderStream::Completed)
         } else {
             Ok(ForwardedProviderStream::ConsumerDropped)
@@ -560,28 +719,30 @@ async fn forward_provider_stream(
             model: effective_model.to_string(),
         },
     );
-    push_prompt_cache_record(client, &mut events);
-    if forward_events(sender, events, emit_output, &stream_callback, &mut emitted) {
+    if forward_events(sender, events, emit_output, &stream_callback, &mut emitted).await {
         Ok(ForwardedProviderStream::Completed)
     } else {
         Ok(ForwardedProviderStream::ConsumerDropped)
     }
 }
 
-fn forward_events(
-    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+async fn forward_events(
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
     events: Vec<AssistantEvent>,
     emit_output: bool,
     stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
     emitted: &mut bool,
 ) -> bool {
-    events
-        .into_iter()
-        .all(|event| forward_event(sender, event, emit_output, stream_callback, emitted))
+    for event in events {
+        if !forward_event(sender, event, emit_output, stream_callback, emitted).await {
+            return false;
+        }
+    }
+    true
 }
 
-fn forward_event(
-    sender: &UnboundedSender<Result<AssistantEvent, RuntimeError>>,
+async fn forward_event(
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
     event: AssistantEvent,
     emit_output: bool,
     stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
@@ -597,7 +758,59 @@ fn forward_event(
         }
     }
     *emitted = true;
-    sender.unbounded_send(Ok(event)).is_ok()
+    let producer_wait_started = Instant::now();
+    let sent = sender.send(Ok(event)).await.is_ok();
+    crate::execution_core::performance::observe_duration(
+        "provider_producer_wait_ms",
+        producer_wait_started.elapsed(),
+    );
+    sent
+}
+
+async fn forward_text_delta(
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
+    text: String,
+    pending_text: &mut String,
+    emit_output: bool,
+    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    emitted: &mut bool,
+) -> bool {
+    if pending_text.is_empty() && sender.capacity() > 0 {
+        return forward_event(
+            sender,
+            AssistantEvent::TextDelta(text),
+            emit_output,
+            stream_callback,
+            emitted,
+        )
+        .await;
+    }
+    pending_text.push_str(&text);
+    if pending_text.len() < MAX_COALESCED_TEXT_BYTES && sender.capacity() == 0 {
+        return true;
+    }
+    flush_pending_text(sender, pending_text, emit_output, stream_callback, emitted).await
+}
+
+async fn flush_pending_text(
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
+    pending_text: &mut String,
+    emit_output: bool,
+    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    emitted: &mut bool,
+) -> bool {
+    if pending_text.is_empty() {
+        return true;
+    }
+    let text = std::mem::take(pending_text);
+    forward_event(
+        sender,
+        AssistantEvent::TextDelta(text),
+        emit_output,
+        stream_callback,
+        emitted,
+    )
+    .await
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
@@ -700,32 +913,14 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
     events
 }
 
-fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
-    if let Some(record) = client.take_last_prompt_cache_record() {
-        if let Some(event) = prompt_cache_record_to_runtime_event(record) {
-            events.push(AssistantEvent::PromptCache(event));
-        }
-    }
-}
-
-fn prompt_cache_record_to_runtime_event(
-    record: provider::PromptCacheRecord,
-) -> Option<PromptCacheEvent> {
-    let cache_break = record.cache_break?;
-    Some(PromptCacheEvent {
-        unexpected: cache_break.unexpected,
-        reason: cache_break.reason,
-        previous_cache_read_input_tokens: cache_break.previous_cache_read_input_tokens,
-        current_cache_read_input_tokens: cache_break.current_cache_read_input_tokens,
-        token_drop: cache_break.token_drop,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{request_reasoning_effort, tool_definitions_for_exposure};
+    use super::{
+        build_provider_entry, forward_text_delta, request_reasoning_effort,
+        tool_definitions_for_exposure,
+    };
     use crate::config::{ProviderConfig, ProvidersConfig};
-    use crate::{ProviderRegistry, ProviderRuntimeClient};
+    use crate::{AssistantEvent, ProviderRegistry, ProviderRuntimeClient, ProviderTransportPool};
     use harness_contract::tool::ToolExposureProjection;
     use provider::ToolDefinition;
     use serde_json::json;
@@ -821,5 +1016,82 @@ mod tests {
             ),
             Some("max".to_string())
         );
+    }
+
+    #[test]
+    fn request_context_is_fresh_while_transport_is_reused() {
+        let registry = ProviderRegistry::new(ProvidersConfig {
+            providers: HashMap::from([(
+                "test".to_string(),
+                ProviderConfig {
+                    name: "test".to_string(),
+                    base_url: "https://example.test/v1".to_string(),
+                    api_key: "test".to_string(),
+                    models: vec!["primary".to_string()],
+                    protocol: Some("completions".to_string()),
+                },
+            )]),
+        })
+        .expect("registry");
+        let snapshot = registry.pin();
+        let pool = ProviderTransportPool::new(2);
+
+        let first = build_provider_entry(&snapshot, &pool, "primary").expect("first");
+        let second = build_provider_entry(&snapshot, &pool, "primary").expect("second");
+
+        assert_ne!(
+            first.request_context.request_id,
+            second.request_context.request_id
+        );
+        assert_eq!(
+            first.request_context.transport_fingerprint,
+            second.request_context.transport_fingerprint
+        );
+        assert_eq!(pool.stats().builds, 1);
+        assert_eq!(pool.stats().hits, 1);
+    }
+
+    #[tokio::test]
+    async fn text_deltas_coalesce_while_bounded_queue_is_full() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .send(Ok(AssistantEvent::ProviderModel {
+                model: "test".to_string(),
+            }))
+            .await
+            .unwrap();
+        let mut pending = String::new();
+        let mut emitted = false;
+
+        assert!(
+            forward_text_delta(
+                &sender,
+                "a".to_string(),
+                &mut pending,
+                false,
+                &None,
+                &mut emitted
+            )
+            .await
+        );
+        assert!(
+            forward_text_delta(
+                &sender,
+                "b".to_string(),
+                &mut pending,
+                false,
+                &None,
+                &mut emitted
+            )
+            .await
+        );
+        assert_eq!(pending, "ab");
+        let _ = receiver.recv().await;
+        assert!(super::flush_pending_text(&sender, &mut pending, false, &None, &mut emitted).await);
+        assert!(pending.is_empty());
+        assert!(matches!(
+            receiver.recv().await,
+            Some(Ok(AssistantEvent::TextDelta(text))) if text == "ab"
+        ));
     }
 }

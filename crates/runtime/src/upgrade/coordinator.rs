@@ -221,7 +221,7 @@ impl UpgradeCoordinator {
         ))?;
         let content_hash = format!(
             "{:016x}",
-            model_protocol::prompt_cache::stable_hash_bytes(&hash_payload)
+            model_protocol::fingerprint::stable_hash_bytes(&hash_payload)
         );
         Ok(UpgradeInventory {
             schema_version: 1,

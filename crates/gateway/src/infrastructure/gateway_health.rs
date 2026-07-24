@@ -20,6 +20,7 @@ pub(crate) struct GatewayRuntimeSnapshot {
     pub(crate) surface_runtime: bool,
     pub(crate) event_bus: bool,
     pub(crate) session_kernel: bool,
+    pub(crate) provider_transport: Option<runtime::ProviderTransportPoolStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +66,11 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         surface_runtime: state.services.surface.is_runtime_available(),
         event_bus: true,
         session_kernel: true,
+        provider_transport: state
+            .services
+            .runtime
+            .as_ref()
+            .map(|service| service.runtime_services().provider_transport_pool().stats()),
     };
     let mut storage_registry = state.services.selected_storage.as_ref().map_or_else(
         || {

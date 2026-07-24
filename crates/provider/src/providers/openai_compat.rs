@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 use tracing;
 
 use crate::error::{ApiError, CompatibilityToolProtocolFailure};
-use crate::http_client::build_http_client_or_default;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
@@ -149,6 +148,10 @@ impl OpenAiCompatConfig {
     }
 }
 
+pub(crate) fn read_env_api_key(config: OpenAiCompatConfig) -> Result<Option<String>, ApiError> {
+    read_env_non_empty(config.api_key_env)
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
@@ -172,8 +175,17 @@ impl OpenAiCompatClient {
     }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
+        Self::new_with_http(api_key, config, reqwest::Client::new())
+    }
+
+    #[must_use]
+    pub fn new_with_http(
+        api_key: impl Into<String>,
+        config: OpenAiCompatConfig,
+        http: reqwest::Client,
+    ) -> Self {
         Self {
-            http: build_http_client_or_default(),
+            http,
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
@@ -207,8 +219,25 @@ impl OpenAiCompatClient {
         provider_name: impl Into<String>,
         wire_protocol: OpenAiWireProtocol,
     ) -> Self {
+        Self::new_custom_with_protocol_and_http(
+            api_key,
+            base_url,
+            provider_name,
+            wire_protocol,
+            reqwest::Client::new(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_custom_with_protocol_and_http(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        provider_name: impl Into<String>,
+        wire_protocol: OpenAiWireProtocol,
+        http: reqwest::Client,
+    ) -> Self {
         Self {
-            http: build_http_client_or_default(),
+            http,
             api_key: api_key.into(),
             config: OpenAiCompatConfig::openai().with_wire_protocol(wire_protocol),
             base_url: base_url.into(),
@@ -226,7 +255,11 @@ impl OpenAiCompatClient {
                 config.credential_env_vars(),
             ));
         };
-        Ok(Self::new(api_key, config))
+        Ok(Self::new_with_http(
+            api_key,
+            config,
+            crate::http_client::build_http_client()?,
+        ))
     }
 
     #[must_use]
