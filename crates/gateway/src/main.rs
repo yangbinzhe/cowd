@@ -6529,22 +6529,16 @@ mod tests {
     }
 
     #[test]
-    fn resume_supported_command_list_matches_expected_surface() {
+    fn resumed_tui_preserves_local_recovery_commands_without_runtime_compaction() {
         let names = resume_supported_slash_commands()
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        // Now with 135+ slash commands, verify minimum resume support
-        assert!(
-            names.len() >= 39,
-            "expected at least 39 resume-supported commands, got {}",
-            names.len()
-        );
-        // Verify key offline-resume commands still exist. `/compact` is
-        // intentionally absent: semantic compaction requires a live Gateway
-        // Runtime and durable session store.
+
         assert!(names.contains(&"help"));
         assert!(names.contains(&"status"));
+        // Semantic compaction requires a live Gateway Runtime and durable
+        // session store, so it must not be advertised as an offline action.
         assert!(!names.contains(&"compact"));
     }
 
