@@ -88,6 +88,16 @@ impl MemoryService {
                         "background_lag_ms": null,
                     })
                 });
+            let kernel_degraded = kernel_health
+                .get("degraded")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let kernel_degraded_reason = kernel_health
+                .get("degraded_reasons")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|reasons| reasons.first())
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned);
             let vector_count = mgr.vector_index_count();
             let scope_migrations = mgr
                 .legacy_scope_migration_reports()
@@ -116,9 +126,9 @@ impl MemoryService {
                 .sum();
             serde_json::json!({
                 "enabled": true,
-                "status": "ready",
-                "degraded": false,
-                "degraded_reason": null,
+                "status": if kernel_degraded { "degraded" } else { "ready" },
+                "degraded": kernel_degraded,
+                "degraded_reason": kernel_degraded_reason,
                 "layers": layers,
                 "total_entries": total_entries,
                 "vector_count": vector_count,
@@ -711,6 +721,7 @@ fn memory_kernel_health_json(health: memory::MemoryHealth) -> serde_json::Value 
         "evidence_coverage": health.evidence_coverage,
         "link_coverage": health.link_coverage,
         "background_lag_ms": health.background_lag_ms,
+        "background_extraction": health.background_extraction,
     })
 }
 

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    cognitive::CognitiveContextManager,
+    cognitive::{BackgroundExtractionHealth, CognitiveContextManager},
     compression::session::{SessionCheckpointFact, SessionSemanticCheckpoint},
     error::MemoryError,
     memory_authority::{
@@ -366,6 +366,7 @@ pub struct MemoryHealth {
     pub evidence_coverage: f32,
     pub link_coverage: f32,
     pub background_lag_ms: Option<u64>,
+    pub background_extraction: BackgroundExtractionHealth,
     pub degraded: Vec<MemoryDegradation>,
 }
 
@@ -378,6 +379,7 @@ impl Default for MemoryHealth {
             evidence_coverage: 1.0,
             link_coverage: 1.0,
             background_lag_ms: None,
+            background_extraction: BackgroundExtractionHealth::default(),
             degraded: Vec::new(),
         }
     }
@@ -1120,20 +1122,28 @@ impl MemoryKernel {
 
     pub async fn health(&self, _ctx: &MemoryTurnContext) -> MemoryKernelResult<MemoryHealth> {
         let started = Instant::now();
+        let background_extraction = self.manager.background_extraction_health();
         let entries = match self.manager.list_all_entries().await {
             Ok(entries) => entries,
             Err(error) => {
                 return Ok(MemoryHealth {
                     degraded: vec![MemoryDegradation::PrepareFailed(error.to_string())],
                     background_lag_ms: Some(started.elapsed().as_millis() as u64),
+                    background_extraction,
                     ..MemoryHealth::default()
                 });
             }
         };
-        Ok(health_from_entries(
-            &entries,
-            Some(started.elapsed().as_millis() as u64),
-        ))
+        let mut health = health_from_entries(&entries, Some(started.elapsed().as_millis() as u64));
+        if let Some(error) = background_extraction.last_error.as_ref() {
+            health
+                .degraded
+                .push(MemoryDegradation::PostTurnFailed(error.clone()));
+        } else if background_extraction.pending_requests > 0 {
+            health.degraded.push(MemoryDegradation::DistillationBacklog);
+        }
+        health.background_extraction = background_extraction;
+        Ok(health)
     }
 
     /// Build a read-only projection for one governance layer.
@@ -1928,6 +1938,7 @@ fn health_from_entries(entries: &[MemoryEntry], background_lag_ms: Option<u64>) 
         evidence_coverage: (evidence_backed / total).clamp(0.0, 1.0),
         link_coverage: (linked / total).clamp(0.0, 1.0),
         background_lag_ms,
+        background_extraction: BackgroundExtractionHealth::default(),
         degraded: Vec::new(),
     }
 }

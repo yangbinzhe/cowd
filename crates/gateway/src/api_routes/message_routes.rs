@@ -527,14 +527,35 @@ async fn cancel_session_input(
                 }),
             )
         })?;
-    let projection = runtime_service.session_input_projection(&id).await.ok();
-    let inbox = runtime_service.active_turn_inbox(&id, None).await.ok();
+    let mut projection_warnings = Vec::new();
+    let projection = match runtime_service.session_input_projection(&id).await {
+        Ok(projection) => Some(projection),
+        Err(error) => {
+            projection_warnings.push(serde_json::json!({
+                "projection": "input_projection",
+                "error": error.message(),
+            }));
+            None
+        }
+    };
+    let inbox = match runtime_service.active_turn_inbox(&id, None).await {
+        Ok(inbox) => Some(inbox),
+        Err(error) => {
+            projection_warnings.push(serde_json::json!({
+                "projection": "turn_inbox",
+                "error": error.message(),
+            }));
+            None
+        }
+    };
     Ok(Json(serde_json::json!({
         "kind": "session_input.cancel",
         "session_id": id,
         "input": input,
         "input_projection": projection,
         "turn_inbox": inbox,
+        "projection_status": if projection_warnings.is_empty() { "ready" } else { "degraded" },
+        "projection_warnings": projection_warnings,
     })))
 }
 
@@ -576,14 +597,35 @@ async fn reclassify_session_input(
                 }),
             )
         })?;
-    let projection = runtime_service.session_input_projection(&id).await.ok();
-    let inbox = runtime_service.active_turn_inbox(&id, None).await.ok();
+    let mut projection_warnings = Vec::new();
+    let projection = match runtime_service.session_input_projection(&id).await {
+        Ok(projection) => Some(projection),
+        Err(error) => {
+            projection_warnings.push(serde_json::json!({
+                "projection": "input_projection",
+                "error": error.message(),
+            }));
+            None
+        }
+    };
+    let inbox = match runtime_service.active_turn_inbox(&id, None).await {
+        Ok(inbox) => Some(inbox),
+        Err(error) => {
+            projection_warnings.push(serde_json::json!({
+                "projection": "turn_inbox",
+                "error": error.message(),
+            }));
+            None
+        }
+    };
     Ok(Json(serde_json::json!({
         "kind": "session_input.reclassify",
         "session_id": id,
         "input": input,
         "input_projection": projection,
         "turn_inbox": inbox,
+        "projection_status": if projection_warnings.is_empty() { "ready" } else { "degraded" },
+        "projection_warnings": projection_warnings,
     })))
 }
 

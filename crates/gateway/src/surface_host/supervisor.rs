@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 
 use chrono::Utc;
@@ -69,14 +69,33 @@ impl SurfaceHost {
         surface: &str,
     ) -> Result<SurfaceRuntimeSnapshot, SurfaceError> {
         let surface = normalize_surface_id(surface);
-        if let Some(process) = self.managed.lock().await.remove(&surface) {
-            if let Some(pid) = process.pid {
-                #[cfg(unix)]
-                {
-                    let _ = Command::new("kill").arg(pid.to_string()).status();
+        let mut cleanup_error = None;
+        if let Some(process) = self.managed.lock().await.get(&surface).cloned() {
+            if let Err(error) = terminate_managed_child(&process.child).await {
+                let snapshot = self
+                    .mark_runtime_error(
+                        &surface,
+                        SurfaceRuntimeStatus::Unavailable,
+                        SurfaceFailureKind::ProcessExited,
+                        error.clone(),
+                    )
+                    .await;
+                self.push_ledger(SurfaceSupervisorEvent::new(
+                    &surface,
+                    SurfaceRuntimeStatus::Unavailable,
+                    error,
+                ))
+                .await;
+                return Ok(snapshot);
+            }
+            self.managed.lock().await.remove(&surface);
+            if let Err(error) = std::fs::remove_dir_all(&process.runtime_dir) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    cleanup_error = Some(format!(
+                        "managed surface stopped but runtime cleanup failed: {error}"
+                    ));
                 }
             }
-            let _ = std::fs::remove_dir_all(&process.runtime_dir);
         }
         let mut snapshot = self.runtime_snapshot(&surface).unwrap_or_else(|| {
             SurfaceRuntimeSnapshot::discovered(&surface, SurfaceLifecycle::Managed)
@@ -84,6 +103,9 @@ impl SurfaceHost {
         snapshot.status = SurfaceRuntimeStatus::Disabled;
         snapshot.active = false;
         snapshot.pid = None;
+        snapshot.last_error = cleanup_error
+            .clone()
+            .map(|message| SurfaceRuntimeError::new(SurfaceFailureKind::Unknown, message));
         snapshot.available_actions = vec![
             SurfaceSupervisorAction::Start,
             SurfaceSupervisorAction::Repair,
@@ -93,7 +115,9 @@ impl SurfaceHost {
         self.push_ledger(SurfaceSupervisorEvent::new(
             &surface,
             SurfaceRuntimeStatus::Disabled,
-            "managed surface stopped by operator",
+            cleanup_error
+                .as_deref()
+                .unwrap_or("managed surface stopped by operator"),
         ))
         .await;
         Ok(snapshot)
@@ -354,8 +378,7 @@ async fn start_managed_process(
     let client = match EdgeH2Client::connect(&socket_path, &surface_id, &token).await {
         Ok(client) => client,
         Err(error) => {
-            let _ = child.kill().await;
-            let _ = std::fs::remove_dir_all(&runtime_dir);
+            cleanup_failed_managed_start(&surface_id, &mut child, &runtime_dir).await;
             return Err(error);
         }
     };
@@ -368,21 +391,20 @@ async fn start_managed_process(
     let bootstrap_response = match client.bootstrap(&bootstrap).await {
         Ok(response) => response,
         Err(error) => {
-            let _ = child.kill().await;
-            let _ = std::fs::remove_dir_all(&runtime_dir);
+            cleanup_failed_managed_start(&surface_id, &mut child, &runtime_dir).await;
             return Err(error);
         }
     };
     if bootstrap_response.surface_id != surface_id
         || bootstrap_response.driver_profile != driver_profile
     {
-        let _ = child.kill().await;
-        let _ = std::fs::remove_dir_all(&runtime_dir);
+        cleanup_failed_managed_start(&surface_id, &mut child, &runtime_dir).await;
         return Err(SurfaceError::Invocation {
             surface: surface_id,
             reason: "managed edge bootstrap identity mismatch".to_string(),
         });
     }
+    let child = Arc::new(AsyncMutex::new(child));
     let events = Arc::new(AsyncMutex::new(VecDeque::new()));
     client.spawn_event_stream(events.clone(), event_tx, messages);
     let wait_runtime = runtime.clone();
@@ -390,8 +412,11 @@ async fn start_managed_process(
     let wait_managed = managed.clone();
     let wait_surface = surface_id.clone();
     let wait_runtime_dir = runtime_dir.clone();
+    let wait_child = child.clone();
     tokio::spawn(async move {
-        let status = child.wait().await;
+        let status = wait_for_managed_child(&wait_child).await;
+        let mut event_status = SurfaceRuntimeStatus::Unavailable;
+        let mut event_message = "managed surface process exited";
         {
             let mut runtime = wait_runtime
                 .write()
@@ -399,7 +424,10 @@ async fn start_managed_process(
             let snapshot = runtime.entry(wait_surface.clone()).or_insert_with(|| {
                 SurfaceRuntimeSnapshot::discovered(&wait_surface, SurfaceLifecycle::Managed)
             });
-            if !matches!(snapshot.status, SurfaceRuntimeStatus::Disabled) {
+            if matches!(snapshot.status, SurfaceRuntimeStatus::Disabled) {
+                event_status = SurfaceRuntimeStatus::Disabled;
+                event_message = "managed surface process stopped";
+            } else {
                 snapshot.status = SurfaceRuntimeStatus::Unavailable;
                 snapshot.active = false;
                 snapshot.pid = None;
@@ -414,14 +442,19 @@ async fn start_managed_process(
             }
         }
         wait_managed.lock().await.remove(&wait_surface);
-        let _ = std::fs::remove_dir_all(wait_runtime_dir);
+        if let Err(error) = std::fs::remove_dir_all(&wait_runtime_dir) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    surface = %wait_surface,
+                    path = %wait_runtime_dir.display(),
+                    %error,
+                    "managed surface runtime directory cleanup failed"
+                );
+            }
+        }
         push_supervisor_event(
             &wait_ledger,
-            SurfaceSupervisorEvent::new(
-                &wait_surface,
-                SurfaceRuntimeStatus::Unavailable,
-                "managed surface process exited",
-            ),
+            SurfaceSupervisorEvent::new(&wait_surface, event_status, event_message),
         )
         .await;
     });
@@ -429,9 +462,110 @@ async fn start_managed_process(
         pid,
         started_at,
         client,
+        child,
         events,
         runtime_dir,
     })
+}
+
+async fn wait_for_managed_child(
+    child: &Arc<AsyncMutex<tokio::process::Child>>,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.lock().await.try_wait()? {
+            return Ok(status);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn terminate_managed_child(
+    child: &Arc<AsyncMutex<tokio::process::Child>>,
+) -> Result<(), String> {
+    let mut child = child.lock().await;
+    terminate_child_process(&mut child).await
+}
+
+async fn terminate_child_process(child: &mut tokio::process::Child) -> Result<(), String> {
+    const GRACEFUL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const FORCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    if child
+        .try_wait()
+        .map_err(|error| format!("failed to inspect managed surface process: {error}"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let pid = child
+        .id()
+        .ok_or_else(|| "managed surface process has no process id".to_string())?;
+    let term_status = TokioCommand::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .await
+        .map_err(|error| format!("failed to send SIGTERM to managed surface process: {error}"))?;
+    if !term_status.success() {
+        return Err(format!(
+            "SIGTERM command failed for managed surface process {pid}: {term_status}"
+        ));
+    }
+
+    let graceful_exit = tokio::time::timeout(GRACEFUL_TIMEOUT, async {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok::<_, std::io::Error>(status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    match graceful_exit {
+        Ok(Ok(_)) => return Ok(()),
+        Ok(Err(error)) => {
+            return Err(format!(
+                "failed while waiting for managed surface process termination: {error}"
+            ));
+        }
+        Err(_) => {}
+    }
+
+    child
+        .start_kill()
+        .map_err(|error| format!("failed to force-kill managed surface process: {error}"))?;
+    match tokio::time::timeout(FORCE_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(format!(
+            "failed while waiting for forced managed surface process termination: {error}"
+        )),
+        Err(_) => Err(format!(
+            "managed surface process did not terminate after SIGTERM and SIGKILL within {} ms",
+            (GRACEFUL_TIMEOUT + FORCE_TIMEOUT).as_millis()
+        )),
+    }
+}
+
+async fn cleanup_failed_managed_start(
+    surface: &str,
+    child: &mut tokio::process::Child,
+    runtime_dir: &Path,
+) {
+    if let Err(error) = terminate_child_process(child).await {
+        tracing::error!(
+            %surface,
+            %error,
+            "failed to terminate managed surface after startup failure"
+        );
+    }
+    if let Err(error) = std::fs::remove_dir_all(runtime_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                %surface,
+                path = %runtime_dir.display(),
+                %error,
+                "failed to clean managed surface runtime directory after startup failure"
+            );
+        }
+    }
 }
 
 fn resolve_managed_artifact(manifest: &Path, artifact: &str) -> Result<PathBuf, String> {
@@ -524,8 +658,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{default_source_surface_config, stage_managed_artifact};
+    use super::{default_source_surface_config, stage_managed_artifact, terminate_managed_child};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[test]
     fn source_surface_without_explicit_config_receives_empty_config() {
@@ -559,5 +695,54 @@ mod tests {
         assert_eq!(staged, runtime.join("cowd-edge-fixture"));
         assert!(staged.starts_with(&runtime));
         assert_eq!(std::fs::read(staged).unwrap(), b"fixture");
+    }
+
+    #[tokio::test]
+    async fn managed_child_termination_waits_for_the_process_to_exit() {
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn managed child fixture");
+        let child = Arc::new(Mutex::new(child));
+
+        terminate_managed_child(&child)
+            .await
+            .expect("managed child should terminate");
+
+        assert!(
+            child
+                .lock()
+                .await
+                .try_wait()
+                .expect("inspect terminated child")
+                .is_some(),
+            "stop must not return before the managed process exits"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_child_termination_escalates_when_sigterm_is_ignored() {
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 1; done"])
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn TERM-resistant managed child fixture");
+        let child = Arc::new(Mutex::new(child));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        terminate_managed_child(&child)
+            .await
+            .expect("managed child should be force-terminated");
+
+        assert!(
+            child
+                .lock()
+                .await
+                .try_wait()
+                .expect("inspect force-terminated child")
+                .is_some(),
+            "stop must escalate to SIGKILL when SIGTERM is ignored"
+        );
     }
 }

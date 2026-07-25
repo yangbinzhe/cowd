@@ -615,6 +615,31 @@ impl RuntimeControlSnapshot {
             .and_then(|item| item.get("latest_checkpoint_id"))
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned);
+        if value
+            .pointer("/kernel_health/degraded")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let reasons = value
+                .pointer("/kernel_health/degraded_reasons")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|reasons| !reasons.is_empty())
+                .unwrap_or_else(|| "unspecified kernel degradation".to_string());
+            self.degrade(format!("memory kernel degraded: {reasons}"));
+        }
+        if let Some(error) = value
+            .pointer("/kernel_health/background_extraction/last_error")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.degrade(format!("memory background extraction failed: {error}"));
+        }
     }
 
     pub fn ingest_cross_plane_summary(&mut self, value: &serde_json::Value) {
@@ -2207,6 +2232,31 @@ pub async fn refresh_runtime_control_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_kernel_failure_becomes_a_visible_tui_degraded_reason() {
+        let mut snapshot = RuntimeControlSnapshot::default();
+
+        snapshot.ingest_memory_status(&serde_json::json!({
+            "status": "degraded",
+            "kernel_health": {
+                "degraded": true,
+                "degraded_reasons": ["BackgroundExtraction"],
+                "background_extraction": {
+                    "last_error": "provider unavailable"
+                }
+            }
+        }));
+
+        assert!(snapshot
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason.contains("memory kernel degraded")));
+        assert!(snapshot
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason.contains("provider unavailable")));
+    }
 
     #[test]
     fn global_snapshot_cannot_overwrite_this_surfaces_read_only_admission() {

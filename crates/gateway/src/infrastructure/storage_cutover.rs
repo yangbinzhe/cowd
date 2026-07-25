@@ -490,7 +490,13 @@ impl MaintenanceGuard {
 
 impl Drop for MaintenanceGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Err(error) = fs::remove_file(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "failed to release storage maintenance barrier"
+            );
+        }
     }
 }
 

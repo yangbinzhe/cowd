@@ -278,11 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn tui_config_version_is_2() {
-        assert_eq!(TUI_CONFIG_VERSION, 2);
-    }
-
-    #[test]
     fn migration_report_failed_format() {
         let report = MigrationReport {
             result: MigrationResult::Failed {

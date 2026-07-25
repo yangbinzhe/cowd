@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 //! Gateway server — service management (pid, status, start/stop).
 
-use std::{fmt, fs, path::PathBuf};
+use std::{
+    fmt, fs,
+    path::{Path, PathBuf},
+};
 
 #[cfg(unix)]
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -40,7 +40,9 @@ impl From<std::num::ParseIntError> for ServerError {
 
 pub fn pid_file() -> PathBuf {
     let dir = runtime::cowd_dirs::config_home_dir().join("run");
-    let _ = std::fs::create_dir_all(&dir);
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(path = %dir.display(), %error, "gateway run directory is unavailable");
+    }
     dir.join("cowd-serve.pid")
 }
 
@@ -52,7 +54,9 @@ fn legacy_runtime_pid_file() -> PathBuf {
         )
     });
     let dir = PathBuf::from(runtime_dir);
-    let _ = std::fs::create_dir_all(&dir);
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(path = %dir.display(), %error, "legacy gateway run directory is unavailable");
+    }
     dir.join("cowd-serve.pid")
 }
 
@@ -74,6 +78,8 @@ fn status_pid_files() -> Vec<PathBuf> {
 pub struct ServerInfo {
     pub pid: u32,
     pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_warning: Option<String>,
 }
 
 pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
@@ -97,10 +103,22 @@ pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
             continue;
         }
 
-        let address = std::fs::read_to_string(pid_path.with_extension("addr"))
-            .unwrap_or_else(|_| "http://127.0.0.1:8642".to_string());
+        let (address, discovery_warning) =
+            match std::fs::read_to_string(pid_path.with_extension("addr")) {
+                Ok(address) => (address.trim().to_string(), None),
+                Err(error) => (
+                    "http://127.0.0.1:8642".to_string(),
+                    Some(format!(
+                        "gateway process is running but address metadata is unavailable: {error}"
+                    )),
+                ),
+            };
 
-        return Ok(Some(ServerInfo { pid, address }));
+        return Ok(Some(ServerInfo {
+            pid,
+            address,
+            discovery_warning,
+        }));
     }
 
     if config_home_overridden() {
@@ -165,10 +183,21 @@ pub fn stop_server() -> Result<(), ServerError> {
         }
     }
     for pid_path in status_pid_files() {
-        let _ = fs::remove_file(&pid_path);
-        let _ = std::fs::remove_file(pid_path.with_extension("addr"));
+        remove_status_file_if_present(&pid_path)?;
+        remove_status_file_if_present(&pid_path.with_extension("addr"))?;
     }
     Ok(())
+}
+
+fn remove_status_file_if_present(path: &Path) -> Result<(), ServerError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ServerError(format!(
+            "failed to remove gateway status file `{}`: {error}",
+            path.display()
+        ))),
+    }
 }
 
 #[cfg(unix)]
@@ -267,13 +296,21 @@ fn discover_default_gateway_listener() -> Option<ServerInfo> {
         .lines()
         .find(|line| line.contains("127.0.0.1:8642") && line.contains("cowd"))?;
     let pid = extract_pid_from_ss_line(line).unwrap_or(0);
+    let mut discovery_warnings = Vec::new();
     if pid != 0 {
-        let _ = fs::write(pid_file(), pid.to_string());
-        let _ = fs::write(addr_file(), "http://127.0.0.1:8642");
+        if let Err(error) = fs::write(pid_file(), pid.to_string()) {
+            discovery_warnings.push(format!("cannot persist discovered gateway PID: {error}"));
+        }
+        if let Err(error) = fs::write(addr_file(), "http://127.0.0.1:8642") {
+            discovery_warnings.push(format!(
+                "cannot persist discovered gateway address: {error}"
+            ));
+        }
     }
     Some(ServerInfo {
         pid,
         address: "http://127.0.0.1:8642".to_string(),
+        discovery_warning: (!discovery_warnings.is_empty()).then(|| discovery_warnings.join("; ")),
     })
 }
 

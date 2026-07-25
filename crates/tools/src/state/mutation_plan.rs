@@ -6,6 +6,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -191,14 +192,14 @@ pub fn apply_mutations(
         planned.push(PlannedMutation {
             path: resolved,
             display_path: path,
-            original,
             updated,
             previous_hash,
             replacement_count,
         });
     }
 
-    let mut temp_paths = Vec::new();
+    let transaction_id = next_transaction_id();
+    let mut temp_paths: Vec<PathBuf> = Vec::new();
     for mutation in &planned {
         let parent = mutation.path.parent().ok_or_else(|| {
             io::Error::new(
@@ -212,38 +213,25 @@ pub fn apply_mutations(
             .and_then(|name| name.to_str())
             .unwrap_or("mutation");
         let temp_path = parent.join(format!(
-            ".{file_name}.cowd-txn-{}-{}",
-            std::process::id(),
+            ".{file_name}.cowd-txn-{transaction_id}-{}",
             temp_paths.len()
         ));
         if let Err(error) = fs::write(&temp_path, &mutation.updated) {
             for temp_path in temp_paths {
-                let _ = fs::remove_file(temp_path);
+                if let Err(cleanup_error) = fs::remove_file(&temp_path) {
+                    tracing::warn!(
+                        path = %temp_path.display(),
+                        error = %cleanup_error,
+                        "failed to remove staged mutation after transaction preparation failed"
+                    );
+                }
             }
             return Err(error);
         }
         temp_paths.push(temp_path);
     }
 
-    let mut committed = Vec::new();
-    let commit_result = (|| -> io::Result<()> {
-        for (index, mutation) in planned.iter().enumerate() {
-            fs::rename(&temp_paths[index], &mutation.path)?;
-            committed.push(index);
-        }
-        Ok(())
-    })();
-
-    if let Err(error) = commit_result {
-        for temp_path in temp_paths {
-            let _ = fs::remove_file(temp_path);
-        }
-        for index in committed.into_iter().rev() {
-            let mutation = &planned[index];
-            let _ = fs::write(&mutation.path, &mutation.original);
-        }
-        return Err(error);
-    }
+    commit_staged_mutations(&planned, &temp_paths, transaction_id)?;
 
     let applied = planned
         .into_iter()
@@ -262,10 +250,107 @@ pub fn apply_mutations(
     })
 }
 
+fn commit_staged_mutations(
+    planned: &[PlannedMutation],
+    temp_paths: &[PathBuf],
+    transaction_id: u64,
+) -> io::Result<()> {
+    let backup_paths = planned
+        .iter()
+        .enumerate()
+        .map(|(index, mutation)| {
+            let parent = mutation.path.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("file `{}` has no parent directory", mutation.display_path),
+                )
+            })?;
+            let file_name = mutation
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("mutation");
+            Ok(parent.join(format!(".{file_name}.cowd-backup-{transaction_id}-{index}")))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let mut committed = Vec::new();
+    let mut active_backup = None;
+    let commit_result = (|| -> io::Result<()> {
+        for (index, mutation) in planned.iter().enumerate() {
+            fs::rename(&mutation.path, &backup_paths[index])?;
+            active_backup = Some(index);
+            fs::rename(&temp_paths[index], &mutation.path)?;
+            active_backup = None;
+            committed.push(index);
+        }
+        Ok(())
+    })();
+
+    if let Err(commit_error) = commit_result {
+        let mut rollback_errors = Vec::new();
+        if let Some(index) = active_backup {
+            if let Err(error) = fs::rename(&backup_paths[index], &planned[index].path) {
+                rollback_errors.push(format!("{}: {error}", planned[index].display_path));
+            }
+        }
+        for index in committed.into_iter().rev() {
+            if let Err(error) = fs::remove_file(&planned[index].path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    rollback_errors.push(format!(
+                        "{} (remove replacement): {error}",
+                        planned[index].display_path
+                    ));
+                    continue;
+                }
+            }
+            if let Err(error) = fs::rename(&backup_paths[index], &planned[index].path) {
+                rollback_errors.push(format!(
+                    "{} (restore backup {}): {error}",
+                    planned[index].display_path,
+                    backup_paths[index].display()
+                ));
+            }
+        }
+        for temp_path in temp_paths {
+            if let Err(error) = fs::remove_file(temp_path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    rollback_errors.push(format!(
+                        "{} (remove staged file): {error}",
+                        temp_path.display()
+                    ));
+                }
+            }
+        }
+        if rollback_errors.is_empty() {
+            return Err(commit_error);
+        }
+        return Err(io::Error::other(format!(
+            "mutation commit failed: {commit_error}; rollback incomplete: {}",
+            rollback_errors.join("; ")
+        )));
+    }
+
+    for backup_path in backup_paths {
+        if let Err(error) = fs::remove_file(&backup_path) {
+            tracing::warn!(
+                path = %backup_path.display(),
+                error = %error,
+                "mutation committed but backup cleanup failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn next_transaction_id() -> u64 {
+    static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
+    ((std::process::id() as u64) << 32) | NEXT_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 struct PlannedMutation {
     path: PathBuf,
     display_path: String,
-    original: String,
     updated: String,
     previous_hash: String,
     replacement_count: usize,
@@ -395,5 +480,53 @@ mod tests {
             "alpha\n"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn commit_failure_restores_every_previously_replaced_file() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-mutation-plan-{}-rollback",
+            next_transaction_id()
+        ));
+        fs::create_dir_all(&root).expect("create rollback root");
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        fs::write(&first, "first-original").expect("write first");
+        fs::write(&second, "second-original").expect("write second");
+        let transaction_id = next_transaction_id();
+        let first_temp = root.join(format!(".first.txt.cowd-txn-{transaction_id}-0"));
+        let second_temp = root.join(format!(".second.txt.cowd-txn-{transaction_id}-1"));
+        fs::write(&first_temp, "first-updated").expect("stage first");
+        fs::write(&second_temp, "second-updated").expect("stage second");
+        fs::remove_file(&second_temp).expect("force second commit failure");
+        let planned = vec![
+            PlannedMutation {
+                path: first.clone(),
+                display_path: "first.txt".to_string(),
+                updated: "first-updated".to_string(),
+                previous_hash: stable_hash("first-original"),
+                replacement_count: 1,
+            },
+            PlannedMutation {
+                path: second.clone(),
+                display_path: "second.txt".to_string(),
+                updated: "second-updated".to_string(),
+                previous_hash: stable_hash("second-original"),
+                replacement_count: 1,
+            },
+        ];
+
+        commit_staged_mutations(&planned, &[first_temp, second_temp], transaction_id)
+            .expect_err("second staged rename must fail");
+
+        assert_eq!(
+            fs::read_to_string(&first).expect("read restored first"),
+            "first-original"
+        );
+        assert_eq!(
+            fs::read_to_string(&second).expect("read untouched second"),
+            "second-original"
+        );
+        fs::remove_dir_all(root).expect("remove rollback root");
     }
 }

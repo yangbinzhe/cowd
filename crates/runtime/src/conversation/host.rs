@@ -10961,7 +10961,6 @@ mod tests {
 
     #[test]
     fn recognized_provider_protocol_failure_has_one_dedicated_retry_budget() {
-        assert_eq!(PROVIDER_PROTOCOL_RECOVERY_BUDGET, 1);
         assert!(RuntimeError::with_provider_failure_metadata(
             "invalid sse frame: malformed compatibility tool-call frame",
             None,

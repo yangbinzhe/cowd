@@ -893,7 +893,7 @@ impl WaveOrchestrator {
         context: &TaskContext,
         timeout: Duration,
     ) -> Vec<TaskResult> {
-        let mut handles: Vec<tokio::task::JoinHandle<TaskResult>> = Vec::new();
+        let mut handles: Vec<(TaskId, Instant, tokio::task::JoinHandle<TaskResult>)> = Vec::new();
 
         for task_id in task_ids {
             if let Some(task) = self.tasks.get(task_id) {
@@ -902,6 +902,8 @@ impl WaveOrchestrator {
                 let timeout = timeout;
                 let exec = executor.clone();
 
+                let panic_task_id = task.id.clone();
+                let panic_started = Instant::now();
                 let handle: tokio::task::JoinHandle<TaskResult> = tokio::spawn(async move {
                     let start = Instant::now();
                     let task_id = task.id.clone();
@@ -939,16 +941,22 @@ impl WaveOrchestrator {
                     }
                 });
 
-                handles.push(handle);
+                handles.push((panic_task_id, panic_started, handle));
             }
         }
 
         // Wait for all tasks in chunk
         let mut results: Vec<TaskResult> = Vec::new();
-        for handle in handles {
+        for (task_id, started, handle) in handles {
             match handle.await {
                 Ok(result) => results.push(result),
-                Err(_) => {} // Task panicked, skip
+                Err(error) => results.push(TaskResult {
+                    task_id,
+                    success: false,
+                    output: None,
+                    error: Some(format!("Task worker failed: {error}")),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }),
             }
         }
 
@@ -1312,6 +1320,52 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results[0].success);
         assert!(results[1].success);
+    }
+
+    #[tokio::test]
+    async fn panicking_worker_preserves_task_result_cardinality() {
+        struct PanicExecutor;
+        impl WaveExecutor for PanicExecutor {
+            fn execute(
+                self: Arc<Self>,
+                task: WaveTask,
+                _context: TaskContext,
+            ) -> Pin<Box<dyn Future<Output = Result<TaskResult, WaveError>> + Send>> {
+                Box::pin(async move {
+                    if task.id == TaskId::new("panic") {
+                        panic!("fixture worker panic");
+                    }
+                    Ok(TaskResult {
+                        task_id: task.id,
+                        success: true,
+                        output: Some("done".to_string()),
+                        error: None,
+                        duration_ms: 0,
+                    })
+                })
+            }
+        }
+
+        let mut orchestrator = WaveOrchestrator::new();
+        orchestrator.add_task(WaveTask::new("ok", "OK"));
+        orchestrator.add_task(WaveTask::new("panic", "Panic"));
+        orchestrator.build_waves().expect("build wave");
+
+        let waves = orchestrator
+            .execute(PanicExecutor)
+            .await
+            .expect("execute wave");
+        let task_results = &waves[0].task_results;
+        assert_eq!(task_results.len(), 2);
+        let panic_result = task_results
+            .iter()
+            .find(|result| result.task_id == TaskId::new("panic"))
+            .expect("panic result");
+        assert!(!panic_result.success);
+        assert!(panic_result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Task worker failed")));
     }
 
     #[test]

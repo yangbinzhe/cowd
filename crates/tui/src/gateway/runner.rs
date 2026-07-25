@@ -2572,13 +2572,46 @@ fn dispatch_pending_input_cancel(
             .await
         {
             Ok(receipt) => {
-                if let Some(projection) = receipt.get("input_projection") {
+                if let Some(projection) = receipt
+                    .get("input_projection")
+                    .filter(|projection| !projection.is_null())
+                {
                     let _ = send_session_scoped_with_generation(
                         &task_tx,
                         &session_id,
                         authority_generation,
                         CowdEvent::SessionInputProjection {
                             projection: projection.clone(),
+                        },
+                    );
+                }
+                if let Some(warnings) = receipt
+                    .get("projection_warnings")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|warnings| !warnings.is_empty())
+                {
+                    let details = warnings
+                        .iter()
+                        .filter_map(|warning| {
+                            let projection = warning
+                                .get("projection")
+                                .and_then(serde_json::Value::as_str)?;
+                            let error = warning
+                                .get("error")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unavailable");
+                            Some(format!("{projection}: {error}"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let _ = send_session_scoped_with_generation(
+                        &task_tx,
+                        &session_id,
+                        authority_generation,
+                        CowdEvent::Warning {
+                            message: format!(
+                                "Queued input was cancelled, but its runtime projection is degraded: {details}"
+                            ),
                         },
                     );
                 }

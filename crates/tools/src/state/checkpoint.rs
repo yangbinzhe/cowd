@@ -199,16 +199,34 @@ pub fn checkpoint_restore_in(
     })();
 
     if let Err(error) = restore_result {
-        if manifest.scopes.is_empty() {
-            let _ = remove_files_not_in_manifest(root, &backup_manifest.files);
-            let _ = copy_dir(&backup_dir, root);
+        let rollback_result = if manifest.scopes.is_empty() {
+            remove_files_not_in_manifest(root, &backup_manifest.files)
+                .and_then(|()| copy_dir(&backup_dir, root))
         } else {
-            let _ = replace_scoped_paths(&backup_dir, root, &manifest.scopes);
+            replace_scoped_paths(&backup_dir, root, &manifest.scopes)
+        };
+        if let Err(rollback_error) = rollback_result {
+            return Err(io::Error::other(format!(
+                "checkpoint restore failed: {error}; rollback failed: {rollback_error}; recovery backup retained at {}",
+                backup_dir.display()
+            )));
         }
-        let _ = fs::remove_dir_all(&backup_dir);
+        if let Err(cleanup_error) = fs::remove_dir_all(&backup_dir) {
+            tracing::warn!(
+                path = %backup_dir.display(),
+                error = %cleanup_error,
+                "checkpoint rollback succeeded but backup cleanup failed"
+            );
+        }
         return Err(error);
     }
-    let _ = fs::remove_dir_all(&backup_dir);
+    if let Err(cleanup_error) = fs::remove_dir_all(&backup_dir) {
+        tracing::warn!(
+            path = %backup_dir.display(),
+            error = %cleanup_error,
+            "checkpoint restore succeeded but backup cleanup failed"
+        );
+    }
     Ok(CheckpointSummary {
         id: input.id,
         path: checkpoint.to_string_lossy().into_owned(),

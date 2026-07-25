@@ -59,11 +59,22 @@ pub fn terminal_gate_report_with_report(
     let matrix_markdown = render_terminal_capability_matrix_markdown(&matrix);
     let matrix_path = evidence_dir.join("terminal-capability-matrix.md");
     let report_path = evidence_dir.join("terminal-gate-report.json");
-    let _ = fs::create_dir_all(&evidence_dir);
-    let _ = fs::write(&matrix_path, matrix_markdown);
-    let report = serde_json::json!({
+    let mut artifact_errors = Vec::new();
+    if let Err(error) = fs::create_dir_all(&evidence_dir) {
+        artifact_errors.push(format!(
+            "cannot create evidence directory {}: {error}",
+            evidence_dir.display()
+        ));
+    }
+    if let Err(error) = fs::write(&matrix_path, matrix_markdown) {
+        artifact_errors.push(format!(
+            "cannot write capability matrix {}: {error}",
+            matrix_path.display()
+        ));
+    }
+    let mut report = serde_json::json!({
         "kind": "harness_eval.terminal_gate",
-        "status": if missing == 0 && failed_matrix_rows == 0 && failed_report_checks == 0 { "passed" } else { "failed" },
+        "status": if missing == 0 && failed_matrix_rows == 0 && failed_report_checks == 0 && artifact_errors.is_empty() { "passed" } else { "failed" },
         "evidence_dir": evidence_dir.display().to_string(),
         "report_json": report_json.as_ref().map(|path| path.display().to_string()),
         "expected": expected,
@@ -75,9 +86,28 @@ pub fn terminal_gate_report_with_report(
         "failed_report_checks": failed_report_checks,
         "matrix_path": matrix_path.display().to_string(),
         "report_path": report_path.display().to_string(),
+        "artifact_errors": artifact_errors,
     });
-    if let Ok(text) = serde_json::to_string_pretty(&report) {
-        let _ = fs::write(&report_path, text);
+    let text = match serde_json::to_string_pretty(&report) {
+        Ok(text) => text,
+        Err(error) => {
+            report["status"] = Value::String("failed".to_string());
+            report["artifact_errors"] =
+                serde_json::json!([format!("cannot serialize terminal gate report: {error}")]);
+            return report;
+        }
+    };
+    if let Err(error) = fs::write(&report_path, text) {
+        let message = format!(
+            "cannot write terminal gate report {}: {error}",
+            report_path.display()
+        );
+        report["status"] = Value::String("failed".to_string());
+        if let Some(errors) = report["artifact_errors"].as_array_mut() {
+            errors.push(Value::String(message));
+        } else {
+            report["artifact_errors"] = serde_json::json!([message]);
+        }
     }
     report
 }
@@ -356,6 +386,22 @@ mod tests {
         assert_eq!(report["status"], "passed");
         assert_eq!(report["failed_report_checks"], 0);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_gate_fails_closed_when_evidence_directory_is_not_writable_as_directory() {
+        let root =
+            std::env::temp_dir().join(format!("cowd-terminal-gate-file-{}", uuid::Uuid::new_v4()));
+        fs::write(&root, "not a directory").expect("blocking file");
+
+        let report = terminal_gate_report(root.clone());
+
+        assert_eq!(report["status"], "failed");
+        assert!(!report["artifact_errors"]
+            .as_array()
+            .expect("artifact errors")
+            .is_empty());
+        fs::remove_file(root).expect("fixture cleanup");
     }
 
     fn seeded_evidence_dir() -> PathBuf {

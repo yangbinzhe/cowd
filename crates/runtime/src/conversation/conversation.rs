@@ -8854,7 +8854,6 @@ pub fn build_cc_memory_config_with_budget(
         drift: DriftConfig::default(),
         perf: memory::config::PerfBudget::default(),
         tuning: Default::default(),
-        model: None,
     }
 }
 

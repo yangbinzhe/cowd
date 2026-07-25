@@ -204,6 +204,23 @@ pub enum TelemetryEvent {
 
 pub trait TelemetrySink: Send + Sync {
     fn record(&self, event: TelemetryEvent);
+
+    fn health(&self) -> TelemetrySinkHealth {
+        TelemetrySinkHealth::default()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetrySinkHealth {
+    pub write_failures: u64,
+    pub last_error: Option<String>,
+}
+
+impl TelemetrySinkHealth {
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.write_failures == 0
+    }
 }
 
 #[derive(Default)]
@@ -233,6 +250,8 @@ impl TelemetrySink for MemoryTelemetrySink {
 pub struct JsonlTelemetrySink {
     path: PathBuf,
     file: Mutex<File>,
+    write_failures: AtomicU64,
+    last_error: Mutex<Option<String>>,
 }
 
 impl Debug for JsonlTelemetrySink {
@@ -253,6 +272,8 @@ impl JsonlTelemetrySink {
         Ok(Self {
             path,
             file: Mutex::new(file),
+            write_failures: AtomicU64::new(0),
+            last_error: Mutex::new(None),
         })
     }
 
@@ -260,19 +281,50 @@ impl JsonlTelemetrySink {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    fn record_failure(&self, error: impl Into<String>) {
+        let error = error.into();
+        self.write_failures.fetch_add(1, Ordering::Relaxed);
+        *self
+            .last_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+        tracing::warn!(
+            path = %self.path.display(),
+            %error,
+            "model telemetry write failed"
+        );
+    }
 }
 
 impl TelemetrySink for JsonlTelemetrySink {
     fn record(&self, event: TelemetryEvent) {
-        let Ok(line) = serde_json::to_string(&event) else {
-            return;
+        let line = match serde_json::to_string(&event) {
+            Ok(line) => line,
+            Err(error) => {
+                self.record_failure(format!("serialize telemetry event: {error}"));
+                return;
+            }
         };
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
+        if let Err(error) = writeln!(file, "{line}").and_then(|()| file.flush()) {
+            drop(file);
+            self.record_failure(format!("append telemetry event: {error}"));
+        }
+    }
+
+    fn health(&self) -> TelemetrySinkHealth {
+        TelemetrySinkHealth {
+            write_failures: self.write_failures.load(Ordering::Relaxed),
+            last_error: self
+                .last_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
     }
 }
 
@@ -315,6 +367,11 @@ impl SessionTracer {
             attributes,
         };
         self.sink.record(TelemetryEvent::SessionTrace(record));
+    }
+
+    #[must_use]
+    pub fn telemetry_health(&self) -> TelemetrySinkHealth {
+        self.sink.health()
     }
 
     pub fn record_http_request_started(
@@ -522,5 +579,24 @@ mod tests {
         assert!(contents.contains("\"action\":\"turn_completed\""));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn jsonl_sink_exposes_write_failures_without_panicking_the_request_path() {
+        let sink = JsonlTelemetrySink::new("/dev/full").expect("/dev/full telemetry fixture");
+
+        sink.record(TelemetryEvent::Analytics(AnalyticsEvent::new(
+            "test",
+            "write_failure",
+        )));
+
+        let health = sink.health();
+        assert!(!health.is_healthy());
+        assert_eq!(health.write_failures, 1);
+        assert!(health
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("append telemetry event")));
     }
 }

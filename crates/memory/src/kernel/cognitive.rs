@@ -14,8 +14,9 @@
 //! 4. Seeds   – pre-authored fragments whose trigger condition fired.
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
@@ -132,11 +133,69 @@ struct BackgroundExtractionRequest {
 }
 
 /// Extracted entries waiting for the foreground persistence boundary. The
-/// source turn remains attached until the batch is committed.
+/// entries are already durable; the foreground only updates its in-process
+/// vector index on the next turn.
 #[derive(Clone)]
 struct PendingLlmEntries {
-    turn: MemoryTurnContext,
     entries: Vec<MemoryEntry>,
+}
+
+fn background_extraction_key(turn: &MemoryTurnContext) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        turn.session_id,
+        turn.agent_id,
+        turn.task_id.as_deref().unwrap_or_default(),
+        turn.definition_lineage_id.as_deref().unwrap_or_default()
+    )
+}
+
+fn coalesce_background_request(
+    batches: &mut HashMap<String, (BackgroundExtractionRequest, u64)>,
+    request: BackgroundExtractionRequest,
+) -> bool {
+    let key = background_extraction_key(&request.turn);
+    if let Some((pending, count)) = batches.get_mut(&key) {
+        pending.messages = request.messages;
+        *count = count.saturating_add(1);
+        true
+    } else {
+        batches.insert(key, (request, 1));
+        false
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackgroundExtractionHealth {
+    pub pending_requests: u64,
+    pub accepted_requests: u64,
+    pub coalesced_requests: u64,
+    pub completed_requests: u64,
+    pub failed_requests: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct BackgroundExtractionState {
+    pending_requests: AtomicU64,
+    accepted_requests: AtomicU64,
+    coalesced_requests: AtomicU64,
+    completed_requests: AtomicU64,
+    failed_requests: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
+
+impl BackgroundExtractionState {
+    fn snapshot(&self) -> BackgroundExtractionHealth {
+        BackgroundExtractionHealth {
+            pending_requests: self.pending_requests.load(Ordering::Relaxed),
+            accepted_requests: self.accepted_requests.load(Ordering::Relaxed),
+            coalesced_requests: self.coalesced_requests.load(Ordering::Relaxed),
+            completed_requests: self.completed_requests.load(Ordering::Relaxed),
+            failed_requests: self.failed_requests.load(Ordering::Relaxed),
+            last_error: self.last_error.lock().clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,13 +246,14 @@ pub struct CognitiveContextManager {
     #[allow(dead_code)]
     background_watcher: Mutex<Option<BackgroundWatcherHandle>>,
     /// Sender for queuing messages to the background LLM extraction worker.
-    extract_tx: mpsc::UnboundedSender<BackgroundExtractionRequest>,
+    extract_tx: mpsc::Sender<BackgroundExtractionRequest>,
     /// Pending memory entries from the background LLM extraction worker,
     /// drained at the start of each turn-end cycle.
     pending_llm_entries: Arc<Mutex<Vec<PendingLlmEntries>>>,
     /// Handle to the background LLM extraction task.
     #[allow(dead_code)]
     extract_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    background_extraction_state: Arc<BackgroundExtractionState>,
     /// Freshness-priority context manager for session budget management.
     fresh_ctx: FreshContextManager,
     /// Context rotation monitor for GSD-style health warnings.
@@ -365,63 +425,110 @@ impl CognitiveContextManager {
         let extractor = Arc::new(extractor);
 
         // ── Background LLM extraction worker ────────────────────────────────
-        let (extract_tx, mut extract_rx) = mpsc::unbounded_channel::<BackgroundExtractionRequest>();
+        let (extract_tx, mut extract_rx) = mpsc::channel::<BackgroundExtractionRequest>(128);
         let pending_llm_entries: Arc<Mutex<Vec<PendingLlmEntries>>> =
             Arc::new(Mutex::new(Vec::new()));
+        let background_extraction_state = Arc::new(BackgroundExtractionState::default());
 
         let bg_extractor = Arc::clone(&extractor);
         let bg_pending = Arc::clone(&pending_llm_entries);
+        let bg_orchestrator = Arc::clone(&orchestrator);
+        let bg_state = Arc::clone(&background_extraction_state);
         let extractor_debounce_secs = config.extractor.extractor_debounce_secs;
 
         let extract_handle = tokio::spawn(async move {
-            let mut last_run = Instant::now();
             let debounce = Duration::from_secs(extractor_debounce_secs);
-            while let Some(request) = extract_rx.recv().await {
-                if last_run.elapsed() < debounce {
-                    tracing::debug!(
-                        elapsed = ?last_run.elapsed(),
-                        "background LLM extract: debouncing, skipping batch"
-                    );
-                    continue;
-                }
-                if bg_extractor.llm_client().is_some() {
-                    match bg_extractor.llm_extract(&request.messages).await {
-                        Ok(llm_entries) => {
-                            let final_entries = bg_extractor.finalize_entries(llm_entries);
-                            if !final_entries.is_empty() {
-                                tracing::info!(
-                                    count = final_entries.len(),
-                                    "background LLM extract: {} entries ready for merge",
-                                    final_entries.len()
-                                );
-                                bg_pending.lock().push(PendingLlmEntries {
-                                    turn: request.turn,
-                                    entries: final_entries,
-                                });
+            while let Some(first_request) = extract_rx.recv().await {
+                let mut batches = HashMap::new();
+                let first_key = background_extraction_key(&first_request.turn);
+                batches.insert(first_key, (first_request, 1_u64));
+
+                if !debounce.is_zero() {
+                    let timer = tokio::time::sleep(debounce);
+                    tokio::pin!(timer);
+                    loop {
+                        tokio::select! {
+                            request = extract_rx.recv() => {
+                                let Some(request) = request else {
+                                    break;
+                                };
+                                if coalesce_background_request(&mut batches, request) {
+                                    bg_state.coalesced_requests.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(%e, "background LLM extract failed");
+                            () = &mut timer => break,
                         }
                     }
                 }
-                last_run = Instant::now();
+
+                for (_, (request, request_count)) in batches {
+                    bg_state
+                        .pending_requests
+                        .fetch_sub(request_count, Ordering::Relaxed);
+                    if bg_extractor.llm_client().is_none() {
+                        continue;
+                    }
+                    match bg_extractor.llm_extract(&request.messages).await {
+                        Ok(llm_entries) => {
+                            let final_entries = bg_extractor.finalize_entries(llm_entries);
+                            let entry_count = final_entries.len();
+                            let persist_result = if final_entries.is_empty() {
+                                Ok(())
+                            } else {
+                                bg_orchestrator
+                                    .remember_batch_for_turn(&request.turn, final_entries.clone())
+                                    .await
+                                    .map(|_| ())
+                            };
+                            match persist_result {
+                                Ok(()) => {
+                                    if !final_entries.is_empty() {
+                                        bg_pending.lock().push(PendingLlmEntries {
+                                            entries: final_entries,
+                                        });
+                                    }
+                                    bg_state
+                                        .completed_requests
+                                        .fetch_add(request_count, Ordering::Relaxed);
+                                    *bg_state.last_error.lock() = None;
+                                    tracing::info!(
+                                        count = entry_count,
+                                        session_id = %request.turn.session_id,
+                                        agent_id = %request.turn.agent_id,
+                                        "background LLM extract persisted"
+                                    );
+                                }
+                                Err(error) => {
+                                    bg_state
+                                        .failed_requests
+                                        .fetch_add(request_count, Ordering::Relaxed);
+                                    *bg_state.last_error.lock() = Some(error.to_string());
+                                    tracing::error!(
+                                        %error,
+                                        session_id = %request.turn.session_id,
+                                        agent_id = %request.turn.agent_id,
+                                        "background LLM extract persistence failed"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            bg_state
+                                .failed_requests
+                                .fetch_add(request_count, Ordering::Relaxed);
+                            *bg_state.last_error.lock() = Some(error.to_string());
+                            tracing::warn!(%error, "background LLM extract failed");
+                        }
+                    }
+                }
             }
             tracing::debug!("background LLM extract: worker exiting");
         });
 
         // Load knowledge graph from persistent store.
         let kg = {
-            let entities = orchestrator
-                .store()
-                .load_entities()
-                .await
-                .unwrap_or_default();
-            let triples = orchestrator
-                .store()
-                .load_triples()
-                .await
-                .unwrap_or_default();
+            let entities = orchestrator.store().load_entities().await?;
+            let triples = orchestrator.store().load_triples().await?;
             let mut graph = KnowledgeGraph::new();
             for e in entities {
                 graph.add_entity(e);
@@ -627,6 +734,7 @@ impl CognitiveContextManager {
             extract_tx,
             pending_llm_entries,
             extract_handle: Mutex::new(Some(extract_handle)),
+            background_extraction_state,
         })
     }
 
@@ -637,7 +745,7 @@ impl CognitiveContextManager {
         workspace_root: PathBuf,
     ) -> Result<Self> {
         let mgr = Self::new_with_workspace(config, Some(workspace_root.clone())).await?;
-        let _ = mgr.load_project_kg(&workspace_root);
+        mgr.load_project_kg(&workspace_root)?;
         Ok(mgr)
     }
 
@@ -1557,28 +1665,10 @@ impl CognitiveContextManager {
                 for entry in &pending.entries {
                     pending_embeddings.push((entry.id, entry.content.clone()));
                 }
-                match self
-                    .orchestrator
-                    .remember_batch_for_turn(&pending.turn, pending.entries)
-                    .await
-                {
-                    Ok(_) => {
-                        tracing::info!(
-                            count = drained_count,
-                            session_id = %pending.turn.session_id,
-                            agent_id = %pending.turn.agent_id,
-                            "extract_and_remember: persisted background LLM entries"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            session_id = %pending.turn.session_id,
-                            agent_id = %pending.turn.agent_id,
-                            "extract_and_remember: background LLM entries persist failed"
-                        );
-                    }
-                }
+                tracing::debug!(
+                    count = drained_count,
+                    "extract_and_remember: indexing durable background LLM entries"
+                );
             }
 
             // ── 0b. Heuristic extraction (Passes 1-4, fast / non-blocking) ──
@@ -1616,13 +1706,37 @@ impl CognitiveContextManager {
 
                 // Queue LLM Pass 5 for background processing (non-blocking).
                 if self.extractor.llm_client().is_some() {
-                    let _ = self.extract_tx.send(BackgroundExtractionRequest {
+                    let request = BackgroundExtractionRequest {
                         turn: turn.clone(),
                         messages: messages.to_vec(),
-                    });
-                    tracing::debug!(
-                        "extract_and_remember: queued messages for background LLM extraction"
-                    );
+                    };
+                    self.background_extraction_state
+                        .pending_requests
+                        .fetch_add(1, Ordering::Relaxed);
+                    match self.extract_tx.send(request).await {
+                        Ok(()) => {
+                            self.background_extraction_state
+                                .accepted_requests
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(
+                                "extract_and_remember: queued messages for background LLM extraction"
+                            );
+                        }
+                        Err(error) => {
+                            self.background_extraction_state
+                                .pending_requests
+                                .fetch_sub(1, Ordering::Relaxed);
+                            self.background_extraction_state
+                                .failed_requests
+                                .fetch_add(1, Ordering::Relaxed);
+                            *self.background_extraction_state.last_error.lock() =
+                                Some(error.to_string());
+                            tracing::error!(
+                                %error,
+                                "extract_and_remember: background LLM extraction queue closed"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -3189,6 +3303,11 @@ impl CognitiveContextManager {
         }
     }
 
+    #[must_use]
+    pub fn background_extraction_health(&self) -> BackgroundExtractionHealth {
+        self.background_extraction_state.snapshot()
+    }
+
     // ── Performance report (P9.4) ────────────────────────────────────────
 
     /// Return a snapshot of current performance metrics and auto-tuner state.
@@ -3356,6 +3475,54 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn user_message(turn_index: usize, content: &str) -> Message {
+        Message {
+            turn_index,
+            role: MessageRole::User,
+            content: content.to_string(),
+            tool_use_id: None,
+            tool_name: None,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn background_extraction_coalesces_only_the_same_turn_identity() {
+        let mut batches = HashMap::new();
+        let first_turn = MemoryTurnContext::new("session-a", "agent-a");
+        assert!(!coalesce_background_request(
+            &mut batches,
+            BackgroundExtractionRequest {
+                turn: first_turn.clone(),
+                messages: vec![user_message(0, "first")],
+            },
+        ));
+        assert!(coalesce_background_request(
+            &mut batches,
+            BackgroundExtractionRequest {
+                turn: first_turn,
+                messages: vec![user_message(1, "latest")],
+            },
+        ));
+        assert!(!coalesce_background_request(
+            &mut batches,
+            BackgroundExtractionRequest {
+                turn: MemoryTurnContext::new("session-b", "agent-a"),
+                messages: vec![user_message(0, "other session")],
+            },
+        ));
+
+        assert_eq!(batches.len(), 2);
+        let first = batches
+            .get(&background_extraction_key(&MemoryTurnContext::new(
+                "session-a",
+                "agent-a",
+            )))
+            .expect("coalesced first turn");
+        assert_eq!(first.1, 2);
+        assert_eq!(first.0.messages[0].content, "latest");
     }
 
     #[test]

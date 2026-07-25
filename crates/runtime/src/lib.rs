@@ -205,8 +205,6 @@ pub mod intent_planner;
 pub mod lane_completion;
 #[path = "session/mission_command_interpreter.rs"]
 pub mod mission_command_interpreter;
-#[path = "infrastructure/mutation_plan.rs"]
-pub mod mutation_plan;
 #[path = "orchestration/mod.rs"]
 pub mod orchestration;
 #[path = "agent/pairing.rs"]
@@ -561,10 +559,6 @@ pub use mission_schedule::{
 };
 pub use module_map::{
     runtime_module_map, runtime_module_names_by_domain, RuntimeDomain, RuntimeModuleDescriptor,
-};
-pub use mutation_plan::{
-    apply_mutations, preview_mutations, FileMutationApplied, FileMutationPreview,
-    MutationApplyInput, MutationApplyOutput, MutationEdit, MutationPreview, MutationPreviewInput,
 };
 pub use orchestration::{
     handle_runtime_orchestration_request, handle_runtime_orchestration_request_with_decision,

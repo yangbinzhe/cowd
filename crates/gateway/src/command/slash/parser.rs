@@ -681,11 +681,12 @@ fn remainder_after_command(input: &str, command: &str) -> Option<String> {
 
 fn find_slash_command_spec(name: &str) -> Option<&'static SlashCommandSpec> {
     slash_command_specs().iter().find(|spec| {
-        spec.name.eq_ignore_ascii_case(name)
-            || spec
-                .aliases
-                .iter()
-                .any(|alias| alias.eq_ignore_ascii_case(name))
+        super::specs::is_executable_slash_command(spec.name)
+            && (spec.name.eq_ignore_ascii_case(name)
+                || spec
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(name)))
     })
 }
 
@@ -744,7 +745,9 @@ pub fn slash_command_specs() -> &'static [SlashCommandSpec] {
 pub fn resume_supported_slash_commands() -> Vec<&'static SlashCommandSpec> {
     slash_command_specs()
         .iter()
-        .filter(|spec| spec.resume_supported)
+        .filter(|spec| {
+            spec.resume_supported && super::specs::is_executable_slash_command(spec.name)
+        })
         .collect()
 }
 
@@ -828,6 +831,7 @@ pub fn suggest_slash_commands(input: &str, limit: usize) -> Vec<String> {
 
     let mut suggestions = slash_command_specs()
         .iter()
+        .filter(|spec| super::specs::is_executable_slash_command(spec.name))
         .filter_map(|spec| {
             let best = std::iter::once(spec.name)
                 .chain(spec.aliases.iter().copied())
@@ -883,6 +887,7 @@ pub fn render_slash_command_help_filtered(exclude: &[&str]) -> String {
         for spec in slash_command_specs()
             .iter()
             .filter(|spec| slash_command_category(spec.name) == category)
+            .filter(|spec| super::specs::is_executable_slash_command(spec.name))
             .filter(|spec| !exclude.contains(&spec.name))
         {
             lines.push(format_slash_command_help_line(spec));
@@ -916,6 +921,7 @@ pub fn render_slash_command_help() -> String {
         for spec in slash_command_specs()
             .iter()
             .filter(|spec| slash_command_category(spec.name) == category)
+            .filter(|spec| super::specs::is_executable_slash_command(spec.name))
         {
             lines.push(format_slash_command_help_line(spec));
         }

@@ -653,8 +653,15 @@ impl Drop for PidFileGuard {
     fn drop(&mut self) {
         let pid_path = crate::server::pid_file();
         if pid_path.exists() {
-            std::fs::remove_file(&pid_path).ok();
-            let _ = std::fs::remove_file(crate::server::addr_file());
+            if let Err(error) = std::fs::remove_file(&pid_path) {
+                tracing::warn!(path = %pid_path.display(), %error, "failed to remove gateway PID file");
+            }
+            let addr_path = crate::server::addr_file();
+            if let Err(error) = std::fs::remove_file(&addr_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %addr_path.display(), %error, "failed to remove gateway address file");
+                }
+            }
             tracing::info!(path = %pid_path.display(), "PID file removed");
         }
     }
@@ -1182,6 +1189,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         broker.shutdown();
     }
 
+    surface_host
+        .shutdown()
+        .await
+        .map_err(|error| format!("surface host shutdown incomplete: {error}"))?;
     tracing::info!("surface host shutdown complete");
 
     // PID file is cleaned up by PidFileGuard drop

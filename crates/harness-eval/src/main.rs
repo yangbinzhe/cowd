@@ -185,6 +185,14 @@ fn run() -> Result<(), String> {
             let gate_json = serde_json::to_string_pretty(&gate)
                 .map_err(|error| format!("serialize terminal gate report: {error}"))?;
             println!("{gate_json}");
+            if gate["status"].as_str() != Some("passed") {
+                return Err(format!(
+                    "terminal gate failed; see {}",
+                    gate["report_path"]
+                        .as_str()
+                        .unwrap_or("<report unavailable>")
+                ));
+            }
             return Ok(());
         }
         _ => {}

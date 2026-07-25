@@ -1,6 +1,6 @@
 //! Suggestion engine — fuzzy matching and ranked suggestions for CLI and slash commands.
 
-use crate::command::slash::slash_command_specs;
+use crate::command::slash::{is_executable_slash_command, slash_command_specs};
 use std::str;
 
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
@@ -77,6 +77,7 @@ fn render_suggestion_line(label: &str, suggestions: &[String]) -> Option<String>
 pub(crate) fn suggest_slash_commands(input: &str) -> Vec<String> {
     let mut candidates = slash_command_specs()
         .iter()
+        .filter(|spec| is_executable_slash_command(spec.name))
         .flat_map(|spec| {
             std::iter::once(spec.name)
                 .chain(spec.aliases.iter().copied())

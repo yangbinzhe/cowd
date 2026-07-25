@@ -7,23 +7,55 @@ use super::SurfaceHost;
 
 impl SurfaceHost {
     pub(crate) fn start_monitor(&self) {
-        let mut started = self
-            .monitor_started
-            .write()
+        let mut monitor = self
+            .monitor_task
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *started {
+        if monitor.is_some() {
             return;
         }
-        *started = true;
-        drop(started);
 
         let host = self.clone();
-        tokio::spawn(async move {
+        *monitor = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 host.monitor_tick().await;
             }
-        });
+        }));
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<(), String> {
+        let monitor = self
+            .monitor_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(monitor) = monitor {
+            monitor.abort();
+            let _ = monitor.await;
+        }
+
+        let surfaces = self
+            .managed
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut failures = Vec::new();
+        for surface in surfaces {
+            if let Err(error) = self.stop_surface(&surface).await {
+                failures.push(format!("{surface}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to stop managed surfaces: {}",
+                failures.join("; ")
+            ))
+        }
     }
 
     async fn monitor_tick(&self) {

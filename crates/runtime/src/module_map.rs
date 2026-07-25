@@ -187,7 +187,6 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("checkpoint", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("execution_outcome", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("lane_completion", Infrastructure, "runtime", false),
-        RuntimeModuleDescriptor::public("mutation_plan", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("eval_gate", Infrastructure, "harness-eval", false),
         RuntimeModuleDescriptor::public("lifecycle_hooks", Infrastructure, "runtime", false),
         RuntimeModuleDescriptor::public("mcp_lifecycle_hardened", Infrastructure, "mcp", false),

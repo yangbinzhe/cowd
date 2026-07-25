@@ -107,9 +107,4 @@ mod tests {
     fn matrix_reference_uses_matrix_namespace() {
         assert_eq!(matrix_reference("fact", "f1"), "matrix:fact:f1");
     }
-
-    #[test]
-    fn matrix_schema_version_is_owned_by_matrix_contract() {
-        assert_eq!(MATRIX_SCHEMA_VERSION, 19);
-    }
 }

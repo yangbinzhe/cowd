@@ -8,6 +8,7 @@ use crate::gateway_static::StaticWebUiSource;
 pub(crate) struct GatewayProcessSnapshot {
     pub(crate) pid: Option<u32>,
     pub(crate) address: Option<String>,
+    pub(crate) discovery_warning: Option<String>,
     pub(crate) pid_file: String,
     pub(crate) addr_file: String,
 }
@@ -59,7 +60,10 @@ pub(crate) struct GatewayReadinessSnapshot {
 }
 
 pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot {
-    let server_status = crate::server::get_server_status().ok().flatten();
+    let (server_status, server_status_error) = match crate::server::get_server_status() {
+        Ok(status) => (status, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let static_webui = state.static_webui.clone();
     let runtime = GatewayRuntimeSnapshot {
         service_layer: state.services.has_minimum_service_contract(),
@@ -120,11 +124,17 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
             .artifact_store()
             .and_then(|store| store.stats().ok()),
     };
-    let status = if runtime.session_kernel && runtime.event_bus {
-        "healthy"
-    } else {
-        "degraded"
-    };
+    let process_discovery_warning = server_status_error.or_else(|| {
+        server_status
+            .as_ref()
+            .and_then(|info| info.discovery_warning.clone())
+    });
+    let status =
+        if runtime.session_kernel && runtime.event_bus && process_discovery_warning.is_none() {
+            "healthy"
+        } else {
+            "degraded"
+        };
 
     GatewayHealthSnapshot {
         status: status.to_string(),
@@ -132,7 +142,8 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         api_router: "gateway-api-router",
         process: GatewayProcessSnapshot {
             pid: server_status.as_ref().map(|info| info.pid),
-            address: server_status.map(|info| info.address),
+            address: server_status.as_ref().map(|info| info.address.clone()),
+            discovery_warning: process_discovery_warning,
             pid_file: crate::server::pid_file().display().to_string(),
             addr_file: crate::server::addr_file().display().to_string(),
         },
@@ -152,6 +163,9 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
     }
     if !health.runtime.event_bus {
         degraded.push("runtime.event_bus_unavailable".to_string());
+    }
+    if health.process.discovery_warning.is_some() {
+        degraded.push("gateway.process_discovery_degraded".to_string());
     }
     if !health
         .storage

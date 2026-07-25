@@ -1235,10 +1235,98 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
 ];
 
+/// Commands retained as parser vocabulary but not backed by an executable
+/// Gateway or Surface dispatch path in this build.
+pub const NON_EXECUTABLE_SLASH_COMMANDS: &[&str] = &[
+    "login",
+    "logout",
+    "upgrade",
+    "share",
+    "feedback",
+    "fast",
+    "exit",
+    "insights",
+    "thinkback",
+    "release-notes",
+    "security-review",
+    "keybindings",
+    "privacy-settings",
+    "plan",
+    "theme",
+    "usage",
+    "rename",
+    "copy",
+    "hooks",
+    "color",
+    "effort",
+    "rewind",
+    "ide",
+    "tag",
+    "output-style",
+    "add-dir",
+    "allowed-tools",
+    "bookmarks",
+    "workspace",
+    "reasoning",
+    "budget",
+    "rate-limit",
+    "changelog",
+    "diagnostics",
+    "metrics",
+    "tool-details",
+    "focus",
+    "unfocus",
+    "pin",
+    "unpin",
+    "language",
+    "profile",
+    "max-tokens",
+    "temperature",
+    "system-prompt",
+    "notifications",
+    "telemetry",
+    "env",
+    "project",
+    "terminal-setup",
+    "api-key",
+    "reset",
+    "undo",
+    "stop",
+    "retry",
+    "paste",
+    "screenshot",
+    "image",
+    "cron",
+    "team",
+    "benchmark",
+    "migrate",
+    "templates",
+    "chat",
+    "map",
+    "symbols",
+    "references",
+    "definition",
+    "hover",
+    "autofix",
+    "multi",
+    "macro",
+    "alias",
+    "parallel",
+    "subagent",
+    "agent",
+];
+
+#[must_use]
+pub fn is_executable_slash_command(name: &str) -> bool {
+    let name = name.trim().trim_start_matches('/');
+    !NON_EXECUTABLE_SLASH_COMMANDS.contains(&name)
+}
+
 #[must_use]
 pub fn unified_command_registry() -> CommandRegistry {
     let mut definitions = SLASH_COMMAND_SPECS
         .iter()
+        .filter(|spec| is_executable_slash_command(spec.name))
         .enumerate()
         .map(|(index, spec)| command_definition_from_slash(index as u16, spec))
         .collect::<Vec<_>>();
@@ -1794,3 +1882,38 @@ impl fmt::Display for SlashCommandParseError {
 }
 
 impl std::error::Error for SlashCommandParseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executable_registry_excludes_unwired_roadmap_commands() {
+        let registry = unified_command_registry();
+        assert!(registry.find("/upgrade").is_none());
+        assert!(registry.find("/parallel").is_none());
+        assert!(registry.find("/agent").is_none());
+    }
+
+    #[test]
+    fn executable_registry_preserves_real_task_and_workspace_entries() {
+        let registry = unified_command_registry();
+        assert!(registry.find("/tasks").is_some());
+        assert!(registry.find("/files").is_some());
+        assert!(registry.find("/status").is_some());
+    }
+
+    #[test]
+    fn every_projected_slash_command_is_executable() {
+        for surface in [
+            CommandSurface::Tui,
+            CommandSurface::Webui,
+            CommandSurface::Gateway,
+        ] {
+            let projection = command_projection(surface);
+            assert!(projection.commands.iter().all(|command| {
+                is_executable_slash_command(command.name.trim_start_matches('/'))
+            }));
+        }
+    }
+}

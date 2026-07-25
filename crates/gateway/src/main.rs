@@ -139,8 +139,8 @@ use provider_crate::{
 #[cfg(test)]
 use crate::command::slash::resume_supported_slash_commands;
 use crate::command::slash::{
-    classify_skills_slash_command, render_slash_command_help_filtered, slash_command_specs,
-    SkillSlashDispatch, SlashCommand,
+    classify_skills_slash_command, is_executable_slash_command, render_slash_command_help_filtered,
+    slash_command_specs, SkillSlashDispatch, SlashCommand, NON_EXECUTABLE_SLASH_COMMANDS,
 };
 use compat_manifest::{extract_manifest, UpstreamPaths};
 use runtime::ContextProfile;
@@ -763,6 +763,7 @@ fn run_gateway_action(
                             "running": status.is_some(),
                             "pid": status.as_ref().map(|s| s.pid),
                             "address": status.as_ref().map(|s| &s.address),
+                            "discovery_warning": status.as_ref().and_then(|s| s.discovery_warning.as_deref()),
                         })
                     );
                 }
@@ -1416,7 +1417,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
     }
     let slash_command = slash_command_specs()
         .iter()
-        .find(|spec| spec.name == command_name)?;
+        .find(|spec| spec.name == command_name && is_executable_slash_command(spec.name))?;
     let session_hint = if slash_command.resume_supported {
         " Use `cowd --resume <session-id|latest>` first when you need a saved session."
     } else {
@@ -1754,9 +1755,10 @@ fn looks_like_slash_command_token(token: &str) -> bool {
         return false;
     };
 
-    slash_command_specs()
-        .iter()
-        .any(|spec| spec.name == name || spec.aliases.contains(&name))
+    slash_command_specs().iter().any(|spec| {
+        is_executable_slash_command(spec.name)
+            && (spec.name == name || spec.aliases.contains(&name))
+    })
 }
 
 fn dump_manifests(
@@ -1894,15 +1896,14 @@ fn resume_session(session_path: &Path, commands: &[String], output_format: CliOu
         // Intercept spec commands that have no parse arm before calling
         // SlashCommand::parse — they return Err(SlashCommandParseError) which
         // formats as the confusing circular "Did you mean /X?" message.
-        // STUB_COMMANDS covers both completions-filtered stubs and parse-less
-        // spec entries; treat both as unsupported in resume mode.
+        // Non-executable vocabulary must not masquerade as a resumable action.
         {
             let cmd_root = raw_command
                 .trim_start_matches('/')
                 .split_whitespace()
                 .next()
                 .unwrap_or("");
-            if STUB_COMMANDS.contains(&cmd_root) {
+            if NON_EXECUTABLE_SLASH_COMMANDS.contains(&cmd_root) {
                 if output_format == CliOutputFormat::Json {
                     eprintln!(
                         "{}",
@@ -2898,7 +2899,7 @@ fn render_terminal_help() -> String {
         "  Gateway context       /context [runtime|config|memory|cross-plane]".to_string(),
         "  Cross-plane action   /cross-plane [preflight|execute] <json>".to_string(),
         String::new(),
-        render_slash_command_help_filtered(STUB_COMMANDS),
+        render_slash_command_help_filtered(NON_EXECUTABLE_SLASH_COMMANDS),
     ]
     .join(
         "
@@ -3894,94 +3895,6 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
         .collect()
 }
 
-/// Slash commands that are registered in the spec list but not yet implemented
-/// in this build. Used to filter terminal completions and help output so the
-/// discovery surface only shows commands that actually work (ROADMAP #39).
-const STUB_COMMANDS: &[&str] = &[
-    "login",
-    "logout",
-    "upgrade",
-    "share",
-    "feedback",
-    "files",
-    "fast",
-    "exit",
-    "insights",
-    "thinkback",
-    "release-notes",
-    "security-review",
-    "keybindings",
-    "privacy-settings",
-    "plan",
-    "tasks",
-    "theme",
-    "usage",
-    "rename",
-    "copy",
-    "hooks",
-    "color",
-    "effort",
-    "rewind",
-    "ide",
-    "tag",
-    "output-style",
-    "add-dir",
-    // Spec entries with no parse arm — produce circular "Did you mean" error
-    // without this guard. Adding here routes them to the proper unsupported
-    // message and excludes them from terminal completions / help.
-    // NOTE: do NOT add "stats", "tokens", "cache" — they are implemented.
-    "allowed-tools",
-    "bookmarks",
-    "workspace",
-    "reasoning",
-    "budget",
-    "rate-limit",
-    "changelog",
-    "diagnostics",
-    "metrics",
-    "tool-details",
-    "focus",
-    "unfocus",
-    "pin",
-    "unpin",
-    "language",
-    "profile",
-    "max-tokens",
-    "temperature",
-    "system-prompt",
-    "notifications",
-    "telemetry",
-    "env",
-    "project",
-    "terminal-setup",
-    "api-key",
-    "reset",
-    "undo",
-    "stop",
-    "retry",
-    "paste",
-    "screenshot",
-    "image",
-    "cron",
-    "team",
-    "benchmark",
-    "migrate",
-    "templates",
-    "chat",
-    "map",
-    "symbols",
-    "references",
-    "definition",
-    "hover",
-    "autofix",
-    "multi",
-    "macro",
-    "alias",
-    "parallel",
-    "subagent",
-    "agent",
-];
-
 fn slash_command_completion_candidates_with_sessions(
     model: &str,
     active_session_id: Option<&str>,
@@ -3990,12 +3903,12 @@ fn slash_command_completion_candidates_with_sessions(
     let mut completions = BTreeSet::new();
 
     for spec in slash_command_specs() {
-        if STUB_COMMANDS.contains(&spec.name) {
+        if NON_EXECUTABLE_SLASH_COMMANDS.contains(&spec.name) {
             continue;
         }
         completions.insert(format!("/{}", spec.name));
         for alias in spec.aliases {
-            if !STUB_COMMANDS.contains(alias) {
+            if !NON_EXECUTABLE_SLASH_COMMANDS.contains(alias) {
                 completions.insert(format!("/{alias}"));
             }
         }
@@ -4700,8 +4613,8 @@ mod tests {
         GatewayAction, GatewayApprovalSlashCommand, GatewayContextSlashCommand,
         GatewayCrossPlaneSlashCommand, GatewayTaskSlashCommand, GatewayToolExecutor,
         GitWorkspaceSummary, LocalHelpTopic, SessionHandle, SessionPromptHistoryEntry,
-        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, SHARED_RT,
-        STUB_COMMANDS,
+        SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
     };
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
@@ -8610,7 +8523,7 @@ UU conflicted.rs",
     fn stub_commands_absent_from_terminal_completions() {
         let candidates =
             slash_command_completion_candidates_with_sessions("claude-3-5-sonnet", None, vec![]);
-        for stub in STUB_COMMANDS {
+        for stub in NON_EXECUTABLE_SLASH_COMMANDS {
             let with_slash = format!("/{stub}");
             assert!(
                 !candidates.contains(&with_slash),

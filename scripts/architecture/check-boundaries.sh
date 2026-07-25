@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
+MFG_ROOT="${COWD_MFG_ROOT:-../cowd-app-mfg}"
 
 fail=0
 
@@ -193,7 +194,7 @@ check_empty "matrix core must not contain mfg application semantics" \
   bash -c 'mixed="matrix_""mfg"; reverse="mfg_""matrix"; adapter="Mfg""Matrix""Adapter"; while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates/matrix/core crates/matrix/repository -g "*.rs" -g "Cargo.toml") | rg -n "Mfg|mfg|manufacturing|server_manufacturing|${mixed}|${reverse}|${adapter}" || true'
 
 check_empty "app-mfg must not depend on gateway or runtime internals" \
-  bash -c 'root="../cowd-app-mfg"; if [[ ! -d "$root" ]]; then echo "missing sibling cowd-app-mfg"; exit 0; fi; rg -n "gateway::|runtime::|use gateway|use runtime|crate::runtime" "$root/crates" "$root/Cargo.toml" --glob "*.rs" --glob "Cargo.toml" || true'
+  bash -c 'root="$1"; if [[ ! -d "$root" ]]; then echo "required cowd-app-mfg workspace is missing: $root" >&2; exit 2; fi; rg -n "(^|[^[:alnum:]_:])(gateway|runtime)::|use[[:space:]]+(gateway|runtime)(::|[[:space:]]|;)|crate::(gateway|runtime)" "$root/crates" "$root/Cargo.toml" --glob "*.rs" --glob "Cargo.toml" || true' _ "$MFG_ROOT"
 
 check_empty "production direct sqlite opens must stay in storage/repository adapters" \
   bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} !/^[[:space:]]*\\/\\// {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates -g "*.rs" -g "!**/tests/**" -g "!crates/storage/**" -g "!crates/connector/src/source.rs" -g "!crates/connector/src/lib.rs" -g "!crates/memory/src/store/**" -g "!crates/memory/src/session/session_store.rs" -g "!crates/memory/src/session/state_rebuilder.rs" -g "!crates/memory/src/knowledge/mod.rs" -g "!crates/memory/src/kernel/cognitive.rs" -g "!crates/memory/src/lifecycle/maintenance.rs" -g "!crates/memory/src/ops/sqlite_persistence.rs" -g "!crates/matrix/repository/**" -g "!crates/runtime/src/recovery/runtime_event_store.rs" -g "!crates/runtime/src/mission/task.rs" -g "!crates/runtime/src/team/team_discovery.rs" -g "!crates/runtime/src/context/artifact.rs" -g "!crates/gateway/src/infrastructure/selected_storage.rs") | rg -n "Connection::open\\(|SqliteConnectionManager::file|TaskKernel::open\\(|UnifiedSessionStore::open\\(|MfgStore::open\\(|SqliteStore::open\\(|MatrixSqliteRepository::open\\(|Store::open\\(" | rg -v "open_in_memory|/tests/|^crates/gateway/src/api_routes/mod.rs:|^crates/gateway/src/kernel/task_kernel.rs:|^crates/gateway/src/kernel/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example)" || true'
@@ -248,8 +249,8 @@ else
   echo "PASS memory forbidden runtime, transport, tool, provider, or Matrix dependency tree"
 fi
 
-if [[ -f ../cowd-app-mfg/Cargo.toml ]]; then
-  if cargo tree --manifest-path ../cowd-app-mfg/Cargo.toml --workspace --edges normal | rg "(^|[ ├└│─])(runtime v|gateway v|gateway =)"; then
+if [[ -f "$MFG_ROOT/Cargo.toml" ]]; then
+  if cargo tree --manifest-path "$MFG_ROOT/Cargo.toml" --workspace --edges normal | rg "(^|[ ├└│─])(runtime v|gateway v|gateway =)"; then
     echo "FAIL app-mfg forbidden dependency tree"
     fail=1
   else
@@ -257,7 +258,7 @@ if [[ -f ../cowd-app-mfg/Cargo.toml ]]; then
   fi
 else
   echo "FAIL app-mfg forbidden dependency tree"
-  echo "missing sibling cowd-app-mfg workspace"
+  echo "missing cowd-app-mfg workspace: $MFG_ROOT"
   fail=1
 fi
 

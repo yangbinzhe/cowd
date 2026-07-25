@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use surface::{SurfaceActionRequest, SurfaceSendRequest};
+use surface::{SurfaceActionRequest, SurfaceOperationResult, SurfaceSendRequest};
 
 use super::{api_error, AppState, ErrorResponse};
 
@@ -724,7 +724,25 @@ async fn surface_callback_handler(
         .callback(&surface, &format!("/{path}"), method.as_str(), payload)
         .await
         .map_err(|error| api_error(StatusCode::BAD_GATEWAY, error))?;
-    Ok(Json(result))
+    successful_callback_result(result).map(Json)
+}
+
+fn successful_callback_result(
+    result: SurfaceOperationResult,
+) -> Result<SurfaceOperationResult, (StatusCode, Json<ErrorResponse>)> {
+    if let Some(error) = result.error.as_ref() {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("{}: {}", error.code, error.message),
+        ));
+    }
+    if result.status == "unavailable" {
+        return Err(api_error(
+            StatusCode::BAD_GATEWAY,
+            format!("surface `{}` is unavailable", result.surface),
+        ));
+    }
+    Ok(result)
 }
 
 fn content_type_for_path(path: &std::path::Path) -> &'static str {
@@ -741,5 +759,23 @@ fn content_type_for_path(path: &std::path::Path) -> &'static str {
         "svg" => "image/svg+xml",
         "webp" => "image/webp",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_operation_error_is_an_http_bad_gateway() {
+        let error = SurfaceOperationResult::error(
+            "feishu",
+            "feishu_callback_delivery_failed",
+            "Gateway event delivery failed",
+        );
+
+        let (status, _) =
+            successful_callback_result(error).expect_err("callback failure must not return 200");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 }

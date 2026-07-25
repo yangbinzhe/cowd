@@ -204,140 +204,6 @@ impl Default for PerfBudget {
     }
 }
 
-/// Model-specific profile for adaptive compression thresholds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModelProfile {
-    pub model_name: String,
-    pub context_window: u64,
-    pub memory_budget_ratio: f32,
-    pub warning_threshold: f32,
-    pub critical_threshold: f32,
-    pub micro_threshold: usize,
-    pub session_threshold: usize,
-    pub compression_aggressiveness: f32,
-}
-
-impl Default for ModelProfile {
-    fn default() -> Self {
-        Self {
-            model_name: "default".to_string(),
-            context_window: 200_000,
-            memory_budget_ratio: 0.30,
-            warning_threshold: 0.70,
-            critical_threshold: 0.90,
-            micro_threshold: 50,
-            session_threshold: 10,
-            compression_aggressiveness: 0.5,
-        }
-    }
-}
-
-impl ModelProfile {
-    /// Find or create a profile for a given model name.
-    pub fn for_model(model_name: &str) -> Self {
-        let name_lower = model_name.to_lowercase();
-        if name_lower.contains("haiku")
-            || name_lower.contains("flash")
-            || name_lower.contains("04-mini")
-            || name_lower.contains("gpt-3.5-turbo")
-        {
-            if name_lower.contains("gpt-3.5-turbo") {
-                Self {
-                    model_name: model_name.to_string(),
-                    context_window: 16_385,
-                    memory_budget_ratio: 0.15,
-                    warning_threshold: 0.50,
-                    critical_threshold: 0.75,
-                    micro_threshold: 20,
-                    session_threshold: 4,
-                    compression_aggressiveness: 0.75,
-                }
-            } else {
-                Self {
-                    model_name: model_name.to_string(),
-                    context_window: 8_192,
-                    memory_budget_ratio: 0.10,
-                    warning_threshold: 0.40,
-                    critical_threshold: 0.65,
-                    micro_threshold: 10,
-                    session_threshold: 2,
-                    compression_aggressiveness: 0.85,
-                }
-            }
-        } else if name_lower.contains("claude-3-5-sonnet") || name_lower.contains("claude-3.5") {
-            Self {
-                model_name: model_name.to_string(),
-                context_window: 200_000,
-                memory_budget_ratio: 0.35,
-                warning_threshold: 0.70,
-                critical_threshold: 0.90,
-                micro_threshold: 50,
-                session_threshold: 10,
-                compression_aggressiveness: 0.5,
-            }
-        } else if name_lower.contains("claude-3-opus") {
-            Self {
-                model_name: model_name.to_string(),
-                context_window: 200_000,
-                memory_budget_ratio: 0.35,
-                warning_threshold: 0.70,
-                critical_threshold: 0.90,
-                micro_threshold: 50,
-                session_threshold: 10,
-                compression_aggressiveness: 0.5,
-            }
-        } else if name_lower.contains("claude") {
-            Self {
-                model_name: model_name.to_string(),
-                context_window: 200_000,
-                memory_budget_ratio: 0.35,
-                warning_threshold: 0.70,
-                critical_threshold: 0.90,
-                micro_threshold: 50,
-                session_threshold: 10,
-                compression_aggressiveness: 0.5,
-            }
-        } else if name_lower.contains("gpt-4o") {
-            Self {
-                model_name: model_name.to_string(),
-                context_window: 128_000,
-                memory_budget_ratio: 0.30,
-                warning_threshold: 0.70,
-                critical_threshold: 0.88,
-                micro_threshold: 45,
-                session_threshold: 9,
-                compression_aggressiveness: 0.55,
-            }
-        } else if name_lower.contains("o1-preview") || name_lower.contains("o1-mini") {
-            Self {
-                model_name: model_name.to_string(),
-                context_window: 128_000,
-                memory_budget_ratio: 0.20,
-                warning_threshold: 0.60,
-                critical_threshold: 0.80,
-                micro_threshold: 30,
-                session_threshold: 6,
-                compression_aggressiveness: 0.7,
-            }
-        } else if name_lower.contains("gpt-4") {
-            Self {
-                model_name: model_name.to_string(),
-                context_window: 128_000,
-                memory_budget_ratio: 0.25,
-                warning_threshold: 0.65,
-                critical_threshold: 0.85,
-                micro_threshold: 40,
-                session_threshold: 8,
-                compression_aggressiveness: 0.6,
-            }
-        } else {
-            let mut profile = Self::default();
-            profile.model_name = model_name.to_string();
-            profile
-        }
-    }
-}
-
 /// LLM summarization configuration for compression pipeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmSummarizerConfig {
@@ -405,10 +271,6 @@ pub struct MemoryConfig {
     pub drift: DriftConfig,
     pub perf: PerfBudget,
     pub tuning: TuningConfig,
-    /// Target model name for adaptive compression thresholds.
-    /// When set, compression parameters auto-adjust based on model profile.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
 }
 
 /// Tunable thresholds that were previously hard-coded.
@@ -663,16 +525,11 @@ impl Default for ExtractorConfig {
 #[derive(Debug, Clone)]
 pub struct BudgetCalculator {
     config: BudgetConfig,
-    model_profile: ModelProfile,
 }
 
 impl BudgetCalculator {
     pub fn new(config: BudgetConfig) -> Self {
-        let profile = ModelProfile::for_model(&config.context_window.to_string());
-        Self {
-            config,
-            model_profile: profile,
-        }
+        Self { config }
     }
 
     pub fn base_available(&self) -> u64 {
@@ -680,10 +537,6 @@ impl BudgetCalculator {
             .context_window
             .saturating_sub(self.config.reserved_system)
             .saturating_sub(self.config.reserved_response)
-    }
-
-    pub fn memory_budget(&self) -> u64 {
-        (self.base_available() as f64 * self.model_profile.memory_budget_ratio as f64) as u64
     }
 
     pub fn make_budget(&self) -> TokenBudget {
@@ -749,40 +602,6 @@ impl BudgetCalculator {
 // ── MemoryConfig methods ────────────────────────────────────────────────
 
 impl MemoryConfig {
-    /// Update configuration based on model profile.
-    pub fn with_model_profile(mut self, model_name: &str) -> Self {
-        let profile = ModelProfile::for_model(model_name);
-
-        self.model = Some(model_name.to_string());
-        self.budget = BudgetConfig::for_context_window(profile.context_window);
-        self.compression.micro_threshold = profile.micro_threshold;
-        self.compression.session_threshold = profile.session_threshold;
-        self.compression.aggressiveness = profile.compression_aggressiveness;
-
-        self
-    }
-
-    /// Get the recommended memory budget for the current model profile.
-    pub fn recommended_memory_budget(&self) -> u64 {
-        let available = self.budget.context_window
-            - self.budget.reserved_system
-            - self.budget.reserved_response;
-
-        let profile = ModelProfile::for_model(&self.model_name().unwrap_or_default());
-
-        (available as f64 * profile.memory_budget_ratio as f64) as u64
-    }
-
-    /// Get the model name (if set).
-    pub fn model_name(&self) -> Option<String> {
-        self.model.clone()
-    }
-
-    /// Set the target model name for adaptive compression.
-    pub fn set_model(&mut self, model_name: String) {
-        self.model = Some(model_name);
-    }
-
     /// Override configuration from environment variables.
     ///
     /// Supported environment variables:
@@ -835,36 +654,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_model_profile_detection() {
-        let claude = ModelProfile::for_model("claude-3-5-sonnet-20241022");
-        assert_eq!(claude.context_window, 200_000);
-        assert_eq!(claude.memory_budget_ratio, 0.35);
-
-        let gpt4o = ModelProfile::for_model("gpt-4o");
-        assert_eq!(gpt4o.context_window, 128_000);
-
-        let o1 = ModelProfile::for_model("o1-preview");
-        assert_eq!(o1.context_window, 128_000);
-        assert_eq!(o1.compression_aggressiveness, 0.7);
-    }
-
-    #[test]
-    fn test_memory_config_with_model() {
-        let config = MemoryConfig::default().with_model_profile("gpt-4o");
-
-        assert_eq!(config.budget.context_window, 128_000);
-        assert_eq!(config.compression.micro_threshold, 45);
-    }
-
-    #[test]
-    fn test_recommended_memory_budget() {
-        let config = MemoryConfig::default().with_model_profile("claude-3-5-sonnet-20241022");
-
-        let budget = config.recommended_memory_budget();
-        assert!(budget > 60000 && budget < 65000);
-    }
-
-    #[test]
     fn test_budget_config_dynamic_calculation() {
         let budget = BudgetConfig::for_context_window(128_000);
 
@@ -889,39 +678,5 @@ mod tests {
         assert!(budget.reserved_system <= 20_000);
         assert!(budget.reserved_response <= 16_000);
         assert!(budget.available_tokens() > 160_000);
-    }
-
-    #[test]
-    fn test_small_model_aggressive_compression() {
-        let small = ModelProfile::for_model("claude-3-5-haiku-20241022");
-        assert_eq!(small.context_window, 8_192);
-        assert!(small.compression_aggressiveness >= 0.8);
-        assert!(small.memory_budget_ratio <= 0.15);
-
-        let detected = ModelProfile::for_model("gpt-3.5-turbo-1106");
-        assert_eq!(detected.context_window, 16_385);
-
-        let mini = ModelProfile::for_model("04-mini");
-        assert_eq!(mini.context_window, 8_192);
-    }
-
-    #[test]
-    fn test_memory_budget_with_default_model() {
-        let calc = BudgetCalculator::new(BudgetConfig::default());
-        let budget = calc.memory_budget();
-        let expected = (calc.base_available() as f64 * 0.30) as u64;
-        assert_eq!(budget, expected);
-    }
-
-    #[test]
-    fn test_memory_budget_preserves_base_available() {
-        let calc = BudgetCalculator::new(BudgetConfig::default());
-        let base = calc.base_available();
-        let _ = calc.memory_budget();
-        assert_eq!(
-            calc.base_available(),
-            base,
-            "base_available must not change"
-        );
     }
 }

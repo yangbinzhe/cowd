@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use surface::{
     SurfaceDescriptor, SurfaceFrame, SurfaceMessageLedger, SurfaceRuntimeSnapshot,
@@ -47,7 +47,7 @@ pub(crate) struct SurfaceHost {
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
     messages: Arc<dyn SurfaceMessageLedger>,
     event_tx: broadcast::Sender<SurfaceFrame>,
-    monitor_started: Arc<RwLock<bool>>,
+    monitor_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl SurfaceHost {
@@ -107,7 +107,7 @@ impl SurfaceHost {
             ledger: Arc::new(AsyncMutex::new(HashMap::new())),
             messages,
             event_tx,
-            monitor_started: Arc::new(RwLock::new(false)),
+            monitor_task: Arc::new(Mutex::new(None)),
         };
         host.register_builtin_surfaces();
         host

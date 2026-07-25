@@ -4,11 +4,7 @@ use std::{
     sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
-use harness_contract::{
-    core::{ExecutionPattern, TaskComplexity, TaskRisk},
-    growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
-    policy::{PolicyDecisionKind, RiskGateReceipt},
-};
+use harness_contract::policy::RiskGateReceipt;
 
 use crate::runtime_service::RuntimeService;
 use memory::CognitiveContextManager;
@@ -490,57 +486,6 @@ impl GrowthService {
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
         service_envelope(self.label, self.owner, operation)
     }
-
-    pub(crate) fn risk_gate_event(
-        &self,
-        session_id: impl Into<String>,
-        receipt: &RiskGateReceipt,
-    ) -> serde_json::Value {
-        let record = LearningRecord::from_input(GrowthInput {
-            selected_pattern: if receipt.approval_required {
-                ExecutionPattern::Execute
-            } else {
-                ExecutionPattern::Execute
-            },
-            complexity: TaskComplexity::Moderate,
-            risk: if receipt.approval_required {
-                TaskRisk::High
-            } else {
-                TaskRisk::Medium
-            },
-            context_omitted: 0,
-            tool_requires_checkpoint: !matches!(receipt.decision, PolicyDecisionKind::Allow),
-            tool_requires_human_confirm: receipt.approval_required,
-            verification_can_finalize: !receipt.approval_required,
-            bench_passed: true,
-        });
-        let event = GrowthEvent::from_input(GrowthEventInput {
-            session_id: session_id.into(),
-            source_event_kind: "approval.risk_receipt".to_string(),
-            strategy_pattern: if receipt.approval_required {
-                ExecutionPattern::Execute
-            } else {
-                ExecutionPattern::Execute
-            },
-            learning_record: record,
-            evidence_refs: vec![GrowthEvidenceRef::new(
-                "risk_gate_receipt",
-                format!("risk:{}", receipt.issued_at.timestamp_millis()),
-                format!(
-                    "decision={:?} approval_required={}",
-                    receipt.decision, receipt.approval_required
-                ),
-            )],
-        });
-        let durability = self.ledger.record_growth_event(event.clone());
-
-        serde_json::json!({
-            "envelope": self.envelope("risk_gate_event"),
-            "event": event,
-            "durable": durability.is_ok(),
-            "error": durability.err().map(|error| error.to_string()),
-        })
-    }
 }
 
 #[derive(Clone)]
@@ -871,6 +816,10 @@ mod tests {
     use crate::services::{
         context::ServiceContext, error::ServiceError, policy::ServicePolicy,
         receipt::ServiceReceipt, registry::ServiceRegistry,
+    };
+    use harness_contract::{
+        core::{ExecutionPattern, TaskComplexity, TaskRisk},
+        growth::{GrowthEvent, GrowthEventInput, GrowthEvidenceRef, GrowthInput, LearningRecord},
     };
 
     #[test]

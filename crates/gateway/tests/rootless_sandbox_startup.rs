@@ -13,11 +13,11 @@ fn rootless_launcher_does_not_downgrade_a_required_kernel_hardening_request() {
     let mut spec = SandboxLaunchSpec::workspace(&workspace);
     spec.require_kernel_hardening = true;
 
-    if let Ok(prepared) = shell_command("true", &spec) {
-        assert_eq!(
-            prepared.security_posture(),
-            SandboxSecurityPosture::KernelHardened,
-            "a successful required-hardening launch must prove the requested posture"
-        )
-    }
+    let prepared = shell_command("true", &spec)
+        .expect("the required rootless sandbox gate must prepare a kernel-hardened command");
+    assert_eq!(
+        prepared.security_posture(),
+        SandboxSecurityPosture::KernelHardened,
+        "a successful required-hardening launch must prove the requested posture"
+    );
 }
