@@ -242,7 +242,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "judge_model": options.judge_model.clone(),
         "provider_fallbacks": "disabled",
         "tool_catalog": "same-binary-runtime-inspected",
-        "workspace_fixture": "workspace-v546-frozen",
+        "workspace_fixture": "workspace-auto-strategy-frozen",
         "mutation_fixture_reset": "per-sample-pristine-full-workspace-sha256",
         "evidence_seed": corpus_hash.clone(),
         "permission_mode": "dontAsk",

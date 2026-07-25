@@ -1,84 +1,46 @@
-# 交互式测试场景目录
+# Interactive 场景目录
 
-本目录是 manual/nightly 诊断清单，不属于默认 release gate。默认门禁只来自：
+本目录是人工或 nightly 诊断工具，不属于默认发布门禁。真实发布信心来自：
 
 - `scripts/validate.sh contract`
+- `scripts/validate.sh serial-global`
 - `scripts/validate.sh scenario`
 - `scripts/validate.sh surface`
 - `scripts/validate.sh release`
 
-interactive 场景用于人工复核、回归定位和后续重写候选。新增或恢复为默认门禁前，必须满足：
+## 场景分层
 
-1. 断言确定性，不依赖真实 LLM 语义判断。
-2. HTTP 调用必须检查状态码，不能吞掉 404/500。
-3. TUI 等待失败必须失败退出，不能用 `.ok()` 降级。
-4. 进程清理只能清理自身启动的子进程，不能 `pkill` 用户环境。
-5. 与 scenario/surface/release 已覆盖的能力不能重复进入默认门禁。
-
-## 默认门禁映射
-
-| 能力 | 默认门禁 | interactive 定位 |
+| 模块 | 目的 | 不重复的失败模式 |
 | --- | --- | --- |
-| Gateway health/ready/WebUI manifest | `scenario.gateway_baseline`、`surface.webui_gateway_contract` | 只用于手工诊断面板或 API 细节 |
-| Session/runtime | `scenario.session_runtime` | 只用于复现 TUI/API 跨面状态 |
-| Memory/context | `scenario.memory_context` | 只用于复杂交互定位 |
-| Tool/permission/audit | `scenario.tool_permission`、`release.full_product_smoke` | 只用于人工排查 |
-| Skill/MFG/structured data | `scenario.skill_mfg`、`release.full_product_smoke` | 只用于扩展质量评测 |
-| CLI/TUI/WebUI surface | `surface` lane 三个控制点 | 只用于视觉或交互细节回归 |
+| `tui_basic` | 启动、输入、滚动、搜索 | 终端基础交互失效 |
+| `tui_interact` | 快捷键、命令面板、历史、弹层 | 键盘操作与弹层状态失效 |
+| `tui_gateway` | Gateway 状态面板 | TUI 无法呈现 Gateway 状态 |
+| `tui_memory` | 记忆面板与命令 | 记忆投影不可见 |
+| `tui_skills` | Skill 面板与导航 | Skill 投影不可达 |
+| `tui_session_sidebar` | 会话侧栏 | 当前会话不可见或不可切换 |
+| `tui_all_panels` | 人工遍历全部二级面板 | 面板可达性与终端布局回归 |
+| `tui_mfg_operations` | MFG 只读控制面 | APP 投影、回链证据和响应式布局回归 |
+| `server_core` | health、session、memory、config | Gateway 核心诊断 |
+| `server_gateway_api` | memory/tool/config API | API 诊断 |
+| `server_gateway_cmd` | CLI Gateway 生命周期 | 启停与状态命令失效 |
+| `server_send_message` | session 创建和消息 | 消息入口与持久会话失效 |
+| `cross_cut` | TUI 发起、API 观察、真实回复 | 同一会话跨 Surface 不收敛 |
 
-## TUI 测试 (18 项)
+## 准入规则
 
-| # | 场景 | 操作 | 验证 |
-|---|------|------|------|
-| 1 | 启动 | cowd 启动 | 启动上下文可见 |
-| 2 | 输入+发送 | 输入文字按 Enter | 消息出现在 timeline |
-| 3 | 滚动(PgUp/PgDn) | 多条消息后按 PgUp | 滚动偏移变化 |
-| 4 | 展开/折叠 | Enter 切换 | 折叠条目标题变化 |
-| 5 | 搜索 | `/` 输入关键词 Enter | 匹配条目被高亮 |
-| 6 | 侧边栏标签切换 | Tab 循环 | 标签高亮切换 |
-| 7 | Which-Key | 按 Space | 快捷键面板弹出 |
-| 8 | 命令面板 Ctrl+P | Ctrl+P | 搜索框弹出 |
-| 9 | Toast 通知 | 触发复制失败 | 右上角提示 |
-| 10 | 状态栏信息 | 观察 | 显示模型/Token |
-| 11 | 输入历史 Alt+↑/↓ | 输入后 Alt+↑ | 历史内容恢复 |
-| 12 | 消息菜单 Ctrl+O | Ctrl+O | 菜单弹出 |
-| 13 | 会话 Fork | f 键 | Fork 对话框弹出 |
-| 14 | Export 导出 | Space e | 导出选项 |
-| 15 | 主题切换 Ctrl+T | Ctrl+T | 颜色变化 |
-| 16 | 模型切换 Ctrl+M | Ctrl+M | 状态栏模型变化 |
-| 17 | 自动补全 Tab | 输入 `/` 后 Tab | 命令列表弹出 |
-| 18 | 多行输入 Shift+Enter | Shift+Enter | 换行显示 |
+新增场景必须满足：
 
-## Server 测试 (12 项)
+1. 写清楚它独有的失败模式；已有默认门禁覆盖时不得再新增。
+2. HTTP 必须检查状态和结构，不能只把请求成功当作业务成功。
+3. TUI 等待超时必须失败，不允许 `.ok()` 吞错。
+4. 只能清理自身创建的进程、端口和临时目录。
+5. LLM judge 只能作为质量评价，不能替代确定性的协议、状态和持久化断言。
+6. 平台 live 收发应进入对应 Edge/Surface 的真实连接测试，不能用源码文件存在代替。
 
-| # | 场景 | 操作 | 验证 |
-|---|------|------|------|
-| 19 | Health | GET /health | 200 OK |
-| 20 | 创建会话 | POST /api/sessions | 返回 session_id |
-| 21 | 列出会话 | GET /api/sessions | 列表含新会话 |
-| 22 | 发送消息 | POST /api/sessions/:id/messages | 消息被接收 |
-| 23 | 获取消息 | GET /api/sessions/:id/messages | 返回消息列表 |
-| 24 | 记忆搜索 | GET /api/memory/search?q=xxx | 返回匹配 |
-| 25 | 配置读取 | GET /api/config | 返回配置 JSON |
-| 26 | 工作区文件 | GET /api/workspace/files | 返回文件列表 |
-| 27 | 平台列表 | GET /api/platforms | 返回平台列表 |
-| 28 | 命令执行 | POST /api/commands/execute | 命令输出 |
-| 29 | 健康状态 | GET /v1/system/status | 返回状态 |
-| 30 | 审批状态 | GET /api/approval/config | 返回审批配置 |
+## 使用
 
-## 交叉测试 (10 项)
-
-| # | 场景 | 操作 | 验证 |
-|---|------|------|------|
-| 31 | TUI发送→API验证 | TUI 发消息，API 查会话 | API 能查到会话和消息 |
-| 32 | API创建→TUI验证 | API 创建会话，TUI 能恢复 | TUI 列表含新会话 |
-| 33 | TUI记忆→API搜索 | TUI 对话中触发记忆 | API 搜索到记忆条目 |
-| 34 | API写入记忆→TUI读取 | API 写记忆，TUI 查询 | TUI 注入该记忆 |
-| 35 | TUI审批→API状态 | TUI 触发审批，API 查待审批 | API 返回 pending 状态 |
-| 36 | TUI搜索→API验证 | TUI /search，API 查历史 | API 记忆搜索匹配 |
-| 37 | 会话压缩 | TUI /compact，API 验证 | API 压缩后消息数减少 |
-| 38 | TUI 配置修改 | TUI /config，API 读配置 | API 返回更新后配置 |
-| 39 | 工作区文件同步 | TUI 侧边栏文件，API 文件列表 | 两者匹配 |
-| 40 | 端到端对话 | TUI 完整对话→API 获取消息 | API 返回全部对话 |
-
-总计：40 个测试场景
+```bash
+cd tests/interactive
+cargo run -- --list
+cargo run -- --scenarios tui_basic,cross_cut
+```

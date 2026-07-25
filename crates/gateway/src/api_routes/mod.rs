@@ -2422,7 +2422,12 @@ pub(crate) mod tests {
     }
 
     fn test_temp_dir(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("cowd-api-{label}-{}", uuid::Uuid::new_v4()));
+        // Several API fixtures host Unix sockets, whose path is capped at
+        // SUN_LEN. Keep the diagnostic prefix while bounding the full path
+        // independently of the validation lane's TMPDIR.
+        let short_label = label.chars().take(8).collect::<String>();
+        let path =
+            std::env::temp_dir().join(format!("cowd-api-{short_label}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }

@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn provisioned_fixture_registers_from_the_same_storage_and_source_contract() {
         let config_home =
-            std::env::temp_dir().join(format!("cowd-v579-fixture-register-{}", std::process::id()));
+            std::env::temp_dir().join(format!("cowd-fixture-register-{}", std::process::id()));
         let mut registry = AppRegistry::default();
         let provisioning = register_products_with_storage(
             vec![fixture_product()],
@@ -821,17 +821,17 @@ mod tests {
 
     #[cfg(feature = "app-postgres")]
     #[test]
-    fn real_postgres_provision_when_configured() {
-        let Ok(url) = std::env::var("COWD_TEST_POSTGRES_URL") else {
-            eprintln!("COWD_TEST_POSTGRES_URL is absent; real PostgreSQL case skipped");
-            return;
-        };
-        let resolver = storage::StaticSecretRefResolver::new([("v579-test".to_string(), url)]);
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_postgres_provision() {
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+        let resolver =
+            storage::StaticSecretRefResolver::new([("product-app-test".to_string(), url)]);
         let executor = storage::PostgresExecutor::connect(
             storage::PostgresConnectionConfig::new(
-                "v579-app-provision",
-                "v579-test",
-                "cowd-v579-test",
+                "product-app-provision",
+                "product-app-test",
+                "cowd-product-app-postgres-contract",
             ),
             &resolver,
         )
@@ -839,7 +839,7 @@ mod tests {
         let products = vec![fixture_product()];
         let provisioning = provision_products(
             &products,
-            storage::StorageRegistry::default_for_config_home("/tmp/cowd-v579-pg"),
+            storage::StorageRegistry::default_for_config_home("/tmp/cowd-product-app-pg"),
             &AppStorageTopology::Postgres {
                 executor: executor.clone(),
             },

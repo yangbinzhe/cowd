@@ -36,11 +36,7 @@ fn authorize_tui_request(
 ) -> reqwest::RequestBuilder {
     let request = request
         .header("x-cowd-surface-id", TUI_SURFACE_ID)
-        .header("x-cowd-observer-id", observer_id)
-        .header(
-            "x-cowd-requested-capabilities",
-            harness_contract::security::CORE_HUMAN_CAPABILITIES.join(","),
-        );
+        .header("x-cowd-observer-id", observer_id);
     if let Some(token) = auth_token.filter(|token| !token.trim().is_empty()) {
         request.bearer_auth(token.trim())
     } else {
@@ -5124,22 +5120,35 @@ mod tests {
     }
 
     #[test]
-    fn every_gateway_request_uses_the_tui_surface_decorator() {
-        let source = include_str!("gateway_client.rs");
-        let production_source = source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("source has a production section");
-        assert!(source.contains("x-cowd-surface-id"));
-        assert_eq!(production_source.matches(".bearer_auth(").count(), 1);
-        assert!(
-            production_source.contains("harness_contract::security::CORE_HUMAN_CAPABILITIES"),
-            "TUI must request the canonical core manager capabilities"
+    fn tui_gateway_request_delegates_capability_projection_to_gateway_catalog() {
+        let request = authorize_tui_request(
+            reqwest::Client::new().get("http://127.0.0.1:8642/healthz"),
+            Some("  test-token  "),
+            "tui:test-observer",
+        )
+        .build()
+        .expect("decorated request should build");
+        let headers = request.headers();
+
+        assert_eq!(
+            headers
+                .get("x-cowd-surface-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("tui")
         );
-        assert!(
-            !production_source.contains("cowd_product_apps::compiled_products"),
-            "TUI must not reconstruct an APP capability union; the broker derives APP entitlements from the active catalogue"
+        assert_eq!(
+            headers
+                .get("x-cowd-observer-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("tui:test-observer")
         );
+        assert_eq!(
+            headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-token")
+        );
+        assert!(headers.get("x-cowd-requested-capabilities").is_none());
     }
 
     #[test]
@@ -5571,208 +5580,6 @@ mod tests {
             .as_deref(),
             Some("runtime relay lag (7 events skipped)")
         );
-    }
-
-    #[test]
-    fn gateway_api_inventory_migrates_legacy_control_and_projection_methods() {
-        let migrated = [
-            "status",
-            "runtime_snapshot",
-            "list_sessions",
-            "session_projection",
-            "session_input_projection",
-            "turn_inbox",
-            "ensure_session",
-            "acquire_session_lease",
-            "release_session_lease",
-            "attach_session",
-            "detach_session",
-            "lifecycle_snapshot",
-            "replay_session",
-            "task_status",
-            "start_task",
-            "cancel_task",
-            "complete_task",
-            "pending_approvals",
-            "mission_projection",
-            "mission_session_detail",
-            "mission_approvals",
-            "mission_relations",
-            "submit_mission_approval",
-            "start_mission_team_runtime",
-            "team_templates",
-            "instantiate_team_template",
-            "team_working_state",
-            "decide_mission_approval",
-            "add_mission_relation",
-            "upsert_mission_proxy",
-            "runtime_agent_input",
-            "runtime_agent_interrupt",
-            "runtime_agent_shutdown",
-            "memory_status",
-            "reality_status",
-            "reality_flow",
-            "reality_boundaries",
-            "context_snapshot",
-            "respond_approval",
-            "connector_resources",
-            "message_connectors",
-            "message_connector_status",
-            "message_connector_repair",
-            "message_endpoints",
-            "message_routes",
-            "message_bindings",
-            "revalidate_connector_resource",
-            "promote_connector_resource_to_memory",
-            "chat_session",
-            "consume_session_live_source",
-            "runtime_control_plane",
-            "cowd_capabilities",
-            "cowd_projection",
-            "cowd_surfaces",
-            "cowd_release_gate",
-            "gateway_capability_contract",
-            "gateway_openai_tools",
-            "structured_sources",
-            "structured_facts",
-            "structured_evidence",
-            "structured_watermarks",
-            "structured_ingest_plan",
-            "runtime_session_leases",
-            "acquire_runtime_session_lease",
-            "release_runtime_session_lease",
-            "runtime_effective_config",
-            "runtime_timeline",
-            "current_context",
-            "cross_plane_summary",
-            "connector_accounts",
-            "connector_capabilities",
-            "connector_service_tools",
-            "execute_connector_service",
-            "surface_start",
-            "surface_stop",
-            "surface_restart",
-            "surface_inbox",
-            "surface_outbox",
-            "surface_messages",
-            "surface_archive_messages",
-            "surface_purge_archived_events",
-            "surface_deliveries",
-            "surface_replay_inbox",
-            "surface_retry_outbox",
-            "surface_dead_letter_outbox",
-            "skill_runs",
-            "skill_run_detail",
-            "skill_action",
-            "harness_eval_latest_report",
-            "harness_eval_reports",
-            "harness_eval_report",
-            "harness_eval_report_artifacts",
-            "harness_eval_report_gate",
-            "harness_eval_run_smoke",
-            "harness_eval_run",
-            "harness_eval_run_status",
-            "harness_eval_cancel_run",
-            "evolution_signals",
-            "evolution_diagnoses",
-            "evolution_missions_summary",
-            "evolution_mission_detail",
-            "evolution_create_diagnosis",
-            "evolution_proposals",
-            "evolution_create_proposal",
-            "evolution_skill_draft",
-            "evolution_chain",
-            "evolution_candidates",
-            "evolution_candidate_detail",
-            "evolution_create_candidate",
-            "evolution_candidate_evaluate",
-            "evolution_candidate_canary_review",
-            "evolution_candidate_stable_review",
-            "evolution_reviews",
-            "evolution_review_detail",
-            "evolution_create_release_review",
-            "evolution_review_decision",
-            "evolution_evaluation_policy",
-            "evolution_evaluation_policy_reviews",
-            "evolution_evaluation_policy_review_decision",
-            "managed_agents",
-            "dispatch_managed_agents",
-            "trigger_managed_agent",
-            "reset_managed_agent_health",
-            "preflight_cross_plane_action",
-            "execute_cross_plane_action",
-            "cross_plane_policy_simulate",
-            "tool_registry",
-            "tool_execute",
-            "tool_cache_stats",
-            "tool_batch_readonly",
-            "tool_mutation_preview",
-            "tool_mutation_apply",
-            "tool_checkpoints",
-            "tool_checkpoint_create",
-            "tool_checkpoint_diff",
-            "tool_checkpoint_restore",
-            "tool_intent_plan",
-            "tool_context_fanout_plan",
-            "slash_dispatch",
-            "cancel_session_turn",
-        ];
-        let deleted = ["socket_path", "with_timeout"];
-        assert!(
-            migrated.len() >= 136,
-            "gateway inventory should not shrink when routes are migrated"
-        );
-        assert!(migrated.contains(&"session_input_projection"));
-        assert!(migrated.contains(&"turn_inbox"));
-        assert_eq!(deleted.len(), 2);
-        assert!(!migrated.iter().any(|item| item.trim().is_empty()));
-        assert!(!deleted.iter().any(|item| item.trim().is_empty()));
-    }
-
-    #[test]
-    fn evolution_gateway_api_inventory_exposes_runtime_evolution_controls() {
-        let evolution_methods = [
-            "evolution_signals",
-            "evolution_diagnoses",
-            "evolution_missions_summary",
-            "evolution_mission_detail",
-            "evolution_create_diagnosis",
-            "evolution_proposals",
-            "evolution_create_proposal",
-            "evolution_skill_draft",
-            "evolution_chain",
-            "evolution_candidates",
-            "evolution_candidate_detail",
-            "evolution_create_candidate",
-            "evolution_candidate_evaluate",
-            "evolution_candidate_canary_review",
-            "evolution_candidate_stable_review",
-            "evolution_reviews",
-            "evolution_review_detail",
-            "evolution_create_release_review",
-            "evolution_review_decision",
-            "evolution_evaluation_policy",
-            "evolution_evaluation_policy_reviews",
-            "evolution_evaluation_policy_review_decision",
-        ];
-        assert_eq!(evolution_methods.len(), 22);
-        assert!(evolution_methods
-            .iter()
-            .all(|method| method.starts_with("evolution_")));
-    }
-
-    #[test]
-    fn managed_agent_gateway_api_inventory_exposes_runtime_owned_controls() {
-        let managed_agent_methods = [
-            "managed_agents",
-            "dispatch_managed_agents",
-            "trigger_managed_agent",
-            "reset_managed_agent_health",
-        ];
-        assert_eq!(managed_agent_methods.len(), 4);
-        assert!(managed_agent_methods
-            .iter()
-            .all(|method| method.contains("managed_agent")));
     }
 
     #[tokio::test]

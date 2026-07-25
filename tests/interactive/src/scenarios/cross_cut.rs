@@ -8,8 +8,6 @@ pub fn has_scenario(name: &str) -> bool {
     matches!(
         name,
         "cross_session_api"
-            | "cross_memory"
-            | "cross_approval"
             | "cross_e2e"
             | "cross_cut"
             | ""

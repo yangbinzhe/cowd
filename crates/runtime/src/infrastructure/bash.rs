@@ -377,10 +377,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run scripts/test/lark-live.sh with COWD_LIVE_LARK_SKILL_TEST=1"]
     fn live_cowd_owned_lark_cli_executes_inside_hardened_sandbox() {
-        if std::env::var_os("COWD_LIVE_LARK_SKILL_TEST").is_none() {
-            return;
-        }
+        assert_eq!(
+            std::env::var("COWD_LIVE_LARK_SKILL_TEST").as_deref(),
+            Ok("1"),
+            "live Lark sandbox test requires COWD_LIVE_LARK_SKILL_TEST=1"
+        );
         let output = execute_bash(BashCommandInput {
             command: String::from(
                 "set -eu; lark-cli --version; lark-cli --help >/dev/null; lark-cli base --help >/dev/null; lark-cli im --help >/dev/null; LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1 LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1 lark-cli auth status --json > /tmp/lark-auth.json 2>&1 || true; grep -q not_configured /tmp/lark-auth.json; printf '\\nlark-sandbox-ok'",

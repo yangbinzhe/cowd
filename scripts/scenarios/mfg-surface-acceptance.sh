@@ -372,7 +372,7 @@ authorized_curl -fsS -X POST \
   "${BASE_URL}/api/apps/mfg/cockpit/profiles/${PROFILE_ID}/reports/generate" \
   -H "content-type: application/json" \
   -H "idempotency-key: ${SCENARIO_ID}-report" \
-  -d '{"request_id":"mfg-live-report","report":{"cadence":"daily","note":"V545 live acceptance"}}' \
+  -d '{"request_id":"mfg-live-report","report":{"cadence":"daily","note":"MFG live acceptance"}}' \
   -o "${REPORT_RESPONSE}"
 jq -e '.report.revision == 1
   and (.report.report_id | type == "string")

@@ -5,14 +5,10 @@
     clippy::unreachable
 )]
 
-//! RED Tests: Task 2 - Fact check write path integration
+//! Fact-check write path integration tests.
 //!
-//! These tests verify that MemoryOrchestrator.remember() uses FactChecker
-//! to detect contradictions when writing entries that contain knowledge
-//! graph triples.
-//!
-//! Current state: FactChecker is designed but NOT wired into remember().
-//! These tests SHOULD FAIL until the GREEN implementation is complete.
+//! These tests verify that `remember()` uses `FactChecker` to detect
+//! contradictions while preserving consistent facts.
 
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
@@ -45,7 +41,7 @@ fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
 //
 // 使用 FactChecker 的单元测试能力（不经过 CognitiveContextManager）
 // 验证: 矛盾的三元组被检测 → is_consistent = false
-// 这个测试直接测试 FactChecker 本身，应该在当前代码下 PASS
+// 这个测试直接验证 FactChecker 的矛盾检测合同。
 // =========================================================================
 #[test]
 fn test_fact_checker_detects_contradiction() {
@@ -97,12 +93,7 @@ fn test_fact_checker_detects_contradiction() {
 // 写入一个包含矛盾三元组的记忆条目，验证：
 // 1. 写入成功（FactChecker 只降级置信度，不阻止写入）
 // 2. 置信度被降级
-// 3. 日志包含矛盾警告
-//
-// 当前: FactChecker 未接入 remember() 路径
-// → 置信度不会被修改 → 测试 FAIL (RED)
-//
-// 注意: 使用 layer list API 避免 FTS5 搜索路径的已知 bug
+// 3. 持久化后的条目保留降级结果
 // =========================================================================
 #[tokio::test]
 async fn test_remember_contradictory_triple_confidence_downgraded() {
@@ -170,9 +161,6 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
         .await
         .expect("Should remember contradictory entry (FactChecker only downgrades, never rejects)");
 
-    let layers = mgr.list_layers().await;
-    eprintln!("Layers: {:?}", layers);
-
     let id_str = contradictory_id.to_string();
     match mgr.get_entry(&id_str).await {
         Ok(Some(retrieved)) => {
@@ -181,13 +169,9 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
                 retrieved.title, retrieved.confidence, original_confidence
             );
 
-            // RED 断言: FactChecker 应该将矛盾条目的置信度降到 0.5 以下
-            // 当前未接入 → 置信度保持 0.9 → 断言失败 (RED)
             assert!(
                 retrieved.confidence < original_confidence,
-                "RED: Contradictory entry confidence should be downgraded below {:.3}. \
-                 Got {:.3}. This fails because FactChecker is not yet wired into \
-                 the remember() path.",
+                "Contradictory entry confidence should be below {:.3}; got {:.3}",
                 original_confidence,
                 retrieved.confidence
             );
@@ -205,7 +189,7 @@ async fn test_remember_contradictory_triple_confidence_downgraded() {
 // Test 3: 一致的条目不受影响
 //
 // 写入一个不矛盾的条目，置信度应保持不变
-// 这应该 PASS（即使 FactChecker 未接入，置信度也不变）
+// 事实检查不能误伤没有矛盾的用户偏好。
 // =========================================================================
 #[tokio::test]
 async fn test_remember_accepts_consistent_entry() {

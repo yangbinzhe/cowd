@@ -198,10 +198,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run scripts/test/lark-live.sh with COWD_LIVE_LARK_SKILL_TEST=1"]
     fn live_cowd_lark_skills_are_discovered_and_selected_by_runtime() {
-        if std::env::var_os("COWD_LIVE_LARK_SKILL_TEST").is_none() {
-            return;
-        }
+        assert_eq!(
+            std::env::var("COWD_LIVE_LARK_SKILL_TEST").as_deref(),
+            Ok("1"),
+            "live Lark skill test requires COWD_LIVE_LARK_SKILL_TEST=1"
+        );
         let assets = runtime_skill_assets_for_workspace(Path::new("."));
         for (query, expected) in [
             ("请使用 lark-base 查询多维表格", "lark-base"),

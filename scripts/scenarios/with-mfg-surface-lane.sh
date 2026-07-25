@@ -79,10 +79,12 @@ for port in "${GATEWAY_PORT}" "${WEBUI_PORT}"; do
   fi
 done
 
-(
-  cd "${ROOT}"
-  cargo build -p cli --features full
-)
+if [[ "${COWD_SCENARIO_SKIP_BUILD:-0}" != "1" ]]; then
+  (
+    cd "${ROOT}"
+    cargo build -p cli --features full
+  )
+fi
 [[ -x "${BIN}" ]] || { echo "missing cowd binary: ${BIN}" >&2; exit 1; }
 
 mkdir -p "${CONFIG_HOME}" "${TEST_HOME}/.cowd" "${WORKSPACE}/.cowd"

@@ -2234,29 +2234,27 @@ mod tests {
         }
     }
 
-    fn open_real_store() -> Option<(RuntimeEventStore, String)> {
-        let url = match std::env::var("COWD_TEST_POSTGRES_URL") {
-            Ok(url) if !url.trim().is_empty() => url,
-            _ => {
-                eprintln!("skipping real PostgreSQL test: COWD_TEST_POSTGRES_URL is not set");
-                return None;
-            }
-        };
+    fn open_real_store() -> (RuntimeEventStore, String) {
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url.clone())]);
         let store = PostgresRuntimeEventStore::connect(
-            PostgresConnectionConfig::new("runtime-event-test", "test.pg", "cowd-v569-test"),
+            PostgresConnectionConfig::new(
+                "runtime-event-test",
+                "test.pg",
+                "cowd-runtime-event-postgres-contract",
+            ),
             &resolver,
         )
         .expect("postgres runtime event store opens")
         .into_runtime_event_store();
-        Some((store, url))
+        (store, url)
     }
 
     #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn postgres_runtime_event_store_preserves_fences_outbox_restart_and_runtime_composition() {
-        let Some((store, url)) = open_real_store() else {
-            return;
-        };
+        let (store, url) = open_real_store();
         let sqlite_source = RuntimeEventStore::try_open_in_memory().expect("SQLite source opens");
         sqlite_source
             .append_transaction(AppendTransactionRequest {
@@ -2450,7 +2448,7 @@ mod tests {
                 PostgresConnectionConfig::new(
                     "runtime-event-reopen-test",
                     "test.pg",
-                    "cowd-v569-reopen-test",
+                    "cowd-runtime-event-postgres-reopen-contract",
                 ),
                 &resolver,
             )
@@ -2489,14 +2487,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn postgres_task_store_preserves_migration_restart_and_per_task_concurrency() {
-        let url = match std::env::var("COWD_TEST_POSTGRES_URL") {
-            Ok(url) if !url.trim().is_empty() => url,
-            _ => {
-                eprintln!("skipping real PostgreSQL task test: COWD_TEST_POSTGRES_URL is not set");
-                return;
-            }
-        };
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let temp = tempfile::tempdir().expect("temporary task migration root");
         let source_path = temp.path().join("source-tasks.db");
         let source = TaskKernel::open(source_path).expect("SQLite task source opens");
@@ -2526,7 +2520,11 @@ mod tests {
 
         let resolver = StaticSecretRefResolver::new([("task.pg".to_string(), url.clone())]);
         let pg_store = PostgresTaskStore::connect(
-            PostgresConnectionConfig::new("runtime-task-test", "task.pg", "cowd-v570-test"),
+            PostgresConnectionConfig::new(
+                "runtime-task-test",
+                "task.pg",
+                "cowd-runtime-task-postgres-contract",
+            ),
             &resolver,
         )
         .expect("postgres task store opens");
@@ -2587,7 +2585,7 @@ mod tests {
             PostgresConnectionConfig::new(
                 "runtime-task-reopen-test",
                 "task.pg",
-                "cowd-v570-reopen-test",
+                "cowd-runtime-task-postgres-reopen-contract",
             ),
             &reopened_resolver,
         )
@@ -2611,16 +2609,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     async fn postgres_artifact_repository_matches_sqlite_selector_and_scope_contract() {
-        let url = match std::env::var("COWD_TEST_POSTGRES_URL") {
-            Ok(url) if !url.trim().is_empty() => url,
-            _ => {
-                eprintln!(
-                    "skipping real PostgreSQL artifact test: COWD_TEST_POSTGRES_URL is not set"
-                );
-                return;
-            }
-        };
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let resolver = StaticSecretRefResolver::new([("artifact.pg".to_string(), url)]);
         let executor = PostgresExecutor::connect(

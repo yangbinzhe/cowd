@@ -8,49 +8,40 @@ LANE="${1:-${COWD_VALIDATION_LANE:-contract}}"
 MANUAL_TARGET="${2:-}"
 
 case "$LANE" in
-  quick) LANE="quick" ;;
-  changed|changed-crates) LANE="changed-crates" ;;
-  full-regression) LANE="full-regression" ;;
-  unit-fast|fast) LANE="unit-fast" ;;
-  contract|core) LANE="contract" ;;
-  scenario|live) LANE="scenario" ;;
-  serial-global|global|serial) LANE="serial-global" ;;
-  surface) LANE="surface" ;;
-  release) LANE="release" ;;
-  all|full) LANE="all" ;;
-  manual) LANE="manual" ;;
+  quick|changed-crates|full-regression|contract|serial-global|scenario|surface|release|all|manual) ;;
   -h|--help|help)
     cat <<'EOF'
-Usage: scripts/validate.sh [quick|changed-crates|full-regression|unit-fast|contract|serial-global|scenario|surface|release|all|manual <name>]
+Usage: scripts/validate.sh [quick|changed-crates|full-regression|contract|serial-global|scenario|surface|release|all|manual <name>]
 
 Lanes:
-  quick      current default edit gate: fmt, workspace check, architecture gates, small boundary crates
+	  quick      current default edit gate: fmt, workspace check, static architecture/governance, small boundary crates
   changed-crates  precise touched-crate gate; base defaults to HEAD or COWD_CHANGED_BASE
-  full-regression final Rust regression: fmt, workspace check, workspace all-target tests single-threaded
-  unit-fast  edit feedback: fmt, light crates, targeted heavy-crate probes
+  full-regression final Rust regression: parallel workspace tests plus isolated global-state tests
   contract   package/API/CLI contracts without browser or tmux scenarios
   serial-global  tests that mutate process-global env/cwd/provider/session state
-  scenario   5 golden paths: gateway, session, memory, tool, skill+mfg
-  surface    3 surface control points: CLI minimal, TUI projection, WebUI gateway
+  scenario   4 golden paths: session, memory, tool, skill+mfg
+  surface    4 surface control points: CLI, TUI, TUI/MFG, WebUI
   release    install artifact smoke; deep scenario checks stay in scenario/manual
-  all        contract + serial-global + scenario
+  all        contract + serial-global + scenario + surface
   manual     run one manual script from scripts/manual
 
 Governance:
   tests/test-governance/test-inventory.yaml classifies default, manual,
-  nightly, and delete-candidate checks. Interactive/live/LLM/visual tests
+  nightly, and external-dependency checks. Interactive/live/LLM/visual tests
   are not release gates unless explicitly promoted by that inventory.
-
-Compatibility aliases:
-  changed -> changed-crates, fast -> unit-fast, core -> contract, live -> scenario, full -> all
 
 Manual targets:
   agent-graph
   context-runtime
   context-runtime-lean-spike
+  lark-live
+  live-provider
+  memory-performance
   memory-degraded
+  postgres-contract
   same-session-multi-surface-sync
   task-phase
+  tui-production-acceptance
   tui-smoke
   report-build-size
   webui-live-workbench
@@ -75,7 +66,11 @@ tmp_available_kb() {
 select_target_dir() {
   if [[ -n "${COWD_TARGET_DIR:-}" ]]; then
     echo "$COWD_TARGET_DIR"
-  elif [[ "$(tmp_available_kb)" -ge "${COWD_MIN_TMP_KB:-8388608}" ]]; then
+  elif [[ "${COWD_ISOLATED_TARGET:-0}" == "1" ]]; then
+    if [[ "$(tmp_available_kb)" -lt "${COWD_MIN_TMP_KB:-8388608}" ]]; then
+      echo "isolated validation requires at least ${COWD_MIN_TMP_KB:-8388608} KB free in /tmp" >&2
+      exit 1
+    fi
     echo "/tmp/cowd-target-$STAMP-$$"
   else
     echo "$ROOT/target"
@@ -97,7 +92,11 @@ cleanup_on_exit() {
 }
 trap cleanup_on_exit EXIT
 
-bytes_or_zero() {
+target_size_or_na() {
+  if [[ "${COWD_MEASURE_TARGET_SIZE:-0}" != "1" ]]; then
+    echo "n/a"
+    return
+  fi
   du -sb "$1" 2>/dev/null | awk '{print $1}' || echo 0
 }
 
@@ -111,7 +110,7 @@ run_step() {
 
   start_epoch="$(date +%s)"
   start_iso="$(date -Iseconds)"
-  before_size="$(bytes_or_zero "$CARGO_TARGET_DIR")"
+  before_size="$(target_size_or_na "$CARGO_TARGET_DIR")"
   echo "[$start_iso] START $name" | tee "$log"
 
   set +e
@@ -124,7 +123,7 @@ run_step() {
 
   end_epoch="$(date +%s)"
   end_iso="$(date -Iseconds)"
-  after_size="$(bytes_or_zero "$CARGO_TARGET_DIR")"
+  after_size="$(target_size_or_na "$CARGO_TARGET_DIR")"
   elapsed=$((end_epoch - start_epoch))
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -183,10 +182,6 @@ fail_if_needed() {
   fi
 }
 
-run_unit_fast() {
-  run_quick
-}
-
 run_quick() {
   run_step quick_gate bash scripts/test/quick.sh
 }
@@ -202,12 +197,11 @@ run_full_regression() {
 run_contract() {
   run_step cargo_fmt cargo fmt --all --check
   run_step cargo_check_workspace cargo check --workspace --all-targets
-  for pkg in approval cli connector fact-kernel harness-contract harness-eval matrix-core model-protocol plugins provider session skill storage surface tools; do
-    run_step "cargo_test_$pkg" cargo test -p "$pkg" --all-targets
-  done
+  run_step cargo_test_boundary_workspace cargo test --workspace --all-targets \
+    --exclude gateway --exclude runtime --exclude memory --exclude tui
+  run_step static_architecture_boundaries bash scripts/architecture/check-boundaries.sh
   run_step cargo_test_runtime_architecture cargo test -p runtime --test runtime_module_architecture
-  run_step cargo_test_gateway_architecture cargo test -p gateway --test gateway_runtimehost_architecture
-  run_step cargo_test_memory_architecture cargo test -p memory --test memory_module_architecture
+  run_step test_governance bash scripts/test/governance-gate.sh
 }
 
 run_serial_global() {
@@ -221,7 +215,6 @@ run_scenario() {
   run_step cargo_build_cli cargo build -p cli --no-default-features --features app-mfg
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step ai_harness bash scripts/ci/ai-harness.sh
-  run_step gateway_baseline bash scripts/scenarios/gateway-webui-contract.sh
   run_step session_runtime bash scripts/scenarios/runtime-surface.sh
   run_step memory_context bash scripts/scenarios/memory-runtime.sh
   run_step tool_permission bash scripts/scenarios/channel-permission.sh
@@ -234,9 +227,10 @@ run_surface() {
   run_step cli_minimal_contract cargo test -p cli --test output_format_contract --no-default-features -- --nocapture --test-threads=1
   # Build the real TUI entrypoint last so the artifact launched below is never
   # whichever reduced binary a preceding contract test happened to emit.
-  run_step cargo_build_tui_surface cargo build -p cli --no-default-features --features tui-surface
+  run_step cargo_build_surface_full cargo build -p cli --features full
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step tui_projection_smoke bash scripts/scenarios/tui-interaction-quality.sh
+  run_step tui_mfg_operations bash scripts/scenarios/tui-mfg-acceptance.sh
   run_step webui_gateway_contract bash scripts/scenarios/gateway-webui-contract.sh
 }
 
@@ -270,14 +264,29 @@ run_manual() {
     context-runtime-lean-spike)
       run_step manual_context_runtime_lean_spike bash scripts/manual/context-runtime-lean-spike.sh
       ;;
+    lark-live)
+      run_step manual_lark_live bash scripts/test/lark-live.sh
+      ;;
+    live-provider)
+      run_step manual_live_provider bash scripts/ci/ai-harness-live-provider.sh
+      ;;
+    memory-performance)
+      run_step manual_memory_performance bash scripts/test/memory-performance.sh
+      ;;
     memory-degraded)
       run_step manual_memory_degraded bash scripts/manual/memory-degraded.sh
+      ;;
+    postgres-contract)
+      run_step manual_postgres_contract bash scripts/test/postgres-contract.sh
       ;;
     same-session-multi-surface-sync)
       run_step manual_same_session_multi_surface_sync bash scripts/scenarios/same-session-multi-surface-sync.sh
       ;;
     task-phase)
       run_step manual_task_phase bash scripts/manual/task-phase.sh
+      ;;
+    tui-production-acceptance)
+      run_step manual_tui_production_acceptance bash scripts/scenarios/tui-production-acceptance.sh
       ;;
     tui-smoke)
       run_step manual_tui_smoke bash scripts/scenarios/tui-smoke.sh
@@ -300,7 +309,6 @@ case "$LANE" in
   quick) run_quick ;;
   changed-crates) run_changed_crates ;;
   full-regression) run_full_regression ;;
-  unit-fast) run_unit_fast ;;
   contract) run_contract ;;
   serial-global) run_serial_global ;;
   scenario) run_scenario ;;
@@ -311,6 +319,7 @@ case "$LANE" in
     run_contract
     run_serial_global
     run_scenario
+    run_surface
     ;;
 esac
 

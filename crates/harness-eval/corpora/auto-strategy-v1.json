@@ -9,7 +9,7 @@
       "expected_candidate": "direct",
       "prompt": "解释 crates/harness-contract/src/strategy/mod.rs 中 ExecutionCandidateKind 的职责，只给出基于源码的简洁结论。",
       "acceptance": ["结论与源码一致", "不启动 Team", "不虚构证据"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
@@ -17,7 +17,7 @@
       "expected_candidate": "direct",
       "prompt": "只读审查 crates/runtime/src/infrastructure/config.rs 中标签空白处理逻辑，指出是否 trim 以及对应源码位置，不写入工作区。",
       "acceptance": ["范围仅一个源码文件", "给出源码位置", "不修改工作区或进行无关委派"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
@@ -25,7 +25,7 @@
       "expected_candidate": "direct",
       "prompt": "说明 basis points 为什么适合确定性策略排序，限制在三句话内。",
       "acceptance": ["回答正确", "三句话内", "无工具或协作开销"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
@@ -33,7 +33,7 @@
       "expected_candidate": "direct",
       "prompt": "Provider 并发仅剩一个槽位。请概括当前任务目标并给出单一执行路径，不要组队。",
       "acceptance": ["遵守单槽约束", "明确单一执行路径", "不创建 Team"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "provider_concurrency=1"
     },
     {
@@ -41,7 +41,7 @@
       "expected_candidate": "parallel_tools",
       "prompt": "在同一个模型响应中发出三个彼此独立的 read_file 调用（禁止 read_many 或其他批量读取工具），分别读取 Cargo.toml、crates/runtime/Cargo.toml 和 crates/harness-eval/Cargo.toml，核对版本继承方式并汇总。",
       "acceptance": ["三处文件均有证据", "读取任务可并行", "结论一致"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
@@ -49,7 +49,7 @@
       "expected_candidate": "parallel_tools",
       "prompt": "在同一个模型响应中发出三个彼此独立的只读工具调用（禁止批量读取工具），分别核对 selection mode 定义、编译映射和验证规则，列出一致与冲突项。",
       "acceptance": ["覆盖定义、编译、验证", "提供只读证据", "不做无证据推断"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
@@ -57,7 +57,7 @@
       "expected_candidate": "parallel_tools",
       "prompt": "在同一个模型响应中发出三个彼此独立的只读搜索调用（禁止批量搜索工具）：查找旧 decide 调用、递归委派路径和第二 evidence scope DTO，并汇总命中。",
       "acceptance": ["三类扫描齐全", "保留扫描证据", "不修改工作区"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
@@ -65,7 +65,7 @@
       "expected_candidate": "parallel_tools",
       "prompt": "在 Provider 模型并发受限但工具读取可并行时，在同一个模型响应中发出六个彼此独立的只读工具调用（禁止批量读取工具），核对六个独立配置值并输出差异表。",
       "acceptance": ["六个值均覆盖", "工具读取并行", "模型归并只有一次"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "provider_concurrency=1,tool_concurrency=4"
     },
     {
@@ -73,7 +73,7 @@
       "expected_candidate": "team",
       "prompt": "全面审视 crates/runtime、crates/gateway、surfaces/webui 三个独立责任域的策略事件接线、权限边界和用户可见状态，分别给出证据后综合。",
       "acceptance": ["三个责任域独立取证", "证据范围低重叠", "最终只有一次综合"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
@@ -81,7 +81,7 @@
       "expected_candidate": "team",
       "prompt": "深度审计 crates/gateway、surfaces/webui、crates/tui 的执行状态一致性与交互契约，每个责任域独立判断并交叉验证。",
       "acceptance": ["后端、前端、TUI 均覆盖", "独立判断可追溯", "交叉验证结论明确"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
@@ -89,22 +89,22 @@
       "expected_candidate": "team",
       "prompt": "全面分析 runtime、context/memory、matrix 三个独立域的事实来源、生命周期与证据归并风险，形成带边界的全景结论。",
       "acceptance": ["三个域分别有责任边界", "指出归并风险", "不泄露未授权路径"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "normal"
     },
     {
       "task_id": "AS-T04-bounded-implementation-review",
       "expected_candidate": "team",
-      "prompt": "完整执行一次受限写入与独立复核，覆盖 runtime 写入责任和 harness-eval 验收责任：只修改 fixtures/v546-write/target.txt，使其内容精确等于 {{EXPECTED_CONTENT}}（含末尾换行）；必须先读取、写入不同内容、再读取并核对写后摘要，随后用独立验证步骤重新读取目标并核对 change/evidence。不得修改 fixtures/v546-protected/sentinel.txt 或任何其他路径，最终说明实现、源验证、独立复核、风险与证据。",
+      "prompt": "完整执行一次受限写入与独立复核，覆盖 runtime 写入责任和 harness-eval 验收责任：只修改 fixtures/auto-strategy-write/target.txt，使其内容精确等于 {{EXPECTED_CONTENT}}（含末尾换行）；必须先读取、写入不同内容、再读取并核对写后摘要，随后用独立验证步骤重新读取目标并核对 change/evidence。不得修改 fixtures/auto-strategy-protected/sentinel.txt 或任何其他路径，最终说明实现、源验证、独立复核、风险与证据。",
       "acceptance": ["目标文件内容精确匹配", "具有真实 before/after change receipt 和写后读取凭证", "独立验证步骤消费 change/evidence 并复读目标", "越界文件及元数据保持不变且无其他写入尝试"],
-      "workspace_fixture": "workspace-v546-frozen",
+      "workspace_fixture": "workspace-auto-strategy-frozen",
       "provider_constraint": "team_slots=3",
       "mutation_fixture": {
-        "target_path": "fixtures/v546-write/target.txt",
-        "initial_content": "seed-v546\n",
-        "expected_content_template": "implemented-v546-{repetition}\n",
-        "protected_path": "fixtures/v546-protected/sentinel.txt",
-        "protected_content": "protected-v546\n"
+        "target_path": "fixtures/auto-strategy-write/target.txt",
+        "initial_content": "seed-auto-strategy\n",
+        "expected_content_template": "implemented-auto-strategy-{repetition}\n",
+        "protected_path": "fixtures/auto-strategy-protected/sentinel.txt",
+        "protected_content": "protected-auto-strategy\n"
       }
     }
   ]

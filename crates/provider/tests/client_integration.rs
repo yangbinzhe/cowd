@@ -648,34 +648,6 @@ async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter
     );
 }
 
-#[tokio::test]
-#[ignore = "requires ANTHROPIC_API_KEY and network access"]
-async fn live_stream_smoke_test() {
-    let client = ApiClient::from_env().expect("ANTHROPIC_API_KEY must be set");
-    let mut stream = client
-        .stream_message(&MessageRequest {
-            model: std::env::var("ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-3-7-sonnet-latest".to_string()),
-            max_tokens: 32,
-            messages: vec![InputMessage::user_text(
-                "Reply with exactly: hello from rust",
-            )],
-            system: None,
-            tools: None,
-            tool_choice: None,
-            stream: false,
-            ..Default::default()
-        })
-        .await
-        .expect("live stream should start");
-
-    while let Some(_event) = stream
-        .next_event()
-        .await
-        .expect("live stream should yield events")
-    {}
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CapturedRequest {
     method: String,

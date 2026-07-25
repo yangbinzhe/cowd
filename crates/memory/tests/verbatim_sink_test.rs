@@ -1,20 +1,9 @@
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unreachable
-)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
-//! RED Tests: VerbatimSink - zero-loss raw storage (mempalace philosophy)
-//!
-//! Tests that verbatim entries survive intact, never pass through compression,
-//! and remain searchable after restart.
+//! Zero-loss raw storage contract.
 
 use memory::config::{BudgetConfig, StoreConfig};
-use memory::{
-    CognitiveContextManager, MemoryCategory, MemoryConfig, MemoryEntry, MemoryLayer, MemoryScope,
-    MemorySource, Priority,
-};
+use memory::{CognitiveContextManager, MemoryConfig, VerbatimEntry, VerbatimSink};
 
 fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
     MemoryConfig {
@@ -36,92 +25,51 @@ fn test_config(sqlite_path: &std::path::Path) -> MemoryConfig {
 }
 
 #[tokio::test]
-async fn test_verbatim_sink_stores_and_retrieves() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mgr = CognitiveContextManager::new(test_config(&tmp.path().join("vbs.db")))
-        .await
-        .unwrap();
+async fn verbatim_entries_remain_exact_searchable_and_durable_after_reopen() {
+    let temporary = tempfile::TempDir::new().unwrap();
+    let database = temporary.path().join("verbatim.db");
 
-    let entry = MemoryEntry {
-        id: uuid::Uuid::new_v4(),
-        layer: MemoryLayer::L3,
-        category: MemoryCategory::Reference,
-        priority: Priority::Normal,
-        source: MemorySource::UserExplicit,
-        title: "Verbatim test".to_string(),
-        content: "This exact raw content must never be compressed or summarized".to_string(),
-        embedding: None,
-        tags: vec!["verbatim-test".to_string()],
-        relations: vec![],
-        confidence: 1.0,
-        access_count: 0,
-        staleness: 0.0,
-        created_at: chrono::Utc::now(),
-        updated_at: chrono::Utc::now(),
-        last_accessed_at: None,
-        scope: MemoryScope::default(),
-        session_id: None,
-        source_agent: None,
-        visibility: memory::AgentVisibility::default(),
+    // The memory store owns schema creation; the raw sink owns raw operations.
+    drop(
+        CognitiveContextManager::new(test_config(&database))
+            .await
+            .expect("initialize memory schema"),
+    );
+
+    let entry = VerbatimEntry {
+        id: uuid::Uuid::new_v4().to_string(),
+        content: "Line one.\n\n原始内容与空白必须保持不变。\n".to_string(),
+        source: "UserExplicit".to_string(),
+        layer: 3,
+        timestamp: chrono::Utc::now().to_rfc3339(),
     };
-    let entry_id = entry.id;
-    mgr.remember(entry).await.unwrap();
-
-    // RED: retrieve from verbatim sink (API doesn't exist yet)
-    let retrieved = mgr.get_entry(&entry_id.to_string()).await.unwrap();
-    assert!(retrieved.is_some(), "Entry should be retrievable");
-    if let Some(e) = retrieved {
+    {
+        let sink = VerbatimSink::new(database.to_str().expect("UTF-8 test path"))
+            .expect("open verbatim sink");
+        sink.store_raw(&entry).expect("store raw entry");
         assert_eq!(
-            e.content,
-            "This exact raw content must never be compressed or summarized"
+            sink.search_by_content("%原始内容%")
+                .expect("search raw content")
+                .len(),
+            1
+        );
+        assert_eq!(
+            sink.search_by_entity("UserExplicit")
+                .expect("search raw source")
+                .len(),
+            1
         );
     }
-}
 
-#[tokio::test]
-async fn test_verbatim_survives_restart() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("vbs_persist.db");
-
-    let entry_id = uuid::Uuid::new_v4();
-
-    {
-        let mgr = CognitiveContextManager::new(test_config(&db_path))
-            .await
-            .unwrap();
-        let entry = MemoryEntry {
-            id: entry_id,
-            layer: MemoryLayer::L3,
-            category: MemoryCategory::Reference,
-            priority: Priority::Normal,
-            source: MemorySource::Import,
-            title: "Persist test".to_string(),
-            content: "Raw content that must survive restart unchanged".to_string(),
-            embedding: None,
-            tags: vec![],
-            relations: vec![],
-            confidence: 1.0,
-            access_count: 0,
-            staleness: 0.0,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            last_accessed_at: None,
-            scope: MemoryScope::default(),
-            session_id: None,
-            source_agent: None,
-            visibility: memory::AgentVisibility::default(),
-        };
-        mgr.remember(entry).await.unwrap();
-    }
-
-    {
-        let mgr = CognitiveContextManager::new(test_config(&db_path))
-            .await
-            .unwrap();
-        let retrieved = mgr.get_entry(&entry_id.to_string()).await.unwrap();
-        assert!(retrieved.is_some(), "Entry should survive restart");
-        if let Some(e) = retrieved {
-            assert_eq!(e.content, "Raw content that must survive restart unchanged");
-        }
-    }
+    let reopened = VerbatimSink::new(database.to_str().expect("UTF-8 test path"))
+        .expect("reopen verbatim sink");
+    let restored = reopened
+        .retrieve_by_id(&entry.id)
+        .expect("retrieve raw entry")
+        .expect("raw entry survives reopen");
+    assert_eq!(restored.id, entry.id);
+    assert_eq!(restored.content, entry.content);
+    assert_eq!(restored.source, entry.source);
+    assert_eq!(restored.layer, entry.layer);
+    assert_eq!(restored.timestamp, entry.timestamp);
 }

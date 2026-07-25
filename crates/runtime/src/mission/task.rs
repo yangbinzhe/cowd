@@ -823,7 +823,9 @@ mod tests {
         let handle = temp_handle("persist");
         let path = handle.path.clone();
         let kernel = TaskKernel::open_storage_handle(&handle).unwrap();
-        let task = kernel.start_goal("Ship v0.9.329", true).unwrap();
+        let task = kernel
+            .start_goal("Ship the validated release", true)
+            .unwrap();
 
         let restored = TaskKernel::open_storage_handle(&handle).unwrap();
         let current = restored

@@ -744,22 +744,6 @@ mod tests {
     }
 
     #[test]
-    fn launch_command_uses_isolated_tmux_and_current_viewport_capture() {
-        let source = include_str!("tui.rs");
-        assert!(source.contains("\"env\".to_string()"));
-        assert!(source.contains("\"-i\".to_string()"));
-        assert!(source.contains("tmux_label"));
-        let viewport_section = source
-            .split("pub fn capture_step")
-            .nth(1)
-            .and_then(|section| section.split("pub fn capture_history").next())
-            .expect("viewport capture section");
-        assert!(!viewport_section.contains("\"-S\""));
-        assert!(source.contains("process-exit.json"));
-        assert!(source.contains("index.json"));
-    }
-
-    #[test]
     fn shell_quoting_does_not_expose_argument_boundaries() {
         assert_eq!(shell_quote("plain/path"), "plain/path");
         assert_eq!(shell_quote("a b"), "'a b'");

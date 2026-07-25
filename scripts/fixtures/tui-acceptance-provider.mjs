@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Deterministic OpenAI-compatible provider used by the V584 production
+ * Deterministic OpenAI-compatible provider used by the TUI production
  * acceptance gates. It records exactly which conversation roles/texts reached
  * the provider, streams in multiple chunks, reports usage and can deliberately
  * emit a split invalid DSML frame to verify the fail-closed protocol boundary.
@@ -9,9 +9,9 @@
 import fs from "node:fs";
 import http from "node:http";
 
-const port = Number.parseInt(process.env.COWD_V584_PROVIDER_PORT ?? "18784", 10);
-const logPath = process.env.COWD_V584_PROVIDER_LOG;
-const fixtureModel = "cowd-v584-acceptance";
+const port = Number.parseInt(process.env.COWD_TUI_ACCEPTANCE_PROVIDER_PORT ?? "18784", 10);
+const logPath = process.env.COWD_TUI_ACCEPTANCE_PROVIDER_LOG;
+const fixtureModel = "cowd-tui-acceptance-model";
 
 function textOf(content) {
   if (typeof content === "string") return content;
@@ -125,18 +125,18 @@ function responseFor(messages, tools) {
     }
   }
 
-  if (latest.includes("V584_TURN_1")) {
-    const nonce = latest.match(/V584-NONCE-[A-Z0-9-]+/)?.[0] ?? "NONCE-MISSING";
+  if (latest.includes("TUI_ACCEPTANCE_TURN_1")) {
+    const nonce = latest.match(/TUI_ACCEPTANCE-NONCE-[A-Z0-9-]+/)?.[0] ?? "NONCE-MISSING";
     return {
-      chunks: [`V584-TURN1-ACK nonce=${nonce}`],
+      chunks: [`TUI_ACCEPTANCE-TURN1-ACK nonce=${nonce}`],
       finishReason: "stop",
     };
   }
-  if (latest.includes("V584_TURN_2")) {
-    const nonce = prior.match(/V584-NONCE-[A-Z0-9-]+/)?.[0] ?? "NONCE-MISSING";
+  if (latest.includes("TUI_ACCEPTANCE_TURN_2")) {
+    const nonce = prior.match(/TUI_ACCEPTANCE-NONCE-[A-Z0-9-]+/)?.[0] ?? "NONCE-MISSING";
     return {
       chunks: [
-        "V584-TURN2-ACK ",
+        "TUI_ACCEPTANCE-TURN2-ACK ",
         `recalled=${nonce} `,
         `provider_user_history=${userMessages.length}`,
       ],
@@ -144,7 +144,7 @@ function responseFor(messages, tools) {
       delayMs: 120,
     };
   }
-  if (latest.includes("V584_LONG_WRAP")) {
+  if (latest.includes("TUI_ACCEPTANCE_LONG_WRAP")) {
     const matrix = Array.from({ length: 48 }, (_, index) => {
       const row = String(index).padStart(2, "0");
       return (
@@ -156,23 +156,23 @@ function responseFor(messages, tools) {
     }).join("");
     return {
       chunks: [
-        "V584-LONG-BEGIN 中文折行验证：这是不能丢失末尾的超长句子，",
+        "TUI_ACCEPTANCE-LONG-BEGIN 中文折行验证：这是不能丢失末尾的超长句子，",
         "它必须在不同终端宽度内自然换行且继续显示全部文字。\n",
         matrix,
-        "V584-LONG-END 🚀🧪 END-OF-LONG-RESPONSE",
+        "TUI_ACCEPTANCE-LONG-END 🚀🧪 END-OF-LONG-RESPONSE",
       ],
       finishReason: "stop",
       delayMs: 120,
     };
   }
-  if (latest.includes("V584_SLOW_STATUS")) {
+  if (latest.includes("TUI_ACCEPTANCE_SLOW_STATUS")) {
     return {
-      chunks: ["V584-SLOW-BEGIN ", "stream-progress-visible ", "V584-SLOW-END"],
+      chunks: ["TUI_ACCEPTANCE-SLOW-BEGIN ", "stream-progress-visible ", "TUI_ACCEPTANCE-SLOW-END"],
       finishReason: "stop",
       delayMs: 650,
     };
   }
-  if (latest.includes("V584_VALID_DSML")) {
+  if (latest.includes("TUI_ACCEPTANCE_VALID_DSML")) {
     const toolResultAfterRequest = messages
       .slice(
         Math.max(
@@ -180,14 +180,14 @@ function responseFor(messages, tools) {
           messages.findLastIndex(
             (message) =>
               message?.role === "user" &&
-              textOf(message.content).includes("V584_VALID_DSML"),
+              textOf(message.content).includes("TUI_ACCEPTANCE_VALID_DSML"),
           ),
         ),
       )
       .some((message) => message?.role === "tool");
     if (toolResultAfterRequest) {
       return {
-        chunks: ["V584-DSML-TOOL-COMPLETE"],
+        chunks: ["TUI_ACCEPTANCE-DSML-TOOL-COMPLETE"],
         finishReason: "stop",
       };
     }
@@ -199,7 +199,7 @@ function responseFor(messages, tools) {
       exposed.find((name) => name === "runtime_capabilities");
     if (!toolName) {
       return {
-        chunks: ["V584-DSML-NO-SAFE-EXPOSED-TOOL"],
+        chunks: ["TUI_ACCEPTANCE-DSML-NO-SAFE-EXPOSED-TOOL"],
         finishReason: "stop",
       };
     }
@@ -216,13 +216,13 @@ function responseFor(messages, tools) {
       delayMs: 80,
     };
   }
-  if (latest.includes("V584_OBSERVER_SYNC")) {
+  if (latest.includes("TUI_ACCEPTANCE_OBSERVER_SYNC")) {
     if (latest.includes("publish one answer")) {
       return {
         chunks: [
-          "V584-OBSERVER-SYNC-BEGIN ",
+          "TUI_ACCEPTANCE-OBSERVER-SYNC-BEGIN ",
           "live-progress-visible ",
-          "V584-OBSERVER-SYNC-ACK",
+          "TUI_ACCEPTANCE-OBSERVER-SYNC-ACK",
         ],
         finishReason: "stop",
         // Keep a deterministic pre-terminal window long enough for the
@@ -231,20 +231,20 @@ function responseFor(messages, tools) {
       };
     }
     const marker = latest.includes("from WebUI")
-      ? "V584-WEBUI-TO-TUI-ACK"
+      ? "TUI_ACCEPTANCE-WEBUI-TO-TUI-ACK"
       : latest.includes("from TUI")
-        ? "V584-TUI-TO-WEBUI-ACK"
+        ? "TUI_ACCEPTANCE-TUI-TO-WEBUI-ACK"
         : latest.includes("after WebUI disconnect")
-          ? "V584-WEBUI-DISCONNECT-ACK"
+          ? "TUI_ACCEPTANCE-WEBUI-DISCONNECT-ACK"
           : latest.includes("after reconnect")
-            ? "V584-RECONNECT-ACK"
-            : "V584-OBSERVER-SYNC-ACK";
+            ? "TUI_ACCEPTANCE-RECONNECT-ACK"
+            : "TUI_ACCEPTANCE-OBSERVER-SYNC-ACK";
     return {
       chunks: [marker],
       finishReason: "stop",
     };
   }
-  if (latest.includes("V584_INVALID_DSML")) {
+  if (latest.includes("TUI_ACCEPTANCE_INVALID_DSML")) {
     return {
       chunks: [
         "<｜｜DSML｜｜tool_",
@@ -255,7 +255,7 @@ function responseFor(messages, tools) {
     };
   }
   return {
-    chunks: ["V584-DEFAULT-ACK"],
+    chunks: ["TUI_ACCEPTANCE-DEFAULT-ACK"],
     finishReason: "stop",
   };
 }
@@ -355,7 +355,7 @@ const server = http.createServer((request, response) => {
     const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
     recordRequest(parsed, messages);
     requestSequence += 1;
-    const requestId = `chatcmpl-v584-${requestSequence}`;
+    const requestId = `chatcmpl-tui-acceptance-${requestSequence}`;
     const model =
       typeof parsed.model === "string" && parsed.model.length > 0
         ? parsed.model
@@ -378,7 +378,7 @@ const server = http.createServer((request, response) => {
 });
 
 server.listen(port, "127.0.0.1", () => {
-  process.stdout.write(`cowd V584 TUI provider listening on ${port}\n`);
+  process.stdout.write(`cowd TUI acceptance provider listening on ${port}\n`);
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

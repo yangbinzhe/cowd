@@ -1055,7 +1055,7 @@ mod tests {
     fn edge_v2_contract_round_trips_bootstrap_and_event_ack() {
         let request = EdgeBootstrapRequest {
             protocol: EDGE_PROTOCOL_V2.to_string(),
-            gateway_version: "0.9.550".to_string(),
+            gateway_version: "0.0.0-test".to_string(),
             surface_id: "feishu".to_string(),
             driver_profile: "feishu-message".to_string(),
             capabilities: vec!["message.health".to_string()],

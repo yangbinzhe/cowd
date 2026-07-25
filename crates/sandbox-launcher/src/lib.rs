@@ -1177,11 +1177,9 @@ mod tests {
         assert!(matches!(spec.validate(), Err(SandboxError::MissingPath(_))));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn explicit_tools_subtree_does_not_expose_sibling_control_data() {
-        if !bwrap_available() {
-            return;
-        }
         let root = ProbeFixture::new().expect("fixture");
         let config_home = root.root.join("config-home");
         let tools = config_home.join("tools");
@@ -1215,28 +1213,25 @@ mod tests {
         assert!(output.status.success(), "{:?}", output);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn prepared_command_has_no_inherited_environment() {
         let root = ProbeFixture::new().expect("fixture");
         let prepared = shell_command(
             "printf ok",
             &SandboxLaunchSpec::workspace(root.workspace.clone()),
-        );
-        if let Ok(prepared) = prepared {
-            let command = prepared.into_command();
-            assert!(command.get_envs().all(|(key, _)| key != "COWD_API_TOKEN"));
-            assert!(command.get_envs().next().is_none());
-        }
+        )
+        .expect("prepare sandbox command");
+        let command = prepared.into_command();
+        assert!(command.get_envs().all(|(key, _)| key != "COWD_API_TOKEN"));
+        assert!(command.get_envs().next().is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn program_arguments_execute_inside_the_hardened_command() {
         use std::os::unix::fs::PermissionsExt;
 
-        if !bwrap_available() {
-            return;
-        }
         let root = ProbeFixture::new().expect("fixture");
         let program = root.workspace.join("argv-fixture.sh");
         fs::write(&program, "#!/bin/sh\nprintf '%s\\n' \"$@\" > argv.out\n")
@@ -1282,11 +1277,9 @@ mod tests {
         report.require_kernel_hardening().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_hides_a_sibling_secret_and_allows_workspace_write() {
-        if !bwrap_available() {
-            return;
-        }
         let root = ProbeFixture::new().expect("fixture");
         let mut spec = SandboxLaunchSpec::workspace(&root.workspace);
         spec.protect_root(&root.control);
@@ -1306,11 +1299,9 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn network_enabled_sandbox_can_read_the_real_resolver_target() {
-        if !bwrap_available() {
-            return;
-        }
         let root = ProbeFixture::new().expect("fixture");
         let prepared = shell_command(
             "target=$(readlink -f /etc/resolv.conf) && test -r \"$target\" && grep -q nameserver \"$target\"",
@@ -1324,11 +1315,9 @@ mod tests {
         assert!(output.status.success(), "{:?}", output);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn fd_closing_wrapper_blocks_inherited_secret_descriptor() {
-        if !bwrap_available() {
-            return;
-        }
         let root = ProbeFixture::new().expect("fixture");
         let prepared = shell_command(
             "test ! -e /proc/self/fd/3 && test ! -e /proc/self/fd/1025 && printf fd-closed",
@@ -1350,11 +1339,9 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout), "fd-closed");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn strict_kernel_mode_executes_only_with_verified_backend() {
-        if !bwrap_available() {
-            return;
-        }
         let root = ProbeFixture::new().expect("fixture");
         let mut spec = SandboxLaunchSpec::workspace(root.workspace.clone());
         spec.require_kernel_hardening = true;
@@ -1366,11 +1353,9 @@ mod tests {
         assert!(prepared.into_command().status().unwrap().success());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn kernel_hardened_child_cannot_write_system_root_or_mount() {
-        if !bwrap_available() {
-            return;
-        }
         let root = ProbeFixture::new().expect("fixture");
         let prepared = shell_command(
             "test ! -w /etc && ! mount -t tmpfs tmpfs /tmp 2>/dev/null",

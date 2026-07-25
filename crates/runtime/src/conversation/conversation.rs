@@ -9512,7 +9512,7 @@ mod tests {
         let output = serde_json::json!({
             "type": "text",
             "path": "fixtures/target.txt",
-            "content": "implemented-v546-0\n",
+            "content": "implemented-auto-strategy-0\n",
             "totalLines": 1,
             "truncated": false,
         })
@@ -9526,7 +9526,7 @@ mod tests {
         );
 
         assert!(!receipt.truncated, "{}", receipt.summary);
-        assert!(receipt.summary.contains("implemented-v546-0"));
+        assert!(receipt.summary.contains("implemented-auto-strategy-0"));
         assert!(!receipt.summary.contains("omitted; retrieve"));
     }
     use fact_kernel::FactLedger;

@@ -1021,7 +1021,7 @@ mod tests {
             channel: ReleaseChannel::Stable,
             status: ReleaseAssignmentStatus::Active,
             authorization: ReleaseAuthorization::ReleaseAuthorityAttestation {
-                attestation_ref: "release-attestation/cowd-0.9.483".to_string(),
+                attestation_ref: "release-attestation/test-candidate".to_string(),
             },
             content_digest: digest('d'),
         };

@@ -5,7 +5,7 @@
     clippy::unreachable
 )]
 
-//! Performance benchmarks for the memory system (Task 22-23).
+//! Performance regression probes for the memory system.
 //!
 //! Tests key operations with timing assertions to catch regression.
 //! Run with: cargo test --release -p memory --test performance_bench -- --nocapture
@@ -72,15 +72,16 @@ fn test_entry(content: &str) -> MemoryEntry {
     }
 }
 
-/// Benchmark: insert N entries and measure recall latency.
+/// Benchmark: insert 1,000 entries and measure recall latency.
 /// Target: search <500ms for 1000 entries.
 #[tokio::test]
+#[ignore = "run scripts/test/memory-performance.sh in release mode"]
 async fn bench_recall_latency_1k_entries() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = bench_config(&tmp.path().join("bench.db"));
     let mgr = CognitiveContextManager::new(config).await.unwrap();
 
-    let n = 200;
+    let n = 1_000;
     let start = Instant::now();
 
     for i in 0..n {
@@ -102,16 +103,20 @@ async fn bench_recall_latency_1k_entries() {
         results.len()
     );
 
-    // Accept up to 1 second for full test (includes all overhead)
     assert!(
-        search_time.as_millis() < 5000,
-        "Search should complete within 5s, took {:?}",
+        search_time.as_millis() < 1_000,
+        "Search should complete within 1s, took {:?}",
         search_time
+    );
+    assert!(
+        insert_time.as_secs() < 30,
+        "1K inserts should complete within 30s, took {insert_time:?}"
     );
 }
 
 /// Benchmark: measure get_entry latency.
 #[tokio::test]
+#[ignore = "run scripts/test/memory-performance.sh in release mode"]
 async fn bench_get_entry_latency() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = bench_config(&tmp.path().join("bench.db"));
@@ -143,8 +148,8 @@ async fn bench_get_entry_latency() {
     );
     assert_eq!(found, n, "All entries should be retrievable");
     assert!(
-        elapsed.as_millis() < 30_000,
-        "get_entry {} should complete within 30s",
+        elapsed.as_millis() < 1_000,
+        "get_entry {} should complete within 1s",
         n
     );
 }
@@ -152,6 +157,7 @@ async fn bench_get_entry_latency() {
 /// Benchmark: repeated prepare_context on a warm local FTS5 path.
 /// Target: p95 <300ms without remote/vector embedding calls.
 #[tokio::test]
+#[ignore = "run scripts/test/memory-performance.sh in release mode"]
 async fn bench_prepare_context_cached_p95_under_300ms() {
     let tmp = tempfile::TempDir::new().unwrap();
     let config = cached_prepare_config(&tmp.path().join("bench.db"));
@@ -190,44 +196,4 @@ async fn bench_prepare_context_cached_p95_under_300ms() {
         p95 < 300.0,
         "prepare_context cached p95 should be <300ms, got {p95:.3}ms"
     );
-}
-
-/// Fast stress test: 1000 entries (~0.5s).
-/// Heavy stress tests: 10K (~5s release), 20K (~10s release) available for benchmarking.
-/// Change `n` below to 10_000 or 20_000 when optimizing hot path.
-#[tokio::test]
-async fn stress_insert_1k_entries() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let config = bench_config(&tmp.path().join("bench.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
-
-    let n = 1_000;
-    let start = Instant::now();
-
-    for i in 0..n {
-        let entry = test_entry(&format!("Stress test entry number {}", i));
-        mgr.remember(entry).await.unwrap();
-    }
-
-    let total_time = start.elapsed();
-    let layers = mgr.list_layers().await;
-    let l3_count: u64 = layers
-        .iter()
-        .filter_map(|v| {
-            if v.get("layer").and_then(|l| l.as_str()) == Some("L3") {
-                v.get("entry_count").and_then(|c| c.as_u64())
-            } else {
-                None
-            }
-        })
-        .next()
-        .unwrap_or(0);
-    eprintln!(
-        "Stress insert 20K: {:?} ({:?} per entry), L3={}",
-        total_time,
-        total_time / n as u32,
-        l3_count
-    );
-    assert!(l3_count >= n as u64 / 2);
-    assert!(total_time.as_secs() < 300);
 }

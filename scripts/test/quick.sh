@@ -10,14 +10,12 @@ cargo fmt --all --check
 echo "[quick] cargo check --workspace --all-targets"
 cargo check --workspace --all-targets
 
-echo "[quick] architecture boundary gates"
-cargo test -p gateway --test gateway_runtimehost_architecture
-cargo test -p runtime --test runtime_module_architecture
-cargo test -p memory --test memory_module_architecture
+echo "[quick] static architecture and test-governance gates"
+bash scripts/architecture/check-boundaries.sh
+bash scripts/test/governance-gate.sh
 
 echo "[quick] focused small boundary crates"
 cargo test -p harness-contract --all-targets
 cargo test -p model-protocol --all-targets
 cargo test -p surface --all-targets
 cargo test -p matrix-core --all-targets
-

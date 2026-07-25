@@ -21,7 +21,7 @@ use memory::store::MemoryStore;
 use memory::types::Message;
 #[cfg(feature = "code-index")]
 use memory::{CodeIndexer, CodeSymbol, SymbolEdge, SymbolEdgeType, SymbolKind};
-use memory::{CognitiveContextManager, ImpactReport, MemoryConfig, TokenBudget, TuningConfig};
+use memory::{CognitiveContextManager, MemoryConfig, TuningConfig};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -65,10 +65,6 @@ fn write_rust_file(dir: &tempfile::TempDir, name: &str, content: &str) -> std::p
     path
 }
 
-// ---------------------------------------------------------------------------
-// F1: Integration tests (7 tests)
-// ---------------------------------------------------------------------------
-
 #[cfg(feature = "code-index")]
 #[tokio::test]
 async fn test_integration_init_code_graph_indexes_symbols() {
@@ -111,21 +107,6 @@ fn authenticate_user(token: &str) -> bool {
     }
     assert!(symbols_found > 0, "should find symbols");
     assert!(files_processed > 0, "should process files");
-}
-
-#[tokio::test]
-async fn test_integration_code_context_injection_on_code_query() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("e2e_inject.db");
-
-    let cfg = test_config(&db_path);
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
-
-    let query = "fix bug in authenticate_user function";
-    let ctx = mgr.prepare_context(query, &[], None).await.unwrap();
-
-    // code_context may be None (no code indexer in bare config) but pipeline works
-    let _ = ctx.code_context;
 }
 
 #[tokio::test]
@@ -246,38 +227,4 @@ async fn test_integration_impact_analysis_with_store() {
     assert!(!report.direct_callers.is_empty());
     assert!(report.direct_callers.contains(&"login_handler".to_string()));
     assert_eq!(report.symbol_name, "authenticate");
-}
-
-#[tokio::test]
-async fn test_integration_prepared_context_has_code_field() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let db_path = tmp.path().join("e2e_codefield.db");
-
-    let cfg = test_config(&db_path);
-    let mgr = CognitiveContextManager::new(cfg).await.unwrap();
-    let ctx = mgr
-        .prepare_context("fix the authenticate function bug", &[], None)
-        .await
-        .unwrap();
-
-    let _has_field = ctx.code_context;
-}
-
-#[tokio::test]
-async fn test_integration_impact_report_defaults() {
-    let report = ImpactReport::default();
-    assert!(report.symbol_name.is_empty());
-    assert!(report.direct_callers.is_empty());
-    assert!(report.indirect.is_empty());
-    assert!(report.affected_files.is_empty());
-
-    let budget = TokenBudget {
-        total: 8000,
-        reserved_system: 2000,
-        reserved_response: 1000,
-        allocated_memory: 0,
-        allocated_conversation: 0,
-        available: 5000,
-    };
-    assert_eq!(budget.compute_available(), 5000);
 }

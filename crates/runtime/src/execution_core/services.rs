@@ -62,6 +62,8 @@ pub enum RuntimeServicesError {
     #[error(transparent)]
     ScopeLock(#[from] ScopeLockError),
     #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
     CrossPlane(#[from] CrossPlaneRuntimeError),
     #[error(transparent)]
     NodeExecutor(#[from] NodeExecutorError),
@@ -539,6 +541,7 @@ impl RuntimeServicesBuilder {
             self.skill_catalog,
             self.mission_schedule_policy,
             definition_registry,
+            None,
         )?);
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
@@ -619,6 +622,9 @@ pub struct RuntimeServices {
     knowledge_activation: crate::knowledge_activation::KnowledgeActivationRuntime,
     session_dispatch_executor: Arc<crate::session_execution::SessionDispatchNodeExecutor>,
     session_input_router: OnceLock<Arc<SessionInputRouter>>,
+    // Keep this field last so filesystem-backed components are dropped before
+    // the temporary root removes their files.
+    _ephemeral_root: Option<tempfile::TempDir>,
 }
 
 impl RuntimeServices {
@@ -649,10 +655,10 @@ impl RuntimeServices {
     pub fn in_memory() -> Result<Arc<Self>, RuntimeServicesError> {
         let workspace_key = format!("in-memory-{}", uuid::Uuid::new_v4());
         let workspace_root = PathBuf::from(format!("/{workspace_key}"));
-        let definition_root = std::env::temp_dir()
-            .join("cowd-runtime-services")
-            .join(&workspace_key)
-            .join("definitions");
+        let ephemeral_root = tempfile::Builder::new()
+            .prefix("cowd-runtime-services-")
+            .tempdir()?;
+        let definition_root = ephemeral_root.path().join("definitions");
         let config_home = definition_root.join("config-home");
         let storage_registry = storage::StorageRegistry::default_for_config_home(&config_home)
             .with_workspace(&workspace_root)?;
@@ -667,10 +673,7 @@ impl RuntimeServices {
             workspace_key.clone(),
             Arc::new(RuntimeEventStore::try_open_in_memory()?),
             Arc::new(WorktreeLeaseManager::open(
-                std::env::temp_dir()
-                    .join("cowd-runtime-services")
-                    .join(&workspace_key)
-                    .join("worktree-leases.json"),
+                ephemeral_root.path().join("worktree-leases.json"),
             )?),
             Arc::new(ScopeLockManager::new()),
             default_resource_quotas(),
@@ -689,6 +692,7 @@ impl RuntimeServices {
             crate::RuntimeSkillCatalog::default(),
             crate::MissionSchedulePolicy::default(),
             definition_registry,
+            Some(ephemeral_root),
         )?);
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
@@ -726,6 +730,7 @@ impl RuntimeServices {
         skill_catalog: crate::RuntimeSkillCatalog,
         mission_schedule_policy: crate::MissionSchedulePolicy,
         definition_registry: Arc<RuntimeDefinitionRegistry>,
+        ephemeral_root: Option<tempfile::TempDir>,
     ) -> Result<Self, RuntimeServicesError> {
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
         let provider_transport_pool = Arc::new(crate::ProviderTransportPool::default());
@@ -902,6 +907,7 @@ impl RuntimeServices {
             }),
             session_dispatch_executor,
             session_input_router: OnceLock::new(),
+            _ephemeral_root: ephemeral_root,
         })
     }
 
@@ -3517,6 +3523,26 @@ mod tests {
         TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
     };
     use memory::SessionRecord;
+
+    #[test]
+    fn in_memory_services_reclaim_their_filesystem_state() {
+        let root = {
+            let services = RuntimeServices::in_memory().expect("in-memory runtime services");
+            let root = services
+                ._ephemeral_root
+                .as_ref()
+                .expect("in-memory services own a temporary root")
+                .path()
+                .to_path_buf();
+            assert!(root.exists());
+            root
+        };
+
+        assert!(
+            !root.exists(),
+            "dropping the final RuntimeServices owner must remove {root:?}"
+        );
+    }
 
     #[test]
     fn task_completion_lifecycle_receipt_is_idempotent_by_correlation_key() {

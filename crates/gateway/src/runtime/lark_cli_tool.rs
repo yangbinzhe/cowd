@@ -661,10 +661,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "run scripts/test/lark-live.sh with COWD_LIVE_LARK_CLI_TOOL_TEST=1"]
     async fn live_configured_bot_executes_official_cli_without_forwarding_app_secret() {
-        if std::env::var_os("COWD_LIVE_LARK_CLI_TOOL_TEST").is_none() {
-            return;
-        }
+        assert_eq!(
+            std::env::var("COWD_LIVE_LARK_CLI_TOOL_TEST").as_deref(),
+            Ok("1"),
+            "live Lark CLI tool test requires COWD_LIVE_LARK_CLI_TOOL_TEST=1"
+        );
         let workspace_root = std::env::current_dir().expect("workspace root");
         let config = runtime::ConfigLoader::default_for(&workspace_root)
             .load()

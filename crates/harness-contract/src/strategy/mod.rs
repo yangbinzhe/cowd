@@ -507,7 +507,7 @@ const FROZEN_TEAM_CALIBRATION_TASKS: [(&str, &str); 4] = [
     ),
     (
         "AS-T04-bounded-implementation-review",
-        "完整执行一次受限写入与独立复核，覆盖 runtime 写入责任和 harness-eval 验收责任：只修改 fixtures/v546-write/target.txt，使其内容精确等于 {{EXPECTED_CONTENT}}（含末尾换行）；必须先读取、写入不同内容、再读取并核对写后摘要，随后用独立验证步骤重新读取目标并核对 change/evidence。不得修改 fixtures/v546-protected/sentinel.txt 或任何其他路径，最终说明实现、源验证、独立复核、风险与证据。",
+        "完整执行一次受限写入与独立复核，覆盖 runtime 写入责任和 harness-eval 验收责任：只修改 fixtures/auto-strategy-write/target.txt，使其内容精确等于 {{EXPECTED_CONTENT}}（含末尾换行）；必须先读取、写入不同内容、再读取并核对写后摘要，随后用独立验证步骤重新读取目标并核对 change/evidence。不得修改 fixtures/auto-strategy-protected/sentinel.txt 或任何其他路径，最终说明实现、源验证、独立复核、风险与证据。",
     ),
 ];
 
@@ -814,7 +814,7 @@ impl StrategyExperienceStore {
             || invariants
                 .get("workspace_fixture")
                 .and_then(serde_json::Value::as_str)
-                != Some("workspace-v546-frozen")
+                != Some("workspace-auto-strategy-frozen")
             || invariants
                 .get("mutation_fixture_reset")
                 .and_then(serde_json::Value::as_str)
@@ -946,7 +946,7 @@ impl StrategyExperienceStore {
                                 .is_none_or(|paths| {
                                     paths
                                         != &[serde_json::Value::String(
-                                            "fixtures/v546-write/target.txt".to_string(),
+                                            "fixtures/auto-strategy-write/target.txt".to_string(),
                                         )]
                                 })
                             || sample
@@ -955,7 +955,7 @@ impl StrategyExperienceStore {
                                 .is_none_or(|paths| {
                                     paths
                                         != &[serde_json::Value::String(
-                                            "fixtures/v546-write/target.txt".to_string(),
+                                            "fixtures/auto-strategy-write/target.txt".to_string(),
                                         )]
                                 })
                             || sample
@@ -3550,12 +3550,12 @@ mod tests {
                         "workspace_reset_verified": true,
                         "workspace_mutation_verified": true,
                         "workspace_changed_paths": if task_id == "AS-T04-bounded-implementation-review" {
-                            vec!["fixtures/v546-write/target.txt"]
+                            vec!["fixtures/auto-strategy-write/target.txt"]
                         } else {
                             Vec::<&str>::new()
                         },
                         "write_attempt_paths": if task_id == "AS-T04-bounded-implementation-review" {
-                            vec!["fixtures/v546-write/target.txt"]
+                            vec!["fixtures/auto-strategy-write/target.txt"]
                         } else {
                             Vec::<&str>::new()
                         },
@@ -3566,7 +3566,7 @@ mod tests {
         }
         let condition_invariants = serde_json::json!({
             "permission_mode": "dontAsk",
-            "workspace_fixture": "workspace-v546-frozen",
+            "workspace_fixture": "workspace-auto-strategy-frozen",
             "mutation_fixture_reset": "per-sample-pristine-full-workspace-sha256",
             "tool_catalog": "same-binary-runtime-inspected",
             "provider_fallbacks": "disabled",

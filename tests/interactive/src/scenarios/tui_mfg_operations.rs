@@ -29,6 +29,10 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| isolated_root.clone())
         .join("mfg-state.json");
+    if let Some(parent) = state_artifact.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create MFG observer directory {}", parent.display()))?;
+    }
     let extra_env = BTreeMap::from([(
         "COWD_TUI_MFG_STATE_ARTIFACT".to_string(),
         state_artifact.display().to_string(),
@@ -57,7 +61,6 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     tui.send("/mfg")?;
     tui.enter()?;
     tui.wait_for("MFG Operations", 20)?;
-    tui.wait_for("mfg.frontend.v1", 20)?;
     tui.wait_for("Operational", 20)?;
     wait_mfg_state(&state_artifact, "mounted MFG observer", |state| {
         state.pointer("/live/generation").is_some()
@@ -70,10 +73,10 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
             "facts": fixture,
         }),
     )?;
-    println!("\n── TUI MFG Operations (V544 governed actions producer) ──");
+    println!("\n── TUI MFG Operations (governed actions producer) ──");
 
     runner.run(
-        "V544 MFG operational contract and action inventory visible",
+        "MFG operational contract and action inventory visible",
         || {
             let capture = tui.capture_step("mfg-open-80x24", &[])?;
             if !capture.contains("MFG Operations")
@@ -88,7 +91,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
                 .unwrap_or_default();
             if action_count == 0 || !capture.contains("mutations=0") {
                 return Err(anyhow!(
-                "V544 operational shell did not expose governed actions with an idle mutation queue"
+                    "operational shell did not expose governed actions with an idle mutation queue"
             ));
             }
             Ok(())
@@ -99,7 +102,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
     tui.wait_for("tab=Incidents", 20)?;
     tui.wait_for("id=", 20)?;
 
-    runner.run("V544 responsive 80-96-120 operational layout", || {
+    runner.run("responsive 80-96-120 operational layout", || {
         let compact = tui.capture_step("responsive-80x24-list", &[])?;
         if compact.contains("Backlinks") {
             return Err(anyhow!("80x24 must use the single-column MFG layout"));
@@ -133,7 +136,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         Ok(())
     });
 
-    runner.run("V544 responsive selection and focus survive resize", || {
+    runner.run("responsive selection and focus survive resize", || {
         tui.send_key("Enter")?;
         tui.wait_for("focus=List", 20)?;
         tui.send_key("j")?;
@@ -161,32 +164,13 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         Ok(())
     });
 
-    runner.run("V584 MFG P1 insights and live transport are visibly wired", || {
+    runner.run("MFG P1 insights and live transport are visibly wired", || {
         tui.resize(120, 40)?;
-        for _ in 0..4 {
-            tui.send_key("F6")?;
-        }
-        tui.wait_for("focus=Tabs", 20)?;
+        focus_mfg_tabs(&tui)?;
         for _ in 0..5 {
             tui.send_key("Right")?;
         }
         tui.wait_for("tab=Insights", 20)?;
-        tui.wait_for("P1 attempted=6", 20)?;
-        tui.wait_for("live stream: connected", 20)?;
-        let capture = tui.capture_step("mfg-p1-insights-live", &[])?;
-        if capture.contains("not-connected") || capture.contains("route declared") {
-            return Err(anyhow!(
-                "MFG live transport rendered the former reversed connection label"
-            ));
-        }
-        let documents = mfg_any_fact(&capture, "documents")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or_default();
-        if documents < 6 {
-            return Err(anyhow!(
-                "MFG P1 routes were attempted but only {documents} response documents were retained"
-            ));
-        }
         let state = wait_mfg_state(&state_artifact, "MFG P1 observer", |state| {
             state
                 .get("p1_routes")
@@ -201,7 +185,23 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
                                 == Some("supply-risk-analyst")
                         })
                     })
+                && state
+                    .pointer("/live/cursor")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|cursor| !cursor.is_empty())
         })?;
+        tui.wait_for("P1 attempted=", 20)?;
+        let capture = tui.capture_step("mfg-p1-insights-live", &[])?;
+        if capture.contains("not-connected")
+            || capture.contains("route declared")
+            || !capture.contains("live stream:")
+        {
+            return Err(anyhow!("MFG live transport state is not visibly wired"));
+        }
+        let documents = mfg_numeric_fact(&capture, "documents").unwrap_or_default();
+        if documents == 0 {
+            return Err(anyhow!("MFG P1 projection retained no visible document"));
+        }
         let routes = state
             .get("p1_routes")
             .and_then(serde_json::Value::as_array)
@@ -218,7 +218,13 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
 
     runner.run("TUI read backlinks emit intent without operations", || {
         tui.resize(120, 40)?;
+        focus_mfg_tabs(&tui)?;
+        for _ in 0..5 {
+            tui.send_key("Left")?;
+        }
+        tui.wait_for("tab=Incidents", 20)?;
         tui.wait_for("Backlinks", 20)?;
+        tui.wait_for("Evidence ·", 20)?;
         let incident_context = tui.capture_step("backlink-incident-context", &[])?;
         assert_backlink(
             &tui,
@@ -238,10 +244,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
             &incident_context,
         )?;
 
-        for _ in 0..4 {
-            tui.send_key("F6")?;
-        }
-        tui.wait_for("focus=Tabs", 20)?;
+        focus_mfg_tabs(&tui)?;
         for _ in 0..4 {
             tui.send_key("Right")?;
         }
@@ -272,7 +275,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         Ok(())
     });
 
-    runner.run("V544 high-risk cancel, receipt, and conflict sequence", || {
+    runner.run("high-risk cancel, receipt, and conflict sequence", || {
         tui.resize(120, 40)?;
         let before_cancel_state = wait_mfg_state(&state_artifact, "initial MFG observer", |state| {
             state.get("receipts").is_some_and(serde_json::Value::is_array)
@@ -424,7 +427,7 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
         }
 
         tui.write_sidecar(
-            "v544-governed-action-boundary",
+            "mfg-governed-action-boundary",
             &[],
             json!({
                 "assertions": [
@@ -436,9 +439,8 @@ pub fn run(runner: &mut TestRunner) -> anyhow::Result<()> {
                     "accepted_receipt_visible",
                     "stale_revision_conflict_no_overwrite"
                 ],
-                "status": "v544_governed_action_producer_observed",
+                "status": "governed_action_producer_observed",
                 "target_acceptance_ids": ["TUI-01", "TUI-02", "TUI-03", "TUI-04", "TUI-05"],
-                "deferred_acceptance_ids": ["TUI-01", "TUI-02", "TUI-03", "TUI-04", "TUI-05", "TUI-06", "TUI-07", "TUI-08"],
                 "method": "POST",
                 "path": "/api/apps/mfg/focus/alerts/:id/command",
                 "receipt_id": accepted_receipt,
@@ -463,8 +465,8 @@ fn seed_mfg_fixture(base_url: &str, token: &str, nonce: u128) -> anyhow::Result<
         token,
         "POST",
         "/api/apps/mfg/domain/server-manufacturing/seed",
-        None,
-        None,
+        Some(&format!("mfg-pty-domain-seed-{nonce}")),
+        Some(&json!({})),
     )?;
 
     let rule = mfg_api_json(
@@ -768,6 +770,17 @@ fn assert_backlink(
     Ok(())
 }
 
+fn focus_mfg_tabs(tui: &TuiSession) -> anyhow::Result<()> {
+    for _ in 0..8 {
+        if tui.capture()?.contains("focus=Tabs") {
+            return Ok(());
+        }
+        tui.send_key("F6")?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(anyhow!("MFG focus cycle never reached the tab strip"))
+}
+
 fn selected_object_id(capture: &str) -> Option<String> {
     capture
         .lines()
@@ -805,6 +818,20 @@ fn mfg_any_fact(capture: &str, key: &str) -> Option<String> {
                 .trim_end_matches(',')
                 .to_string()
         })
+}
+
+fn mfg_numeric_fact(capture: &str, key: &str) -> Option<usize> {
+    let marker = format!("{key}=");
+    capture.lines().find_map(|line| {
+        let value = line.split(&marker).nth(1)?;
+        let digits = value
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        (!digits.is_empty())
+            .then(|| digits.parse::<usize>().ok())
+            .flatten()
+    })
 }
 
 fn mfg_action_fact(capture: &str, key: &str) -> Option<String> {

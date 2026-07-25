@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use std::collections::BTreeMap;
 
@@ -12,17 +12,12 @@ fn cowd_binary() -> &'static str {
     env!("CARGO_BIN_EXE_cowd")
 }
 
-fn temp_root(label: &str) -> PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "cowd-single-binary-{label}-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&root).expect("create single-binary fixture");
-    root
+fn temp_root(label: &str) -> tempfile::TempDir {
+    let short_label = label.chars().take(8).collect::<String>();
+    tempfile::Builder::new()
+        .prefix(&format!("cowd-sb-{short_label}-"))
+        .tempdir()
+        .expect("create single-binary fixture")
 }
 
 fn stop_child(child: &mut Child) {
@@ -128,12 +123,6 @@ fn run_auth_profile(args: &[&str], config_home: &Path, credential: &str) -> std:
         .expect("wait for auth profile command")
 }
 
-fn bwrap_available() -> bool {
-    ["/usr/bin/bwrap", "/bin/bwrap"]
-        .into_iter()
-        .any(|path| Path::new(path).is_file())
-}
-
 fn repository_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -142,67 +131,57 @@ fn repository_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn collect_shell_sources(root: &Path, output: &mut String) {
-    for entry in fs::read_dir(root).expect("read scripts directory") {
-        let path = entry.expect("script entry").path();
-        if path.is_dir() {
-            collect_shell_sources(&path, output);
-        } else if path.extension().and_then(|value| value.to_str()) == Some("sh") {
-            output.push_str(&fs::read_to_string(path).expect("read shell source"));
-        }
-    }
-}
-
 #[test]
 fn workspace_defines_only_one_cowd_executable_artifact() {
     let root = repository_root();
-    let auth_manifest =
-        fs::read_to_string(root.join("crates/auth-broker/Cargo.toml")).expect("auth manifest");
-    let sandbox_manifest = fs::read_to_string(root.join("crates/sandbox-launcher/Cargo.toml"))
-        .expect("sandbox manifest");
-    let runtime_host = fs::read_to_string(root.join("crates/gateway/src/runtime_host/mod.rs"))
-        .expect("runtime host");
-    let cli_main = fs::read_to_string(root.join("crates/cli/src/main.rs")).expect("cli main");
-    let installer =
-        fs::read_to_string(root.join("scripts/release/install-debug-to-ai.sh")).expect("installer");
-    let sandbox_launcher = fs::read_to_string(root.join("crates/sandbox-launcher/src/lib.rs"))
-        .expect("sandbox launcher");
-    let mut shell_sources = String::new();
-    collect_shell_sources(&root.join("scripts"), &mut shell_sources);
-
-    assert!(!auth_manifest.contains("[[bin]]"));
-    assert!(!sandbox_manifest.contains("[[bin]]"));
-    assert!(!root.join("crates/auth-broker/src/main.rs").exists());
-    assert!(!root.join("crates/sandbox-launcher/src/main.rs").exists());
-    assert!(!runtime_host.contains("COWD_AUTH_BROKER_BIN"));
-    assert!(!runtime_host.contains("COWD_INTERNAL_PROCESS_BIN"));
-    assert!(!runtime_host.contains("cowd-auth-broker"));
-    assert!(runtime_host.contains(INTERNAL_DISPATCH));
+    let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(&root)
+        .output()
+        .expect("read workspace Cargo metadata");
     assert!(
-        cli_main
-            .find("register_cowd_process_host")
-            .expect("Cowd process registration")
-            < cli_main
-                .find("dispatch_internal_process")
-                .expect("internal process dispatch"),
-        "Cowd must register its single-file process identity before role dispatch"
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!shell_sources.contains("COWD_AUTH_BROKER_BIN"));
-    assert!(!shell_sources.contains("COWD_SANDBOX_LAUNCHER"));
-    assert!(!shell_sources.contains("COWD_INTERNAL_PROCESS_BIN"));
-    assert!(!installer.contains("cp \"$SANDBOX_BIN\""));
-    assert!(!installer.contains("cp \"$BIN\" \"$INSTALL_DIR/cowd\""));
-    assert!(installer.contains("cowd binary version mismatch"));
-    assert!(installer.contains(".cowd.install.XXXXXX"));
-    assert!(installer.contains("mv -f \"$INSTALL_TMP\" \"$INSTALL_DIR/cowd\""));
-    assert!(installer.contains("single_binary_multi_process"));
-    assert!(!root
-        .join("crates/gateway/src/entry/install_entry.rs")
-        .exists());
-    assert!(sandbox_launcher.contains("\"/proc/{}/exe\""));
-    assert!(sandbox_launcher.contains("Command::new(\"/proc/self/exe\")"));
-    assert!(sandbox_launcher.contains("requires Linux executable identity pinning"));
-    assert!(runtime_host.contains("cowd_internal_process_command"));
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid Cargo metadata");
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("Cargo metadata packages");
+
+    let cowd_bins = packages
+        .iter()
+        .flat_map(|package| {
+            package["targets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|target| {
+                    target["name"] == "cowd"
+                        && target["kind"]
+                            .as_array()
+                            .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+                })
+                .map(|_| package["name"].as_str().unwrap_or_default().to_string())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cowd_bins, vec!["cli"]);
+
+    for internal_role in ["auth-broker", "sandbox-launcher"] {
+        let package = packages
+            .iter()
+            .find(|package| package["name"] == internal_role)
+            .expect("internal role package");
+        assert!(
+            package["targets"]
+                .as_array()
+                .is_some_and(|targets| targets.iter().all(|target| !target["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin")))),
+            "{internal_role} must remain a library hosted by the cowd executable"
+        );
+    }
 }
 
 #[test]
@@ -222,8 +201,8 @@ fn cowd_exposes_the_versioned_sandbox_process_protocol() {
 #[test]
 fn cowd_runs_the_auth_broker_as_an_internal_child_role() {
     let fixture = temp_root("auth");
-    let authority_root = fixture.join("authority");
-    let socket = fixture.join("broker.sock");
+    let authority_root = fixture.path().join("authority");
+    let socket = fixture.path().join("broker.sock");
     let mut child = spawn_auth_broker(
         &authority_root,
         &socket,
@@ -236,13 +215,12 @@ fn cowd_runs_the_auth_broker_as_an_internal_child_role() {
     wait_for_broker(&client, &mut child);
 
     stop_child(&mut child);
-    let _ = fs::remove_dir_all(&fixture);
 }
 
 #[test]
 fn cowd_auth_profile_uses_a_descriptor_catalog_through_the_live_internal_broker() {
     let fixture = temp_root("generic-auth-profile");
-    let config_home = fixture.join("config");
+    let config_home = fixture.path().join("config");
     let authority_root = config_home.join("auth-broker");
     let socket = auth_broker::BrokerClient::default_socket(&authority_root);
     let credential = "generic-profile-test-credential";
@@ -336,7 +314,6 @@ fn cowd_auth_profile_uses_a_descriptor_catalog_through_the_live_internal_broker(
         .is_err());
 
     stop_child(&mut broker);
-    let _ = fs::remove_dir_all(&fixture);
 }
 
 #[cfg(unix)]
@@ -345,9 +322,9 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let fixture = temp_root("atomic-install");
-    let install_dir = fixture.join("install");
-    let authority_root = fixture.join("authority");
-    let socket = fixture.join("broker.sock");
+    let install_dir = fixture.path().join("install");
+    let authority_root = fixture.path().join("authority");
+    let socket = fixture.path().join("broker.sock");
     fs::create_dir_all(&authority_root).expect("create authority root");
     let catalog_path = auth_broker::catalog_file(&authority_root);
     auth_broker::write_catalog(
@@ -410,7 +387,7 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
         .arg("--print-path-only")
         .env("COWD_BIN", cowd_binary())
         .env("COWD_INSTALL_DIR", &install_dir)
-        .env("COWD_AI_ROOT", fixture.join("ai"))
+        .env("COWD_AI_ROOT", fixture.path().join("ai"))
         .output()
         .expect("run release installer");
 
@@ -443,7 +420,6 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
             .starts_with(".cowd.install.")));
 
     stop_child(&mut child);
-    let _ = fs::remove_dir_all(&fixture);
 }
 
 #[cfg(unix)]
@@ -452,8 +428,8 @@ fn release_installer_rejects_binary_version_drift_without_touching_target() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = temp_root("version-drift");
-    let install_dir = fixture.join("install");
-    let candidate = fixture.join("cowd-candidate");
+    let install_dir = fixture.path().join("install");
+    let candidate = fixture.path().join("cowd-candidate");
     fs::create_dir_all(&install_dir).expect("create install directory");
     fs::write(install_dir.join("cowd"), b"existing-cowd").expect("seed existing target");
     fs::write(
@@ -469,7 +445,7 @@ fn release_installer_rejects_binary_version_drift_without_touching_target() {
         .arg("--print-path-only")
         .env("COWD_BIN", &candidate)
         .env("COWD_INSTALL_DIR", &install_dir)
-        .env("COWD_AI_ROOT", fixture.join("ai"))
+        .env("COWD_AI_ROOT", fixture.path().join("ai"))
         .output()
         .expect("run release installer");
 
@@ -486,27 +462,22 @@ fn release_installer_rejects_binary_version_drift_without_touching_target() {
             .file_name()
             .to_string_lossy()
             .starts_with(".cowd.install.")));
-
-    let _ = fs::remove_dir_all(&fixture);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cowd_runs_a_kernel_hardened_command_without_a_helper_binary() {
-    if !bwrap_available() {
-        return;
-    }
     let workspace = temp_root("sandbox");
     let output = Command::new(cowd_binary())
         .args([
             INTERNAL_DISPATCH,
             "sandbox-launcher",
-            workspace.to_str().expect("utf-8 workspace"),
+            workspace.path().to_str().expect("utf-8 workspace"),
             "printf single-binary-sandbox",
         ])
         .output()
         .expect("run Cowd sandbox role");
 
-    let _ = fs::remove_dir_all(&workspace);
     assert!(
         output.status.success(),
         "sandbox role failed: stdout={} stderr={}",

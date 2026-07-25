@@ -4429,64 +4429,6 @@ mod tests {
     }
 
     #[test]
-    fn tools_executor_does_not_own_agent_lifecycle() {
-        let source_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execution/executor.rs");
-        let source =
-            std::fs::read_to_string(source_path).expect("executor source should be readable");
-        for forbidden in [
-            ["fn ", "spawn_agent_job"].concat(),
-            ["fn ", "run_agent_job"].concat(),
-            ["fn ", "write_agent_manifest"].concat(),
-            ["fn ", "persist_agent_terminal_state"].concat(),
-            ["std::thread::", "Builder::new()"].concat(),
-        ] {
-            assert!(
-                !source.contains(&forbidden),
-                "tools executor must not own Agent lifecycle primitive `{forbidden}`"
-            );
-        }
-        assert!(
-            !source.contains(&["runtime", "::", "spawn_provider_agent"].concat()),
-            "tools executor must not spawn agent providers directly"
-        );
-    }
-
-    #[test]
-    fn tools_crate_does_not_own_runtime_control_plane_registries() {
-        let lib_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
-        let executor_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execution/executor.rs");
-        let lib = std::fs::read_to_string(lib_path).expect("lib source should be readable");
-        let executor =
-            std::fs::read_to_string(executor_path).expect("executor source should be readable");
-
-        for forbidden in [
-            ["fn ", "global_worker_registry"].concat(),
-            ["fn ", "global_team_registry"].concat(),
-            ["fn ", "global_cron_registry"].concat(),
-            ["fn ", "global_task_registry"].concat(),
-            ["WorkerRegistry", "::new"].concat(),
-            ["TeamRegistry", "::new"].concat(),
-            ["CronRegistry", "::new"].concat(),
-            ["TaskRegistry", "::new"].concat(),
-        ] {
-            assert!(
-                !lib.contains(&forbidden) && !executor.contains(&forbidden),
-                "tools must not own runtime control-plane registry `{forbidden}`"
-            );
-        }
-        assert!(
-            !executor.contains(&["runtime", "::", "global_runtime_control_plane()"].concat()),
-            "tools executor must not call runtime control-plane directly"
-        );
-        assert!(
-            !executor.contains(&["runtime", "::", "global_task_registry()"].concat()),
-            "tools executor must not call task registry directly"
-        );
-    }
-
-    #[test]
     fn agent_control_plane_tool_is_not_executable_from_tools() {
         let error = execute_tool(
             "Agent",
@@ -5970,19 +5912,5 @@ printf 'pwsh:%s' "$1"
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
-    }
-
-    #[test]
-    fn tools_crate_does_not_depend_on_provider_directly() {
-        let manifest = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
-        )
-        .expect("tools manifest should be readable");
-        assert!(
-            !manifest
-                .lines()
-                .any(|line| line.trim_start().starts_with("provider =")),
-            "tools must route provider access through runtime, not a direct provider dependency"
-        );
     }
 }

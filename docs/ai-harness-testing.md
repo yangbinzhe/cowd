@@ -58,7 +58,7 @@ This adds:
 
 - `cargo test --workspace --exclude gateway --all-targets`
 - `cargo test -p gateway --all-targets -- --test-threads=1`
-- `scripts/ci/scenario.sh`
+- `scripts/validate.sh scenario`
 
 The scenario report is written under `test-reports/validation-*/report.md`.
 The gateway crate is run serially in this lane because some gateway tests mutate

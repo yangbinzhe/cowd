@@ -4221,18 +4221,19 @@ mod tests {
         }
     }
 
-    fn real_store() -> Option<PostgresSessionStore> {
-        let url = std::env::var("COWD_TEST_POSTGRES_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())?;
+    fn real_store() -> PostgresSessionStore {
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url)]);
-        Some(
-            PostgresSessionStore::connect(
-                PostgresConnectionConfig::new("session-postgres-test", "test.pg", "cowd-v577-test"),
-                &resolver,
-            )
-            .expect("isolated PostgreSQL session store opens"),
+        PostgresSessionStore::connect(
+            PostgresConnectionConfig::new(
+                "session-postgres-test",
+                "test.pg",
+                "cowd-session-postgres-contract",
+            ),
+            &resolver,
         )
+        .expect("isolated PostgreSQL session store opens")
     }
 
     #[test]
@@ -4295,12 +4296,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     async fn postgres_adapter_real_copy_fences_and_injected_facade() {
         let _guard = postgres_test_guard();
-        let Some(target) = real_store() else {
-            eprintln!("skipping real PostgreSQL session test: COWD_TEST_POSTGRES_URL is not set");
-            return;
-        };
+        let target = real_store();
         let source = SqliteSessionStore::open_in_memory().expect("SQLite source opens");
         source
             .create_session(&session("migration-session"))
@@ -4367,12 +4366,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn postgres_terminal_transcript_preserves_published_cursor_and_is_idempotent() {
         let _guard = postgres_test_guard();
-        let Some(store) = real_store() else {
-            eprintln!("skipping real PostgreSQL session test: COWD_TEST_POSTGRES_URL is not set");
-            return;
-        };
+        let store = real_store();
         let session_id = format!(
             "causal-terminal-{}-{}",
             std::process::id(),
@@ -4478,17 +4475,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn postgres_concurrent_store_startup_serializes_preflight_and_migrations() {
         let _guard = postgres_test_guard();
-        let Some(url) = std::env::var("COWD_TEST_POSTGRES_URL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-        else {
-            eprintln!(
-                "skipping real PostgreSQL concurrency test: COWD_TEST_POSTGRES_URL is not set"
-            );
-            return;
-        };
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let worker_count = 8;
         let gate = Arc::new(Barrier::new(worker_count));
         let workers = (0..worker_count)
@@ -4502,7 +4493,7 @@ mod tests {
                         PostgresConnectionConfig::new(
                             format!("session-postgres-concurrent-{worker}"),
                             "test.pg",
-                            "cowd-v584-concurrent-test",
+                            "cowd-concurrent-session-test",
                         ),
                         &resolver,
                     )

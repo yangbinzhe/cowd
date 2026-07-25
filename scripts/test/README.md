@@ -1,124 +1,78 @@
-# Cowd 测试入口规范
+# Cowd 测试入口
 
-本目录只放测试执行入口和测试治理辅助脚本。目标是让日常开发、阶段验收、最终回归分层执行，避免每次小改都跑完整工作区测试。
+测试分层的目标是快速反馈和完整发布证据同时成立。所有入口由
+`scripts/validate.sh` 调度，分类来源是
+`tests/test-governance/test-inventory.yaml`。
 
-## 三层测试入口
-
-## Clippy 门禁
-
-发布阻断使用：
+## 日常
 
 ```bash
-scripts/ci/clippy-safety.sh
+scripts/validate.sh quick
+scripts/validate.sh changed-crates
 ```
 
-该门禁检查工作区所有生产 `lib/bin` target，并将 Rust warning、未处理
-`unwrap/expect`、显式 panic、未完成路径、debug 宏和进程退出视为错误。测试 target
-中的断言式 panic 由全量回归负责，不混入生产崩溃门禁。`clippy::all` 与
-`clippy::pedantic` 仍应定期运行：
+`changed-crates` 使用 `cargo metadata` 动态识别 package，不维护手写 crate 清单。根
+Cargo manifest 或 lockfile 变化会自动提升为 workspace all-targets；独立
+`tests/interactive` 变化会检查自己的 manifest。位于 crate 外的 APP source lock
+显式归属 `cowd-product-apps`；该映射由治理门禁自测。
+
+## 阶段
 
 ```bash
-scripts/ci/clippy-style-report.sh
+scripts/validate.sh contract
+scripts/validate.sh serial-global
+scripts/validate.sh scenario
+scripts/validate.sh surface
 ```
 
-后者是非阻断的风格债务报告。其内容可能随 Rust/Clippy 版本变化；涉及截断、转换或 API 形态的建议必须在对应业务模块中单独审查，不能在发布修复中机械改写。
+- `contract`：稳定 crate 合同与依赖边界。
+- `serial-global`：唯一需要串行执行的 Gateway 全局状态测试。
+- `scenario`：少量跨模块黄金路径。
+- `surface`：CLI、TUI、TUI/MFG、WebUI 的真实控制点。
 
-### 1. 日常快速门禁
+## 封版
 
 ```bash
-scripts/test/quick.sh
+scripts/validate.sh full-regression
+scripts/validate.sh release
 ```
 
-用途：
+`full-regression` 让普通 Rust 测试使用 Cargo 默认并行度，完成后单独运行
+`gateway-global-env.sh`。不得为了少量全局状态测试把整个 workspace 强制单线程。
+各 lane 默认复用仓库唯一 `target` 且关闭 incremental，不保留版本备份；需要验证干净
+构建时显式设置 `COWD_ISOLATED_TARGET=1`，退出后会删除一次性 target。
+验证默认不递归统计大型 `target` 目录，构建体积专项才设置
+`COWD_MEASURE_TARGET_SIZE=1`。Gateway 架构边界是静态依赖/禁用路径门禁，不再为源码
+扫描链接完整 Gateway 测试二进制；Runtime 生命周期映射和 Memory 依赖合同集中在
+`contract`，避免编辑门禁重复构建重包。
 
-- 普通代码修改后的默认检查。
-- 物理目录治理、边界调整、非高风险业务修改后的第一轮反馈。
-
-内容：
-
-- `cargo fmt --all --check`
-- `cargo check --workspace --all-targets`
-- 核心架构边界测试：gateway/runtime/memory architecture tests
-- 小型边界 crate：`harness-contract`、`model-protocol`、`surface`、`matrix-core`
-
-原则：
-
-- 快速证明代码可编译、核心边界未回退。
-- 不跑所有 gateway/runtime/tui/memory 大测试集。
-
-### 2. 变更包精准门禁
+## 外部依赖
 
 ```bash
-scripts/test/changed-crates.sh [base]
+scripts/validate.sh manual live-provider
+scripts/validate.sh manual lark-live
+scripts/validate.sh manual memory-performance
+scripts/validate.sh manual postgres-contract
+scripts/validate.sh manual tui-production-acceptance
 ```
 
-默认 `base` 为 `HEAD`，也可以通过 `COWD_CHANGED_BASE` 指定。
+PostgreSQL 合同要求隔离、可清空的 `COWD_TEST_POSTGRES_URL`；跨 PostgreSQL 复制还可
+提供 `COWD_TEST_POSTGRES_TARGET_URL`。统一入口覆盖 Fact、Surface、Gateway、
+Memory、Matrix、Runtime、Session、Approval、Connector 和 Product App 存储合同；
+每项必须真实执行且恰好有一个测试通过，禁止因环境缺失静默返回成功。这些入口不会
+读取用户生产数据库。TUI 生产验收使用真实 Gateway、受控 Provider 和 PTY，并把证据
+写入版本化报告目录。
 
-用途：
+## 新测试准入
 
-- 提交前针对当前变更涉及的 crate 精准补测。
-- 大重构阶段内部完成后，用于快速确认 touched crates。
+1. 说明它能独立发现的失败模式。
+2. 优先断言公开输出、状态、持久化或依赖方向。
+3. 不断言私有函数名、源码空格、目录形状、历史版本号或固定测试数量。
+4. 与现有测试重叠时合并或替换。
+5. ignored 测试必须登记唯一 runner。
+6. 外部依赖测试必须显式 ignored，并由 runner 对环境做 fail-fast 校验，不能在测试
+   内打印 skipped 后成功返回。
+7. 测试治理修改必须通过 `scripts/test/governance-gate.sh`。
 
-规则：
-
-- 先跑 `fmt` 和全工作区 `check`。
-- 根据变更文件映射到 crate。
-- 普通 crate 跑 `cargo test -p <crate> --all-targets`。
-- `gateway`、`runtime`、`memory` 会额外跑各自架构测试。
-- `tui` 默认跑 `cargo test -p tui --lib`，避免每次都拉起全部终端交互相关目标。
-
-### 3. 最终全量回归
-
-```bash
-scripts/test/full-regression.sh
-```
-
-用途：
-
-- 版本提交前。
-- 大规模重构完成后。
-- 准备打 tag 或发布前。
-
-内容：
-
-- `cargo fmt --all --check`
-- `cargo check --workspace --all-targets`
-- `cargo test --workspace --all-targets -- --test-threads=1`
-
-原则：
-
-- 这是最终回归工具，不是日常开发工具。
-- 单线程执行用于降低全局状态、端口、环境变量、临时目录等测试互相干扰。
-
-## 为什么不默认全量测试
-
-当前缓存态实测显示：
-
-- `gateway --all-targets` 约 30 秒，主测试集约 373 个测试。
-- `tui --lib` 约 23 秒，约 901 个测试。
-- `runtime --lib` 约 12 秒，约 827 个测试。
-- `memory --all-targets` 约 10 秒，lib 约 530 个测试。
-
-这些测试有价值，但它们不是每次小改的最佳反馈路径。日常应先跑快速门禁和变更包精准门禁，最终再跑全量回归。
-
-## 新测试准入原则
-
-- 新默认测试必须证明关键边界、关键合同、关键行为，不添加低价值重复断言。
-- 如果已有测试覆盖同一行为，新测试应替换或收敛旧测试，而不是叠加一层。
-- 会修改进程全局状态、工作目录、环境变量、端口、provider 配置的测试，应进入 serial/global 类门禁。
-- live provider、LLM judge、视觉交互、人工探索测试不进入默认门禁，除非被明确提升为发布门禁。
-- 架构重构必须有源码扫描或架构测试作为硬门禁，不能只依赖“能编译”。
-
-## AI Harness 报告规范
-
-深度评测、真实 provider 评测、场景化评测的结果包必须遵守
-[docs/ai-harness-report-spec.md](../../docs/ai-harness-report-spec.md)：
-
-- `report.md` 只是摘要入口。
-- `analysis-context.json`、`full-analysis-report-template.md`、
-  `full-analysis-report-prompt.md` 是报告生成契约，必须由评测器自动生成。
-- `full-analysis-report.md` 是 AI reviewer 基于证据包生成的人工审查完整分析报告。
-- `report.json`、`execution-trace.json`、`provider-rounds/`、`tool-calls/`、
-  `evidence/` 是可追溯证据包。
-- 即使总体状态为 passed，局部工具失败、降级行为、未证明内容也必须写入
-  `full-analysis-report.md`。
+AI Harness 深度报告遵守
+`docs/ai-harness-report-spec.md`，必须保留完整证据包，不能只输出摘要。

@@ -2769,11 +2769,9 @@ mod tests {
     use crate::{copy_quiesced_matrix_store, MatrixSqliteRepository};
 
     #[test]
-    fn real_postgres_adapter_preserves_matrix_snapshot_when_configured() {
-        let Some(url) = env::var("COWD_TEST_POSTGRES_URL").ok() else {
-            eprintln!("skipping real PostgreSQL Matrix test: COWD_TEST_POSTGRES_URL is not set");
-            return;
-        };
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_postgres_adapter_preserves_matrix_snapshot() {
+        let url = env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let source = MatrixSqliteRepository::in_memory().expect("sqlite source opens");
         let entity = source
             .upsert_entity(&MatrixEntity::from_input(MatrixEntityInput {
@@ -2833,7 +2831,7 @@ mod tests {
             PostgresConnectionConfig::new(
                 "matrix-postgres-integration-test",
                 "matrix.pg.test",
-                "cowd-v575-matrix-test",
+                "cowd-matrix-postgres-contract",
             ),
             &resolver,
         )

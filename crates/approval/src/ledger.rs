@@ -583,13 +583,9 @@ mod tests {
     }
 
     #[test]
-    fn real_postgres_copy_reopens_with_matching_digest_when_configured() {
-        let Some(url) = env::var("COWD_TEST_POSTGRES_URL").ok() else {
-            eprintln!(
-                "skipping real PostgreSQL approval ledger test: COWD_TEST_POSTGRES_URL is not set"
-            );
-            return;
-        };
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn real_postgres_copy_reopens_with_matching_digest() {
+        let url = env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let source = SqliteApprovalHistoryLedger::in_memory().unwrap();
         source.append(entry("pg-decision-1")).unwrap();
         source.append(entry("pg-decision-2")).unwrap();
@@ -599,7 +595,7 @@ mod tests {
                 PostgresConnectionConfig::new(
                     "approval-history-postgres-test",
                     "approval.pg.test",
-                    "cowd-v576-approval-test",
+                    "cowd-approval-postgres-contract",
                 ),
                 &resolver,
             )

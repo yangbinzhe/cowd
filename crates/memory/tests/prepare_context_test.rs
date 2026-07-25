@@ -73,36 +73,6 @@ fn test_entry(layer: MemoryLayer, title: &str, content: &str) -> MemoryEntry {
     }
 }
 
-// Test 1: Basic recall works with direct ID lookup
-#[tokio::test]
-async fn test_prepare_context_basic_get_entry() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let config = test_basic_config(&tmp.path().join("test.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
-
-    let entry = test_entry(MemoryLayer::L3, "test-title", "test content here");
-    let id = entry.id;
-    mgr.remember(entry).await.unwrap();
-
-    let retrieved = mgr.get_entry(&id.to_string()).await.unwrap().unwrap();
-    assert_eq!(retrieved.title, "test-title");
-}
-
-// Test 2: Entry persisted in correct layer
-#[tokio::test]
-async fn test_prepare_context_layer_isolation() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let config = test_basic_config(&tmp.path().join("test.db"));
-    let mgr = CognitiveContextManager::new(config).await.unwrap();
-
-    let entry = test_entry(MemoryLayer::L2, "project-ctx", "project specific data");
-    let id = entry.id;
-    mgr.remember(entry).await.unwrap();
-
-    let retrieved = mgr.get_entry(&id.to_string()).await.unwrap().unwrap();
-    assert_eq!(retrieved.layer, MemoryLayer::L2);
-}
-
 #[tokio::test]
 async fn test_recall_semantic_bridge_finds_related_memory_without_keyword_overlap() {
     let tmp = tempfile::TempDir::new().unwrap();

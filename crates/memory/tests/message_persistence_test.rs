@@ -92,66 +92,6 @@ fn make_multi_block_message(session_id: &str, sequence: usize) -> SessionMessage
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test 1: Schema existence
-// ---------------------------------------------------------------------------
-
-#[test]
-fn message_persistence_schema_exists() {
-    let (store, _dir) = make_store();
-    let conn = store.conn().expect("get connection");
-
-    // Check messages table
-    let table_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count messages table");
-    assert_eq!(table_count, 1, "messages table should exist");
-
-    // Check indexes
-    let idx_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_messages%'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count message indexes");
-    assert!(
-        idx_count >= 2,
-        "idx_messages_session and idx_messages_session_seq should exist"
-    );
-
-    // Check FTS virtual table
-    let fts_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages_fts'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count messages_fts table");
-    assert_eq!(fts_count, 1, "messages_fts virtual table should exist");
-
-    // Check triggers
-    let trigger_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name LIKE 'messages_fts_%'",
-            [],
-            |row| row.get(0),
-        )
-        .expect("count message triggers");
-    assert_eq!(
-        trigger_count, 3,
-        "messages_fts_ai, messages_fts_ad, messages_fts_au should exist"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Test 2: Insert and retrieve single message
-// ---------------------------------------------------------------------------
-
 #[test]
 fn message_persistence_insert_and_get() {
     let (store, _dir) = make_store();

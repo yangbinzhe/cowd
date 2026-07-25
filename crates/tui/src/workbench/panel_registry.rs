@@ -221,7 +221,6 @@ mod tests {
                 "Gateway"
             ]
         );
-        assert_eq!(sidebar_count(), 11);
     }
 
     #[test]

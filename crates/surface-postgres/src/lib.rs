@@ -1413,10 +1413,10 @@ mod tests {
     use super::*;
 
     fn ledger_from_url(url: String, identity: &str) -> Arc<PostgresSurfaceMessageLedger> {
-        let resolver = StaticSecretRefResolver::new([("v572-test".to_string(), url)]);
+        let resolver = StaticSecretRefResolver::new([("surface-postgres-test".to_string(), url)]);
         Arc::new(
             PostgresSurfaceMessageLedger::connect(
-                PostgresConnectionConfig::new(identity, "v572-test", identity),
+                PostgresConnectionConfig::new(identity, "surface-postgres-test", identity),
                 &resolver,
             )
             .expect("connect isolated PostgreSQL test database"),
@@ -1461,7 +1461,7 @@ mod tests {
             thread: Some("thread-1".to_string()),
             text: "durable PostgreSQL delivery".to_string(),
             idempotency_key: Some(key.to_string()),
-            metadata: serde_json::json!({"test": "v572"}),
+            metadata: serde_json::json!({"test": "postgres-contract"}),
         }
     }
 
@@ -1487,7 +1487,7 @@ mod tests {
     fn real_postgres_preserves_contract_and_serializes_competing_delivery_claims() {
         let ledger = ledger_from_url(
             std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required"),
-            "surface-v572-real",
+            "surface-postgres-contract",
         );
         clear(&ledger);
         let checksum_original = PostgresMigrationSpec {
@@ -1673,12 +1673,12 @@ mod tests {
     fn real_postgres_to_postgres_quiesced_copy_is_digest_exact_and_target_only() {
         let source = ledger_from_url(
             std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required"),
-            "surface-v572-copy-source",
+            "surface-postgres-copy-source",
         );
         let target = ledger_from_url(
             std::env::var("COWD_TEST_POSTGRES_TARGET_URL")
                 .expect("COWD_TEST_POSTGRES_TARGET_URL is required"),
-            "surface-v572-copy-target",
+            "surface-postgres-copy-target",
         );
         clear(&source);
         clear(&target);

@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 /// Product-neutral capabilities exposed by Cowd's core human-manager profile.
 ///
-/// Interactive Surfaces request only this stable core set during principal
-/// issuance. APP capabilities remain catalogue-derived and must not be
-/// reconstructed by a Surface.
+/// The authorization catalogue always includes this stable core set when it
+/// derives a Surface projection. APP capabilities remain catalogue-derived;
+/// a Surface must not reconstruct or hard-code either set.
 pub const CORE_HUMAN_CAPABILITIES: &[&str] = &[
     "approval.respond",
     "definition.manage",

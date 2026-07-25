@@ -114,7 +114,7 @@ required-features = ["test-support"]
 unsafe_code = "allow"
 
 [dev-dependencies]
-app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "f57e729ef6d2ba350d19328a1d51351793740def" }
+app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "2e71701633dcd7f5b0a327de7ab0fa97f6e415a6" }
 auth-broker = { path = "../auth-broker", features = ["test-support"] }
 runtime = { path = "../runtime", features = ["test-fixtures"] }
 serde_json.workspace = true

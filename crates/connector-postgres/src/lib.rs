@@ -590,14 +590,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn postgres_resource_directory_migrates_restarts_and_copies_real_database() {
-        let Some(url) = std::env::var("COWD_TEST_POSTGRES_URL").ok() else {
-            eprintln!("skipping real PostgreSQL test: COWD_TEST_POSTGRES_URL is not set");
-            return;
-        };
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url)]);
         let directory = PostgresResourceDirectory::connect(
-            PostgresConnectionConfig::new("connector-directory-test", "test.pg", "cowd-v567-test"),
+            PostgresConnectionConfig::new(
+                "connector-directory-test",
+                "test.pg",
+                "cowd-connector-postgres-contract",
+            ),
             &resolver,
         )
         .expect("postgres directory opens");
@@ -621,8 +624,8 @@ mod tests {
             .apply_migrations(checksum_changed.domain, &[checksum_changed])
             .expect_err("changed migration checksum fails closed");
         assert!(checksum_error.to_string().contains("checksum mismatch"));
-        let first = resource("v567-first", "PostgreSQL integration first resource");
-        let second = resource("v567-second", "PostgreSQL integration second resource");
+        let first = resource("postgres-first", "PostgreSQL integration first resource");
+        let second = resource("postgres-second", "PostgreSQL integration second resource");
         directory.upsert(&first).expect("first upsert");
         directory.upsert(&second).expect("second upsert");
         let workers = (0..8)
@@ -631,7 +634,7 @@ mod tests {
                 std::thread::spawn(move || {
                     directory
                         .upsert(&resource(
-                            &format!("v567-parallel-{index}"),
+                            &format!("postgres-parallel-{index}"),
                             "parallel PostgreSQL resource",
                         ))
                         .expect("parallel upsert");
@@ -664,7 +667,7 @@ mod tests {
             PostgresConnectionConfig::new(
                 "connector-directory-test",
                 "test.pg",
-                "cowd-v567-test-restart",
+                "cowd-connector-postgres-restart-contract",
             ),
             &resolver,
         )
@@ -697,7 +700,7 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let source = SqliteResourceDirectory::open(temporary.path().join("source.sqlite"))
             .expect("sqlite source opens");
-        let first = resource("v567-copy", "Copy source resource");
+        let first = resource("postgres-copy", "Copy source resource");
         source.upsert(&first).expect("source upsert");
         source
             .attach_source(&first.reference, "bitable", "source-id")
@@ -706,7 +709,7 @@ mod tests {
             PostgresConnectionConfig::new(
                 "connector-directory-copy-test",
                 "test.pg",
-                "cowd-v567-copy-test",
+                "cowd-connector-postgres-copy-contract",
             ),
             &resolver,
         )

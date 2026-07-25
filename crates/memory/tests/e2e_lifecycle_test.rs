@@ -5,11 +5,11 @@
     clippy::unreachable
 )]
 
-//! E2E test: full memory lifecycle (Task 24).
+//! Memory entry lifecycle integration.
 //!
-//! Simulates: conversation → auto-extract → compress → persist → restart → verify.
-//! Verifies that memory entries, KG entities, and compression summaries all
-//! survive the full lifecycle.
+//! Verifies that entries written across memory layers remain readable after
+//! the manager is reopened. Fact checking, raw storage and compression have
+//! dedicated contract tests.
 
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
@@ -62,7 +62,7 @@ fn entry(content: &str, layer: MemoryLayer) -> MemoryEntry {
 }
 
 #[tokio::test]
-async fn test_e2e_memory_lifecycle() {
+async fn memory_entries_across_layers_survive_manager_reopen() {
     let tmp = tempfile::TempDir::new().unwrap();
     let db_path = tmp.path().join("e2e.db");
 
@@ -124,12 +124,7 @@ async fn test_e2e_memory_lifecycle() {
             .iter()
             .filter_map(|v| v.get("entry_count").and_then(|c| c.as_u64()))
             .sum();
-        assert!(
-            total_entries >= n_entries as u64,
-            "Expected at least {} total entries after restart, got {}",
-            n_entries,
-            total_entries
-        );
+        assert_eq!(total_entries, n_entries as u64);
 
         // Verify individual entries
         let first_id = entry_ids[0];
@@ -144,93 +139,5 @@ async fn test_e2e_memory_lifecycle() {
                 e.content
             );
         }
-    }
-
-    // ===== Phase 3: Verify fact checking (if FactChecker is integrated) =====
-    {
-        let mgr = CognitiveContextManager::new(test_config(&db_path))
-            .await
-            .unwrap();
-
-        // Write identity fact
-        let identity = MemoryEntry {
-            id: uuid::Uuid::new_v4(),
-            layer: MemoryLayer::L1,
-            category: MemoryCategory::Reference,
-            priority: Priority::Normal,
-            source: MemorySource::UserExplicit,
-            title: "Identity".to_string(),
-            content: "Known fact: Alice's parent is Bob".to_string(),
-            embedding: None,
-            tags: vec![],
-            relations: vec![],
-            confidence: 1.0,
-            access_count: 0,
-            staleness: 0.0,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            last_accessed_at: None,
-            scope: MemoryScope::default(),
-            session_id: None,
-            source_agent: None,
-            visibility: memory::AgentVisibility::default(),
-        };
-        mgr.remember(identity).await.unwrap();
-
-        // Now write contradictory fact - FactChecker should downgrade confidence
-        let contradictory = MemoryEntry {
-            id: uuid::Uuid::new_v4(),
-            layer: MemoryLayer::L2,
-            category: MemoryCategory::Decision,
-            priority: Priority::Normal,
-            source: MemorySource::AutoExtracted,
-            title: "Contradiction".to_string(),
-            content: "Alice's parent is Charlie".to_string(),
-            embedding: None,
-            tags: vec![],
-            relations: vec![],
-            confidence: 0.9,
-            access_count: 0,
-            staleness: 0.0,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            last_accessed_at: None,
-            scope: MemoryScope::default(),
-            session_id: None,
-            source_agent: None,
-            visibility: memory::AgentVisibility::default(),
-        };
-        let contradictory_id = contradictory.id;
-        mgr.remember(contradictory).await.unwrap();
-
-        // Verify confidence was downgraded
-        let retrieved = mgr.get_entry(&contradictory_id.to_string()).await.unwrap();
-        if let Some(e) = retrieved {
-            eprintln!(
-                "Fact check result: confidence={:.3} (was 0.9)",
-                e.confidence
-            );
-            assert!(
-                e.confidence < 0.9,
-                "Contradictory entry confidence should be downgraded (was 0.9, got {:.3})",
-                e.confidence
-            );
-        }
-    }
-
-    // ===== Phase 4: Final restart - verify everything is intact =====
-    {
-        let mgr = CognitiveContextManager::new(test_config(&db_path))
-            .await
-            .unwrap();
-        let layer_info = mgr.list_layers().await;
-        eprintln!("Phase 4 final state: {:?}", layer_info);
-
-        let total_entries: u64 = layer_info
-            .iter()
-            .filter_map(|v| v.get("entry_count").and_then(|c| c.as_u64()))
-            .sum();
-        assert!(total_entries > 0, "Entries should survive final restart");
-        eprintln!("E2E lifecycle test PASSED: {} total entries", total_entries);
     }
 }

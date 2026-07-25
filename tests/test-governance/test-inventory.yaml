@@ -1,328 +1,125 @@
-version: 1
-release_version: 0.9.353
-governance_goal: >
-  Keep cowd validation focused on critical control points. Default gates should
-  protect kernel contracts and a small set of cross-module golden paths. Manual,
-  nightly, live, LLM, visual, and exploratory checks must not become release
-  gates without replacing overlapping default coverage.
+version: 2
+release_version: 0.9.598
+source_of_truth:
+  execution: scripts/validate.sh
+  inventory: scripts/test/inventory.sh
+  governance_gate: scripts/test/governance-gate.sh
 
 lanes:
-  unit-fast:
+  quick:
     default: true
-    purpose: edit feedback for stable low-cost checks
+    purpose: low-cost edit feedback
+  changed-crates:
+    default: true
+    purpose: metadata-derived package-local regression
   contract:
     default: true
-    purpose: kernel/API/CLI contracts without browser or live platform dependencies
+    purpose: stable contracts and dependency boundaries
   serial-global:
     default: true
-    purpose: >
-      high-risk gateway tests that mutate process-global env/cwd/provider/session
-      state; kept out of the default parallel Rust test lane and run serially
+    purpose: isolated process-global Gateway state
   scenario:
     default: true
-    purpose: integration gate; V2 will converge it to five golden paths
+    purpose: cross-module golden paths
+  surface:
+    default: true
+    purpose: CLI, TUI, and WebUI control points
   release:
     default: false
-    purpose: install artifact smoke before publishing or local handoff
+    purpose: installed artifact and product smoke
+  full-regression:
+    default: false
+    purpose: complete parallel Rust regression plus serial-global
   manual:
     default: false
-    purpose: diagnostics, live platforms, visual checks, LLM-assisted analysis
+    purpose: live provider, PostgreSQL, terminal, visual, and exploratory evidence
 
-promotion_rules:
-  - A default check must protect a kernel contract, a cross-module golden path, or a high-cost regression.
-  - A new default scenario must replace overlapping coverage instead of adding a duplicate gateway run.
-  - Live platform, LLM-judged, visual, and exploratory checks remain manual or nightly.
-  - A check that swallows critical failures or ignores HTTP status cannot be a default gate.
-  - Stable capabilities should use key control points rather than step-by-step end-to-end repetition.
-  - Tests that require env_lock/cwd_lock/provider_registry should either be made hermetic or classified in serial-global.
-  - Duplicate tests should be removed only when another default gate covers the same contract and failure mode.
+architecture_gates:
+  - path: scripts/architecture/check-boundaries.sh
+    protects:
+      - Gateway has no second AI execution loop
+      - Runtime, Tools, Provider, Surface, and Connector dependency direction
+      - Gateway has no direct MFG implementation ownership
+      - TUI is independent from Runtime implementation crates
+      - removed channel document operations do not return
+      - Runtime does not depend on transport or Surface crates
+      - Memory consumes fact and storage contracts
+      - Memory does not reverse depend on Runtime, transport, Provider, Tools, or Matrix
+  - path: crates/runtime/tests/runtime_module_architecture.rs
+    protects:
+      - Runtime lifecycle domains have explicit owners
+  - path: crates/harness-eval/tests/architecture_dependencies.rs
+    protects:
+      - Harness Eval dependency direction and external Edge boundary
 
-current_counts:
-  measured_at: 2026-06-19
-  workspace_rust_test_entries: 3529
-  gateway_lib_test_entries: 371
-  gateway_serial_global_entries: 10
-  gateway_serial_global_warm_measured_seconds: 2.05
-  gateway_serial_global_script_measured_seconds_after_incremental_compile: 6.44
-  gateway_serial_global_cold_validate_seconds: 51
-  note: >
-    Cold standalone serial-global spends most time compiling gateway into a fresh
-    CARGO_TARGET_DIR; in all/full validation it should reuse artifacts produced
-    by earlier contract steps.
-  default_workspace_test_command: cargo test --workspace --no-default-features
-  serial_global_command: scripts/validate.sh serial-global
+ignored_tests:
+  gateway_serial_global:
+    marker: scripts/test/gateway-global-env.sh
+    runner: scripts/validate.sh serial-global
+  provider_live:
+    marker: COWD_AI_HARNESS_LIVE=1
+    runner: scripts/validate.sh manual live-provider
+  postgres_contract:
+    marker: COWD_TEST_POSTGRES_URL
+    runner: scripts/validate.sh manual postgres-contract
+    domains:
+      - fact
+      - surface
+      - gateway
+      - memory
+      - matrix
+      - runtime
+      - session
+      - approval
+      - connector
+      - product-app
+  memory_performance:
+    marker: scripts/test/memory-performance.sh
+    runner: scripts/validate.sh manual memory-performance
+  lark_live:
+    marker: scripts/test/lark-live.sh
+    runner: scripts/validate.sh manual lark-live
 
-serial_global_tests:
-  - name: user_defined_aliases_resolve_before_provider_dispatch
-    path: crates/gateway/src/main.rs
-    capability: config.aliases
-    keep_reason: validates project-defined aliases resolve before provider dispatch.
-    measured_seconds: 0.22
-    optimization: make config resolver accept explicit config home/cwd instead of mutating env and cwd.
-  - name: yolo_flag_forces_danger_full_access_and_marks_repl_mode
-    path: crates/gateway/src/main.rs
-    capability: cli.yolo_permissions
-    keep_reason: protects yolo CLI parsing from permission-mode regressions.
-    measured_seconds: 0.19
-    optimization: extract permission resolution into a pure parser helper.
-  - name: yolo_mode_creates_and_reuses_durable_task
-    path: crates/gateway/src/main.rs
-    capability: task.yolo_durable
-    keep_reason: protects durable task reuse and config-home storage path.
-    measured_seconds: 0.18
-    optimization: inject task store path directly into ensure_yolo_task.
-  - name: yolo_system_prompt_adds_continuous_execution_instruction
-    path: crates/gateway/src/main.rs
-    capability: prompt.yolo_mode
-    keep_reason: protects system prompt contract for continuous execution mode.
-    measured_seconds: 0.19
-    optimization: make prompt builder accept an explicit workspace context.
-  - name: setup_report_and_json_are_redacted_and_actionable
-    path: crates/gateway/src/main.rs
-    capability: setup.redaction
-    keep_reason: protects setup report usability and secret redaction.
-    measured_seconds: 0.27
-    optimization: inject setup snapshot/config source to avoid process env reads.
-  - name: resolve_repl_model_falls_back_to_anthropic_model_env_when_default
-    path: crates/gateway/src/main.rs
-    capability: provider.model_resolution
-    keep_reason: protects env fallback for default REPL model.
-    measured_seconds: 0.20
-    optimization: move env reads behind a small testable provider-model source.
-  - name: resolve_repl_model_returns_default_when_env_unset_and_no_config
-    path: crates/gateway/src/main.rs
-    capability: provider.model_resolution
-    keep_reason: protects default model fallback when env and config are absent.
-    measured_seconds: 0.19
-    optimization: share the provider-model source with the env fallback test.
-  - name: resume_diff_command_renders_report_for_saved_session
-    path: crates/gateway/src/main.rs
-    capability: session.resume_diff
-    keep_reason: protects resume command wiring to real git diff report.
-    measured_seconds: 0.21
-    optimization: keep as integration control point; avoid adding more git-diff variants.
-  - name: resume_session_switch_updates_outcome_session_and_path
-    path: crates/gateway/src/main.rs
-    capability: session.resume_switch
-    keep_reason: protects managed SQLite session switching from resume context.
-    measured_seconds: 0.18
-    optimization: inject config home/session db path to reduce env mutation.
-  - name: tui_sidebar_switch_replaces_live_runtime_session
-    path: crates/gateway/src/main.rs
-    capability: tui.runtime_session_switch
-    keep_reason: protects TUI runtime replacement through configured provider/session state.
-    measured_seconds: 0.30
-    optimization: keep serial until provider registry and runtime session construction are injectable.
-
-structured_data_control_points:
-  contract:
-    status: planned-v2
-    target: cargo test -p runtime structured_data --no-default-features
-  scenario:
-    status: planned-v2
-    target: skill_mfg verifies structured evidence/ref propagation
-  release:
-    status: planned-v3
-    target: release smoke checks structured data contract exposure only
-  domain_fixture:
-    status: current
-    target: tests/fixtures/mfg/server_gpu_shortage.json
-    boundary: fixture supports one golden path and must not add a sixth default scenario
-
-scenario_scripts:
-  - path: scripts/scenarios/gateway-webui-contract.sh
-    classification: scenario
-    default_gate: planned-v2
-    capability: gateway.baseline
-    keep_reason: health, ready, webui manifest, and fallback contract are release-critical.
-  - path: scripts/scenarios/runtime-surface.sh
-    classification: scenario
-    default_gate: current
+scenario_gates:
+  - script: scripts/scenarios/runtime-surface.sh
     capability: session.runtime
-    keep_reason: validates runtime/session/task surface wiring.
-    planned_change: merge with session-lifecycle into session_runtime golden path.
-  - path: scripts/scenarios/session-lifecycle.sh
-    classification: scenario
-    default_gate: current
-    capability: session.lifecycle
-    keep_reason: protects session/task persistence control point.
-    planned_change: merge into session_runtime golden path.
-  - path: scripts/scenarios/memory-runtime.sh
-    classification: scenario
-    default_gate: current
+  - script: scripts/scenarios/memory-runtime.sh
     capability: memory.context
-    keep_reason: protects write/search/context/lifecycle cross-module behavior.
-    planned_change: trim to key memory_context controls.
-  - path: scripts/scenarios/channel-permission.sh
-    classification: scenario
-    default_gate: current
-    capability: tools.permission
-    keep_reason: protects preflight, dry-run, commit, audit, and connector permission chain.
-    planned_change: remain scenario golden path; remove full duplicate from release in V3.
-  - path: scripts/scenarios/skill-surface-unification.sh
-    classification: scenario
-    default_gate: current
-    capability: skills.mfg
-    keep_reason: protects skills catalog/detail/projection/action and mfg application wiring.
-    planned_change: add structured evidence/ref assertion in V2.
-  - path: scripts/scenarios/agent-graph.sh
-    classification: manual
-    default_gate: current
-    capability: agents.graph
-    keep_reason: useful but overlaps session/runtime and skill/mfg graph assertions.
-    planned_change: move out of default scenario or fold assertions into skill_mfg/session_runtime.
-  - path: scripts/scenarios/context-runtime.sh
-    classification: manual
-    default_gate: current
-    capability: context.runtime
-    keep_reason: useful but overlaps memory_context and session_runtime.
-    planned_change: move out of default scenario or fold assertions into memory_context.
-  - path: scripts/scenarios/same-session-multi-surface-sync.sh
-    classification: manual
-    default_gate: false
-    capability: session.multi_surface_sync
-    keep_reason: important diagnostic, but not a default gate until merged into session_runtime.
-  - path: scripts/scenarios/tui-smoke.sh
-    classification: surface
-    default_gate: current
-    capability: tui.startup
-    keep_reason: protects basic terminal startup.
-    planned_change: move from scenario to surface or release TUI attach coverage.
-  - path: scripts/scenarios/tui-daemon-attach.sh
-    classification: release
-    default_gate: release
-    capability: tui.daemon_attach
-    keep_reason: validates installed artifact can attach to daemon from TUI.
-  - path: scripts/scenarios/tui-interaction-quality.sh
-    classification: manual
-    default_gate: false
-    capability: tui.interaction_quality
-    keep_reason: targeted UI diagnostics; not a default gate until reduced to projection smoke.
-  - path: scripts/scenarios/full-product-smoke.sh
-    classification: release
-    default_gate: release
-    capability: release.install_smoke
-    keep_reason: install artifact smoke.
-    planned_change: trim duplicated deep scenario assertions in V3.
-  - path: scripts/scenarios/mfg-surface-acceptance.sh
-    classification: manual
-    default_gate: false
-    capability: mfg.multi_surface_acceptance
-    keep_reason: V545 executable three-observer, slow-consumer, burst and restart scenario; V548 records the final command evidence.
+  - script: scripts/scenarios/channel-permission.sh
+    capability: tool.permission.audit
+  - script: scripts/scenarios/skill-surface-unification.sh
+    capability: skill.mfg
+  - script: scripts/ci/ai-harness.sh
+    capability: harness.offline
 
-manual_scripts:
-  - path: scripts/manual/context-runtime-lean-spike.sh
-    classification: manual
-    capability: context.runtime
-  - path: scripts/manual/memory-degraded.sh
-    classification: manual
-    capability: memory.degraded
-  - path: scripts/manual/task-phase.sh
-    classification: manual
-    capability: task.phase
-  - path: scripts/manual/report-build-size.sh
-    classification: manual
-    capability: release.size_report
+surface_gates:
+  - script: scripts/scenarios/gateway-webui-contract.sh
+    capability: gateway.webui.baseline
+  - script: scripts/scenarios/tui-mfg-acceptance.sh
+    capability: mfg.tui.operational
+
+manual_suites:
+  - path: tests/interactive
+    capability: tui.gateway.manual_diagnostics
+  - path: scripts/scenarios/tui-production-acceptance.sh
+    capability: tui.production
+  - path: scripts/ci/ai-harness-live-provider.sh
+    capability: provider.live
+  - path: scripts/test/postgres-contract.sh
+    capability: persistence.postgres
+  - path: scripts/test/memory-performance.sh
+    capability: memory.performance
+  - path: scripts/test/lark-live.sh
+    capability: lark.skill_and_cli.live
   - path: scripts/manual/webui-live-workbench.sh
-    classification: manual
-    capability: webui.cross_repo_live
+    capability: webui.live
+  - path: scripts/scenarios/mfg-surface-acceptance.sh
+    capability: mfg.multi_surface
 
-interactive_modules:
-  - path: tests/interactive/src/scenarios/tui_basic.rs
-    classification: manual
-    capability: tui.basic
-    rationale: overlaps TUI smoke and uses exploratory timing/LLM checks.
-  - path: tests/interactive/src/scenarios/tui_interact.rs
-    classification: manual
-    capability: tui.interaction
-    rationale: valuable diagnostics, not a deterministic release gate.
-  - path: tests/interactive/src/scenarios/tui_gateway.rs
-    classification: manual
-    capability: tui.gateway_panel
-    rationale: overlaps gateway panel/live checks; merge in V4.
-  - path: tests/interactive/src/scenarios/tui_gateway_live.rs
-    classification: manual
-    capability: tui.gateway_panel
-    rationale: overlaps tui_gateway; merge in V4.
-  - path: tests/interactive/src/scenarios/tui_memory.rs
-    classification: manual
-    capability: tui.memory_panel
-    rationale: panel smoke only; promote later only if it reads real projection deterministically.
-  - path: tests/interactive/src/scenarios/tui_skills.rs
-    classification: manual
-    capability: tui.skills_panel
-    rationale: overlaps skills registry; merge in V4.
-  - path: tests/interactive/src/scenarios/tui_skills_registry.rs
-    classification: manual
-    capability: tui.skills_panel
-    rationale: keep as basis for deterministic projection smoke, but not default yet.
-  - path: tests/interactive/src/scenarios/tui_session_sidebar.rs
-    classification: manual
-    capability: tui.session_sidebar
-    rationale: overlaps session runtime golden path.
-  - path: tests/interactive/src/scenarios/tui_all_panels.rs
-    classification: manual
-    capability: tui.panels
-    rationale: broad panel traversal is too expensive for default gates.
-  - path: tests/interactive/src/scenarios/tui_mfg_operations.rs
-    classification: manual
-    capability: tui.mfg_operations
-    rationale: V544 defines responsive governed-action PTY evidence; V545 activates the isolated multi-Surface lane.
-  - path: tests/interactive/src/scenarios/server_core.rs
-    classification: manual
-    capability: server.core
-    rationale: overlaps gateway/API scenario and currently contains weak assertions.
-  - path: tests/interactive/src/scenarios/server_gateway_api.rs
-    classification: manual
-    capability: gateway.api
-    rationale: overlaps gateway baseline; keep for diagnostics.
-  - path: tests/interactive/src/scenarios/server_gateway_cmd.rs
-    classification: manual
-    capability: gateway.cli
-    rationale: useful diagnostics, not a default gate.
-  - path: tests/interactive/src/scenarios/server_mgmt.rs
-    classification: delete-candidate
-    capability: server.management
-    rationale: weak .ok() API checks; rewrite before promotion.
-  - path: tests/interactive/src/scenarios/server_send_message.rs
-    classification: manual
-    capability: server.messages
-    rationale: useful smoke but overlaps session/API contracts.
-  - path: tests/interactive/src/scenarios/server_feishu.rs
-    classification: delete-candidate
-    capability: platform.feishu
-    rationale: file-existence checks do not validate behavior.
-  - path: tests/interactive/src/scenarios/cross_cut.rs
-    classification: manual
-    capability: cross_surface
-    rationale: overlaps multi-surface/session scenario; keep one golden path later.
-  - path: tests/interactive/src/scenarios/cross_active.rs
-    classification: manual
-    capability: cross_surface
-    rationale: overlaps cross_cut; merge in V4.
-  - path: tests/interactive/src/scenarios/core.rs
-    classification: manual
-    capability: interactive.legacy_core
-    rationale: legacy aggregate scenario; keep out of default gates.
-  - path: tests/interactive/src/scenarios/mod.rs
-    classification: registry
-    capability: interactive.registry
-    rationale: scenario registry, not an executable gate by itself.
-
-default_gate_summary:
-  current:
-    - scripts/validate.sh unit-fast
-    - scripts/validate.sh contract
-    - scripts/validate.sh serial-global
-    - scripts/validate.sh scenario
-    - scripts/validate.sh release
-  planned_v2_scenario_steps:
-    - gateway_baseline
-    - session_runtime
-    - memory_context
-    - tool_permission
-    - skill_mfg
-  planned_v5_surface_steps:
-    - cli_minimal_contract
-    - tui_projection_smoke
-    - webui_gateway_contract
+admission_rules:
+  - Default checks protect a unique contract, boundary, or high-cost regression.
+  - Source scans may enforce forbidden dependencies or execution paths, never private symbol presence.
+  - Fixed test counts and historical version identifiers are not acceptance criteria.
+  - Manual and live checks cannot silently pass when their required environment is present but broken.
+  - Tests that require an external service are explicit ignored contracts and cannot self-skip as success.
+  - New coverage must replace overlap instead of extending duplicated end-to-end paths.

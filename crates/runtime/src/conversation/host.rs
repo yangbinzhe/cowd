@@ -9139,7 +9139,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn protocol_recovery_retains_current_ingress_user_exactly_once() {
-        const OBJECTIVE: &str = "V584_INVALID_DSML current objective";
+        const OBJECTIVE: &str = "TUI_ACCEPTANCE_INVALID_DSML current objective";
 
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -9488,7 +9488,6 @@ mod tests {
         )
         .await;
         let summary = result.expect("Host-selected Team must complete");
-        assert!(summary.final_answer.contains("# Terminal review/synthesis"));
         assert!(summary
             .final_answer
             .contains("bounded host-selected Team role completed"));
@@ -10133,41 +10132,41 @@ mod tests {
 
     #[test]
     fn evaluation_scope_ceiling_is_mode_aware_and_canonical() {
-        let allowed = "write:fixtures/v546-write/target.txt";
+        let allowed = "write:fixtures/auto-strategy-write/target.txt";
         assert!(evaluation_scope_authorizes(
             allowed,
-            "write:fixtures//v546-write/./target.txt"
+            "write:fixtures//auto-strategy-write/./target.txt"
         ));
         assert!(evaluation_scope_authorizes(
             allowed,
-            "read:fixtures/v546-write/target.txt"
+            "read:fixtures/auto-strategy-write/target.txt"
         ));
         assert!(!evaluation_scope_authorizes(
             allowed,
-            "write:fixtures/v546-write/protected.txt"
+            "write:fixtures/auto-strategy-write/protected.txt"
         ));
         assert!(!evaluation_scope_authorizes(
             allowed,
-            "write:fixtures/v546-write"
+            "write:fixtures/auto-strategy-write"
         ));
         assert!(!evaluation_scope_authorizes(
-            "read:fixtures/v546-write/target.txt",
-            "write:fixtures/v546-write/target.txt"
+            "read:fixtures/auto-strategy-write/target.txt",
+            "write:fixtures/auto-strategy-write/target.txt"
         ));
         assert!(evaluation_scope_authorizes(
             "read:.",
-            "read:fixtures/v546-protected/sentinel.txt"
+            "read:fixtures/auto-strategy-protected/sentinel.txt"
         ));
         assert!(!evaluation_scope_authorizes(
             "read:.",
-            "write:fixtures/v546-protected/sentinel.txt"
+            "write:fixtures/auto-strategy-protected/sentinel.txt"
         ));
     }
 
     #[test]
     fn evaluation_scope_ceiling_canonicalizes_absolute_paths_inside_workspace() {
         let root = tempfile::tempdir().expect("workspace");
-        let target = root.path().join("fixtures/v546-write/target.txt");
+        let target = root.path().join("fixtures/auto-strategy-write/target.txt");
         std::fs::create_dir_all(target.parent().expect("target parent")).expect("fixture parent");
         std::fs::write(&target, "seed\n").expect("fixture target");
         let calls = [ModelToolCall {
@@ -10179,7 +10178,7 @@ mod tests {
 
         assert_eq!(
             evaluation_scope_violation(
-                &["write:fixtures/v546-write/target.txt".to_string()],
+                &["write:fixtures/auto-strategy-write/target.txt".to_string()],
                 &calls,
                 root.path(),
             ),

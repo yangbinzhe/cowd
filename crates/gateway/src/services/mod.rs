@@ -874,10 +874,8 @@ mod tests {
     };
 
     #[test]
-    fn services_declares_gateway_boundary_owner() {
+    fn baseline_registers_the_complete_gateway_service_contract() {
         let services = GatewayServices::baseline();
-        assert_eq!(services.owner, "0.9.380 GatewayServices");
-        assert_eq!(services.boundary_status, "0620_final_boundary");
         assert!(services.runtime.is_none());
         assert_eq!(
             services.service_labels(),

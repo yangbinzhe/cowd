@@ -43,19 +43,20 @@ run_check() {
 run_check "format-and-whitespace" "cargo fmt --all --check && git diff --check"
 run_check "ai-harness-core" "scripts/ci/ai-harness.sh"
 run_check "mission-harness-quick-eval" "cargo run -p harness-eval -- quick"
-run_check "runtime-lib-tests" "cargo test -p runtime --lib"
-run_check "tool-closure" "cargo test -p tools --test ai_harness_tool_closure"
-run_check "provider-failure-classification" "cargo test -p provider --test provider_failure_classification"
 
 if [[ "${COWD_AI_HARNESS_FULL_WORKSPACE:-0}" == "1" ]]; then
-  run_check "workspace-all-targets" "cargo test --workspace --exclude gateway --all-targets && cargo test -p gateway --all-targets -- --test-threads=1"
+  run_check "workspace-all-targets" "scripts/test/full-regression.sh"
+else
+  run_check "runtime-lib-tests" "cargo test -p runtime --lib"
+  run_check "tool-closure" "cargo test -p tools --test ai_harness_tool_closure"
+  run_check "provider-failure-classification" "cargo test -p provider --test provider_failure_classification"
 fi
 
 if [[ "${COWD_AI_HARNESS_SCENARIO:-0}" == "1" ]]; then
-  run_check "scenario-e2e" "scripts/ci/scenario.sh"
+  run_check "scenario-e2e" "scripts/validate.sh scenario"
 else
-  ROWS+=("| scenario-e2e | SKIP | 0s | \`scripts/ci/scenario.sh\` | opt-in: set \`COWD_AI_HARNESS_SCENARIO=1\` |")
-  printf '%s\t%s\t%s\t%s\t%s\n' "scenario-e2e" "SKIP" "0" "scripts/ci/scenario.sh" "opt-in: set COWD_AI_HARNESS_SCENARIO=1" >>"$ROWS_TSV"
+  ROWS+=("| scenario-e2e | SKIP | 0s | \`scripts/validate.sh scenario\` | opt-in: set \`COWD_AI_HARNESS_SCENARIO=1\` |")
+  printf '%s\t%s\t%s\t%s\t%s\n' "scenario-e2e" "SKIP" "0" "scripts/validate.sh scenario" "opt-in: set COWD_AI_HARNESS_SCENARIO=1" >>"$ROWS_TSV"
 fi
 
 if [[ "${COWD_AI_HARNESS_LIVE:-0}" == "1" ]]; then

@@ -1,16 +1,9 @@
 # Cowd Test Governance
 
-本目录记录测试治理口径：哪些测试是日常默认门禁，哪些是阶段门禁、最终回归、手工诊断或删除候选。
+当前治理版本：`0.9.598`
 
-测试执行入口统一放在 [scripts/test/README.md](../../scripts/test/README.md) 中维护。当前推荐顺序：
-
-```bash
-scripts/test/quick.sh
-scripts/test/changed-crates.sh
-scripts/test/full-regression.sh
-```
-
-也可以通过 `scripts/validate.sh` 调用：
+测试入口统一由 [scripts/test/README.md](../../scripts/test/README.md) 维护。日常、
+提交前和封版依次使用：
 
 ```bash
 scripts/validate.sh quick
@@ -18,43 +11,43 @@ scripts/validate.sh changed-crates
 scripts/validate.sh full-regression
 ```
 
-AI Harness 深度评测和场景化评测的报告输出必须遵守
-[AI Harness Report Specification](../../docs/ai-harness-report-spec.md)。摘要
-`report.md` 不能作为完整报告；结果包必须包含自动生成的报告生成资产
-`analysis-context.json`、`full-analysis-report-template.md` 和
-`full-analysis-report-prompt.md`。最终 `full-analysis-report.md` 由 AI reviewer
-基于证据包生成，并必须暴露局部工具失败、provider 轮次、runtime action、
-matrix/memory/session 证据和证据索引。
+## 原则
 
-## 核心原则
+- 每个默认测试必须保护唯一的业务失败模式、公开合同或架构边界。
+- 不允许用函数名、源码空格、文件布局、历史版本号或测试数量证明业务能力。
+- 新测试如果与现有测试覆盖同一故障，应替换或合并现有测试。
+- 会修改进程全局 env/cwd/provider/session 的测试只进入 `serial-global`。
+- live provider、真实 Lark、真实 PostgreSQL、人工 TUI、视觉和探索性检查显式进入 manual/nightly。
+- 所有 `#[ignore]` 必须能从唯一入口运行，不能成为永久不可达测试。
+- 测试统计必须是静态扫描；运行时通过数和耗时从真实回归报告获取。
 
-- 稳定内核合同留在 Rust unit/contract tests。
-- 高风险跨模块行为只保留少量黄金路径，不为同一闭环堆叠重复场景。
-- 修改进程全局 env/cwd/provider/session 状态的测试进入 serial/global lane。
-- interactive、live provider、LLM judge、视觉和探索性测试默认不进入发布门禁，除非明确提升。
-- 新默认测试必须替换或收敛重叠覆盖，不应只新增低价值断言。
-- 架构重构必须配硬门禁：源码扫描、依赖方向检查、架构测试或关键行为测试。
+## 门禁
 
-## 当前实测基线
+| Lane | 用途 | 内容 |
+| --- | --- | --- |
+| `quick` | 编辑反馈 | fmt、workspace check、静态架构/治理边界、小合同 crate |
+| `changed-crates` | 提交前 | metadata 动态定位变更 package 并跑其 all-targets |
+| `contract` | 阶段合同 | 非重包 workspace tests + Runtime/Gateway/Memory 边界 |
+| `serial-global` | 全局状态 | Gateway env/cwd/provider/session 串行测试 |
+| `scenario` | 黄金路径 | Session、Memory、Tool、Skill/MFG |
+| `surface` | 交互入口 | CLI、TUI、TUI/MFG、WebUI 四个真实控制点 |
+| `release` | 安装产物 | 安装、doctor、OpenAPI、完整产品、TUI attach |
+| `full-regression` | Rust 封版 | workspace all-targets + serial-global；不重复执行 check |
+| `manual` | 外部依赖 | live provider、Lark、PostgreSQL、人工/诊断场景 |
 
-2026-06-26 缓存态抽样：
+## 架构测试口径
 
-- `cargo check --workspace --all-targets`：约 2.6 秒。
-- `cargo test -p gateway --all-targets -- --test-threads=1`：约 30 秒。
-- `cargo test -p tui --lib -- --test-threads=1`：约 23 秒，约 901 个测试。
-- `cargo test -p runtime --lib -- --test-threads=1`：约 12 秒，约 827 个测试。
-- `cargo test -p memory --all-targets -- --test-threads=1`：约 10 秒。
+架构测试只能保护：
 
-结论：
+1. Cargo 生产依赖方向。
+2. 禁止出现的第二执行循环、反向依赖或越权业务实现。
+3. Runtime 公开模块映射中的生命周期域与唯一 owner。
 
-- 全量测试有价值，但不适合作为每次小改的默认反馈。
-- 日常使用 `quick`，提交前使用 `changed-crates`，版本末尾使用 `full-regression`。
+物理目录、私有函数名和源码调用文本不属于稳定合同。
 
-## Inventory
+## AI Harness 报告
 
-`test-inventory.yaml` 是当前测试分类的来源。更新测试策略时，应同步更新 inventory，而不是只在脚本中暗改。
-
-旧入口说明：
-
-- `scripts/test/gateway-global-env.sh` 是 serial global-state 的 canonical gateway 入口。
-- `scripts/test/gateway-slow.sh` 只是兼容别名。
+深度评测遵守
+[AI Harness Report Specification](../../docs/ai-harness-report-spec.md)。摘要报告不是完整
+证据；结果包必须保留 provider rounds、tool calls、execution trace、memory/matrix/session
+证据和 AI reviewer 生成的完整分析。

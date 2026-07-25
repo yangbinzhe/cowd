@@ -161,7 +161,7 @@
     "max_tool_concurrency_observed": 3,
     "parallel_tool_batches": 4,
     "write_attempt_refs": [
-      "fixtures/v546-write/target.txt"
+      "fixtures/auto-strategy-write/target.txt"
     ],
     "evidence_overlap_bp": 700,
     "evidence_overlap_observed": true,

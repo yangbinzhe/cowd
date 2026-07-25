@@ -2031,7 +2031,7 @@ mod tests {
     #[test]
     fn upstream_review_matches_normalized_receipt_path_and_its_digest_key() {
         let change = harness_contract::agent::AgentChangeReceipt {
-            path: "fixtures/v546-write/target.txt".to_string(),
+            path: "fixtures/auto-strategy-write/target.txt".to_string(),
             before_sha256: Some("before".to_string()),
             after_sha256: "after".to_string(),
             write_sequence: 3,
@@ -2039,13 +2039,13 @@ mod tests {
         let receipt = ScopedToolExecutionReceipt {
             sequence: 1,
             effect_kind: harness_contract::tool::ToolEffectKind::Read,
-            paths: vec!["./fixtures/v546-write/target.txt".to_string()],
+            paths: vec!["./fixtures/auto-strategy-write/target.txt".to_string()],
             before_digests: BTreeMap::from([(
-                "./fixtures/v546-write/target.txt".to_string(),
+                "./fixtures/auto-strategy-write/target.txt".to_string(),
                 Some("after".to_string()),
             )]),
             after_digests: BTreeMap::from([(
-                "./fixtures/v546-write/target.txt".to_string(),
+                "./fixtures/auto-strategy-write/target.txt".to_string(),
                 Some("after".to_string()),
             )]),
         };

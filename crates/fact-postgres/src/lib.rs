@@ -547,14 +547,14 @@ mod tests {
     fn source() -> FactSource {
         FactSource {
             kind: SourceKind::Growth,
-            id: "growth-v573".to_string(),
+            id: "growth-postgres-contract".to_string(),
             label: None,
         }
     }
 
     fn growth_event() -> GrowthEvent {
         GrowthEvent::from_input(GrowthEventInput {
-            session_id: "session-v573".to_string(),
+            session_id: "session-postgres-contract".to_string(),
             source_event_kind: "test.fact_growth".to_string(),
             strategy_pattern: ExecutionPattern::Execute,
             learning_record: LearningRecord::from_input(GrowthInput {
@@ -567,7 +567,11 @@ mod tests {
                 verification_can_finalize: true,
                 bench_passed: true,
             }),
-            evidence_refs: vec![GrowthEvidenceRef::new("test", "v573", "copy ledger")],
+            evidence_refs: vec![GrowthEvidenceRef::new(
+                "test",
+                "postgres-contract",
+                "copy ledger",
+            )],
         })
     }
 
@@ -584,10 +588,10 @@ mod tests {
     fn real_postgres_reopens_and_serializes_competing_fact_upserts() {
         let url =
             std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-        let ledger = Arc::new(ledger_from_url(url.clone(), "fact-v573-real"));
+        let ledger = Arc::new(ledger_from_url(url.clone(), "fact-postgres-contract"));
         clear(&ledger);
         let mut fact = FactRecord::new("policy", "verify durable output");
-        fact.id = FactId::from_string("fact-v573-concurrent");
+        fact.id = FactId::from_string("fact-postgres-concurrent");
         fact.confidence = Confidence::from_basis_points(9_500);
         let workers = (0..16)
             .map(|_| {
@@ -597,7 +601,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for worker in workers {
-            assert_eq!(worker.join().unwrap().id.as_str(), "fact-v573-concurrent");
+            assert_eq!(
+                worker.join().unwrap().id.as_str(),
+                "fact-postgres-concurrent"
+            );
         }
         let event = growth_event();
         ledger
@@ -609,13 +616,13 @@ mod tests {
                     id: GrowthPromotionRecord::stable_id(
                         &event.id,
                         "fact.policy",
-                        Some("fact-v573-concurrent"),
+                        Some("fact-postgres-concurrent"),
                         "batch committed",
                     ),
                     event_id: event.id,
                     target: "fact.policy".to_string(),
                     status: "promoted".to_string(),
-                    target_id: Some("fact-v573-concurrent".to_string()),
+                    target_id: Some("fact-postgres-concurrent".to_string()),
                     summary: "batch committed".to_string(),
                     error: None,
                     created_at: "2026-07-23T00:00:00Z".to_string(),
@@ -628,7 +635,7 @@ mod tests {
             .canonical_digest()
             .unwrap();
         drop(ledger);
-        let reopened = ledger_from_url(url, "fact-v573-reopen");
+        let reopened = ledger_from_url(url, "fact-postgres-reopen-contract");
         assert_eq!(reopened.list_facts().unwrap().len(), 1);
         assert_eq!(reopened.list_growth_events().unwrap().len(), 1);
         assert_eq!(reopened.list_growth_promotions().unwrap().len(), 1);
@@ -648,19 +655,19 @@ mod tests {
     fn real_sqlite_to_postgres_copy_is_digest_exact_and_reopens() {
         let url =
             std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
-        let target = ledger_from_url(url, "fact-v573-copy");
+        let target = ledger_from_url(url, "fact-postgres-copy-contract");
         clear(&target);
         let temp = tempfile::tempdir().unwrap();
         let endpoint = StorageEndpoint::sqlite(
             StorageDomainId::Fact,
             StorageScope::Global,
             temp.path().join("fact.sqlite"),
-            "fact-v573-copy-test",
+            "fact-postgres-copy-source",
             "fact.0002.ledger",
         );
         let source_ledger = fact_sqlite::SqliteFactLedger::open(&endpoint).unwrap();
         let mut fact = FactRecord::new("policy", "copy only after quiesce");
-        fact.id = FactId::from_string("fact-v573-copy");
+        fact.id = FactId::from_string("fact-postgres-copy");
         source_ledger.upsert_fact(fact).unwrap();
         source_ledger
             .upsert_evidence(EvidencePacket::new(
@@ -676,7 +683,7 @@ mod tests {
                 event_id: event.id,
                 target: "fact.policy".to_string(),
                 status: "promoted".to_string(),
-                target_id: Some("fact-v573-copy".to_string()),
+                target_id: Some("fact-postgres-copy".to_string()),
                 summary: "copied".to_string(),
                 error: None,
                 created_at: "2026-07-23T00:00:00Z".to_string(),

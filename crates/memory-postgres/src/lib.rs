@@ -2069,11 +2069,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_postgres_memory_roundtrip_when_configured() {
-        let Ok(url) = std::env::var("COWD_TEST_POSTGRES_URL") else {
-            eprintln!("COWD_TEST_POSTGRES_URL absent; real PostgreSQL test skipped");
-            return;
-        };
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    async fn real_postgres_memory_roundtrip() {
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let marker = uuid::Uuid::new_v4().simple().to_string();
         let mut config = PostgresConnectionConfig::new(
             format!("memory-test-{marker}"),

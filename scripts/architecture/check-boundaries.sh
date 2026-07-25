@@ -27,126 +27,30 @@ check_empty() {
   fi
 }
 
-if [[ "${1:-}" == "--v566-sqlite" ]]; then
-  # This focused gate is intentionally independent from older whole-repository
-  # architecture checks. It verifies the V566 ownership boundary without
-  # claiming unrelated historical checks have passed.
-  check_empty "V566 durable owners must use StorageRuntime executors" \
-    bash -c 'for file in \
-      crates/connector/src/lib.rs \
-      crates/matrix/repository/src/sqlite_repository.rs \
-      crates/runtime/src/recovery/runtime_event_store.rs \
-      crates/runtime/src/mission/task.rs \
-      crates/runtime/src/context/reality_recall_port.rs \
-      crates/gateway/src/surface_host/message_store.rs \
-      crates/gateway/src/services/growth_service.rs \
-      crates/gateway/src/infrastructure/gateway_health.rs; do
-      awk "/#\[cfg\(test\)\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"
-    done | rg -n "Connection::open\\(|SqliteConnectionManager::file|Mutex<Connection>|SqliteConnectionFactory" || true'
-  exit "$fail"
-fi
+gateway_production_sources() {
+  while IFS= read -r file; do
+    awk '/#\[cfg\(test\)\]/{exit} {print FILENAME ":" FNR ":" $0}' "$file"
+  done < <(rg --files crates/gateway/src -g '*.rs')
+}
 
-if [[ "${1:-}" == "--v567-postgres" ]]; then
-  # V567 validates the first complete PostgreSQL domain without pretending
-  # that the global deployment switch is ready. Connector keeps a backend-free
-  # port; its PostgreSQL driver lives in the dedicated adapter crate.
-  check_empty "V567 Gateway must not name the concrete SQLite directory" \
-    rg -n '\bSqliteResourceDirectory\b|resource_directory_path' \
-      crates/gateway/src/services crates/gateway/src/api_routes --glob '*.rs'
-  check_empty "V567 global PostgreSQL switch must remain unavailable" \
-    rg -n 'StorageBackendKind::Postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
-  check_empty "V567 connector manifest must not depend on PostgreSQL" \
-    rg -n '^postgres\s*=|^tokio-postgres\s*=|^r2d2_postgres\s*=' crates/connector/Cargo.toml
-  check_empty "V567 PostgreSQL adapter crate must exist" \
-    bash -c 'if [[ ! -f crates/connector-postgres/Cargo.toml || ! -f crates/connector-postgres/src/lib.rs ]]; then echo missing; fi'
-  exit "$fail"
-fi
+scan_gateway_production() {
+  local pattern="$1"
+  gateway_production_sources | rg -n "$pattern" || true
+}
 
-if [[ "${1:-}" == "--v568-runtime-port" ]]; then
-  # V568 moves Runtime callers behind the durable event-store façade. The
-  # SQLite adapter may remain in its owner module until V569 adds PostgreSQL;
-  # no other Runtime production module may learn its concrete type or SQL API.
-  check_empty "V568 runtime callers must not name SQLite event adapter" \
-    bash -c 'rg -n "SqliteRuntimeEventStore|RuntimeEventStoreBackend" crates/runtime/src --glob "*.rs" | rg -v "^crates/runtime/src/recovery/runtime_event_store.rs:" | rg -v "/tests?/" | rg -v "/tests\\.rs:" || true'
-  check_empty "V568 runtime callers must not use event-store file paths" \
-    rg -n 'RuntimeEventStore.*\.path\(|event_store\.path\(' crates/runtime/src --glob '*.rs' --glob '!**/tests/**' --glob '!**/tests.rs'
-  check_empty "V568 public event adapter must not leak outside owner module" \
-    bash -c 'rg -n "pub struct SqliteRuntimeEventStore|pub enum RuntimeEventStoreBackend" crates/runtime/src/recovery/runtime_event_store.rs || true'
-  exit "$fail"
-fi
+check_empty "gateway second AI execution loop" \
+  scan_gateway_production 'execute_model_tool_cycle|run_turn_async|run_prompt\(|run_repl\(|mod repl;|livecli'
 
-if [[ "${1:-}" == "--v569-runtime-postgres" ]]; then
-  # V569 keeps PostgreSQL infrastructure outside Runtime while proving a full
-  # adapter can be composed explicitly. A deployment-wide backend toggle is
-  # still forbidden until every required domain has migrated.
-  check_empty "V569 runtime normal dependency tree must not include PostgreSQL driver" \
-    bash -c 'cargo tree -p runtime --edges normal 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
-  check_empty "V569 runtime manifest must not name PostgreSQL driver" \
-    rg -n '^postgres\s*=|^tokio-postgres\s*=|^r2d2_postgres\s*=' crates/runtime/Cargo.toml
-  check_empty "V569 global PostgreSQL switch must remain unavailable" \
-    rg -n 'StorageBackendKind::Postgres|control_plane_backend.*postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
-  check_empty "V569 dedicated runtime PostgreSQL adapter crate must exist" \
-    bash -c 'if [[ ! -f crates/runtime-postgres/Cargo.toml || ! -f crates/runtime-postgres/src/lib.rs ]]; then echo missing; fi'
-  check_empty "V569 RuntimeServices must retain explicit event backend injection" \
-    bash -c 'if ! rg -q "pub fn runtime_event_store\(" crates/runtime/src/execution_core/services.rs; then echo missing; fi'
-  exit "$fail"
-fi
+check_empty "gateway removed process compatibility paths" \
+  scan_gateway_production 'crate::daemon::|DaemonConfig|run_daemon|COWD_AUTH_BROKER_BIN|COWD_INTERNAL_PROCESS_BIN|cowd-auth-broker'
 
-if [[ "${1:-}" == "--v570-task-postgres" ]]; then
-  # V570 moves Task lifecycle authority out of the process-local Vec/Mutex and
-  # behind the Runtime task backend port. PostgreSQL remains an explicitly
-  # composed adapter, never a deployment-wide backend toggle.
-  check_empty "V570 runtime task must not retain in-memory authority or full-table rewrite" \
-    bash -c 'awk "/#\[cfg\(test\)\]/{exit} {print}" crates/runtime/src/mission/task.rs | rg -n "Mutex<TaskStore>|struct TaskStore[[:space:]\{]|fn persist\(|DELETE FROM tasks" || true'
-  check_empty "V570 runtime normal dependency tree must not include PostgreSQL driver" \
-    bash -c 'cargo tree -p runtime --edges normal 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
-  check_empty "V570 Gateway normal dependency tree must not include PostgreSQL driver" \
-    bash -c 'cargo tree -p gateway --edges normal 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
-  check_empty "V570 task adapter and explicit Gateway composition must exist" \
-    bash -c 'missing=""; rg -q "pub struct PostgresTaskStore" crates/runtime-postgres/src/lib.rs || missing="$missing postgres-task"; rg -q "pub trait TaskStoreBackend" crates/runtime/src/mission/task.rs || missing="$missing task-port"; rg -q "from_runtime_kernel" crates/gateway/src/kernel/task_kernel.rs || missing="$missing gateway-injection"; if [[ -n "$missing" ]]; then echo "$missing"; fi'
-  check_empty "V570 global PostgreSQL switch must remain unavailable" \
-    rg -n 'StorageBackendKind::Postgres|control_plane_backend.*postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
-  exit "$fail"
-fi
+check_empty "gateway direct MFG implementation ownership" \
+  scan_gateway_production 'app_mfg::|app_mfg_contract::'
 
-if [[ "${1:-}" == "--v571-surface-ledger-port" ]]; then
-  # V571 moves Surface durable facts and operations behind a storage-neutral,
-  # object-safe contract. SQLite remains a private Gateway adapter; PostgreSQL
-  # composition and any deployment switch are intentionally deferred.
-  check_empty "V571 surface contract must own the durable ledger port" \
-    bash -c 'if ! rg -q "pub trait SurfaceMessageLedger" crates/surface/src/message_ledger.rs; then echo missing; fi'
-  check_empty "V571 host and managed transports must not retain concrete SQLite ledger types" \
-    bash -c 'rg -n "Arc<SqliteSurfaceMessageStore>" crates/gateway/src/surface_host --glob "*.rs" | rg -v "#\[cfg\(test\)\]" || true'
-  check_empty "V571 Gateway must not redefine surface durable DTOs" \
-    rg -n 'pub\(crate\) struct Surface(TurnCorrelation|InboxRecord|OutboxRecord|TriggerEventRecord|DeliveryEvent|MessageSnapshot)' crates/gateway/src/surface_host/message_store.rs
-  check_empty "V571 nonfallible ledger projections must remain test-only" \
-    bash -c 'awk "/^\/\/\/ Gateway.s current SQLite implementation/{exit} {print}" crates/gateway/src/surface_host/message_store.rs | rg -n "fn (get_outbox_by_delivery|due_retry_deliveries|due_trigger_event_retries|get_inbox_message|list_inbox|list_outbox|list_all_inbox|list_all_outbox|list_trigger_events|list_delivery_events|snapshot)\(.*-> (Option<|Vec<|SurfaceMessageSnapshot)" || true'
-  check_empty "V571 Surface and Gateway normal dependency trees must stay PostgreSQL-free" \
-    bash -c '(cargo tree -p surface --edges normal; cargo tree -p gateway --edges normal) 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
-  check_empty "V571 global PostgreSQL switch must remain unavailable" \
-    rg -n 'StorageBackendKind::Postgres|control_plane_backend.*postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
-  exit "$fail"
-fi
-
-if [[ "${1:-}" == "--v572-surface-ledger-postgres" ]]; then
-  # V572 introduces a complete PostgreSQL implementation of the V571 port.
-  # The adapter may depend on the driver, while the contract and Gateway
-  # production graph must stay database-driver-free until a separately
-  # approved deployment-wide cutover.
-  check_empty "V572 dedicated Surface PostgreSQL adapter must exist" \
-    bash -c 'if [[ ! -f crates/surface-postgres/Cargo.toml || ! -f crates/surface-postgres/src/lib.rs ]]; then echo missing; fi'
-  check_empty "V572 Surface and Gateway normal dependency trees must stay PostgreSQL-free" \
-    bash -c '(cargo tree -p surface --edges normal; cargo tree -p gateway --edges normal) 2>/dev/null | rg "(postgres|r2d2_postgres)" || true'
-  check_empty "V572 Surface contract must not name a PostgreSQL driver" \
-    rg -n '^postgres\s*=|^tokio-postgres\s*=|^r2d2_postgres\s*=' crates/surface/Cargo.toml
-  check_empty "V572 Gateway production source must not compose the PostgreSQL adapter" \
-    bash -c 'awk "/#\[cfg\(test\)\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" crates/gateway/src/surface_host/message_store.rs | rg -n "surface_postgres|PostgresSurfaceMessageLedger" || true'
-  check_empty "V572 migration carrier must be owned by the Surface contract" \
-    bash -c 'if ! rg -q "SurfaceMessageLedgerMigrationSnapshot" crates/surface/src/message_ledger.rs; then echo missing; fi'
-  check_empty "V572 global PostgreSQL switch must remain unavailable" \
-    rg -n 'StorageBackendKind::Postgres|control_plane_backend.*postgres' crates/gateway crates/runtime crates/cli --glob '*.rs'
-  exit "$fail"
-fi
+check_empty "built-in channel document operations" \
+  rg -n "service\.feishu\.docx|feishu\.readonly|docx:read|doc_ops" \
+    crates/surface/src crates/connector/src crates/gateway/src crates/runtime/src crates/tui/src \
+    --glob '*.rs' --glob '!**/tests/**'
 
 check_empty "cli business command names" \
   rg -n "\\b(run|chat|prompt|mcp serve)\\b" crates/cli/src/main.rs --glob '*.rs'
@@ -300,11 +204,48 @@ check_empty "storage direct-open allowlist must stay empty" \
 echo "Checking cargo entrypoint dependency summaries"
 cargo tree -p cli --depth 1 --no-default-features
 
+if cargo tree -p gateway --depth 1 --edges normal | rg "(^|[ ├└│─])(app-mfg|app-mfg-contract) v"; then
+  echo "FAIL gateway direct MFG implementation dependency"
+  fail=1
+else
+  echo "PASS gateway direct MFG implementation dependency"
+fi
+
 if cargo tree -p tui --depth 1 --no-default-features | rg "(^|[ ├└│─])((runtime|matrix-core|matrix-repository|storage|tools|command-contract|command-service) v|memory|app-mfg|app_mfg|rusqlite)"; then
   echo "FAIL tui forbidden direct dependency tree"
   fail=1
 else
   echo "PASS tui forbidden direct dependency tree"
+fi
+
+if cargo tree -p tools --depth 1 --edges normal | rg "(^|[ ├└│─])(runtime v|gateway v|provider v|memory v|matrix-core v|matrix-repository v)"; then
+  echo "FAIL tools forbidden runtime or persistence dependency tree"
+  fail=1
+else
+  echo "PASS tools forbidden runtime or persistence dependency tree"
+fi
+
+if cargo tree -p runtime --depth 1 --edges normal | rg "(^|[ ├└│─])(gateway v|surface v|connector v|tui v)"; then
+  echo "FAIL runtime forbidden transport or Surface dependency tree"
+  fail=1
+else
+  echo "PASS runtime forbidden transport or Surface dependency tree"
+fi
+
+memory_tree="$(cargo tree -p memory --depth 1 --edges normal)"
+for required in fact-kernel harness-contract storage; do
+  if ! grep -Eq "(^|[ ├└│─])${required} v" <<<"$memory_tree"; then
+    echo "FAIL memory required dependency missing: $required"
+    fail=1
+  else
+    echo "PASS memory required dependency: $required"
+  fi
+done
+if rg "(^|[ ├└│─])(gateway v|runtime v|surface v|connector v|tui v|provider v|tools v|matrix-core v|matrix-repository v)" <<<"$memory_tree"; then
+  echo "FAIL memory forbidden runtime, transport, tool, provider, or Matrix dependency tree"
+  fail=1
+else
+  echo "PASS memory forbidden runtime, transport, tool, provider, or Matrix dependency tree"
 fi
 
 if [[ -f ../cowd-app-mfg/Cargo.toml ]]; then

@@ -57,11 +57,11 @@ ring = "0.17"
 futures = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 libc = "0.2.186"
+tempfile = "3"
 
 [dev-dependencies]
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
-tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]

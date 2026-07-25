@@ -3405,12 +3405,13 @@ mod tests {
     fn sqlite_snapshot_copies_to_postgres_with_exact_digest() {
         let url = std::env::var("COWD_TEST_POSTGRES_URL")
             .expect("COWD_TEST_POSTGRES_URL is required for PostgreSQL integration tests");
-        let resolver = storage::StaticSecretRefResolver::new([("v572-test".into(), url)]);
+        let resolver =
+            storage::StaticSecretRefResolver::new([("surface-postgres-test".into(), url)]);
         let target = surface_postgres::PostgresSurfaceMessageLedger::connect(
             storage::PostgresConnectionConfig::new(
-                "surface-v572-sqlite-source",
-                "v572-test",
-                "cowd-v572-sqlite-source",
+                "surface-sqlite-source-contract",
+                "surface-postgres-test",
+                "cowd-surface-sqlite-source-contract",
             ),
             &resolver,
         )
@@ -3426,7 +3427,7 @@ mod tests {
             .unwrap();
 
         let root = std::env::temp_dir().join(format!(
-            "cowd-surface-v572-sqlite-source-{}",
+            "cowd-surface-sqlite-source-contract-{}",
             uuid::Uuid::new_v4()
         ));
         let source = SqliteSurfaceMessageStore::new(&root);

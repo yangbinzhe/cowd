@@ -187,7 +187,7 @@ for index in 0 1 2; do
       COWD_API_TOKEN="${API_TOKEN}" \
       COWD_EVAL_HARNESS=1 \
       COWD_EVAL_CORPUS_ID=auto-strategy-v1 \
-      COWD_EVAL_WORKSPACE_FIXTURE=workspace-v546-frozen \
+      COWD_EVAL_WORKSPACE_FIXTURE=workspace-auto-strategy-frozen \
       COWD_EVAL_STRATEGY_OVERRIDE="${condition}" \
       COWD_MODEL_TEMPERATURE=0 \
       HOME="${home}" \

@@ -609,7 +609,7 @@ mod tests {
         let apps = runtime::AppsConfig::default();
         let binding = GatewayAppHostBinding::new();
         let config_home =
-            std::env::temp_dir().join(format!("cowd-v579-registry-{}", std::process::id()));
+            std::env::temp_dir().join(format!("cowd-registry-test-{}", std::process::id()));
         let registry = broker_backed_app_registry(&config_home, binding.context(), &apps);
         let registered = registry.apps();
         let mfg = registered

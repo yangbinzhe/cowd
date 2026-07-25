@@ -129,7 +129,7 @@ mod tests {
             1,
             "toolu-1",
             "bash",
-            "scripts/validate.sh unit-fast",
+            "scripts/validate.sh quick",
             ToolSafetyCategory::WriteLocal,
             100,
         )

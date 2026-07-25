@@ -49,7 +49,7 @@ Cowd 两分支共同基点为 `1e6e66acd65e04e54443acff33f211eb335bd90c`。相�
 | `crates/gateway/src/api_routes/edge_routes.rs` | 自动合并 | master Managed Edge 投影；develop 主要为格式和测试调整 | 保留 Managed 语义；补齐明确 runtime spec 投影，禁止把 artifact 当 OneShot entry |
 | `crates/gateway/src/runtime_host/mod.rs` | 自动合并 | master 内部 broker 子进程；develop MFG reconciler 关闭 | 保留内部 broker，并加入 `shutdown_review_reconciler()`；不得恢复 `auth_broker_binary()` |
 | `scripts/scenarios/tui-smoke.sh` | 自动合并 | develop 强制 full TUI 构建 | 构建 `cli --features full`，移除多余 `-p auth-broker` helper 假设 |
-| `scripts/v9-terminal-gate.sh` | 自动合并 | develop 增加受控策略 E2E fixture | 保留，继续限定在 E2E 环境变量范围内 |
+| 旧单体终端门禁 | 已退役 | 当前分层场景、Surface、Harness Eval 与性能验收 | 不再恢复跨层重复入口 |
 
 ## 4. 语义冲突与删除预检
 

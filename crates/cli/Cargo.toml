@@ -27,6 +27,7 @@ full = ["tui-surface", "app-mfg", "tui/code-highlight", "gateway/code-index"]
 [dev-dependencies]
 cowd-app-sdk = { path = "../app-sdk" }
 serde_json.workspace = true
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints.rust]

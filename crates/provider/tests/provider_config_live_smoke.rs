@@ -16,9 +16,7 @@ use std::path::PathBuf;
 #[tokio::test]
 #[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
 async fn provider_config_live_smoke_returns_structured_health_signal() {
-    let Some(env) = live_env() else {
-        return;
-    };
+    let env = live_env();
     let probes = [
         LiveProbe {
             name: "structured_provider",
@@ -89,9 +87,7 @@ async fn provider_config_live_smoke_returns_structured_health_signal() {
 #[tokio::test]
 #[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
 async fn provider_live_stream_contract_is_ordered() {
-    let Some(env) = live_env() else {
-        return;
-    };
+    let env = live_env();
     let mut stream = env
         .client
         .stream_message(&MessageRequest {
@@ -161,9 +157,7 @@ async fn provider_live_stream_contract_is_ordered() {
 #[tokio::test]
 #[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
 async fn provider_live_structured_output_is_stable() {
-    let Some(env) = live_env() else {
-        return;
-    };
+    let env = live_env();
     let probe = LiveProbe {
         name: "structured_drift",
         max_tokens: 96,
@@ -194,9 +188,7 @@ async fn provider_live_structured_output_is_stable() {
 #[tokio::test]
 #[ignore = "requires COWD_AI_HARNESS_LIVE=1 and configured provider credentials"]
 async fn provider_live_routing_respects_simple_complex_and_risk() {
-    let Some(env) = live_env() else {
-        return;
-    };
+    let env = live_env();
     let probes = [
         LiveProbe {
             name: "route_direct",
@@ -325,11 +317,12 @@ fn provider_from_cowd_config(model: &str) -> Option<ProviderConfig> {
     None
 }
 
-fn live_env() -> Option<LiveEnv> {
-    if std::env::var("COWD_AI_HARNESS_LIVE").ok().as_deref() != Some("1") {
-        eprintln!("skipping live provider test; set COWD_AI_HARNESS_LIVE=1");
-        return None;
-    }
+fn live_env() -> LiveEnv {
+    assert_eq!(
+        std::env::var("COWD_AI_HARNESS_LIVE").as_deref(),
+        Ok("1"),
+        "live provider tests require COWD_AI_HARNESS_LIVE=1"
+    );
 
     let model = std::env::var("COWD_AI_HARNESS_LIVE_MODEL")
         .ok()
@@ -340,11 +333,11 @@ fn live_env() -> Option<LiveEnv> {
         .unwrap_or_else(|| panic!("no provider configured for live model {model:?}"));
     let provider_name = provider.name.clone();
     let client = ProviderClient::from_config(&provider).expect("provider client should build");
-    Some(LiveEnv {
+    LiveEnv {
         model,
         provider_name,
         client,
-    })
+    }
 }
 
 async fn send_live_probe(
