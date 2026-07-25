@@ -632,6 +632,7 @@ mod tests {
             }],
             session_reset: SessionResetPolicy::default(),
             capacity: GatewayCapacityConfig::default(),
+            recovery: runtime::SessionRecoveryConfig::default(),
         };
         let account = resolve_account(&gateway, Some("feishu")).expect("account");
         let root = PrivateRuntimeRoot::create("environment-test").expect("private root");

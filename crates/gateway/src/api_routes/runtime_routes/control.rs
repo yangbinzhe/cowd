@@ -155,6 +155,11 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
             acc
         });
     let session_lease_projection = session_lease_projection(&state).await;
+    let session_working_set = match state.services.session_manager.as_ref() {
+        Some(manager) => serde_json::to_value(manager.working_set_projection().await)
+            .unwrap_or_else(|_| serde_json::json!({"status": "degraded"})),
+        None => serde_json::json!({"status": "unavailable"}),
+    };
     let memory_attached = state.services.memory.manager().is_some();
     let component_count = 10usize;
     let degraded_component_count =
@@ -410,6 +415,7 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
                 "event_bus": true,
                 "source_of_truth": if durable_session_store { "sqlite" } else { "unavailable" },
                 "leases": session_lease_projection,
+                "working_set": session_working_set,
             },
             "memory": memory,
             "context": {

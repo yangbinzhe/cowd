@@ -9,7 +9,7 @@ use memory::store::session::{
 };
 use memory::{
     MemoryError, SessionDomainEvent, SessionDomainEventPage, SessionDomainScope, SessionRecord,
-    UnifiedSessionStore,
+    SessionRecoveryManifest, SessionRecoverySignal, UnifiedSessionStore,
 };
 use tokio::sync::Mutex;
 
@@ -114,6 +114,46 @@ impl SessionKernel {
             return Ok(None);
         };
         store.get_session(session_id).await
+    }
+
+    pub(crate) async fn stored_recovery_manifest(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionRecoveryManifest>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store.get_session_recovery_manifest(session_id).await
+    }
+
+    pub(crate) async fn active_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Option<Vec<SessionRecoveryManifest>>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store
+            .list_active_session_recovery_manifests(offset, limit)
+            .await
+            .map(Some)
+    }
+
+    pub(crate) async fn set_recovery_signal(
+        &self,
+        session_id: &str,
+        signal: SessionRecoverySignal,
+        active: bool,
+        observed_at_ms: u64,
+    ) -> Result<Option<SessionRecoveryManifest>, MemoryError> {
+        let Some(store) = self.unified_store.as_ref() else {
+            return Ok(None);
+        };
+        store
+            .set_session_recovery_signal(session_id, signal, active, observed_at_ms)
+            .await
+            .map(Some)
     }
 
     /// Persist the Session authority record and its one-way Mission lifecycle

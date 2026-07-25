@@ -838,6 +838,7 @@ fn run_gateway_action(
                 surface_configs,
                 surface_runtime_configs,
                 runtime_config: runtime_config_json,
+                session_recovery: runtime_config.gateway().recovery,
                 webui_dir: runtime_config.gateway().webui_dir.clone(),
                 cors_origins,
                 auth_token,

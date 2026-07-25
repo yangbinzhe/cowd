@@ -304,6 +304,45 @@ pub struct SessionMissionOutboxRecord {
     pub updated_at_ms: u64,
 }
 
+/// Durable, body-free recovery projection for one Session.
+///
+/// The transcript remains authoritative in `messages`; this manifest is the
+/// transactionally maintained index used to decide whether startup must
+/// hydrate the transcript into a Runtime carrier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecoveryManifest {
+    pub session_id: String,
+    pub durable_cursor: u64,
+    pub history_revision: u64,
+    pub transcript_messages: u64,
+    pub transcript_bytes: u64,
+    pub in_flight_turn: bool,
+    pub pending_approval: bool,
+    pub active_writer_or_attachment: bool,
+    pub mission_agent_team_continuation: bool,
+    pub last_activity_ms: u64,
+    pub manifest_revision: u64,
+}
+
+impl SessionRecoveryManifest {
+    #[must_use]
+    pub const fn requires_hydration(&self) -> bool {
+        self.in_flight_turn
+            || self.pending_approval
+            || self.active_writer_or_attachment
+            || self.mission_agent_team_continuation
+    }
+}
+
+/// Explicit recovery signals whose source of truth is outside the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRecoverySignal {
+    PendingApproval,
+    ActiveWriterOrAttachment,
+    MissionAgentTeamContinuation,
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE;").map_err(sql_err)?;
 
@@ -418,6 +457,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     ensure_messages_schema(conn)?;
     ensure_session_runtime_outbox_schema(conn)?;
     ensure_session_mission_outbox_schema(conn)?;
+    ensure_session_recovery_manifest_schema(conn)?;
     migrate_legacy_session_domain_events(conn)?;
 
     let existing_session_columns = {
@@ -509,6 +549,257 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
     conn.execute_batch("COMMIT;").map_err(sql_err)?;
     Ok(())
+}
+
+fn ensure_session_recovery_manifest_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_recovery_manifest (
+            session_id TEXT PRIMARY KEY,
+            durable_cursor INTEGER NOT NULL DEFAULT 0,
+            history_revision INTEGER NOT NULL DEFAULT 0,
+            transcript_messages INTEGER NOT NULL DEFAULT 0,
+            transcript_bytes INTEGER NOT NULL DEFAULT 0,
+            in_flight_turn INTEGER NOT NULL DEFAULT 0,
+            pending_approval INTEGER NOT NULL DEFAULT 0,
+            active_writer_or_attachment INTEGER NOT NULL DEFAULT 0,
+            mission_agent_team_continuation INTEGER NOT NULL DEFAULT 0,
+            last_activity_ms INTEGER NOT NULL DEFAULT 0,
+            manifest_revision INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_session_recovery_required
+            ON session_recovery_manifest(
+                in_flight_turn,
+                pending_approval,
+                active_writer_or_attachment,
+                mission_agent_team_continuation,
+                last_activity_ms DESC
+            );
+        INSERT INTO session_recovery_manifest (
+            session_id,
+            durable_cursor,
+            history_revision,
+            transcript_messages,
+            transcript_bytes,
+            in_flight_turn,
+            active_writer_or_attachment,
+            mission_agent_team_continuation,
+            last_activity_ms,
+            manifest_revision
+        )
+        SELECT
+            sessions.session_id,
+            COALESCE((
+                SELECT MAX(sequence) + 1 FROM messages
+                 WHERE messages.session_id = sessions.session_id
+            ), 0),
+            COALESCE((
+                SELECT COUNT(*) FROM messages
+                 WHERE messages.session_id = sessions.session_id
+            ), 0),
+            COALESCE((
+                SELECT COUNT(*) FROM messages
+                 WHERE messages.session_id = sessions.session_id
+            ), 0),
+            COALESCE((
+                SELECT SUM(
+                    length(CAST(stable_message_id AS BLOB))
+                    + length(CAST(session_id AS BLOB))
+                    + length(CAST(role AS BLOB))
+                    + length(CAST(content_json AS BLOB))
+                    + length(CAST(COALESCE(token_usage_json, '') AS BLOB))
+                    + length(CAST(COALESCE(tool_use_id, '') AS BLOB))
+                    + length(CAST(COALESCE(tool_name, '') AS BLOB))
+                )
+                FROM messages WHERE messages.session_id = sessions.session_id
+            ), 0),
+            EXISTS(
+                SELECT 1 FROM session_runtime_outbox
+                 WHERE session_runtime_outbox.session_id = sessions.session_id
+                   AND status IN ('pending', 'claimed', 'retry_scheduled')
+            ),
+            COALESCE((
+                SELECT CASE
+                    WHEN json_array_length(
+                        json_extract(event_json, '$.snapshot.attachments')
+                    ) > 0 THEN 1 ELSE 0
+                END
+                  FROM session_events
+                 WHERE session_events.session_id = sessions.session_id
+                   AND event_type = 'session.lifecycle.v1'
+                 ORDER BY sequence DESC
+                 LIMIT 1
+            ), 0),
+            EXISTS(
+                SELECT 1 FROM session_mission_outbox
+                 WHERE session_mission_outbox.session_id = sessions.session_id
+                   AND operation = 'start'
+                   AND status IN ('pending', 'claimed', 'retry_scheduled')
+            ),
+            MAX(sessions.updated_at_ms, sessions.created_at_ms),
+            1
+        FROM sessions
+        WHERE TRUE
+        ON CONFLICT(session_id) DO UPDATE SET
+            durable_cursor = excluded.durable_cursor,
+            transcript_messages = excluded.transcript_messages,
+            transcript_bytes = excluded.transcript_bytes,
+            in_flight_turn = excluded.in_flight_turn,
+            active_writer_or_attachment =
+                excluded.active_writer_or_attachment,
+            mission_agent_team_continuation =
+                excluded.mission_agent_team_continuation,
+            last_activity_ms = MAX(
+                session_recovery_manifest.last_activity_ms,
+                excluded.last_activity_ms
+            );
+
+        CREATE TRIGGER IF NOT EXISTS session_recovery_session_insert
+        AFTER INSERT ON sessions BEGIN
+            INSERT OR IGNORE INTO session_recovery_manifest(
+                session_id, last_activity_ms, manifest_revision
+            ) VALUES (
+                NEW.session_id, MAX(NEW.created_at_ms, NEW.updated_at_ms), 1
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_recovery_session_update
+        AFTER UPDATE OF status, last_activity, updated_at_ms ON sessions BEGIN
+            UPDATE session_recovery_manifest
+               SET last_activity_ms = MAX(last_activity_ms, NEW.updated_at_ms),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_recovery_message_insert
+        AFTER INSERT ON messages BEGIN
+            UPDATE session_recovery_manifest
+               SET durable_cursor = MAX(durable_cursor, NEW.sequence + 1),
+                   history_revision = history_revision + 1,
+                   transcript_messages = transcript_messages + 1,
+                   transcript_bytes = transcript_bytes
+                       + length(CAST(NEW.stable_message_id AS BLOB))
+                       + length(CAST(NEW.session_id AS BLOB))
+                       + length(CAST(NEW.role AS BLOB))
+                       + length(CAST(NEW.content_json AS BLOB))
+                       + length(CAST(COALESCE(NEW.token_usage_json, '') AS BLOB))
+                       + length(CAST(COALESCE(NEW.tool_use_id, '') AS BLOB))
+                       + length(CAST(COALESCE(NEW.tool_name, '') AS BLOB)),
+                   last_activity_ms = MAX(last_activity_ms, NEW.created_at_ms),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_recovery_message_delete
+        AFTER DELETE ON messages BEGIN
+            UPDATE session_recovery_manifest
+               SET history_revision = history_revision + 1,
+                   transcript_messages = MAX(0, transcript_messages - 1),
+                   transcript_bytes = MAX(
+                       0,
+                       transcript_bytes
+                           - length(CAST(OLD.stable_message_id AS BLOB))
+                           - length(CAST(OLD.session_id AS BLOB))
+                           - length(CAST(OLD.role AS BLOB))
+                           - length(CAST(OLD.content_json AS BLOB))
+                           - length(CAST(COALESCE(OLD.token_usage_json, '') AS BLOB))
+                           - length(CAST(COALESCE(OLD.tool_use_id, '') AS BLOB))
+                           - length(CAST(COALESCE(OLD.tool_name, '') AS BLOB))
+                   ),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = OLD.session_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_recovery_message_update
+        AFTER UPDATE ON messages BEGIN
+            UPDATE session_recovery_manifest
+               SET durable_cursor = MAX(durable_cursor, NEW.sequence + 1),
+                   history_revision = history_revision + 1,
+                   transcript_bytes = MAX(
+                       0,
+                       transcript_bytes
+                           - length(CAST(OLD.stable_message_id AS BLOB))
+                           - length(CAST(OLD.session_id AS BLOB))
+                           - length(CAST(OLD.role AS BLOB))
+                           - length(CAST(OLD.content_json AS BLOB))
+                           - length(CAST(COALESCE(OLD.token_usage_json, '') AS BLOB))
+                           - length(CAST(COALESCE(OLD.tool_use_id, '') AS BLOB))
+                           - length(CAST(COALESCE(OLD.tool_name, '') AS BLOB))
+                           + length(CAST(NEW.stable_message_id AS BLOB))
+                           + length(CAST(NEW.session_id AS BLOB))
+                           + length(CAST(NEW.role AS BLOB))
+                           + length(CAST(NEW.content_json AS BLOB))
+                           + length(CAST(COALESCE(NEW.token_usage_json, '') AS BLOB))
+                           + length(CAST(COALESCE(NEW.tool_use_id, '') AS BLOB))
+                           + length(CAST(COALESCE(NEW.tool_name, '') AS BLOB))
+                   ),
+                   last_activity_ms = MAX(last_activity_ms, NEW.created_at_ms),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_recovery_lifecycle_event_insert
+        AFTER INSERT ON session_events
+        WHEN NEW.event_type = 'session.lifecycle.v1' BEGIN
+            UPDATE session_recovery_manifest
+               SET active_writer_or_attachment = CASE
+                       WHEN json_array_length(
+                           json_extract(NEW.event_json, '$.snapshot.attachments')
+                       ) > 0 THEN 1 ELSE 0
+                   END,
+                   last_activity_ms = MAX(last_activity_ms, NEW.created_at_ms),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_recovery_runtime_outbox_insert
+        AFTER INSERT ON session_runtime_outbox BEGIN
+            UPDATE session_recovery_manifest
+               SET in_flight_turn = EXISTS(
+                       SELECT 1 FROM session_runtime_outbox
+                        WHERE session_id = NEW.session_id
+                          AND status IN ('pending', 'claimed', 'retry_scheduled')
+                   ),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_recovery_runtime_outbox_update
+        AFTER UPDATE OF status ON session_runtime_outbox BEGIN
+            UPDATE session_recovery_manifest
+               SET in_flight_turn = EXISTS(
+                       SELECT 1 FROM session_runtime_outbox
+                        WHERE session_id = NEW.session_id
+                          AND status IN ('pending', 'claimed', 'retry_scheduled')
+                   ),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_recovery_mission_outbox_insert
+        AFTER INSERT ON session_mission_outbox BEGIN
+            UPDATE session_recovery_manifest
+               SET mission_agent_team_continuation = EXISTS(
+                       SELECT 1 FROM session_mission_outbox
+                        WHERE session_id = NEW.session_id
+                          AND operation = 'start'
+                          AND status IN ('pending', 'claimed', 'retry_scheduled')
+                   ),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS session_recovery_mission_outbox_update
+        AFTER UPDATE OF status ON session_mission_outbox BEGIN
+            UPDATE session_recovery_manifest
+               SET mission_agent_team_continuation = EXISTS(
+                       SELECT 1 FROM session_mission_outbox
+                        WHERE session_id = NEW.session_id
+                          AND operation = 'start'
+                          AND status IN ('pending', 'claimed', 'retry_scheduled')
+                   ),
+                   manifest_revision = manifest_revision + 1
+             WHERE session_id = NEW.session_id;
+        END;
+        "#,
+    )
+    .map_err(sql_err)
 }
 
 fn reconcile_legacy_session_summaries(conn: &Connection) -> Result<()> {
@@ -1021,6 +1312,22 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
         tool_name: row.get(7)?,
         token_usage_json: row.get(8)?,
         created_at_ms: row.get::<_, i64>(9)? as u64,
+    })
+}
+
+fn row_to_recovery_manifest(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecoveryManifest> {
+    Ok(SessionRecoveryManifest {
+        session_id: row.get(0)?,
+        durable_cursor: row.get::<_, i64>(1)?.max(0) as u64,
+        history_revision: row.get::<_, i64>(2)?.max(0) as u64,
+        transcript_messages: row.get::<_, i64>(3)?.max(0) as u64,
+        transcript_bytes: row.get::<_, i64>(4)?.max(0) as u64,
+        in_flight_turn: row.get(5)?,
+        pending_approval: row.get(6)?,
+        active_writer_or_attachment: row.get(7)?,
+        mission_agent_team_continuation: row.get(8)?,
+        last_activity_ms: row.get::<_, i64>(9)?.max(0) as u64,
+        manifest_revision: row.get::<_, i64>(10)?.max(0) as u64,
     })
 }
 
@@ -1564,6 +1871,96 @@ impl SqliteSessionStore {
         )
         .optional()
         .map_err(sql_err)
+    }
+
+    /// Read the body-free recovery projection for one Session.
+    pub fn get_session_recovery_manifest(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionRecoveryManifest>> {
+        let conn = self.conn()?;
+        conn.query_row(
+            r"SELECT session_id, durable_cursor, history_revision,
+                     transcript_messages, transcript_bytes, in_flight_turn,
+                     pending_approval, active_writer_or_attachment,
+                     mission_agent_team_continuation, last_activity_ms,
+                     manifest_revision
+                FROM session_recovery_manifest
+               WHERE session_id=?1",
+            params![session_id],
+            row_to_recovery_manifest,
+        )
+        .optional()
+        .map_err(sql_err)
+    }
+
+    /// Page active Session manifests without reading transcript rows.
+    pub fn list_active_session_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionRecoveryManifest>> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                r"SELECT manifest.session_id, manifest.durable_cursor,
+                         manifest.history_revision, manifest.transcript_messages,
+                         manifest.transcript_bytes, manifest.in_flight_turn,
+                         manifest.pending_approval,
+                         manifest.active_writer_or_attachment,
+                         manifest.mission_agent_team_continuation,
+                         manifest.last_activity_ms, manifest.manifest_revision
+                    FROM session_recovery_manifest AS manifest
+                    JOIN sessions ON sessions.session_id=manifest.session_id
+                   WHERE sessions.status='active'
+                   ORDER BY manifest.last_activity_ms DESC, manifest.session_id ASC
+                   LIMIT ?1 OFFSET ?2",
+            )
+            .map_err(sql_err)?;
+        let rows = statement
+            .query_map(
+                params![limit as i64, offset as i64],
+                row_to_recovery_manifest,
+            )
+            .map_err(sql_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sql_err)
+    }
+
+    /// Update one external durable recovery signal without overwriting other
+    /// independently-owned signals.
+    pub fn set_session_recovery_signal(
+        &self,
+        session_id: &str,
+        signal: SessionRecoverySignal,
+        active: bool,
+        observed_at_ms: u64,
+    ) -> Result<SessionRecoveryManifest> {
+        let column = match signal {
+            SessionRecoverySignal::PendingApproval => "pending_approval",
+            SessionRecoverySignal::ActiveWriterOrAttachment => "active_writer_or_attachment",
+            SessionRecoverySignal::MissionAgentTeamContinuation => {
+                "mission_agent_team_continuation"
+            }
+        };
+        let conn = self.conn()?;
+        conn.execute(
+            &format!(
+                "UPDATE session_recovery_manifest
+                    SET {column}=?2,
+                        last_activity_ms=MAX(last_activity_ms, ?3),
+                        manifest_revision=manifest_revision + 1
+                  WHERE session_id=?1"
+            ),
+            params![session_id, active, observed_at_ms as i64],
+        )
+        .map_err(sql_err)?;
+        drop(conn);
+        self.get_session_recovery_manifest(session_id)?
+            .ok_or_else(|| {
+                MemoryError::Store(format!(
+                    "session recovery manifest `{session_id}` does not exist"
+                ))
+            })
     }
 
     /// Overwrite all mutable fields of an existing session record.
@@ -5589,6 +5986,105 @@ mod tests {
             .ack_session_runtime_outbox("request-1", "worker-a", renewed.revision, 7, 153)
             .unwrap();
         assert_eq!(done.status, OutboxStatus::Materialized);
+    }
+
+    #[test]
+    fn recovery_manifest_tracks_transcript_outbox_and_external_signals() {
+        let (store, _dir) = make_store();
+        store.create_session(&make_record("s-recovery")).unwrap();
+        let initial = store
+            .get_session_recovery_manifest("s-recovery")
+            .unwrap()
+            .unwrap();
+        assert_eq!(initial.transcript_messages, 0);
+        assert!(!initial.requires_hydration());
+
+        let mut message = outbox_message("s-recovery");
+        message.stable_message_id = "recovery-message".to_string();
+        message.content_json = r#"[{"type":"text","text":"恢复中文"}]"#.to_string();
+        let mut request = outbox_request();
+        request.message_id = message.stable_message_id.clone();
+        request.request_id = "recovery-request".to_string();
+        request.turn_id = "recovery-turn".to_string();
+        store
+            .append_message_with_runtime_outbox(&message, &request)
+            .unwrap();
+        let pending = store
+            .get_session_recovery_manifest("s-recovery")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.durable_cursor, 1);
+        assert_eq!(pending.transcript_messages, 1);
+        let expected_bytes = message.stable_message_id.len()
+            + message.session_id.len()
+            + message.role.len()
+            + message.content_json.len()
+            + message.token_usage_json.as_ref().map_or(0, String::len)
+            + message.tool_use_id.as_ref().map_or(0, String::len)
+            + message.tool_name.as_ref().map_or(0, String::len);
+        assert_eq!(pending.transcript_bytes, expected_bytes as u64);
+        assert!(pending.in_flight_turn);
+
+        let claimed = store
+            .claim_session_runtime_outbox("worker", 100, 1_000, 1)
+            .unwrap()
+            .remove(0);
+        store
+            .ack_session_runtime_outbox(&claimed.request_id, "worker", claimed.revision, 1, 101)
+            .unwrap();
+        let settled = store
+            .set_session_recovery_signal(
+                "s-recovery",
+                SessionRecoverySignal::PendingApproval,
+                true,
+                102,
+            )
+            .unwrap();
+        assert!(!settled.in_flight_turn);
+        assert!(settled.pending_approval);
+        assert!(settled.requires_hydration());
+        assert_eq!(
+            store
+                .list_active_session_recovery_manifests(0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_manifest_backfills_existing_transcript_without_body_loss() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recovery-backfill.db");
+        {
+            let store = SqliteSessionStore::open(&path).unwrap();
+            store.create_session(&make_record("s-backfill")).unwrap();
+            store.insert_message(&outbox_message("s-backfill")).unwrap();
+            let connection = store.conn().unwrap();
+            connection
+                .execute_batch(
+                    "DROP TRIGGER IF EXISTS session_recovery_session_insert;
+                     DROP TRIGGER IF EXISTS session_recovery_session_update;
+                     DROP TRIGGER IF EXISTS session_recovery_message_insert;
+                     DROP TRIGGER IF EXISTS session_recovery_message_delete;
+                     DROP TRIGGER IF EXISTS session_recovery_message_update;
+                     DROP TRIGGER IF EXISTS session_recovery_lifecycle_event_insert;
+                     DROP TRIGGER IF EXISTS session_recovery_runtime_outbox_insert;
+                     DROP TRIGGER IF EXISTS session_recovery_runtime_outbox_update;
+                     DROP TRIGGER IF EXISTS session_recovery_mission_outbox_insert;
+                     DROP TRIGGER IF EXISTS session_recovery_mission_outbox_update;
+                     DROP TABLE session_recovery_manifest;",
+                )
+                .unwrap();
+        }
+        let reopened = SqliteSessionStore::open(&path).unwrap();
+        let manifest = reopened
+            .get_session_recovery_manifest("s-backfill")
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.transcript_messages, 1);
+        assert_eq!(manifest.durable_cursor, 1);
+        assert!(manifest.transcript_bytes > 0);
     }
 
     #[test]

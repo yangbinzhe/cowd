@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use chrono::Utc;
 use futures::{stream, StreamExt};
-use memory::{SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord};
+use memory::{
+    SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord,
+    SessionRecoveryManifest, SessionRecoverySignal,
+};
 use runtime::session_lifecycle::SessionLifecycleManager;
 use tokio::sync::Mutex;
 
@@ -109,10 +112,52 @@ pub(crate) struct EnsureSessionOutcome {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct SessionRecoverySummary {
     pub(crate) discovered: usize,
+    pub(crate) metadata_loaded: usize,
+    pub(crate) required: usize,
+    pub(crate) attached: usize,
+    pub(crate) recent: usize,
     pub(crate) recovered: usize,
     pub(crate) already_active: usize,
     pub(crate) failed: usize,
+    pub(crate) hot_bytes: u64,
     pub(crate) failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SessionHydrationStatus {
+    MetadataLoaded,
+    Hydrating,
+    Ready,
+    Degraded,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SessionWorkingSetEntry {
+    pub(crate) session_id: String,
+    pub(crate) status: SessionHydrationStatus,
+    pub(crate) transcript_bytes: u64,
+    pub(crate) transcript_messages: u64,
+    pub(crate) last_activity_ms: u64,
+    pub(crate) pin_reasons: BTreeSet<String>,
+    pub(crate) last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct SessionWorkingSetProjection {
+    pub(crate) hot_bytes: u64,
+    pub(crate) byte_budget: u64,
+    pub(crate) metadata_loaded: usize,
+    pub(crate) hydrating: usize,
+    pub(crate) ready: usize,
+    pub(crate) degraded: usize,
+    pub(crate) entries: Vec<SessionWorkingSetEntry>,
+}
+
+#[derive(Default)]
+struct WorkingSetState {
+    hot_bytes: u64,
+    entries: HashMap<String, SessionWorkingSetEntry>,
 }
 
 /// Exclusive coordinator for durable Session identity and process-local Runtime state.
@@ -124,7 +169,9 @@ pub(crate) struct UnifiedSessionManager {
     runtime: Arc<RuntimeService>,
     resource_lifecycle: Arc<SessionLifecycleManager>,
     session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    working_set: Mutex<WorkingSetState>,
     max_active_sessions: usize,
+    recovery: runtime::SessionRecoveryConfig,
 }
 
 impl UnifiedSessionManager {
@@ -133,12 +180,15 @@ impl UnifiedSessionManager {
         runtime: Arc<RuntimeService>,
         resource_lifecycle: Arc<SessionLifecycleManager>,
         max_active_sessions: usize,
+        recovery: runtime::SessionRecoveryConfig,
     ) -> Self {
         Self {
             runtime,
             resource_lifecycle,
             session_locks: Mutex::new(HashMap::new()),
+            working_set: Mutex::new(WorkingSetState::default()),
             max_active_sessions: max_active_sessions.max(1),
+            recovery,
         }
     }
 
@@ -148,6 +198,281 @@ impl UnifiedSessionManager {
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    async fn register_manifest_metadata(
+        &self,
+        manifest: &SessionRecoveryManifest,
+        extra_pin_reasons: impl IntoIterator<Item = &'static str>,
+    ) {
+        let mut pin_reasons = manifest_pin_reasons(manifest);
+        pin_reasons.extend(extra_pin_reasons.into_iter().map(str::to_string));
+        let mut state = self.working_set.lock().await;
+        let existing = state.entries.get(&manifest.session_id).cloned();
+        let existing_status = existing
+            .as_ref()
+            .map(|entry| entry.status)
+            .unwrap_or(SessionHydrationStatus::MetadataLoaded);
+        if existing_status == SessionHydrationStatus::Ready {
+            state.hot_bytes = state
+                .hot_bytes
+                .saturating_sub(existing.as_ref().map_or(0, |entry| entry.transcript_bytes))
+                .saturating_add(manifest.transcript_bytes);
+        }
+        state.entries.insert(
+            manifest.session_id.clone(),
+            SessionWorkingSetEntry {
+                session_id: manifest.session_id.clone(),
+                status: existing_status,
+                transcript_bytes: manifest.transcript_bytes,
+                transcript_messages: manifest.transcript_messages,
+                last_activity_ms: manifest.last_activity_ms,
+                pin_reasons,
+                last_error: None,
+            },
+        );
+    }
+
+    async fn begin_hydration(&self, session_id: &str, manifest: &SessionRecoveryManifest) {
+        self.register_manifest_metadata(manifest, []).await;
+        let victims = {
+            let mut state = self.working_set.lock().await;
+            let requested = manifest.transcript_bytes;
+            let budget = self.recovery.hot_bytes as u64;
+            let mut candidates = state
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry.session_id != session_id
+                        && entry.status == SessionHydrationStatus::Ready
+                        && entry.pin_reasons.is_empty()
+                })
+                .map(|entry| {
+                    (
+                        entry.last_activity_ms,
+                        entry.session_id.clone(),
+                        entry.transcript_bytes,
+                    )
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|candidate| (candidate.0, candidate.1.clone()));
+            let mut victims = Vec::new();
+            let mut projected = state.hot_bytes.saturating_add(requested);
+            for (_, victim, bytes) in candidates {
+                if projected <= budget {
+                    break;
+                }
+                projected = projected.saturating_sub(bytes);
+                victims.push(victim);
+            }
+            for victim in &victims {
+                let bytes = state
+                    .entries
+                    .get(victim)
+                    .map_or(0, |entry| entry.transcript_bytes);
+                state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
+                if let Some(entry) = state.entries.get_mut(victim) {
+                    entry.status = SessionHydrationStatus::MetadataLoaded;
+                    entry.last_error = None;
+                }
+            }
+            if let Some(entry) = state.entries.get_mut(session_id) {
+                entry.status = SessionHydrationStatus::Hydrating;
+                entry.last_error = None;
+            }
+            victims
+        };
+        for victim in victims {
+            self.runtime.remove_active_runtime_if_present(&victim);
+            self.resource_lifecycle.unregister(&victim).await;
+            tracing::info!(
+                session_id = victim,
+                "evicted unpinned hot Runtime carrier under byte budget"
+            );
+        }
+    }
+
+    async fn finish_hydration(&self, session_id: &str, result: Result<(), &str>) {
+        let mut state = self.working_set.lock().await;
+        let previous = state.entries.get(session_id).map(|entry| entry.status);
+        let bytes = state
+            .entries
+            .get(session_id)
+            .map_or(0, |entry| entry.transcript_bytes);
+        match result {
+            Ok(()) => {
+                if previous != Some(SessionHydrationStatus::Ready) {
+                    state.hot_bytes = state.hot_bytes.saturating_add(bytes);
+                }
+                if let Some(entry) = state.entries.get_mut(session_id) {
+                    entry.status = SessionHydrationStatus::Ready;
+                    entry.last_error = None;
+                }
+            }
+            Err(error) => {
+                if previous == Some(SessionHydrationStatus::Ready) {
+                    state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
+                }
+                if let Some(entry) = state.entries.get_mut(session_id) {
+                    entry.status = SessionHydrationStatus::Degraded;
+                    entry.last_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+
+    async fn mark_metadata_only(&self, session_id: &str) {
+        let mut state = self.working_set.lock().await;
+        let bytes = state
+            .entries
+            .get(session_id)
+            .filter(|entry| entry.status == SessionHydrationStatus::Ready)
+            .map_or(0, |entry| entry.transcript_bytes);
+        state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
+        if let Some(entry) = state.entries.get_mut(session_id) {
+            entry.status = SessionHydrationStatus::MetadataLoaded;
+            entry.last_error = None;
+        }
+    }
+
+    pub(crate) async fn working_set_projection(&self) -> SessionWorkingSetProjection {
+        let state = self.working_set.lock().await;
+        let mut projection = SessionWorkingSetProjection {
+            hot_bytes: state.hot_bytes,
+            byte_budget: self.recovery.hot_bytes as u64,
+            ..SessionWorkingSetProjection::default()
+        };
+        projection.entries = state.entries.values().cloned().collect();
+        projection.entries.sort_by_key(|entry| {
+            (
+                std::cmp::Reverse(entry.last_activity_ms),
+                entry.session_id.clone(),
+            )
+        });
+        for entry in &projection.entries {
+            match entry.status {
+                SessionHydrationStatus::MetadataLoaded => projection.metadata_loaded += 1,
+                SessionHydrationStatus::Hydrating => projection.hydrating += 1,
+                SessionHydrationStatus::Ready => projection.ready += 1,
+                SessionHydrationStatus::Degraded => projection.degraded += 1,
+            }
+        }
+        projection
+    }
+
+    async fn refresh_working_set_signals(&self) {
+        let pending = self
+            .runtime
+            .runtime_services()
+            .approval_queue()
+            .pending()
+            .into_iter()
+            .filter_map(|approval| approval.source.session_id)
+            .collect::<BTreeSet<_>>();
+        let continuations = self
+            .runtime
+            .running_session_execution_indices()
+            .into_iter()
+            .map(|index| index.session_id)
+            .collect::<BTreeSet<_>>();
+        let writer_leases = self
+            .runtime
+            .active_lease_session_ids()
+            .await
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let session_ids = self
+            .working_set
+            .lock()
+            .await
+            .entries
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            let Ok(Some(mut manifest)) = self
+                .runtime
+                .session_kernel()
+                .stored_recovery_manifest(&session_id)
+                .await
+            else {
+                continue;
+            };
+            let pending_approval = pending.contains(&session_id);
+            if manifest.pending_approval != pending_approval {
+                if let Ok(Some(updated)) = self
+                    .runtime
+                    .session_kernel()
+                    .set_recovery_signal(
+                        &session_id,
+                        SessionRecoverySignal::PendingApproval,
+                        pending_approval,
+                        current_time_ms(),
+                    )
+                    .await
+                {
+                    manifest = updated;
+                }
+            }
+            if continuations.contains(&session_id) && !manifest.mission_agent_team_continuation {
+                if let Ok(Some(updated)) = self
+                    .runtime
+                    .session_kernel()
+                    .set_recovery_signal(
+                        &session_id,
+                        SessionRecoverySignal::MissionAgentTeamContinuation,
+                        true,
+                        current_time_ms(),
+                    )
+                    .await
+                {
+                    manifest = updated;
+                }
+            }
+            let extra_reasons = writer_leases
+                .contains(&session_id)
+                .then_some("writer_lease")
+                .into_iter();
+            self.register_manifest_metadata(&manifest, extra_reasons)
+                .await;
+        }
+    }
+
+    async fn is_pinned(&self, session_id: &str) -> bool {
+        self.working_set
+            .lock()
+            .await
+            .entries
+            .get(session_id)
+            .is_some_and(|entry| !entry.pin_reasons.is_empty())
+    }
+
+    async fn evict_one_unpinned_for_capacity(&self, exclude: &str) -> Option<String> {
+        let victim = {
+            let mut state = self.working_set.lock().await;
+            let victim = state
+                .entries
+                .values()
+                .filter(|entry| {
+                    entry.session_id != exclude
+                        && entry.status == SessionHydrationStatus::Ready
+                        && entry.pin_reasons.is_empty()
+                })
+                .min_by_key(|entry| (entry.last_activity_ms, entry.session_id.clone()))
+                .map(|entry| entry.session_id.clone())?;
+            let bytes = state
+                .entries
+                .get(&victim)
+                .map_or(0, |entry| entry.transcript_bytes);
+            state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
+            if let Some(entry) = state.entries.get_mut(&victim) {
+                entry.status = SessionHydrationStatus::MetadataLoaded;
+            }
+            victim
+        };
+        self.runtime.remove_active_runtime_if_present(&victim);
+        self.resource_lifecycle.unregister(&victim).await;
+        Some(victim)
     }
 
     pub(crate) async fn ensure_session(
@@ -239,6 +564,15 @@ impl UnifiedSessionManager {
                     record
                 }
             };
+            let manifest = self
+                .runtime
+                .session_kernel()
+                .stored_recovery_manifest(session_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .unwrap_or_else(|| manifest_from_record(&record));
+            self.register_manifest_metadata(&manifest, []).await;
+            self.finish_hydration(session_id, Ok(())).await;
             return Ok(EnsureSessionOutcome {
                 session_id: session_id.to_string(),
                 model: record
@@ -254,10 +588,15 @@ impl UnifiedSessionManager {
         if existing.is_none()
             && session_kernel.list_active_session_ids().len() >= self.max_active_sessions
         {
-            return Err(format!(
-                "active session limit {} reached",
-                self.max_active_sessions
-            ));
+            self.refresh_working_set_signals().await;
+            self.evict_one_unpinned_for_capacity(session_id)
+                .await
+                .ok_or_else(|| {
+                    format!(
+                        "active session limit {} reached and all hot Runtime carriers are pinned",
+                        self.max_active_sessions
+                    )
+                })?;
         }
 
         let created = existing.is_none();
@@ -273,15 +612,15 @@ impl UnifiedSessionManager {
                 .len()
                 >= self.max_active_sessions
         {
+            self.refresh_working_set_signals().await;
             let victim = self
-                .resource_lifecycle
-                .evict_one_for_capacity()
+                .evict_one_unpinned_for_capacity(session_id)
                 .await
                 .ok_or_else(|| {
-                    "active Session registry is full but lifecycle has no eviction candidate"
+                    "active Session registry is full and all hot Runtime carriers are pinned"
                         .to_string()
                 })?;
-            self.runtime.remove_active_runtime_if_present(&victim);
+            tracing::info!(session_id = victim, "evicted unpinned hot Runtime carrier");
         }
         let model = request
             .model
@@ -296,18 +635,34 @@ impl UnifiedSessionManager {
             })
             .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
 
+        let manifest = self
+            .runtime
+            .session_kernel()
+            .stored_recovery_manifest(session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| manifest_from_record(&record));
+        self.begin_hydration(session_id, &manifest).await;
         if let Err(error) = self
             .runtime
-            .activate_persisted_session(session_id, Some(&model), request.source.system_prompt())
+            .activate_persisted_session(
+                session_id,
+                Some(&model),
+                request.source.system_prompt(),
+                self.recovery,
+            )
             .await
         {
+            self.finish_hydration(session_id, Err(&error)).await;
             if created {
                 return Err(self.rollback_created_session(&record, error).await);
             }
             return Err(error);
         }
+        self.finish_hydration(session_id, Ok(())).await;
         if let Err(error) = self.register_lifecycle(session_id, !created).await {
             self.runtime.remove_active_runtime_if_present(session_id);
+            self.mark_metadata_only(session_id).await;
             self.resource_lifecycle.unregister(session_id).await;
             if created {
                 return Err(self.rollback_created_session(&record, error).await);
@@ -480,6 +835,7 @@ impl UnifiedSessionManager {
         let _guard = lock.lock().await;
         let removed = self.runtime.remove_active_runtime_if_present(session_id);
         self.resource_lifecycle.unregister(session_id).await;
+        self.mark_metadata_only(session_id).await;
         removed
     }
 
@@ -501,31 +857,25 @@ impl UnifiedSessionManager {
             .delete_stored_session_with_mission_outbox(&request)
             .await
             .map_err(|error| error.to_string())?;
+        let mut state = self.working_set.lock().await;
+        if let Some(entry) = state.entries.remove(session_id) {
+            if entry.status == SessionHydrationStatus::Ready {
+                state.hot_bytes = state.hot_bytes.saturating_sub(entry.transcript_bytes);
+            }
+        }
         Ok(true)
     }
 
     pub(crate) async fn recover_active_sessions(&self) -> SessionRecoverySummary {
         let mut summary = SessionRecoverySummary::default();
         let mut offset = 0usize;
-        let mut records = Vec::new();
-        const PAGE_SIZE: usize = 100;
+        let mut manifests = Vec::new();
+        let page_size = self.recovery.manifest_page_size;
         loop {
-            let options = memory::store::session::SessionListOptions {
-                query: None,
-                model: None,
-                status: Some("active"),
-                // Recovery activates each page and may update last_activity.
-                // Page on immutable creation order so offset pagination cannot
-                // skip records that move while earlier pages are restored.
-                sort: "created_at",
-                order: "asc",
-                limit: PAGE_SIZE,
-                offset,
-            };
             let page = match self
                 .runtime
                 .session_kernel()
-                .list_stored_sessions_page(&options)
+                .active_recovery_manifests(offset, page_size)
                 .await
             {
                 Ok(Some(page)) => page,
@@ -536,32 +886,152 @@ impl UnifiedSessionManager {
                     break;
                 }
             };
-            if page.records.is_empty() {
+            if page.is_empty() {
                 break;
             }
-            summary.discovered += page.records.len();
-            let count = page.records.len();
-            records.extend(page.records);
+            summary.discovered += page.len();
+            let count = page.len();
+            manifests.extend(page);
             offset += count;
-            if count < PAGE_SIZE {
+            if count < page_size {
                 break;
             }
         }
-        // Finish the stable paged discovery before activation. Runtime
-        // construction may update a durable Session's status or timestamps;
-        // interleaving those mutations with offset pagination can skip rows.
-        let results = stream::iter(records)
-            .map(|record| async move {
-                let was_active = self.runtime.has_active_session(&record.session_id);
-                let request = EnsureSessionRequest::new(
-                    &record.session_id,
-                    record.model.clone(),
-                    SessionSource::Internal,
-                );
+
+        let pending_approval_sessions = self
+            .runtime
+            .runtime_services()
+            .approval_queue()
+            .pending()
+            .into_iter()
+            .filter_map(|approval| approval.source.session_id)
+            .collect::<BTreeSet<_>>();
+        let continuation_sessions = self
+            .runtime
+            .running_session_execution_indices()
+            .into_iter()
+            .map(|index| index.session_id)
+            .collect::<BTreeSet<_>>();
+
+        for manifest in &mut manifests {
+            let pending_approval = pending_approval_sessions.contains(&manifest.session_id);
+            if manifest.pending_approval != pending_approval {
+                match self
+                    .runtime
+                    .session_kernel()
+                    .set_recovery_signal(
+                        &manifest.session_id,
+                        SessionRecoverySignal::PendingApproval,
+                        pending_approval,
+                        current_time_ms(),
+                    )
+                    .await
+                {
+                    Ok(Some(updated)) => *manifest = updated,
+                    Ok(None) => {}
+                    Err(error) => {
+                        summary.failed += 1;
+                        summary.failures.push(format!(
+                            "{}: failed to reconcile approval manifest: {error}",
+                            manifest.session_id
+                        ));
+                    }
+                }
+            }
+            if continuation_sessions.contains(&manifest.session_id)
+                && !manifest.mission_agent_team_continuation
+            {
+                match self
+                    .runtime
+                    .session_kernel()
+                    .set_recovery_signal(
+                        &manifest.session_id,
+                        SessionRecoverySignal::MissionAgentTeamContinuation,
+                        true,
+                        current_time_ms(),
+                    )
+                    .await
+                {
+                    Ok(Some(updated)) => *manifest = updated,
+                    Ok(None) => {}
+                    Err(error) => {
+                        summary.failed += 1;
+                        summary.failures.push(format!(
+                            "{}: failed to reconcile continuation manifest: {error}",
+                            manifest.session_id
+                        ));
+                    }
+                }
+            }
+            self.register_manifest_metadata(manifest, []).await;
+            summary.metadata_loaded += 1;
+        }
+
+        let now_ms = current_time_ms();
+        let recent_cutoff = now_ms.saturating_sub(self.recovery.recent_window_ms);
+        let mut required = Vec::new();
+        let mut attached = Vec::new();
+        let mut recent = Vec::new();
+        for manifest in manifests {
+            if manifest.in_flight_turn
+                || manifest.pending_approval
+                || manifest.mission_agent_team_continuation
+            {
+                summary.required += 1;
+                required.push(manifest);
+            } else if manifest.active_writer_or_attachment {
+                attached.push(manifest);
+            } else if manifest.last_activity_ms >= recent_cutoff {
+                recent.push(manifest);
+            }
+        }
+        attached.sort_by_key(|manifest| {
+            (
+                std::cmp::Reverse(manifest.last_activity_ms),
+                manifest.session_id.clone(),
+            )
+        });
+        recent.sort_by_key(|manifest| {
+            (
+                std::cmp::Reverse(manifest.last_activity_ms),
+                manifest.session_id.clone(),
+            )
+        });
+        let mut attached_bytes = 0u64;
+        let mut selected_attached = Vec::new();
+        for manifest in attached {
+            let projected = attached_bytes.saturating_add(manifest.transcript_bytes);
+            if projected > self.recovery.attached_bytes as u64 {
+                continue;
+            }
+            attached_bytes = projected;
+            summary.attached += 1;
+            selected_attached.push(manifest);
+        }
+        let mut recent_bytes = 0u64;
+        let mut selected_recent = Vec::new();
+        for manifest in recent {
+            let projected = recent_bytes.saturating_add(manifest.transcript_bytes);
+            if projected > self.recovery.recent_bytes as u64 {
+                continue;
+            }
+            recent_bytes = projected;
+            summary.recent += 1;
+            selected_recent.push(manifest);
+        }
+        let selected = required
+            .into_iter()
+            .chain(selected_attached)
+            .chain(selected_recent);
+        let results = stream::iter(selected)
+            .map(|manifest| async move {
+                let was_active = self.runtime.has_active_session(&manifest.session_id);
+                let request =
+                    EnsureSessionRequest::new(&manifest.session_id, None, SessionSource::Internal);
                 let result = self.ensure_session(request).await;
-                (record.session_id, was_active, result)
+                (manifest.session_id, was_active, result)
             })
-            .buffer_unordered(8)
+            .buffer_unordered(self.recovery.hydrate_concurrency)
             .collect::<Vec<_>>()
             .await;
         for (session_id, was_active, result) in results {
@@ -574,12 +1044,14 @@ impl UnifiedSessionManager {
                 }
             }
         }
+        summary.hot_bytes = self.working_set.lock().await.hot_bytes;
         summary
     }
 
     /// Apply TTL/idle/capacity policy to hot runtimes without deleting durable
     /// Session identity or transcript data.
     pub(crate) async fn run_resource_cleanup(&self) -> usize {
+        self.refresh_working_set_signals().await;
         let evicted = self.resource_lifecycle.run_cleanup().await;
         let mut terminal = self
             .resource_lifecycle
@@ -601,6 +1073,11 @@ impl UnifiedSessionManager {
         terminal.dedup();
         let mut unloaded = 0;
         for session_id in terminal {
+            if self.is_pinned(&session_id).await {
+                self.resource_lifecycle.register(&session_id).await;
+                self.resource_lifecycle.mark_active(&session_id).await;
+                continue;
+            }
             if self.unload_runtime(&session_id).await {
                 unloaded += 1;
             }
@@ -632,6 +1109,39 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn manifest_pin_reasons(manifest: &SessionRecoveryManifest) -> BTreeSet<String> {
+    let mut reasons = BTreeSet::new();
+    if manifest.in_flight_turn {
+        reasons.insert("in_flight_turn".to_string());
+    }
+    if manifest.pending_approval {
+        reasons.insert("pending_approval".to_string());
+    }
+    if manifest.active_writer_or_attachment {
+        reasons.insert("writer_or_attachment".to_string());
+    }
+    if manifest.mission_agent_team_continuation {
+        reasons.insert("mission_agent_team_continuation".to_string());
+    }
+    reasons
+}
+
+fn manifest_from_record(record: &SessionRecord) -> SessionRecoveryManifest {
+    SessionRecoveryManifest {
+        session_id: record.session_id.clone(),
+        durable_cursor: record.message_count.max(0) as u64,
+        history_revision: 0,
+        transcript_messages: record.message_count.max(0) as u64,
+        transcript_bytes: 0,
+        in_flight_turn: false,
+        pending_approval: false,
+        active_writer_or_attachment: false,
+        mission_agent_team_continuation: false,
+        last_activity_ms: 0,
+        manifest_revision: 0,
+    }
 }
 
 #[cfg(test)]
@@ -712,11 +1222,16 @@ mod tests {
         let resource_lifecycle = Arc::new(SessionLifecycleManager::new(
             runtime::session_lifecycle::SessionLifecycleConfig::default(),
         ));
+        let recovery = runtime::SessionRecoveryConfig {
+            recent_window_ms: 0,
+            ..runtime::SessionRecoveryConfig::default()
+        };
         (
             Arc::new(UnifiedSessionManager::new(
                 runtime,
                 Arc::clone(&resource_lifecycle),
                 manager_max_active_sessions,
+                recovery,
             )),
             store,
             active,
@@ -1028,7 +1543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capacity_limit_rejects_new_sessions_but_never_blocks_durable_recovery() {
+    async fn capacity_limit_evicts_only_hot_state_and_never_blocks_durable_recovery() {
         let (manager, store, active, lifecycle) = test_manager(1);
         manager
             .ensure_session(EnsureSessionRequest::new(
@@ -1070,15 +1585,22 @@ mod tests {
             lifecycle.check_session("session-durable").await,
             Some(runtime::session_lifecycle::SessionStatus::Active)
         );
-        assert!(manager
+        let replacement = manager
             .ensure_session(EnsureSessionRequest::new(
                 "session-over-limit",
                 None,
                 SessionSource::WebUi,
             ))
             .await
-            .unwrap_err()
-            .contains("active session limit"));
+            .unwrap();
+        assert!(replacement.created);
+        assert!(active.get("session-over-limit").is_some());
+        assert!(active.get("session-durable").is_none());
+        assert!(store
+            .get_session("session-durable")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -1110,7 +1632,12 @@ mod tests {
                 cleanup_interval: std::time::Duration::from_millis(5),
             },
         ));
-        let manager = UnifiedSessionManager::new(base.runtime().clone(), lifecycle, 8);
+        let manager = UnifiedSessionManager::new(
+            base.runtime().clone(),
+            lifecycle,
+            8,
+            runtime::SessionRecoveryConfig::default(),
+        );
         manager
             .ensure_session(EnsureSessionRequest::new(
                 "session-idle-cleanup",
@@ -1131,7 +1658,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_pages_through_more_than_one_hundred_sessions() {
+    async fn writer_lease_pins_hot_runtime_without_becoming_restart_durable() {
+        let (base, store, active, _) = test_manager(8);
+        let lifecycle = Arc::new(SessionLifecycleManager::new(
+            runtime::session_lifecycle::SessionLifecycleConfig {
+                idle_timeout: Some(std::time::Duration::from_millis(10)),
+                max_ttl: None,
+                max_active_sessions: 8,
+                eviction_policy: runtime::session_lifecycle::EvictionPolicy::Lru,
+                cleanup_interval: std::time::Duration::from_millis(5),
+            },
+        ));
+        let manager = UnifiedSessionManager::new(
+            base.runtime().clone(),
+            lifecycle,
+            8,
+            runtime::SessionRecoveryConfig::default(),
+        );
+        manager
+            .ensure_session(EnsureSessionRequest::new(
+                "session-writer-pin",
+                None,
+                SessionSource::WebUi,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .runtime()
+                .acquire_session_lease_value("session-writer-pin", "web:test", "collaborative",)
+                .await["ok"],
+            true
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert_eq!(manager.run_resource_cleanup().await, 0);
+        assert!(active.get("session-writer-pin").is_some());
+        let projection = manager.working_set_projection().await;
+        let entry = projection
+            .entries
+            .iter()
+            .find(|entry| entry.session_id == "session-writer-pin")
+            .unwrap();
+        assert!(entry.pin_reasons.contains("writer_lease"));
+        assert!(
+            !store
+                .get_session_recovery_manifest("session-writer-pin")
+                .await
+                .unwrap()
+                .unwrap()
+                .active_writer_or_attachment
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_pages_metadata_without_hydrating_idle_transcripts() {
         let (manager, store, active, lifecycle) = test_manager(256);
         for index in 0..125 {
             let session_id = format!("session-page-{index:03}");
@@ -1141,8 +1722,8 @@ mod tests {
                 chat_id: session_id,
                 user_id: None,
                 model: Some("test-model".to_string()),
-                created_at: Utc::now().to_rfc3339(),
-                last_activity: Utc::now().to_rfc3339(),
+                created_at: "1970-01-01T00:00:00Z".to_string(),
+                last_activity: "1970-01-01T00:00:00Z".to_string(),
                 message_count: 0,
                 reset_policy: "manual".to_string(),
                 metadata_json: None,
@@ -1156,11 +1737,332 @@ mod tests {
 
         let summary = manager.recover_active_sessions().await;
         assert_eq!(summary.discovered, 125);
-        assert_eq!(summary.recovered, 125);
+        assert_eq!(summary.metadata_loaded, 125);
+        assert_eq!(summary.recovered, 0);
         assert_eq!(summary.already_active, 0);
         assert_eq!(summary.failed, 0, "{:?}", summary.failures);
-        assert_eq!(active.list().len(), 125);
-        assert_eq!(lifecycle.status_snapshot().await.len(), 125);
+        assert_eq!(active.list().len(), 0);
+        assert_eq!(lifecycle.status_snapshot().await.len(), 0);
+        assert_eq!(manager.runtime().hydration_stats().attempts, 0);
+        assert_eq!(manager.runtime().hydration_stats().body_reads, 0);
+        let projection = manager.working_set_projection().await;
+        assert_eq!(projection.metadata_loaded, 125);
+        assert_eq!(projection.ready, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_hydrates_and_pins_in_flight_session() {
+        let (manager, store, active, _) = test_manager(16);
+        let record = SessionRecord {
+            session_id: "session-required".to_string(),
+            platform: "webui".to_string(),
+            chat_id: "session-required".to_string(),
+            user_id: None,
+            model: Some("test-model".to_string()),
+            created_at: "1970-01-01T00:00:00Z".to_string(),
+            last_activity: "1970-01-01T00:00:00Z".to_string(),
+            message_count: 0,
+            reset_policy: "manual".to_string(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            status: "active".to_string(),
+        };
+        store.upsert_session(&record).await.unwrap();
+        store
+            .append_ingress_with_runtime_outbox(
+                "session-required",
+                "user",
+                Some(r#"[{"type":"text","text":"resume"}]"#),
+                1,
+                &memory::SessionRuntimeOutboxRequest {
+                    request_id: "request-required".to_string(),
+                    turn_id: "turn-required".to_string(),
+                    message_id: "message-required".to_string(),
+                    created_at_ms: 1,
+                    runtime_options_json: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let summary = manager.recover_active_sessions().await;
+        assert_eq!(summary.required, 1);
+        assert_eq!(summary.recovered, 1);
+        assert!(active.get("session-required").is_some());
+        let stats = manager.runtime().hydration_stats();
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.body_reads, 1);
+        let projection = manager.working_set_projection().await;
+        let entry = projection
+            .entries
+            .iter()
+            .find(|entry| entry.session_id == "session-required")
+            .unwrap();
+        assert_eq!(entry.status, SessionHydrationStatus::Ready);
+        assert!(entry.pin_reasons.contains("in_flight_turn"));
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_reconciles_pending_approval_before_selection() {
+        let (manager, store, active, _) = test_manager(16);
+        store
+            .upsert_session(&SessionRecord {
+                session_id: "session-approval".to_string(),
+                platform: "webui".to_string(),
+                chat_id: "session-approval".to_string(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: "1970-01-01T00:00:00Z".to_string(),
+                last_activity: "1970-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        manager
+            .runtime()
+            .runtime_services()
+            .approval_queue()
+            .submit(runtime::SubmitGlobalApprovalRequest {
+                source: runtime::ApprovalSource {
+                    kind: runtime::ApprovalSourceKind::Session,
+                    session_id: Some("session-approval".to_string()),
+                    agent_id: None,
+                    team_id: None,
+                    mission_id: None,
+                    resource_ref: None,
+                    review_ref: None,
+                    application: None,
+                },
+                action: "write".to_string(),
+                summary: "approval required".to_string(),
+                risk: harness_contract::core::TaskRisk::High,
+                evidence_refs: Vec::new(),
+                timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+            })
+            .unwrap();
+
+        let summary = manager.recover_active_sessions().await;
+        assert_eq!(summary.required, 1);
+        assert_eq!(summary.recovered, 1);
+        assert!(active.get("session-approval").is_some());
+        let manifest = store
+            .get_session_recovery_manifest("session-approval")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(manifest.pending_approval);
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_hydrates_durable_attachment_and_mission_continuation() {
+        let (manager, store, active, _) = test_manager(16);
+        for session_id in ["session-attached", "session-mission"] {
+            store
+                .upsert_session(&SessionRecord {
+                    session_id: session_id.to_string(),
+                    platform: "webui".to_string(),
+                    chat_id: session_id.to_string(),
+                    user_id: None,
+                    model: Some("test-model".to_string()),
+                    created_at: "1970-01-01T00:00:00Z".to_string(),
+                    last_activity: "1970-01-01T00:00:00Z".to_string(),
+                    message_count: 0,
+                    reset_policy: "manual".to_string(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+        manager
+            .runtime()
+            .lifecycle_kernel()
+            .attach(
+                "session-attached",
+                session::SessionActor::new("web:test", "webui"),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_session_with_mission_outbox(
+                &store.get_session("session-mission").await.unwrap().unwrap(),
+                &SessionMissionOutboxRequest {
+                    request_id: "mission-start-recovery".to_string(),
+                    session_id: "session-mission".to_string(),
+                    title: "mission".to_string(),
+                    workspace_key: "workspace".to_string(),
+                    operation: SessionMissionOutboxOperation::Start,
+                    created_at_ms: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let summary = manager.recover_active_sessions().await;
+        assert_eq!(summary.required, 1);
+        assert_eq!(summary.attached, 1);
+        assert_eq!(summary.recovered, 2);
+        assert!(active.get("session-attached").is_some());
+        assert!(active.get("session-mission").is_some());
+        let projection = manager.working_set_projection().await;
+        let attached = projection
+            .entries
+            .iter()
+            .find(|entry| entry.session_id == "session-attached")
+            .unwrap();
+        assert!(attached.pin_reasons.contains("writer_or_attachment"));
+        let mission = projection
+            .entries
+            .iter()
+            .find(|entry| entry.session_id == "session-mission")
+            .unwrap();
+        assert!(mission
+            .pin_reasons
+            .contains("mission_agent_team_continuation"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_attach_hydrates_transcript_once() {
+        let (manager, store, active, _) = test_manager(64);
+        let record = SessionRecord {
+            session_id: "session-single-flight".to_string(),
+            platform: "webui".to_string(),
+            chat_id: "session-single-flight".to_string(),
+            user_id: None,
+            model: Some("test-model".to_string()),
+            created_at: Utc::now().to_rfc3339(),
+            last_activity: Utc::now().to_rfc3339(),
+            message_count: 0,
+            reset_policy: "manual".to_string(),
+            metadata_json: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_cost_usd: 0.0,
+            status: "active".to_string(),
+        };
+        store.upsert_session(&record).await.unwrap();
+        store
+            .insert_message(&memory::SessionMessage {
+                stable_message_id: "single-flight-message".to_string(),
+                session_id: "session-single-flight".to_string(),
+                sequence: 0,
+                role: "user".to_string(),
+                content_json: r#"[{"type":"text","text":"history"}]"#.to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let results = futures::future::join_all((0..32).map(|_| {
+            let manager = Arc::clone(&manager);
+            async move {
+                manager
+                    .ensure_session(EnsureSessionRequest::new(
+                        "session-single-flight",
+                        None,
+                        SessionSource::WebUi,
+                    ))
+                    .await
+            }
+        }))
+        .await;
+        assert!(results.into_iter().all(|result| result.is_ok()));
+        assert!(active.get("session-single-flight").is_some());
+        let stats = manager.runtime().hydration_stats();
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.body_reads, 1);
+    }
+
+    #[tokio::test]
+    async fn byte_budget_evicts_unpinned_hot_runtime_but_keeps_durable_history() {
+        let (base, store, active, _) = test_manager(8);
+        let lifecycle = Arc::new(SessionLifecycleManager::default());
+        let manager = UnifiedSessionManager::new(
+            base.runtime().clone(),
+            Arc::clone(&lifecycle),
+            8,
+            runtime::SessionRecoveryConfig {
+                hot_bytes: 1,
+                attached_bytes: 0,
+                recent_bytes: 0,
+                recent_window_ms: 0,
+                ..runtime::SessionRecoveryConfig::default()
+            },
+        );
+        for session_id in ["session-byte-a", "session-byte-b"] {
+            store
+                .upsert_session(&SessionRecord {
+                    session_id: session_id.to_string(),
+                    platform: "webui".to_string(),
+                    chat_id: session_id.to_string(),
+                    user_id: None,
+                    model: Some("test-model".to_string()),
+                    created_at: Utc::now().to_rfc3339(),
+                    last_activity: Utc::now().to_rfc3339(),
+                    message_count: 0,
+                    reset_policy: "manual".to_string(),
+                    metadata_json: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .unwrap();
+            store
+                .insert_message(&memory::SessionMessage {
+                    stable_message_id: format!("{session_id}-message"),
+                    session_id: session_id.to_string(),
+                    sequence: 0,
+                    role: "user".to_string(),
+                    content_json: r#"[{"type":"text","text":"payload"}]"#.to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: 1,
+                })
+                .await
+                .unwrap();
+        }
+        manager
+            .ensure_session(EnsureSessionRequest::new(
+                "session-byte-a",
+                None,
+                SessionSource::WebUi,
+            ))
+            .await
+            .unwrap();
+        manager
+            .ensure_session(EnsureSessionRequest::new(
+                "session-byte-b",
+                None,
+                SessionSource::WebUi,
+            ))
+            .await
+            .unwrap();
+
+        assert!(active.get("session-byte-a").is_none());
+        assert!(active.get("session-byte-b").is_some());
+        assert!(store.get_session("session-byte-a").await.unwrap().is_some());
+        let projection = manager.working_set_projection().await;
+        assert_eq!(projection.ready, 1);
+        assert_eq!(projection.metadata_loaded, 1);
     }
 
     #[tokio::test]

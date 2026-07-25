@@ -50,6 +50,7 @@ impl GatewayServices {
             Arc::clone(&runtime),
             resource_lifecycle,
             100,
+            runtime::SessionRecoveryConfig::default(),
         ));
         Self::new_with_session_manager(
             runtime,

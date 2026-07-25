@@ -209,6 +209,20 @@ impl SessionLeaseRegistry {
         });
         items
     }
+
+    /// Return sessions with at least one process-local writer lease.
+    ///
+    /// Writer leases are intentionally not restart durable. Durable Surface
+    /// attachment state is tracked by the Session lifecycle kernel instead.
+    pub async fn active_session_ids(&self) -> Vec<String> {
+        let leases = self.leases.read().await;
+        let mut session_ids = leases
+            .iter()
+            .filter_map(|(session_id, owners)| (!owners.is_empty()).then_some(session_id.clone()))
+            .collect::<Vec<_>>();
+        session_ids.sort();
+        session_ids
+    }
 }
 
 fn current_epoch_ms() -> u64 {
@@ -264,5 +278,19 @@ mod tests {
         let leases = registry.list().await;
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].mode, "exclusive");
+    }
+
+    #[tokio::test]
+    async fn active_session_ids_track_process_local_leases() {
+        let registry = SessionLeaseRegistry::default();
+        registry.acquire("s2", "web", "collaborative").await;
+        registry.acquire("s1", "tui", "collaborative").await;
+        registry.acquire("s1", "web", "collaborative").await;
+        assert_eq!(registry.active_session_ids().await, vec!["s1", "s2"]);
+
+        registry.release("s1", "tui").await;
+        assert_eq!(registry.active_session_ids().await, vec!["s1", "s2"]);
+        registry.release("s1", "web").await;
+        assert_eq!(registry.active_session_ids().await, vec!["s2"]);
     }
 }

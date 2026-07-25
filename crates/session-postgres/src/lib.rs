@@ -8,9 +8,9 @@ use std::{fs, path::Path};
 use memory::store::session::{
     OutboxFailureClass, OutboxStatus, SessionEvent, SessionListOptions, SessionListPage,
     SessionMessage, SessionMissionOutboxOperation, SessionMissionOutboxRecord,
-    SessionMissionOutboxRequest, SessionRecord, SessionRuntimeOutboxHealth,
-    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
-    SqliteSessionStore,
+    SessionMissionOutboxRequest, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionSearchResult, SessionSnapshot, SqliteSessionStore,
 };
 use postgres::{types::ToSql, Row};
 use serde::{Deserialize, Serialize};
@@ -554,6 +554,219 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         "CREATE INDEX IF NOT EXISTS idx_session_records_updated_ms
             ON session_records(updated_at_ms DESC, session_id ASC)",
     ],
+}, PostgresMigrationSpec {
+    id: "session.0006.recovery-manifest",
+    domain: SESSION_DOMAIN,
+    version: 6,
+    description: "add body-free durable session recovery manifests",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS session_recovery_manifest (
+            session_id TEXT PRIMARY KEY REFERENCES session_records(session_id) ON DELETE CASCADE,
+            durable_cursor BIGINT NOT NULL DEFAULT 0,
+            history_revision BIGINT NOT NULL DEFAULT 0,
+            transcript_messages BIGINT NOT NULL DEFAULT 0,
+            transcript_bytes BIGINT NOT NULL DEFAULT 0,
+            in_flight_turn BOOLEAN NOT NULL DEFAULT FALSE,
+            pending_approval BOOLEAN NOT NULL DEFAULT FALSE,
+            active_writer_or_attachment BOOLEAN NOT NULL DEFAULT FALSE,
+            mission_agent_team_continuation BOOLEAN NOT NULL DEFAULT FALSE,
+            last_activity_ms BIGINT NOT NULL DEFAULT 0,
+            manifest_revision BIGINT NOT NULL DEFAULT 0
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_session_recovery_required
+            ON session_recovery_manifest(
+                in_flight_turn,
+                pending_approval,
+                active_writer_or_attachment,
+                mission_agent_team_continuation,
+                last_activity_ms DESC
+            )",
+        "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
+             target_session_id TEXT,
+             bump_history BOOLEAN
+         )
+         RETURNS VOID
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             INSERT INTO session_recovery_manifest(
+                 session_id, durable_cursor, history_revision,
+                 transcript_messages, transcript_bytes, in_flight_turn,
+                 active_writer_or_attachment,
+                 mission_agent_team_continuation, last_activity_ms,
+                 manifest_revision
+             )
+             SELECT
+                 record.session_id,
+                 COALESCE((
+                     SELECT MAX(sequence) + 1 FROM session_messages
+                      WHERE session_id=record.session_id
+                 ), 0),
+                 CASE WHEN bump_history THEN 1 ELSE 0 END,
+                 COALESCE((
+                     SELECT COUNT(*) FROM session_messages
+                      WHERE session_id=record.session_id
+                 ), 0),
+                 COALESCE((
+                     SELECT SUM(
+                         octet_length(stable_message_id)
+                         + octet_length(session_id)
+                         + octet_length(role)
+                         + octet_length(content_json)
+                         + octet_length(COALESCE(token_usage_json, ''))
+                         + octet_length(COALESCE(tool_use_id, ''))
+                         + octet_length(COALESCE(tool_name, ''))
+                     )
+                     FROM session_messages WHERE session_id=record.session_id
+                 ), 0),
+                 EXISTS(
+                     SELECT 1 FROM session_runtime_outbox
+                      WHERE session_id=record.session_id
+                        AND status IN ('pending', 'claimed', 'retry_scheduled')
+                 ),
+                 COALESCE((
+                     SELECT jsonb_array_length(
+                         (event_json::jsonb)->'snapshot'->'attachments'
+                     ) > 0
+                       FROM session_events
+                      WHERE session_id=record.session_id
+                        AND event_type='session.lifecycle.v1'
+                      ORDER BY sequence DESC
+                      LIMIT 1
+                 ), FALSE),
+                 EXISTS(
+                     SELECT 1 FROM session_mission_outbox
+                      WHERE session_id=record.session_id
+                        AND operation = 'start'
+                        AND status IN ('pending', 'claimed', 'retry_scheduled')
+                 ),
+                 GREATEST(record.created_at_ms, record.updated_at_ms),
+                 1
+             FROM session_records AS record
+             WHERE record.session_id=target_session_id
+             ON CONFLICT(session_id) DO UPDATE SET
+                 durable_cursor=EXCLUDED.durable_cursor,
+                 history_revision=session_recovery_manifest.history_revision
+                     + CASE WHEN bump_history THEN 1 ELSE 0 END,
+                 transcript_messages=EXCLUDED.transcript_messages,
+                 transcript_bytes=EXCLUDED.transcript_bytes,
+                 in_flight_turn=EXCLUDED.in_flight_turn,
+                 active_writer_or_attachment=
+                     EXCLUDED.active_writer_or_attachment,
+                 mission_agent_team_continuation=
+                     EXCLUDED.mission_agent_team_continuation,
+                 last_activity_ms=GREATEST(
+                     session_recovery_manifest.last_activity_ms,
+                     EXCLUDED.last_activity_ms
+                 ),
+                 manifest_revision=
+                     session_recovery_manifest.manifest_revision + 1;
+         END
+         $$",
+        "CREATE OR REPLACE FUNCTION cowd_session_recovery_manifest_trigger()
+         RETURNS TRIGGER
+         LANGUAGE plpgsql
+         AS $$
+         DECLARE
+             target_session_id TEXT;
+         BEGIN
+             IF TG_OP = 'DELETE' THEN
+                 target_session_id := OLD.session_id;
+                 PERFORM cowd_refresh_session_recovery_manifest(
+                     target_session_id,
+                     TG_TABLE_NAME = 'session_messages'
+                 );
+                 RETURN OLD;
+             ELSE
+                 target_session_id := NEW.session_id;
+                 PERFORM cowd_refresh_session_recovery_manifest(
+                     target_session_id,
+                     TG_TABLE_NAME = 'session_messages'
+                 );
+                 RETURN NEW;
+             END IF;
+         END
+         $$",
+        "DROP TRIGGER IF EXISTS session_recovery_record_change ON session_records",
+        "CREATE TRIGGER session_recovery_record_change
+             AFTER INSERT OR UPDATE OF status, last_activity, updated_at_ms
+                ON session_records
+              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
+        "DROP TRIGGER IF EXISTS session_recovery_message_change ON session_messages",
+        "CREATE TRIGGER session_recovery_message_change
+             AFTER INSERT OR UPDATE OR DELETE ON session_messages
+              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
+        "DROP TRIGGER IF EXISTS session_recovery_lifecycle_event_change ON session_events",
+        "CREATE TRIGGER session_recovery_lifecycle_event_change
+             AFTER INSERT ON session_events
+              FOR EACH ROW
+              WHEN (NEW.event_type = 'session.lifecycle.v1')
+              EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
+        "DROP TRIGGER IF EXISTS session_recovery_runtime_outbox_change ON session_runtime_outbox",
+        "CREATE TRIGGER session_recovery_runtime_outbox_change
+             AFTER INSERT OR UPDATE OF status ON session_runtime_outbox
+              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
+        "DROP TRIGGER IF EXISTS session_recovery_mission_outbox_change ON session_mission_outbox",
+        "CREATE TRIGGER session_recovery_mission_outbox_change
+             AFTER INSERT OR UPDATE OF status ON session_mission_outbox
+              FOR EACH ROW EXECUTE FUNCTION cowd_session_recovery_manifest_trigger()",
+        "SELECT cowd_refresh_session_recovery_manifest(session_id, FALSE)
+           FROM session_records",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0007.lifecycle-recovery-signal",
+    domain: SESSION_DOMAIN,
+    version: 7,
+    description: "derive durable recovery attachment state from lifecycle events",
+    statements: &[
+        "CREATE OR REPLACE FUNCTION cowd_session_recovery_lifecycle_trigger()
+         RETURNS TRIGGER
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             UPDATE session_recovery_manifest
+                SET active_writer_or_attachment =
+                        COALESCE(
+                            jsonb_array_length(
+                                (NEW.event_json::jsonb)->'snapshot'->'attachments'
+                            ) > 0,
+                            FALSE
+                        ),
+                    last_activity_ms=GREATEST(last_activity_ms, NEW.created_at_ms),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=NEW.session_id;
+             RETURN NEW;
+         END
+         $$",
+        "DROP TRIGGER IF EXISTS session_recovery_lifecycle_event_change ON session_events",
+        "CREATE TRIGGER session_recovery_lifecycle_event_change
+             AFTER INSERT ON session_events
+              FOR EACH ROW
+              WHEN (NEW.event_type = 'session.lifecycle.v1')
+              EXECUTE FUNCTION cowd_session_recovery_lifecycle_trigger()",
+        "UPDATE session_recovery_manifest AS manifest
+            SET active_writer_or_attachment=latest.active,
+                last_activity_ms=GREATEST(
+                    manifest.last_activity_ms,
+                    latest.created_at_ms
+                ),
+                manifest_revision=manifest.manifest_revision + 1
+           FROM (
+                SELECT DISTINCT ON (session_id)
+                       session_id,
+                       COALESCE(
+                           jsonb_array_length(
+                               (event_json::jsonb)->'snapshot'->'attachments'
+                           ) > 0,
+                           FALSE
+                       ) AS active,
+                       created_at_ms
+                  FROM session_events
+                 WHERE event_type='session.lifecycle.v1'
+                 ORDER BY session_id, sequence DESC
+           ) AS latest
+          WHERE manifest.session_id=latest.session_id",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -609,6 +822,98 @@ impl PostgresSessionStore {
             .map_err(postgres_error)?
             .map(|row| row_to_session(&row))
             .transpose()
+    }
+
+    pub fn get_session_recovery_manifest(
+        &self,
+        session_id: &str,
+    ) -> memory::store::Result<Option<SessionRecoveryManifest>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT session_id, durable_cursor, history_revision,
+                        transcript_messages, transcript_bytes, in_flight_turn,
+                        pending_approval, active_writer_or_attachment,
+                        mission_agent_team_continuation, last_activity_ms,
+                        manifest_revision
+                   FROM session_recovery_manifest
+                  WHERE session_id=$1",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_recovery_manifest(&row))
+            .transpose()
+    }
+
+    pub fn list_active_session_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> memory::store::Result<Vec<SessionRecoveryManifest>> {
+        let offset = to_i64(offset, "recovery manifest offset")?;
+        let limit = to_i64(limit.max(1), "recovery manifest limit")?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT manifest.session_id, manifest.durable_cursor,
+                        manifest.history_revision, manifest.transcript_messages,
+                        manifest.transcript_bytes, manifest.in_flight_turn,
+                        manifest.pending_approval,
+                        manifest.active_writer_or_attachment,
+                        manifest.mission_agent_team_continuation,
+                        manifest.last_activity_ms, manifest.manifest_revision
+                   FROM session_recovery_manifest AS manifest
+                   JOIN session_records AS record
+                     ON record.session_id=manifest.session_id
+                  WHERE record.status='active'
+                  ORDER BY manifest.last_activity_ms DESC, manifest.session_id ASC
+                  LIMIT $1 OFFSET $2",
+                &[&limit, &offset],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_recovery_manifest)
+            .collect()
+    }
+
+    pub fn set_session_recovery_signal(
+        &self,
+        session_id: &str,
+        signal: SessionRecoverySignal,
+        active: bool,
+        observed_at_ms: u64,
+    ) -> memory::store::Result<SessionRecoveryManifest> {
+        let column = match signal {
+            SessionRecoverySignal::PendingApproval => "pending_approval",
+            SessionRecoverySignal::ActiveWriterOrAttachment => "active_writer_or_attachment",
+            SessionRecoverySignal::MissionAgentTeamContinuation => {
+                "mission_agent_team_continuation"
+            }
+        };
+        let observed_at_ms = to_u64_i64(observed_at_ms, "recovery observed_at_ms")?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let statement = format!(
+            "UPDATE session_recovery_manifest
+                SET {column}=$2,
+                    last_activity_ms=GREATEST(last_activity_ms, $3),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=$1
+          RETURNING session_id, durable_cursor, history_revision,
+                    transcript_messages, transcript_bytes, in_flight_turn,
+                    pending_approval, active_writer_or_attachment,
+                    mission_agent_team_continuation, last_activity_ms,
+                    manifest_revision"
+        );
+        connection
+            .query_opt(&statement, &[&session_id, &active, &observed_at_ms])
+            .map_err(postgres_error)?
+            .map(|row| row_to_recovery_manifest(&row))
+            .transpose()?
+            .ok_or_else(|| {
+                memory::MemoryError::Store(format!(
+                    "session recovery manifest `{session_id}` does not exist"
+                ))
+            })
     }
 
     pub fn update_session(&self, session: &SessionRecord) -> memory::store::Result<()> {
@@ -3203,6 +3508,40 @@ fn row_to_session(row: &Row) -> memory::store::Result<SessionRecord> {
     })
 }
 
+fn row_to_recovery_manifest(row: &Row) -> memory::store::Result<SessionRecoveryManifest> {
+    Ok(SessionRecoveryManifest {
+        session_id: row.try_get(0).map_err(postgres_error)?,
+        durable_cursor: i64_to_u64(
+            row.try_get(1).map_err(postgres_error)?,
+            "recovery durable cursor",
+        )?,
+        history_revision: i64_to_u64(
+            row.try_get(2).map_err(postgres_error)?,
+            "recovery history revision",
+        )?,
+        transcript_messages: i64_to_u64(
+            row.try_get(3).map_err(postgres_error)?,
+            "recovery transcript messages",
+        )?,
+        transcript_bytes: i64_to_u64(
+            row.try_get(4).map_err(postgres_error)?,
+            "recovery transcript bytes",
+        )?,
+        in_flight_turn: row.try_get(5).map_err(postgres_error)?,
+        pending_approval: row.try_get(6).map_err(postgres_error)?,
+        active_writer_or_attachment: row.try_get(7).map_err(postgres_error)?,
+        mission_agent_team_continuation: row.try_get(8).map_err(postgres_error)?,
+        last_activity_ms: i64_to_u64(
+            row.try_get(9).map_err(postgres_error)?,
+            "recovery last activity",
+        )?,
+        manifest_revision: i64_to_u64(
+            row.try_get(10).map_err(postgres_error)?,
+            "recovery manifest revision",
+        )?,
+    })
+}
+
 fn refresh_session_message_summary_tx(
     transaction: &mut PostgresTransaction<'_>,
     session_id: &str,
@@ -3441,6 +3780,28 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
     }
     fn get_session(&self, v: &str) -> memory::store::Result<Option<SessionRecord>> {
         self.get_session(v)
+    }
+    fn get_session_recovery_manifest(
+        &self,
+        v: &str,
+    ) -> memory::store::Result<Option<SessionRecoveryManifest>> {
+        self.get_session_recovery_manifest(v)
+    }
+    fn list_active_session_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> memory::store::Result<Vec<SessionRecoveryManifest>> {
+        self.list_active_session_recovery_manifests(offset, limit)
+    }
+    fn set_session_recovery_signal(
+        &self,
+        session_id: &str,
+        signal: SessionRecoverySignal,
+        active: bool,
+        observed_at_ms: u64,
+    ) -> memory::store::Result<SessionRecoveryManifest> {
+        self.set_session_recovery_signal(session_id, signal, active, observed_at_ms)
     }
     fn update_session(&self, v: &SessionRecord) -> memory::store::Result<()> {
         self.update_session(v)

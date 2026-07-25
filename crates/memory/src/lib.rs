@@ -227,8 +227,8 @@ pub use state_rebuilder::{
 pub use store::session::{
     OutboxFailureClass, OutboxStatus, SessionEvent, SessionMessage, SessionMissionOutboxOperation,
     SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
-    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
-    SessionSearchResult, SessionSnapshot,
+    SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeOutboxHealth,
+    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
 };
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use store::{FtsSearchOptions, FtsSearchResult, MemoryStore, MemoryStoreCapabilities};

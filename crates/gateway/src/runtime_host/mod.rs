@@ -413,6 +413,7 @@ pub struct RuntimeHostConfig {
     pub surface_configs: Vec<SurfaceManifest>,
     pub surface_runtime_configs: BTreeMap<String, serde_json::Value>,
     pub runtime_config: Option<serde_json::Value>,
+    pub session_recovery: runtime::SessionRecoveryConfig,
     pub webui_dir: Option<PathBuf>,
     pub cors_origins: Vec<String>,
     pub auth_token: Option<String>,
@@ -952,6 +953,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Arc::clone(&runtime_service),
         Arc::clone(&lifecycle),
         100,
+        config.session_recovery,
     ));
     let session_activation_port: Arc<dyn crate::runtime_service::SessionActivationPort> =
         session_manager.clone();
@@ -1004,9 +1006,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         let summary = session_manager.recover_active_sessions().await;
         tracing::info!(
             discovered = summary.discovered,
+            metadata_loaded = summary.metadata_loaded,
+            required = summary.required,
+            attached = summary.attached,
+            recent = summary.recent,
             recovered = summary.recovered,
             already_active = summary.already_active,
             failed = summary.failed,
+            hot_bytes = summary.hot_bytes,
             "session startup recovery completed"
         );
         for failure in summary.failures {
@@ -1346,6 +1353,7 @@ mod tests {
             surface_configs: vec![],
             surface_runtime_configs: BTreeMap::new(),
             runtime_config: None,
+            session_recovery: runtime::SessionRecoveryConfig::default(),
             webui_dir: None,
             cors_origins: vec![],
             auth_token: None,
@@ -1465,6 +1473,7 @@ mod tests {
             surface_configs: vec![],
             surface_runtime_configs: BTreeMap::new(),
             runtime_config: None,
+            session_recovery: runtime::SessionRecoveryConfig::default(),
             webui_dir: None,
             cors_origins: vec!["http://localhost:3000".into()],
             auth_token: Some("secret-token".into()),
@@ -1483,6 +1492,7 @@ mod tests {
             surface_configs: vec![],
             surface_runtime_configs: BTreeMap::new(),
             runtime_config: None,
+            session_recovery: runtime::SessionRecoveryConfig::default(),
             webui_dir: None,
             cors_origins: vec![],
             auth_token: None,
@@ -1557,6 +1567,7 @@ mod tests {
             surface_configs: vec![surface],
             surface_runtime_configs: BTreeMap::new(),
             runtime_config: Some(serde_json::json!({"model": "test-model"})),
+            session_recovery: runtime::SessionRecoveryConfig::default(),
             webui_dir: Some(webui_dir.clone()),
             cors_origins: vec!["http://localhost:3000".into()],
             auth_token: Some("do-not-log-this-token".into()),

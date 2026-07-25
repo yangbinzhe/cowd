@@ -374,6 +374,18 @@ apps:
 
 gateway:
   enabled: true
+  # 启动只读取会话恢复清单；必须续接和最近会话才按字节预算进入热 Runtime。
+  # 所有限制只治理进程内热态，不截断或删除持久化会话历史。
+  recovery:
+    hot_bytes: 536870912
+    attached_bytes: 134217728
+    recent_bytes: 268435456
+    recent_window_ms: 60000
+    manifest_page_size: 256
+    hydrate_concurrency: 8
+    hydrate_page_messages: 1024
+    max_session_hydrate_bytes: 536870912
+    stable_snapshot_attempts: 16
   # 会话重置策略: daily | idle | both | always | none
   # 控制平台会话（飞书/邮件）何时自动结束并开启新对话
   session_reset: "none"

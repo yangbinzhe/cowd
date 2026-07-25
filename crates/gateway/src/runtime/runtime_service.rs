@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
@@ -419,6 +420,33 @@ fn reconcile_session_execution_indices(
     }
 }
 
+fn stored_message_bytes(message: &memory::SessionMessage) -> usize {
+    message
+        .stable_message_id
+        .len()
+        .saturating_add(message.session_id.len())
+        .saturating_add(message.role.len())
+        .saturating_add(message.content_json.len())
+        .saturating_add(
+            message
+                .token_usage_json
+                .as_ref()
+                .map_or(0, std::string::String::len),
+        )
+        .saturating_add(
+            message
+                .tool_use_id
+                .as_ref()
+                .map_or(0, std::string::String::len),
+        )
+        .saturating_add(
+            message
+                .tool_name
+                .as_ref()
+                .map_or(0, std::string::String::len),
+        )
+}
+
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
     sessions: Arc<ActiveSessions>,
@@ -434,6 +462,9 @@ pub(crate) struct RuntimeService {
     session_event_relays: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
     session_activation_locks: Arc<Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>>,
+    hydration_attempts: Arc<AtomicU64>,
+    hydration_body_reads: Arc<AtomicU64>,
+    hydration_body_bytes: Arc<AtomicU64>,
     approval_gate: Option<Arc<runtime::approval_gate::SmartApprovalGate>>,
     provider_registry: Arc<runtime::ProviderRegistry>,
     upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
@@ -443,6 +474,13 @@ pub(crate) struct RuntimeService {
     runtime_services: Arc<runtime::RuntimeServices>,
     session_input_router: Arc<runtime::SessionInputRouter>,
     session_activator: Arc<OnceLock<Weak<dyn SessionActivationPort>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SessionHydrationStats {
+    pub(crate) attempts: u64,
+    pub(crate) body_reads: u64,
+    pub(crate) body_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -491,6 +529,9 @@ impl RuntimeService {
             session_event_relays: Arc::new(Mutex::new(BTreeMap::new())),
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
             session_activation_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            hydration_attempts: Arc::new(AtomicU64::new(0)),
+            hydration_body_reads: Arc::new(AtomicU64::new(0)),
+            hydration_body_bytes: Arc::new(AtomicU64::new(0)),
             approval_gate: None,
             provider_registry,
             upgrade_coordinator,
@@ -1374,6 +1415,15 @@ impl RuntimeService {
         self.sessions.get(session_id).is_some()
     }
 
+    #[must_use]
+    pub(crate) fn hydration_stats(&self) -> SessionHydrationStats {
+        SessionHydrationStats {
+            attempts: self.hydration_attempts.load(Ordering::Relaxed),
+            body_reads: self.hydration_body_reads.load(Ordering::Relaxed),
+            body_bytes: self.hydration_body_bytes.load(Ordering::Relaxed),
+        }
+    }
+
     /// Lazily activate a persisted session for a new ingress turn. Persisted
     /// session identity remains owned by UnifiedSessionStore; this only adds
     /// the process-local runtime required to execute work.
@@ -1382,6 +1432,7 @@ impl RuntimeService {
         session_id: &str,
         model_hint: Option<&str>,
         system_prompt: Vec<String>,
+        recovery: runtime::SessionRecoveryConfig,
     ) -> Result<(), String> {
         let activation_lock = {
             let mut locks = self
@@ -1425,68 +1476,44 @@ impl RuntimeService {
             .or(stored_model)
             .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
         let session = if let Some(record) = stored_record {
-            // A missing arbitrary truncation is deliberate. Runtime's context
-            // builder owns prompt budgeting; silently dropping durable turns
-            // here is indistinguishable from memory loss. The guard prevents a
-            // corrupt store from exhausting the Gateway process.
-            const MAX_HYDRATED_MESSAGES: usize = 50_000;
-            const MAX_HYDRATED_BYTES: usize = 128 * 1024 * 1024;
-            const MAX_STABLE_SNAPSHOT_ATTEMPTS: usize = 16;
+            self.hydration_attempts.fetch_add(1, Ordering::Relaxed);
             let mut messages = None;
-            for attempt in 1..=MAX_STABLE_SNAPSHOT_ATTEMPTS {
+            for attempt in 1..=recovery.stable_snapshot_attempts {
                 let total_before = self
                     .session_kernel
                     .stored_message_count(session_id)
                     .await
                     .map_err(|error| error.to_string())?
                     .unwrap_or_default();
-                if total_before > MAX_HYDRATED_MESSAGES {
-                    return Err(format!(
-                        "session {session_id} contains {total_before} messages, above the safe runtime hydration limit {MAX_HYDRATED_MESSAGES}; compact or checkpoint it before activation"
-                    ));
-                }
-                let candidate = self
-                    .session_kernel
-                    .stored_messages(session_id, 0, total_before)
-                    .await
-                    .map_err(|error| error.to_string())?
-                    .unwrap_or_default();
-                let hydrated_bytes = candidate.iter().try_fold(0usize, |total, message| {
-                    let message_bytes = message
-                        .stable_message_id
-                        .len()
-                        .saturating_add(message.session_id.len())
-                        .saturating_add(message.role.len())
-                        .saturating_add(message.content_json.len())
-                        .saturating_add(
-                            message
-                                .token_usage_json
-                                .as_ref()
-                                .map_or(0, std::string::String::len),
-                        )
-                        .saturating_add(
-                            message
-                                .tool_use_id
-                                .as_ref()
-                                .map_or(0, std::string::String::len),
-                        )
-                        .saturating_add(
-                            message
-                                .tool_name
-                                .as_ref()
-                                .map_or(0, std::string::String::len),
-                        );
-                    total.checked_add(message_bytes)
-                });
-                let Some(hydrated_bytes) = hydrated_bytes else {
-                    return Err(format!(
-                        "session {session_id} hydration byte accounting overflowed; compact or checkpoint it before activation"
-                    ));
-                };
-                if hydrated_bytes > MAX_HYDRATED_BYTES {
-                    return Err(format!(
-                        "session {session_id} durable payload is {hydrated_bytes} bytes, above the safe runtime hydration limit {MAX_HYDRATED_BYTES}; compact or checkpoint it before activation"
-                    ));
+                let mut candidate = Vec::with_capacity(total_before);
+                let mut hydrated_bytes = 0usize;
+                while candidate.len() < total_before {
+                    let remaining = total_before.saturating_sub(candidate.len());
+                    let page_limit = recovery.hydrate_page_messages.min(remaining);
+                    let page = self
+                        .session_kernel
+                        .stored_messages(session_id, candidate.len(), page_limit)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .unwrap_or_default();
+                    self.hydration_body_reads.fetch_add(1, Ordering::Relaxed);
+                    if page.is_empty() {
+                        break;
+                    }
+                    for message in &page {
+                        hydrated_bytes = hydrated_bytes
+                            .checked_add(stored_message_bytes(message))
+                            .ok_or_else(|| {
+                                format!("session {session_id} hydration byte accounting overflowed")
+                            })?;
+                    }
+                    if hydrated_bytes > recovery.max_session_hydrate_bytes {
+                        return Err(format!(
+                            "session {session_id} durable payload exceeded configured gateway.recovery.max_session_hydrate_bytes={} during activation; raise the explicit limit or compact/checkpoint the session",
+                            recovery.max_session_hydrate_bytes
+                        ));
+                    }
+                    candidate.extend(page);
                 }
                 let total_after = self
                     .session_kernel
@@ -1505,15 +1532,18 @@ impl RuntimeService {
                     messages = Some((candidate, hydrated_bytes, attempt));
                     break;
                 }
-                if attempt < MAX_STABLE_SNAPSHOT_ATTEMPTS {
+                if attempt < recovery.stable_snapshot_attempts {
                     tokio::task::yield_now().await;
                 }
             }
             let (messages, hydrated_bytes, snapshot_attempts) = messages.ok_or_else(|| {
                 format!(
-                    "session {session_id} changed during all {MAX_STABLE_SNAPSHOT_ATTEMPTS} runtime hydration snapshot attempts; retry activation after ingress stabilizes"
+                    "session {session_id} changed during all {} configured runtime hydration snapshot attempts; retry activation after ingress stabilizes",
+                    recovery.stable_snapshot_attempts
                 )
             })?;
+            self.hydration_body_bytes
+                .fetch_add(hydrated_bytes as u64, Ordering::Relaxed);
             tracing::info!(
                 session_id,
                 hydration_messages = messages.len(),
@@ -2901,6 +2931,10 @@ impl RuntimeService {
         owner: &str,
     ) -> serde_json::Value {
         self.lease_registry.release(session_id, owner).await
+    }
+
+    pub(crate) async fn active_lease_session_ids(&self) -> Vec<String> {
+        self.lease_registry.active_session_ids().await
     }
 
     #[must_use]

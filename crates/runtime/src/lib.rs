@@ -379,9 +379,9 @@ pub use config::{
     McpServerConfig, McpStdioServerConfig, McpTransport, McpWebSocketServerConfig, MemoryConfig,
     PlatformConfig as GatewayPlatformConfig, PostgresTopologyConfig, ResolvedPermissionMode,
     RuntimeConfig, RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig, SessionResetPolicy,
-    SessionStorageExecutionConfig, StorageBackendSelection, StorageTopologyConfig,
-    COWD_SETTINGS_SCHEMA_NAME,
+    RuntimePermissionRuleConfig, RuntimePluginConfig, ScopedMcpServerConfig, SessionRecoveryConfig,
+    SessionResetPolicy, SessionStorageExecutionConfig, StorageBackendSelection,
+    StorageTopologyConfig, COWD_SETTINGS_SCHEMA_NAME,
 };
 pub use config_validate::{
     check_unsupported_format, format_diagnostics, validate_config_file, ConfigDiagnostic,

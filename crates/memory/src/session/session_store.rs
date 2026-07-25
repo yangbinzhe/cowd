@@ -32,8 +32,9 @@ use crate::session_execution_plane::{
 use crate::store::session::{
     OutboxFailureClass, SessionEvent, SessionListOptions, SessionListPage, SessionMessage,
     SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
-    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
-    SessionSearchResult, SessionSnapshot, SqliteSessionStore,
+    SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeOutboxHealth,
+    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
+    SqliteSessionStore,
 };
 use crate::store::Result;
 
@@ -163,6 +164,41 @@ impl UnifiedSessionStore {
         let session_id = session_id.to_string();
         self.execute(move |backend| backend.get_session(&session_id))
             .await
+    }
+
+    /// Read one body-free durable recovery manifest.
+    pub async fn get_session_recovery_manifest(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionRecoveryManifest>> {
+        let session_id = session_id.to_string();
+        self.execute(move |backend| backend.get_session_recovery_manifest(&session_id))
+            .await
+    }
+
+    /// Page active recovery manifests without loading transcript rows.
+    pub async fn list_active_session_recovery_manifests(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionRecoveryManifest>> {
+        self.execute(move |backend| backend.list_active_session_recovery_manifests(offset, limit))
+            .await
+    }
+
+    /// Persist one externally-owned recovery signal.
+    pub async fn set_session_recovery_signal(
+        &self,
+        session_id: &str,
+        signal: SessionRecoverySignal,
+        active: bool,
+        observed_at_ms: u64,
+    ) -> Result<SessionRecoveryManifest> {
+        let session_id = session_id.to_string();
+        self.execute(move |backend| {
+            backend.set_session_recovery_signal(&session_id, signal, active, observed_at_ms)
+        })
+        .await
     }
 
     /// Overwrite all mutable fields of an existing session record.

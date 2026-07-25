@@ -80,6 +80,51 @@ fn mission_entries_do_not_own_execution() {
     }
 }
 
+#[test]
+fn startup_recovery_discovers_metadata_before_hydrating_selected_sessions() {
+    let manager_source = read_repo("crates/gateway/src/session/unified_manager.rs");
+    let recovery = source_between(
+        production_part(&manager_source),
+        "pub(crate) async fn recover_active_sessions",
+        "/// Apply TTL/idle/capacity policy",
+    );
+    assert!(
+        recovery.contains(".active_recovery_manifests("),
+        "startup recovery must discover sessions through body-free manifests"
+    );
+    for required_signal in [
+        "manifest.in_flight_turn",
+        "manifest.pending_approval",
+        "manifest.mission_agent_team_continuation",
+    ] {
+        assert!(
+            recovery.contains(required_signal),
+            "startup recovery must select required sessions from `{required_signal}`"
+        );
+    }
+    assert!(
+        recovery.contains("self.recovery.attached_bytes"),
+        "durable attachments must be selected under their configured byte budget"
+    );
+    for forbidden in [
+        ".list_sessions(",
+        ".stored_session(",
+        ".stored_messages(",
+        ".activate_persisted_session(",
+    ] {
+        assert!(
+            !recovery.contains(forbidden),
+            "startup discovery must not read transcript/session bodies through `{forbidden}`"
+        );
+    }
+
+    let host_source = read_repo("crates/gateway/src/runtime_host/mod.rs");
+    assert!(
+        production_part(&host_source).contains("session_manager.recover_active_sessions().await"),
+        "Gateway startup must invoke the canonical manifest recovery owner"
+    );
+}
+
 fn read_repo(path: &str) -> String {
     std::fs::read_to_string(repo_root().join(path)).expect("source file should read")
 }

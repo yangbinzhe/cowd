@@ -545,14 +545,32 @@ mod tests {
             .attach("session-a", SessionActor::new("web-1", "webui"))
             .await
             .expect("attach");
+        assert!(
+            store
+                .get_session_recovery_manifest("session-a")
+                .await
+                .expect("recovery manifest")
+                .expect("recovery row")
+                .active_writer_or_attachment
+        );
         first.mark_active("session-a").await.expect("active");
 
-        let rebuilt = SessionLifecycleKernel::with_store(store);
+        let rebuilt = SessionLifecycleKernel::with_store(Arc::clone(&store));
         let snapshot = rebuilt.snapshot("session-a").await.expect("rehydrated");
         assert_eq!(snapshot.state, SessionLifecycleState::Active);
         assert_eq!(snapshot.attachments.len(), 1);
         assert_eq!(snapshot.attachments[0].actor.id, "web-1");
         assert_eq!(snapshot.next_sequence, 2);
+
+        rebuilt.detach("session-a", "web-1").await.expect("detach");
+        assert!(
+            !store
+                .get_session_recovery_manifest("session-a")
+                .await
+                .expect("recovery manifest")
+                .expect("recovery row")
+                .active_writer_or_attachment
+        );
     }
 
     #[tokio::test]
