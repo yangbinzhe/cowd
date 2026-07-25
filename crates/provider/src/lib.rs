@@ -31,7 +31,8 @@ pub use providers::openai_compat::{OpenAiCompatClient, OpenAiCompatConfig, OpenA
 pub use providers::{
     detect_provider_kind, max_tokens_for_model, max_tokens_for_model_with_override,
     model_context_window, model_context_window_resolution, model_context_window_with_overrides,
-    ModelContextWindowResolution, ModelContextWindowSource, ProviderKind,
+    model_max_output_resolution, ModelContextWindowResolution, ModelContextWindowSource,
+    ModelMaxOutputResolution, ProviderKind,
 };
 pub use sse::{parse_frame, SseParser};
 pub use types::{

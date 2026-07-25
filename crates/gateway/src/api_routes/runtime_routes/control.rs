@@ -35,12 +35,41 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
         ),
     };
     let control = runtime_config.runtime_control();
-    let providers = runtime_config.providers();
-    let registry = model_protocol::model_registry::ModelRegistry::load()
-        .unwrap_or_else(|_| model_protocol::model_registry::ModelRegistry::empty());
+    let provider_snapshot = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.provider_registry().pin());
+    let providers = provider_snapshot.as_ref().map_or_else(
+        || runtime_config.providers(),
+        runtime::ProviderRegistrySnapshot::config,
+    );
+    let active_provider_revision = provider_snapshot
+        .as_ref()
+        .map(runtime::ProviderRegistrySnapshot::revision);
+    let active_matches_configured = provider_snapshot
+        .as_ref()
+        .is_none_or(|snapshot| snapshot.config() == runtime_config.providers());
+    let registry = model_protocol::model_registry::global_registry();
+    let configured_provider_catalog =
+        provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
+            providers: runtime_config.providers(),
+            registry,
+            model_context_windows: runtime_config.model_context_windows(),
+            max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+            configured_model: runtime_config.model(),
+            aliases: runtime_config.aliases(),
+            config_source,
+            extra_sources: Vec::new(),
+            transforms: Vec::new(),
+            warnings: config_warnings.clone(),
+        });
+    let configured_catalog_generation = configured_provider_catalog.generation;
     let provider_catalog = provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
         providers,
-        registry: &registry,
+        registry,
+        model_context_windows: runtime_config.model_context_windows(),
+        max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
         configured_model: runtime_config.model(),
         aliases: runtime_config.aliases(),
         config_source,
@@ -449,8 +478,11 @@ pub(in crate::api_routes) async fn get_runtime_control_plane(
                 "status": provider_status,
                 "source": config_source,
                 "catalog_generation": catalog_generation,
+                "configured_catalog_generation": configured_catalog_generation,
                 "catalog_updated": generated_at_ms,
                 "catalog": provider_catalog,
+                "active_provider_revision": active_provider_revision,
+                "active_matches_configured": active_matches_configured,
                 "configured": provider_configured,
                 "provider_count": provider_count,
                 "model_count": provider_model_count,

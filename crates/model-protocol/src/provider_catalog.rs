@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     fingerprint::hash_serializable,
-    model_registry::ModelRegistry,
+    model_registry::{canonical_capacity_model_id, ModelRegistry, ModelRegistryLoadStatus},
     provider_config::{ProviderProtocol, ProvidersConfig},
 };
 
-pub const PROVIDER_CATALOG_SCHEMA_VERSION: u32 = 1;
+pub const PROVIDER_CATALOG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCatalog {
@@ -66,7 +66,9 @@ pub struct ProviderCatalogModel {
     pub protocol_configured: bool,
     pub selected: bool,
     pub context_window_tokens: Option<u64>,
+    pub context_window_source: String,
     pub max_output_tokens: Option<u64>,
+    pub max_output_source: String,
     pub capabilities: Vec<String>,
 }
 
@@ -85,6 +87,8 @@ pub struct ProviderCatalogProfile {
 pub struct ProviderCatalogInput<'a> {
     pub providers: &'a ProvidersConfig,
     pub registry: &'a ModelRegistry,
+    pub model_context_windows: &'a BTreeMap<String, u32>,
+    pub max_output_tokens_override: Option<u32>,
     pub configured_model: Option<&'a str>,
     pub aliases: &'a BTreeMap<String, String>,
     pub config_source: &'a str,
@@ -150,7 +154,18 @@ impl ProviderCatalog {
                     .as_ref()
                     .is_some_and(|value| !value.trim().is_empty());
                 provider.models.iter().map(move |model_id| {
-                    let registry_info = input.registry.get(model_id);
+                    let registry_info = input.registry.capacity_model_info(model_id);
+                    let canonical = canonical_capacity_model_id(model_id);
+                    let configured_window = input
+                        .model_context_windows
+                        .get(model_id)
+                        .or_else(|| input.model_context_windows.get(canonical.as_str()))
+                        .copied();
+                    let capacity = input.registry.resolve_capacity(
+                        model_id,
+                        configured_window,
+                        input.max_output_tokens_override,
+                    );
                     ProviderCatalogModel {
                         id: model_id.clone(),
                         name: model_id.clone(),
@@ -163,10 +178,10 @@ impl ProviderCatalog {
                         effective_protocol: effective_protocol.clone(),
                         protocol_configured,
                         selected: input.configured_model == Some(model_id.as_str()),
-                        context_window_tokens: registry_info
-                            .map(|info| u64::from(info.context_window)),
-                        max_output_tokens: registry_info
-                            .map(|info| u64::from(info.max_output_tokens)),
+                        context_window_tokens: Some(u64::from(capacity.context_window_tokens)),
+                        context_window_source: capacity.context_window_source.as_str().to_string(),
+                        max_output_tokens: Some(u64::from(capacity.max_output_tokens)),
+                        max_output_source: capacity.max_output_source.as_str().to_string(),
                         capabilities: registry_info
                             .map(|info| info.capabilities.clone())
                             .unwrap_or_default(),
@@ -245,6 +260,9 @@ impl ProviderCatalog {
         {
             warnings.push("configured default model is not declared by any provider".to_string());
         }
+        if let Some(diagnostic) = input.registry.load_diagnostic() {
+            warnings.push(format!("model registry unavailable: {diagnostic}"));
+        }
         warnings.sort();
         warnings.dedup();
 
@@ -270,8 +288,24 @@ impl ProviderCatalog {
                 kind: "registry".to_string(),
                 enabled: true,
                 priority: 80,
-                status: "ready".to_string(),
-                summary: "model metadata enriches configured provider models".to_string(),
+                status: match input.registry.load_status() {
+                    ModelRegistryLoadStatus::Loaded => "ready",
+                    ModelRegistryLoadStatus::Missing => "missing",
+                    ModelRegistryLoadStatus::Invalid => "invalid",
+                }
+                .to_string(),
+                summary: match input.registry.load_status() {
+                    ModelRegistryLoadStatus::Loaded => {
+                        "user model metadata loaded; bundled capacity facts remain available"
+                    }
+                    ModelRegistryLoadStatus::Missing => {
+                        "user model metadata missing; using bundled facts and assumptions"
+                    }
+                    ModelRegistryLoadStatus::Invalid => {
+                        "user model metadata invalid; using bundled facts and assumptions"
+                    }
+                }
+                .to_string(),
             },
         ];
         sources.extend(input.extra_sources);
@@ -338,7 +372,7 @@ impl ProviderCatalog {
             warnings: &self.warnings,
         };
         format!(
-            "provider-catalog-v1-{:016x}",
+            "provider-catalog-v2-{:016x}",
             hash_serializable(&fingerprint)
         )
     }
@@ -399,6 +433,8 @@ mod tests {
         let catalog = ProviderCatalog::from_input(ProviderCatalogInput {
             providers: &providers,
             registry: &registry,
+            model_context_windows: &BTreeMap::new(),
+            max_output_tokens_override: None,
             configured_model: Some("gpt-5-mini"),
             aliases: &aliases,
             config_source: "config",
@@ -407,18 +443,24 @@ mod tests {
             warnings: Vec::new(),
         });
 
-        assert_eq!(catalog.schema_version, 1);
+        assert_eq!(catalog.schema_version, 2);
         assert_eq!(catalog.providers.len(), 2);
         assert_eq!(catalog.models.len(), 2);
         assert!(catalog.models.iter().any(|model| model.id == "gpt-5-mini"
             && model.effective_protocol == "responses"
             && model.selected));
+        assert!(catalog.models.iter().any(|model| {
+            model.id == "deepseek-v4-flash"
+                && model.context_window_tokens == Some(1_000_000)
+                && model.context_window_source == "bundled"
+                && model.max_output_tokens == Some(384_000)
+        }));
         assert!(catalog
             .profiles
             .iter()
             .any(|profile| profile.id == "alias:fast"
                 && profile.provider.as_deref() == Some("deepseek")));
-        assert!(catalog.generation.starts_with("provider-catalog-v1-"));
+        assert!(catalog.generation.starts_with("provider-catalog-v2-"));
         assert_eq!(catalog.generation, catalog.compute_generation());
     }
 
@@ -429,6 +471,8 @@ mod tests {
         let catalog = ProviderCatalog::from_input(ProviderCatalogInput {
             providers: &providers,
             registry: &registry,
+            model_context_windows: &BTreeMap::new(),
+            max_output_tokens_override: None,
             configured_model: Some("missing-model"),
             aliases: &BTreeMap::new(),
             config_source: "config",

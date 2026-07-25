@@ -198,6 +198,18 @@ impl PromptAssembly {
         crate::context_ledger::estimate_text_tokens(&self.trusted_system.join("\n\n"))
     }
 
+    /// Estimate packets that final hard-cap packing classifies as required.
+    /// Both operations call the same admission function to prevent drift.
+    #[must_use]
+    pub fn required_packet_token_estimate(&self) -> u64 {
+        self.contextual_packets
+            .iter()
+            .filter(|packet| packet_admission_rank(packet) == 0)
+            .map(PromptContextPacket::render_for_user_context)
+            .map(|packet| crate::context_ledger::estimate_text_tokens(&packet))
+            .sum()
+    }
+
     #[must_use]
     pub fn revision_fingerprint(&self) -> u64 {
         model_protocol::fingerprint::stable_hash_bytes(format!("{self:?}").as_bytes())
@@ -447,6 +459,36 @@ mod tests {
             .pack_for_hard_cap(1)
             .expect_err("required history must fail rather than disappear");
         assert_eq!(error.required_packet_ids, vec!["required-history"]);
+    }
+
+    #[test]
+    fn required_packet_estimate_uses_hard_cap_classification() {
+        let mut assembly = PromptAssembly::new(vec!["builtin".to_string()]);
+        assembly.contextual_packets.push(PromptContextPacket {
+            authority: ContextAuthority::Session,
+            source: ContextSourceKind::Conversation,
+            role: ContextRole::TaskState,
+            source_id: "required-history".to_string(),
+            content: "required".repeat(20),
+            evidence: Vec::new(),
+            utility_score_milli: 1,
+        });
+        assembly.contextual_packets.push(PromptContextPacket {
+            authority: ContextAuthority::Derived,
+            source: ContextSourceKind::Memory,
+            role: ContextRole::Evidence,
+            source_id: "optional-memory".to_string(),
+            content: "optional".repeat(20),
+            evidence: Vec::new(),
+            utility_score_milli: 1,
+        });
+
+        assert_eq!(
+            assembly.required_packet_token_estimate(),
+            crate::context_ledger::estimate_text_tokens(
+                &assembly.contextual_packets[0].render_for_user_context()
+            )
+        );
     }
 
     #[test]

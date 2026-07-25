@@ -78,7 +78,10 @@ use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::budget_policy::{clamp_context_budget_ratio_bp, RuntimeBudgetInputs, RuntimeBudgetPlan};
+use crate::budget_policy::{
+    clamp_context_budget_ratio_bp, ProviderOutputBudget, ProviderOutputBudgetInputs,
+    RuntimeBudgetInputs, RuntimeBudgetPlan,
+};
 
 static STRATEGY_EXPERIENCE_IO_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 static EVALUATION_PROVIDER_TOKEN_LEASE: OnceLock<
@@ -313,24 +316,21 @@ use crate::{
 };
 use model_protocol::usage::TokenUsage;
 
-/// Keep enough request capacity for fixed instructions, current history and a
-/// meaningful continuation even when a provider calibrates an unknown model
-/// to a much smaller context window.
-const MIN_PROVIDER_INPUT_RESERVE_TOKENS: u32 = 4_096;
-
-fn bounded_provider_output_tokens(model: &str, context_window: u32) -> u32 {
-    let provider_cap = provider::max_tokens_for_model(model);
-    let fixed_reserve_cap = context_window
-        .saturating_sub(MIN_PROVIDER_INPUT_RESERVE_TOKENS)
-        .max(1);
-    // `max_tokens` is an output ceiling, not a reason to starve the request
-    // itself. Unknown/custom models commonly report a 64k generic provider
-    // cap; on a 16k context that previously reserved 12k for output and made
-    // Cowd's own production system/tool schema impossible to send. Preserve
-    // at least half of the physical window for input while still honoring
-    // smaller provider-specific output limits.
-    let balanced_cap = (context_window / 2).max(1);
-    provider_cap.min(fixed_reserve_cap).min(balanced_cap)
+fn provider_output_budget_hint(
+    model: &str,
+    context_window: u32,
+    max_output_override: Option<u32>,
+) -> u32 {
+    let max_output = provider::model_max_output_resolution(model, max_output_override);
+    let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
+        context_window_tokens: u64::from(context_window),
+        max_output_tokens: u64::from(max_output.tokens),
+        fixed_input_tokens: 0,
+        required_input_tokens: 0,
+        protocol_overhead_tokens: 0,
+        safety_margin_tokens: 0,
+    });
+    u32::try_from(budget.requested_output_tokens).unwrap_or(u32::MAX)
 }
 
 fn provider_transport_policy(
@@ -1592,6 +1592,7 @@ pub struct ConversationRuntime<C, T> {
     model_context_window: u32,
     model_context_window_source: provider::ModelContextWindowSource,
     model_context_windows: BTreeMap<String, u32>,
+    provider_max_output_override: Option<u32>,
     calibrated_model_context_windows: std::sync::Mutex<BTreeMap<String, u32>>,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Arc<std::sync::Mutex<Option<Box<dyn HookProgressReporter + Send>>>>,
@@ -1805,7 +1806,11 @@ where
         );
         let initial_model_context_window = initial_window_resolution.tokens;
         let initial_model_max_output = feature_config.model().map_or(0, |model| {
-            bounded_provider_output_tokens(model, initial_model_context_window)
+            provider_output_budget_hint(
+                model,
+                initial_model_context_window,
+                feature_config.plugins().max_output_tokens(),
+            )
         });
         let initial_budget_plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window: initial_model_context_window,
@@ -1914,6 +1919,7 @@ where
             model_context_window: initial_model_context_window,
             model_context_window_source: initial_window_resolution.source,
             model_context_windows: feature_config.model_context_windows().clone(),
+            provider_max_output_override: feature_config.plugins().max_output_tokens(),
             calibrated_model_context_windows: std::sync::Mutex::new(BTreeMap::new()),
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: Arc::new(std::sync::Mutex::new(None)),
@@ -2402,155 +2408,172 @@ where
         let mut models_tried = Vec::new();
 
         for model in self.model_candidates_for_turn(objective) {
-            let mut request =
-                match self.pack_provider_attempt(&prompt, &messages, &model, inventory) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        tracing::warn!(
-                            model,
-                            error = %error,
-                            "provider request preflight rejected clean terminal synthesis"
-                        );
-                        last_error = Some(error);
-                        continue;
-                    }
-                };
-            let mut evaluation_reservation =
-                match EvaluationProviderTokenReservation::acquire(&mut request) {
-                    Ok(reservation) => reservation,
-                    Err(error) => {
-                        last_error = Some(error);
-                        continue;
-                    }
-                };
-            if !models_tried.contains(&model) {
-                models_tried.push(model.clone());
-            }
-            if let Some(cowd) = &self.cowd_bus {
-                cowd.emit(crate::cowd_event::CowdEvent::ProviderAttempt {
-                    model: model.clone(),
-                    models_tried: models_tried.clone(),
-                    context_window_tokens: request.budget.context_window_tokens,
-                    context_window_source: request.budget.context_window_source.clone(),
-                    packed_input_tokens: request
-                        .budget
-                        .fixed_input_tokens
-                        .saturating_add(request.budget.dynamic_input_tokens)
-                        .saturating_add(request.budget.protocol_overhead_tokens),
-                });
-            }
-            self.record_provider_context_request(
-                &request,
-                self.session().message_count(),
-                inventory,
-                self.api_client.tool_schema_cache_stats(),
-            );
-            let cancellation = self.cancellation_token.clone();
-            let stream_started = Instant::now();
-            let mut stream = self.api_client.stream(request);
-            let mut text = String::new();
-            let mut thinking = String::new();
-            let mut signature = String::new();
-            let mut calls = Vec::new();
-            let mut usage = TokenUsage::default();
-            let mut effective_model = None;
-            let mut failed = None;
-            let mut first_event_at = None;
-            use futures::StreamExt;
-            loop {
-                let event = tokio::select! {
-                    () = cancellation.cancelled() => {
-                        failed = Some(RuntimeError::new(
-                            "turn cancelled during clean terminal provider stream",
-                        ));
-                        break;
-                    }
-                    event = stream.next() => match event {
-                        Some(event) => event,
-                        None => break,
-                    }
-                };
-                first_event_at.get_or_insert_with(Instant::now);
-                match event {
-                    Ok(AssistantEvent::ProviderModel { model }) => {
-                        effective_model = Some(model);
-                    }
-                    Ok(AssistantEvent::TextDelta(delta)) => text.push_str(&delta),
-                    Ok(AssistantEvent::ThinkingDelta(delta)) => thinking.push_str(&delta),
-                    Ok(AssistantEvent::SignatureDelta(delta)) => signature.push_str(&delta),
-                    Ok(AssistantEvent::ToolUse { id, name, input }) => {
-                        calls.push(ModelToolCall {
-                            id,
-                            name,
-                            input,
-                            depends_on: Vec::new(),
-                        });
-                    }
-                    Ok(AssistantEvent::Usage(value)) => usage = value,
-                    Ok(AssistantEvent::MessageStop) => break,
-                    Ok(
-                        AssistantEvent::ToolStart { .. }
-                        | AssistantEvent::ToolProgress { .. }
-                        | AssistantEvent::ToolComplete { .. },
-                    ) => {}
-                    Err(error) => {
-                        failed = Some(error);
-                        break;
-                    }
-                }
-            }
-            drop(stream);
-            if let Some(reservation) = evaluation_reservation.as_mut() {
-                reservation.reconcile(usage);
-            }
-            self.reconcile_provider_context_usage(usage);
-            if let Some(error) = failed {
-                if error.is_provider_tool_protocol_failure() {
-                    return Err(error);
-                }
-                last_error = Some(error);
-                continue;
-            }
-
-            let mut blocks = Vec::new();
-            if !thinking.is_empty() {
-                blocks.push(ContentBlock::Thinking {
-                    thinking,
-                    signature: (!signature.is_empty()).then_some(signature),
-                });
-            }
-            blocks.push(ContentBlock::Text { text: text.clone() });
-            for call in &calls {
-                blocks.push(ContentBlock::ToolUse {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    input: call.input.clone(),
-                });
-            }
-            let effective_model = effective_model.or(Some(model));
-            if let Some(model) = effective_model.as_ref() {
-                if !models_tried.contains(model) {
+            let mut calibration_retried = false;
+            'candidate_attempt: loop {
+                let mut request =
+                    match self.pack_provider_attempt(&prompt, &messages, &model, inventory) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            tracing::warn!(
+                                model,
+                                error = %error,
+                                "provider request preflight rejected clean terminal synthesis"
+                            );
+                            last_error = Some(error);
+                            break 'candidate_attempt;
+                        }
+                    };
+                let mut evaluation_reservation =
+                    match EvaluationProviderTokenReservation::acquire(&mut request) {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            last_error = Some(error);
+                            break 'candidate_attempt;
+                        }
+                    };
+                if !models_tried.contains(&model) {
                     models_tried.push(model.clone());
                 }
+                if let Some(cowd) = &self.cowd_bus {
+                    cowd.emit(crate::cowd_event::CowdEvent::ProviderAttempt {
+                        model: model.clone(),
+                        models_tried: models_tried.clone(),
+                        context_window_tokens: request.budget.context_window_tokens,
+                        context_window_source: request.budget.context_window_source.clone(),
+                        packed_input_tokens: request
+                            .budget
+                            .fixed_input_tokens
+                            .saturating_add(request.budget.dynamic_input_tokens)
+                            .saturating_add(request.budget.protocol_overhead_tokens),
+                    });
+                }
+                self.record_provider_context_request(
+                    &request,
+                    self.session().message_count(),
+                    inventory,
+                    self.api_client.tool_schema_cache_stats(),
+                );
+                let cancellation = self.cancellation_token.clone();
+                let stream_started = Instant::now();
+                let mut stream = self.api_client.stream(request);
+                let mut text = String::new();
+                let mut thinking = String::new();
+                let mut signature = String::new();
+                let mut calls = Vec::new();
+                let mut usage = TokenUsage::default();
+                let mut effective_model = None;
+                let mut failed = None;
+                let mut first_event_at = None;
+                use futures::StreamExt;
+                loop {
+                    let event = tokio::select! {
+                        () = cancellation.cancelled() => {
+                            failed = Some(RuntimeError::new(
+                                "turn cancelled during clean terminal provider stream",
+                            ));
+                            break;
+                        }
+                        event = stream.next() => match event {
+                            Some(event) => event,
+                            None => break,
+                        }
+                    };
+                    first_event_at.get_or_insert_with(Instant::now);
+                    match event {
+                        Ok(AssistantEvent::ProviderModel { model }) => {
+                            effective_model = Some(model);
+                        }
+                        Ok(AssistantEvent::TextDelta(delta)) => text.push_str(&delta),
+                        Ok(AssistantEvent::ThinkingDelta(delta)) => thinking.push_str(&delta),
+                        Ok(AssistantEvent::SignatureDelta(delta)) => signature.push_str(&delta),
+                        Ok(AssistantEvent::ToolUse { id, name, input }) => {
+                            calls.push(ModelToolCall {
+                                id,
+                                name,
+                                input,
+                                depends_on: Vec::new(),
+                            });
+                        }
+                        Ok(AssistantEvent::Usage(value)) => usage = value,
+                        Ok(AssistantEvent::MessageStop) => break,
+                        Ok(
+                            AssistantEvent::ToolStart { .. }
+                            | AssistantEvent::ToolProgress { .. }
+                            | AssistantEvent::ToolComplete { .. },
+                        ) => {}
+                        Err(error) => {
+                            failed = Some(error);
+                            break;
+                        }
+                    }
+                }
+                drop(stream);
+                if let Some(reservation) = evaluation_reservation.as_mut() {
+                    reservation.reconcile(usage);
+                }
+                self.reconcile_provider_context_usage(usage);
+                if let Some(error) = failed {
+                    if error.is_provider_tool_protocol_failure() {
+                        return Err(error);
+                    }
+                    if !calibration_retried {
+                        if let Some(observed_limit) = error.provider_context_window_limit() {
+                            if self.calibrate_model_context_window(&model, observed_limit) {
+                                calibration_retried = true;
+                                tracing::info!(
+                                model,
+                                observed_limit,
+                                "provider context window calibrated; retrying clean terminal candidate once"
+                            );
+                                continue 'candidate_attempt;
+                            }
+                        }
+                    }
+                    last_error = Some(error);
+                    break 'candidate_attempt;
+                }
+
+                let mut blocks = Vec::new();
+                if !thinking.is_empty() {
+                    blocks.push(ContentBlock::Thinking {
+                        thinking,
+                        signature: (!signature.is_empty()).then_some(signature),
+                    });
+                }
+                blocks.push(ContentBlock::Text { text: text.clone() });
+                for call in &calls {
+                    blocks.push(ContentBlock::ToolUse {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        input: call.input.clone(),
+                    });
+                }
+                let effective_model = effective_model.or(Some(model));
+                if let Some(model) = effective_model.as_ref() {
+                    if !models_tried.contains(model) {
+                        models_tried.push(model.clone());
+                    }
+                }
+                return Ok(ModelStepResult {
+                    intent: classify_model_step_intent(text, calls),
+                    assistant_message: ConversationMessage {
+                        role: crate::session::MessageRole::Assistant,
+                        blocks,
+                        usage: Some(usage),
+                    },
+                    usage,
+                    model: effective_model,
+                    models_used: models_tried.clone(),
+                    first_token_latency_ms: first_event_at.map(|first| {
+                        u64::try_from(first.saturating_duration_since(stream_started).as_millis())
+                            .unwrap_or(u64::MAX)
+                    }),
+                    active_stream_duration_ms: first_event_at
+                        .map(|first| millis_since(first).max(1)),
+                    wall_duration_ms: millis_since(started_at).max(1),
+                    text_only_response: true,
+                });
             }
-            return Ok(ModelStepResult {
-                intent: classify_model_step_intent(text, calls),
-                assistant_message: ConversationMessage {
-                    role: crate::session::MessageRole::Assistant,
-                    blocks,
-                    usage: Some(usage),
-                },
-                usage,
-                model: effective_model,
-                models_used: models_tried.clone(),
-                first_token_latency_ms: first_event_at.map(|first| {
-                    u64::try_from(first.saturating_duration_since(stream_started).as_millis())
-                        .unwrap_or(u64::MAX)
-                }),
-                active_stream_duration_ms: first_event_at.map(|first| millis_since(first).max(1)),
-                wall_duration_ms: millis_since(started_at).max(1),
-                text_only_response: true,
-            });
         }
 
         Err(last_error.unwrap_or_else(|| {
@@ -3129,7 +3152,11 @@ where
             .as_deref()
             .filter(|model| !model.is_empty())
             .map_or(0, |model| {
-                bounded_provider_output_tokens(model, self.context_window_for_model(model))
+                provider_output_budget_hint(
+                    model,
+                    self.context_window_for_model(model),
+                    self.provider_max_output_override,
+                )
             });
         RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window: self.model_context_window,
@@ -3156,7 +3183,11 @@ where
             .iter()
             .filter(|model| !model.trim().is_empty())
             .map(|model| {
-                bounded_provider_output_tokens(model, self.context_window_for_model(model))
+                provider_output_budget_hint(
+                    model,
+                    self.context_window_for_model(model),
+                    self.provider_max_output_override,
+                )
             });
         let model_max_output_tokens = outputs
             .next()
@@ -3363,10 +3394,6 @@ where
     ) -> Result<ApiRequest, RuntimeError> {
         let window_resolution = self.context_window_resolution_for_model(model);
         let context_window_tokens = u64::from(window_resolution.tokens);
-        let requested_output_tokens = u64::from(bounded_provider_output_tokens(
-            model,
-            window_resolution.tokens,
-        ));
         // Protocol framing is deliberately explicit and conservative. Schema
         // payload itself is accounted separately from fixed wire framing.
         let protocol_overhead_tokens =
@@ -3380,13 +3407,38 @@ where
             model,
         );
         let fixed_input_tokens = prepared.fixed_input_tokens;
+        let required_input_tokens = prompt.required_packet_token_estimate();
+        let max_output =
+            provider::model_max_output_resolution(model, self.provider_max_output_override);
+        let output_budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
+            context_window_tokens,
+            max_output_tokens: u64::from(max_output.tokens),
+            fixed_input_tokens,
+            required_input_tokens,
+            protocol_overhead_tokens,
+            safety_margin_tokens,
+        });
+        if !output_budget.executable {
+            return Err(RuntimeError::new(format!(
+                "provider candidate `{model}` cannot fit fixed and required request components with a viable continuation: fixed={fixed_input_tokens} required={required_input_tokens} window={context_window_tokens} available_output={} output_floor={}",
+                output_budget.available_output_tokens,
+                output_budget.floor_output_tokens,
+            )));
+        }
         let mut budget = crate::context_ledger::RequestBudgetReport::for_attempt(
             model,
             context_window_tokens,
-            requested_output_tokens,
+            output_budget.requested_output_tokens,
             protocol_overhead_tokens,
             safety_margin_tokens,
             fixed_input_tokens,
+        );
+        budget.set_output_policy(
+            u64::from(max_output.tokens),
+            max_output.source.as_str(),
+            output_budget.preferred_output_tokens,
+            output_budget.floor_output_tokens,
+            required_input_tokens,
         );
         budget.set_context_window_source(window_resolution.source.as_str());
         if !budget.executable {
@@ -4141,7 +4193,11 @@ where
             .iter()
             .map(|model| {
                 let window = u64::from(self.context_window_for_model(model));
-                let output = u64::from(bounded_provider_output_tokens(model, window as u32));
+                let output = u64::from(provider_output_budget_hint(
+                    model,
+                    window as u32,
+                    self.provider_max_output_override,
+                ));
                 let protocol = 128u64
                     .saturating_add(u64::from(inventory.tool_count as u32).saturating_mul(12));
                 let safety = (window / 100).clamp(128, 2_048);
@@ -8707,7 +8763,11 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
         )
     });
     let model_max_output = feature_config.model().map_or(0, |model| {
-        bounded_provider_output_tokens(model, model_context_window)
+        provider_output_budget_hint(
+            model,
+            model_context_window,
+            feature_config.plugins().max_output_tokens(),
+        )
     });
     let ratio_bp =
         clamp_context_budget_ratio_bp(feature_config.context_budget().subsystem_budget_ratio_bp);
@@ -9827,11 +9887,14 @@ mod tests {
     }
 
     #[test]
-    fn custom_model_output_ceiling_cannot_starve_production_input_window() {
+    fn custom_model_output_budget_preserves_production_input_window() {
         let context_window = 16_384;
-        let output =
-            super::bounded_provider_output_tokens("custom-model-with-generic-cap", context_window);
-        assert_eq!(output, context_window / 2);
+        let output = super::provider_output_budget_hint(
+            "custom-model-with-generic-cap",
+            context_window,
+            None,
+        );
+        assert_eq!(output, 4_000);
 
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -9861,10 +9924,11 @@ mod tests {
             )
             .expect("production prompt and bootstrap schemas must reach a 16k custom model");
 
-        assert_eq!(
-            request.budget.requested_output_tokens,
-            u64::from(context_window / 2)
-        );
+        assert_eq!(request.budget.requested_output_tokens, u64::from(output));
+        assert_eq!(request.budget.provider_max_output_tokens, 64_000);
+        assert_eq!(request.budget.max_output_source, "assumed");
+        assert_eq!(request.budget.preferred_output_tokens, 4_000);
+        assert_eq!(request.budget.output_floor_tokens, 2_000);
         assert!(request.budget.executable);
         assert!(request.budget.fixed_input_tokens <= request.budget.hard_input_cap_tokens);
     }
@@ -10108,6 +10172,46 @@ mod tests {
         assert_eq!(windows[0].0, 128_000);
         assert_eq!(windows[1].0, 32_768);
         assert_eq!(windows[1].1, "calibrated");
+    }
+
+    #[tokio::test]
+    async fn clean_terminal_calibrates_once_and_repackages_the_same_model() {
+        let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api = CalibrationRecordingApi {
+            windows: Arc::clone(&windows),
+        };
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["builtin policy".to_string()],
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime.set_active_model("private-model");
+
+        let result = runtime
+            .execute_clean_terminal_synthesis("give a concise answer", "checked evidence")
+            .await
+            .expect("clean terminal calibrated retry should complete");
+        assert_eq!(result.model.as_deref(), Some("private-model"));
+        let windows = windows.lock().expect("windows");
+        assert_eq!(
+            windows.as_slice(),
+            &[
+                (128_000, "assumed".to_string()),
+                (32_768, "calibrated".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_max_output_override_reaches_provider_budget_policy() {
+        assert_eq!(
+            super::provider_output_budget_hint("deepseek-v4-pro", 1_000_000, Some(12_000)),
+            12_000
+        );
     }
 
     #[test]

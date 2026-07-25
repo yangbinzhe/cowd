@@ -127,6 +127,54 @@ pub struct ModelInfo {
     pub capabilities: Vec<String>,
 }
 
+/// Origin of one resolved model capacity value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapacitySource {
+    Configured,
+    UserRegistry,
+    Bundled,
+    Assumed,
+    Calibrated,
+}
+
+impl ModelCapacitySource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::UserRegistry => "user_registry",
+            Self::Bundled => "bundled",
+            Self::Assumed => "assumed",
+            Self::Calibrated => "calibrated",
+        }
+    }
+}
+
+/// Capacity facts needed by request packing. This deliberately excludes
+/// pricing, marketing metadata and protocol capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCapacity {
+    pub context_window_tokens: u32,
+    pub max_output_tokens: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModelCapacity {
+    pub context_window_tokens: u32,
+    pub max_output_tokens: u32,
+    pub context_window_source: ModelCapacitySource,
+    pub max_output_source: ModelCapacitySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRegistryLoadStatus {
+    Loaded,
+    Missing,
+    Invalid,
+}
+
 // ── YAML file shape ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +189,8 @@ struct ModelsFile {
 /// Dynamic, YAML-driven model catalogue loaded from `~/.cowd/models.yaml`.
 pub struct ModelRegistry {
     models: HashMap<String, ModelInfo>,
+    load_status: ModelRegistryLoadStatus,
+    load_diagnostic: Option<String>,
 }
 
 impl ModelRegistry {
@@ -157,6 +207,8 @@ impl ModelRegistry {
             serde_yaml::from_str(&content).map_err(|e| ModelRegistryError::Parse(e.to_string()))?;
         Ok(Self {
             models: file.models,
+            load_status: ModelRegistryLoadStatus::Loaded,
+            load_diagnostic: None,
         })
     }
 
@@ -165,6 +217,21 @@ impl ModelRegistry {
     pub fn empty() -> Self {
         Self {
             models: HashMap::new(),
+            load_status: ModelRegistryLoadStatus::Missing,
+            load_diagnostic: None,
+        }
+    }
+
+    fn unavailable(error: &ModelRegistryError) -> Self {
+        Self {
+            models: HashMap::new(),
+            load_status: match error {
+                ModelRegistryError::NotFound(_) => ModelRegistryLoadStatus::Missing,
+                ModelRegistryError::Io(_) | ModelRegistryError::Parse(_) => {
+                    ModelRegistryLoadStatus::Invalid
+                }
+            },
+            load_diagnostic: Some(error.to_string()),
         }
     }
 
@@ -172,6 +239,17 @@ impl ModelRegistry {
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&ModelInfo> {
         self.models.get(name)
+    }
+
+    /// Look up user metadata using the same deterministic routing-prefix
+    /// normalization as capacity resolution.
+    #[must_use]
+    pub fn capacity_model_info(&self, name: &str) -> Option<&ModelInfo> {
+        let trimmed = name.trim();
+        self.models.get(trimmed).or_else(|| {
+            let canonical = canonical_capacity_model_id(trimmed);
+            self.models.get(canonical.as_str())
+        })
     }
 
     /// Return all models in the registry.
@@ -186,26 +264,107 @@ impl ModelRegistry {
         self.get(name).map(|info| &info.pricing)
     }
 
+    /// Resolve W/P from explicit configuration, user metadata, bundled exact
+    /// facts, then conservative unknown-model assumptions.
+    #[must_use]
+    pub fn resolve_capacity(
+        &self,
+        name: &str,
+        explicit_context_window: Option<u32>,
+        explicit_max_output_tokens: Option<u32>,
+    ) -> ResolvedModelCapacity {
+        let user = self.capacity_model_info(name);
+        let bundled = bundled_capacity(name);
+        let (context_window_tokens, context_window_source) =
+            if let Some(tokens) = explicit_context_window {
+                (tokens, ModelCapacitySource::Configured)
+            } else if let Some(info) = user {
+                (info.context_window, ModelCapacitySource::UserRegistry)
+            } else if let Some(capacity) = bundled {
+                (capacity.context_window_tokens, ModelCapacitySource::Bundled)
+            } else {
+                (128_000, ModelCapacitySource::Assumed)
+            };
+        let (max_output_tokens, max_output_source) =
+            if let Some(tokens) = explicit_max_output_tokens {
+                (tokens, ModelCapacitySource::Configured)
+            } else if let Some(info) = user {
+                (info.max_output_tokens, ModelCapacitySource::UserRegistry)
+            } else if let Some(capacity) = bundled {
+                (capacity.max_output_tokens, ModelCapacitySource::Bundled)
+            } else {
+                (64_000, ModelCapacitySource::Assumed)
+            };
+        ResolvedModelCapacity {
+            context_window_tokens,
+            max_output_tokens,
+            context_window_source,
+            max_output_source,
+        }
+    }
+
+    #[must_use]
+    pub const fn load_status(&self) -> ModelRegistryLoadStatus {
+        self.load_status
+    }
+
+    #[must_use]
+    pub fn load_diagnostic(&self) -> Option<&str> {
+        self.load_diagnostic.as_deref()
+    }
+
     /// Maximum output tokens for a model, falling back to 64K.
     #[must_use]
     pub fn max_output_tokens_for(&self, name: &str) -> u32 {
-        self.get(name)
-            .map(|info| info.max_output_tokens)
-            .unwrap_or(64_000)
+        self.resolve_capacity(name, None, None).max_output_tokens
     }
 
     /// Context window for a model, falling back to 128K.
     #[must_use]
     pub fn context_window_for(&self, name: &str) -> u32 {
-        self.get(name)
-            .map(|info| info.context_window)
-            .unwrap_or(128_000)
+        self.resolve_capacity(name, None, None)
+            .context_window_tokens
     }
 
     // ── internal helpers ────────────────────────────────────────────────
 
     fn default_path() -> PathBuf {
         home_dir().join(dot_dir()).join("models.yaml")
+    }
+}
+
+/// Normalize only transport routing decorations. Model families and aliases
+/// remain exact so capacity is never guessed from a substring.
+#[must_use]
+pub fn canonical_capacity_model_id(model: &str) -> String {
+    let trimmed = model.trim();
+    if let Some((prefix, value)) = trimmed.split_once(':') {
+        if prefix.eq_ignore_ascii_case("kimi") {
+            return value.trim().to_string();
+        }
+    }
+    if let Some((prefix, value)) = trimmed.split_once('/') {
+        if matches!(
+            prefix.to_ascii_lowercase().as_str(),
+            "openai" | "xai" | "grok" | "qwen" | "dashscope" | "moonshot" | "deepseek"
+        ) {
+            return value.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn bundled_capacity(model: &str) -> Option<ModelCapacity> {
+    match canonical_capacity_model_id(model).as_str() {
+        "deepseek-v4-pro" | "deepseek-v4-flash" => Some(ModelCapacity {
+            context_window_tokens: 1_000_000,
+            max_output_tokens: 384_000,
+        }),
+        "glm-5.2" => Some(ModelCapacity {
+            context_window_tokens: 1_000_000,
+            max_output_tokens: 128_000,
+        }),
+        _ => None,
     }
 }
 
@@ -221,13 +380,15 @@ fn dot_dir() -> String {
 
 // ── Lazy global ────────────────────────────────────────────────────────────
 
-/// Lazily-loaded global model registry. Falls back to an empty registry
-/// when `models.yaml` is missing or malformed.
+/// Lazily-loaded process snapshot. Missing or malformed user metadata is kept
+/// as a diagnostic while bundled capacities and unknown-model assumptions
+/// remain available.
 #[must_use]
 pub fn global_registry() -> &'static ModelRegistry {
     use std::sync::LazyLock;
-    static REGISTRY: LazyLock<ModelRegistry> =
-        LazyLock::new(|| ModelRegistry::load().unwrap_or_else(|_| ModelRegistry::empty()));
+    static REGISTRY: LazyLock<ModelRegistry> = LazyLock::new(|| {
+        ModelRegistry::load().unwrap_or_else(|error| ModelRegistry::unavailable(&error))
+    });
     &REGISTRY
 }
 
@@ -448,7 +609,11 @@ mod tests {
                 capabilities: vec!["text".to_string()],
             },
         );
-        let registry = ModelRegistry { models };
+        let registry = ModelRegistry {
+            models,
+            load_status: ModelRegistryLoadStatus::Loaded,
+            load_diagnostic: None,
+        };
 
         let info = registry.get("test-model").expect("model should exist");
         assert_eq!(info.context_window, 128_000);
@@ -473,6 +638,66 @@ mod tests {
         let registry = ModelRegistry::empty();
         assert_eq!(registry.max_output_tokens_for("unknown"), 64_000);
         assert_eq!(registry.context_window_for("unknown"), 128_000);
+    }
+
+    #[test]
+    fn bundled_capacity_is_exact_and_routing_prefix_aware() {
+        let registry = ModelRegistry::empty();
+        let deepseek = registry.resolve_capacity("deepseek/deepseek-v4-pro", None, None);
+        assert_eq!(deepseek.context_window_tokens, 1_000_000);
+        assert_eq!(deepseek.max_output_tokens, 384_000);
+        assert_eq!(deepseek.context_window_source, ModelCapacitySource::Bundled);
+        assert_eq!(deepseek.max_output_source, ModelCapacitySource::Bundled);
+
+        let glm = registry.resolve_capacity("glm-5.2", None, None);
+        assert_eq!(glm.context_window_tokens, 1_000_000);
+        assert_eq!(glm.max_output_tokens, 128_000);
+    }
+
+    #[test]
+    fn explicit_capacity_overrides_user_registry_and_bundled_facts() {
+        let mut models = HashMap::new();
+        models.insert(
+            "deepseek-v4-pro".to_string(),
+            ModelInfo {
+                provider: "private".to_string(),
+                display_name: "Private DeepSeek".to_string(),
+                context_window: 256_000,
+                max_output_tokens: 24_000,
+                pricing: Pricing {
+                    input_per_1m: 0.0,
+                    output_per_1m: 0.0,
+                    cache_write_per_1m: None,
+                    cache_read_per_1m: None,
+                },
+                capabilities: Vec::new(),
+            },
+        );
+        let registry = ModelRegistry {
+            models,
+            load_status: ModelRegistryLoadStatus::Loaded,
+            load_diagnostic: None,
+        };
+        let resolved = registry.resolve_capacity("deepseek-v4-pro", Some(64_000), Some(12_000));
+        assert_eq!(resolved.context_window_tokens, 64_000);
+        assert_eq!(resolved.max_output_tokens, 12_000);
+        assert_eq!(
+            resolved.context_window_source,
+            ModelCapacitySource::Configured
+        );
+        assert_eq!(resolved.max_output_source, ModelCapacitySource::Configured);
+
+        let user_capacity = registry.resolve_capacity("deepseek-v4-pro", None, None);
+        assert_eq!(user_capacity.context_window_tokens, 256_000);
+        assert_eq!(user_capacity.max_output_tokens, 24_000);
+        assert_eq!(
+            user_capacity.context_window_source,
+            ModelCapacitySource::UserRegistry
+        );
+        assert_eq!(
+            user_capacity.max_output_source,
+            ModelCapacitySource::UserRegistry
+        );
     }
 
     #[test]

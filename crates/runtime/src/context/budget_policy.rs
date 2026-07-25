@@ -12,6 +12,68 @@ pub const MIN_CONTEXT_BUDGET_RATIO_BP: u32 = 1_000;
 pub const MAX_CONTEXT_BUDGET_RATIO_BP: u32 = 9_500;
 pub const FALLBACK_MODEL_CONTEXT_WINDOW: u32 = 128_000;
 pub const DEFAULT_SUBAGENT_BUDGET_TOKENS: usize = 20_000;
+const MIN_PREFERRED_OUTPUT_TOKENS: u64 = 4_000;
+const MAX_PREFERRED_OUTPUT_TOKENS: u64 = 32_000;
+const MIN_OUTPUT_FLOOR_TOKENS: u64 = 2_000;
+const MAX_OUTPUT_FLOOR_TOKENS: u64 = 8_000;
+
+/// Facts available when Runtime materializes one concrete provider attempt.
+/// `fixed_input_tokens` and `required_input_tokens` are request-local; no
+/// subsystem budget is allowed to masquerade as provider capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOutputBudgetInputs {
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u64,
+    pub fixed_input_tokens: u64,
+    pub required_input_tokens: u64,
+    pub protocol_overhead_tokens: u64,
+    pub safety_margin_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOutputBudget {
+    pub preferred_output_tokens: u64,
+    pub floor_output_tokens: u64,
+    pub available_output_tokens: u64,
+    pub requested_output_tokens: u64,
+    pub executable: bool,
+}
+
+impl ProviderOutputBudget {
+    /// Derive the per-attempt output lease:
+    ///
+    /// P = provider maximum output, W = context window, F = fixed request,
+    /// R = required dynamic context, H = protocol overhead, S = safety margin.
+    #[must_use]
+    pub fn derive(inputs: ProviderOutputBudgetInputs) -> Self {
+        let window = inputs.context_window_tokens;
+        let scaled_preferred =
+            (window / 16).clamp(MIN_PREFERRED_OUTPUT_TOKENS, MAX_PREFERRED_OUTPUT_TOKENS);
+        let preferred_output_tokens = inputs
+            .max_output_tokens
+            .min(window / 2)
+            .min(scaled_preferred);
+        let scaled_floor = (window / 64).clamp(MIN_OUTPUT_FLOOR_TOKENS, MAX_OUTPUT_FLOOR_TOKENS);
+        let floor_output_tokens = preferred_output_tokens.min(scaled_floor);
+        let available_output_tokens = window
+            .saturating_sub(inputs.fixed_input_tokens)
+            .saturating_sub(inputs.required_input_tokens)
+            .saturating_sub(inputs.protocol_overhead_tokens)
+            .saturating_sub(inputs.safety_margin_tokens);
+        let executable = available_output_tokens >= floor_output_tokens;
+        Self {
+            preferred_output_tokens,
+            floor_output_tokens,
+            available_output_tokens,
+            requested_output_tokens: if executable {
+                preferred_output_tokens.min(available_output_tokens)
+            } else {
+                0
+            },
+            executable,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeBudgetInputs {
@@ -242,5 +304,97 @@ mod tests {
         assert!(plan.tool_result_budget.max_total_tokens < 89_600);
         assert!(plan.subagent_default_budget <= 89_600);
         assert!(plan.team_total_budget <= 89_600);
+    }
+
+    #[test]
+    fn provider_output_budget_scales_without_starving_input() {
+        let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
+            context_window_tokens: 16_384,
+            max_output_tokens: 64_000,
+            fixed_input_tokens: 6_000,
+            required_input_tokens: 2_000,
+            protocol_overhead_tokens: 200,
+            safety_margin_tokens: 164,
+        });
+
+        assert!(budget.executable);
+        assert_eq!(budget.preferred_output_tokens, 4_000);
+        assert_eq!(budget.floor_output_tokens, 2_000);
+        assert_eq!(budget.requested_output_tokens, 4_000);
+    }
+
+    #[test]
+    fn provider_output_budget_rejects_when_minimum_continuation_cannot_fit() {
+        let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
+            context_window_tokens: 16_384,
+            max_output_tokens: 64_000,
+            fixed_input_tokens: 13_000,
+            required_input_tokens: 1_500,
+            protocol_overhead_tokens: 200,
+            safety_margin_tokens: 164,
+        });
+
+        assert!(!budget.executable);
+        assert_eq!(budget.requested_output_tokens, 0);
+        assert!(budget.available_output_tokens < budget.floor_output_tokens);
+    }
+
+    #[test]
+    fn provider_output_budget_shrinks_to_real_remaining_capacity() {
+        let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
+            context_window_tokens: 16_384,
+            max_output_tokens: 64_000,
+            fixed_input_tokens: 10_000,
+            required_input_tokens: 3_000,
+            protocol_overhead_tokens: 200,
+            safety_margin_tokens: 184,
+        });
+
+        assert!(budget.executable);
+        assert_eq!(budget.available_output_tokens, 3_000);
+        assert_eq!(budget.requested_output_tokens, 3_000);
+    }
+
+    #[test]
+    fn provider_output_budget_honors_small_provider_maximum() {
+        let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
+            context_window_tokens: 1_000_000,
+            max_output_tokens: 6_000,
+            fixed_input_tokens: 10_000,
+            required_input_tokens: 10_000,
+            protocol_overhead_tokens: 128,
+            safety_margin_tokens: 2_048,
+        });
+
+        assert_eq!(budget.preferred_output_tokens, 6_000);
+        assert_eq!(budget.floor_output_tokens, 6_000);
+        assert_eq!(budget.requested_output_tokens, 6_000);
+    }
+
+    #[test]
+    fn provider_output_budget_matches_supported_window_matrix() {
+        for (window, provider_max, expected_preferred, expected_floor) in [
+            (16_384, 64_000, 4_000, 2_000),
+            (128_000, 64_000, 8_000, 2_000),
+            (1_000_000, 384_000, 32_000, 8_000),
+        ] {
+            let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
+                context_window_tokens: window,
+                max_output_tokens: provider_max,
+                fixed_input_tokens: 1_000,
+                required_input_tokens: 1_000,
+                protocol_overhead_tokens: 128,
+                safety_margin_tokens: 128,
+            });
+            assert!(budget.executable, "window={window}");
+            assert_eq!(
+                budget.preferred_output_tokens, expected_preferred,
+                "window={window}"
+            );
+            assert_eq!(
+                budget.floor_output_tokens, expected_floor,
+                "window={window}"
+            );
+        }
     }
 }

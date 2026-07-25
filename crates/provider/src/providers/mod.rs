@@ -2,6 +2,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+pub use model_protocol::model_registry::ModelCapacitySource as ModelContextWindowSource;
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -49,33 +50,15 @@ pub struct ModelTokenLimit {
     pub context_window_tokens: u32,
 }
 
-/// Provenance for the model context capacity Runtime is allowed to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelContextWindowSource {
-    Configured,
-    Registry,
-    Assumed,
-    /// A provider explicitly rejected a larger capacity and returned a
-    /// numeric maximum. Runtime may use this smaller limit for the process
-    /// lifetime without overwriting user configuration.
-    Calibrated,
-}
-
-impl ModelContextWindowSource {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Configured => "configured",
-            Self::Registry => "registry",
-            Self::Assumed => "assumed",
-            Self::Calibrated => "calibrated",
-        }
-    }
-}
-
 /// Model window plus the evidence from which it was resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelContextWindowResolution {
+    pub tokens: u32,
+    pub source: ModelContextWindowSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelMaxOutputResolution {
     pub tokens: u32,
     pub source: ModelContextWindowSource,
 }
@@ -198,7 +181,9 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
     let registry = model_protocol::model_registry::global_registry();
-    registry.max_output_tokens_for(model)
+    registry
+        .resolve_capacity(model, None, None)
+        .max_output_tokens
 }
 
 /// Returns the effective max output tokens for a model, preferring a plugin
@@ -206,16 +191,32 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 /// override is `None`.
 #[must_use]
 pub fn max_tokens_for_model_with_override(model: &str, plugin_override: Option<u32>) -> u32 {
-    plugin_override.unwrap_or_else(|| max_tokens_for_model(model))
+    model_max_output_resolution(model, plugin_override).tokens
+}
+
+#[must_use]
+pub fn model_max_output_resolution(
+    model: &str,
+    explicit_max_output_tokens: Option<u32>,
+) -> ModelMaxOutputResolution {
+    let capacity = model_protocol::model_registry::global_registry().resolve_capacity(
+        model,
+        None,
+        explicit_max_output_tokens,
+    );
+    ModelMaxOutputResolution {
+        tokens: capacity.max_output_tokens,
+        source: capacity.max_output_source,
+    }
 }
 
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let registry = model_protocol::model_registry::global_registry();
-    let info = registry.get(model)?;
+    let capacity = registry.resolve_capacity(model, None, None);
     Some(ModelTokenLimit {
-        max_output_tokens: info.max_output_tokens,
-        context_window_tokens: info.context_window,
+        max_output_tokens: capacity.max_output_tokens,
+        context_window_tokens: capacity.context_window_tokens,
     })
 }
 
@@ -240,24 +241,18 @@ pub fn model_context_window_resolution(
     model: &str,
     overrides: Option<&std::collections::BTreeMap<String, u32>>,
 ) -> ModelContextWindowResolution {
-    if let Some(overrides) = overrides {
-        if let Some(&ctx) = overrides.get(model) {
-            return ModelContextWindowResolution {
-                tokens: ctx,
-                source: ModelContextWindowSource::Configured,
-            };
-        }
-    }
-    if let Some(limit) = model_token_limit(model) {
-        ModelContextWindowResolution {
-            tokens: limit.context_window_tokens,
-            source: ModelContextWindowSource::Registry,
-        }
-    } else {
-        ModelContextWindowResolution {
-            tokens: 128_000,
-            source: ModelContextWindowSource::Assumed,
-        }
+    let canonical = model_protocol::model_registry::canonical_capacity_model_id(model);
+    let explicit = overrides.and_then(|values| {
+        values
+            .get(model.trim())
+            .or_else(|| values.get(canonical.as_str()))
+            .copied()
+    });
+    let capacity =
+        model_protocol::model_registry::global_registry().resolve_capacity(model, explicit, None);
+    ModelContextWindowResolution {
+        tokens: capacity.context_window_tokens,
+        source: capacity.context_window_source,
     }
 }
 
@@ -463,8 +458,8 @@ mod tests {
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_context_window, model_context_window_resolution, parse_dotenv,
-        preflight_message_request, ModelContextWindowSource, ProviderKind,
+        model_context_window, model_context_window_resolution, model_max_output_resolution,
+        parse_dotenv, preflight_message_request, ModelContextWindowSource, ProviderKind,
     };
 
     #[test]
@@ -547,6 +542,10 @@ mod tests {
         assert_eq!(plugin_override, Some(12345));
         assert_eq!(effective, 12345);
         assert_ne!(effective, max_tokens_for_model("claude-opus-4-6"));
+        assert_eq!(
+            model_max_output_resolution("claude-opus-4-6", plugin_override).source,
+            ModelContextWindowSource::Configured
+        );
     }
 
     #[test]
@@ -984,7 +983,8 @@ NO_EQUALS_LINE
     #[test]
     fn model_context_window_chinese_models() {
         assert_eq!(model_context_window("deepseek-chat"), 128_000);
-        assert_eq!(model_context_window("deepseek-v4-pro"), 128_000);
+        assert_eq!(model_context_window("deepseek-v4-pro"), 1_000_000);
+        assert_eq!(max_tokens_for_model("deepseek-v4-pro"), 384_000);
         assert_eq!(model_context_window("deepseek-r1"), 128_000);
         assert_eq!(model_context_window("qwen-max"), 128_000);
         assert_eq!(model_context_window("qwen-plus"), 128_000);
@@ -1003,6 +1003,10 @@ NO_EQUALS_LINE
         let configured = model_context_window_resolution("deepseek-v4-pro", Some(&overrides));
         assert_eq!(configured.tokens, 64_000);
         assert_eq!(configured.source, ModelContextWindowSource::Configured);
+
+        let bundled = model_context_window_resolution("deepseek-v4-pro", None);
+        assert_eq!(bundled.tokens, 1_000_000);
+        assert_eq!(bundled.source, ModelContextWindowSource::Bundled);
 
         let unknown = model_context_window_resolution("private-unknown-model", None);
         assert_eq!(unknown.tokens, 128_000);

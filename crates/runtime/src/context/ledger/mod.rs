@@ -10,8 +10,16 @@ use serde::{Deserialize, Serialize};
 pub struct RequestBudgetReport {
     pub model: String,
     pub context_window_tokens: u64,
-    /// configured | registry | assumed | calibrated
+    /// configured | user_registry | bundled | assumed | calibrated
     pub context_window_source: String,
+    #[serde(default)]
+    pub provider_max_output_tokens: u64,
+    #[serde(default)]
+    pub max_output_source: String,
+    #[serde(default)]
+    pub preferred_output_tokens: u64,
+    #[serde(default)]
+    pub output_floor_tokens: u64,
     pub requested_output_tokens: u64,
     pub protocol_overhead_tokens: u64,
     pub safety_margin_tokens: u64,
@@ -20,6 +28,8 @@ pub struct RequestBudgetReport {
     /// It is intentionally not a second, lower request limit.
     pub target_input_cap_tokens: u64,
     pub fixed_input_tokens: u64,
+    #[serde(default)]
+    pub required_input_tokens: u64,
     pub dynamic_input_tokens: u64,
     pub omitted_packet_ids: Vec<String>,
     #[serde(default)]
@@ -45,12 +55,17 @@ impl RequestBudgetReport {
             model: model.into(),
             context_window_tokens,
             context_window_source: "unknown".to_string(),
+            provider_max_output_tokens: 0,
+            max_output_source: "unknown".to_string(),
+            preferred_output_tokens: requested_output_tokens,
+            output_floor_tokens: 0,
             requested_output_tokens,
             protocol_overhead_tokens,
             safety_margin_tokens,
             hard_input_cap_tokens,
             target_input_cap_tokens: hard_input_cap_tokens,
             fixed_input_tokens,
+            required_input_tokens: 0,
             dynamic_input_tokens: 0,
             omitted_packet_ids: Vec::new(),
             omitted_packet_reasons: BTreeMap::new(),
@@ -60,6 +75,21 @@ impl RequestBudgetReport {
 
     pub fn set_context_window_source(&mut self, source: impl Into<String>) {
         self.context_window_source = source.into();
+    }
+
+    pub fn set_output_policy(
+        &mut self,
+        provider_max_output_tokens: u64,
+        max_output_source: impl Into<String>,
+        preferred_output_tokens: u64,
+        output_floor_tokens: u64,
+        required_input_tokens: u64,
+    ) {
+        self.provider_max_output_tokens = provider_max_output_tokens;
+        self.max_output_source = max_output_source.into();
+        self.preferred_output_tokens = preferred_output_tokens;
+        self.output_floor_tokens = output_floor_tokens;
+        self.required_input_tokens = required_input_tokens;
     }
 
     #[must_use]

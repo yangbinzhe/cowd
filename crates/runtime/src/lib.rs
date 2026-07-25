@@ -748,8 +748,9 @@ pub use wave::{
 
 pub use budget_policy::{
     clamp_context_budget_ratio_bp, resolve_context_budget_tokens, MemoryBudgetLease,
-    RuntimeBudgetInputs, RuntimeBudgetPlan, RuntimeControlBudgetLease, ToolOutputBudgetLease,
-    DEFAULT_SUBAGENT_BUDGET_TOKENS, DEFAULT_SUBSYSTEM_BUDGET_RATIO_BP,
+    ProviderOutputBudget, ProviderOutputBudgetInputs, RuntimeBudgetInputs, RuntimeBudgetPlan,
+    RuntimeControlBudgetLease, ToolOutputBudgetLease, DEFAULT_SUBAGENT_BUDGET_TOKENS,
+    DEFAULT_SUBSYSTEM_BUDGET_RATIO_BP,
 };
 pub use context_runtime::{
     AgentContextLease, AgentContextView, AgentReturnContextProjection, AgentReturnRequirement,

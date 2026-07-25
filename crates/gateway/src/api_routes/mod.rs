@@ -2089,6 +2089,22 @@ pub(crate) mod tests {
         })
     }
 
+    fn activate_test_provider_config(state: &Arc<AppState>) {
+        let config = state
+            .services
+            .system
+            .runtime_config(&state.workspace_root, &state.config_home)
+            .expect("test provider config");
+        state
+            .services
+            .runtime
+            .as_ref()
+            .expect("test runtime service")
+            .provider_registry()
+            .replace(config.providers().clone())
+            .expect("activate test provider config");
+    }
+
     #[test]
     fn session_service_shares_session_kernel_handles() {
         let state = test_state_with_store(Arc::new(UnifiedSessionStore::open_in_memory().unwrap()));
@@ -10790,7 +10806,9 @@ providers:
         )
         .unwrap();
 
-        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let state = test_state_with_workspace(workspace, config_home);
+        activate_test_provider_config(&state);
+        let app = api_router(state);
         let response = app
             .oneshot(
                 Request::builder()
@@ -10822,7 +10840,17 @@ providers:
         assert!(json["components"]["provider"]["catalog_generation"]
             .as_str()
             .unwrap_or_default()
-            .starts_with("provider-catalog-v1-"));
+            .starts_with("provider-catalog-v2-"));
+        assert!(
+            json["components"]["provider"]["configured_catalog_generation"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("provider-catalog-v2-")
+        );
+        assert_eq!(
+            json["components"]["provider"]["active_matches_configured"],
+            true
+        );
         assert_eq!(
             json["components"]["provider"]["catalog"]["models"][0]["effective_protocol"],
             "anthropic"
@@ -10873,7 +10901,9 @@ providers:
         )
         .unwrap();
 
-        let app = api_router(test_state_with_workspace(workspace, config_home.clone()));
+        let state = test_state_with_workspace(workspace, config_home.clone());
+        activate_test_provider_config(&state);
+        let app = api_router(state);
         let response = app
             .clone()
             .oneshot(
@@ -10896,7 +10926,13 @@ providers:
         assert!(json["catalog_generation"]
             .as_str()
             .unwrap_or_default()
-            .starts_with("provider-catalog-v1-"));
+            .starts_with("provider-catalog-v2-"));
+        assert_ne!(
+            json["catalog_generation"],
+            json["configured_catalog_generation"]
+        );
+        assert!(json["active_provider_revision"].as_u64().is_some());
+        assert_eq!(json["active_matches_configured"], true);
         assert_eq!(json["catalog"]["providers"][0]["id"], "local");
         assert_eq!(json["catalog"]["models"][1]["id"], "model-b");
         assert_eq!(json["catalog"]["profiles"][0]["id"], "default");

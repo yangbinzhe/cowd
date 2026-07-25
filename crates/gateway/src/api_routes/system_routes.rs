@@ -645,9 +645,15 @@ async fn config_providers_handler(
         .system
         .runtime_config(&state.workspace_root, &state.config_home)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    Ok(Json(
-        state.services.provider.config_projection(&runtime_config),
-    ))
+    let active_snapshot = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.provider_registry().pin());
+    Ok(Json(state.services.provider.config_projection(
+        &runtime_config,
+        active_snapshot.as_ref(),
+    )))
 }
 
 async fn config_provider_catalog_handler(
@@ -658,11 +664,22 @@ async fn config_provider_catalog_handler(
         .system
         .runtime_config(&state.workspace_root, &state.config_home)
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let projection = state.services.provider.config_projection(&runtime_config);
+    let active_snapshot = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|service| service.provider_registry().pin());
+    let projection = state
+        .services
+        .provider
+        .config_projection(&runtime_config, active_snapshot.as_ref());
     Ok(Json(serde_json::json!({
         "envelope": state.services.provider.envelope("provider_catalog"),
         "catalog": projection.get("catalog").cloned().unwrap_or_else(|| serde_json::json!({})),
         "catalog_generation": projection.get("catalog_generation").cloned().unwrap_or(serde_json::Value::Null),
+        "configured_catalog_generation": projection.get("configured_catalog_generation").cloned().unwrap_or(serde_json::Value::Null),
+        "active_provider_revision": projection.get("active_provider_revision").cloned().unwrap_or(serde_json::Value::Null),
+        "active_matches_configured": projection.get("active_matches_configured").cloned().unwrap_or(serde_json::Value::Bool(false)),
         "warnings": projection.get("warnings").cloned().unwrap_or_else(|| serde_json::json!([])),
     })))
 }

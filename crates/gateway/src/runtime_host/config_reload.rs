@@ -539,11 +539,12 @@ pub(crate) fn apply_runtime_providers(
         "config"
     };
     let providers = runtime_config.providers().clone();
-    let registry = model_protocol::model_registry::ModelRegistry::load()
-        .unwrap_or_else(|_| model_protocol::model_registry::ModelRegistry::empty());
+    let registry = model_protocol::model_registry::global_registry();
     let catalog = provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
         providers: &providers,
-        registry: &registry,
+        registry,
+        model_context_windows: runtime_config.model_context_windows(),
+        max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
         configured_model: runtime_config.model(),
         aliases: runtime_config.aliases(),
         config_source: source,
@@ -577,6 +578,7 @@ pub(crate) fn apply_runtime_providers(
         "model_count": catalog.models.len(),
         "profile_count": catalog.profiles.len(),
         "warnings": catalog.warnings,
+        "activation_scope": provider_activation_scope(),
     });
     let Some(runtime_service) = state.services.runtime.as_ref() else {
         return serde_json::json!({
@@ -691,6 +693,7 @@ pub(crate) fn apply_runtime_providers(
         "configured_model": configured_model,
         "configured_model_provider": configured_model_provider,
         "configured_model_resolved": configured_model_resolved,
+        "activation_scope": provider_activation_scope(),
         "warnings": if provider_count == 0 {
             serde_json::json!(["no runtime providers are configured"])
         } else if !configured_model_resolved {
@@ -698,6 +701,14 @@ pub(crate) fn apply_runtime_providers(
         } else {
             serde_json::json!(update.diagnostics.warnings)
         }
+    })
+}
+
+fn provider_activation_scope() -> Value {
+    serde_json::json!({
+        "provider_credentials_and_protocol": "subsequent_provider_checkout",
+        "model_capacity_overrides": "new_or_restored_session_runtime",
+        "models_yaml": "gateway_restart",
     })
 }
 
@@ -1000,5 +1011,28 @@ mod tests {
         assert!(configs.contains_key("feishu"));
         assert!(!configs.contains_key("lark"));
         assert_eq!(configs["feishu"]["platform_type"], "lark");
+    }
+
+    #[test]
+    fn provider_activation_scope_distinguishes_checkout_session_and_restart() {
+        let scope = provider_activation_scope();
+        assert_eq!(
+            scope["provider_credentials_and_protocol"],
+            "subsequent_provider_checkout"
+        );
+        assert_eq!(
+            scope["model_capacity_overrides"],
+            "new_or_restored_session_runtime"
+        );
+        assert_eq!(scope["models_yaml"], "gateway_restart");
+    }
+
+    #[test]
+    fn model_context_window_changes_do_not_claim_gateway_restart() {
+        let startup = serde_json::json!({"model_context_windows": {"model-a": 128000}});
+        let current = serde_json::json!({"model_context_windows": {"model-a": 1000000}});
+        let report = restart_required_report(Some(&startup), &current);
+        assert_eq!(report["required"], false);
+        assert_eq!(report["fields"], serde_json::json!([]));
     }
 }

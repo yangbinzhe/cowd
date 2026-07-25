@@ -50,6 +50,8 @@ pub struct OpenAiCompatConfig {
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
     pub wire_protocol: OpenAiWireProtocol,
+    /// Whether this endpoint supports OpenAI-compatible streamed usage chunks.
+    pub request_stream_usage: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,6 +76,7 @@ impl OpenAiCompatConfig {
             base_url_env: "XAI_BASE_URL",
             default_base_url: DEFAULT_XAI_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
+            request_stream_usage: false,
         }
     }
 
@@ -85,6 +88,7 @@ impl OpenAiCompatConfig {
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: DEFAULT_OPENAI_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
+            request_stream_usage: true,
         }
     }
 
@@ -100,6 +104,7 @@ impl OpenAiCompatConfig {
             base_url_env: "DASHSCOPE_BASE_URL",
             default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
+            request_stream_usage: false,
         }
     }
 
@@ -113,6 +118,7 @@ impl OpenAiCompatConfig {
             base_url_env: "MOONSHOT_BASE_URL",
             default_base_url: DEFAULT_MOONSHOT_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
+            request_stream_usage: false,
         }
     }
 
@@ -126,6 +132,7 @@ impl OpenAiCompatConfig {
             base_url_env: "DEEPSEEK_BASE_URL",
             default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
+            request_stream_usage: true,
         }
     }
 
@@ -1807,7 +1814,7 @@ fn responses_tool_choice(tool_choice: &ToolChoice) -> Value {
 }
 
 fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
-    matches!(config.provider_name, "OpenAI")
+    config.request_stream_usage
 }
 
 fn normalize_chat_completion_response(
@@ -3030,6 +3037,22 @@ mod tests {
         );
 
         assert!(payload.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn deepseek_streaming_requests_include_supported_usage_opt_in() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-flash".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("hello")],
+                stream: true,
+                ..Default::default()
+            },
+            OpenAiCompatConfig::deepseek(),
+        );
+
+        assert_eq!(payload["stream_options"], json!({"include_usage": true}));
     }
 
     #[test]

@@ -313,26 +313,51 @@ impl ProviderService {
     pub(crate) fn config_projection(
         &self,
         runtime_config: &runtime::RuntimeConfig,
+        active_snapshot: Option<&runtime::ProviderRegistrySnapshot>,
     ) -> serde_json::Value {
-        let providers = runtime_config.providers();
-        let registry = model_protocol::model_registry::ModelRegistry::load()
-            .unwrap_or_else(|_| model_protocol::model_registry::ModelRegistry::empty());
+        let configured_providers = runtime_config.providers();
+        let registry = model_protocol::model_registry::global_registry();
         let configured_model = runtime_config.model().map(str::to_string);
         let config_source = if runtime_config.loaded_entries().is_empty() {
             "default"
         } else {
             "config"
         };
-        let catalog = provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
-            providers,
-            registry: &registry,
-            configured_model: configured_model.as_deref(),
-            aliases: runtime_config.aliases(),
-            config_source,
-            extra_sources: Vec::new(),
-            transforms: Vec::new(),
-            warnings: Vec::new(),
-        });
+        let configured_catalog =
+            provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
+                providers: configured_providers,
+                registry,
+                model_context_windows: runtime_config.model_context_windows(),
+                max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+                configured_model: configured_model.as_deref(),
+                aliases: runtime_config.aliases(),
+                config_source,
+                extra_sources: Vec::new(),
+                transforms: Vec::new(),
+                warnings: Vec::new(),
+            });
+        let active_provider_revision =
+            active_snapshot.map(runtime::ProviderRegistrySnapshot::revision);
+        let active_matches_configured =
+            active_snapshot.is_none_or(|snapshot| snapshot.config() == configured_providers);
+        let catalog = active_snapshot.map_or_else(
+            || configured_catalog.clone(),
+            |snapshot| {
+                provider::ProviderCatalog::from_input(provider::ProviderCatalogInput {
+                    providers: snapshot.config(),
+                    registry,
+                    model_context_windows: runtime_config.model_context_windows(),
+                    max_output_tokens_override: runtime_config.plugins().max_output_tokens(),
+                    configured_model: configured_model.as_deref(),
+                    aliases: runtime_config.aliases(),
+                    config_source: "active_runtime",
+                    extra_sources: Vec::new(),
+                    transforms: Vec::new(),
+                    warnings: Vec::new(),
+                })
+            },
+        );
+        let configured_catalog_generation = configured_catalog.generation.clone();
         let configured_model_provider = catalog
             .profiles
             .iter()
@@ -379,7 +404,9 @@ impl ProviderService {
                     "protocol_configured": model.protocol_configured,
                     "selected": model.selected,
                     "context_window_tokens": model.context_window_tokens,
+                    "context_window_source": model.context_window_source,
                     "max_output_tokens": model.max_output_tokens,
+                    "max_output_source": model.max_output_source,
                     "capabilities": model.capabilities,
                     "catalog_generation": catalog_generation.clone(),
                 })
@@ -390,6 +417,9 @@ impl ProviderService {
             "envelope": self.envelope("config_projection"),
             "catalog": catalog,
             "catalog_generation": catalog_generation,
+            "configured_catalog_generation": configured_catalog_generation,
+            "active_provider_revision": active_provider_revision,
+            "active_matches_configured": active_matches_configured,
             "providers": provider_rows,
             "models": models,
             "profiles": catalog_profiles,
@@ -399,6 +429,11 @@ impl ProviderService {
             "configured_model": configured_model,
             "configured_model_provider": configured_model_provider,
             "configured_model_resolved": configured_model.is_none() || configured_model_provider.is_some(),
+            "activation_scope": {
+                "provider_credentials_and_protocol": "subsequent_provider_checkout",
+                "model_capacity_overrides": "new_or_restored_session_runtime",
+                "models_yaml": "gateway_restart",
+            },
         })
     }
 }
