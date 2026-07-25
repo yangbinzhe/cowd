@@ -7,7 +7,7 @@ MFG_ROOT="${COWD_MFG_ROOT:-${ROOT}/../cowd-app-mfg}"
 OUTPUT="${1:-${ROOT}/target/release-evidence/cross-repo-provenance.json}"
 
 for repository in "$ROOT" "$EDGE_ROOT" "$MFG_ROOT"; do
-  [[ -d "$repository/.git" ]] || {
+  git -C "$repository" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
     echo "required release repository is missing: $repository" >&2
     exit 1
   }
