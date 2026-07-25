@@ -78,6 +78,7 @@ pub(crate) fn run_deep_real_provider_review(
         .into(),
         model: model.clone(),
         reasoning_effort_override: None,
+        request_compiler_cache_hit: false,
         budget: runtime::context_ledger::RequestBudgetReport::for_attempt(
             &model, 1_000_000, 32_000, 128, 256, 0,
         ),

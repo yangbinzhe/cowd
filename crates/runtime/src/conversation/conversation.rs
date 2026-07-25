@@ -51,7 +51,8 @@ use futures::stream::Stream;
 use harness_contract::{
     context::{
         CompactionReceipt, ContextGovernanceDecision, ContextPressureState, ContextTurnReport,
-        EvidenceAccessRef, EvidenceAuditProjection, EvidenceRef, ToolObservation,
+        EvidenceAccessRef, EvidenceAuditProjection, EvidenceRef, StablePrefixMetrics,
+        ToolExposureMetrics, ToolObservation,
     },
     core::KernelRef,
     knowledge::KnowledgeTurnReport,
@@ -626,6 +627,9 @@ pub struct ApiRequest {
     /// The transport adapter decides whether the selected model supports the
     /// requested effort; unsupported backends retain their configured policy.
     pub reasoning_effort_override: Option<String>,
+    /// Whether Runtime reused a previously compiled immutable request basis.
+    /// This is diagnostic metadata only and is never serialized to Provider.
+    pub request_compiler_cache_hit: bool,
     /// Request-local capacity contract used for diagnostics and ledger
     /// reconciliation. Provider must not mutate routing or budget ownership.
     pub budget: crate::context_ledger::RequestBudgetReport,
@@ -735,6 +739,187 @@ fn tool_exposure_for_catalog(
     ToolExposurePlanner.plan(discovery, bootstrap_tool_ids(maximum_permission), &policy)
 }
 
+#[derive(Debug, Default)]
+struct TurnToolExposureMetrics {
+    projection: ToolExposureMetrics,
+    activated_ids: BTreeSet<String>,
+    invoked_ids: BTreeSet<String>,
+    pending_search_round: bool,
+    schema_stats_baseline: Option<(u64, u64)>,
+}
+
+impl TurnToolExposureMetrics {
+    fn reset(&mut self, schema_stats_baseline: (u64, u64)) {
+        *self = Self::default();
+        self.schema_stats_baseline = Some(schema_stats_baseline);
+    }
+
+    fn observe_catalog_lookup(&mut self, elapsed: Duration) {
+        self.projection.catalog_lookups = self.projection.catalog_lookups.saturating_add(1);
+        self.projection.catalog_lookup_micros = self
+            .projection
+            .catalog_lookup_micros
+            .saturating_add(elapsed.as_micros().min(u128::from(u64::MAX)) as u64);
+    }
+
+    fn observe_provider_request(
+        &mut self,
+        inventory: ProviderContextInventory,
+        schema_stats: (u64, u64),
+    ) {
+        self.projection.provider_requests = self.projection.provider_requests.saturating_add(1);
+        if self.pending_search_round {
+            self.projection.tool_search_additional_rounds = self
+                .projection
+                .tool_search_additional_rounds
+                .saturating_add(1);
+            self.pending_search_round = false;
+        }
+        self.projection.schema_tokens_max = self
+            .projection
+            .schema_tokens_max
+            .max(inventory.tool_schema_tokens);
+        let baseline = self.schema_stats_baseline.get_or_insert(schema_stats);
+        self.projection.schema_compilations = schema_stats.0.saturating_sub(baseline.0);
+        self.projection.schema_cache_hits = schema_stats.1.saturating_sub(baseline.1);
+    }
+
+    fn observe_search(&mut self, receipt: &harness_contract::tool::ToolActivationReceipt) {
+        use harness_contract::tool::ToolActivationStatus;
+
+        self.projection.tool_search_calls = self.projection.tool_search_calls.saturating_add(1);
+        self.projection.activation_candidates = self
+            .projection
+            .activation_candidates
+            .saturating_add(receipt.decisions.len() as u64);
+        self.pending_search_round = true;
+        for decision in &receipt.decisions {
+            match decision.status {
+                ToolActivationStatus::Activated => {
+                    if self.activated_ids.insert(decision.canonical_id.clone()) {
+                        self.projection.activations = self.projection.activations.saturating_add(1);
+                    }
+                }
+                ToolActivationStatus::NotFound => {
+                    self.projection.descriptor_misses =
+                        self.projection.descriptor_misses.saturating_add(1);
+                }
+                ToolActivationStatus::Denied => {
+                    self.projection.permission_rejections =
+                        self.projection.permission_rejections.saturating_add(1);
+                }
+                ToolActivationStatus::Unavailable => {
+                    self.projection.unavailable_descriptors =
+                        self.projection.unavailable_descriptors.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    fn observe_invalid_search(&mut self) {
+        self.projection.tool_search_calls = self.projection.tool_search_calls.saturating_add(1);
+        self.projection.descriptor_misses = self.projection.descriptor_misses.saturating_add(1);
+        self.pending_search_round = true;
+    }
+
+    fn observe_invocation(&mut self, tool_name: &str) {
+        if self.activated_ids.contains(tool_name) {
+            self.invoked_ids.insert(tool_name.to_string());
+        }
+    }
+
+    fn projection(&self) -> ToolExposureMetrics {
+        let mut projection = self.projection.clone();
+        projection.activated_invocations =
+            self.activated_ids.intersection(&self.invoked_ids).count() as u64;
+        projection.activation_precision_bp = (!self.activated_ids.is_empty()).then(|| {
+            ratio_bp(
+                projection.activated_invocations,
+                self.activated_ids.len() as u64,
+            )
+        });
+        // Runtime cannot know the task-specific set of Tools that should have
+        // been exposed. A paired evaluator with frozen ground truth owns recall.
+        projection.activation_recall_bp = None;
+        projection
+    }
+}
+
+fn ratio_bp(numerator: u64, denominator: u64) -> u16 {
+    if denominator == 0 {
+        return 0;
+    }
+    u16::try_from(
+        numerator
+            .saturating_mul(10_000)
+            .saturating_div(denominator)
+            .min(10_000),
+    )
+    .unwrap_or(10_000)
+}
+
+#[derive(Debug, Default)]
+struct TurnStablePrefixMetrics {
+    projection: StablePrefixMetrics,
+}
+
+impl TurnStablePrefixMetrics {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe_request(&mut self, request: &ApiRequest) {
+        let wire = request.prompt.wire_system_text().unwrap_or_default();
+        let stable_bytes = request.prompt.stable_system_bytes();
+        let stable = wire.as_bytes().get(..stable_bytes).unwrap_or_default();
+        let fingerprint = format!(
+            "{:016x}",
+            model_protocol::fingerprint::stable_hash_bytes(stable)
+        );
+        if !self.projection.stable_prefix_fingerprint.is_empty()
+            && self.projection.stable_prefix_fingerprint != fingerprint
+        {
+            self.projection.wire_identity_failures =
+                self.projection.wire_identity_failures.saturating_add(1);
+        }
+        if stable.len() != stable_bytes {
+            self.projection.wire_identity_failures =
+                self.projection.wire_identity_failures.saturating_add(1);
+        }
+        self.projection.provider_requests = self.projection.provider_requests.saturating_add(1);
+        self.projection.stable_prefix_fingerprint = fingerprint;
+        self.projection.stable_prefix_bytes = stable.len() as u64;
+        self.projection.runtime_system_bytes_max = self.projection.runtime_system_bytes_max.max(
+            request
+                .prompt
+                .runtime_system_text()
+                .map_or(0, |text| text.len()) as u64,
+        );
+        if request.request_compiler_cache_hit {
+            self.projection.request_compiler_cache_hits = self
+                .projection
+                .request_compiler_cache_hits
+                .saturating_add(1);
+        } else {
+            self.projection.request_compiler_compilations = self
+                .projection
+                .request_compiler_compilations
+                .saturating_add(1);
+        }
+    }
+
+    fn observe_usage(&mut self, usage: TokenUsage) {
+        self.projection.native_cache_creation_input_tokens = self
+            .projection
+            .native_cache_creation_input_tokens
+            .saturating_add(u64::from(usage.cache_creation_input_tokens));
+        self.projection.native_cache_read_input_tokens = self
+            .projection
+            .native_cache_read_input_tokens
+            .saturating_add(u64::from(usage.cache_read_input_tokens));
+    }
+}
+
 #[cfg(test)]
 mod tool_exposure_contract_tests {
     use super::bootstrap_tool_ids;
@@ -838,6 +1023,11 @@ pub trait ApiClient {
 
     fn context_inventory(&self) -> ProviderContextInventory {
         ProviderContextInventory::default()
+    }
+
+    /// Lifetime Tool schema compilation/cache counters for this client.
+    fn tool_schema_cache_stats(&self) -> (u64, u64) {
+        (0, 0)
     }
 
     /// Convenience: collect all events synchronously (backward compat).
@@ -1513,6 +1703,8 @@ pub struct ConversationRuntime<C, T> {
         std::sync::Mutex<Option<crate::execution_core::TurnStrategyDecisionState>>,
     /// Revisioned tool set visible to the next provider request.
     tool_exposure_state: std::sync::Mutex<Option<ToolExposureState>>,
+    /// Turn-local cost/usefulness evidence for dynamic Tool exposure.
+    turn_tool_exposure_metrics: std::sync::Mutex<TurnToolExposureMetrics>,
     /// Tools coupled to the PromptOnly Skill selected for the active turn.
     /// Runtime folds these into the first provider exposure so Skill guidance
     /// and its executable capability arrive atomically.
@@ -1523,6 +1715,8 @@ pub struct ConversationRuntime<C, T> {
     /// rejected as an older projection by the provider client.
     tool_exposure_revision: AtomicU64,
     request_compiler: crate::PreparedRequestCompiler,
+    /// Actual Provider wire-prefix and native-cache evidence for the active turn.
+    turn_stable_prefix_metrics: std::sync::Mutex<TurnStablePrefixMetrics>,
     /// Stable evidence projections emitted during the active turn.
     turn_evidence_audits: std::sync::Mutex<Vec<EvidenceAuditProjection>>,
     /// Per-turn component accounting and tool-result lease consumption.
@@ -1778,11 +1972,13 @@ where
             turn_governed_tool_plans: std::sync::Mutex::new(Vec::new()),
             active_turn_strategy: std::sync::Mutex::new(None),
             tool_exposure_state: std::sync::Mutex::new(None),
+            turn_tool_exposure_metrics: std::sync::Mutex::new(TurnToolExposureMetrics::default()),
             active_skill_tool_refs: std::sync::Mutex::new(BTreeSet::new()),
             tool_exposure_revision: AtomicU64::new(0),
             request_compiler: crate::PreparedRequestCompiler::new(
                 feature_config.session_history().request_cache_entries,
             ),
+            turn_stable_prefix_metrics: std::sync::Mutex::new(TurnStablePrefixMetrics::default()),
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
                 initial_budget_plan.subsystem_budget_tokens,
@@ -1875,6 +2071,18 @@ where
     pub fn with_tool_execution_plane(mut self, plane: Arc<crate::ToolExecutionPlane>) -> Self {
         self.tool_execution_plane = plane;
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_tool_execution_plane(&self, plane: &Arc<crate::ToolExecutionPlane>) -> bool {
+        Arc::ptr_eq(&self.tool_execution_plane, plane)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_artifact_store(&self, store: &Arc<crate::ArtifactStore>) -> bool {
+        self.artifact_store
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, store))
     }
 
     #[must_use]
@@ -2148,7 +2356,11 @@ where
             .tool_exposure_revision
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
+        let discovery_started = Instant::now();
         let discovery = self.tool_executor.tool_discovery_receipt();
+        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+            metrics.observe_catalog_lookup(discovery_started.elapsed());
+        }
         let deferred = discovery
             .descriptors
             .iter()
@@ -2227,6 +2439,12 @@ where
                         .saturating_add(request.budget.protocol_overhead_tokens),
                 });
             }
+            self.record_provider_context_request(
+                &request,
+                self.session().message_count(),
+                inventory,
+                self.api_client.tool_schema_cache_stats(),
+            );
             let cancellation = self.cancellation_token.clone();
             let stream_started = Instant::now();
             let mut stream = self.api_client.stream(request);
@@ -2285,6 +2503,7 @@ where
             if let Some(reservation) = evaluation_reservation.as_mut() {
                 reservation.reconcile(usage);
             }
+            self.reconcile_provider_context_usage(usage);
             if let Some(error) = failed {
                 if error.is_provider_tool_protocol_failure() {
                     return Err(error);
@@ -2374,6 +2593,12 @@ where
         if let Ok(mut guard) = self.turn_evidence_audits.lock() {
             guard.clear();
         }
+        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+            metrics.reset(self.api_client.tool_schema_cache_stats());
+        }
+        if let Ok(mut metrics) = self.turn_stable_prefix_metrics.lock() {
+            metrics.reset();
+        }
     }
 
     fn push_turn_tool_observation(&self, observation: ToolObservation) {
@@ -2386,6 +2611,20 @@ where
         self.turn_tool_observations
             .lock()
             .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn tool_exposure_metrics(&self) -> ToolExposureMetrics {
+        self.turn_tool_exposure_metrics
+            .lock()
+            .map(|metrics| metrics.projection())
+            .unwrap_or_default()
+    }
+
+    fn stable_prefix_metrics(&self) -> StablePrefixMetrics {
+        self.turn_stable_prefix_metrics
+            .lock()
+            .map(|metrics| metrics.projection.clone())
             .unwrap_or_default()
     }
 
@@ -2545,20 +2784,26 @@ where
         })
     }
 
-    fn activate_tool_discovery(&self, output: &str) {
+    fn activate_tool_discovery(
+        &self,
+        output: &str,
+    ) -> Option<harness_contract::tool::ToolActivationReceipt> {
         let Ok(discovery) =
             serde_json::from_str::<harness_contract::tool::ToolDiscoveryReceipt>(output)
         else {
             tracing::warn!("ToolSearch returned a non-canonical discovery receipt");
-            return;
+            if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+                metrics.observe_invalid_search();
+            }
+            return None;
         };
         let Ok(mut guard) = self.tool_exposure_state.lock() else {
             tracing::warn!("tool exposure state lock poisoned");
-            return;
+            return None;
         };
         let Some(state) = guard.as_mut() else {
             tracing::warn!("ToolSearch completed before tool exposure was initialized");
-            return;
+            return None;
         };
         let allowed_ids = state
             .bootstrap
@@ -2580,6 +2825,10 @@ where
             activated = ?activation.activated_ids().collect::<Vec<_>>(),
             "ToolSearch activation applied to the next provider request"
         );
+        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+            metrics.observe_search(&activation);
+        }
+        Some(activation)
     }
 
     fn remember_tool_trace_from_message(&self, message: &ConversationMessage) {
@@ -3010,7 +3259,9 @@ where
         }
         let mut report = ContextTurnReport::new(turn_id.to_string(), pressure)
             .with_output_token_estimate(u64::from(usage.output_tokens))
-            .with_governance_decision(decision);
+            .with_governance_decision(decision)
+            .with_tool_exposure_metrics(self.tool_exposure_metrics())
+            .with_stable_prefix_metrics(self.stable_prefix_metrics());
         if let Ok(ledger) = self.turn_context_ledger.lock() {
             report = report.with_ledger(ledger.projection());
         }
@@ -3061,7 +3312,9 @@ where
         identity.mode = ContextRuntimeKernel::mode_for_profile(profile);
         let governance_report_id =
             ContextRuntimeKernel::governance_report_id(&session_id, user_input);
-        let mut runtime_header = ContextRuntimeKernel::runtime_header(&identity, profile);
+        let canonical_prompt = PromptAssembly::new(self.system_prompt.clone());
+        let mut runtime_header = canonical_prompt.runtime_system_segments().to_vec();
+        runtime_header.extend(ContextRuntimeKernel::runtime_header(&identity, profile));
         runtime_header.push(format!(
             "context_governance_report_id:{governance_report_id}"
         ));
@@ -3078,7 +3331,7 @@ where
             runtime_header,
             identity,
             intent: user_input.to_string(),
-            stable_head: self.system_prompt.clone(),
+            stable_head: canonical_prompt.stable_system_segments().to_vec(),
             dynamic_items: selected_items,
             omitted,
             total_budget_tokens,
@@ -3159,6 +3412,7 @@ where
             messages: prepared.history,
             model: model.to_string(),
             reasoning_effort_override: None,
+            request_compiler_cache_hit: prepared.cache_hit,
             budget,
         })
     }
@@ -3763,7 +4017,11 @@ where
             .and_then(|mut effort| effort.take());
         let explicitly_forbids_tool_use =
             harness_contract::strategy::prompt_explicitly_forbids_tool_use(user_input);
+        let discovery_started = Instant::now();
         let discovery = self.tool_executor.tool_discovery_receipt();
+        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+            metrics.observe_catalog_lookup(discovery_started.elapsed());
+        }
         let available_tools = discovery
             .descriptors
             .iter()
@@ -4064,7 +4322,12 @@ where
                         .saturating_add(request.budget.protocol_overhead_tokens),
                 });
             }
-            self.record_provider_context_request(&request, self.session().message_count());
+            self.record_provider_context_request(
+                &request,
+                self.session().message_count(),
+                inventory,
+                self.api_client.tool_schema_cache_stats(),
+            );
             let attempt_budget = self.runtime_budget_plan_for_candidates(&[model.clone()]);
             let transport_policy = provider_transport_policy(
                 attempt_budget.model_context_window.min(u64::from(u32::MAX)) as u32,
@@ -5096,6 +5359,9 @@ where
                     self.session().message_count(),
                 );
                 self.record_tool_started(iterations, tool_name);
+                if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+                    metrics.observe_invocation(tool_name);
+                }
                 self.emit_tool_started(tool_use_id, tool_name, &effective_input);
 
                 if let Some(callback) = &self.tool_callback {
@@ -5318,7 +5584,7 @@ where
                 // T36: Truncate oversized tool results before storing.
                 // Append hook feedback messages to the tool output.
                 if tool_name == "ToolSearch" && !is_error {
-                    self.activate_tool_discovery(&output);
+                    let _ = self.activate_tool_discovery(&output);
                 }
                 let mut combined = if tool_name == "runtime_capabilities" && !is_error {
                     self.project_runtime_capabilities_for_model(&output)
@@ -6838,7 +7104,19 @@ where
         retrieve_tool_evidence_from_sandbox(self.tool_output_sandbox.as_ref(), input)
     }
 
-    fn record_provider_context_request(&self, request: &ApiRequest, request_sequence: usize) {
+    fn record_provider_context_request(
+        &self,
+        request: &ApiRequest,
+        request_sequence: usize,
+        inventory: ProviderContextInventory,
+        schema_stats: (u64, u64),
+    ) {
+        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+            metrics.observe_provider_request(inventory, schema_stats);
+        }
+        if let Ok(mut metrics) = self.turn_stable_prefix_metrics.lock() {
+            metrics.observe_request(request);
+        }
         let mut system_tokens = crate::context_ledger::estimate_text_tokens(
             &request.prompt.trusted_system.join("\n\n"),
         );
@@ -6983,6 +7261,9 @@ where
     fn reconcile_provider_context_usage(&self, usage: TokenUsage) {
         if let Ok(mut ledger) = self.turn_context_ledger.lock() {
             ledger.reconcile_input_tokens(u64::from(usage.input_tokens));
+        }
+        if let Ok(mut metrics) = self.turn_stable_prefix_metrics.lock() {
+            metrics.observe_usage(usage);
         }
     }
 
@@ -9128,7 +9409,8 @@ mod tests {
         provider_transport_policy, rate_per_second, required_team_orchestration_call,
         tool_batch_pattern, turn_strategy_event_kind_allowed, vision_user_message, ApiClient,
         ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime, ModelStepIntent,
-        ModelToolCall, RuntimeError, StaticToolExecutor, ToolExposureState,
+        ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
+        ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -9476,6 +9758,7 @@ mod tests {
             messages: vec![ConversationMessage::user_text("status".to_string())].into(),
             model: "test".to_string(),
             reasoning_effort_override: None,
+            request_compiler_cache_hit: false,
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "test", 32_768, 4_096, 128, 256, 0,
             ),
@@ -9485,6 +9768,7 @@ mod tests {
             messages: vec![ConversationMessage::user_text("evidence".repeat(10_000))].into(),
             model: "test".to_string(),
             reasoning_effort_override: None,
+            request_compiler_cache_hit: false,
             budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                 "test", 1_000_000, 32_000, 128, 256, 0,
             ),
@@ -10928,6 +11212,7 @@ mod tests {
                 messages: Vec::new().into(),
                 model: "test".to_string(),
                 reasoning_effort_override: None,
+                request_compiler_cache_hit: false,
                 budget: crate::context_ledger::RequestBudgetReport::for_attempt(
                     "test", 128_000, 4_096, 128, 256, 0,
                 ),
@@ -11312,6 +11597,117 @@ mod tests {
             .active_ids
             .contains(&"custom_reader".to_string()));
         assert!(projections[1].exposure_revision > projections[0].exposure_revision);
+
+        let metrics = runtime.tool_exposure_metrics();
+        assert_eq!(metrics.provider_requests, 2);
+        assert_eq!(metrics.tool_search_calls, 1);
+        assert_eq!(metrics.tool_search_additional_rounds, 1);
+        assert_eq!(metrics.activation_candidates, 1);
+        assert_eq!(metrics.activations, 1);
+        assert_eq!(metrics.activated_invocations, 0);
+        assert_eq!(metrics.activation_precision_bp, Some(0));
+        assert_eq!(metrics.activation_recall_bp, None);
+    }
+
+    #[test]
+    fn tool_exposure_metrics_distinguish_activation_cost_and_outcomes() {
+        use harness_contract::tool::{
+            ToolActivationDecision, ToolActivationReceipt, ToolActivationStatus,
+        };
+
+        let mut metrics = TurnToolExposureMetrics::default();
+        metrics.reset((0, 0));
+        metrics.observe_search(&ToolActivationReceipt {
+            catalog_revision: 7,
+            previous_exposure_revision: 2,
+            exposure_revision: 3,
+            decisions: vec![
+                ToolActivationDecision {
+                    canonical_id: "reader".to_string(),
+                    status: ToolActivationStatus::Activated,
+                    reason: "healthy and permitted".to_string(),
+                },
+                ToolActivationDecision {
+                    canonical_id: "writer".to_string(),
+                    status: ToolActivationStatus::Denied,
+                    reason: "permission ceiling".to_string(),
+                },
+                ToolActivationDecision {
+                    canonical_id: "remote".to_string(),
+                    status: ToolActivationStatus::Unavailable,
+                    reason: "catalog health".to_string(),
+                },
+                ToolActivationDecision {
+                    canonical_id: "missing".to_string(),
+                    status: ToolActivationStatus::NotFound,
+                    reason: "unknown descriptor".to_string(),
+                },
+            ],
+        });
+        metrics.observe_provider_request(
+            ProviderContextInventory {
+                tool_count: 2,
+                tool_schema_tokens: 333,
+                ..Default::default()
+            },
+            (2, 1),
+        );
+        metrics.observe_invocation("reader");
+
+        let projection = metrics.projection();
+        assert_eq!(projection.provider_requests, 1);
+        assert_eq!(projection.tool_search_calls, 1);
+        assert_eq!(projection.tool_search_additional_rounds, 1);
+        assert_eq!(projection.activation_candidates, 4);
+        assert_eq!(projection.activations, 1);
+        assert_eq!(projection.activated_invocations, 1);
+        assert_eq!(projection.permission_rejections, 1);
+        assert_eq!(projection.unavailable_descriptors, 1);
+        assert_eq!(projection.descriptor_misses, 1);
+        assert_eq!(projection.schema_tokens_max, 333);
+        assert_eq!(projection.schema_compilations, 2);
+        assert_eq!(projection.schema_cache_hits, 1);
+        assert_eq!(projection.activation_precision_bp, Some(10_000));
+        assert_eq!(projection.activation_recall_bp, None);
+    }
+
+    #[test]
+    fn stable_prefix_metrics_track_wire_identity_and_provider_native_cache() {
+        let mut metrics = TurnStablePrefixMetrics::default();
+        let request = |dynamic: &str, cache_hit| ApiRequest {
+            prompt: PromptAssembly::new(vec![
+                "stable identity".to_string(),
+                "stable policy".to_string(),
+                crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+                dynamic.to_string(),
+            ]),
+            messages: vec![ConversationMessage::user_text("inspect".to_string())].into(),
+            model: "test".to_string(),
+            reasoning_effort_override: None,
+            request_compiler_cache_hit: cache_hit,
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "test", 32_768, 4_096, 128, 256, 0,
+            ),
+        };
+
+        metrics.observe_request(&request("runtime A", false));
+        metrics.observe_request(&request("runtime B with more bytes", true));
+        metrics.observe_usage(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_input_tokens: 80,
+            cache_read_input_tokens: 64,
+        });
+
+        let projection = metrics.projection;
+        assert_eq!(projection.provider_requests, 2);
+        assert!(!projection.stable_prefix_fingerprint.is_empty());
+        assert_eq!(projection.wire_identity_failures, 0);
+        assert_eq!(projection.request_compiler_compilations, 1);
+        assert_eq!(projection.request_compiler_cache_hits, 1);
+        assert_eq!(projection.native_cache_creation_input_tokens, 80);
+        assert_eq!(projection.native_cache_read_input_tokens, 64);
+        assert!(projection.runtime_system_bytes_max > 0);
     }
 
     #[tokio::test]

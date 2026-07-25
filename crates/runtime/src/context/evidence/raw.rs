@@ -827,6 +827,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_scoped_raw_evidence_cannot_be_read_through_a_sibling_scope() {
+        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&memory::SessionRecord {
+                session_id: "s1".to_string(),
+                platform: "test".to_string(),
+                chat_id: "raw-evidence-isolation".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                last_activity: "2026-01-01T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let artifacts = Arc::new(crate::ArtifactStore::sqlite(
+            tempfile::tempdir().unwrap().keep(),
+            crate::ArtifactStoreConfig::default(),
+        ));
+        let facade = RawEvidenceFacade::new(SessionStoreRawEvidenceStore::new(store, artifacts));
+        let access = facade.persist(write()).await.expect("durable write");
+        let mut sibling_access = access;
+        sibling_access.visibility_scope = "session:sibling".to_string();
+
+        assert!(matches!(
+            facade.retrieve(&sibling_access).await,
+            Err(RawEvidenceError::Retrieval(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn native_staged_artifact_publishes_receipt_without_rematerializing_payload() {
         let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
         store

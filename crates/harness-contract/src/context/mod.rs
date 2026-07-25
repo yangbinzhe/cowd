@@ -767,6 +767,51 @@ impl CompactionReceipt {
     }
 }
 
+/// Turn-local evidence for the cost and usefulness of dynamic Tool exposure.
+///
+/// Precision is the share of activated descriptors subsequently invoked.
+/// Recall requires task-specific expected Tool ground truth, so Runtime leaves
+/// it absent and the paired evaluator fills it from its frozen rubric. Denied
+/// or unhealthy descriptors are reported separately and never counted as
+/// missed executable capability.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolExposureMetrics {
+    pub provider_requests: u64,
+    pub catalog_lookups: u64,
+    pub catalog_lookup_micros: u64,
+    pub tool_search_calls: u64,
+    pub tool_search_additional_rounds: u64,
+    pub activation_candidates: u64,
+    pub activations: u64,
+    pub activated_invocations: u64,
+    pub descriptor_misses: u64,
+    pub permission_rejections: u64,
+    pub unavailable_descriptors: u64,
+    pub schema_tokens_max: u64,
+    pub schema_compilations: u64,
+    pub schema_cache_hits: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_precision_bp: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_recall_bp: Option<u16>,
+}
+
+/// Proof that the Provider wire preserves the stable system prefix while
+/// request-local controls remain outside it. Provider-native cache counters
+/// come from the actual usage response; no local completion cache is implied.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StablePrefixMetrics {
+    pub provider_requests: u64,
+    pub stable_prefix_fingerprint: String,
+    pub stable_prefix_bytes: u64,
+    pub runtime_system_bytes_max: u64,
+    pub wire_identity_failures: u64,
+    pub request_compiler_compilations: u64,
+    pub request_compiler_cache_hits: u64,
+    pub native_cache_creation_input_tokens: u64,
+    pub native_cache_read_input_tokens: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextTurnReport {
     pub turn_id: String,
@@ -786,6 +831,10 @@ pub struct ContextTurnReport {
     pub audit_projections: Vec<EvidenceAuditProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<crate::knowledge::KnowledgeTurnReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_exposure_metrics: Option<ToolExposureMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_prefix_metrics: Option<StablePrefixMetrics>,
 }
 
 impl ContextTurnReport {
@@ -805,6 +854,8 @@ impl ContextTurnReport {
             tool_exposure: None,
             audit_projections: Vec::new(),
             knowledge: None,
+            tool_exposure_metrics: None,
+            stable_prefix_metrics: None,
         }
     }
 
@@ -867,6 +918,18 @@ impl ContextTurnReport {
     #[must_use]
     pub fn with_knowledge(mut self, report: crate::knowledge::KnowledgeTurnReport) -> Self {
         self.knowledge = Some(report);
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_exposure_metrics(mut self, metrics: ToolExposureMetrics) -> Self {
+        self.tool_exposure_metrics = Some(metrics);
+        self
+    }
+
+    #[must_use]
+    pub fn with_stable_prefix_metrics(mut self, metrics: StablePrefixMetrics) -> Self {
+        self.stable_prefix_metrics = Some(metrics);
         self
     }
 }

@@ -373,6 +373,11 @@ impl ApiClient for ProviderRuntimeClient {
     fn context_inventory(&self) -> ProviderContextInventory {
         self.compiled_tool_schema().inventory
     }
+
+    fn tool_schema_cache_stats(&self) -> (u64, u64) {
+        let stats = ProviderRuntimeClient::tool_schema_cache_stats(self);
+        (stats.compilations, stats.cache_hits)
+    }
 }
 
 impl ProviderRuntimeClient {
@@ -390,7 +395,21 @@ impl ProviderRuntimeClient {
             .map(InputMessage::user_text)
             .collect::<Vec<_>>();
         messages.extend(convert_messages(request.messages.iter()));
-        let system = request.prompt.trusted_system_text();
+        let system = request.prompt.wire_system_text();
+        debug_assert!(
+            system
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes()
+                .starts_with(
+                    request
+                        .prompt
+                        .stable_system_text()
+                        .unwrap_or_default()
+                        .as_bytes()
+                ),
+            "Provider wire must preserve the exact stable system prefix"
+        );
         let active_tools = self.compiled_tool_schema().tools.to_vec();
         let tool_choice = (!active_tools.is_empty()).then_some(ToolChoice::Auto);
 

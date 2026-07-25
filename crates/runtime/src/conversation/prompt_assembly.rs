@@ -76,14 +76,28 @@ impl std::error::Error for PromptPackingError {}
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PromptAssembly {
     pub(crate) trusted_system: Vec<String>,
+    /// Number of leading trusted-system segments that are byte-stable across
+    /// turns. Every segment appended after construction is request-local.
+    stable_system_len: usize,
     pub(crate) contextual_packets: Vec<PromptContextPacket>,
 }
 
 impl PromptAssembly {
     #[must_use]
     pub fn new(trusted_system: Vec<String>) -> Self {
+        let mut normalized = Vec::with_capacity(trusted_system.len());
+        let mut stable_system_len = None;
+        for segment in trusted_system {
+            if segment == crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY {
+                stable_system_len.get_or_insert(normalized.len());
+            } else {
+                normalized.push(segment);
+            }
+        }
+        let stable_system_len = stable_system_len.unwrap_or(normalized.len());
         Self {
-            trusted_system,
+            trusted_system: normalized,
+            stable_system_len,
             contextual_packets: Vec::new(),
         }
     }
@@ -111,6 +125,61 @@ impl PromptAssembly {
     #[must_use]
     pub fn trusted_system_text(&self) -> Option<String> {
         (!self.trusted_system.is_empty()).then(|| self.trusted_system.join("\n\n"))
+    }
+
+    #[must_use]
+    pub fn stable_system_segments(&self) -> &[String] {
+        &self.trusted_system[..self.stable_system_len]
+    }
+
+    #[must_use]
+    pub fn runtime_system_segments(&self) -> &[String] {
+        &self.trusted_system[self.stable_system_len..]
+    }
+
+    #[must_use]
+    pub fn stable_system_text(&self) -> Option<String> {
+        (!self.stable_system_segments().is_empty())
+            .then(|| self.stable_system_segments().join("\n\n"))
+    }
+
+    #[must_use]
+    pub fn runtime_system_text(&self) -> Option<String> {
+        (!self.runtime_system_segments().is_empty())
+            .then(|| self.runtime_system_segments().join("\n\n"))
+    }
+
+    #[must_use]
+    pub fn stable_system_fingerprint(&self) -> u64 {
+        let wire = self.wire_system_text().unwrap_or_default();
+        let stable_bytes = wire
+            .as_bytes()
+            .get(..self.stable_system_bytes())
+            .unwrap_or_default();
+        model_protocol::fingerprint::stable_hash_bytes(stable_bytes)
+    }
+
+    #[must_use]
+    pub fn runtime_system_fingerprint(&self) -> u64 {
+        model_protocol::fingerprint::stable_hash_bytes(
+            self.runtime_system_text().unwrap_or_default().as_bytes(),
+        )
+    }
+
+    #[must_use]
+    pub fn stable_system_bytes(&self) -> usize {
+        self.stable_system_segments()
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            + self.stable_system_len.saturating_sub(1) * 2
+    }
+
+    /// The exact system bytes sent by Provider adapters. Stable content is
+    /// always the leading byte prefix; runtime controls follow it.
+    #[must_use]
+    pub fn wire_system_text(&self) -> Option<String> {
+        self.trusted_system_text()
     }
 
     #[must_use]
@@ -143,7 +212,11 @@ impl PromptAssembly {
         &self,
         hard_token_allowance: u64,
     ) -> Result<(Self, u64, Vec<String>, BTreeMap<String, String>), PromptPackingError> {
-        let mut packed = Self::new(self.trusted_system.clone());
+        let mut packed = Self {
+            trusted_system: self.trusted_system.clone(),
+            stable_system_len: self.stable_system_len,
+            contextual_packets: Vec::new(),
+        };
         let mut consumed = 0u64;
         let mut selected = vec![false; self.contextual_packets.len()];
         let packet_tokens = self
@@ -374,5 +447,49 @@ mod tests {
             .pack_for_hard_cap(1)
             .expect_err("required history must fail rather than disappear");
         assert_eq!(error.required_packet_ids, vec!["required-history"]);
+    }
+
+    #[test]
+    fn dynamic_boundary_is_removed_and_preserves_exact_wire_prefix() {
+        let mut assembly = PromptAssembly::new(vec![
+            "stable identity".to_string(),
+            "stable policy".to_string(),
+            crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            "runtime environment A".to_string(),
+        ]);
+        assembly.push_trusted_system("turn-local control");
+
+        assert_eq!(
+            assembly.stable_system_segments(),
+            ["stable identity", "stable policy"]
+        );
+        assert_eq!(
+            assembly.runtime_system_segments(),
+            ["runtime environment A", "turn-local control"]
+        );
+        let stable = assembly.stable_system_text().expect("stable prefix");
+        let wire = assembly.wire_system_text().expect("wire system");
+        assert!(wire.as_bytes().starts_with(stable.as_bytes()));
+        assert!(!stable.contains("runtime environment A"));
+        assert!(!wire.contains(crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
+    }
+
+    #[test]
+    fn packing_preserves_stable_runtime_boundary() {
+        let assembly = PromptAssembly::new(vec![
+            "stable".to_string(),
+            crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            "dynamic".to_string(),
+        ]);
+
+        let (packed, _, _, _) = assembly
+            .pack_for_hard_cap(1_024)
+            .expect("empty packet set fits");
+        assert_eq!(packed.stable_system_segments(), ["stable"]);
+        assert_eq!(packed.runtime_system_segments(), ["dynamic"]);
+        assert_eq!(
+            packed.stable_system_fingerprint(),
+            assembly.stable_system_fingerprint()
+        );
     }
 }

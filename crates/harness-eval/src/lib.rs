@@ -3326,6 +3326,7 @@ mod tests {
             .into(),
             model,
             reasoning_effort_override: None,
+            request_compiler_cache_hit: false,
             budget: runtime::context_ledger::RequestBudgetReport::for_attempt(
                 "deepseek-v4-flash",
                 1_000_000,
