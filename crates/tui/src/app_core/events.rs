@@ -142,6 +142,7 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::SessionHistoryHydrationFailed { .. }
             | CowdEvent::SessionStreamConnection { .. }
             | CowdEvent::ExecutionProjectionConnection { .. }
+            | CowdEvent::MissionProjectionSnapshot { .. }
             | CowdEvent::TurnError { .. }
             | CowdEvent::ResourceUploaded { .. }
             | CowdEvent::ResourceUploadFailed { .. }
@@ -196,6 +197,7 @@ fn is_reconstructible_reliable_event(event: &CowdEvent) -> bool {
             event: crate::protocol::GatewaySessionEvent::ExecutionPhase { .. }
         } | CowdEvent::SessionStreamConnection { .. }
             | CowdEvent::ExecutionProjectionConnection { .. }
+            | CowdEvent::MissionProjectionSnapshot { .. }
             | CowdEvent::ExecutionProjectionDelta { .. }
             | CowdEvent::ExecutionProjectionRefreshFailed { .. }
             | CowdEvent::ExecutionProjectionAccessRevoked { .. }
@@ -291,6 +293,19 @@ fn retain_reliable_event(
                         ..
                     } if queued_generation == generation
                         && queued_execution_id == execution_id
+                )
+            }) {
+                queue.remove(index);
+            }
+        }
+        CowdEvent::MissionProjectionSnapshot { mission_id, .. } => {
+            if let Some(index) = queue.iter().position(|queued| {
+                matches!(
+                    &queued.event,
+                    CowdEvent::MissionProjectionSnapshot {
+                        mission_id: queued_mission_id,
+                        ..
+                    } if queued_mission_id == mission_id
                 )
             }) {
                 queue.remove(index);

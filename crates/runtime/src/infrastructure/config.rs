@@ -938,6 +938,34 @@ pub struct GatewayConfig {
     pub session_reset: SessionResetPolicy,
     pub capacity: GatewayCapacityConfig,
     pub recovery: SessionRecoveryConfig,
+    pub live: GatewayLiveConfig,
+}
+
+/// Gateway-owned multiplex live transport limits. These bounds protect the
+/// shared SSE control plane without changing any durable Session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayLiveConfig {
+    pub max_sources: usize,
+    pub max_subscriptions_per_principal_instance: usize,
+    pub queue_capacity: usize,
+    pub checkpoint_max_bytes: usize,
+    pub default_ttl_seconds: u64,
+    pub max_ttl_seconds: u64,
+    pub baseline_timeout_ms: u64,
+}
+
+impl Default for GatewayLiveConfig {
+    fn default() -> Self {
+        Self {
+            max_sources: 32,
+            max_subscriptions_per_principal_instance: 4,
+            queue_capacity: 512,
+            checkpoint_max_bytes: 6_144,
+            default_ttl_seconds: 3_600,
+            max_ttl_seconds: 86_400,
+            baseline_timeout_ms: 15_000,
+        }
+    }
 }
 
 /// Gateway-owned hot Runtime working-set policy. Durable Session history is
@@ -2674,6 +2702,66 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
     } else {
         SessionRecoveryConfig::default()
     };
+    let live = if let Some(value) = gw.get("live") {
+        let value = expect_object(value, "merged settings.gateway.live")?;
+        let defaults = GatewayLiveConfig::default();
+        let live = GatewayLiveConfig {
+            max_sources: optional_usize(value, "max_sources", "merged settings.gateway.live")?
+                .unwrap_or(defaults.max_sources),
+            max_subscriptions_per_principal_instance: optional_usize(
+                value,
+                "max_subscriptions_per_principal_instance",
+                "merged settings.gateway.live",
+            )?
+            .unwrap_or(defaults.max_subscriptions_per_principal_instance),
+            queue_capacity: optional_usize(
+                value,
+                "queue_capacity",
+                "merged settings.gateway.live",
+            )?
+            .unwrap_or(defaults.queue_capacity),
+            checkpoint_max_bytes: optional_usize(
+                value,
+                "checkpoint_max_bytes",
+                "merged settings.gateway.live",
+            )?
+            .unwrap_or(defaults.checkpoint_max_bytes),
+            default_ttl_seconds: optional_u64(
+                value,
+                "default_ttl_seconds",
+                "merged settings.gateway.live",
+            )?
+            .unwrap_or(defaults.default_ttl_seconds),
+            max_ttl_seconds: optional_u64(
+                value,
+                "max_ttl_seconds",
+                "merged settings.gateway.live",
+            )?
+            .unwrap_or(defaults.max_ttl_seconds),
+            baseline_timeout_ms: optional_u64(
+                value,
+                "baseline_timeout_ms",
+                "merged settings.gateway.live",
+            )?
+            .unwrap_or(defaults.baseline_timeout_ms),
+        };
+        if live.max_sources == 0
+            || live.max_subscriptions_per_principal_instance == 0
+            || live.queue_capacity == 0
+            || live.checkpoint_max_bytes < 1_024
+            || live.default_ttl_seconds == 0
+            || live.max_ttl_seconds < live.default_ttl_seconds
+            || live.baseline_timeout_ms == 0
+        {
+            return Err(ConfigError::Parse(
+                "merged settings.gateway.live requires positive source/subscription/queue/TTL/timeout limits, checkpoint_max_bytes >= 1024, and max_ttl_seconds >= default_ttl_seconds"
+                    .to_string(),
+            ));
+        }
+        live
+    } else {
+        GatewayLiveConfig::default()
+    };
     Ok(GatewayConfig {
         enabled,
         webui_dir,
@@ -2681,6 +2769,7 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
         session_reset,
         capacity,
         recovery,
+        live,
     })
 }
 
@@ -5143,6 +5232,38 @@ gateway:
         )
         .unwrap();
         assert!(parse_optional_gateway_config(&oversized_session).is_err());
+    }
+
+    #[test]
+    fn parses_gateway_live_limits_and_rejects_unsafe_boundaries() {
+        let root = JsonValue::parse(
+            r#"{"gateway":{"live":{
+                "max_sources":48,
+                "max_subscriptions_per_principal_instance":3,
+                "queue_capacity":768,
+                "checkpoint_max_bytes":8192,
+                "default_ttl_seconds":1800,
+                "max_ttl_seconds":7200,
+                "baseline_timeout_ms":9000
+            }}}"#,
+        )
+        .unwrap();
+        let live = parse_optional_gateway_config(&root).unwrap().live;
+        assert_eq!(live.max_sources, 48);
+        assert_eq!(live.queue_capacity, 768);
+        assert_eq!(live.checkpoint_max_bytes, 8_192);
+        assert_eq!(live.default_ttl_seconds, 1_800);
+        assert_eq!(live.max_ttl_seconds, 7_200);
+        assert_eq!(live.baseline_timeout_ms, 9_000);
+
+        let invalid_header =
+            JsonValue::parse(r#"{"gateway":{"live":{"checkpoint_max_bytes":512}}}"#).unwrap();
+        assert!(parse_optional_gateway_config(&invalid_header).is_err());
+        let invalid_ttl = JsonValue::parse(
+            r#"{"gateway":{"live":{"default_ttl_seconds":7200,"max_ttl_seconds":3600}}}"#,
+        )
+        .unwrap();
+        assert!(parse_optional_gateway_config(&invalid_ttl).is_err());
     }
 
     #[test]

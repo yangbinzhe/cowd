@@ -25,6 +25,7 @@ pub mod goal;
 pub mod growth;
 pub mod harness;
 pub mod knowledge;
+pub mod live;
 pub mod managed_agent;
 pub mod mission;
 pub mod policy;

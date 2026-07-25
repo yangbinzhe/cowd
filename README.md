@@ -221,12 +221,13 @@ Public
 Session & Message
 ├── GET  /api/sessions                       会话列表/创建/详情/删除/分支
 ├── POST /api/sessions/:id/messages          发送消息
-├── GET  /api/sessions/:id/stream            SSE 流
 ├── GET  /api/sessions/:id/projection        运行投影(run graph/时间线/telemetry)
 ├── POST /api/sessions/:id/compact           触发压缩
 └── POST /api/sessions/:id/replay            重放会话
 
 Runtime & Control Plane
+├── POST/PATCH /api/runtime/live-subscriptions  管理 Surface 多源实时订阅
+├── GET  /api/runtime/live/:id               单物理连接 multiplex SSE
 ├── GET  /api/runtime/timeline               timeline
 ├── GET  /api/runtime/control-plane          控制面摘要
 ├── POST /api/runtime/turns                  提交 turn / 取消
@@ -834,7 +835,8 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 | `GET /api/sessions/:id/events` | session event |
 | `GET /api/sessions/:id/runs` | run 列表 |
 | `POST /api/sessions/:id/messages` | 发送消息 |
-| `GET /api/sessions/:id/stream` | SSE stream |
+| `POST/PATCH /api/runtime/live-subscriptions` | 创建或原子更新 Surface 多源实时订阅 |
+| `GET /api/runtime/live/:id` | Session、Execution、Mission 共用的 multiplex SSE |
 | `GET /api/runtime/timeline` | runtime timeline |
 | `GET /api/runtime/control-plane` | 控制面摘要 |
 

@@ -40,6 +40,8 @@ pub mod layout;
 pub mod md_renderer;
 #[path = "platform/osc52.rs"]
 pub mod osc52;
+#[path = "rendering/performance.rs"]
+pub mod performance;
 #[path = "rendering/profiler.rs"]
 pub mod profiler;
 #[path = "app_core/protocol.rs"]

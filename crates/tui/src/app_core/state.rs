@@ -737,12 +737,14 @@ impl TuiState {
     /// internal state-change notification. It is intentionally not encoded
     /// as a fake terminal event.
     pub fn apply_event(&mut self, event: CowdEvent) {
+        let apply_started = std::time::Instant::now();
         if let CowdEvent::AppTui { panel_id, event } = event {
             self.app_tui_host.apply_event(&panel_id, event);
             self.flush_app_effects();
             self.sync_app_palette_actions();
             self.event_bus.notify_state_changed();
             self.event_dispatcher.dispatch(&self.event_bus);
+            crate::performance::observe_duration("tui_event_apply_ms", apply_started.elapsed());
             return;
         }
 
@@ -787,6 +789,7 @@ impl TuiState {
         self.app.apply_event(event);
         self.event_bus.notify_state_changed();
         self.event_dispatcher.dispatch(&self.event_bus);
+        crate::performance::observe_duration("tui_event_apply_ms", apply_started.elapsed());
     }
 
     /// Drain APP effects after every APP lifecycle transition. UI effects are
@@ -1232,6 +1235,7 @@ impl TuiState {
     // ── Rendering ───────────────────────────────────────────────
 
     pub fn render(&mut self, frame: &mut Frame) {
+        let render_started = std::time::Instant::now();
         let area = frame.area();
         self.last_terminal_width = area.width;
         let skin = self.app.skin.clone();
@@ -1284,6 +1288,7 @@ impl TuiState {
                     TAB_FILES => {
                         if !self.app.file_entries.is_empty() {
                             self.file_tree.rebuild(&self.app.file_entries);
+                            crate::performance::observe_count("tui_layout_cache_rebuild_count", 1);
                         }
                     }
                     TAB_SESSIONS => {
@@ -1954,6 +1959,8 @@ impl TuiState {
         self.app.last_drawn_version = self.app.msg_version;
         self.app.last_drawn_render_version = self.app.render_version;
         self.app.lines_dirty = false;
+        crate::performance::observe_duration("tui_render_ms", render_started.elapsed());
+        crate::performance::observe_input_frame();
     }
 
     // ── Input Handling ──────────────────────────────────────────
@@ -2084,6 +2091,7 @@ impl TuiState {
     /// Returns the action the main loop should take in response.
     pub fn process_raw_key(&mut self, key: crossterm::event::KeyEvent) -> ProcessedKey {
         use crossterm::event::{KeyCode, KeyModifiers};
+        crate::performance::note_input();
 
         // ── Modal overlays: route keys to the topmost active overlay ──
 

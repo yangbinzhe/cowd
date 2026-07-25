@@ -3,12 +3,13 @@ use std::fmt;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use futures::StreamExt;
 use tokio::io::AsyncReadExt;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     events::CowdEventSender,
@@ -28,6 +29,25 @@ const GATEWAY_SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const DEFAULT_GATEWAY_URL: &str = "http://127.0.0.1:8642";
 const TUI_SURFACE_ID: &str = "tui";
 
+fn authorize_tui_request(
+    request: reqwest::RequestBuilder,
+    auth_token: Option<&str>,
+    observer_id: &str,
+) -> reqwest::RequestBuilder {
+    let request = request
+        .header("x-cowd-surface-id", TUI_SURFACE_ID)
+        .header("x-cowd-observer-id", observer_id)
+        .header(
+            "x-cowd-requested-capabilities",
+            harness_contract::security::CORE_HUMAN_CAPABILITIES.join(","),
+        );
+    if let Some(token) = auth_token.filter(|token| !token.trim().is_empty()) {
+        request.bearer_auth(token.trim())
+    } else {
+        request
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GatewayApiClient {
     base_url: String,
@@ -37,6 +57,84 @@ pub struct GatewayApiClient {
     /// Long-lived streams cannot share the ordinary 15-second total request
     /// deadline. A per-read idle watchdog still detects missing heartbeats.
     sse_client: reqwest::Client,
+    live: Arc<TuiLiveMultiplexer>,
+}
+
+#[derive(Debug)]
+struct TuiLiveMultiplexer {
+    transport: LiveTransportConfig,
+    commands: Mutex<Option<mpsc::UnboundedSender<LiveCommand>>>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveTransportConfig {
+    base_url: String,
+    auth_token: Option<String>,
+    observer_id: String,
+    client: reqwest::Client,
+    sse_client: reqwest::Client,
+}
+
+impl LiveTransportConfig {
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        authorize_tui_request(request, self.auth_token.as_deref(), &self.observer_id)
+    }
+}
+
+#[derive(Debug)]
+enum LiveCommand {
+    Add {
+        subscriber_id: String,
+        source: harness_contract::live::LiveSourceSelector,
+        tx: mpsc::Sender<harness_contract::live::LiveEnvelope>,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    Remove {
+        subscriber_id: String,
+        source_key: String,
+    },
+}
+
+struct TuiLiveLease {
+    subscriber_id: String,
+    source_key: String,
+    commands: mpsc::UnboundedSender<LiveCommand>,
+    rx: mpsc::Receiver<harness_contract::live::LiveEnvelope>,
+}
+
+impl TuiLiveLease {
+    async fn recv(&mut self) -> Option<harness_contract::live::LiveEnvelope> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for TuiLiveLease {
+    fn drop(&mut self) {
+        let _ = self.commands.send(LiveCommand::Remove {
+            subscriber_id: self.subscriber_id.clone(),
+            source_key: self.source_key.clone(),
+        });
+    }
+}
+
+#[derive(Debug)]
+enum LiveTransportEvent {
+    Envelope(harness_contract::live::LiveEnvelope),
+    Interrupted(String),
+    Recreate(String),
+}
+
+#[derive(Debug)]
+struct LiveSubscriber {
+    selector: harness_contract::live::LiveSourceSelector,
+    tx: mpsc::Sender<harness_contract::live::LiveEnvelope>,
+}
+
+#[derive(Debug)]
+struct LiveSourceState {
+    selector: harness_contract::live::LiveSourceSelector,
+    subscribers: BTreeMap<String, LiveSubscriber>,
+    pending_previews: BTreeMap<String, harness_contract::live::LiveEnvelope>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -65,30 +163,650 @@ pub enum GatewayApiError {
     Url(String),
 }
 
+impl TuiLiveMultiplexer {
+    async fn subscribe(
+        &self,
+        source: harness_contract::live::LiveSourceSelector,
+    ) -> Result<TuiLiveLease, GatewayApiError> {
+        let commands = {
+            let mut slot = self
+                .commands
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(commands) = slot.as_ref() {
+                commands.clone()
+            } else {
+                let (commands, receiver) = mpsc::unbounded_channel();
+                tokio::spawn(run_tui_live_manager(self.transport.clone(), receiver));
+                *slot = Some(commands.clone());
+                commands
+            }
+        };
+        let subscriber_id = uuid::Uuid::new_v4().to_string();
+        let source_key = source.key();
+        let (tx, rx) = mpsc::channel(256);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        commands
+            .send(LiveCommand::Add {
+                subscriber_id: subscriber_id.clone(),
+                source,
+                tx,
+                ack: ack_tx,
+            })
+            .map_err(|_| GatewayApiError::Url("TUI live manager is unavailable".to_string()))?;
+        ack_rx
+            .await
+            .map_err(|_| GatewayApiError::Url("TUI live manager stopped".to_string()))?
+            .map_err(GatewayApiError::Contract)?;
+        Ok(TuiLiveLease {
+            subscriber_id,
+            source_key,
+            commands,
+            rx,
+        })
+    }
+}
+
+async fn run_tui_live_manager(
+    transport: LiveTransportConfig,
+    mut commands: mpsc::UnboundedReceiver<LiveCommand>,
+) {
+    let (event_tx, mut event_rx) = mpsc::channel(512);
+    let mut sources = BTreeMap::<String, LiveSourceState>::new();
+    let mut subscription: Option<harness_contract::live::LiveSubscription> = None;
+    let mut connection: Option<tokio::task::JoinHandle<()>> = None;
+    let mut ready_revision = 0u64;
+    let mut pending_revision_envelopes = Vec::<harness_contract::live::LiveEnvelope>::new();
+
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(command) = command else { break; };
+                match command {
+                    LiveCommand::Add { subscriber_id, source, tx, ack } => {
+                        let key = source.key();
+                        let source_state = sources.entry(key.clone()).or_insert_with(|| LiveSourceState {
+                            selector: source.clone(),
+                            subscribers: BTreeMap::new(),
+                            pending_previews: BTreeMap::new(),
+                        });
+                        source_state.subscribers.insert(
+                            subscriber_id.clone(),
+                            LiveSubscriber {
+                                selector: source,
+                                tx,
+                            },
+                        );
+                        refresh_tui_live_source_selector(source_state);
+                        let previous_revision =
+                            subscription.as_ref().map_or(0, |active| active.revision);
+                        let result = sync_tui_live_subscription(
+                            &transport,
+                            &sources,
+                            &mut subscription,
+                        ).await;
+                        if result.is_err() {
+                            let mut remove_source = false;
+                            if let Some(source) = sources.get_mut(&key) {
+                                source.subscribers.remove(&subscriber_id);
+                                source.pending_previews.remove(&subscriber_id);
+                                remove_source = source.subscribers.is_empty();
+                                if !remove_source {
+                                    refresh_tui_live_source_selector(source);
+                                }
+                            }
+                            if remove_source {
+                                sources.remove(&key);
+                            }
+                        }
+                        let current_revision =
+                            subscription.as_ref().map_or(0, |active| active.revision);
+                        if result.is_ok() && previous_revision != current_revision {
+                            ready_revision = 0;
+                            pending_revision_envelopes.clear();
+                        }
+                        if result.is_ok() && connection.as_ref().is_none_or(|task| task.is_finished()) {
+                            if let Some(active) = subscription.clone() {
+                                if let Some(old) = connection.take() {
+                                    old.abort();
+                                }
+                                connection = Some(tokio::spawn(run_tui_live_connection(
+                                    transport.clone(),
+                                    active,
+                                    event_tx.clone(),
+                                )));
+                            }
+                        }
+                        let _ = ack.send(result);
+                    }
+                    LiveCommand::Remove { subscriber_id, source_key } => {
+                        let mut changed = false;
+                        let mut remove_source = false;
+                        if let Some(source) = sources.get_mut(&source_key) {
+                            changed = source.subscribers.remove(&subscriber_id).is_some();
+                            source.pending_previews.remove(&subscriber_id);
+                            remove_source = source.subscribers.is_empty();
+                            if changed && !remove_source {
+                                refresh_tui_live_source_selector(source);
+                            }
+                        }
+                        if remove_source {
+                            sources.remove(&source_key);
+                        }
+                        if changed {
+                            let previous_revision =
+                                subscription.as_ref().map_or(0, |active| active.revision);
+                            let result = sync_tui_live_subscription(
+                                &transport,
+                                &sources,
+                                &mut subscription,
+                            ).await;
+                            let current_revision =
+                                subscription.as_ref().map_or(0, |active| active.revision);
+                            if result.is_ok() && previous_revision != current_revision {
+                                ready_revision = 0;
+                                pending_revision_envelopes.clear();
+                            }
+                            if let Err(reason) = result {
+                                let _ = event_tx
+                                    .send(LiveTransportEvent::Interrupted(format!(
+                                        "TUI live selector update failed: {reason}"
+                                    )))
+                                    .await;
+                            }
+                        }
+                        if sources.is_empty() {
+                            if let Some(task) = connection.take() {
+                                task.abort();
+                            }
+                        }
+                    }
+                }
+            }
+            event = event_rx.recv() => {
+                let Some(event) = event else { break; };
+                match event {
+                    LiveTransportEvent::Envelope(envelope) => {
+                        let current_revision =
+                            subscription.as_ref().map_or(0, |active| active.revision);
+                        if envelope.subscription_revision < current_revision {
+                            continue;
+                        }
+                        if envelope.subscription_revision > current_revision {
+                            let _ = event_tx
+                                .send(LiveTransportEvent::Recreate(
+                                    "Gateway advanced beyond the acknowledged subscription revision"
+                                        .to_string(),
+                                ))
+                                .await;
+                            continue;
+                        }
+                        if matches!(
+                            envelope.event.as_str(),
+                            "subscription.ready" | "subscription.revision.changed"
+                        ) {
+                            ready_revision = envelope.subscription_revision;
+                            let pending = std::mem::take(&mut pending_revision_envelopes);
+                            for queued in pending {
+                                if queued.subscription_revision == ready_revision {
+                                    deliver_tui_live_envelope(&mut sources, queued).await;
+                                }
+                            }
+                            continue;
+                        }
+                        let can_precede_barrier = matches!(
+                            envelope.source_health,
+                            harness_contract::live::SourceHealth::Baseline
+                                | harness_contract::live::SourceHealth::Revoked
+                                | harness_contract::live::SourceHealth::ResyncRequired
+                        );
+                        if ready_revision != envelope.subscription_revision
+                            && !can_precede_barrier
+                        {
+                            if pending_revision_envelopes.len() >= 1_024 {
+                                let _ = event_tx
+                                    .send(LiveTransportEvent::Recreate(
+                                        "TUI live revision barrier buffer exceeded its safety bound"
+                                            .to_string(),
+                                    ))
+                                    .await;
+                            } else {
+                                pending_revision_envelopes.push(envelope);
+                            }
+                            continue;
+                        }
+                        deliver_tui_live_envelope(&mut sources, envelope).await;
+                    }
+                    LiveTransportEvent::Interrupted(reason) => {
+                        ready_revision = 0;
+                        pending_revision_envelopes.clear();
+                        deliver_tui_live_resync(&mut sources, &subscription, &reason).await;
+                    }
+                    LiveTransportEvent::Recreate(reason) => {
+                        if let Some(task) = connection.take() {
+                            task.abort();
+                        }
+                        deliver_tui_live_resync(&mut sources, &subscription, &reason).await;
+                        if let Some(active) = subscription.take() {
+                            let _ = tui_live_delete(&transport, &active.id).await;
+                        }
+                        ready_revision = 0;
+                        pending_revision_envelopes.clear();
+                        if !sources.is_empty()
+                            && sync_tui_live_subscription(
+                                &transport,
+                                &sources,
+                                &mut subscription,
+                            ).await.is_ok()
+                        {
+                            if let Some(active) = subscription.clone() {
+                                connection = Some(tokio::spawn(run_tui_live_connection(
+                                    transport.clone(),
+                                    active,
+                                    event_tx.clone(),
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(task) = connection {
+        task.abort();
+    }
+    if let Some(active) = subscription {
+        let _ = tui_live_delete(&transport, &active.id).await;
+    }
+}
+
+fn refresh_tui_live_source_selector(source: &mut LiveSourceState) {
+    let Some(first) = source.subscribers.values().next() else {
+        return;
+    };
+    let mut selector = first.selector.clone();
+    selector.cursor = selector.cursor.max(source.selector.cursor);
+    for subscriber in source.subscribers.values().skip(1) {
+        selector.cursor = selector.cursor.max(subscriber.selector.cursor);
+        if subscriber.selector.detail_scope
+            == harness_contract::projection::ProjectionDetailScope::Full
+        {
+            selector.detail_scope = harness_contract::projection::ProjectionDetailScope::Full;
+        }
+    }
+    source.selector = selector;
+}
+
+async fn deliver_tui_live_resync(
+    sources: &mut BTreeMap<String, LiveSourceState>,
+    subscription: &Option<harness_contract::live::LiveSubscription>,
+    reason: &str,
+) {
+    let subscription_id = subscription.as_ref().map_or_else(
+        || "tui-live-unavailable".to_string(),
+        |active| active.id.clone(),
+    );
+    let subscription_revision = subscription.as_ref().map_or(0, |active| active.revision);
+    let envelopes = sources
+        .values()
+        .map(|source| {
+            let kind = match source.selector.kind {
+                harness_contract::live::LiveSourceKind::Session => "session",
+                harness_contract::live::LiveSourceKind::Execution => "execution",
+                harness_contract::live::LiveSourceKind::Mission => "mission",
+            };
+            harness_contract::live::LiveEnvelope {
+                schema_version: harness_contract::live::LIVE_CONTRACT_SCHEMA_VERSION,
+                subscription_id: subscription_id.clone(),
+                subscription_revision,
+                source_kind: kind.to_string(),
+                source_id: source.selector.id.clone(),
+                detail_scope: source.selector.detail_scope,
+                source_cursor: Some(source.selector.cursor),
+                delivery_class: harness_contract::live::DeliveryClass::Durable,
+                source_health: harness_contract::live::SourceHealth::ResyncRequired,
+                event: "source.resync_required".to_string(),
+                payload: serde_json::json!({
+                    "reason": reason,
+                    "origin": "tui_live_transport",
+                }),
+                session_id: (kind == "session").then(|| source.selector.id.clone()),
+                execution_id: (kind == "execution").then(|| source.selector.id.clone()),
+                mission_id: (kind == "mission").then(|| source.selector.id.clone()),
+                agent_id: None,
+                stream_revision: None,
+                start_bytes: None,
+                end_bytes: None,
+            }
+        })
+        .collect::<Vec<_>>();
+    for envelope in envelopes {
+        deliver_tui_live_envelope(sources, envelope).await;
+    }
+}
+
+async fn deliver_tui_live_envelope(
+    sources: &mut BTreeMap<String, LiveSourceState>,
+    envelope: harness_contract::live::LiveEnvelope,
+) {
+    let key = format!("{}:{}", envelope.source_kind, envelope.source_id);
+    let Some(source) = sources.get_mut(&key) else {
+        return;
+    };
+    if let Some(cursor) = envelope.source_cursor {
+        source.selector.cursor = source.selector.cursor.max(cursor);
+    }
+    let mut closed = Vec::new();
+    for (subscriber_id, subscriber) in &source.subscribers {
+        crate::performance::observe_count(
+            "tui_live_queue_depth",
+            subscriber
+                .tx
+                .max_capacity()
+                .saturating_sub(subscriber.tx.capacity()),
+        );
+        let delivered = if envelope.delivery_class
+            != harness_contract::live::DeliveryClass::EphemeralPreview
+        {
+            source.pending_previews.remove(subscriber_id);
+            let started = Instant::now();
+            let delivered = subscriber.tx.send(envelope.clone()).await.is_ok();
+            crate::performance::observe_duration(
+                "tui_reliable_delivery_wait_ms",
+                started.elapsed(),
+            );
+            delivered
+        } else {
+            if let Some(pending) = source.pending_previews.remove(subscriber_id) {
+                if let Err(mpsc::error::TrySendError::Closed(_)) = subscriber.tx.try_send(pending) {
+                    closed.push(subscriber_id.clone());
+                    continue;
+                }
+            }
+            match subscriber.tx.try_send(envelope.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(pending)) => {
+                    source
+                        .pending_previews
+                        .insert(subscriber_id.clone(), pending);
+                    crate::performance::observe_count("tui_preview_coalesced_count", 1);
+                    true
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        };
+        if !delivered && subscriber.tx.is_closed() {
+            closed.push(subscriber_id.clone());
+        }
+    }
+    for subscriber_id in closed {
+        source.subscribers.remove(&subscriber_id);
+        source.pending_previews.remove(&subscriber_id);
+    }
+}
+
+async fn sync_tui_live_subscription(
+    transport: &LiveTransportConfig,
+    sources: &BTreeMap<String, LiveSourceState>,
+    subscription: &mut Option<harness_contract::live::LiveSubscription>,
+) -> Result<(), String> {
+    let selector = harness_contract::live::LiveSelector {
+        sources: sources
+            .values()
+            .map(|source| source.selector.clone())
+            .collect(),
+    };
+    if selector.sources.is_empty() {
+        if let Some(active) = subscription.take() {
+            tui_live_delete(transport, &active.id).await?;
+        }
+        return Ok(());
+    }
+    let response = if let Some(active) = subscription.as_ref() {
+        match tui_live_request(
+            transport,
+            reqwest::Method::PATCH,
+            &format!("/api/runtime/live-subscriptions/{}", active.id),
+            serde_json::json!({
+                "expected_revision": active.revision,
+                "idempotency_key": format!(
+                    "tui-live-patch:{}:{}",
+                    active.id, active.revision
+                ),
+                "selector": selector,
+            }),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) if live_subscription_requires_recreate(&error) => {
+                if let Some(stale) = subscription.take() {
+                    let _ = tui_live_delete(transport, &stale.id).await;
+                }
+                create_tui_live_subscription(transport, selector).await?
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        create_tui_live_subscription(transport, selector).await?
+    };
+    let parsed = serde_json::from_value(response)
+        .map_err(|error| format!("Gateway live subscription contract is invalid: {error}"))?;
+    *subscription = Some(parsed);
+    Ok(())
+}
+
+async fn create_tui_live_subscription(
+    transport: &LiveTransportConfig,
+    selector: harness_contract::live::LiveSelector,
+) -> Result<serde_json::Value, String> {
+    tui_live_request(
+        transport,
+        reqwest::Method::POST,
+        "/api/runtime/live-subscriptions",
+        serde_json::json!({
+            "surface_instance": transport.observer_id,
+            "selector": selector,
+            "idempotency_key": format!("tui-live:{}", transport.observer_id),
+        }),
+    )
+    .await
+}
+
+fn live_subscription_requires_recreate(error: &str) -> bool {
+    ["404 Not Found", "409 Conflict", "410 Gone"]
+        .iter()
+        .any(|status| error.contains(status))
+}
+
+async fn tui_live_request(
+    transport: &LiveTransportConfig,
+    method: reqwest::Method,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let request = transport.authorize(
+        transport
+            .client
+            .request(method, format!("{}{}", transport.base_url, path))
+            .json(&body),
+    );
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body = response.text().await.map_err(|error| error.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "Gateway live subscription returned {status}: {body}"
+        ));
+    }
+    serde_json::from_str(&body).map_err(|error| error.to_string())
+}
+
+async fn tui_live_delete(
+    transport: &LiveTransportConfig,
+    subscription_id: &str,
+) -> Result<(), String> {
+    let request = transport.authorize(transport.client.delete(format!(
+        "{}/api/runtime/live-subscriptions/{}",
+        transport.base_url,
+        url_encode(subscription_id)
+    )));
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!(
+            "Gateway live subscription delete returned {}",
+            response.status()
+        ))
+    }
+}
+
+async fn run_tui_live_connection(
+    transport: LiveTransportConfig,
+    subscription: harness_contract::live::LiveSubscription,
+    tx: mpsc::Sender<LiveTransportEvent>,
+) {
+    let mut checkpoint: Option<String> = None;
+    let mut retry = Duration::from_millis(250);
+    let mut interruption_reported = false;
+    loop {
+        let mut request = transport.authorize(
+            transport
+                .sse_client
+                .get(format!("{}{}", transport.base_url, subscription.stream_url))
+                .header("Accept", "text/event-stream"),
+        );
+        if let Some(checkpoint) = checkpoint.as_deref() {
+            request = request.header("Last-Event-ID", checkpoint);
+        }
+        let response = match request.send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response)
+                if matches!(
+                    response.status(),
+                    reqwest::StatusCode::NOT_FOUND
+                        | reqwest::StatusCode::GONE
+                        | reqwest::StatusCode::CONFLICT
+                ) =>
+            {
+                let _ = tx
+                    .send(LiveTransportEvent::Recreate(format!(
+                        "Gateway live subscription became invalid ({})",
+                        response.status()
+                    )))
+                    .await;
+                return;
+            }
+            Ok(response) => {
+                if !interruption_reported {
+                    interruption_reported = tx
+                        .send(LiveTransportEvent::Interrupted(format!(
+                            "Gateway live stream returned {}",
+                            response.status()
+                        )))
+                        .await
+                        .is_ok();
+                }
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(5));
+                continue;
+            }
+            Err(error) => {
+                if !interruption_reported {
+                    interruption_reported = tx
+                        .send(LiveTransportEvent::Interrupted(format!(
+                            "Gateway live stream is unreachable: {error}"
+                        )))
+                        .await
+                        .is_ok();
+                }
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(Duration::from_secs(5));
+                continue;
+            }
+        };
+        interruption_reported = false;
+        retry = Duration::from_millis(250);
+        let mut bytes = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut recreate = false;
+        while let Some(chunk) = bytes.next().await {
+            let Ok(chunk) = chunk else {
+                break;
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Ok(Some(frame)) = take_gateway_sse_frame(&mut buffer) {
+                if let Some(id) = gateway_sse_frame_id(&frame) {
+                    checkpoint = Some(id.to_string());
+                }
+                let Some(data) = gateway_sse_frame_data(&frame) else {
+                    continue;
+                };
+                let Ok(envelope) =
+                    serde_json::from_str::<harness_contract::live::LiveEnvelope>(&data)
+                else {
+                    recreate = true;
+                    break;
+                };
+                if envelope.subscription_id != subscription.id {
+                    recreate = true;
+                    break;
+                }
+                if envelope.event.starts_with("subscription.")
+                    && envelope.source_health
+                        == harness_contract::live::SourceHealth::ResyncRequired
+                {
+                    recreate = true;
+                }
+                if tx
+                    .send(LiveTransportEvent::Envelope(envelope))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if recreate {
+                break;
+            }
+        }
+        if recreate {
+            let _ = tx
+                .send(LiveTransportEvent::Recreate(
+                    "Gateway requested live subscription resync".to_string(),
+                ))
+                .await;
+            return;
+        }
+        if !interruption_reported {
+            interruption_reported = tx
+                .send(LiveTransportEvent::Interrupted(
+                    "Gateway live stream ended before a terminal event".to_string(),
+                ))
+                .await
+                .is_ok();
+        }
+        tokio::time::sleep(retry).await;
+        retry = (retry * 2).min(Duration::from_secs(5));
+    }
+}
+
 impl GatewayApiClient {
     #[must_use]
     pub fn observer_id(&self) -> &str {
         &self.observer_id
     }
 
-    fn authorize(&self, mut request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        request = request
-            .header("x-cowd-surface-id", TUI_SURFACE_ID)
-            .header("x-cowd-observer-id", &self.observer_id);
-        if let Some(token) = self
-            .auth_token
-            .as_deref()
-            .filter(|token| !token.trim().is_empty())
-        {
-            request = request.bearer_auth(token.trim());
-        }
-        request
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        authorize_tui_request(request, self.auth_token.as_deref(), &self.observer_id)
     }
 
     pub fn new(
         base_url: impl Into<String>,
         auth_token: Option<String>,
     ) -> Result<Self, GatewayApiError> {
+        let base_url = normalize_base_url(base_url.into())?;
         let client = reqwest::Client::builder()
             .connect_timeout(DEFAULT_GATEWAY_CONNECT_TIMEOUT)
             .timeout(DEFAULT_GATEWAY_REQUEST_TIMEOUT)
@@ -99,15 +817,27 @@ impl GatewayApiClient {
             .read_timeout(GATEWAY_SSE_IDLE_TIMEOUT)
             .build()
             .map_err(GatewayApiError::Http)?;
+        let observer_id = std::env::var("COWD_TUI_OBSERVER_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4()));
+        let live = Arc::new(TuiLiveMultiplexer {
+            transport: LiveTransportConfig {
+                base_url: base_url.clone(),
+                auth_token: auth_token.clone(),
+                observer_id: observer_id.clone(),
+                client: client.clone(),
+                sse_client: sse_client.clone(),
+            },
+            commands: Mutex::new(None),
+        });
         Ok(Self {
-            base_url: normalize_base_url(base_url.into())?,
+            base_url,
             auth_token,
-            observer_id: std::env::var("COWD_TUI_OBSERVER_ID")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| format!("tui:{}", uuid::Uuid::new_v4())),
+            observer_id,
             client,
             sse_client,
+            live,
         })
     }
 
@@ -771,7 +1501,7 @@ impl GatewayApiClient {
         Ok(value)
     }
 
-    pub async fn subscribe_session_events(
+    pub async fn consume_session_live_source(
         &self,
         session_id: &str,
         tx: CowdEventSender,
@@ -779,30 +1509,15 @@ impl GatewayApiClient {
         next_message_sequence: Arc<AtomicUsize>,
         authority_generation: u64,
     ) -> Result<SessionStreamProgress, GatewayApiError> {
-        let suffix = after_commit_cursor
-            .map(|cursor| format!("?from_cursor={cursor}"))
-            .unwrap_or_default();
-        let url = format!(
-            "{}/api/sessions/{}/stream{suffix}",
-            self.base_url,
-            url_encode(session_id)
-        );
-        let mut request = self.sse_client.get(url);
-        if let Some(cursor) = after_commit_cursor {
-            request = request.header("Last-Event-ID", cursor.to_string());
-        }
-        let request = self.authorize(request);
-        let response = request.send().await.map_err(GatewayApiError::Http)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(gateway_status_error(status, body));
-        }
-
-        // Durable history is owned by an independent per-session hydration
-        // worker in the runner. Tying that future to this network response
-        // caused every SSE reconnect to cancel partial progress and restart
-        // large transcripts from sequence zero.
+        let mut source = self
+            .live
+            .subscribe(harness_contract::live::LiveSourceSelector {
+                kind: harness_contract::live::LiveSourceKind::Session,
+                id: session_id.to_string(),
+                cursor: after_commit_cursor.unwrap_or_default(),
+                detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+            })
+            .await?;
         tx.send_wait(session_scoped_event(
             session_id,
             authority_generation,
@@ -813,112 +1528,21 @@ impl GatewayApiClient {
         ))
         .await
         .map_err(|_| GatewayApiError::Url("TUI event receiver closed".to_string()))?;
-        let mut buffer = Vec::new();
-        let mut stream = response.bytes_stream();
         let mut latest_cursor = after_commit_cursor;
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    let _ = tx.send(session_scoped_event(
-                        session_id,
-                        authority_generation,
-                        CowdEvent::Warning {
-                            message: format!("Gateway session stream read failed; durable cursor recovery scheduled: {error}"),
-                        },
-                    ));
-                    break;
-                }
-            };
-            buffer.extend_from_slice(&chunk);
-            if buffer.len() > 2 * 1024 * 1024 {
-                let _ = tx.send(session_scoped_event(
-                    session_id,
-                    authority_generation,
-                    CowdEvent::Warning {
-                        message: "Gateway session SSE frame exceeded 2 MiB; reconnecting from the last durable cursor".to_string(),
-                    },
+        while let Some(envelope) = source.recv().await {
+            if envelope.source_kind != "session" || envelope.source_id != session_id {
+                return Err(GatewayApiError::Contract(
+                    "TUI live demultiplexer delivered a mismatched Session source".to_string(),
                 ));
-                break;
             }
-            while let Some(frame) = take_gateway_sse_frame(&mut buffer)? {
-                let candidate_cursor = gateway_sse_frame_commit_cursor(&frame);
-                if let Some(reason) = gateway_sse_frame_session_authorization_revoked(&frame) {
-                    validate_session_authorization_revoke_identity(&frame, session_id)?;
-                    tx.send_wait(session_scoped_event(
-                        session_id,
-                        authority_generation,
-                        CowdEvent::SessionAuthorizationRevoked {
-                            session_id: session_id.to_string(),
-                            reason: reason.clone(),
-                        },
-                    ))
-                    .await
-                    .map_err(|_| GatewayApiError::Url("TUI event receiver closed".to_string()))?;
-                    return Err(GatewayApiError::SessionAuthorizationRevoked(reason));
-                }
-                if let Some(reason) = gateway_sse_frame_resync_reason(&frame) {
-                    latest_cursor = Some(
-                        latest_cursor
-                            .unwrap_or_default()
-                            .max(candidate_cursor.unwrap_or_default()),
-                    );
-                    let _ = tx.send(session_scoped_event(
-                        session_id,
-                        authority_generation,
-                        CowdEvent::Warning {
-                            message: format!(
-                                "Gateway session stream reported {reason}; refreshing durable history and execution projection"
-                            ),
-                        },
-                    ));
-                    return Ok(SessionStreamProgress {
-                        commit_cursor: latest_cursor,
-                        next_message_sequence: next_message_sequence.load(Ordering::Acquire),
-                    });
-                }
-                match strict_gateway_sse_frame_to_cowd_event_for_session(&frame, session_id) {
-                    Ok(Some(event)) => {
-                        deliver_session_stream_event_with_catchup(
-                            self,
-                            &tx,
-                            session_id,
-                            event,
-                            &next_message_sequence,
-                            authority_generation,
-                        )
-                        .await?;
-                        latest_cursor = Some(
-                            latest_cursor
-                                .unwrap_or_default()
-                                .max(candidate_cursor.unwrap_or_default()),
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _ = tx.send(session_scoped_event(
-                            session_id,
-                            authority_generation,
-                            CowdEvent::Warning {
-                                message: format!(
-                                    "Gateway session stream emitted an invalid typed frame; reconnecting for durable recovery: {error}"
-                                ),
-                            },
-                        ));
-                        return Err(GatewayApiError::Url(error));
-                    }
-                }
-            }
-        }
-        if !buffer.iter().all(u8::is_ascii_whitespace) {
-            let frame = String::from_utf8(std::mem::take(&mut buffer)).map_err(|_| {
-                GatewayApiError::Url(
-                    "Gateway session SSE ended with invalid UTF-8 in its final frame".to_string(),
-                )
-            })?;
-            let candidate_cursor = gateway_sse_frame_commit_cursor(&frame);
-            if let Some(reason) = gateway_sse_frame_session_authorization_revoked(&frame) {
-                validate_session_authorization_revoke_identity(&frame, session_id)?;
+            let candidate_cursor = envelope.source_cursor;
+            if envelope.event == "source.authorization_revoked" {
+                let reason = envelope
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Gateway revoked this Session source")
+                    .to_string();
                 tx.send_wait(session_scoped_event(
                     session_id,
                     authority_generation,
@@ -930,7 +1554,8 @@ impl GatewayApiClient {
                 .await
                 .map_err(|_| GatewayApiError::Url("TUI event receiver closed".to_string()))?;
                 return Err(GatewayApiError::SessionAuthorizationRevoked(reason));
-            } else if let Some(reason) = gateway_sse_frame_resync_reason(&frame) {
+            }
+            if envelope.source_health == harness_contract::live::SourceHealth::ResyncRequired {
                 latest_cursor = Some(
                     latest_cursor
                         .unwrap_or_default()
@@ -941,42 +1566,46 @@ impl GatewayApiClient {
                     authority_generation,
                     CowdEvent::Warning {
                         message: format!(
-                            "Gateway session stream reported {reason}; refreshing durable history and execution projection"
+                            "Gateway Session source requested recovery: {}; refreshing durable history and execution projection",
+                            envelope
+                                .payload
+                                .get("reason")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("canonical resync required")
                         ),
                     },
                 ));
-            } else {
-                match strict_gateway_sse_frame_to_cowd_event_for_session(&frame, session_id) {
-                    Ok(Some(event)) => {
-                        deliver_session_stream_event_with_catchup(
-                            self,
-                            &tx,
-                            session_id,
-                            event,
-                            &next_message_sequence,
-                            authority_generation,
-                        )
-                        .await?;
-                        latest_cursor = Some(
-                            latest_cursor
-                                .unwrap_or_default()
-                                .max(candidate_cursor.unwrap_or_default()),
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        let _ = tx.send(session_scoped_event(
-                            session_id,
-                            authority_generation,
-                            CowdEvent::Warning {
-                                message: format!(
-                                    "Gateway session stream ended with an invalid typed frame; reconnecting for durable recovery: {error}"
-                                ),
-                            },
-                        ));
-                        return Err(GatewayApiError::Url(error));
-                    }
+                return Ok(SessionStreamProgress {
+                    commit_cursor: latest_cursor,
+                    next_message_sequence: next_message_sequence.load(Ordering::Acquire),
+                });
+            }
+            let frame = match candidate_cursor {
+                Some(cursor) => format!(
+                    "id: {cursor}\nevent: {}\ndata: {}",
+                    envelope.event, envelope.payload
+                ),
+                None => format!("event: {}\ndata: {}", envelope.event, envelope.payload),
+            };
+            match strict_gateway_sse_frame_to_cowd_event_for_session(&frame, session_id) {
+                Ok(Some(event)) => {
+                    deliver_session_stream_event_with_catchup(
+                        self,
+                        &tx,
+                        session_id,
+                        event,
+                        &next_message_sequence,
+                        authority_generation,
+                    )
+                    .await?;
+                    latest_cursor = Some(
+                        latest_cursor
+                            .unwrap_or_default()
+                            .max(candidate_cursor.unwrap_or_default()),
+                    );
                 }
+                Ok(None) => {}
+                Err(error) => return Err(GatewayApiError::Contract(error)),
             }
         }
         Ok(SessionStreamProgress {
@@ -1206,28 +1835,7 @@ impl GatewayApiClient {
         Ok(projection)
     }
 
-    pub async fn execution_projection_delta(
-        &self,
-        execution_id: &str,
-        cursor: u64,
-        full: bool,
-    ) -> Result<harness_contract::projection::ProjectionDelta, GatewayApiError> {
-        let scope = if full { "full" } else { "summary" };
-        let value = self
-            .get_json(&format!(
-                "/api/runtime/executions/{}/events?cursor={cursor}&detail_scope={scope}",
-                url_encode(execution_id)
-            ))
-            .await?;
-        let delta: harness_contract::projection::ProjectionDelta = serde_json::from_value(value)
-            .map_err(|error| GatewayApiError::Contract(error.to_string()))?;
-        crate::protocol::validate_projection_delta_schema(&delta)
-            .map_err(GatewayApiError::Contract)?;
-        validate_execution_projection_identity(execution_id, &delta.execution_id)?;
-        Ok(delta)
-    }
-
-    pub async fn subscribe_execution_projection_events(
+    pub async fn consume_execution_live_source(
         &self,
         execution_id: &str,
         after_cursor: u64,
@@ -1235,24 +1843,19 @@ impl GatewayApiClient {
         generation: u64,
         tx: CowdEventSender,
     ) -> Result<u64, GatewayApiError> {
-        let scope = if full { "full" } else { "summary" };
-        let url = format!(
-            "{}/api/runtime/executions/{}/events?cursor={after_cursor}&detail_scope={scope}",
-            self.base_url,
-            url_encode(execution_id),
-        );
-        let request = self
-            .sse_client
-            .get(url)
-            .header("Accept", "text/event-stream")
-            .header("Last-Event-ID", after_cursor.to_string());
-        let request = self.authorize(request);
-        let response = request.send().await.map_err(GatewayApiError::Http)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(gateway_status_error(status, body));
-        }
+        let mut source = self
+            .live
+            .subscribe(harness_contract::live::LiveSourceSelector {
+                kind: harness_contract::live::LiveSourceKind::Execution,
+                id: execution_id.to_string(),
+                cursor: after_cursor,
+                detail_scope: if full {
+                    harness_contract::projection::ProjectionDetailScope::Full
+                } else {
+                    harness_contract::projection::ProjectionDetailScope::Summary
+                },
+            })
+            .await?;
         tx.send(CowdEvent::ExecutionProjectionConnection {
             generation,
             execution_id: execution_id.to_string(),
@@ -1264,32 +1867,28 @@ impl GatewayApiClient {
             )
         })?;
 
-        let mut buffer = Vec::new();
-        let mut stream = response.bytes_stream();
         let mut latest_cursor = after_cursor;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(GatewayApiError::Http)?;
-            buffer.extend_from_slice(&chunk);
-            while let Some(frame) = take_gateway_sse_frame(&mut buffer)? {
-                latest_cursor = self
-                    .apply_execution_projection_sse_frame(
-                        &frame,
-                        execution_id,
-                        full,
-                        generation,
-                        latest_cursor,
-                        &tx,
-                    )
-                    .await?;
+        while let Some(envelope) = source.recv().await {
+            if envelope.source_kind != "execution" || envelope.source_id != execution_id {
+                return Err(GatewayApiError::Contract(
+                    "TUI live demultiplexer delivered a mismatched Execution source".to_string(),
+                ));
             }
-        }
-        if !buffer.iter().all(u8::is_ascii_whitespace) {
-            let frame = String::from_utf8(std::mem::take(&mut buffer)).map_err(|_| {
-                GatewayApiError::Url(
-                    "execution projection SSE ended with invalid UTF-8 in its final frame"
+            if envelope.event == "source.authorization_revoked" {
+                return Err(GatewayApiError::Status(
+                    reqwest::StatusCode::FORBIDDEN,
+                    envelope
+                        .payload
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("execution source authorization revoked")
                         .to_string(),
-                )
-            })?;
+                ));
+            }
+            if envelope.source_health == harness_contract::live::SourceHealth::ResyncRequired {
+                return Ok(envelope.source_cursor.unwrap_or(latest_cursor));
+            }
+            let frame = format!("event: {}\ndata: {}", envelope.event, envelope.payload);
             latest_cursor = self
                 .apply_execution_projection_sse_frame(
                     &frame,
@@ -1302,6 +1901,54 @@ impl GatewayApiClient {
                 .await?;
         }
         Ok(latest_cursor)
+    }
+
+    pub async fn consume_mission_live_source(
+        &self,
+        mission_id: &str,
+        tx: CowdEventSender,
+    ) -> Result<(), GatewayApiError> {
+        let mut source = self
+            .live
+            .subscribe(harness_contract::live::LiveSourceSelector {
+                kind: harness_contract::live::LiveSourceKind::Mission,
+                id: mission_id.to_string(),
+                cursor: 0,
+                detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
+            })
+            .await?;
+        while let Some(envelope) = source.recv().await {
+            if envelope.source_kind != "mission" || envelope.source_id != mission_id {
+                return Err(GatewayApiError::Contract(
+                    "TUI live demultiplexer delivered a mismatched Mission source".to_string(),
+                ));
+            }
+            if envelope.event == "source.authorization_revoked" {
+                return Err(GatewayApiError::Status(
+                    reqwest::StatusCode::FORBIDDEN,
+                    envelope
+                        .payload
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("mission source authorization revoked")
+                        .to_string(),
+                ));
+            }
+            if envelope.source_health == harness_contract::live::SourceHealth::ResyncRequired {
+                continue;
+            }
+            if envelope.event == "mission_snapshot" {
+                tx.send_wait(CowdEvent::MissionProjectionSnapshot {
+                    mission_id: mission_id.to_string(),
+                    projection: envelope.payload,
+                })
+                .await
+                .map_err(|_| {
+                    GatewayApiError::Url("TUI Mission projection consumer closed".to_string())
+                })?;
+            }
+        }
+        Ok(())
     }
 
     async fn apply_execution_projection_sse_frame(
@@ -3228,24 +3875,17 @@ async fn deliver_session_stream_event(
     event: CowdEvent,
     authority_generation: u64,
 ) -> Result<(), GatewayApiError> {
-    let requires_delivery = matches!(
-        &event,
-        CowdEvent::GatewaySession {
-            event: GatewaySessionEvent::UserMessageCommitted { .. }
-                | GatewaySessionEvent::ExecutionPhase { .. }
-                | GatewaySessionEvent::TerminalCommitted { .. }
-                | GatewaySessionEvent::TurnError { .. },
-        }
-    );
     let event = session_scoped_event(session_id, authority_generation, event);
-    if requires_delivery {
-        tx.send_wait(event)
-            .await
-            .map_err(|_| GatewayApiError::Url("TUI event receiver closed".to_string()))
-    } else {
-        tx.send(event)
-            .map_err(|_| GatewayApiError::Url("TUI event channel is saturated".to_string()))
-    }
+    // The shared live multiplexer has already applied the delivery-class
+    // policy: ephemeral previews may be coalesced there, while durable and
+    // reconstructable envelopes are lossless. Once an envelope enters a
+    // session bridge, queue pressure must backpressure that bridge instead of
+    // turning an otherwise healthy live source into a reconnect. In
+    // particular, dropping TextDelta here makes every Surface see only the
+    // terminal replay during event bursts.
+    tx.send_wait(event)
+        .await
+        .map_err(|_| GatewayApiError::Url("TUI event receiver closed".to_string()))
 }
 
 async fn deliver_session_stream_event_with_catchup(
@@ -4106,6 +4746,7 @@ fn validate_session_messages_identity(
     Ok(())
 }
 
+#[cfg(test)]
 fn gateway_sse_frame_resync_reason(frame: &str) -> Option<String> {
     let data = frame
         .lines()
@@ -4134,22 +4775,7 @@ fn gateway_sse_frame_resync_reason(frame: &str) -> Option<String> {
     }
 }
 
-fn gateway_sse_frame_session_authorization_revoked(frame: &str) -> Option<String> {
-    let data = gateway_sse_frame_data(frame)?;
-    let value = serde_json::from_str::<serde_json::Value>(&data).ok()?;
-    matches!(
-        value.get("type").and_then(serde_json::Value::as_str),
-        Some("SessionAuthorizationRevoked" | "session_authorization_revoked")
-    )
-    .then(|| {
-        value
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Gateway revoked this session observer")
-            .to_string()
-    })
-}
-
+#[cfg(test)]
 fn validate_session_authorization_revoke_identity(
     frame: &str,
     subscribed_session_id: &str,
@@ -4177,6 +4803,14 @@ fn gateway_sse_frame_event_name(frame: &str) -> Option<&str> {
         .find_map(|line| line.strip_prefix("event:"))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn gateway_sse_frame_id(frame: &str) -> Option<&str> {
+    frame.lines().find_map(|line| {
+        line.strip_prefix("id:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 fn gateway_sse_frame_data(frame: &str) -> Option<String> {
@@ -4209,6 +4843,252 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn tui_consumes_the_canonical_live_envelope_fixture() {
+        let envelope: harness_contract::live::LiveEnvelope =
+            serde_json::from_str(harness_contract::live::LIVE_ENVELOPE_CANONICAL_FIXTURE_JSON)
+                .expect("TUI must consume the canonical live fixture");
+        assert_eq!(envelope.subscription_id, "subscription-contract");
+        assert_eq!(envelope.subscription_revision, 7);
+        assert_eq!(envelope.source_cursor, Some(42));
+        assert_eq!(envelope.event, "TerminalCommitted");
+        assert_eq!(
+            harness_contract::live::live_envelope_schema_hash(),
+            "53ccc1bb8fb6896f1e648035dad6985aba8754b2e5d88e47b7687ddc492a346c"
+        );
+    }
+
+    #[test]
+    fn live_source_selector_recomputes_detail_without_regressing_cursor() {
+        let (summary_tx, _) = mpsc::channel(4);
+        let (full_tx, _) = mpsc::channel(4);
+        let mut source = LiveSourceState {
+            selector: harness_contract::live::LiveSourceSelector {
+                kind: harness_contract::live::LiveSourceKind::Execution,
+                id: "execution-1".to_string(),
+                cursor: 11,
+                detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+            },
+            subscribers: BTreeMap::from([
+                (
+                    "summary".to_string(),
+                    LiveSubscriber {
+                        selector: harness_contract::live::LiveSourceSelector {
+                            kind: harness_contract::live::LiveSourceKind::Execution,
+                            id: "execution-1".to_string(),
+                            cursor: 5,
+                            detail_scope:
+                                harness_contract::projection::ProjectionDetailScope::Summary,
+                        },
+                        tx: summary_tx,
+                    },
+                ),
+                (
+                    "full".to_string(),
+                    LiveSubscriber {
+                        selector: harness_contract::live::LiveSourceSelector {
+                            kind: harness_contract::live::LiveSourceKind::Execution,
+                            id: "execution-1".to_string(),
+                            cursor: 7,
+                            detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
+                        },
+                        tx: full_tx,
+                    },
+                ),
+            ]),
+            pending_previews: BTreeMap::new(),
+        };
+
+        refresh_tui_live_source_selector(&mut source);
+        assert_eq!(
+            source.selector.detail_scope,
+            harness_contract::projection::ProjectionDetailScope::Full
+        );
+        assert_eq!(source.selector.cursor, 11);
+
+        source.subscribers.remove("full");
+        refresh_tui_live_source_selector(&mut source);
+        assert_eq!(
+            source.selector.detail_scope,
+            harness_contract::projection::ProjectionDetailScope::Summary
+        );
+        assert_eq!(source.selector.cursor, 11);
+    }
+
+    #[tokio::test]
+    async fn live_transport_interruption_is_visible_to_every_source() {
+        let (session_tx, mut session_rx) = mpsc::channel(4);
+        let (mission_tx, mut mission_rx) = mpsc::channel(4);
+        let session_selector = harness_contract::live::LiveSourceSelector {
+            kind: harness_contract::live::LiveSourceKind::Session,
+            id: "session-1".to_string(),
+            cursor: 13,
+            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+        };
+        let mission_selector = harness_contract::live::LiveSourceSelector {
+            kind: harness_contract::live::LiveSourceKind::Mission,
+            id: "mission-1".to_string(),
+            cursor: 0,
+            detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
+        };
+        let mut sources = BTreeMap::from([
+            (
+                session_selector.key(),
+                LiveSourceState {
+                    selector: session_selector.clone(),
+                    subscribers: BTreeMap::from([(
+                        "session-view".to_string(),
+                        LiveSubscriber {
+                            selector: session_selector,
+                            tx: session_tx,
+                        },
+                    )]),
+                    pending_previews: BTreeMap::new(),
+                },
+            ),
+            (
+                mission_selector.key(),
+                LiveSourceState {
+                    selector: mission_selector.clone(),
+                    subscribers: BTreeMap::from([(
+                        "mission-view".to_string(),
+                        LiveSubscriber {
+                            selector: mission_selector,
+                            tx: mission_tx,
+                        },
+                    )]),
+                    pending_previews: BTreeMap::new(),
+                },
+            ),
+        ]);
+
+        deliver_tui_live_resync(&mut sources, &None, "gateway unavailable").await;
+
+        let session = session_rx.recv().await.expect("session resync");
+        let mission = mission_rx.recv().await.expect("mission resync");
+        assert_eq!(
+            session.source_health,
+            harness_contract::live::SourceHealth::ResyncRequired
+        );
+        assert_eq!(
+            mission.source_health,
+            harness_contract::live::SourceHealth::ResyncRequired
+        );
+        assert_eq!(session.source_cursor, Some(13));
+        assert_eq!(session.payload["reason"], "gateway unavailable");
+        assert_eq!(mission.payload["origin"], "tui_live_transport");
+    }
+
+    #[tokio::test]
+    async fn snapshot_reconstructable_events_use_reliable_bounded_delivery() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(harness_contract::live::canonical_live_envelope_fixture())
+            .await
+            .expect("prefill subscriber queue");
+        let selector = harness_contract::live::LiveSourceSelector {
+            kind: harness_contract::live::LiveSourceKind::Session,
+            id: "session-contract".to_string(),
+            cursor: 42,
+            detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
+        };
+        let mut sources = BTreeMap::from([(
+            selector.key(),
+            LiveSourceState {
+                selector: selector.clone(),
+                subscribers: BTreeMap::from([(
+                    "execution-view".to_string(),
+                    LiveSubscriber { selector, tx },
+                )]),
+                pending_previews: BTreeMap::new(),
+            },
+        )]);
+        let mut envelope = harness_contract::live::canonical_live_envelope_fixture();
+        envelope.delivery_class = harness_contract::live::DeliveryClass::SnapshotReconstructable;
+        envelope.event = "ExecutionPhase".to_string();
+
+        let mut delivery = Box::pin(deliver_tui_live_envelope(&mut sources, envelope));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err(),
+            "reconstructable event must wait instead of replacing queued causal data"
+        );
+        assert_eq!(
+            rx.recv().await.expect("prefilled event").event,
+            "TerminalCommitted"
+        );
+        tokio::time::timeout(Duration::from_secs(1), delivery)
+            .await
+            .expect("reliable delivery resumes when bounded capacity is available");
+        assert_eq!(
+            rx.recv().await.expect("reconstructable event").event,
+            "ExecutionPhase"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_text_delta_backpressures_instead_of_restarting_a_saturated_source() {
+        let (tx, mut rx) = crate::cowd_event_channel();
+        for index in 0..256 {
+            tx.send(CowdEvent::ThinkingDelta {
+                thinking: format!("queued-{index}"),
+            })
+            .expect("fill primary event queue");
+        }
+        let event = CowdEvent::GatewaySession {
+            event: GatewaySessionEvent::TextDelta {
+                correlation: GatewayEventCorrelation {
+                    session_id: "session-1".to_string(),
+                    execution_id: Some("execution-1".to_string()),
+                    turn_id: Some("turn-1".to_string()),
+                    part_id: Some("assistant_text".to_string()),
+                    ..Default::default()
+                },
+                text: "visible before terminal".to_string(),
+                start_bytes: 0,
+                end_bytes: 23,
+                stream_revision: 23,
+            },
+        };
+
+        let mut delivery = Box::pin(deliver_session_stream_event(&tx, "session-1", event, 1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut delivery)
+                .await
+                .is_err(),
+            "a saturated render queue must apply backpressure instead of failing the live source"
+        );
+        assert!(matches!(
+            rx.try_recv().expect("free one queue slot"),
+            CowdEvent::ThinkingDelta { .. }
+        ));
+        tokio::time::timeout(Duration::from_secs(1), delivery)
+            .await
+            .expect("delta delivery resumes when one bounded slot is available")
+            .expect("healthy live source remains connected");
+
+        let delivered = std::iter::from_fn(|| rx.try_recv().ok()).any(|event| {
+            matches!(
+                event,
+                CowdEvent::SessionScoped {
+                    session_id,
+                    authority_generation: 1,
+                    event,
+                } if session_id == "session-1"
+                    && matches!(
+                        event.as_ref(),
+                        CowdEvent::GatewaySession {
+                            event: GatewaySessionEvent::TextDelta { text, .. }
+                        } if text == "visible before terminal"
+                    )
+            )
+        });
+        assert!(
+            delivered,
+            "accepted preview must reach the TUI reducer exactly once"
+        );
+    }
 
     #[test]
     fn normalize_base_url_trims_trailing_slashes() {
@@ -4253,8 +5133,12 @@ mod tests {
         assert!(source.contains("x-cowd-surface-id"));
         assert_eq!(production_source.matches(".bearer_auth(").count(), 1);
         assert!(
-            !production_source.contains("x-cowd-requested-capabilities"),
-            "TUI must not reconstruct an APP capability union; the broker derives it from the active APP catalogue"
+            production_source.contains("harness_contract::security::CORE_HUMAN_CAPABILITIES"),
+            "TUI must request the canonical core manager capabilities"
+        );
+        assert!(
+            !production_source.contains("cowd_product_apps::compiled_products"),
+            "TUI must not reconstruct an APP capability union; the broker derives APP entitlements from the active catalogue"
         );
     }
 
@@ -4741,7 +5625,7 @@ mod tests {
             "revalidate_connector_resource",
             "promote_connector_resource_to_memory",
             "chat_session",
-            "subscribe_session_events",
+            "consume_session_live_source",
             "runtime_control_plane",
             "cowd_capabilities",
             "cowd_projection",
@@ -5029,10 +5913,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_stream_hydrates_after_live_subscription_before_delivering_queued_events() {
+    async fn session_stream_holds_live_delta_until_revision_barrier_then_hydrates_history() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let server = tokio::spawn(async move {
+            let (mut subscription_socket, _) =
+                listener.accept().await.expect("accept subscription");
+            let mut request = vec![0; 4096];
+            let size = subscription_socket
+                .read(&mut request)
+                .await
+                .expect("read subscription request");
+            let request = String::from_utf8_lossy(&request[..size]);
+            assert!(
+                request.starts_with("POST /api/runtime/live-subscriptions HTTP/1.1"),
+                "{request}"
+            );
+            let subscription = serde_json::json!({
+                "schema_version": 1,
+                "id": "live-test",
+                "surface_instance": "tui:test",
+                "revision": 1,
+                "selector": {"sources": [{
+                    "kind": "session",
+                    "id": "session-1",
+                    "cursor": 0,
+                    "detail_scope": "summary"
+                }]},
+                "selector_hash": "selector-1",
+                "expires_at_ms": u64::MAX,
+                "stream_url": "/api/runtime/live/live-test"
+            })
+            .to_string();
+            subscription_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{subscription}",
+                        subscription.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write subscription response");
+            drop(subscription_socket);
+
             let (mut stream_socket, _) = listener.accept().await.expect("accept stream");
             let mut request = vec![0; 4096];
             let size = stream_socket
@@ -5041,31 +5965,65 @@ mod tests {
                 .expect("read stream request");
             let request = String::from_utf8_lossy(&request[..size]);
             assert!(
-                request.starts_with("GET /api/sessions/session-1/stream HTTP/1.1"),
+                request.starts_with("GET /api/runtime/live/live-test HTTP/1.1"),
                 "{request}"
             );
-            let sse = concat!(
-                "id: 9\r\n",
-                "event: message\r\n",
-                "data: {\"type\":\"TerminalCommitted\",",
-                "\"session_id\":\"session-1\",",
-                "\"execution_id\":\"execution-1\",",
-                "\"turn_id\":\"turn-1\",",
-                "\"part_id\":\"assistant_text\",",
-                "\"message_id\":\"assistant-2\",",
-                "\"terminal_id\":\"terminal-1\",",
-                "\"response\":\"live answer\"}\r\n\r\n"
-            );
+            let ready = serde_json::json!({
+                "schema_version": 1,
+                "subscription_id": "live-test",
+                "subscription_revision": 1,
+                "source_kind": "subscription",
+                "source_id": "live-test",
+                "detail_scope": "summary",
+                "delivery_class": "snapshot_reconstructable",
+                "source_health": "baseline",
+                "event": "subscription.ready",
+                "payload": {"revision": 1}
+            });
+            let terminal = serde_json::json!({
+                "schema_version": 1,
+                "subscription_id": "live-test",
+                "subscription_revision": 1,
+                "source_kind": "session",
+                "source_id": "session-1",
+                "detail_scope": "summary",
+                "source_cursor": 9,
+                "delivery_class": "durable",
+                "source_health": "live",
+                "event": "TerminalCommitted",
+                "payload": {
+                    "type": "TerminalCommitted",
+                    "session_id": "session-1",
+                    "execution_id": "execution-1",
+                    "turn_id": "turn-1",
+                    "part_id": "assistant_text",
+                    "message_id": "assistant-2",
+                    "terminal_id": "terminal-1",
+                    "response": "live answer"
+                }
+            });
+            let resync = serde_json::json!({
+                "schema_version": 1,
+                "subscription_id": "live-test",
+                "subscription_revision": 1,
+                "source_kind": "session",
+                "source_id": "session-1",
+                "detail_scope": "summary",
+                "source_cursor": 9,
+                "delivery_class": "snapshot_reconstructable",
+                "source_health": "resync_required",
+                "event": "source.resync_required",
+                "payload": {"reason": "fixture complete"}
+            });
             stream_socket
                 .write_all(
                     format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\nevent: live\r\ndata: {terminal}\r\n\r\nevent: live\r\ndata: {ready}\r\n\r\nevent: live\r\ndata: {resync}\r\n\r\n"
                     )
                     .as_bytes(),
                 )
                 .await
                 .expect("write stream response");
-            drop(stream_socket);
 
             let (mut probe_socket, _) = listener.accept().await.expect("accept history probe");
             let mut request = vec![0; 4096];
@@ -5131,12 +6089,13 @@ mod tests {
                 )
                 .await
                 .expect("write history page");
+            drop(stream_socket);
         });
 
         let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let (tx, mut rx) = crate::cowd_event_channel();
         let progress = client
-            .subscribe_session_events(
+            .consume_session_live_source(
                 "session-1",
                 tx.clone(),
                 None,
@@ -5199,39 +6158,106 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let server = tokio::spawn(async move {
+            let (mut subscription_socket, _) =
+                listener.accept().await.expect("accept subscription");
+            let mut request = vec![0; 4096];
+            let _ = subscription_socket
+                .read(&mut request)
+                .await
+                .expect("read subscription request");
+            let subscription = serde_json::json!({
+                "schema_version": 1,
+                "id": "live-test",
+                "surface_instance": "tui:test",
+                "revision": 1,
+                "selector": {"sources": [{
+                    "kind": "session",
+                    "id": "session-1",
+                    "cursor": 0,
+                    "detail_scope": "summary"
+                }]},
+                "selector_hash": "selector-1",
+                "expires_at_ms": u64::MAX,
+                "stream_url": "/api/runtime/live/live-test"
+            })
+            .to_string();
+            subscription_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{subscription}",
+                        subscription.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write subscription response");
+            drop(subscription_socket);
+
             let (mut stream_socket, _) = listener.accept().await.expect("accept stream");
             let mut request = vec![0; 4096];
             let _ = stream_socket
                 .read(&mut request)
                 .await
                 .expect("read stream request");
+            let resync = serde_json::json!({
+                "schema_version": 1,
+                "subscription_id": "live-test",
+                "subscription_revision": 1,
+                "source_kind": "session",
+                "source_id": "session-1",
+                "detail_scope": "summary",
+                "source_cursor": 0,
+                "delivery_class": "snapshot_reconstructable",
+                "source_health": "resync_required",
+                "event": "source.resync_required",
+                "payload": {"reason": "hydrate using durable history"}
+            });
             stream_socket
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: live\r\ndata: {resync}\r\n\r\n"
+                    )
+                    .as_bytes(),
                 )
                 .await
                 .expect("write stream response");
-            drop(stream_socket);
 
-            let (mut history_socket, _) = listener.accept().await.expect("accept history");
-            let mut request = vec![0; 4096];
-            let _ = history_socket
-                .read(&mut request)
-                .await
-                .expect("read history request");
-            history_socket
-                .write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 31\r\nconnection: close\r\n\r\n{\"error\":\"history unavailable\"}",
-                )
-                .await
-                .expect("write history response");
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.expect("accept follow-up request");
+                let mut request = vec![0; 4096];
+                let size = socket
+                    .read(&mut request)
+                    .await
+                    .expect("read follow-up request");
+                let request = String::from_utf8_lossy(&request[..size]);
+                if request.starts_with("GET /api/sessions/session-1/messages") {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 31\r\nconnection: close\r\n\r\n{\"error\":\"history unavailable\"}",
+                        )
+                        .await
+                        .expect("write history response");
+                    break;
+                }
+                if request.starts_with("DELETE /api/runtime/live-subscriptions/live-test") {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}",
+                        )
+                        .await
+                        .expect("write delete response");
+                    continue;
+                }
+                panic!("unexpected follow-up request: {request}");
+            }
+            drop(stream_socket);
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
 
         let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
         let (tx, mut rx) = crate::cowd_event_channel();
         let progress = client
-            .subscribe_session_events(
+            .consume_session_live_source(
                 "session-1",
                 tx.clone(),
                 None,
@@ -5249,17 +6275,31 @@ mod tests {
                     .await;
             }
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            CowdEvent::SessionScoped { session_id, event, .. }
-                if session_id == "session-1"
-                    && matches!(event.as_ref(), CowdEvent::SessionHistoryHydrationFailed {
-                        session_id,
-                        error
-                    } if session_id == "session-1" && error.contains("history unavailable"))
-        )));
+        let failure = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let Ok(event) = rx.try_recv() else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                };
+                if matches!(
+                    event,
+                    CowdEvent::SessionScoped { ref session_id, ref event, .. }
+                        if session_id == "session-1"
+                            && matches!(event.as_ref(), CowdEvent::SessionHistoryHydrationFailed {
+                                session_id,
+                                error
+                            } if session_id == "session-1" && error.contains("history unavailable"))
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("typed hydration failure should be visible without timing assumptions");
+        assert!(matches!(
+            failure,
+            CowdEvent::SessionScoped { session_id, .. } if session_id == "session-1"
+        ));
         hydration.abort();
         server.await.expect("server task");
     }

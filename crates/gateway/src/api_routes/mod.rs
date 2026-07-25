@@ -62,6 +62,7 @@ mod edge_routes;
 mod evolution_routes;
 mod growth_routes;
 mod harness_eval_routes;
+mod live_routes;
 mod managed_agent_routes;
 mod matrix_outcomes;
 mod matrix_routes;
@@ -858,15 +859,10 @@ pub(super) fn issue_human_decision_lease(
 
 #[cfg(any(test, feature = "test-support"))]
 fn test_human_capabilities() -> Vec<String> {
-    let mut capabilities = vec![
-        "approval.respond".to_string(),
-        "definition.manage".to_string(),
-        "definition.default.set".to_string(),
-        "definition.rollback".to_string(),
-        "evolution.release.manage".to_string(),
-        "runtime.maintenance.manage".to_string(),
-        "runtime.outbox.retry".to_string(),
-    ];
+    let mut capabilities = harness_contract::security::CORE_HUMAN_CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect::<Vec<_>>();
     capabilities.extend(
         cowd_product_apps::compiled_products()
             .into_iter()
@@ -1192,6 +1188,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         .merge(matrix_routes::router())
         .merge(mission_routes::router())
         .merge(memory_routes::router())
+        .merge(live_routes::router())
         .merge(message_routes::router())
         .merge(profile_routes::router())
         .merge(reality_routes::router())
@@ -1281,7 +1278,7 @@ fn hold_capacity_lease_for_body(
 fn is_stream_capacity_path(path: &str) -> bool {
     path.ends_with("/stream")
         || path == "/api/apps/mfg/live"
-        || (path.starts_with("/api/runtime/executions/") && path.ends_with("/events"))
+        || path.starts_with("/api/runtime/live/")
 }
 
 fn is_control_capacity_path(path: &str) -> bool {
@@ -1317,7 +1314,7 @@ mod capacity_middleware_tests {
     fn routes_are_partitioned_without_treating_long_stream_as_data() {
         assert!(is_control_capacity_path("/healthz"));
         assert!(is_control_capacity_path("/api/runtime/turns/t-1/cancel"));
-        assert!(is_stream_capacity_path("/api/sessions/s-1/stream"));
+        assert!(is_stream_capacity_path("/api/runtime/live/subscription-1"));
         assert!(is_stream_capacity_path("/api/apps/mfg/live"));
         assert!(!is_stream_capacity_path("/api/runtime/events"));
     }
@@ -3474,25 +3471,59 @@ pub(crate) mod tests {
                 .unwrap();
         assert_eq!(snapshot["execution_id"], execution_id);
         let revision = snapshot["revision"].as_u64().expect("revision");
-        let cursor = snapshot["cursor"].as_u64().expect("cursor");
 
-        let delta = app
+        let subscription = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(format!(
-                        "/api/runtime/executions/{execution_id}/events?cursor=0"
+                    .method("POST")
+                    .uri("/api/runtime/live-subscriptions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "test.execution-projection")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "surface_instance": "test.execution-projection",
+                            "idempotency_key": "test-execution-projection-live",
+                            "selector": {
+                                "sources": [{
+                                    "kind": "execution",
+                                    "id": execution_id,
+                                    "cursor": 0,
+                                    "detail_scope": "summary"
+                                }]
+                            }
+                        })
+                        .to_string(),
                     ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription.status(), StatusCode::CREATED);
+        let subscription: serde_json::Value = serde_json::from_slice(
+            &to_bytes(subscription.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let subscription_id = subscription["id"].as_str().expect("subscription id");
+        let live = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runtime/live/{subscription_id}"))
+                    .header("x-cowd-observer-id", "test.execution-projection")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(delta.status(), StatusCode::OK);
-        let delta: serde_json::Value =
-            serde_json::from_slice(&to_bytes(delta.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        assert!(delta["target_cursor"].as_u64().unwrap_or_default() >= cursor);
+        assert_eq!(live.status(), StatusCode::OK);
+        assert!(live
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/event-stream")));
 
         let command = app
             .oneshot(

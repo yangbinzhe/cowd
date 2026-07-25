@@ -1,10 +1,10 @@
 # Gateway API 全量接口说明书
 
-生成时间：2026-07-13
+生成时间：2026-07-25
 
 来源：`crates/gateway/src/api_routes/**/*.rs` 中实际 `axum::Router::route` 声明，并与 `crates/gateway/src/api_routes/route_manifest.rs` 的运行时清单方向保持一致。
 
-当前共识别 `492` 个唯一 `method + path` 接口。
+当前共识别 `426` 个唯一 `method + path` 接口。
 
 ## Capability Contract / OpenAPI 状态
 
@@ -27,27 +27,26 @@ Gateway 现在以 `/api/gateway/capability-contract` 作为运行时接口能力
 - [公共入口与认证](#公共入口与认证)：11 个接口
 - [Cowd 核心投影与发布门禁](#cowd-核心投影与发布门禁)：10 个接口
 - [Runtime 执行核心](#runtime-执行核心)：28 个接口
-- [Session 生命周期](#session-生命周期)：20 个接口
-- [对话消息与 SSE](#对话消息与-sse)：9 个接口
+- [Session 生命周期](#session-生命周期)：24 个接口
+- [对话消息与 SSE](#对话消息与-sse)：8 个接口
 - [Mission Control / 多 Session 多 Agent 协同](#mission-control-/-多-session-多-agent-协同)：34 个接口
 - [Agent 目录、组队与运行](#agent-目录、组队与运行)：18 个接口
 - [Task 阶段化执行](#task-阶段化执行)：8 个接口
-- [Context / Evidence](#context-/-evidence)：7 个接口
-- [Memory / Knowledge](#memory-/-knowledge)：30 个接口
+- [Context / Evidence](#context-/-evidence)：8 个接口
+- [Memory / Knowledge](#memory-/-knowledge)：31 个接口
 - [Reality Core](#reality-core)：10 个接口
 - [Matrix 结构化事实](#matrix-结构化事实)：43 个接口
 - [Growth / 自我演进](#growth-/-自我演进)：2 个接口
 - [Tools 工具执行](#tools-工具执行)：17 个接口
 - [Skills 技能体系](#skills-技能体系)：12 个接口
-- [Approval 审批](#approval-审批)：7 个接口
-- [Cross Plane 权限与动作](#cross-plane-权限与动作)：14 个接口
-- [Surface 接入面](#surface-接入面)：29 个接口
+- [Approval 审批](#approval-审批)：8 个接口
+- [Cross Plane 权限与动作](#cross-plane-权限与动作)：15 个接口
+- [Surface 接入面](#surface-接入面)：30 个接口
 - [Edge 热加载与外部包](#edge-热加载与外部包)：7 个接口
-- [Connector 数据与服务连接](#connector-数据与服务连接)：15 个接口
-- [Resource 附件资源](#resource-附件资源)：3 个接口
+- [Connector 数据与服务连接](#connector-数据与服务连接)：14 个接口
+- [Resource 附件资源](#resource-附件资源)：4 个接口
 - [Workspace 文件工作区](#workspace-文件工作区)：14 个接口
 - [Profile 配置画像](#profile-配置画像)：4 个接口
-- [MFG 上层应用](#mfg-上层应用)：79 个接口
 - [Harness Eval 评测](#harness-eval-评测)：10 个接口
 - [Audit 审计](#audit-审计)：1 个接口
 - [Slash 命令](#slash-命令)：5 个接口
@@ -140,6 +139,8 @@ AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提�
 | `POST` | `/api/sessions/:id/detach` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `detach_session_handler` | `session_routes.rs` | P1 |
 | `POST` | `/api/sessions/:id/ensure` | Session 生命周期 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `ensure_session_handler` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/events` | Session 生命周期 查询接口 | id | 支持 Query 参数，详见 handler Params struct | - | `get_session_events` | `session_routes.rs` | P1 |
+| `GET` | `/api/sessions/:id/evidence` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_evidence` | `session_routes.rs` | P1 |
+| `GET` | `/api/sessions/:id/execution` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_execution_index` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/lifecycle` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `session_lifecycle_handler` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/projection` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_projection` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/replay` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `replay_session_handler` | `session_routes.rs` | P1 |
@@ -147,6 +148,8 @@ AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提�
 | `GET` | `/api/sessions/:id/stats` | 读取 session token、耗时和运行统计 | id | 支持 Query 参数，详见 handler Params struct | - | `get_session_stats_handler` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/turns` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_turns` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/turns/:turn_id` | Session 生命周期 查询接口 | id, turn_id | 可选 Query 视具体 handler 而定 | - | `get_session_turn` | `session_routes.rs` | P1 |
+| `GET` | `/api/sessions/:id/turns/:turn_id/evidence` | Session 生命周期 查询接口 | id, turn_id | 可选 Query 视具体 handler 而定 | - | `get_turn_evidence` | `session_routes.rs` | P1 |
+| `GET` | `/api/sessions/executions` | Session 生命周期 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `list_running_session_execution_indices` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/search` | Session 生命周期 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `search_messages_handler` | `session_routes.rs` | P1 |
 
 ## 对话消息与 SSE
@@ -161,7 +164,6 @@ AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提�
 | `POST` | `/api/sessions/:id/inputs/:input_id/reclassify` | 对话消息与 SSE 创建/动作接口 | id, input_id | - | JSON 或 Multipart，详见对应 Request struct | `reclassify_session_input` | `message_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/messages` | 读取或发送指定 session 的对话消息 | id | 可选 Query 视具体 handler 而定 | - | `get_session_messages` | `message_routes.rs` | P1 |
 | `POST` | `/api/sessions/:id/messages` | 读取或发送指定 session 的对话消息 | id | - | JSON 或 Multipart，详见对应 Request struct | `send_message` | `message_routes.rs` | P1 |
-| `GET` | `/api/sessions/:id/stream` | 订阅指定 session 的 SSE 实时输出 | id | 可选 Query 视具体 handler 而定 | - | `sse_stream_handler` | `message_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/turn-inbox` | 对话消息与 SSE 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_turn_inbox` | `message_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/turns/:turn_id/inbox` | 对话消息与 SSE 查询接口 | id, turn_id | 可选 Query 视具体 handler 而定 | - | `get_turn_inbox_by_path` | `message_routes.rs` | P1 |
 
@@ -256,6 +258,7 @@ Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉�
 | `GET` | `/api/context/current` | 构建当前上下文 envelope | - | 支持 Query 参数，详见 handler Params struct | - | `context_current_handler` | `context_routes.rs` | P1 |
 | `GET` | `/api/evidence/projections` | Context / Evidence 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `list_evidence_audit_projections` | `context_routes.rs` | P2 |
 | `GET` | `/api/evidence/resolve` | 解析 evidence ref 到可展示证据 | - | 可选 Query 视具体 handler 而定 | - | `resolve_evidence_ref_handler` | `context_routes.rs` | P2 |
+| `POST` | `/api/evidence/resolve/batch` | Context / Evidence 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `resolve_evidence_refs_batch_handler` | `context_routes.rs` | P2 |
 | `GET` | `/api/sessions/:id/context` | Context / Evidence 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_context_history` | `context_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/context/recommendations` | Context / Evidence 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_context_recommendation_stats` | `context_routes.rs` | P1 |
 | `POST` | `/api/sessions/:id/context/recommendations` | Context / Evidence 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `record_context_recommendation_action` | `context_routes.rs` | P1 |
@@ -275,6 +278,7 @@ Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉�
 | `GET` | `/api/memory/context-envelope/:session_id` | Memory/Knowledge 查询接口 | session_id | 可选 Query 视具体 handler 而定 | - | `memory_context_envelope_session_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/entities` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_entities_handler` | `memory_routes.rs` | P1 |
 | `PATCH` | `/api/memory/entry/:id` | Memory/Knowledge 局部更新接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `update_memory_entry_handler` | `memory_routes.rs` | P1 |
+| `GET` | `/api/memory/graph` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_graph_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/knowledge` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_knowledge_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/knowledge/conflicts` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_knowledge_conflicts_handler` | `memory_routes.rs` | P1 |
 | `GET` | `/api/memory/knowledge/health` | Memory/Knowledge 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `memory_knowledge_health_handler` | `memory_routes.rs` | P1 |
@@ -422,6 +426,7 @@ Reality Core 的静态地图、动态 fact flow、promotions、governance、boun
 
 | 方法 | 路径 | 用途 | Path 参数 | Query | Body | Handler | Source | 级别 |
 |---|---|---|---|---|---|---|---|---|
+| `GET` | `/api/approval/:id` | Approval 审批 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `approval_exact_handler` | `approval_routes.rs` | P1 |
 | `GET` | `/api/approval/config` | Approval 审批 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `approval_config_handler` | `approval_routes.rs` | P1 |
 | `PUT` | `/api/approval/config` | Approval 审批 全量更新接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `update_approval_config_handler` | `approval_routes.rs` | P1 |
 | `GET` | `/api/approval/history` | Approval 审批 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `approval_history_handler` | `approval_routes.rs` | P1 |
@@ -439,6 +444,7 @@ Reality Core 的静态地图、动态 fact flow、promotions、governance、boun
 | `GET` | `/api/cross-plane/action/adapters` | Cross Plane 权限与动作 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `cross_plane_action_adapters_handler` | `cross_plane_routes.rs` | P1 |
 | `POST` | `/api/cross-plane/action/execute` | Cross Plane 权限与动作 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `cross_plane_action_execute_handler` | `cross_plane_routes.rs` | P1 |
 | `GET` | `/api/cross-plane/action/executions` | Cross Plane 权限与动作 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `cross_plane_action_executions_handler` | `cross_plane_routes.rs` | P1 |
+| `GET` | `/api/cross-plane/action/executions/:id` | Cross Plane 权限与动作 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `cross_plane_action_execution_get_handler` | `cross_plane_routes.rs` | P1 |
 | `POST` | `/api/cross-plane/action/preflight` | Cross Plane 权限与动作 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `cross_plane_action_preflight_handler` | `cross_plane_routes.rs` | P1 |
 | `GET` | `/api/cross-plane/audit` | Cross Plane 权限与动作 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `cross_plane_audit_handler` | `cross_plane_routes.rs` | P1 |
 | `GET` | `/api/cross-plane/grants` | Cross Plane 权限与动作 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `cross_plane_grants_handler` | `cross_plane_routes.rs` | P1 |
@@ -470,6 +476,7 @@ Surface 注册表、健康、路由、资源、状态、事件、启动/停止/�
 | `POST` | `/api/surfaces/:id/messages/archive` | Surface 接入面 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `archive_surface_messages_handler` | `surface_routes.rs` | P1 |
 | `POST` | `/api/surfaces/:id/messages/purge-archived-events` | Surface 接入面 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `purge_archived_surface_messages_handler` | `surface_routes.rs` | P1 |
 | `GET` | `/api/surfaces/:id/outbox` | Surface 接入面 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_surface_outbox_handler` | `surface_routes.rs` | P1 |
+| `GET` | `/api/surfaces/:id/outbox/:delivery_id` | Surface 接入面 查询接口 | id, delivery_id | 可选 Query 视具体 handler 而定 | - | `get_surface_outbox_delivery_handler` | `surface_routes.rs` | P1 |
 | `POST` | `/api/surfaces/:id/outbox/:delivery_id/dead-letter` | Surface 接入面 创建/动作接口 | id, delivery_id | - | JSON 或 Multipart，详见对应 Request struct | `dead_letter_surface_outbox_handler` | `surface_routes.rs` | P1 |
 | `POST` | `/api/surfaces/:id/outbox/:delivery_id/retry` | Surface 接入面 创建/动作接口 | id, delivery_id | - | JSON 或 Multipart，详见对应 Request struct | `retry_surface_outbox_handler` | `surface_routes.rs` | P1 |
 | `POST` | `/api/surfaces/:id/repair` | 对 surface 执行人工修复动作 | id | - | JSON 或 Multipart，详见对应 Request struct | `repair_surface_handler` | `surface_routes.rs` | P1 |
@@ -517,7 +524,6 @@ Edge 包发现、健康、热加载、surface/connector/resource 投影。
 | `POST` | `/api/connectors/services/:service_id/execute` | Connector 外部连接 创建/动作接口 | service_id | - | JSON 或 Multipart，详见对应 Request struct | `connector_service_execute_handler` | `connector_routes.rs` | P2 |
 | `GET` | `/api/connectors/services/:service_id/tools` | Connector 外部连接 查询接口 | service_id | 可选 Query 视具体 handler 而定 | - | `connector_service_tools_handler` | `connector_routes.rs` | P1 |
 | `GET` | `/api/connectors/sources` | Connector 外部连接 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `connector_sources_handler` | `connector_routes.rs` | P2 |
-| `POST` | `/api/connectors/sources/:adapter_id/commit-watermark` | Connector 外部连接 创建/动作接口 | adapter_id | - | JSON 或 Multipart，详见对应 Request struct | `connector_source_commit_watermark_handler` | `connector_routes.rs` | P2 |
 | `POST` | `/api/connectors/sources/:adapter_id/poll-events` | Connector 外部连接 创建/动作接口 | adapter_id | - | JSON 或 Multipart，详见对应 Request struct | `connector_source_poll_events_handler` | `connector_routes.rs` | P2 |
 | `POST` | `/api/connectors/sources/:adapter_id/run-incremental` | Connector 外部连接 创建/动作接口 | adapter_id | - | JSON 或 Multipart，详见对应 Request struct | `connector_source_run_incremental_handler` | `connector_routes.rs` | P2 |
 | `GET` | `/api/connectors/sources/:adapter_id/state` | Connector 外部连接 查询接口 | adapter_id | 可选 Query 视具体 handler 而定 | - | `connector_source_state_handler` | `connector_routes.rs` | P2 |
@@ -531,6 +537,7 @@ Edge 包发现、健康、热加载、surface/connector/resource 投影。
 |---|---|---|---|---|---|---|---|---|
 | `POST` | `/api/resources` | 上传附件资源并注册到 runtime resource store | - | - | JSON 或 Multipart，详见对应 Request struct | `upload_resource_handler` | `resource_routes.rs` | P1 |
 | `GET` | `/api/resources/:id` | 附件资源 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_resource_handler` | `resource_routes.rs` | P1 |
+| `GET` | `/api/resources/:id/content` | 附件资源 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_resource_content_handler` | `resource_routes.rs` | P1 |
 | `GET` | `/api/resources/:id/evidence` | 附件资源 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_resource_evidence_handler` | `resource_routes.rs` | P1 |
 
 ## Workspace 文件工作区
@@ -564,92 +571,6 @@ Edge 包发现、健康、热加载、surface/connector/resource 投影。
 | `POST` | `/api/profiles` | Profile 配置画像 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `create_profile_handler` | `profile_routes.rs` | P2 |
 | `DELETE` | `/api/profiles/:id` | Profile 配置画像 删除接口 | id | - | 通常无 body 或仅 path/query | `delete_profile_handler` | `profile_routes.rs` | P2 |
 | `POST` | `/api/profiles/switch` | Profile 配置画像 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `switch_profile_handler` | `profile_routes.rs` | P2 |
-
-## MFG 上层应用
-
-制造领域应用：Reality 数据、事件、incident、playbook、case、analysis、action、report。
-
-| 方法 | 路径 | 用途 | Path 参数 | Query | Body | Handler | Source | 级别 |
-|---|---|---|---|---|---|---|---|---|
-| `POST` | `/api/apps/mfg/analyses/:analysis_id/actions/:action_id/execute` | MFG 应用 创建/动作接口 | analysis_id, action_id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_action_execute_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/analyses/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_analysis_get_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/app` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_app_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/cases/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_memory_case_get_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/cases/search` | MFG 应用 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `mfg_memory_case_search_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/cockpit/profiles/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_cockpit_profile_get_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/cockpit/profiles/:id/projection` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_cockpit_projection_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/cockpit/profiles/:id/reports/generate` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_cockpit_report_generate_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/cockpit/profiles/upsert` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_cockpit_profile_upsert_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/cockpit/reports/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_cockpit_report_get_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/cockpit/reports/:id/deliver` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_cockpit_report_deliver_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/cockpit/reports/:id/delivery-state` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_cockpit_report_delivery_state_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/cockpit/reports/:id/delivery/retry` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_cockpit_report_delivery_retry_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/cockpit/reports/schedules/run` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_cockpit_report_schedule_run_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/command-center` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_command_center_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/command-center/live` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_command_center_live_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/decision-trace` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_decision_trace_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/domain/server-manufacturing` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_server_manufacturing_domain_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/domain/server-manufacturing/seed` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_server_manufacturing_seed_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/executions/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_execution_get_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/executions/:id/cross-plane/execute` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_execution_cross_plane_bridge_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/executions/:id/feedback` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_execution_feedback_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/incidents` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_incidents_list_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/incidents` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_incident_create_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/incidents/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_incident_get_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/incidents/:id/analyze` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_incident_analyze_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/incidents/:id/cases/promote` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_incident_case_promote_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/incidents/:id/playbooks/recommend` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_incident_playbook_recommend_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/incidents/:id/room` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_incident_room_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/incidents/:id/skills` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_incident_skill_runs_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/incidents/:id/skills/:skill_id/run` | MFG 应用 创建/动作接口 | id, skill_id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_incident_skill_run_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/incidents/:id/skills/plan` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_incident_skill_plan_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/ontology/server-manufacturing` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_server_manufacturing_ontology_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/ontology/server-manufacturing/seed` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_server_manufacturing_ontology_seed_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/playbooks/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_playbook_get_handler` | `mfg_routes.rs` | P2 |
-| `POST` | `/api/apps/mfg/playbooks/upsert` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_playbook_upsert_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/production/governance` | MFG 外置应用查询接口 | - | 无 | - | `mfg_production_governance_handler` | `cowd-app-mfg/app-mfg-adapter` | P2 |
-| `GET` | `/api/apps/mfg/reality/attention/hot` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_reality_attention_hot_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/changes` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_reality_changes_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/compute/jobs/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_compute_job_get_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/compute/jobs/:id/run` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_compute_job_run_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/compute/jobs/plan` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_compute_job_plan_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/connector-runs/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_connector_run_get_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/data-plane/health` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_reality_data_plane_health_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/data-plane/ingest-plan` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_data_plane_ingest_plan_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/entities` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_reality_entities_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/entities/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_entity_get_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/entities/:id/impact-path` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_entity_impact_path_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/entities/:id/relations` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_entity_relations_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/entities/conflict-decision` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_entity_conflict_decision_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/entities/match-candidate` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_entity_match_candidate_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/entities/resolve-source-key` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_entity_resolve_source_key_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/entities/upsert` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_entity_upsert_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/evidence/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_evidence_get_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/evidence/:id/context` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_evidence_context_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/evidence/:id/quality-gate` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_evidence_quality_gate_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/evidence/build` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_evidence_build_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/facts/ingest` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_fact_ingest_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/health` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_reality_health_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/metric-dependencies/affected-by-fact-type` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_metric_affected_by_fact_type_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/metric-dependencies/upsert` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_metric_dependency_upsert_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/metrics` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_reality_metrics_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/metrics/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_metric_detail_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/metrics/:id/lineage` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_metric_lineage_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/metrics/attention-plan` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_metric_attention_plan_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/metrics/recompute` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_metric_recompute_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/metrics/snapshots/materialize` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_metric_snapshot_materialize_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/quality-gates/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_quality_gate_get_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/relations/upsert` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_relation_upsert_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/reality/source-packs/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_reality_source_pack_get_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/source-packs/:id/connector-runs/plan` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_source_pack_connector_run_plan_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/source-packs/:id/connector-runs/run` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_source_pack_connector_run_execute_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/source-packs/:id/delta-plan` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_source_pack_delta_plan_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/source-packs/:id/ingest-file` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_source_pack_ingest_file_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/source-packs/:id/validate` | MFG 应用 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_source_pack_validate_handler` | `mfg_routes.rs` | P1 |
-| `POST` | `/api/apps/mfg/reality/source-packs/upsert` | MFG 应用 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `mfg_reality_source_pack_upsert_handler` | `mfg_routes.rs` | P1 |
-| `GET` | `/api/apps/mfg/skill-runs/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_skill_run_get_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/skills` | MFG 应用 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mfg_skills_handler` | `mfg_routes.rs` | P2 |
-| `GET` | `/api/apps/mfg/skills/:id` | MFG 应用 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `mfg_skill_get_handler` | `mfg_routes.rs` | P2 |
 
 ## Harness Eval 评测
 

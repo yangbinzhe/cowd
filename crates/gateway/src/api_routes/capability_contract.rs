@@ -246,6 +246,14 @@ fn gateway_openapi_document_from_contract(
             "ExecutionCommandReceipt",
             execution_command_receipt_schema(),
         ),
+        (
+            "CreateLiveSubscriptionRequest",
+            live_create_request_schema(),
+        ),
+        ("PatchLiveSubscriptionRequest", live_patch_request_schema()),
+        ("LiveSubscription", live_subscription_schema()),
+        ("LiveEnvelope", live_envelope_schema()),
+        ("Empty", json!({"type": "object", "maxProperties": 0})),
     ] {
         schemas.insert(name.to_string(), schema);
     }
@@ -864,7 +872,7 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
     if capability.auth == "public" {
         operation.insert("security".to_string(), Value::Array(vec![]));
     }
-    let parameters = openapi_parameters(&capability.http.path);
+    let parameters = openapi_parameters(&capability.http.method, &capability.http.path);
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
@@ -988,6 +996,101 @@ fn stable_response_schema(capability: &GatewayCapability) -> Option<Value> {
     stable_route_metadata(&capability.http.method, &capability.http.path).map(
         |metadata| json!({"$ref": format!("#/components/schemas/{}", metadata.response_schema)}),
     )
+}
+
+fn live_source_selector_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["kind", "id"],
+        "properties": {
+            "kind": {"type": "string", "enum": ["session", "execution", "mission"]},
+            "id": {"type": "string", "minLength": 1, "maxLength": 256},
+            "cursor": {"type": "integer", "minimum": 0},
+            "detail_scope": {"type": "string", "enum": ["summary", "full"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn live_selector_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["sources"],
+        "properties": {
+            "sources": {
+                "type": "array",
+                "maxItems": 32,
+                "items": live_source_selector_schema()
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn live_create_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["surface_instance", "selector"],
+        "properties": {
+            "surface_instance": {"type": "string", "minLength": 1, "maxLength": 128},
+            "selector": live_selector_schema(),
+            "ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 86400},
+            "idempotency_key": {"type": "string", "maxLength": 256}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn live_patch_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["expected_revision", "idempotency_key", "selector"],
+        "properties": {
+            "expected_revision": {"type": "integer", "minimum": 1},
+            "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
+            "selector": live_selector_schema(),
+            "ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 86400}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn live_subscription_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "schema_version", "id", "surface_instance", "revision", "selector",
+            "selector_hash", "expires_at_ms", "stream_url"
+        ],
+        "properties": {
+            "schema_version": {"type": "integer", "const": 1},
+            "id": {"type": "string"},
+            "surface_instance": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 1},
+            "selector": live_selector_schema(),
+            "selector_hash": {"type": "string"},
+            "expires_at_ms": {"type": "integer", "minimum": 0},
+            "stream_url": {"type": "string"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn live_envelope_schema() -> Value {
+    let mut schema = harness_contract::live::live_envelope_json_schema();
+    let object = schema
+        .as_object_mut()
+        .expect("canonical live envelope schema must be an object");
+    object.insert(
+        "x-cowd-schema-hash".to_string(),
+        json!(harness_contract::live::live_envelope_schema_hash()),
+    );
+    object.insert(
+        "example".to_string(),
+        serde_json::to_value(harness_contract::live::canonical_live_envelope_fixture())
+            .expect("canonical live envelope fixture must serialize"),
+    );
+    schema
 }
 
 fn execution_projection_entity_schema() -> Value {
@@ -1474,7 +1577,7 @@ fn execution_command_receipt_schema() -> Value {
     })
 }
 
-fn openapi_parameters(path: &str) -> Vec<Value> {
+fn openapi_parameters(method: &str, path: &str) -> Vec<Value> {
     let mut params = Vec::new();
     for segment in path.split('/') {
         if let Some(name) = segment.strip_prefix(':') {
@@ -1492,6 +1595,24 @@ fn openapi_parameters(path: &str) -> Vec<Value> {
                 "schema": {"type": "string"}
             }));
         }
+    }
+    if path.starts_with("/api/runtime/live") {
+        params.push(json!({
+            "name": "x-cowd-observer-id",
+            "in": "header",
+            "required": path != "/api/runtime/live/:id",
+            "description": "Surface instance binding. Must match the subscription owner.",
+            "schema": {"type": "string", "maxLength": 128}
+        }));
+    }
+    if method == "GET" && path == "/api/runtime/live/:id" {
+        params.push(json!({
+            "name": "surface_instance",
+            "in": "query",
+            "required": false,
+            "description": "Browser EventSource Surface binding. Required when x-cowd-observer-id cannot be sent.",
+            "schema": {"type": "string", "maxLength": 128}
+        }));
     }
     params
 }
@@ -1632,16 +1753,31 @@ mod tests {
             "#/components/schemas/ExecutionEdgeProjection"
         );
 
-        let events = &document["paths"]["/api/runtime/executions/{id}/events"]["get"];
-        assert_eq!(events["operationId"], "runtime_execution_projection_events");
+        let events = &document["paths"]["/api/runtime/live/{id}"]["get"];
+        assert_eq!(events["operationId"], "runtime_live_stream_get");
         assert_eq!(
             events["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/ProjectionDelta"
+            "#/components/schemas/LiveEnvelope"
         );
         assert_eq!(
             events["responses"]["200"]["content"]["text/event-stream"]["x-cowd-event-schema"]
                 ["$ref"],
-            "#/components/schemas/ProjectionDelta"
+            "#/components/schemas/LiveEnvelope"
+        );
+        let live_schema = &document["components"]["schemas"]["LiveEnvelope"];
+        assert_eq!(
+            live_schema["x-cowd-schema-hash"],
+            harness_contract::live::live_envelope_schema_hash()
+        );
+        assert_eq!(
+            live_schema["example"],
+            serde_json::to_value(harness_contract::live::canonical_live_envelope_fixture())
+                .expect("canonical live fixture")
+        );
+        assert_eq!(live_schema["additionalProperties"], false);
+        assert_eq!(
+            live_schema["properties"]["source_kind"]["enum"],
+            serde_json::json!(["session", "execution", "mission", "subscription"])
         );
 
         let command = &document["paths"]["/api/runtime/executions/{id}/commands"]["post"];

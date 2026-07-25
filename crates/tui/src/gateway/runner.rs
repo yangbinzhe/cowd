@@ -53,11 +53,11 @@ pub struct GatewayTuiConfig {
 }
 
 #[derive(Debug, Default)]
-struct ExecutionProjectionStreamController {
+struct ExecutionProjectionReducerController {
     next_generation: u64,
     selected: Option<SelectedExecutionProjection>,
     snapshot_request: Option<SelectedExecutionProjection>,
-    active: Option<ActiveExecutionProjectionStream>,
+    active: Option<ActiveExecutionProjectionSource>,
     reducer: crate::protocol::ExecutionProjectionReducer,
 }
 
@@ -68,7 +68,7 @@ struct SelectedExecutionProjection {
 }
 
 #[derive(Debug)]
-struct ActiveExecutionProjectionStream {
+struct ActiveExecutionProjectionSource {
     execution_id: String,
     generation: u64,
     task: tokio::task::JoinHandle<()>,
@@ -137,7 +137,7 @@ impl SessionAuthorityRegistry {
     }
 }
 
-impl ExecutionProjectionStreamController {
+impl ExecutionProjectionReducerController {
     /// End a prior selection before the next execution has a usable snapshot.
     /// This raises the generation even when the new snapshot temporarily
     /// returns 404/403, so a late delta from the old execution cannot revive
@@ -179,14 +179,14 @@ impl ExecutionProjectionStreamController {
             return;
         }
         self.stop();
-        if let Some(task) = spawn_execution_projection_stream(
+        if let Some(task) = spawn_execution_projection_source(
             gateway_client,
             execution_id.clone(),
             initial_cursor,
             generation,
             event_tx,
         ) {
-            self.active = Some(ActiveExecutionProjectionStream {
+            self.active = Some(ActiveExecutionProjectionSource {
                 execution_id,
                 generation,
                 task,
@@ -281,7 +281,7 @@ impl ExecutionProjectionStreamController {
     }
 }
 
-impl Drop for ExecutionProjectionStreamController {
+impl Drop for ExecutionProjectionReducerController {
     fn drop(&mut self) {
         self.stop();
     }
@@ -410,8 +410,8 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     let mut gateway_lease_owner: Option<String> = None;
     let mut session_authorities = SessionAuthorityRegistry::default();
     let initial_authority_generation = session_authorities.begin(&session_id);
-    let mut execution_projection_stream = ExecutionProjectionStreamController::default();
-    let mut session_event_bridges: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
+    let mut execution_projection_source = ExecutionProjectionReducerController::default();
+    let mut session_source_bridges: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
     let mut session_apps: BTreeMap<String, App> = BTreeMap::new();
     let (session_switch_tx, mut session_switch_rx) =
         tokio::sync::mpsc::unbounded_channel::<SessionSwitchResult>();
@@ -448,11 +448,25 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         &mut state,
         &config,
         &mut gateway_lease_owner,
-        &mut execution_projection_stream,
-        &mut session_event_bridges,
+        &mut execution_projection_source,
+        &mut session_source_bridges,
         &observer_id,
         initial_authority_generation,
     )?;
+    let mission_live_task = state
+        .app
+        .gateway_mission_control
+        .as_ref()
+        .and_then(|mission| mission.mission_id.as_deref())
+        .filter(|mission_id| !mission_id.trim().is_empty())
+        .map(|mission_id| {
+            spawn_mission_source(
+                runtime,
+                gateway_client.clone(),
+                tui_tx.clone(),
+                mission_id.to_string(),
+            )
+        });
     let mut app_transport_controller = AppTransportController::default();
     dispatch_pending_app_transport_effects(
         runtime,
@@ -529,8 +543,8 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                             &mut state,
                             &mut session_apps,
                             &mut gateway_lease_owner,
-                            &mut execution_projection_stream,
-                            &mut session_event_bridges,
+                            &mut execution_projection_source,
+                            &mut session_source_bridges,
                             prepared,
                             config.yolo_mode,
                             &observer_id,
@@ -893,12 +907,12 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                         &mut state,
                         &gateway_client,
                         &tui_tx,
-                        &mut execution_projection_stream,
+                        &mut execution_projection_source,
                         &mut session_apps,
                         &mut session_authorities,
                         &mut gateway_lease_owner,
                         &mut app_transport_controller,
-                        &mut session_event_bridges,
+                        &mut session_source_bridges,
                     ).await;
                     dispatch_pending_app_transport_effects(
                         runtime,
@@ -939,8 +953,11 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     });
 
     app_transport_controller.stop_all();
-    let observed_session_ids = session_event_bridges.keys().cloned().collect::<Vec<_>>();
-    for (_, task) in std::mem::take(&mut session_event_bridges) {
+    if let Some(task) = mission_live_task {
+        task.abort();
+    }
+    let observed_session_ids = session_source_bridges.keys().cloned().collect::<Vec<_>>();
+    for (_, task) in std::mem::take(&mut session_source_bridges) {
         task.abort();
     }
     let active_session_id = state.app.session_id.clone();
@@ -1002,8 +1019,8 @@ fn attach_gateway_session(
     state: &mut TuiState,
     config: &GatewayTuiConfig,
     gateway_lease_owner: &mut Option<String>,
-    execution_projection_stream: &mut ExecutionProjectionStreamController,
-    session_event_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
+    execution_projection_source: &mut ExecutionProjectionReducerController,
+    session_source_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
     _observer_id: &str,
     authority_generation: u64,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -1135,11 +1152,11 @@ fn attach_gateway_session(
     // consumes durable history and live bytes concurrently. Stable message
     // identities reconcile either arrival order without holding live progress
     // behind a slow history page.
-    session_event_bridges.retain(|_, task| !task.is_finished());
-    if !session_event_bridges.contains_key(&ensured_session_id) {
-        session_event_bridges.insert(
+    session_source_bridges.retain(|_, task| !task.is_finished());
+    if !session_source_bridges.contains_key(&ensured_session_id) {
+        session_source_bridges.insert(
             ensured_session_id.clone(),
-            spawn_session_event_bridge(
+            spawn_session_source_bridge(
                 runtime,
                 gateway_client.clone(),
                 event_tx.clone(),
@@ -1152,14 +1169,14 @@ fn attach_gateway_session(
     match runtime.block_on(gateway_client.session_execution_index(&ensured_session_id)) {
         Ok(index) => {
             if let Some(execution_id) = session_index_visible_execution_id(&index) {
-                if let Some(generation) = execution_projection_stream.begin_selection(&execution_id)
+                if let Some(generation) = execution_projection_source.begin_selection(&execution_id)
                 {
                     match runtime.block_on(gateway_client.execution_projection(&execution_id, true))
                     {
                         Ok(projection) => {
                             let cursor = projection.cursor;
                             state.apply_execution_projection(projection);
-                            execution_projection_stream.switch(
+                            execution_projection_source.switch(
                                 gateway_client.clone(),
                                 execution_id,
                                 cursor,
@@ -1174,7 +1191,7 @@ fn attach_gateway_session(
                                     "Latest execution projection is still materializing during attach: {error}"
                                 ),
                             );
-                            if execution_projection_stream
+                            if execution_projection_source
                                 .begin_snapshot_request(generation, &execution_id)
                             {
                                 spawn_execution_projection_materialization(
@@ -1308,7 +1325,7 @@ fn attach_gateway_session(
     Ok(gateway_session_ids)
 }
 
-fn spawn_session_event_bridge(
+fn spawn_session_source_bridge(
     runtime: &tokio::runtime::Runtime,
     event_client: GatewayApiClient,
     event_tx: crate::events::CowdEventSender,
@@ -1343,7 +1360,7 @@ fn spawn_session_event_bridge(
                     authority_generation,
                 )));
             }
-            let mut subscription = Box::pin(event_client.subscribe_session_events(
+            let mut subscription = Box::pin(event_client.consume_session_live_source(
                 &event_session_id,
                 event_tx.clone(),
                 after_commit_cursor,
@@ -1433,6 +1450,24 @@ fn spawn_session_event_bridge(
             if !made_progress {
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
             }
+        }
+    })
+}
+
+fn spawn_mission_source(
+    runtime: &tokio::runtime::Runtime,
+    client: GatewayApiClient,
+    event_tx: crate::events::CowdEventSender,
+    mission_id: String,
+) -> tokio::task::JoinHandle<()> {
+    runtime.spawn(async move {
+        if let Err(error) = client
+            .consume_mission_live_source(&mission_id, event_tx.clone())
+            .await
+        {
+            let _ = event_tx.send(CowdEvent::Warning {
+                message: format!("Gateway Mission live source stopped: {error}"),
+            });
         }
     })
 }
@@ -2040,8 +2075,8 @@ fn commit_prepared_session_switch(
     state: &mut TuiState,
     session_apps: &mut BTreeMap<String, App>,
     gateway_lease_owner: &mut Option<String>,
-    execution_projection_stream: &mut ExecutionProjectionStreamController,
-    session_event_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
+    execution_projection_source: &mut ExecutionProjectionReducerController,
+    session_source_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
     prepared: PreparedSessionSwitch,
     yolo_mode: bool,
     _observer_id: &str,
@@ -2062,7 +2097,7 @@ fn commit_prepared_session_switch(
     if target_session_id == previous_session_id {
         return;
     }
-    execution_projection_stream.stop();
+    execution_projection_source.stop();
     let target_model = ensured
         .get("model")
         .and_then(serde_json::Value::as_str)
@@ -2107,19 +2142,19 @@ fn commit_prepared_session_switch(
     }
     if let Some(execution_id) = execution_id {
         if let Some(projection_generation) =
-            execution_projection_stream.begin_selection(&execution_id)
+            execution_projection_source.begin_selection(&execution_id)
         {
             if let Some(projection) = execution_projection {
                 let cursor = projection.cursor;
                 state.apply_execution_projection(projection);
-                execution_projection_stream.switch(
+                execution_projection_source.switch(
                     gateway_client.clone(),
                     execution_id,
                     cursor,
                     projection_generation,
                     event_tx.clone(),
                 );
-            } else if execution_projection_stream
+            } else if execution_projection_source
                 .begin_snapshot_request(projection_generation, &execution_id)
             {
                 spawn_execution_projection_materialization(
@@ -2148,13 +2183,13 @@ fn commit_prepared_session_switch(
     for warning in warnings {
         state.add_system_notice(SystemNoticeKind::Warning, &warning);
     }
-    session_event_bridges.retain(|_, task| !task.is_finished());
-    if let Some(stale_bridge) = session_event_bridges.remove(&target_session_id) {
+    session_source_bridges.retain(|_, task| !task.is_finished());
+    if let Some(stale_bridge) = session_source_bridges.remove(&target_session_id) {
         stale_bridge.abort();
     }
-    session_event_bridges.insert(
+    session_source_bridges.insert(
         target_session_id.clone(),
-        spawn_session_event_bridge(
+        spawn_session_source_bridge(
             runtime,
             gateway_client.clone(),
             event_tx.clone(),
@@ -2825,12 +2860,12 @@ async fn drain_cowd_events_state(
     state: &mut TuiState,
     gateway_client: &GatewayApiClient,
     event_tx: &CowdEventSender,
-    execution_projection_stream: &mut ExecutionProjectionStreamController,
+    execution_projection_source: &mut ExecutionProjectionReducerController,
     session_apps: &mut BTreeMap<String, App>,
     session_authorities: &mut SessionAuthorityRegistry,
     gateway_lease_owner: &mut Option<String>,
     app_transport_controller: &mut AppTransportController,
-    session_event_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
+    session_source_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
 ) {
     let mut count = 0;
     let limit = if state.app.turn_is_active() { 64 } else { 256 };
@@ -2850,11 +2885,11 @@ async fn drain_cowd_events_state(
                     _ => unreachable!("matched revoke"),
                 };
                 if session_authorities.revoke(&session_id, authority_generation) {
-                    if let Some(bridge) = session_event_bridges.remove(&session_id) {
+                    if let Some(bridge) = session_source_bridges.remove(&session_id) {
                         bridge.abort();
                     }
                     if session_id == state.app.session_id {
-                        execution_projection_stream.revoke_session_authorization();
+                        execution_projection_source.revoke_session_authorization();
                         app_transport_controller.stop_all();
                         *gateway_lease_owner = None;
                         state.app.gateway_lease_owner = None;
@@ -2912,7 +2947,7 @@ async fn drain_cowd_events_state(
             if current_generation
                 .is_some_and(|generation| session_authorities.revoke(session_id, generation))
             {
-                if let Some(bridge) = session_event_bridges.remove(session_id) {
+                if let Some(bridge) = session_source_bridges.remove(session_id) {
                     bridge.abort();
                 }
                 if session_id == &state.app.session_id {
@@ -2923,7 +2958,7 @@ async fn drain_cowd_events_state(
                     app.revoke_session_authorization(reason);
                 }
             }
-            execution_projection_stream.revoke_session_authorization();
+            execution_projection_source.revoke_session_authorization();
             count += 1;
             if count >= limit {
                 break;
@@ -2932,8 +2967,8 @@ async fn drain_cowd_events_state(
         }
         let execution_id = event_selected_execution_id(&event, &state.app);
         if let CowdEvent::ExecutionProjectionDelta { generation, delta } = &event {
-            if execution_projection_stream.accepts(*generation, &delta.execution_id) {
-                let apply = execution_projection_stream.apply_delta(*generation, delta);
+            if execution_projection_source.accepts(*generation, &delta.execution_id) {
+                let apply = execution_projection_source.apply_delta(*generation, delta);
                 // ProjectionEvent carries a safe event entity, not a complete
                 // graph/strategy/command patch. A legacy Gateway delta thus
                 // advances the persistent cursor guard but coalesces exactly
@@ -2943,7 +2978,7 @@ async fn drain_cowd_events_state(
                 let needs_snapshot = !delta.events.is_empty()
                     || matches!(apply, crate::protocol::ProjectionDeltaApply::ResyncRequired);
                 if needs_snapshot
-                    && execution_projection_stream
+                    && execution_projection_source
                         .begin_snapshot_request(*generation, &delta.execution_id)
                 {
                     spawn_execution_projection_refresh(
@@ -2961,7 +2996,7 @@ async fn drain_cowd_events_state(
             continue;
         }
         if let CowdEvent::ExecutionProjectionLive { generation, update } = &event {
-            if execution_projection_stream.accepts(*generation, &update.execution_id) {
+            if execution_projection_source.accepts(*generation, &update.execution_id) {
                 state.apply_execution_live_update(update.clone());
             }
             count += 1;
@@ -2976,7 +3011,7 @@ async fn drain_cowd_events_state(
             ..
         } = &event
         {
-            if execution_projection_stream.accepts(*generation, execution_id) {
+            if execution_projection_source.accepts(*generation, execution_id) {
                 state.apply_event(event);
             }
             count += 1;
@@ -2991,8 +3026,8 @@ async fn drain_cowd_events_state(
             message,
         } = &event
         {
-            if execution_projection_stream.accepts(*generation, execution_id) {
-                execution_projection_stream.clear_selection_if(*generation, execution_id);
+            if execution_projection_source.accepts(*generation, execution_id) {
+                execution_projection_source.clear_selection_if(*generation, execution_id);
                 state.invalidate_execution_projection(execution_id, message);
             }
             count += 1;
@@ -3007,8 +3042,8 @@ async fn drain_cowd_events_state(
             message,
         } = &event
         {
-            if execution_projection_stream.accepts(*generation, execution_id) {
-                execution_projection_stream.finish_snapshot_request(*generation, execution_id);
+            if execution_projection_source.accepts(*generation, execution_id) {
+                execution_projection_source.finish_snapshot_request(*generation, execution_id);
                 state.add_system_notice(SystemNoticeKind::Warning, message);
             }
             count += 1;
@@ -3023,10 +3058,10 @@ async fn drain_cowd_events_state(
         } = &event
         {
             let execution_id = projection.execution_id.clone();
-            if execution_projection_stream.accepts(*generation, &execution_id) {
-                execution_projection_stream.finish_snapshot_request(*generation, &execution_id);
+            if execution_projection_source.accepts(*generation, &execution_id) {
+                execution_projection_source.finish_snapshot_request(*generation, &execution_id);
                 if matches!(
-                    execution_projection_stream.install_snapshot(*generation, projection),
+                    execution_projection_source.install_snapshot(*generation, projection),
                     crate::protocol::ProjectionDeltaApply::ResyncRequired
                 ) {
                     state.add_system_notice(
@@ -3040,7 +3075,7 @@ async fn drain_cowd_events_state(
                     continue;
                 }
                 state.apply_execution_projection(projection.clone());
-                execution_projection_stream.switch(
+                execution_projection_source.switch(
                     gateway_client.clone(),
                     execution_id,
                     projection.cursor,
@@ -3056,7 +3091,7 @@ async fn drain_cowd_events_state(
         }
         let mut materialization = None;
         if let Some(next_execution_id) = execution_id.as_deref() {
-            let previous_execution_id = execution_projection_stream
+            let previous_execution_id = execution_projection_source
                 .selected_execution_id()
                 .or_else(|| {
                     state
@@ -3065,7 +3100,7 @@ async fn drain_cowd_events_state(
                         .as_ref()
                         .map(|projection| projection.execution_id.clone())
                 });
-            if let Some(generation) = execution_projection_stream.begin_selection(next_execution_id)
+            if let Some(generation) = execution_projection_source.begin_selection(next_execution_id)
             {
                 state.app.projection_connection_state =
                     Some(crate::protocol::SessionStreamConnectionState::Connecting);
@@ -3082,7 +3117,7 @@ async fn drain_cowd_events_state(
         }
         state.apply_event(event);
         if let Some((execution_id, generation)) = materialization {
-            if execution_projection_stream.begin_snapshot_request(generation, &execution_id) {
+            if execution_projection_source.begin_snapshot_request(generation, &execution_id) {
                 spawn_execution_projection_materialization(
                     gateway_client.clone(),
                     execution_id,
@@ -3137,7 +3172,17 @@ fn cowd_event_session_id(event: &CowdEvent) -> Option<&str> {
 
 fn event_selected_execution_id(event: &CowdEvent, app: &crate::App) -> Option<String> {
     match event {
-        CowdEvent::ExecutionGraphSummary { summary } => summary.graph_id.clone(),
+        CowdEvent::ExecutionGraphSummary { summary } => {
+            let incoming = summary.graph_id.as_deref()?;
+            (!app.execution_is_terminalized(incoming)
+                && (app.current_execution_id.is_none()
+                    || app.current_execution_id.as_deref() == Some(incoming)
+                    || !app.turn_is_active()
+                    || app.current_execution_status.is_some_and(
+                        harness_contract::projection::ExecutionLiveStatus::is_terminal,
+                    )))
+            .then(|| incoming.to_string())
+        }
         CowdEvent::GatewaySession {
             event: crate::protocol::GatewaySessionEvent::UserMessageCommitted { correlation, .. },
         } => {
@@ -3157,9 +3202,11 @@ fn event_selected_execution_id(event: &CowdEvent, app: &crate::App) -> Option<St
                     status,
                     ..
                 },
-        } if *status != harness_contract::projection::ExecutionLiveStatus::Queued => {
-            correlation.execution_id.clone()
-        }
+        } if *status != harness_contract::projection::ExecutionLiveStatus::Queued => correlation
+            .execution_id
+            .as_deref()
+            .filter(|execution_id| !app.execution_is_terminalized(execution_id))
+            .map(ToOwned::to_owned),
         _ => None,
     }
 }
@@ -3234,7 +3281,7 @@ fn spawn_execution_projection_materialization(
 }
 
 /// Fetch the latest canonical projection outside the render/event drain.
-/// Snapshot refreshes are coalesced by `ExecutionProjectionStreamController`,
+/// Snapshot refreshes are coalesced by `ExecutionProjectionReducerController`,
 /// so high-rate graph deltas cannot create an HTTP fan-out or block keystrokes.
 fn spawn_execution_projection_refresh(
     gateway_client: GatewayApiClient,
@@ -3279,7 +3326,7 @@ fn spawn_execution_projection_refresh(
     });
 }
 
-fn spawn_execution_projection_stream(
+fn spawn_execution_projection_source(
     gateway_client: GatewayApiClient,
     execution_id: String,
     initial_cursor: u64,
@@ -3306,7 +3353,7 @@ fn spawn_execution_projection_stream(
             let cursor_before_attempt = cursor;
             let mut closed_without_progress = false;
             match gateway_client
-                .subscribe_execution_projection_events(
+                .consume_execution_live_source(
                     &execution_id,
                     cursor,
                     true,
@@ -3573,10 +3620,10 @@ mod tests {
         })
         .expect("queue background terminal");
         let client = GatewayApiClient::new("http://127.0.0.1:1", None).expect("client");
-        let mut projection_stream = ExecutionProjectionStreamController::default();
+        let mut projection_stream = ExecutionProjectionReducerController::default();
         let mut gateway_lease_owner = None;
         let mut app_transport = AppTransportController::default();
-        let mut session_event_bridges = BTreeMap::new();
+        let mut session_source_bridges = BTreeMap::new();
 
         drain_cowd_events_state(
             &mut rx,
@@ -3588,7 +3635,7 @@ mod tests {
             &mut session_authorities,
             &mut gateway_lease_owner,
             &mut app_transport,
-            &mut session_event_bridges,
+            &mut session_source_bridges,
         )
         .await;
 
@@ -3664,6 +3711,27 @@ mod tests {
             event_selected_execution_id(&event, &running_app).is_none(),
             "a queued follow-up cannot steal the visible running projection"
         );
+        assert!(
+            event_selected_execution_id(
+                &CowdEvent::ExecutionGraphSummary {
+                    summary: crate::RuntimeExecutionGraphSummary {
+                        graph_id: Some("execution-stale".to_string()),
+                        board_id: None,
+                        status: "terminal".to_string(),
+                        agent_tasks: 0,
+                        child_executions: 0,
+                        memory_candidates: 0,
+                        conflicts: 0,
+                        completion_rate: Some(1.0),
+                        synthesis_lift: None,
+                        complementarity_score: None,
+                    },
+                },
+                &running_app,
+            )
+            .is_none(),
+            "a delayed graph summary cannot steal an active execution selection"
+        );
         let started_followup = CowdEvent::GatewaySession {
             event: crate::protocol::GatewaySessionEvent::ExecutionPhase {
                 correlation: crate::protocol::GatewayEventCorrelation {
@@ -3679,6 +3747,28 @@ mod tests {
         assert_eq!(
             event_selected_execution_id(&started_followup, &running_app).as_deref(),
             Some("execution-1")
+        );
+
+        let mut terminalized_app = crate::App::new("model", "session-1");
+        terminalized_app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
+                correlation: crate::protocol::GatewayEventCorrelation {
+                    session_id: "session-1".to_string(),
+                    execution_id: Some("execution-1".to_string()),
+                    turn_id: Some("turn-1".to_string()),
+                    message_id: Some("assistant-1".to_string()),
+                    terminal_id: Some("terminal-1".to_string()),
+                    ..crate::protocol::GatewayEventCorrelation::default()
+                },
+                assistant_text: "done".to_string(),
+                sequence: Some(1),
+                iterations: 1,
+                token_usage: None,
+            },
+        });
+        assert!(
+            event_selected_execution_id(&started_followup, &terminalized_app).is_none(),
+            "a delayed non-terminal phase cannot reopen a durably terminalized execution"
         );
     }
 
@@ -3704,14 +3794,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execution_projection_stream_generation_rejects_zombie_and_replayed_events() {
-        let mut controller = ExecutionProjectionStreamController::default();
+    async fn execution_projection_source_generation_rejects_zombie_and_replayed_events() {
+        let mut controller = ExecutionProjectionReducerController::default();
         let first_generation = controller
             .begin_selection("execution-a")
             .expect("new selection");
         let first_task = tokio::spawn(std::future::pending::<()>());
         let first_abort = first_task.abort_handle();
-        controller.active = Some(ActiveExecutionProjectionStream {
+        controller.active = Some(ActiveExecutionProjectionSource {
             execution_id: "execution-a".to_string(),
             generation: first_generation,
             task: first_task,
@@ -3724,7 +3814,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(first_abort.is_finished());
         let second_task = tokio::spawn(std::future::pending::<()>());
-        controller.active = Some(ActiveExecutionProjectionStream {
+        controller.active = Some(ActiveExecutionProjectionSource {
             execution_id: "execution-b".to_string(),
             generation: second_generation,
             task: second_task,
@@ -3736,7 +3826,7 @@ mod tests {
             .begin_selection("execution-a")
             .expect("new selection");
         let third_task = tokio::spawn(std::future::pending::<()>());
-        controller.active = Some(ActiveExecutionProjectionStream {
+        controller.active = Some(ActiveExecutionProjectionSource {
             execution_id: "execution-a".to_string(),
             generation: third_generation,
             task: third_task,
@@ -3755,7 +3845,7 @@ mod tests {
 
         let (tx, mut rx) = crate::cowd_event_channel();
         let mut state = TuiState::new("model", "session-rest-generation");
-        let mut controller = ExecutionProjectionStreamController::default();
+        let mut controller = ExecutionProjectionReducerController::default();
         let old_generation = controller
             .begin_selection("execution-old")
             .expect("old selection");
@@ -3829,14 +3919,14 @@ mod tests {
 
     #[tokio::test]
     async fn e10_session_authorization_revoke_aborts_projection_and_rejects_queued_results() {
-        let mut controller = ExecutionProjectionStreamController::default();
+        let mut controller = ExecutionProjectionReducerController::default();
         let generation = controller
             .begin_selection("execution-sensitive")
             .expect("new selection");
         assert!(controller.begin_snapshot_request(generation, "execution-sensitive"));
         let task = tokio::spawn(std::future::pending::<()>());
         let abort = task.abort_handle();
-        controller.active = Some(ActiveExecutionProjectionStream {
+        controller.active = Some(ActiveExecutionProjectionSource {
             execution_id: "execution-sensitive".to_string(),
             generation,
             task,
@@ -3891,13 +3981,13 @@ mod tests {
         let mut session_apps = BTreeMap::new();
         let mut authorities = SessionAuthorityRegistry::default();
         let authority_generation = authorities.begin("session-sensitive");
-        let mut projection_stream = ExecutionProjectionStreamController::default();
+        let mut projection_stream = ExecutionProjectionReducerController::default();
         let projection_generation = projection_stream
             .begin_selection("execution-sensitive")
             .expect("projection selection");
         let projection_task = tokio::spawn(std::future::pending::<()>());
         let projection_abort = projection_task.abort_handle();
-        projection_stream.active = Some(ActiveExecutionProjectionStream {
+        projection_stream.active = Some(ActiveExecutionProjectionSource {
             execution_id: "execution-sensitive".to_string(),
             generation: projection_generation,
             task: projection_task,
@@ -4043,7 +4133,7 @@ mod tests {
 
     #[test]
     fn selected_execution_coalesces_snapshot_refreshes_until_the_background_result_arrives() {
-        let mut controller = ExecutionProjectionStreamController::default();
+        let mut controller = ExecutionProjectionReducerController::default();
         let generation = controller
             .begin_selection("execution-a")
             .expect("new selection");

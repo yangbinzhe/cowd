@@ -273,6 +273,7 @@ pub struct MissionSessionSummary {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MissionControlSummary {
+    pub mission_id: Option<String>,
     pub active_session_id: Option<String>,
     pub session_count: u64,
     pub active_count: u64,
@@ -894,6 +895,10 @@ impl RuntimeControlSnapshot {
             agent_count += session.agent_count;
         }
         self.mission_control = Some(MissionControlSummary {
+            mission_id: mission
+                .get("mission_id")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
             active_session_id: mission
                 .get("active_session_id")
                 .and_then(serde_json::Value::as_str)

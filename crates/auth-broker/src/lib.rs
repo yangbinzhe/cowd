@@ -17,7 +17,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use cowd_app_sdk::AppDescriptor;
 use harness_contract::security::{
     DecisionLeaseClaims, PrincipalAssurance, PrincipalClaims, PrincipalKind, SignedDecisionLease,
-    SignedPrincipalEnvelope,
+    SignedPrincipalEnvelope, CORE_HUMAN_CAPABILITIES,
 };
 use ring::{
     digest,
@@ -34,16 +34,6 @@ const CREDENTIAL_STATE_VERSION: u32 = 3;
 const CATALOG_FILE: &str = "profile-catalog.json";
 const KEY_ID: &str = "cowd-local-ed25519-v1";
 const SOCKET_FILE: &str = "broker.sock";
-
-const CORE_HUMAN_CAPABILITIES: &[&str] = &[
-    "approval.respond",
-    "definition.manage",
-    "definition.default.set",
-    "definition.rollback",
-    "evolution.release.manage",
-    "runtime.maintenance.manage",
-    "runtime.outbox.retry",
-];
 
 /// Stable, product-neutral authorization catalogue. Product composition builds
 /// this from the APP descriptors linked into the current Cowd binary; the
@@ -116,7 +106,10 @@ impl AuthorizationCatalog {
             core_profiles: vec![
                 AuthorizationProfile {
                     id: "core_operator".to_string(),
-                    capabilities: vec!["approval.respond".to_string()],
+                    capabilities: vec![
+                        "approval.respond".to_string(),
+                        "mission.observe".to_string(),
+                    ],
                 },
                 AuthorizationProfile {
                     id: "core_manager".to_string(),

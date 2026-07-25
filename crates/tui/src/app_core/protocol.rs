@@ -451,6 +451,12 @@ pub enum CowdEvent {
         execution_id: String,
         state: SessionStreamConnectionState,
     },
+    /// Canonical Mission/approval/team snapshot demultiplexed from the one
+    /// physical Gateway live connection.
+    MissionProjectionSnapshot {
+        mission_id: String,
+        projection: serde_json::Value,
+    },
     ThinkingDelta {
         thinking: String,
     },

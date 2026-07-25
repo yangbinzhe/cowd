@@ -263,7 +263,7 @@ fn median_u64(mut values: Vec<u64>) -> u64 {
     values[values.len() / 2]
 }
 
-/// Observe the first visible model TextDelta from the public session stream.
+/// Observe the first visible model TextDelta from the public multiplex stream.
 ///
 /// A terminal response is deliberately not accepted as a substitute: doing so
 /// would turn durable response latency back into a mislabeled TTFT sample.
@@ -273,11 +273,53 @@ pub(crate) fn start_first_delta_observer(
     session_id: &str,
 ) -> Result<mpsc::Receiver<FirstDeltaObservation>, String> {
     let client = client.clone();
-    let url = format!("{base}/api/sessions/{session_id}/stream");
+    let base = base.to_string();
+    let session_id = session_id.to_string();
+    let subscription_url = format!("{base}/api/runtime/live-subscriptions");
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let (first_tx, first_rx) = mpsc::sync_channel::<FirstDeltaObservation>(1);
     thread::spawn(move || {
-        let response = match client.get(url).send() {
+        let surface_instance = format!("eval:{}", uuid::Uuid::new_v4());
+        let subscription = match client
+            .post(&subscription_url)
+            .header("x-cowd-observer-id", &surface_instance)
+            .json(&serde_json::json!({
+                "surface_instance": surface_instance,
+                "selector": {
+                    "sources": [{
+                        "kind": "session",
+                        "id": session_id,
+                        "cursor": 0,
+                        "detail_scope": "summary"
+                    }]
+                }
+            }))
+            .send()
+        {
+            Ok(response) if response.status().is_success() => match response.json::<Value>() {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                    return;
+                }
+            },
+            Ok(response) => {
+                let _ = ready_tx.send(Err(format!(
+                    "live subscription returned HTTP {}",
+                    response.status()
+                )));
+                return;
+            }
+            Err(error) => {
+                let _ = ready_tx.send(Err(error.to_string()));
+                return;
+            }
+        };
+        let Some(stream_url) = subscription.get("stream_url").and_then(Value::as_str) else {
+            let _ = ready_tx.send(Err("live subscription omitted stream_url".to_string()));
+            return;
+        };
+        let response = match client.get(format!("{base}{stream_url}")).send() {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
                 let _ = ready_tx.send(Err(format!("SSE returned HTTP {}", response.status())));
@@ -297,11 +339,13 @@ pub(crate) fn start_first_delta_observer(
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
             };
-            let Ok(event) = serde_json::from_str::<Value>(data.trim()) else {
+            let Ok(envelope) = serde_json::from_str::<Value>(data.trim()) else {
                 continue;
             };
-            match event.get("type").and_then(Value::as_str) {
-                Some("Connected") => {
+            let event_name = envelope.get("event").and_then(Value::as_str);
+            let event = envelope.get("payload").cloned().unwrap_or(Value::Null);
+            match event_name {
+                Some("subscription.ready" | "session.connected") => {
                     if !ready {
                         ready = true;
                         let _ = ready_tx.send(Ok(()));
@@ -309,8 +353,9 @@ pub(crate) fn start_first_delta_observer(
                 }
                 Some("TextDelta") if !first_sent && visible_text_delta(&event).is_some() => {
                     first_sent = true;
-                    let source_cursor = event
-                        .get("runtime_commit_cursor")
+                    let source_cursor = envelope
+                        .get("source_cursor")
+                        .or_else(|| event.get("runtime_commit_cursor"))
                         .or_else(|| event.get("source_cursor"))
                         .or_else(|| event.get("cursor"))
                         .or_else(|| event.get("sequence"))

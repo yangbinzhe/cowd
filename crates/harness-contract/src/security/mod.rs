@@ -6,6 +6,22 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Product-neutral capabilities exposed by Cowd's core human-manager profile.
+///
+/// Interactive Surfaces request only this stable core set during principal
+/// issuance. APP capabilities remain catalogue-derived and must not be
+/// reconstructed by a Surface.
+pub const CORE_HUMAN_CAPABILITIES: &[&str] = &[
+    "approval.respond",
+    "definition.manage",
+    "definition.default.set",
+    "definition.rollback",
+    "evolution.release.manage",
+    "mission.observe",
+    "runtime.maintenance.manage",
+    "runtime.outbox.retry",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrincipalKind {

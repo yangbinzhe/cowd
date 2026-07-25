@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 
 use super::route_registry::{
-    execution_projection_route_metadata, generated_route_metadata, GeneratedRouteMetadata,
+    generated_route_metadata, typed_route_metadata, GeneratedRouteMetadata,
 };
 
 /// Public, deterministic route inventory. Its source is the build-generated
@@ -58,7 +58,7 @@ fn gateway_route_manifest_with_apps(
     }
     // Typed routes are registered through constant specs, so there is no
     // literal `.route("...")` for the build generator to collect.
-    for route in execution_projection_route_metadata() {
+    for route in typed_route_metadata() {
         // Session execution/evidence routes have literal Axum registrations,
         // so the build-generated inventory already owns their manifest row.
         // The typed metadata enriches OpenAPI response schemas, but must not

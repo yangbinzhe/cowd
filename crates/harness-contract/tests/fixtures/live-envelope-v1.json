@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "subscription_id": "subscription-contract",
+  "subscription_revision": 7,
+  "source_kind": "session",
+  "source_id": "session-contract",
+  "detail_scope": "full",
+  "source_cursor": 42,
+  "delivery_class": "durable",
+  "source_health": "live",
+  "event": "TerminalCommitted",
+  "payload": {
+    "type": "TerminalCommitted",
+    "content": "canonical contract fixture"
+  },
+  "session_id": "session-contract",
+  "execution_id": "execution-contract",
+  "mission_id": "mission-contract",
+  "agent_id": "agent-contract",
+  "stream_revision": 3,
+  "start_bytes": 128,
+  "end_bytes": 256
+}

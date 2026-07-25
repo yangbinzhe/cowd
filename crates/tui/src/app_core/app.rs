@@ -452,6 +452,11 @@ pub struct App {
     /// a Runtime execution is active.
     pub turn_interaction: TurnInteractionState,
     streaming_received: bool,
+    /// Bounded causal tombstones for executions that already emitted a
+    /// durable terminal. Projection and session streams are independent, so
+    /// an older non-terminal snapshot can otherwise reopen a completed turn
+    /// and make a passive Surface reject the next execution's deltas.
+    terminal_correlations: VecDeque<(String, String)>,
 
     pub msg_version: u64,
     /// Non-transcript UI revision (composer, focus, modal/search selection).
@@ -807,6 +812,7 @@ impl App {
 
             turn_interaction: TurnInteractionState::default(),
             streaming_received: false,
+            terminal_correlations: VecDeque::new(),
 
             msg_version: 0,
             render_version: 0,
@@ -956,6 +962,22 @@ impl App {
         &mut self,
         mut projection: crate::protocol::ExecutionProjection,
     ) -> bool {
+        if self.turn_is_active()
+            && self
+                .current_execution_id
+                .as_deref()
+                .is_some_and(|current| current != projection.execution_id.as_str())
+        {
+            return false;
+        }
+        if self.execution_is_terminalized(&projection.execution_id)
+            && projection
+                .live
+                .as_ref()
+                .is_none_or(|live| !live.status.is_terminal())
+        {
+            return false;
+        }
         if let Some(current) = self
             .latest_execution_projection
             .as_ref()
@@ -1060,6 +1082,10 @@ impl App {
     ) -> bool {
         if update.schema_version
             != harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION
+        {
+            return false;
+        }
+        if self.execution_is_terminalized(&update.execution_id) && !update.live.status.is_terminal()
         {
             return false;
         }
@@ -1247,13 +1273,16 @@ impl App {
             .latest_execution_projection
             .as_ref()
             .is_some_and(|projection| projection.execution_id == execution_id);
+        let matches_current_execution = self.current_execution_id.as_deref() == Some(execution_id);
         let matches_interaction =
             self.turn_interaction.execution.execution_id.as_deref() == Some(execution_id);
-        if !matches_projection && !matches_interaction {
+        if !matches_projection && !matches_current_execution && !matches_interaction {
             return false;
         }
         if matches_projection {
             self.latest_execution_projection = None;
+        }
+        if matches_projection || matches_current_execution {
             self.reset_live_execution_facts();
         }
         if self
@@ -2162,6 +2191,57 @@ impl App {
                 .is_none_or(|current| correlation.turn_id.as_deref() == Some(current))
     }
 
+    pub(crate) fn execution_is_terminalized(&self, execution_id: &str) -> bool {
+        self.terminal_correlations
+            .iter()
+            .any(|(terminal_execution_id, _)| terminal_execution_id == execution_id)
+    }
+
+    fn correlation_is_terminalized(
+        &self,
+        correlation: &crate::protocol::GatewayEventCorrelation,
+    ) -> bool {
+        correlation
+            .execution_id
+            .as_deref()
+            .zip(correlation.turn_id.as_deref())
+            .is_some_and(|(execution_id, turn_id)| {
+                self.terminal_correlations.iter().any(
+                    |(terminal_execution_id, terminal_turn_id)| {
+                        terminal_execution_id == execution_id && terminal_turn_id == turn_id
+                    },
+                )
+            })
+    }
+
+    fn record_terminal_correlation(
+        &mut self,
+        correlation: &crate::protocol::GatewayEventCorrelation,
+    ) {
+        const TERMINAL_CORRELATION_CAPACITY: usize = 1_024;
+        let Some((execution_id, turn_id)) = correlation
+            .execution_id
+            .as_ref()
+            .zip(correlation.turn_id.as_ref())
+        else {
+            return;
+        };
+        if self
+            .terminal_correlations
+            .iter()
+            .any(|(known_execution_id, known_turn_id)| {
+                known_execution_id == execution_id && known_turn_id == turn_id
+            })
+        {
+            return;
+        }
+        self.terminal_correlations
+            .push_back((execution_id.clone(), turn_id.clone()));
+        while self.terminal_correlations.len() > TERMINAL_CORRELATION_CAPACITY {
+            self.terminal_correlations.pop_front();
+        }
+    }
+
     fn adopt_live_correlation(
         &mut self,
         correlation: &crate::protocol::GatewayEventCorrelation,
@@ -2182,7 +2262,14 @@ impl App {
             // noisy stale stream to flood the transcript.
             if orphan_count == 1 || orphan_count.is_power_of_two() {
                 let warning = format!(
-                    "Ignored {orphan_count} event(s) outside the active session/execution/turn; canonical history and projection remain authoritative"
+                    "Ignored {orphan_count} event(s) outside the active session/execution/turn \
+                     (current execution={}, turn={}, status={:?}; incoming execution={}, turn={}); \
+                     canonical history and projection remain authoritative",
+                    self.current_execution_id.as_deref().unwrap_or("none"),
+                    self.current_turn_id.as_deref().unwrap_or("none"),
+                    self.current_execution_status,
+                    correlation.execution_id.as_deref().unwrap_or("missing"),
+                    correlation.turn_id.as_deref().unwrap_or("missing"),
                 );
                 self.add_system_notice(SystemNoticeKind::Warning, &warning);
                 self.show_notification(&warning);
@@ -2466,6 +2553,9 @@ impl App {
                 status,
                 detail,
             } => {
+                if self.correlation_is_terminalized(&correlation) && !status.is_terminal() {
+                    return;
+                }
                 if !self.adopt_live_correlation(&correlation) {
                     return;
                 }
@@ -2584,6 +2674,7 @@ impl App {
                         return;
                     }
                 }
+                self.record_terminal_correlation(&correlation);
                 if let Some(message_id) = correlation.message_id.as_deref() {
                     if let Some(usage) = token_usage.as_ref() {
                         self.record_durable_message_usage(message_id, usage);
@@ -3814,6 +3905,13 @@ impl App {
                 }
                 self.mark_dirty();
             }
+            CowdEvent::MissionProjectionSnapshot { projection, .. } => {
+                let mut snapshot =
+                    crate::runtime_control_store::RuntimeControlSnapshot::from_app(self);
+                snapshot.ingest_mission_projection(&projection);
+                snapshot.apply_to_app(self);
+                self.mark_dirty();
+            }
             CowdEvent::ThinkingDelta { thinking } => {
                 let mut found = false;
                 if let Some(TimelineEntry::Thinking {
@@ -4467,6 +4565,23 @@ mod tests {
         assert!(app.context_window_tokens.is_none());
         assert!(app.current_run_metrics.is_none());
         assert_eq!(app.token_count, 0);
+    }
+
+    #[test]
+    fn invalidating_selected_execution_clears_identity_without_materialized_projection() {
+        let mut app = App::new("requested-model", "session-selection");
+        app.current_execution_id = Some("execution-old".to_string());
+        app.current_turn_id = Some("turn-old".to_string());
+        app.current_execution_status =
+            Some(harness_contract::projection::ExecutionLiveStatus::Finalizing);
+        app.effective_model = Some("stale-model".to_string());
+        assert!(app.latest_execution_projection.is_none());
+
+        assert!(app.invalidate_execution_projection("execution-old"));
+        assert!(app.current_execution_id.is_none());
+        assert!(app.current_turn_id.is_none());
+        assert!(app.current_execution_status.is_none());
+        assert!(app.effective_model.is_none());
     }
 
     #[test]
@@ -5351,6 +5466,44 @@ mod tests {
         assert_eq!(
             app.telemetry.text_delta_dedupe_count, 2,
             "older and equal revisions must not mutate visible text"
+        );
+    }
+
+    #[test]
+    fn durable_terminal_rejects_late_non_terminal_phase_for_the_same_execution() {
+        let mut app = App::new("test", "sess");
+        let mut terminal = correlation("execution-terminal", "turn-terminal");
+        terminal.message_id = Some("assistant-terminal".to_string());
+        terminal.terminal_id = Some("terminal-1".to_string());
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
+                correlation: terminal.clone(),
+                assistant_text: "done".to_string(),
+                sequence: Some(1),
+                iterations: 1,
+                token_usage: None,
+            },
+        });
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::ExecutionPhase {
+                correlation: terminal,
+                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
+                detail: Some("late projection".to_string()),
+            },
+        });
+
+        assert_eq!(
+            app.current_execution_status,
+            Some(harness_contract::projection::ExecutionLiveStatus::Complete)
+        );
+        assert_eq!(
+            app.current_execution_status_detail.as_deref(),
+            Some("durable terminal committed")
+        );
+        assert!(app.execution_is_terminalized("execution-terminal"));
+        assert_eq!(
+            app.telemetry.orphan_event_count, 0,
+            "a known late phase is discarded as an ordering fact, not misreported as a causal orphan"
         );
     }
 

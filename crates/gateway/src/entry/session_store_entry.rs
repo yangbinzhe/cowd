@@ -486,8 +486,7 @@ pub(crate) fn hydrated_runtime_session(
         .and_then(serde_json::Value::as_str)
         .map(std::string::ToString::to_string);
 
-    let mut session = Session::new();
-    session.created_at_ms = chrono::DateTime::parse_from_rfc3339(&record.created_at)
+    let created_at_ms = chrono::DateTime::parse_from_rfc3339(&record.created_at)
         .map(|timestamp| timestamp.timestamp_millis().max(0) as u64)
         .map_err(|error| {
             format!(
@@ -495,7 +494,7 @@ pub(crate) fn hydrated_runtime_session(
                 record.session_id
             )
         })?;
-    session.updated_at_ms = chrono::DateTime::parse_from_rfc3339(&record.last_activity)
+    let updated_at_ms = chrono::DateTime::parse_from_rfc3339(&record.last_activity)
         .map(|timestamp| timestamp.timestamp_millis().max(0) as u64)
         .map_err(|error| {
             format!(
@@ -503,9 +502,15 @@ pub(crate) fn hydrated_runtime_session(
                 record.session_id
             )
         })?;
+    let mut session = Session::new();
     session.session_id = record.session_id;
     session.model = record.model;
     session.replace_messages(messages);
+    // Replacing the in-memory transcript updates activity time. Durable
+    // hydration must restore the persisted timestamps after that mutation so
+    // a cold attach cannot masquerade as new user activity.
+    session.created_at_ms = created_at_ms;
+    session.updated_at_ms = updated_at_ms;
     session.workspace_root = workspace_root;
     session.fork = parent_session_id.map(|parent_session_id| runtime::SessionFork {
         parent_session_id,

@@ -2460,6 +2460,7 @@ mod tests {
         panel.server_running = true;
         panel.health_status = Some("Healthy".to_string());
         panel.mission_control = Some(MissionControlSummary {
+            mission_id: Some("mission-control".to_string()),
             active_session_id: Some("mission-a".to_string()),
             session_count: 2,
             active_count: 1,

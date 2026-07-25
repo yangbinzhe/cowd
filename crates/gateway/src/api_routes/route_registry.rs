@@ -11,10 +11,15 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use harness_contract::projection::{
-    ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection, ProjectionDelta,
-    SessionEvidenceProjection, SessionExecutionIndexProjection, SessionExecutionIndicesProjection,
-    TurnEvidenceProjection,
+use harness_contract::{
+    live::{
+        CreateLiveSubscriptionRequest, LiveEnvelope, LiveSubscription, PatchLiveSubscriptionRequest,
+    },
+    projection::{
+        ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection,
+        SessionEvidenceProjection, SessionExecutionIndexProjection,
+        SessionExecutionIndicesProjection, TurnEvidenceProjection,
+    },
 };
 
 use super::{runtime_routes, AppState};
@@ -96,15 +101,6 @@ fn execution_projection_snapshot_spec(
     )
 }
 
-fn execution_projection_events_spec(
-) -> TypedRouteSpec<(), runtime_routes::ExecutionProjectionQuery, ProjectionDelta> {
-    TypedRouteSpec::new(
-        "GET",
-        "/api/runtime/executions/:id/events",
-        "runtime_execution_projection_events",
-    )
-}
-
 fn execution_projection_command_spec(
 ) -> TypedRouteSpec<ExecutionCommandRequest, (), ExecutionCommandReceipt> {
     TypedRouteSpec::new(
@@ -142,10 +138,37 @@ fn turn_evidence_spec() -> TypedRouteSpec<(), (), TurnEvidenceProjection> {
     )
 }
 
-pub(crate) fn execution_projection_route_metadata() -> Vec<StableRouteMetadata> {
+fn live_create_spec() -> TypedRouteSpec<CreateLiveSubscriptionRequest, (), LiveSubscription> {
+    TypedRouteSpec::new(
+        "POST",
+        "/api/runtime/live-subscriptions",
+        "runtime_live_subscription_create",
+    )
+}
+
+fn live_patch_spec() -> TypedRouteSpec<PatchLiveSubscriptionRequest, (), LiveSubscription> {
+    TypedRouteSpec::new(
+        "PATCH",
+        "/api/runtime/live-subscriptions/:id",
+        "runtime_live_subscription_patch",
+    )
+}
+
+fn live_delete_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new(
+        "DELETE",
+        "/api/runtime/live-subscriptions/:id",
+        "runtime_live_subscription_delete",
+    )
+}
+
+fn live_stream_spec() -> TypedRouteSpec<(), (), LiveEnvelope> {
+    TypedRouteSpec::new("GET", "/api/runtime/live/:id", "runtime_live_stream_get")
+}
+
+pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
     vec![
         execution_projection_snapshot_spec().metadata(None, "ExecutionProjection", false),
-        execution_projection_events_spec().metadata(None, "ProjectionDelta", true),
         execution_projection_command_spec().metadata(
             Some("ExecutionCommandRequest"),
             "ExecutionCommandReceipt",
@@ -155,11 +178,23 @@ pub(crate) fn execution_projection_route_metadata() -> Vec<StableRouteMetadata> 
         session_execution_index_spec().metadata(None, "SessionExecutionIndexProjection", false),
         session_evidence_spec().metadata(None, "SessionEvidenceProjection", false),
         turn_evidence_spec().metadata(None, "TurnEvidenceProjection", false),
+        live_create_spec().metadata(
+            Some("CreateLiveSubscriptionRequest"),
+            "LiveSubscription",
+            false,
+        ),
+        live_patch_spec().metadata(
+            Some("PatchLiveSubscriptionRequest"),
+            "LiveSubscription",
+            false,
+        ),
+        live_delete_spec().metadata(None, "Empty", false),
+        live_stream_spec().metadata(None, "LiveEnvelope", true),
     ]
 }
 
 pub(crate) fn stable_route_metadata(method: &str, path: &str) -> Option<StableRouteMetadata> {
-    execution_projection_route_metadata()
+    typed_route_metadata()
         .into_iter()
         .find(|spec| spec.method == method && spec.path == path)
 }
@@ -168,14 +203,9 @@ pub(super) fn register_execution_projection_routes(
     router: Router<Arc<AppState>>,
 ) -> Router<Arc<AppState>> {
     let snapshot = execution_projection_snapshot_spec();
-    let events = execution_projection_events_spec();
     let command = execution_projection_command_spec();
     router
         .route(snapshot.path, get(runtime_routes::get_execution_projection))
-        .route(
-            events.path,
-            get(runtime_routes::get_execution_projection_events),
-        )
         .route(
             command.path,
             post(runtime_routes::execute_projection_command),
@@ -187,25 +217,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn execution_projection_specs_cover_snapshot_delta_and_command_contracts() {
-        let specs = execution_projection_route_metadata();
-        assert_eq!(specs.len(), 7);
+    fn typed_specs_cover_projection_and_live_contracts() {
+        let specs = typed_route_metadata();
+        assert_eq!(specs.len(), 10);
         assert_eq!(specs[0].operation_id, "runtime_execution_projection_get");
         assert_eq!(specs[0].response_schema, "ExecutionProjection");
-        assert_eq!(specs[1].path, "/api/runtime/executions/:id/events");
-        assert!(specs[1].streaming);
-        assert_eq!(specs[1].response_schema, "ProjectionDelta");
         assert_eq!(
-            specs[2].request_schema,
+            specs[1].request_schema,
             Some("ExecutionCommandRequest".to_string())
         );
-        assert_eq!(specs[2].response_schema, "ExecutionCommandReceipt");
+        assert_eq!(specs[1].response_schema, "ExecutionCommandReceipt");
         assert_eq!(
-            specs[3].response_schema,
+            specs[2].response_schema,
             "SessionExecutionIndicesProjection"
         );
-        assert_eq!(specs[4].operation_id, "session_execution_index_get");
-        assert_eq!(specs[5].response_schema, "SessionEvidenceProjection");
-        assert_eq!(specs[6].response_schema, "TurnEvidenceProjection");
+        assert_eq!(specs[3].operation_id, "session_execution_index_get");
+        assert_eq!(specs[4].response_schema, "SessionEvidenceProjection");
+        assert_eq!(specs[5].response_schema, "TurnEvidenceProjection");
+        assert_eq!(
+            specs[6].request_schema,
+            Some("CreateLiveSubscriptionRequest".to_string())
+        );
+        assert_eq!(specs[9].response_schema, "LiveEnvelope");
+        assert!(specs[9].streaming);
     }
 }

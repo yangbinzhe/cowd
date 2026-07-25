@@ -1,32 +1,21 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
-    convert::Infallible,
-    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::task_kernel::TaskRecord;
 use axum::{
     extract::{Extension, Path, Query, State as AxumState},
     http::{HeaderMap, StatusCode},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse,
-    },
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use futures::{stream::Stream, StreamExt};
 use harness_contract::turn::{
     InputRoutingDecision, InputSourceKind, SessionInputEnvelope, SessionInputId, TurnId,
 };
 use runtime::{ContextProfile, ResumeContextPacket, ResumeContextSource};
 use serde::Deserialize;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
-
-use crate::event_bus::SessionEventBus;
-use crate::task_kernel::TaskRecord;
 
 use super::{
     session_routes::{authorize_session_access, SessionAccess},
@@ -60,7 +49,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/sessions/:id/inputs/:input_id/reclassify",
             post(reclassify_session_input),
         )
-        .route("/api/sessions/:id/stream", get(sse_stream_handler))
 }
 
 #[derive(Deserialize)]
@@ -101,14 +89,6 @@ struct SessionInputReclassifyRequest {
     decision: InputRoutingDecision,
     #[serde(default)]
     reason: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct SessionStreamQuery {
-    /// Exclusive Runtime commit cursor. `Last-Event-ID` takes precedence so
-    /// native EventSource reconnects need no client-specific query mutation.
-    #[serde(default)]
-    from_cursor: Option<u64>,
 }
 
 fn current_time_ms() -> u64 {
@@ -821,251 +801,7 @@ async fn get_session_messages(
         })
 }
 
-struct SseStream {
-    rx: ReceiverStream<String>,
-    session_id: String,
-    event_bus: Arc<SessionEventBus>,
-    subscription_id: u64,
-    seen_durable_cursors: BTreeSet<u64>,
-    durable_cursor_order: VecDeque<u64>,
-}
-
-impl Stream for SseStream {
-    type Item = Result<Event, Infallible>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        loop {
-            match self.rx.poll_next_unpin(cx) {
-                std::task::Poll::Ready(Some(data)) => {
-                    let durable_cursor = stream_durable_cursor(&data);
-                    if let Some(cursor) = durable_cursor {
-                        if !self.seen_durable_cursors.insert(cursor) {
-                            continue;
-                        }
-                        self.durable_cursor_order.push_back(cursor);
-                        if self.durable_cursor_order.len() > 1_024 {
-                            if let Some(expired) = self.durable_cursor_order.pop_front() {
-                                self.seen_durable_cursors.remove(&expired);
-                            }
-                        }
-                    }
-                    let mut event = Event::default().data(data);
-                    if let Some(cursor) = durable_cursor {
-                        event = event.id(cursor.to_string());
-                    }
-                    return std::task::Poll::Ready(Some(Ok(event)));
-                }
-                std::task::Poll::Ready(None) => return std::task::Poll::Ready(None),
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-            }
-        }
-    }
-}
-
-impl Drop for SseStream {
-    fn drop(&mut self) {
-        let event_bus = self.event_bus.clone();
-        let session_id = self.session_id.clone();
-        let subscription_id = self.subscription_id;
-        tokio::spawn(async move {
-            event_bus.unsubscribe(&session_id, subscription_id).await;
-        });
-    }
-}
-
-async fn sse_stream_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(session_id): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Query(query): Query<SessionStreamQuery>,
-    headers: HeaderMap,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ErrorResponse>)> {
-    authorize_session_access(&state, &principal, &session_id, SessionAccess::Read).await?;
-    // Replay runs after Axum receives the stream so arbitrarily many bounded
-    // pages can drain concurrently to the client. Producing replay inside the
-    // handler would either deadlock on the output channel or silently stop
-    // after one page.
-    const SESSION_STREAM_OUTPUT_CAPACITY: usize = 512;
-    let (tx, rx) = mpsc::channel(SESSION_STREAM_OUTPUT_CAPACITY);
-    let (bus_tx, bus_rx) = mpsc::channel(256);
-    let event_bus = state.event_bus();
-    let subscription_id = event_bus.subscribe(&session_id, bus_tx).await;
-    let resume_cursor = headers
-        .get("last-event-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .or(query.from_cursor)
-        .unwrap_or_default();
-    let observer_id = headers
-        .get("x-cowd-observer-id")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| super::validated_session_observer_id(Some(value)))
-        .map(str::to_string);
-    let revoked_attachment_actor = observer_id
-        .as_deref()
-        .map(|observer_id| super::surface_actor_id(&principal, observer_id));
-    let revoked_lease_owner = super::session_lease_owner(&principal, observer_id.as_deref());
-    spawn_session_stream_authorization_guard(
-        bus_rx,
-        tx,
-        state.clone(),
-        state.config_home.clone(),
-        principal,
-        session_id.clone(),
-        resume_cursor,
-        revoked_attachment_actor,
-        revoked_lease_owner,
-    );
-
-    let stream = SseStream {
-        rx: ReceiverStream::new(rx),
-        session_id,
-        event_bus,
-        subscription_id,
-        seen_durable_cursors: BTreeSet::new(),
-        durable_cursor_order: VecDeque::new(),
-    };
-
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(std::time::Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
-}
-
-/// Bus subscriptions outlive one HTTP poll, therefore auth middleware alone
-/// cannot protect a Session SSE connection.  Forward through a private
-/// channel and revalidate on a bounded cadence without ever blocking Tokio's
-/// worker threads on the broker's Unix socket.  Once revoked, emit exactly one
-/// typed terminal event and stop forwarding before any later durable event.
-fn spawn_session_stream_authorization_guard(
-    mut bus_rx: mpsc::Receiver<String>,
-    tx: mpsc::Sender<String>,
-    state: Arc<AppState>,
-    config_home: PathBuf,
-    principal: AuthenticatedPrincipal,
-    session_id: String,
-    resume_cursor: u64,
-    revoked_attachment_actor: Option<String>,
-    revoked_lease_owner: String,
-) {
-    tokio::spawn(async move {
-        const TERMINAL_REPLAY_PAGE_SIZE: usize = 500;
-        const TERMINAL_REPLAY_MAX_PAGES: usize = 100;
-        let mut replay_cursor = resume_cursor;
-        for page_index in 0..TERMINAL_REPLAY_MAX_PAGES {
-            let page = replay_materialized_terminal_events(
-                &state,
-                &session_id,
-                replay_cursor,
-                TERMINAL_REPLAY_PAGE_SIZE,
-            )
-            .await;
-            for event in page.events {
-                if tx.send(event).await.is_err() {
-                    return;
-                }
-            }
-            replay_cursor = replay_cursor.max(page.last_cursor.unwrap_or(replay_cursor));
-            if page.requires_resync {
-                return;
-            }
-            if page.record_count < TERMINAL_REPLAY_PAGE_SIZE {
-                break;
-            }
-            if page_index + 1 == TERMINAL_REPLAY_MAX_PAGES {
-                // This is a typed recovery boundary, not a false Connected:
-                // reconnecting from replay_cursor continues with the next
-                // bounded page and cannot strand terminal 50_001 forever.
-                let _ = tx
-                    .send(
-                        serde_json::json!({
-                            "type": "session_stream_resync",
-                            "session_id": session_id,
-                            "reason": "terminal_replay_window",
-                            "runtime_commit_cursor": replay_cursor,
-                        })
-                        .to_string(),
-                    )
-                    .await;
-                return;
-            }
-        }
-        if tx
-            .send(
-                serde_json::json!({
-                    "type": "Connected",
-                    "session_id": session_id,
-                    "runtime_commit_cursor": replay_cursor,
-                })
-                .to_string(),
-            )
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                biased;
-                _ = interval.tick() => {
-                    if tx.is_closed() {
-                        break;
-                    }
-                    let config_home = config_home.clone();
-                    let principal = principal.clone();
-                    let check = tokio::task::spawn_blocking(move || {
-                        super::projection_stream_principal_current(&config_home, &principal)
-                    }).await;
-                    let reason = match check {
-                        Ok(Ok(())) => None,
-                        Ok(Err(reason)) => Some(reason),
-                        Err(error) => Some(format!("session stream authorization check aborted: {error}")),
-                    };
-                    if let Some(reason) = reason {
-                        // Revocation is a server-side authority boundary, not
-                        // just an instruction for the remote renderer. Remove
-                        // the exact observer attachment and writer lease before
-                        // publishing the terminal event so no subsequent HTTP
-                        // mutation can continue under stale Surface state.
-                        cleanup_revoked_session_stream_authority(
-                            &state,
-                            &session_id,
-                            revoked_attachment_actor.as_deref(),
-                            &revoked_lease_owner,
-                        ).await;
-                        let _ = tx.send(serde_json::json!({
-                            "type": "SessionAuthorizationRevoked",
-                            "session_id": session_id,
-                            "reason": reason,
-                        }).to_string()).await;
-                        break;
-                    }
-                }
-                event = bus_rx.recv() => match event {
-                    Some(event) => {
-                        let projection_started = std::time::Instant::now();
-                        if tx.send(event).await.is_err() {
-                            break;
-                        }
-                        runtime::execution_core::performance::observe_duration(
-                            "surface_projection_ms",
-                            projection_started.elapsed(),
-                        );
-                    }
-                    None => break,
-                },
-            }
-        }
-    });
-}
-
-async fn cleanup_revoked_session_stream_authority(
+pub(super) async fn cleanup_revoked_session_stream_authority(
     state: &AppState,
     session_id: &str,
     attachment_actor: Option<&str>,
@@ -1099,14 +835,14 @@ async fn cleanup_revoked_session_stream_authority(
     }
 }
 
-fn stream_durable_cursor(data: &str) -> Option<u64> {
+pub(super) fn stream_durable_cursor(data: &str) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(data)
         .ok()?
         .get("runtime_commit_cursor")?
         .as_u64()
 }
 
-async fn replay_materialized_terminal_events(
+pub(super) async fn replay_materialized_terminal_events(
     state: &AppState,
     session_id: &str,
     after_cursor: u64,
@@ -1163,11 +899,11 @@ async fn replay_materialized_terminal_events(
 }
 
 #[derive(Default)]
-struct ReplayTerminalPage {
-    events: Vec<String>,
-    record_count: usize,
-    last_cursor: Option<u64>,
-    requires_resync: bool,
+pub(super) struct ReplayTerminalPage {
+    pub(super) events: Vec<String>,
+    pub(super) record_count: usize,
+    pub(super) last_cursor: Option<u64>,
+    pub(super) requires_resync: bool,
 }
 
 fn terminal_committed_stream_payload(

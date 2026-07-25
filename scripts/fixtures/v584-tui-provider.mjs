@@ -225,7 +225,9 @@ function responseFor(messages, tools) {
           "V584-OBSERVER-SYNC-ACK",
         ],
         finishReason: "stop",
-        delayMs: 500,
+        // Keep a deterministic pre-terminal window long enough for the
+        // acceptance harness to capture both independent terminal surfaces.
+        delayMs: 1000,
       };
     }
     const marker = latest.includes("from WebUI")

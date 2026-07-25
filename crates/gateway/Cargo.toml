@@ -27,6 +27,7 @@ surface-postgres = { path = "../surface-postgres" }
 approval = { path = "../approval" }
 axum = { version = "0.7", features = ["multipart"] }
 base64 = "0.22"
+hmac = "0.12"
 bytes = "1"
 memory = { path = "../memory" }
 memory-postgres = { path = "../memory-postgres" }
@@ -113,7 +114,7 @@ required-features = ["test-support"]
 unsafe_code = "allow"
 
 [dev-dependencies]
-app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "272227bfc9d09e821dded89e1800e332c2366e46" }
+app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "5e409419a80388fd340b01ff607da28c081c2fa0" }
 auth-broker = { path = "../auth-broker", features = ["test-support"] }
 runtime = { path = "../runtime", features = ["test-fixtures"] }
 serde_json.workspace = true

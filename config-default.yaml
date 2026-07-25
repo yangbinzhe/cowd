@@ -374,6 +374,16 @@ apps:
 
 gateway:
   enabled: true
+  # 单物理 SSE 多路实时传输治理。逻辑 source 共用一个 Surface 连接；
+  # 达到上限时显式拒绝或要求定向重同步，不截断 checkpoint 或静默丢语义事件。
+  live:
+    max_sources: 32
+    max_subscriptions_per_principal_instance: 4
+    queue_capacity: 512
+    checkpoint_max_bytes: 6144
+    default_ttl_seconds: 3600
+    max_ttl_seconds: 86400
+    baseline_timeout_ms: 15000
   # 启动只读取会话恢复清单；必须续接和最近会话才按字节预算进入热 Runtime。
   # 所有限制只治理进程内热态，不截断或删除持久化会话历史。
   recovery:

@@ -6,6 +6,10 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
 EXPECTED_GIT_SHA="$(git -C "$ROOT" rev-parse --short=8 HEAD)"
 EXPECTED_BUILD_DATE="${COWD_V584_EXPECTED_BUILD_DATE:-$(date -u +%Y-%m-%d)}"
+EXPECTED_VERSION="$(
+  python3 -c 'import sys,tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["workspace"]["package"]["version"])' \
+    "$ROOT/Cargo.toml"
+)"
 GATEWAY_PORT="${COWD_V584_GATEWAY_PORT:-18783}"
 PROVIDER_PORT="${COWD_V584_PROVIDER_PORT:-18784}"
 BASE_URL="http://127.0.0.1:$GATEWAY_PORT"
@@ -175,6 +179,19 @@ needle = sys.argv[1]
 text = json.dumps(page.get("messages", []), ensure_ascii=False)
 raise SystemExit(0 if needle in text else 1)
 ' "$needle"
+}
+
+create_session_live_subscription() {
+  local session_id="$1"
+  local surface_instance="$2"
+  local output="$3"
+  auth_curl \
+    -H "x-cowd-observer-id: $surface_instance" \
+    -H 'content-type: application/json' \
+    -X POST "$BASE_URL/api/runtime/live-subscriptions" \
+    -d "{\"surface_instance\":\"$surface_instance\",\"idempotency_key\":\"acceptance-live:$surface_instance\",\"selector\":{\"sources\":[{\"kind\":\"session\",\"id\":\"$session_id\",\"cursor\":0,\"detail_scope\":\"summary\"}]}}" \
+    >"$output"
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["stream_url"])' "$output"
 }
 
 wait_message() {
@@ -388,18 +405,19 @@ rg -q 'test result: ok\. 7 passed; 0 failed' \
 "$BIN" --version >"$ARTIFACT_DIR/cowd-version.txt" 2>&1
 python3 - \
   "$ARTIFACT_DIR/cowd-version.txt" \
+  "$EXPECTED_VERSION" \
   "$EXPECTED_GIT_SHA" \
   "$EXPECTED_BUILD_DATE" <<'PY'
 import re
 import sys
 
 text = open(sys.argv[1], encoding="utf-8").read()
-expected_sha, expected_date = sys.argv[2:]
-assert re.search(r"(?m)^\s*Version\s+0\.9\.585\s*$", text), text
+expected_version, expected_sha, expected_date = sys.argv[2:]
+assert re.search(rf"(?m)^\s*Version\s+{re.escape(expected_version)}\s*$", text), text
 assert re.search(rf"(?m)^\s*Git SHA\s+{re.escape(expected_sha)}\s*$", text), text
 assert re.search(rf"(?m)^\s*Build date\s+{re.escape(expected_date)}\s*$", text), text
 PY
-pass "binary reports version 0.9.589 from commit $EXPECTED_GIT_SHA built $EXPECTED_BUILD_DATE"
+pass "binary reports version $EXPECTED_VERSION from commit $EXPECTED_GIT_SHA built $EXPECTED_BUILD_DATE"
 
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "$MODEL"
@@ -449,8 +467,8 @@ pass "isolated provider and Gateway are healthy"
 start_tui writer "$SESSION_A" "tui:v584-writer" 120 40
 wait_capture writer "$MODEL" boot \
   || fail "writer TUI did not render the requested model"
-rg -q '0\.9\.585' "$ARTIFACT_DIR/boot.txt" \
-  || fail "writer TUI did not render version 0.9.589"
+rg -Fq "$EXPECTED_VERSION" "$ARTIFACT_DIR/boot.txt" \
+  || fail "writer TUI did not render version $EXPECTED_VERSION"
 rg -q 'idle|ready' "$ARTIFACT_DIR/boot.txt" \
   || fail "writer TUI did not expose an idle/ready state"
 capture_utf8 writer boot-utf8 \
@@ -474,8 +492,11 @@ rg -q "$MODEL" "$ARTIFACT_DIR/boot-resized.txt" \
   || fail "new-session resize lost the requested model"
 resize_tui writer 120 40
 pass "E1 new-session version/model/idle/unknown metrics and palette/resize interaction are visible"
+SESSION_LIVE_URL="$(create_session_live_subscription \
+  "$SESSION_A" "acceptance:session-monitor:$$" \
+  "$ARTIFACT_DIR/session-live-subscription.json")"
 curl -fsSN -H "Authorization: Bearer $TOKEN" \
-  --max-time 90 "$BASE_URL/api/sessions/$SESSION_A/stream" \
+  --max-time 90 "$BASE_URL$SESSION_LIVE_URL" \
   >"$SESSION_STREAM_LOG" 2>&1 &
 SESSION_STREAM_PID=$!
 
@@ -594,6 +615,8 @@ wait_message "$SESSION_A" "V584-SLOW-END" \
   || fail "slow streaming response did not complete"
 wait_capture writer 'V584-SLOW-END' slow-complete \
   || fail "slow streaming completion was not rendered"
+wait_capture writer 'ctx[[:space:]]+[[:digit:]]+[[:space:]]+/16[.]4k' slow-complete-metrics \
+  || fail "canonical execution metrics did not reach a stable terminal render"
 capture_utf8 writer slow-complete-utf8 \
   || fail "slow completion UTF-8 transcript could not be captured"
 auth_curl "$BASE_URL/api/sessions/$SESSION_A/execution" \
@@ -615,7 +638,7 @@ rg -q "$MODEL" "$ARTIFACT_DIR/slow-complete.txt" \
   || fail "effective model disappeared after a real turn"
 python3 - \
   "$ARTIFACT_DIR/slow-execution-projection.json" \
-  "$ARTIFACT_DIR/slow-complete.txt" \
+  "$ARTIFACT_DIR/slow-complete-metrics.txt" \
   "$MODEL" <<'PY'
 import json
 import sys
@@ -662,6 +685,9 @@ assert (
     f"approvals {metrics['approvals']} · files {metrics['files_touched']}"
 ) in screen, (metrics, screen)
 PY
+if rg -q 'Gateway Mission live source stopped' "$ARTIFACT_DIR/slow-complete-utf8.txt"; then
+  fail "TUI Mission source stopped instead of joining the multiplexed live subscription"
+fi
 pass "E6 active progress/model status is visible; terminal model/context/token/tool/memory/approval metrics exactly match the canonical execution projection"
 pass "E9 input-to-first-visible-partial latency is ${slow_partial_ms}ms"
 
@@ -683,11 +709,14 @@ auth_curl \
   -X POST "$BASE_URL/api/runtime/session-leases/acquire" \
   -d "{\"session_id\":\"$SESSION_A\",\"mode\":\"collaborative\"}" \
   >"$ARTIFACT_DIR/webui-writer-lease.json"
+WEBUI_LIVE_URL="$(create_session_live_subscription \
+  "$SESSION_A" "$WEBUI_OBSERVER_ID" \
+  "$ARTIFACT_DIR/webui-live-subscription.json")"
 curl -fsSN \
   -H "Authorization: Bearer $TOKEN" \
   -H 'x-cowd-surface-id: webui' \
   -H "x-cowd-observer-id: $WEBUI_OBSERVER_ID" \
-  --max-time 90 "$BASE_URL/api/sessions/$SESSION_A/stream" \
+  --max-time 90 "$BASE_URL$WEBUI_LIVE_URL" \
   >"$WEBUI_STREAM_LOG" 2>&1 &
 WEBUI_STREAM_PID=$!
 
@@ -699,7 +728,7 @@ for _ in {1..240}; do
   sleep 0.25
 done
 rg -q 'V584-TUI-TO-WEBUI-ACK' "$WEBUI_STREAM_LOG" \
-  || fail "the real WebUI session stream did not observe TUI-originated progress"
+  || fail "the real WebUI multiplex live stream did not observe TUI-originated progress"
 
 auth_curl \
   -H 'x-cowd-surface-id: webui' \
@@ -717,7 +746,7 @@ for _ in {1..240}; do
   sleep 0.25
 done
 rg -q 'V584-WEBUI-TO-TUI-ACK' "$WEBUI_STREAM_LOG" \
-  || fail "the WebUI stream did not observe its own canonical terminal result"
+  || fail "the WebUI multiplex stream did not observe its own canonical terminal result"
 
 auth_curl \
   -H 'x-cowd-surface-id: webui' \
@@ -792,15 +821,19 @@ send_prompt writer "V584_OBSERVER_SYNC publish one answer to both terminals"
 writer_partial=0
 observer_partial=0
 for _ in {1..80}; do
-  capture writer writer-sync-progress \
-    || fail "writer collaborative progress screen could not be captured"
-  capture observer observer-sync-progress \
-    || fail "observer collaborative progress screen could not be captured"
-  if rg -q 'V584-OBSERVER-SYNC-BEGIN' "$ARTIFACT_DIR/writer-sync-progress.txt"; then
-    writer_partial=1
+  if [[ "$writer_partial" == "0" ]]; then
+    capture writer writer-sync-progress \
+      || fail "writer collaborative progress screen could not be captured"
+    if rg -q 'V584-OBSERVER-SYNC-BEGIN' "$ARTIFACT_DIR/writer-sync-progress.txt"; then
+      writer_partial=1
+    fi
   fi
-  if rg -q 'V584-OBSERVER-SYNC-BEGIN' "$ARTIFACT_DIR/observer-sync-progress.txt"; then
-    observer_partial=1
+  if [[ "$observer_partial" == "0" ]]; then
+    capture observer observer-sync-progress \
+      || fail "observer collaborative progress screen could not be captured"
+    if rg -q 'V584-OBSERVER-SYNC-BEGIN' "$ARTIFACT_DIR/observer-sync-progress.txt"; then
+      observer_partial=1
+    fi
   fi
   if [[ "$writer_partial" == "1" && "$observer_partial" == "1" ]]; then
     break
@@ -838,7 +871,7 @@ pass "E8 simultaneous sessions remain causally and visually isolated"
 
 stop_gateway
 wait_capture writer \
-  'reconnect:[[:digit:]]+@|Gateway session stream interrupted; reconnecting with durable hydration' \
+  'reconnect:[[:digit:]]+@|Gateway live|reconnecting with durable hydration' \
   e7-gateway-down \
   || fail "Gateway loss did not become visible in the active TUI"
 start_gateway || fail "Gateway did not restart on the same durable store"

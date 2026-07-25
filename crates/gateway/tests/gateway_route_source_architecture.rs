@@ -23,7 +23,8 @@ fn production_part(source: &str) -> &str {
 /// Gateway route inventory has two deliberate source paths only:
 ///
 /// * literal Axum registrations are collected once at build time;
-/// * typed execution-projection registrations carry their own stable schema.
+/// * typed execution-projection and multiplex-live registrations carry their
+///   own stable schemas.
 ///
 /// The runtime manifest/OpenAPI path must consume those artifacts, never parse
 /// Rust source while serving a request. Keeping this as a source test makes a
@@ -45,8 +46,12 @@ fn route_inventory_has_single_build_or_typed_source_of_truth() {
     );
     assert!(registry.contains("pub(crate) struct TypedRouteSpec"));
     assert!(registry.contains("execution_projection_snapshot_spec"));
-    assert!(registry.contains("execution_projection_events_spec"));
     assert!(registry.contains("execution_projection_command_spec"));
+    assert!(registry.contains("live_create_spec"));
+    assert!(registry.contains("live_patch_spec"));
+    assert!(registry.contains("live_delete_spec"));
+    assert!(registry.contains("live_stream_spec"));
+    assert!(!registry.contains("execution_projection_events_spec"));
     assert!(registry.contains("register_execution_projection_routes"));
 
     let runtime_routes_source = read_repo("crates/gateway/src/api_routes/runtime_routes.rs");
@@ -56,7 +61,7 @@ fn route_inventory_has_single_build_or_typed_source_of_truth() {
     let route_manifest_source = read_repo("crates/gateway/src/api_routes/route_manifest.rs");
     let route_manifest = production_part(&route_manifest_source);
     assert!(route_manifest.contains("generated_route_metadata"));
-    assert!(route_manifest.contains("execution_projection_route_metadata"));
+    assert!(route_manifest.contains("typed_route_metadata"));
     assert!(
         !route_manifest.contains("std::fs::read_to_string")
             && !route_manifest.contains("fs::read_to_string")
