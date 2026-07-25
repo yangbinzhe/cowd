@@ -472,7 +472,7 @@ fn adjust_p_values(
                     adjusted[index] = trailing_min;
                 }
             }
-            EvaluationMultiplicityCorrection::None => unreachable!("filtered above"),
+            EvaluationMultiplicityCorrection::None => {}
         }
     }
     adjusted
@@ -513,7 +513,21 @@ impl runtime::EvolutionEvalRunner for DefinitionEvolutionEvalRunner {
 
 #[must_use]
 pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
-    let candidate = closure_candidate();
+    let candidate = match closure_candidate() {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            return EvolutionClosureReport {
+                kind: "harness_eval.definition_evolution_closure".to_string(),
+                candidate_count: 0,
+                comparison_report_count: 0,
+                eligible_report_count: 0,
+                release_mutation_count: 0,
+                runtime_port_implemented: true,
+                status: "failed".to_string(),
+                evidence_refs: vec![format!("candidate_error:{error}")],
+            };
+        }
+    };
     let runner = DefinitionEvolutionEvalRunner::new(Arc::new(ClosureWorkload));
     match futures::executor::block_on(runtime::EvolutionEvalRunner::evaluate(&runner, &candidate)) {
         Ok(report) => EvolutionClosureReport {
@@ -592,15 +606,15 @@ impl DefinitionEvolutionWorkload for ClosureWorkload {
     }
 }
 
-fn closure_candidate() -> runtime::EvolutionGovernanceCandidate {
+fn closure_candidate() -> Result<runtime::EvolutionGovernanceCandidate, String> {
     let definition_id = harness_contract::agent::AgentDefinitionId::new(
         harness_contract::agent::DefinitionScope::Workspace,
         "cowd/evolution-closure",
     )
-    .expect("valid fixture definition id");
+    .map_err(|error| error.to_string())?;
     let revision_ref = harness_contract::agent::AgentDefinitionRevisionRef::new(definition_id, 2)
-        .expect("valid fixture revision");
-    runtime::EvolutionGovernanceCandidate {
+        .map_err(|error| error.to_string())?;
+    Ok(runtime::EvolutionGovernanceCandidate {
         candidate_id: "harness-eval-closure-candidate".to_string(),
         subject: runtime::EvolutionCandidateSubject::AgentDefinition { revision_ref },
         baseline_revision: 1,
@@ -632,7 +646,7 @@ fn closure_candidate() -> runtime::EvolutionGovernanceCandidate {
         canary_observation: None,
         created_at_ms: 1,
         updated_at_ms: 1,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -668,7 +682,7 @@ mod tests {
         assert!(
             futures::executor::block_on(runtime::EvolutionEvalRunner::evaluate(
                 &runner,
-                &closure_candidate(),
+                &closure_candidate().expect("closure candidate"),
             ))
             .is_err()
         );
@@ -676,7 +690,9 @@ mod tests {
 
     #[test]
     fn evaluator_collects_the_contract_sample_count_before_scoring() {
-        let contract = closure_candidate().evaluation_contract;
+        let contract = closure_candidate()
+            .expect("closure candidate")
+            .evaluation_contract;
         assert_eq!(
             scenario_repetitions(&contract).expect("schedule"),
             vec![("harness-eval/closure".to_string(), 10)]

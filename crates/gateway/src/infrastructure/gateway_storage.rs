@@ -11,17 +11,19 @@ impl GatewayStorage {
     }
 
     pub(crate) fn task_db_path(config_home: impl AsRef<Path>) -> PathBuf {
-        Self::registry(config_home)
-            .endpoint(&StorageDomainId::Tasks)
-            .map(|endpoint| endpoint.as_handle().path)
-            .expect("tasks endpoint is part of the default Cowd storage inventory")
+        let layout = storage::StorageLayout::default_for_config_home(config_home);
+        layout
+            .sqlite_path("tasks")
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| layout.root.join("tasks.sqlite"))
     }
 
     pub(crate) fn session_db_path(config_home: impl AsRef<Path>) -> PathBuf {
-        Self::registry(config_home)
-            .endpoint(&StorageDomainId::Session)
-            .map(|endpoint| endpoint.as_handle().path)
-            .expect("session endpoint is part of the default Cowd storage inventory")
+        let layout = storage::StorageLayout::default_for_config_home(config_home);
+        layout
+            .sqlite_path("session")
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| layout.root.join("session.sqlite"))
     }
 
     pub(crate) fn open_task_kernel(config_home: impl AsRef<Path>) -> Result<TaskKernel, String> {

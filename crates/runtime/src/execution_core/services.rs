@@ -56,6 +56,8 @@ pub enum RuntimeServicesError {
     #[error(transparent)]
     EventStore(#[from] RuntimeEventStoreError),
     #[error(transparent)]
+    Artifact(#[from] crate::ArtifactError),
+    #[error(transparent)]
     WorktreeLease(#[from] WorktreeLeaseError),
     #[error(transparent)]
     ScopeLock(#[from] ScopeLockError),
@@ -503,12 +505,8 @@ impl RuntimeServicesBuilder {
             Arc::new(RuntimeEventStore::try_open(runtime_event_handle.path)?)
         };
         let artifact_store = self.artifact_store.unwrap_or_else(|| {
-            let endpoint = storage_registry
-                .endpoint(&storage::StorageDomainId::Blobs)
-                .expect("default storage registry always contains the blobs endpoint");
-            Arc::new(crate::ArtifactStore::sqlite(
-                endpoint.path.clone(),
-                crate::ArtifactStoreConfig::default(),
+            Arc::new(crate::ArtifactStore::sqlite_default(
+                storage_registry.layout.blobs.clone(),
             ))
         });
         let resource_state_root = std::env::temp_dir()
@@ -678,12 +676,11 @@ impl RuntimeServices {
             default_resource_quotas(),
             Arc::new(crate::ProviderRegistry::empty()),
             None,
-            Arc::new(crate::ArtifactStore::sqlite(
+            Arc::new(crate::ArtifactStore::sqlite_default(
                 storage_registry
                     .endpoint(&storage::StorageDomainId::Blobs)?
                     .path
                     .clone(),
-                crate::ArtifactStoreConfig::default(),
             )),
             None,
             None,

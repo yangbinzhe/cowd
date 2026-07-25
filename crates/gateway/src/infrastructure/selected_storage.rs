@@ -122,10 +122,10 @@ impl SelectedStorageTopology {
             Some(&workspace_scope),
         )?;
         let blob_endpoint = endpoint(&registry, &StorageDomainId::Blobs, None)?;
-        let artifact_store = Arc::new(runtime::ArtifactStore::sqlite(
-            blob_endpoint.path,
-            artifacts.into(),
-        ));
+        let artifact_store = Arc::new(
+            runtime::ArtifactStore::sqlite(blob_endpoint.path, artifacts.into())
+                .map_err(|error| error.to_string())?,
+        );
 
         let session_store = Arc::new(
             UnifiedSessionStore::open_sqlite_storage_handle_with_execution_config(
@@ -177,7 +177,7 @@ impl SelectedStorageTopology {
         let surface_messages: Arc<dyn SurfaceMessageLedger> = Arc::new(
             crate::surface_host::SqliteSurfaceMessageStore::from_storage_endpoint(
                 &surface_endpoint,
-            ),
+            )?,
         );
         let connector_factory: Arc<dyn connector::ResourceDirectoryFactory> =
             Arc::new(connector::SqliteResourceDirectoryFactory);
@@ -353,7 +353,9 @@ fn workspace_scope(registry: &StorageRegistry) -> Result<StorageScope, String> {
             scopes.len()
         ));
     }
-    Ok(scopes.pop_first().expect("one workspace scope"))
+    scopes
+        .pop_first()
+        .ok_or_else(|| "selected storage has no workspace scope".to_string())
 }
 
 fn replace_business_endpoints_with_postgres(registry: &mut StorageRegistry) -> Result<(), String> {

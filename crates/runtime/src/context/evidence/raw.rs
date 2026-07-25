@@ -488,9 +488,10 @@ async fn migrate_session_raw_evidence(
         }
         let mut payload = event.payload.clone();
         let report_value = if payload.get("report").is_some() {
-            payload
-                .get_mut("report")
-                .expect("report presence was checked")
+            let Some(report) = payload.get_mut("report") else {
+                continue;
+            };
+            report
         } else {
             &mut payload
         };
@@ -542,9 +543,10 @@ async fn migrate_session_raw_evidence(
                     event.sequence
                 )
             })?;
-            *projection
-                .get_mut("access")
-                .expect("projection access was found above") = serde_json::to_value(durable)
+            let Some(access_slot) = projection.get_mut("access") else {
+                continue;
+            };
+            *access_slot = serde_json::to_value(durable)
                 .map_err(|error| format!("encode migrated evidence access: {error}"))?;
             changed = true;
         }
@@ -814,10 +816,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let artifacts = Arc::new(crate::ArtifactStore::sqlite(
-            tempfile::tempdir().unwrap().keep(),
-            crate::ArtifactStoreConfig::default(),
-        ));
+        let artifacts = Arc::new(
+            crate::ArtifactStore::sqlite(
+                tempfile::tempdir().unwrap().keep(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        );
         let facade = RawEvidenceFacade::new(SessionStoreRawEvidenceStore::new(store, artifacts));
         let access = facade.persist(write()).await.expect("durable write");
         assert!(access.is_durable());
@@ -848,10 +853,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let artifacts = Arc::new(crate::ArtifactStore::sqlite(
-            tempfile::tempdir().unwrap().keep(),
-            crate::ArtifactStoreConfig::default(),
-        ));
+        let artifacts = Arc::new(
+            crate::ArtifactStore::sqlite(
+                tempfile::tempdir().unwrap().keep(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        );
         let facade = RawEvidenceFacade::new(SessionStoreRawEvidenceStore::new(store, artifacts));
         let access = facade.persist(write()).await.expect("durable write");
         let mut sibling_access = access;
@@ -885,10 +893,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let artifacts = Arc::new(crate::ArtifactStore::sqlite(
-            tempfile::tempdir().unwrap().keep(),
-            crate::ArtifactStoreConfig::default(),
-        ));
+        let artifacts = Arc::new(
+            crate::ArtifactStore::sqlite(
+                tempfile::tempdir().unwrap().keep(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        );
         let artifact = artifacts
             .write_bytes(
                 ArtifactWriteDescriptor {
@@ -1014,10 +1025,13 @@ mod tests {
             ))
             .await
             .unwrap();
-        let artifacts = Arc::new(crate::ArtifactStore::sqlite(
-            tempfile::tempdir().unwrap().keep(),
-            crate::ArtifactStoreConfig::default(),
-        ));
+        let artifacts = Arc::new(
+            crate::ArtifactStore::sqlite(
+                tempfile::tempdir().unwrap().keep(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        );
 
         let dry_run = migrate_legacy_raw_evidence(
             Arc::clone(&sessions),

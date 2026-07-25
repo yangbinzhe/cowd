@@ -186,6 +186,10 @@ pub fn live_envelope_json_schema() -> Value {
     })
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the embedded canonical fixture is compile-time source and covered by contract tests"
+)]
 pub fn canonical_live_envelope_fixture() -> LiveEnvelope {
     serde_json::from_str(LIVE_ENVELOPE_CANONICAL_FIXTURE_JSON)
         .expect("canonical live envelope fixture must remain valid")
@@ -197,6 +201,10 @@ pub fn live_envelope_schema_hash() -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "serde_json Value serialization and fmt::Write into String are infallible"
+)]
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {

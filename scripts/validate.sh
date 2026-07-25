@@ -215,7 +215,10 @@ run_serial_global() {
 }
 
 run_scenario() {
-  run_step cargo_build_cli cargo build -p cli --no-default-features
+  # The golden Skill/MFG path must exercise the compiled first-party APP.
+  # Keep the feature explicit so this lane cannot silently validate a reduced
+  # binary that omits the capability under test.
+  run_step cargo_build_cli cargo build -p cli --no-default-features --features app-mfg
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step ai_harness bash scripts/ci/ai-harness.sh
   run_step gateway_baseline bash scripts/scenarios/gateway-webui-contract.sh
@@ -226,9 +229,13 @@ run_scenario() {
 }
 
 run_surface() {
-  run_step cargo_build_cli cargo build -p cli --no-default-features
-  export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
+  # Run the minimal-CLI contract first: integration tests materialize their own
+  # no-feature cowd binary and may replace target/debug/cowd.
   run_step cli_minimal_contract cargo test -p cli --test output_format_contract --no-default-features -- --nocapture --test-threads=1
+  # Build the real TUI entrypoint last so the artifact launched below is never
+  # whichever reduced binary a preceding contract test happened to emit.
+  run_step cargo_build_tui_surface cargo build -p cli --no-default-features --features tui-surface
+  export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step tui_projection_smoke bash scripts/scenarios/tui-interaction-quality.sh
   run_step webui_gateway_contract bash scripts/scenarios/gateway-webui-contract.sh
 }

@@ -356,6 +356,10 @@ macro_rules! impl_postgres_client {
 }
 
 impl PostgresConnection {
+    #[allow(
+        clippy::expect_used,
+        reason = "the driver is taken only by Drop, which cannot overlap a live mutable borrow"
+    )]
     fn driver_mut(&mut self) -> &mut postgres::Client {
         self.inner
             .as_deref_mut()
@@ -382,12 +386,20 @@ impl Drop for PostgresConnection {
 }
 
 impl<'a> PostgresTransaction<'a> {
+    #[allow(
+        clippy::expect_used,
+        reason = "the driver is taken only by consuming commit, rollback, or Drop"
+    )]
     fn driver_mut(&mut self) -> &mut Transaction<'a> {
         self.inner
             .as_mut()
             .expect("PostgresTransaction driver is available until commit or drop")
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "commit consumes self, so the transaction cannot have been consumed earlier"
+    )]
     pub fn commit(mut self) -> Result<(), PostgresError> {
         let transaction = self
             .inner
@@ -396,6 +408,10 @@ impl<'a> PostgresTransaction<'a> {
         in_postgres_driver_context(|| transaction.commit())
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "rollback consumes self, so the transaction cannot have been consumed earlier"
+    )]
     pub fn rollback(mut self) -> Result<(), PostgresError> {
         let transaction = self
             .inner

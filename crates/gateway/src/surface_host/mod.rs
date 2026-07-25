@@ -51,10 +51,16 @@ pub(crate) struct SurfaceHost {
 }
 
 impl SurfaceHost {
+    #[cfg(test)]
     pub(crate) fn new(roots: Vec<PathBuf>) -> Self {
         Self::with_configs(roots, BTreeMap::new())
     }
 
+    #[cfg(test)]
+    #[allow(
+        clippy::expect_used,
+        reason = "isolated Surface test fixtures must fail at their local construction boundary"
+    )]
     pub(crate) fn with_configs(
         roots: Vec<PathBuf>,
         configs: BTreeMap<String, serde_json::Value>,
@@ -66,6 +72,11 @@ impl SurfaceHost {
         Self::with_configs_and_message_root(roots, configs, message_root)
     }
 
+    #[cfg(test)]
+    #[allow(
+        clippy::expect_used,
+        reason = "isolated Surface test fixtures must fail at their local construction boundary"
+    )]
     pub(crate) fn with_configs_and_message_root(
         roots: Vec<PathBuf>,
         configs: BTreeMap<String, serde_json::Value>,
@@ -74,7 +85,10 @@ impl SurfaceHost {
         Self::with_configs_and_message_store(
             roots,
             configs,
-            Arc::new(SqliteSurfaceMessageStore::new(message_root)),
+            Arc::new(
+                SqliteSurfaceMessageStore::try_new(message_root)
+                    .expect("isolated Surface test store"),
+            ),
         )
     }
 
@@ -99,27 +113,14 @@ impl SurfaceHost {
         host
     }
 
-    pub(crate) fn default_for(config_home: &Path) -> Self {
-        Self::default_for_with_configs(config_home, BTreeMap::new())
-    }
-
-    pub(crate) fn default_for_with_configs(
-        config_home: &Path,
-        configs: BTreeMap<String, serde_json::Value>,
-    ) -> Self {
-        let roots = default_surface_roots(config_home);
-        let message_root = SqliteSurfaceMessageStore::default_root(config_home);
-        let storage = storage::StorageRegistry::default_for_config_home(config_home)
-            .with_surface_message_root(&message_root)
-            .expect("surface storage endpoint registration must not collide");
-        let endpoint = storage
-            .endpoint(&storage::StorageDomainId::SurfaceMessages)
-            .expect("surface messages endpoint must be registered");
-        Self::with_configs_and_message_store(
-            roots,
-            configs,
-            Arc::new(SqliteSurfaceMessageStore::from_storage_endpoint(endpoint)),
-        )
+    pub(crate) fn baseline() -> Result<Self, String> {
+        Ok(Self::with_configs_and_message_store(
+            Vec::new(),
+            BTreeMap::new(),
+            Arc::new(SqliteSurfaceMessageStore::in_memory(
+                "gateway-surface-baseline",
+            )?),
+        ))
     }
 
     pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<SurfaceFrame> {
@@ -166,12 +167,6 @@ fn isolated_message_root() -> PathBuf {
     std::env::temp_dir()
         .join("cowd-surface-messages")
         .join(uuid::Uuid::new_v4().to_string())
-}
-
-impl Default for SurfaceHost {
-    fn default() -> Self {
-        Self::new(Vec::new())
-    }
 }
 
 #[cfg(test)]

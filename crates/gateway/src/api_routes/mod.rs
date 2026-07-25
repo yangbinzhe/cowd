@@ -1060,7 +1060,7 @@ pub mod test_support {
             let services = Arc::new(GatewayServices::new_with_config_home(
                 runtime,
                 task_kernel,
-                Arc::new(crate::surface_host::SurfaceHost::default()),
+                Arc::new(crate::surface_host::SurfaceHost::baseline()?),
                 None,
                 approval_gate,
                 approval_ledger,
@@ -1802,7 +1802,12 @@ pub(crate) mod tests {
         Arc::new(crate::services::GatewayServices::new_with_config_home(
             runtime,
             task_kernel,
-            surface_host.unwrap_or_else(|| Arc::new(crate::surface_host::SurfaceHost::default())),
+            surface_host.unwrap_or_else(|| {
+                Arc::new(
+                    crate::surface_host::SurfaceHost::baseline()
+                        .expect("test Surface message ledger"),
+                )
+            }),
             None,
             test_approval_gate(Arc::clone(&approval_ledger)),
             approval_ledger,

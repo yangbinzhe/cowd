@@ -38,14 +38,15 @@ impl SessionLeaseRegistry {
                 && existing.values().all(|lease| lease.mode == "collaborative");
             let takeover = normalized_mode == "takeover";
             if !same_owner && !compatible && !takeover {
-                let holder = existing.values().next().expect("non-empty lease group");
-                return serde_json::json!({
-                    "ok": false,
-                    "error": "session lease is held by another owner",
-                    "session_id": session_id,
-                    "owner": holder.owner,
-                    "mode": holder.mode,
-                });
+                if let Some(holder) = existing.values().next() {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "session lease is held by another owner",
+                        "session_id": session_id,
+                        "owner": holder.owner,
+                        "mode": holder.mode,
+                    });
+                }
             }
             if same_owner
                 && normalized_mode == "exclusive"
@@ -114,14 +115,15 @@ impl SessionLeaseRegistry {
                 });
             }
             if !existing.values().all(|lease| lease.mode == "collaborative") {
-                let holder = existing.values().next().expect("non-empty lease group");
-                return serde_json::json!({
-                    "ok": false,
-                    "error": "session lease is held exclusively by another owner",
-                    "session_id": session_id,
-                    "owner": holder.owner,
-                    "mode": holder.mode,
-                });
+                if let Some(holder) = existing.values().next() {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "session lease is held exclusively by another owner",
+                        "session_id": session_id,
+                        "owner": holder.owner,
+                        "mode": holder.mode,
+                    });
+                }
             }
             let lease = SessionLease {
                 session_id: session_id.to_string(),
@@ -173,14 +175,20 @@ impl SessionLeaseRegistry {
                         "session_id": session_id,
                         "released": true,
                     })
-                } else {
-                    let holder = existing.values().next().expect("non-empty lease group");
+                } else if let Some(holder) = existing.values().next() {
                     serde_json::json!({
                         "ok": false,
                         "error": "session lease is held by another owner",
                         "session_id": session_id,
                         "owner": holder.owner,
                         "mode": holder.mode,
+                    })
+                } else {
+                    remove_empty_group = true;
+                    serde_json::json!({
+                        "ok": true,
+                        "session_id": session_id,
+                        "released": false,
                     })
                 }
             }

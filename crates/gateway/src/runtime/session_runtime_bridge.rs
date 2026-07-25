@@ -297,19 +297,19 @@ async fn deliver_terminal(
                     created_at_ms: 0,
                 })
                 .collect::<Vec<_>>();
-            let write = if let Some(ingress_message_id) = payload.ingress_message_id.as_deref() {
-                store
-                    .append_terminal_transcript_idempotent(
-                        &record.message_id,
-                        ingress_message_id,
-                        &record.session_id,
-                        &messages,
-                        now_ms(),
-                    )
-                    .await
-            } else {
-                let terminal = messages.last().expect("legacy transcript has one row");
-                store
+            let write = match (payload.ingress_message_id.as_deref(), messages.last()) {
+                (Some(ingress_message_id), _) => {
+                    store
+                        .append_terminal_transcript_idempotent(
+                            &record.message_id,
+                            ingress_message_id,
+                            &record.session_id,
+                            &messages,
+                            now_ms(),
+                        )
+                        .await
+                }
+                (None, Some(terminal)) => store
                     .append_terminal_message_idempotent(
                         &record.message_id,
                         &record.session_id,
@@ -318,7 +318,10 @@ async fn deliver_terminal(
                         now_ms(),
                     )
                     .await
-                    .map(|(terminal, inserted)| (vec![terminal], inserted))
+                    .map(|(terminal, inserted)| (vec![terminal], inserted)),
+                (None, None) => Err(memory::MemoryError::InvalidArgument(
+                    "legacy terminal transcript is empty".to_string(),
+                )),
             };
             match write {
                 Ok((messages, inserted)) => {

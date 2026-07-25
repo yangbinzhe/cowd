@@ -598,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_uses_local_reply_to_for_gateway_ledger_when_present() {
-        let host = SurfaceHost::default();
+        let host = SurfaceHost::baseline().unwrap();
         let _ = host
             .send(SurfaceSendRequest {
                 surface: "feishu".to_string(),

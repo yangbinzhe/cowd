@@ -42,72 +42,65 @@ pub(crate) struct SqliteSurfaceMessageStore {
 }
 
 impl SqliteSurfaceMessageStore {
+    #[cfg(test)]
     pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
+        Self::try_new(root).expect("isolated Surface test store")
+    }
+
+    pub(crate) fn try_new(root: impl Into<PathBuf>) -> Result<Self, String> {
         let root = root.into();
         Self::open_at(root.clone(), root.join(DATABASE_FILE))
     }
 
     /// Production composition receives the resolved endpoint from `storage`.
-    /// The `new(root)` helper remains for isolated tests and intentionally
+    /// The `try_new(root)` helper remains for isolated stores and intentionally
     /// does not participate in Gateway's durable-store bootstrap.
-    pub(crate) fn from_storage_endpoint(endpoint: &storage::StorageEndpoint) -> Self {
-        assert_eq!(
-            endpoint.backend,
-            storage::StorageBackendKind::Sqlite,
-            "surface messages require a sqlite endpoint"
-        );
+    pub(crate) fn from_storage_endpoint(
+        endpoint: &storage::StorageEndpoint,
+    ) -> Result<Self, String> {
+        if endpoint.backend != storage::StorageBackendKind::Sqlite {
+            return Err("surface messages require a sqlite endpoint".to_string());
+        }
         let database_path = endpoint.as_handle().path;
         let root = database_path
             .parent()
             .map(Path::to_path_buf)
-            .expect("surface storage endpoint must name a database file");
-        let executor = storage::SqliteExecutor::for_endpoint(endpoint).unwrap_or_else(|error| {
-            tracing::error!(error = %error, "surface durable executor creation failed");
-            eprintln!("surface durable executor creation failed: {error}");
-            std::process::abort();
-        });
+            .unwrap_or_else(|| PathBuf::from("."));
+        let executor =
+            storage::SqliteExecutor::for_endpoint(endpoint).map_err(|error| error.to_string())?;
         Self::open_with_executor(root, executor)
     }
 
-    fn open_at(root: PathBuf, database_path: PathBuf) -> Self {
+    pub(crate) fn in_memory(identity: impl Into<String>) -> Result<Self, String> {
+        let identity = identity.into();
+        let executor = storage::SqliteExecutor::in_memory(identity.clone())
+            .map_err(|error| error.to_string())?;
+        Self::open_with_executor(PathBuf::from(format!("memory://{identity}")), executor)
+    }
+
+    fn open_at(root: PathBuf, database_path: PathBuf) -> Result<Self, String> {
         let handle = storage::StorageHandle::sqlite(
             "surface_messages",
             database_path,
             "surface",
             "surface_message_executor",
         );
-        let executor = storage::SqliteExecutor::for_handle(&handle).unwrap_or_else(|error| {
-            tracing::error!(error = %error, "surface durable executor creation failed");
-            eprintln!("surface durable executor creation failed: {error}");
-            std::process::abort();
-        });
+        let executor =
+            storage::SqliteExecutor::for_handle(&handle).map_err(|error| error.to_string())?;
         Self::open_with_executor(root, executor)
     }
 
-    fn open_with_executor(root: PathBuf, executor: storage::SqliteExecutor) -> Self {
-        let connection = executor.checkout().unwrap_or_else(|error| {
-            tracing::error!(path = %root.display(), error = %error, "surface durable store open failed");
-            eprintln!("surface durable store open failed: {error}");
-            std::process::abort();
-        });
-        if let Err(error) = initialize_database(&connection) {
-            tracing::error!(path = %root.display(), error = %error, "surface durable store schema initialization failed");
-            eprintln!("surface durable store schema initialization failed: {error}");
-            std::process::abort();
-        }
+    fn open_with_executor(
+        root: PathBuf,
+        executor: storage::SqliteExecutor,
+    ) -> Result<Self, String> {
+        let connection = executor.checkout().map_err(|error| error.to_string())?;
+        initialize_database(&connection)?;
         drop(connection);
         let store = Self { root, executor };
-        if let Err(error) = store.import_legacy_jsonl_once() {
-            tracing::error!(path = %store.root.display(), error = %error, "surface JSONL import failed");
-            eprintln!("surface JSONL import failed: {error}");
-            std::process::abort();
-        }
-        if let Err(error) = store.reconcile_after_restart() {
-            tracing::error!(path = %store.root.display(), error = %error, "surface durable recovery failed");
-            eprintln!("surface durable recovery failed: {error}");
-            std::process::abort();
-        }
-        store
+        store.import_legacy_jsonl_once()?;
+        store.reconcile_after_restart()?;
+        Ok(store)
     }
 
     pub(crate) fn default_root(config_home: &Path) -> PathBuf {
@@ -2477,6 +2470,21 @@ fn outbox_failure_reason(record: &SurfaceOutboxRecord) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn surface_message_store_rejects_non_sqlite_storage_endpoint() {
+        let endpoint = storage::StorageEndpoint::postgres(
+            storage::StorageDomainId::SurfaceMessages,
+            storage::StorageScope::Global,
+            "surface",
+            "surface_messages_postgres_test",
+        );
+
+        let error = SqliteSurfaceMessageStore::from_storage_endpoint(&endpoint)
+            .expect_err("non-SQLite endpoint must fail closed");
+
+        assert!(error.contains("require a sqlite endpoint"));
+    }
 
     fn trigger_event(id: &str) -> ManagedAgentTriggerEvent {
         ManagedAgentTriggerEvent {

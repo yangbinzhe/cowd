@@ -3,8 +3,10 @@ use super::*;
 pub(in crate::api_routes) fn execution_graph_summary(events: &[RuntimeEvent]) -> Value {
     let mut graph_events = std::collections::BTreeMap::<String, &RuntimeEvent>::new();
     let mut latest = None;
-    for event in events.iter().filter(|event| agent_graph(event).is_some()) {
-        let graph = agent_graph(event).expect("filtered agent graph");
+    for event in events {
+        let Some(graph) = agent_graph(event) else {
+            continue;
+        };
         let graph_id = graph_identity(graph, event);
         graph_events.insert(graph_id, event);
         latest = Some(event);

@@ -382,27 +382,23 @@ fn build_memory_config(
         return None;
     }
     let config_home = runtime::cowd_dirs::config_home_dir();
-    let registry = if let Some(store_path) = src.store_path.as_ref().map(|path| expand_home(path)) {
-        if let Err(error) = std::fs::create_dir_all(&store_path) {
-            tracing::warn!(?store_path, "failed to create memory store dir: {error}");
-        }
-        storage::StorageRegistry::default_for_config_home(&config_home)
-            .with_memory_root(&store_path)
-            .expect("memory storage override must not collide with the core inventory")
-    } else {
-        storage::StorageRegistry::default_for_config_home(&config_home)
-    };
+    let (sqlite_path, blob_dir) =
+        if let Some(store_path) = src.store_path.as_ref().map(|path| expand_home(path)) {
+            if let Err(error) = std::fs::create_dir_all(&store_path) {
+                tracing::warn!(?store_path, "failed to create memory store dir: {error}");
+            }
+            (store_path.join("memory.db"), store_path.join("blobs"))
+        } else {
+            let layout = storage::StorageLayout::default_for_config_home(&config_home);
+            let sqlite_path = layout
+                .sqlite_path("memory")
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| layout.root.join("memory.sqlite"));
+            (sqlite_path, layout.blobs)
+        };
     let mut mc = memory::MemoryConfig::default();
-    let memory_handle = registry
-        .endpoint(&storage::StorageDomainId::Memory)
-        .expect("memory endpoint is part of the default Cowd storage inventory")
-        .as_handle();
-    let blob_handle = registry
-        .endpoint(&storage::StorageDomainId::Blobs)
-        .expect("blob endpoint is part of the default Cowd storage inventory")
-        .as_handle();
-    mc.store.sqlite_path = memory_handle.path;
-    mc.store.blob_dir = blob_handle.path;
+    mc.store.sqlite_path = sqlite_path;
+    mc.store.blob_dir = blob_dir;
     if let Some(parent) = mc.store.sqlite_path.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             tracing::warn!(?parent, "failed to create memory sqlite dir: {error}");

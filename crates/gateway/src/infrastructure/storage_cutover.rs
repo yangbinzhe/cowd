@@ -626,10 +626,7 @@ fn manifest_digest(manifest: &CutoverManifest) -> Result<String, String> {
 }
 
 fn workspace_key(workspace_root: &Path) -> String {
-    match storage::StorageScope::workspace_for_root(workspace_root) {
-        storage::StorageScope::Workspace { key } => key,
-        _ => unreachable!("workspace_for_root returns workspace scope"),
-    }
+    storage::StorageScope::workspace_key_for_root(workspace_root)
 }
 
 fn cutover_root(config_home: &Path) -> PathBuf {

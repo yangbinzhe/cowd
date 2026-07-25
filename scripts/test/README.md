@@ -12,7 +12,10 @@
 scripts/ci/clippy-safety.sh
 ```
 
-该门禁将 Rust warning、未处理 `unwrap/expect`、显式 panic、未完成路径、debug 宏和进程退出视为错误。`clippy::all` 与 `clippy::pedantic` 仍应定期运行：
+该门禁检查工作区所有生产 `lib/bin` target，并将 Rust warning、未处理
+`unwrap/expect`、显式 panic、未完成路径、debug 宏和进程退出视为错误。测试 target
+中的断言式 panic 由全量回归负责，不混入生产崩溃门禁。`clippy::all` 与
+`clippy::pedantic` 仍应定期运行：
 
 ```bash
 scripts/ci/clippy-style-report.sh

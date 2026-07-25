@@ -5834,6 +5834,13 @@ async fn execute_governed_runtime_tool_batch(
                 let invocation = prepared_invocations.get(&calls[*index].id)?;
                 (invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read)
                     .then(|| {
+                        let outcome = results[*index].clone().unwrap_or_else(|| {
+                            failed_governed_tool_outcome(
+                                &calls[*index],
+                                plan.tasks[*index].safety_category,
+                                "tool scheduler did not produce a wave result".to_string(),
+                            )
+                        });
                         (
                             bound_runtime_tool_request(
                                 &calls[*index],
@@ -5845,7 +5852,7 @@ async fn execute_governed_runtime_tool_batch(
                                 ticket,
                                 tool_authorizations.get(&calls[*index].id).cloned(),
                             ),
-                            results[*index].clone().expect("wave result must exist"),
+                            outcome,
                         )
                     })
             })

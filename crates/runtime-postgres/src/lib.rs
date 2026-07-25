@@ -698,9 +698,10 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                   FROM candidates
                  WHERE outbox.terminal_id=candidates.terminal_id
                 RETURNING outbox.terminal_id, outbox.message_id, outbox.session_id,
-                    outbox.commit_cursor, outbox.payload_ref, outbox.status, outbox.attempts,
-                    outbox.next_attempt_at, outbox.claim_owner, outbox.claim_expires_at,
-                    outbox.failure_class, outbox.last_error, outbox.materialized_at, outbox.revision
+                    outbox.commit_cursor, outbox.payload_ref, outbox.execution_id, outbox.turn_id,
+                    outbox.status, outbox.attempts, outbox.next_attempt_at, outbox.claim_owner,
+                    outbox.claim_expires_at, outbox.failure_class, outbox.last_error,
+                    outbox.materialized_at, outbox.revision
              ) SELECT * FROM claimed ORDER BY commit_cursor, terminal_id",
             &[
                 &to_i64(now_ms, "now_ms")?,
@@ -897,9 +898,9 @@ impl PostgresRuntimeEventStore {
              materialized_at=CASE WHEN $1='materialized' THEN $5 ELSE materialized_at END,
              revision=revision+1 WHERE terminal_id=$6 AND status='claimed'
              AND claim_owner=$7 AND revision=$8
-             RETURNING terminal_id, message_id, session_id, commit_cursor, payload_ref, status,
-                 attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
-                 last_error, materialized_at, revision",
+             RETURNING terminal_id, message_id, session_id, commit_cursor, payload_ref,
+                 execution_id, turn_id, status, attempts, next_attempt_at, claim_owner,
+                 claim_expires_at, failure_class, last_error, materialized_at, revision",
             &[
                 &status,
                 &retry_at_ms

@@ -740,13 +740,17 @@ pub struct DestructivePatternDetector {
 impl DestructivePatternDetector {
     /// Create a new detector with all built-in patterns
     pub fn new(config_dir: PathBuf) -> Self {
-        let registry = storage::StorageRegistry::default_for_config_home(&config_dir);
-        let approval_policy = FileApprovalPolicyArtifact::from_storage_endpoint(
-            registry
-                .endpoint(&storage::StorageDomainId::AlwaysApproved)
-                .expect("always-approved endpoint is part of the default Cowd storage inventory"),
-        )
-        .expect("always-approved endpoint must use the file_json backend");
+        let layout = storage::StorageLayout::default_for_config_home(&config_dir);
+        let always_approved_path = layout
+            .file_path("always_approved")
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                config_dir
+                    .join("storage")
+                    .join("files")
+                    .join("always_approved.json")
+            });
+        let approval_policy = FileApprovalPolicyArtifact::new(always_approved_path);
         let patterns = Self::build_patterns();
         Self {
             patterns,

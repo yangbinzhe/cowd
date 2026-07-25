@@ -161,7 +161,12 @@ fn resolved_scope(
                     observed: scopes.len(),
                 });
             }
-            Ok(scopes.into_iter().next().expect("one workspace scope"))
+            scopes.into_iter().next().ok_or_else(|| {
+                AppStorageResolutionError::WorkspaceScopeUnavailable {
+                    app_id: app_id.to_string(),
+                    observed: 0,
+                }
+            })
         }
     }
 }
@@ -227,7 +232,14 @@ fn provision_requirement(
         capabilities.push(match backend {
             storage::StorageBackendKind::Sqlite => "sqlite".to_string(),
             storage::StorageBackendKind::Postgres => "postgres".to_string(),
-            _ => unreachable!("relational requirement resolved to a non-relational backend"),
+            _ => {
+                return Err(AppStorageResolutionError::BackendMismatchAtRequirement {
+                    app_id: app_id.to_string(),
+                    domain: requirement.domain.clone(),
+                    requested: requirement.backend.clone(),
+                    selected: backend,
+                })
+            }
         });
         if backend == storage::StorageBackendKind::Postgres {
             capabilities.push("connection_pool".to_string());
@@ -275,7 +287,14 @@ fn provision_requirement(
                     .path
                     .parent()
                     .unwrap_or_else(|| std::path::Path::new(".")),
-                _ => unreachable!("relational backends handled above"),
+                _ => {
+                    return Err(AppStorageResolutionError::BackendMismatchAtRequirement {
+                        app_id: app_id.to_string(),
+                        domain: requirement.domain.clone(),
+                        requested: requirement.backend.clone(),
+                        selected: backend,
+                    })
+                }
             };
             std::fs::create_dir_all(directory)?;
             Ok(AppStorageLease::artifact(endpoint, provision))

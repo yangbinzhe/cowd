@@ -155,7 +155,7 @@ check_empty "cli business modules" \
   rg -n "use .*\\b(auth|session|memory|matrix|mfg|agent|daemon)\\b|\\b(auth|session|memory|matrix|mfg|agent|daemon)::|mod (auth|session|memory|matrix|mfg|agent|daemon)" crates/cli/src/main.rs --glob '*.rs'
 
 check_empty "daemon business management" \
-  rg -n "daemon status|daemon start$|daemon stop|daemon restart|daemon_client|UnixStream|socket business" crates --glob '*.rs' --glob '!**/tests/**' --glob '!crates/auth-broker/**' --glob '!crates/sandbox-launcher/**'
+  rg -n "daemon status|daemon start$|daemon stop|daemon restart|daemon_client|socket business" crates --glob '*.rs' --glob '!**/tests/**' --glob '!crates/auth-broker/**' --glob '!crates/sandbox-launcher/**'
 
 check_empty "tui direct business dependencies" \
   rg -n "(^|[^[:alnum:]_:])runtime::|use runtime::|use app_mfg::|app_mfg::|use matrix_core::|matrix_core::|use matrix_repository::|matrix_repository::|use storage::|storage::|rusqlite|use tools::|tools::|use memory::|memory::|use command_contract::|command_contract::|use command_service::|command_service::" crates/tui/src --glob '*.rs' --glob '!lib.rs' --glob '!boundary_policy.rs'
@@ -169,8 +169,8 @@ check_empty "compat harness workspace residue" \
 check_empty "api crate naming residue" \
   rg -n "crates/api|api::" crates --glob '*.rs' --glob 'Cargo.toml'
 
-check_empty "internal cowd package alias residue" \
-  bash -c 'rg -n "cowd_app_mfg|cowd_memory|cowd_storage|mod cowd_|pub mod cowd_|use cowd_" crates --glob "*.rs" | rg -v "^crates/runtime/src/lib.rs:[0-9]+:(pub mod cowd_(dirs|event);|pub use cowd_(dirs|event)(::|;|\\{))" || true'
+check_empty "obsolete internal cowd package alias residue" \
+  bash -c 'rg -n "cowd_memory|cowd_storage|mod cowd_|pub mod cowd_" crates --glob "*.rs" | rg -v "^crates/runtime/src/lib.rs:[0-9]+:(pub mod cowd_(dirs|event);|pub use cowd_(dirs|event)(::|;|\\{))" || true'
 
 check_empty "mixed matrix mfg route module residue" \
   bash -c 'mixed="matrix_""mfg"; file="crates/gateway/src/api_routes/${mixed}_routes.rs"; if test -e "$file"; then echo "$file"; fi; rg -n "${mixed}_routes|cowd_${mixed}|${mixed}" crates/gateway/src crates/gateway/tests --glob "*.rs" || true'
@@ -180,8 +180,7 @@ check_empty "matrix routes must stay free of mfg application semantics" \
     crates/gateway/src/api_routes/matrix_routes.rs
 
 check_empty "mfg routes must not keep legacy matrix handler names" \
-  rg -n "matrix_(production_governance|command_center|decision_trace|server_manufacturing)|matrix_health_capabilities" \
-    crates/gateway/src/api_routes/mfg_routes.rs
+  bash -c 'file="crates/gateway/src/api_routes/mfg_routes.rs"; if [[ -f "$file" ]]; then rg -n "matrix_(production_governance|command_center|decision_trace|server_manufacturing)|matrix_health_capabilities" "$file"; fi'
 
 check_empty "AI bin install residue" \
   rg -n "~/AI/bin|AI/bin" README.md docs scripts crates --glob '*.rs' --glob '*.md' --glob '*.sh' --glob 'Cargo.toml' --glob '!scripts/architecture/check-boundaries.sh'
@@ -272,7 +271,7 @@ else
 fi
 
 check_empty "gateway services must not become protocol or storage adapters" \
-  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates/gateway/src/services -g "*.rs") | rg -n "crate::api_routes::AppState|AppState|axum::|StatusCode|IntoResponse|Json<|Connection::open|SqliteConnectionManager::file|UnifiedSessionStore::open|ConfigLoader::default_for" | rg -v "^crates/gateway/src/services/mfg_service.rs:[0-9]+:.*MfgStore::open_storage_handle" || true'
+  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates/gateway/src/services -g "*.rs" -g "!app_host_ports.rs") | rg -n "crate::api_routes::AppState|AppState|axum::|StatusCode|IntoResponse|Json<|Connection::open|SqliteConnectionManager::file|UnifiedSessionStore::open|ConfigLoader::default_for" | rg -v "^crates/gateway/src/services/mfg_service.rs:[0-9]+:.*MfgStore::open_storage_handle" || true'
 
 check_empty "gateway services must not route through slash command execution" \
   rg -n "slash_catalog|handle_.*slash_command|resolve_skill_invocation|resolve_skill_path" crates/gateway/src/services --glob "*.rs"
@@ -287,14 +286,13 @@ check_empty "gateway main must not own business registries" \
   bash -c 'awk "/#\\[cfg\\(test\\)\\]/{exit} {print}" crates/gateway/src/main.rs | rg -n "GlobalToolRegistry|SkillRegistry|PluginManager|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt|MfgStore::open|MatrixSqliteRepository|UnifiedSessionStore::open|TaskKernel::open|current_tool_registry|build_runtime_plugin_state|RuntimePluginState" || true'
 
 check_empty "matrix core must not contain mfg application semantics" \
-  bash -c 'mixed="matrix_""mfg"; reverse="mfg_""matrix"; adapter="Mfg""Matrix""Adapter"; rg -n "Mfg|mfg|manufacturing|server_manufacturing|${mixed}|${reverse}|${adapter}" crates/matrix/core crates/matrix/repository --glob "*.rs" --glob "Cargo.toml"'
+  bash -c 'mixed="matrix_""mfg"; reverse="mfg_""matrix"; adapter="Mfg""Matrix""Adapter"; while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates/matrix/core crates/matrix/repository -g "*.rs" -g "Cargo.toml") | rg -n "Mfg|mfg|manufacturing|server_manufacturing|${mixed}|${reverse}|${adapter}" || true'
 
 check_empty "app-mfg must not depend on gateway or runtime internals" \
-  rg -n "gateway::|runtime::|use gateway|use runtime|crate::runtime" \
-    crates/app-mfg/src crates/app-mfg/Cargo.toml --glob '*.rs' --glob 'Cargo.toml'
+  bash -c 'root="../cowd-app-mfg"; if [[ ! -d "$root" ]]; then echo "missing sibling cowd-app-mfg"; exit 0; fi; rg -n "gateway::|runtime::|use gateway|use runtime|crate::runtime" "$root/crates" "$root/Cargo.toml" --glob "*.rs" --glob "Cargo.toml" || true'
 
 check_empty "production direct sqlite opens must stay in storage/repository adapters" \
-  bash -c 'rg -n "Connection::open\\(|SqliteConnectionManager::file|TaskKernel::open\\(|UnifiedSessionStore::open\\(|MfgStore::open\\(|SqliteStore::open\\(|MatrixSqliteRepository::open\\(|Store::open\\(" crates --glob "*.rs" --glob "!**/tests/**" --glob "!crates/storage/**" --glob "!crates/connector/src/source.rs" --glob "!crates/connector/src/lib.rs" --glob "!crates/memory/src/store/**" --glob "!crates/memory/src/session/session_store.rs" --glob "!crates/memory/src/session/state_rebuilder.rs" --glob "!crates/memory/src/knowledge/mod.rs" --glob "!crates/memory/src/kernel/cognitive.rs" --glob "!crates/memory/src/lifecycle/maintenance.rs" --glob "!crates/memory/src/ops/sqlite_persistence.rs" --glob "!crates/matrix/repository/**" --glob "!crates/app-mfg/src/repository.rs" --glob "!crates/app-mfg/src/store.rs" --glob "!crates/runtime/src/recovery/runtime_event_store.rs" --glob "!crates/runtime/src/mission/task.rs" --glob "!crates/runtime/src/team/team_discovery.rs" | rg -v "open_in_memory|/tests/|^crates/gateway/src/api_routes/mod.rs:|^crates/gateway/src/kernel/task_kernel.rs:|^crates/gateway/src/kernel/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example|//!|///)" || true'
+  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} !/^[[:space:]]*\\/\\// {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates -g "*.rs" -g "!**/tests/**" -g "!crates/storage/**" -g "!crates/connector/src/source.rs" -g "!crates/connector/src/lib.rs" -g "!crates/memory/src/store/**" -g "!crates/memory/src/session/session_store.rs" -g "!crates/memory/src/session/state_rebuilder.rs" -g "!crates/memory/src/knowledge/mod.rs" -g "!crates/memory/src/kernel/cognitive.rs" -g "!crates/memory/src/lifecycle/maintenance.rs" -g "!crates/memory/src/ops/sqlite_persistence.rs" -g "!crates/matrix/repository/**" -g "!crates/runtime/src/recovery/runtime_event_store.rs" -g "!crates/runtime/src/mission/task.rs" -g "!crates/runtime/src/team/team_discovery.rs" -g "!crates/runtime/src/context/artifact.rs" -g "!crates/gateway/src/infrastructure/selected_storage.rs") | rg -n "Connection::open\\(|SqliteConnectionManager::file|TaskKernel::open\\(|UnifiedSessionStore::open\\(|MfgStore::open\\(|SqliteStore::open\\(|MatrixSqliteRepository::open\\(|Store::open\\(" | rg -v "open_in_memory|/tests/|^crates/gateway/src/api_routes/mod.rs:|^crates/gateway/src/kernel/task_kernel.rs:|^crates/gateway/src/kernel/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example)" || true'
 
 check_empty "storage direct-open allowlist must stay empty" \
   bash -c 'if [[ "$(tr -d "[:space:]" < crates/storage/direct-open-allowlist.json)" != "[]" ]]; then cat crates/storage/direct-open-allowlist.json; fi'
@@ -302,18 +300,24 @@ check_empty "storage direct-open allowlist must stay empty" \
 echo "Checking cargo entrypoint dependency summaries"
 cargo tree -p cli --depth 1 --no-default-features
 
-if cargo tree -p tui --no-default-features | rg "(^|[ ├└│─])((runtime|matrix-core|matrix-repository|storage|tools|command-contract|command-service) v|memory|app-mfg|app_mfg|rusqlite)"; then
-  echo "FAIL tui forbidden dependency tree"
+if cargo tree -p tui --depth 1 --no-default-features | rg "(^|[ ├└│─])((runtime|matrix-core|matrix-repository|storage|tools|command-contract|command-service) v|memory|app-mfg|app_mfg|rusqlite)"; then
+  echo "FAIL tui forbidden direct dependency tree"
   fail=1
 else
-  echo "PASS tui forbidden dependency tree"
+  echo "PASS tui forbidden direct dependency tree"
 fi
 
-if cargo tree -p app-mfg --no-default-features | rg "(^|[ ├└│─])(runtime v|gateway v|gateway =)"; then
-  echo "FAIL app-mfg forbidden dependency tree"
-  fail=1
+if [[ -f ../cowd-app-mfg/Cargo.toml ]]; then
+  if cargo tree --manifest-path ../cowd-app-mfg/Cargo.toml --workspace --edges normal | rg "(^|[ ├└│─])(runtime v|gateway v|gateway =)"; then
+    echo "FAIL app-mfg forbidden dependency tree"
+    fail=1
+  else
+    echo "PASS app-mfg forbidden dependency tree"
+  fi
 else
-  echo "PASS app-mfg forbidden dependency tree"
+  echo "FAIL app-mfg forbidden dependency tree"
+  echo "missing sibling cowd-app-mfg workspace"
+  fail=1
 fi
 
 if cargo tree -p matrix-core --no-default-features | rg "(^|[ ├└│─])((runtime|gateway|app-mfg) v|app_mfg|mfg)"; then

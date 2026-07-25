@@ -212,13 +212,23 @@ impl std::fmt::Debug for ArtifactStore {
 
 impl ArtifactStore {
     #[must_use]
-    pub fn sqlite(blob_root: impl Into<PathBuf>, config: ArtifactStoreConfig) -> Self {
+    pub fn sqlite_default(blob_root: impl Into<PathBuf>) -> Self {
+        let blob_root = blob_root.into();
+        let repository = Arc::new(SqliteArtifactRepository::new(
+            blob_root.join("artifact-catalog.sqlite3"),
+        ));
+        Self::from_validated(blob_root, repository, ArtifactStoreConfig::default())
+    }
+
+    pub fn sqlite(
+        blob_root: impl Into<PathBuf>,
+        config: ArtifactStoreConfig,
+    ) -> Result<Self, ArtifactError> {
         let blob_root = blob_root.into();
         let repository = Arc::new(SqliteArtifactRepository::new(
             blob_root.join("artifact-catalog.sqlite3"),
         ));
         Self::new(blob_root, repository, config)
-            .expect("default artifact configuration must remain valid")
     }
 
     pub fn new(
@@ -228,14 +238,22 @@ impl ArtifactStore {
     ) -> Result<Self, ArtifactError> {
         let blob_root = blob_root.into();
         let config = config.validate()?;
-        Ok(Self {
+        Ok(Self::from_validated(blob_root, repository, config))
+    }
+
+    fn from_validated(
+        blob_root: PathBuf,
+        repository: Arc<dyn ArtifactMetadataRepository>,
+        config: ArtifactStoreConfig,
+    ) -> Self {
+        Self {
             inner: Arc::new(ArtifactStoreInner {
                 staging_root: blob_root.join("staging"),
                 blob_root,
                 repository,
                 config,
             }),
-        })
+        }
     }
 
     #[must_use]
@@ -794,11 +812,10 @@ impl SqliteArtifactRepository {
                 .map_err(|error| error.to_string())?;
             *guard = Some(connection);
         }
-        operation(
-            guard
-                .as_ref()
-                .expect("artifact SQLite connection was initialized"),
-        )
+        let connection = guard
+            .as_ref()
+            .ok_or_else(|| "artifact SQLite connection was not initialized".to_string())?;
+        operation(connection)
     }
 }
 
@@ -1125,7 +1142,7 @@ mod tests {
             gc_low_water_bytes: 3_000,
             orphan_grace_ms: 0,
         };
-        let store = ArtifactStore::sqlite(temporary.path(), config);
+        let store = ArtifactStore::sqlite(temporary.path(), config).expect("artifact store");
         let descriptor = |scope: &str| ArtifactWriteDescriptor {
             media_type: "application/octet-stream".to_string(),
             visibility_scope: scope.to_string(),
@@ -1159,7 +1176,8 @@ mod tests {
     #[tokio::test]
     async fn duplicate_content_deduplicates_physical_bytes_and_abort_is_invisible() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default());
+        let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default())
+            .expect("artifact store");
         let descriptor = ArtifactWriteDescriptor {
             media_type: "text/plain".to_string(),
             visibility_scope: "session:s1".to_string(),
@@ -1186,7 +1204,8 @@ mod tests {
     #[tokio::test]
     async fn dropping_an_unfinished_writer_removes_staging_bytes() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default());
+        let store = ArtifactStore::sqlite(temporary.path(), ArtifactStoreConfig::default())
+            .expect("artifact store");
         let staging_root = temporary.path().join("staging");
         let mut writer = store
             .begin(ArtifactWriteDescriptor {
@@ -1219,7 +1238,8 @@ mod tests {
                 gc_low_water_bytes: 200 * 1024 * 1024,
                 orphan_grace_ms: 0,
             },
-        );
+        )
+        .expect("artifact store");
         let mut writer = store
             .begin(ArtifactWriteDescriptor {
                 media_type: "application/octet-stream".to_string(),
@@ -1262,7 +1282,8 @@ mod tests {
                 gc_low_water_bytes: 0,
                 orphan_grace_ms: 0,
             },
-        );
+        )
+        .expect("artifact store");
         let descriptor = ArtifactWriteDescriptor {
             media_type: "application/octet-stream".to_string(),
             visibility_scope: "session:gc".to_string(),
@@ -1317,7 +1338,8 @@ mod tests {
                 gc_low_water_bytes: 2 * 1024 * 1024,
                 orphan_grace_ms: 0,
             },
-        );
+        )
+        .expect("artifact store");
         let payload = vec![0x7b; 1024 * 1024];
         let artifact = store
             .write_bytes(

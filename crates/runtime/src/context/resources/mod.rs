@@ -11,7 +11,7 @@ use harness_contract::context::{ArtifactRef, ArtifactWriteDescriptor};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{cowd_dirs, ArtifactStore, ArtifactStoreConfig};
+use crate::{cowd_dirs, ArtifactStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -312,10 +312,7 @@ impl ResourceStore {
             .unwrap_or_else(|_| config_home.join("storage").join("blobs"));
         Self::from_artifact_store(
             config_home,
-            Arc::new(ArtifactStore::sqlite(
-                blob_root,
-                ArtifactStoreConfig::default(),
-            )),
+            Arc::new(ArtifactStore::sqlite_default(blob_root)),
             capabilities,
         )
     }

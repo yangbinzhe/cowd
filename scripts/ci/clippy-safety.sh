@@ -7,7 +7,10 @@ cd "$ROOT"
 # `clippy::all` and `clippy::pedantic` evolve with the compiler and are tracked
 # separately as advisory hygiene. This gate only blocks release on diagnostics
 # that can hide a production crash, unfinished path, debug leak, or process exit.
-exec cargo clippy --workspace --all-targets -- \
+# Test targets intentionally use assertion-style panics and are covered by the
+# full regression lane; applying production panic policy to them makes the gate
+# report fixture style instead of executable safety.
+exec cargo clippy --workspace --lib --bins -- \
   -D warnings \
   -A clippy::all \
   -A clippy::pedantic \

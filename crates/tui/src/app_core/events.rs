@@ -113,11 +113,19 @@ impl CowdEventReceiver {
             self.pending_primary.as_ref().map(|event| event.sequence),
             reliable.front().map(|event| event.sequence),
         ) {
-            (Some(primary), Some(side)) if side < primary => {
-                Ok(reliable.pop_front().expect("front exists").event)
-            }
-            (Some(_), _) => Ok(self.pending_primary.take().expect("primary exists").event),
-            (None, Some(_)) => Ok(reliable.pop_front().expect("front exists").event),
+            (Some(primary), Some(side)) if side < primary => reliable
+                .pop_front()
+                .map(|event| event.event)
+                .ok_or(mpsc::error::TryRecvError::Empty),
+            (Some(_), _) => self
+                .pending_primary
+                .take()
+                .map(|event| event.event)
+                .ok_or(mpsc::error::TryRecvError::Empty),
+            (None, Some(_)) => reliable
+                .pop_front()
+                .map(|event| event.event)
+                .ok_or(mpsc::error::TryRecvError::Empty),
             (None, None) => Err(mpsc::error::TryRecvError::Empty),
         }
     }

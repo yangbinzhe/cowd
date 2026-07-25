@@ -76,20 +76,21 @@ impl PreparedRequestCompiler {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(index) = cache.iter().position(|entry| entry.key == key) {
-            let entry = cache.remove(index).expect("cache index was found");
-            let fixed_input_tokens = entry.fixed_input_tokens;
-            cache.push_front(entry);
-            let mut stats = self
-                .stats
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            stats.cache_hits = stats.cache_hits.saturating_add(1);
-            stats.cache_entries = cache.len();
-            return PreparedRequestBasis {
-                history: history.clone(),
-                fixed_input_tokens,
-                cache_hit: true,
-            };
+            if let Some(entry) = cache.remove(index) {
+                let fixed_input_tokens = entry.fixed_input_tokens;
+                cache.push_front(entry);
+                let mut stats = self
+                    .stats
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                stats.cache_hits = stats.cache_hits.saturating_add(1);
+                stats.cache_entries = cache.len();
+                return PreparedRequestBasis {
+                    history: history.clone(),
+                    fixed_input_tokens,
+                    cache_hit: true,
+                };
+            }
         }
 
         let fixed_input_tokens = prompt

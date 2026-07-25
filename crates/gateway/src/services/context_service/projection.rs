@@ -78,7 +78,10 @@ impl ContextService {
             Err(_) => degraded.push(ContextSourceKind::Memory),
         }
 
-        dynamic_items.extend(self.resource_context_items(connector, workspace_root, &query));
+        match self.resource_context_items(connector, workspace_root, &query) {
+            Ok(items) => dynamic_items.extend(items),
+            Err(_) => degraded.push(ContextSourceKind::Workspace),
+        }
         dynamic_items.extend(extra_dynamic_items);
 
         let mut envelope = RuntimeContextBoundary::build_envelope(ContextEnvelopeRequest {
@@ -100,18 +103,17 @@ impl ContextService {
         connector: &ConnectorService,
         workspace_root: &Path,
         query: &str,
-    ) -> Vec<ContextItem> {
-        if !connector.resource_directory_initialized(workspace_root) {
-            return Vec::new();
+    ) -> connector::ResourceDirectoryResult<Vec<ContextItem>> {
+        if !connector.resource_directory_initialized(workspace_root)? {
+            return Ok(Vec::new());
         }
         let resources = if query.trim().is_empty() {
             connector.recent_resources(workspace_root, 5)
         } else {
             connector.search_resources(workspace_root, query, 5)
-        }
-        .unwrap_or_default();
+        }?;
 
-        resources.into_iter().map(resource_context_item).collect()
+        Ok(resources.into_iter().map(resource_context_item).collect())
     }
 }
 

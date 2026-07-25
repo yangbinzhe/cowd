@@ -653,9 +653,11 @@ impl Component for ChatView {
                 && self.append_patch_start.is_some()
                 && !self.cached_chat_lines.is_empty()
             {
-                let start = self.append_patch_start.take().expect("checked above");
-                self.rebuild_wrapped_appended_tail(start, usize::from(wrap_width));
-                self.incremental_rebuild_count = self.incremental_rebuild_count.saturating_add(1);
+                if let Some(start) = self.append_patch_start.take() {
+                    self.rebuild_wrapped_appended_tail(start, usize::from(wrap_width));
+                    self.incremental_rebuild_count =
+                        self.incremental_rebuild_count.saturating_add(1);
+                }
             } else if self.cached_wrap_width == wrap_width
                 && !self.dirty_patch_indices.is_empty()
                 && !self.cached_chat_lines.is_empty()

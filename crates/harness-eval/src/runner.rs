@@ -737,6 +737,20 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             );
         }
     };
+    let template_id = match harness_contract::team::TeamTemplateDefinitionId::new(
+        harness_contract::agent::DefinitionScope::Builtin,
+        "cowd/parallel-research-synthesis",
+    ) {
+        Ok(template_id) => template_id,
+        Err(error) => {
+            return mission_runtime_collaboration_failure(
+                started,
+                objective,
+                "resolve_team_template",
+                error,
+            );
+        }
+    };
     let team_plan = match runtime_services.team_runtime().plan(
         harness_contract::team::TeamInstantiationRequest {
             request_id: format!("harness-eval-request-{team_id}"),
@@ -747,11 +761,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
             strategy_binding: None,
             template_selector: harness_contract::team::TeamTemplateSelector::LatestStable {
-                template_id: harness_contract::team::TeamTemplateDefinitionId::new(
-                    harness_contract::agent::DefinitionScope::Builtin,
-                    "cowd/parallel-research-synthesis",
-                )
-                .expect("builtin Team template id"),
+                template_id,
             },
             objective: objective.to_string(),
             acceptance: vec!["summary".to_string(), "evidence".to_string()],

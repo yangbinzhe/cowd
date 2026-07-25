@@ -72,10 +72,19 @@ impl WorkspaceService {
         let session = if let Some(endpoint) = selected_session {
             endpoint
         } else {
-            fallback = storage::StorageRegistry::default_for_config_home(config_home)
+            let registry = storage::StorageRegistry::default_for_config_home(config_home);
+            fallback = registry
                 .endpoint(&storage::StorageDomainId::Session)
-                .expect("session endpoint is part of the default Cowd storage inventory")
-                .clone();
+                .cloned()
+                .unwrap_or_else(|_| {
+                    storage::StorageEndpoint::sqlite(
+                        storage::StorageDomainId::Session,
+                        storage::StorageScope::Global,
+                        registry.layout.root.join("session.sqlite"),
+                        "session",
+                        "default_session_endpoint_fallback",
+                    )
+                });
             &fallback
         };
         serde_json::json!({

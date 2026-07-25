@@ -182,7 +182,7 @@ fn resolve_account(
             }
         })?;
     let brand = platform_brand(&platform.platform_type)
-        .expect("filtered platform must have a supported brand")
+        .ok_or_else(|| "selected platform is not a supported Feishu/Lark brand".to_string())?
         .to_string();
     let app_id = string_value(&platform.extra, "app_id")
         .filter(|value| !value.trim().is_empty())

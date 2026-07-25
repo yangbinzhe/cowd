@@ -106,7 +106,7 @@ pub(crate) fn request_for_intent(
                 .to_string(),
         ));
         } else {
-            fallback_binding_identity(intent)
+            fallback_binding_identity(intent)?
         };
     let mut request = AgentBindingRequest::new(
         definition_id,
@@ -489,7 +489,7 @@ fn capability_from_name(value: String) -> Option<AgentCapability> {
 
 fn fallback_binding_identity(
     intent: &AgentTaskIntent,
-) -> (AgentDefinitionId, RevisionSelector, Vec<AgentCapability>) {
+) -> Result<(AgentDefinitionId, RevisionSelector, Vec<AgentCapability>), AgentBindingError> {
     let requires_execute = intent.allowed_tools.iter().any(|tool| {
         let lower = tool.to_ascii_lowercase();
         ["write", "edit", "patch", "bash", "shell", "test"]
@@ -520,12 +520,12 @@ fn fallback_binding_identity(
     } else {
         ("cowd/direct", vec![AgentCapability::Read])
     };
-    (
+    Ok((
         AgentDefinitionId::new(DefinitionScope::Builtin, local_id)
-            .expect("static builtin definition id is valid"),
+            .map_err(|error| AgentBindingError::InvalidRequest(error.to_string()))?,
         RevisionSelector::LatestApprovedStable,
         capabilities,
-    )
+    ))
 }
 
 #[cfg(test)]

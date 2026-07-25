@@ -1078,9 +1078,12 @@ fn live_subscription_schema() -> Value {
 
 fn live_envelope_schema() -> Value {
     let mut schema = harness_contract::live::live_envelope_json_schema();
-    let object = schema
-        .as_object_mut()
-        .expect("canonical live envelope schema must be an object");
+    let Some(object) = schema.as_object_mut() else {
+        return json!({
+            "type": "object",
+            "x-cowd-schema-error": "canonical live envelope schema is not an object",
+        });
+    };
     object.insert(
         "x-cowd-schema-hash".to_string(),
         json!(harness_contract::live::live_envelope_schema_hash()),
@@ -1088,7 +1091,7 @@ fn live_envelope_schema() -> Value {
     object.insert(
         "example".to_string(),
         serde_json::to_value(harness_contract::live::canonical_live_envelope_fixture())
-            .expect("canonical live envelope fixture must serialize"),
+            .unwrap_or(serde_json::Value::Null),
     );
     schema
 }

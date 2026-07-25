@@ -2834,7 +2834,11 @@ async fn app_json_request_with_transient_retry(
             Err(failure) => return Err(failure),
         }
     }
-    unreachable!("bounded APP request retry always returns on its final attempt")
+    Err(AppTransportFailure {
+        status: None,
+        body: None,
+        message: "Gateway APP request retry policy has no executable attempt".to_string(),
+    })
 }
 
 fn is_idempotent_app_read_method(method: &str) -> bool {
@@ -2876,14 +2880,8 @@ async fn drain_cowd_events_state(
             event: scoped,
         } = event
         {
-            if matches!(
-                scoped.as_ref(),
-                CowdEvent::SessionAuthorizationRevoked { .. }
-            ) {
-                let reason = match scoped.as_ref() {
-                    CowdEvent::SessionAuthorizationRevoked { reason, .. } => reason.clone(),
-                    _ => unreachable!("matched revoke"),
-                };
+            if let CowdEvent::SessionAuthorizationRevoked { reason, .. } = scoped.as_ref() {
+                let reason = reason.clone();
                 if session_authorities.revoke(&session_id, authority_generation) {
                     if let Some(bridge) = session_source_bridges.remove(&session_id) {
                         bridge.abort();

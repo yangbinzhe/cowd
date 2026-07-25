@@ -322,11 +322,11 @@ fn setup_memory_item(config: &runtime::RuntimeConfig) -> SetupItem {
 }
 
 fn setup_session_item(config_home: &Path) -> SetupItem {
-    let db_path = storage::StorageRegistry::default_for_config_home(config_home)
-        .endpoint(&storage::StorageDomainId::Session)
-        .expect("session endpoint is part of the default Cowd storage inventory")
-        .as_handle()
-        .path;
+    let layout = storage::StorageLayout::default_for_config_home(config_home);
+    let db_path = layout
+        .sqlite_path("session")
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| layout.root.join("session.sqlite"));
     SetupItem {
         id: "session",
         label: "Session",

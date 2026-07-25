@@ -436,10 +436,9 @@ impl ExecutionResourceManager {
                 if !blocked_by_earlier_conflict && has_capacity {
                     guard.waiters.remove(position);
                     for (kind, weight) in &demands {
-                        let state = guard
-                            .resources
-                            .get_mut(kind)
-                            .expect("validated resource demand");
+                        let Some(state) = guard.resources.get_mut(kind) else {
+                            return Err(ResourceAcquireError::RegistrationLost);
+                        };
                         observe_latency(
                             &mut state.queue_wait_ms,
                             duration_millis(started.elapsed()),

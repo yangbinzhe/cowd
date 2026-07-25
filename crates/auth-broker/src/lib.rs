@@ -161,9 +161,12 @@ impl AuthorizationCatalog {
         }
         let mut capabilities = core.capabilities.clone();
         for app in &self.apps {
-            let profile_id = app_profiles
-                .get(&app.app_id)
-                .expect("validated app selection");
+            let profile_id = app_profiles.get(&app.app_id).ok_or_else(|| {
+                AuthBrokerError::InvalidCredentialState(format!(
+                    "missing profile selection for app {}",
+                    app.app_id
+                ))
+            })?;
             let profile = app
                 .profiles
                 .iter()

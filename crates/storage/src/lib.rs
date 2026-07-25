@@ -160,12 +160,17 @@ pub enum StorageScope {
 
 impl StorageScope {
     #[must_use]
-    pub fn workspace_for_root(root: impl AsRef<Path>) -> Self {
+    pub fn workspace_key_for_root(root: impl AsRef<Path>) -> String {
         let mut hasher = Sha256::new();
         hasher.update(root.as_ref().as_os_str().as_encoded_bytes());
         let digest = format!("{:x}", hasher.finalize());
+        digest[..24].to_string()
+    }
+
+    #[must_use]
+    pub fn workspace_for_root(root: impl AsRef<Path>) -> Self {
         Self::Workspace {
-            key: digest[..24].to_string(),
+            key: Self::workspace_key_for_root(root),
         }
     }
 }
@@ -671,6 +676,10 @@ impl StorageRegistry {
                 )))
             }
         }
+        #[allow(
+            clippy::unreachable,
+            reason = "the exhaustive scope validator above rejects Global before path selection"
+        )]
         let scoped_root = match &scope {
             StorageScope::App { .. } => self.layout.root.join("apps").join(app_id),
             StorageScope::Workspace { key } => self
@@ -705,7 +714,8 @@ impl StorageRegistry {
         workspace_root: impl AsRef<Path>,
     ) -> Result<Self, StorageError> {
         let workspace_root = workspace_root.as_ref();
-        let scope = StorageScope::workspace_for_root(workspace_root);
+        let key = StorageScope::workspace_key_for_root(workspace_root);
+        let scope = StorageScope::Workspace { key: key.clone() };
         self.register_endpoint(StorageEndpoint::sqlite(
             StorageDomainId::ConnectorDirectory,
             scope.clone(),
@@ -724,9 +734,6 @@ impl StorageRegistry {
             "runtime",
             "workspace_definition_endpoint_since_0.9.565",
         ))?;
-        let StorageScope::Workspace { key } = scope else {
-            unreachable!("workspace_for_root always creates a workspace scope");
-        };
         self.register_endpoint(StorageEndpoint::sqlite(
             StorageDomainId::RuntimeEvents,
             StorageScope::Workspace { key: key.clone() },
@@ -1368,6 +1375,12 @@ mod tests {
             .with_app_sqlite("mfg", "primary", "test")
             .unwrap();
         let workspace_scope = StorageScope::workspace_for_root(workspace.path());
+        assert_eq!(
+            workspace_scope,
+            StorageScope::Workspace {
+                key: StorageScope::workspace_key_for_root(workspace.path())
+            }
+        );
         let connector = registry
             .endpoint_in_scope(&StorageDomainId::ConnectorDirectory, &workspace_scope)
             .unwrap();

@@ -59,12 +59,12 @@ where
 {
     let instructions = "# Execute and Review\n\nAn implementer produces evidence-backed work; an independent reviewer verifies it before synthesis.\n";
     let execute = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute")
-        .expect("static builtin id is valid");
+        .map_err(TeamDefinitionStoreError::Contract)?;
     let direct = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/direct")
-        .expect("static builtin id is valid");
+        .map_err(TeamDefinitionStoreError::Contract)?;
     let template_id =
         TeamTemplateDefinitionId::new(DefinitionScope::Builtin, "cowd/execute-review")
-            .expect("static builtin template id is valid");
+            .map_err(TeamDefinitionStoreError::Contract)?;
     let manifest = TeamTemplateManifest {
         api_version: "cowd.team/v1".to_string(),
         template_id,
@@ -197,7 +197,7 @@ fn additional_builtin_team_manifests(
     direct: &AgentDefinitionId,
 ) -> Result<Vec<(TeamTemplateManifest, &'static str)>, TeamDefinitionStoreError> {
     let explore = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/explore")
-        .expect("static builtin id is valid");
+        .map_err(TeamDefinitionStoreError::Contract)?;
     let fixed = RoleCardinalityPolicy::Fixed { count: 1 };
     let parallel = RoleCardinalityPolicy::Adaptive {
         min: 2,

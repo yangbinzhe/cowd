@@ -79,14 +79,17 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
             StorageRegistry::default_for_config_home(&state.config_home)
                 .with_workspace(&state.workspace_root)
                 .and_then(StorageRegistry::with_surface_messages)
-                .expect("gateway storage endpoint registration must not collide")
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "gateway health storage inventory is incomplete");
+                    StorageRegistry::default_for_config_home(&state.config_home)
+                })
         },
         |selected| selected.registry.clone(),
     );
     for endpoint in state.services.app_registry.storage_endpoints() {
-        storage_registry
-            .register_endpoint(endpoint)
-            .expect("provisioned APP endpoint must remain unique in Gateway health");
+        if let Err(error) = storage_registry.register_endpoint(endpoint) {
+            tracing::error!(%error, "gateway health skipped a duplicate APP storage endpoint");
+        }
     }
     let pragma = SqlitePragmaConfig::default();
     let storage = StorageGatewaySnapshot {

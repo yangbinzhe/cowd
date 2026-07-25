@@ -614,7 +614,12 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         }
         "orchestration_options" => {
             response["evidence_plan"] =
-                serde_json::to_value(&evidence_plan).expect("evidence plan is serializable");
+                serde_json::to_value(&evidence_plan).unwrap_or_else(|error| {
+                    json!({
+                        "available": false,
+                        "error": format!("encode evidence plan: {error}"),
+                    })
+                });
             let team_template_compact: Vec<Value> = catalog
                 .templates
                 .iter()
@@ -685,9 +690,11 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     }
 
     const RESPONSE_SIZE_LIMIT: usize = 8192;
-    let serialized =
-        serde_json::to_vec(&response).expect("runtime capabilities response is serializable");
-    if serialized.len() > RESPONSE_SIZE_LIMIT {
+    let response_bytes = serde_json::to_vec(&response)
+        .map_or(RESPONSE_SIZE_LIMIT.saturating_add(1), |serialized| {
+            serialized.len()
+        });
+    if response_bytes > RESPONSE_SIZE_LIMIT {
         if let Some(tool_names) = response["available_tool_names"].as_array_mut() {
             let total = tool_names.len();
             tool_names.truncate(20);

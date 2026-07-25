@@ -34,6 +34,10 @@ impl TeamTemplateDefinitionId {
     }
 
     #[must_use]
+    #[allow(
+        clippy::unreachable,
+        reason = "construction validates the qualified scope prefix before storing the opaque id"
+    )]
     pub fn scope(&self) -> DefinitionScope {
         match self.0.split('/').next() {
             Some("builtin") => DefinitionScope::Builtin,

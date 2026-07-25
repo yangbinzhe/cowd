@@ -89,13 +89,24 @@ impl ContextService {
         workspace_root: &Path,
         reference: &str,
     ) -> serde_json::Value {
-        if !connector.resource_directory_initialized(workspace_root) {
-            return serde_json::json!({
-                "ref": reference,
-                "kind": "resource",
-                "available": false,
-                "reason": "resource directory is not initialized",
-            });
+        match connector.resource_directory_initialized(workspace_root) {
+            Ok(true) => {}
+            Ok(false) => {
+                return serde_json::json!({
+                    "ref": reference,
+                    "kind": "resource",
+                    "available": false,
+                    "reason": "resource directory is not initialized",
+                });
+            }
+            Err(error) => {
+                return serde_json::json!({
+                    "ref": reference,
+                    "kind": "resource",
+                    "available": false,
+                    "reason": format!("resource directory initialization check failed: {error}"),
+                });
+            }
         }
         match connector.get_resource(workspace_root, reference) {
             Ok(Some(resource)) => serde_json::json!({
@@ -606,10 +617,13 @@ mod tests {
             .expect("create session");
 
         let raw = "canonical durable output";
-        let artifact_store = Arc::new(runtime::ArtifactStore::sqlite(
-            tempfile::tempdir().expect("artifact tempdir").keep(),
-            runtime::ArtifactStoreConfig::default(),
-        ));
+        let artifact_store = Arc::new(
+            runtime::ArtifactStore::sqlite(
+                tempfile::tempdir().expect("artifact tempdir").keep(),
+                runtime::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        );
         let artifact = artifact_store
             .write_bytes(
                 ArtifactWriteDescriptor {

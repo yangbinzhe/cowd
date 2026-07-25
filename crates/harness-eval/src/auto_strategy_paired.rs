@@ -1745,7 +1745,23 @@ fn apply_blind_judge(
             break;
         }
     }
-    let judge = final_judge.expect("positive Judge lease must execute at least one attempt");
+    let Some(judge) = final_judge else {
+        drop(ordered);
+        for sample in samples {
+            sample.quality_bp = 0;
+            sample.judge = json!({
+                "rubric_id": rubric.rubric_id,
+                "judge_model_revision": options.judge_model,
+                "raw": Value::Null,
+                "judge_run_status": "budget_unavailable",
+                "judge_error": "blind Judge token lease had no executable attempt",
+                "observed_models": [],
+                "judge_isolation_verified": false,
+                "attempts": judge_attempts,
+            });
+        }
+        return judge_usage;
+    };
     let parsed = if judge_isolation_verified {
         final_parsed
     } else {
@@ -2168,6 +2184,9 @@ fn evaluate_samples(
         .iter()
         .filter(|task| task.mutation_fixture.is_some())
         .all(|task| {
+            let Some(mutation_fixture) = task.mutation_fixture.as_ref() else {
+                return false;
+            };
             let mutation_samples = scored
                 .iter()
                 .filter(|sample| sample.task_id == task.task_id)
@@ -2176,19 +2195,8 @@ fn evaluate_samples(
                 && mutation_samples.into_iter().all(|sample| {
                     sample.workspace_mutation_verified
                         && sample.workspace_changed_paths
-                            == vec![task
-                                .mutation_fixture
-                                .as_ref()
-                                .expect("filtered mutation fixture")
-                                .target_path
-                                .clone()]
-                        && sample.write_attempt_paths
-                            == vec![task
-                                .mutation_fixture
-                                .as_ref()
-                                .expect("filtered mutation fixture")
-                                .target_path
-                                .clone()]
+                            == vec![mutation_fixture.target_path.clone()]
+                        && sample.write_attempt_paths == vec![mutation_fixture.target_path.clone()]
                         && sample.workspace_mutation_error.is_none()
                 })
         });

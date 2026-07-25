@@ -28,11 +28,15 @@ pub(crate) struct SurfaceService {
 }
 
 impl SurfaceService {
+    #[allow(
+        clippy::expect_used,
+        reason = "the process-local baseline Surface ledger is a deterministic dependency for static Gateway service projections"
+    )]
     pub(crate) fn new() -> Self {
         Self {
             label: "surface",
             owner: "0.9.380 Surface service boundary",
-            host: Arc::new(SurfaceHost::default()),
+            host: Arc::new(SurfaceHost::baseline().expect("baseline Surface message ledger")),
         }
     }
 

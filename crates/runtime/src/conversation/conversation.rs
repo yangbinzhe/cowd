@@ -8731,23 +8731,20 @@ pub fn build_cc_memory_config_with_budget(
 
     let mem = feature_config.memory();
     let config_home = crate::cowd_dirs::config_home_dir();
-    let registry = if let Some(store_path) = mem.store_path.as_ref() {
-        storage::StorageRegistry::default_for_config_home(&config_home)
-            .with_memory_root(store_path)
-            .expect("memory storage override must not collide with the core inventory")
+    let (sqlite_path, blob_dir) = if let Some(store_path) = mem.store_path.as_ref() {
+        (store_path.join("memory.db"), store_path.join("blobs"))
     } else {
-        storage::StorageRegistry::default_for_config_home(&config_home)
+        let registry = storage::StorageRegistry::default_for_config_home(&config_home);
+        let sqlite_path = registry
+            .endpoint(&storage::StorageDomainId::Memory)
+            .map(|endpoint| endpoint.as_handle().path)
+            .unwrap_or_else(|_| registry.layout.root.join("memory.sqlite"));
+        let blob_dir = registry
+            .endpoint(&storage::StorageDomainId::Blobs)
+            .map(|endpoint| endpoint.as_handle().path)
+            .unwrap_or_else(|_| registry.layout.blobs.clone());
+        (sqlite_path, blob_dir)
     };
-    let sqlite_path = registry
-        .endpoint(&storage::StorageDomainId::Memory)
-        .expect("memory endpoint is part of the default Cowd storage inventory")
-        .as_handle()
-        .path;
-    let blob_dir = registry
-        .endpoint(&storage::StorageDomainId::Blobs)
-        .expect("blob endpoint is part of the default Cowd storage inventory")
-        .as_handle()
-        .path;
 
     CcMemoryConfig {
         store: StoreConfig {
@@ -11554,10 +11551,13 @@ mod tests {
         .without_memory()
         .with_runtime_event_store(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()))
         .with_session_store(session_store)
-        .with_artifact_store(Arc::new(crate::ArtifactStore::sqlite(
-            artifact_root.path(),
-            crate::ArtifactStoreConfig::default(),
-        )));
+        .with_artifact_store(Arc::new(
+            crate::ArtifactStore::sqlite(
+                artifact_root.path(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        ));
         runtime
             .begin_turn_strategy("test-dynamic-exposure-turn", "inspect files")
             .expect("test turn strategy admission");
@@ -11743,10 +11743,13 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory()
-        .with_artifact_store(Arc::new(crate::ArtifactStore::sqlite(
-            artifact_root.path(),
-            crate::ArtifactStoreConfig::default(),
-        )))
+        .with_artifact_store(Arc::new(
+            crate::ArtifactStore::sqlite(
+                artifact_root.path(),
+                crate::ArtifactStoreConfig::default(),
+            )
+            .expect("artifact store"),
+        ))
         .with_session_store(Arc::clone(&store));
         let raw = format!("first\n{}\nlast", "middle-evidence ".repeat(8_000));
 

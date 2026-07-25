@@ -1569,9 +1569,9 @@ fn merge_tool_projection_item(
     let Some(identity) = tool_instance_identity(&payload) else {
         return;
     };
-    let object = payload
-        .as_object_mut()
-        .expect("tool projection payloads are normalized to objects");
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
     object.insert(
         "tool_instance_id".to_string(),
         serde_json::Value::String(identity.clone()),
@@ -1586,10 +1586,13 @@ fn merge_tool_projection_item(
         tools.insert(identity, payload);
         return;
     }
-    let existing = tools
+    let Some(existing) = tools
         .get_mut(&identity)
         .and_then(serde_json::Value::as_object_mut)
-        .expect("canonical tool projection item is an object");
+    else {
+        tools.insert(identity, payload);
+        return;
+    };
     for (key, value) in object {
         if !value.is_null() {
             existing.insert(key.clone(), value.clone());
@@ -1616,9 +1619,9 @@ fn durable_tool_payloads(messages: &[SessionMessage]) -> Vec<serde_json::Value> 
                 continue;
             }
             let mut payload = block;
-            let object = payload
-                .as_object_mut()
-                .expect("durable transcript blocks are JSON objects");
+            let Some(object) = payload.as_object_mut() else {
+                continue;
+            };
             object.insert(
                 "source".to_string(),
                 serde_json::Value::String("durable_transcript".to_string()),
@@ -1656,7 +1659,7 @@ fn durable_tool_payloads(messages: &[SessionMessage]) -> Vec<serde_json::Value> 
                         object.insert("summary".to_string(), output);
                     }
                 }
-                _ => unreachable!(),
+                _ => continue,
             }
             payloads.push(payload);
         }

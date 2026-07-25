@@ -119,6 +119,10 @@ impl GatewayServices {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::expect_used,
+        reason = "SelectedStorageTopology is constructed only after the Matrix endpoint inventory has been validated"
+    )]
     fn new_with_session_manager_inner(
         runtime: Arc<RuntimeService>,
         task_kernel: Arc<TaskKernel>,
@@ -517,6 +521,10 @@ fn embedded_app_registry(
     embedded_app_registry_with_policy(config_home, host_context, &runtime::AppsConfig::default())
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "compile-time linked APP descriptors are source-locked and validated by product-app contract tests"
+)]
 fn embedded_app_registry_with_policy(
     config_home: &std::path::Path,
     host_context: cowd_app_sdk::CowdAppContext,
@@ -543,6 +551,10 @@ pub(crate) fn enabled_app_descriptors(
     cowd_product_apps::enabled_descriptors(&|app_id| apps.is_enabled(app_id))
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "compile-time linked APP descriptors are source-locked and validated by product-app contract tests"
+)]
 pub(crate) fn broker_backed_app_registry(
     config_home: impl AsRef<std::path::Path>,
     host_context: cowd_app_sdk::CowdAppContext,

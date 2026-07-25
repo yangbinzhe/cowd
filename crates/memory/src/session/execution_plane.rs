@@ -133,7 +133,7 @@ impl StorageExecutionPlane {
         self.counters
             .queue_wait_micros
             .fetch_add(elapsed_micros(queued_at), Ordering::Relaxed);
-        let admission = queued.into_admission();
+        let admission = queued.into_admission()?;
         self.counters.active.fetch_add(1, Ordering::AcqRel);
         let counters = Arc::clone(&self.counters);
 
@@ -220,11 +220,11 @@ impl QueuedGuard {
         }
     }
 
-    fn into_admission(mut self) -> OwnedSemaphorePermit {
+    fn into_admission(mut self) -> Result<OwnedSemaphorePermit> {
         self.counters.queued.fetch_sub(1, Ordering::AcqRel);
         self.admission
             .take()
-            .expect("queued admission permit must exist")
+            .ok_or_else(|| MemoryError::Store("queued admission permit is missing".to_string()))
     }
 }
 

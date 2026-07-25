@@ -507,14 +507,12 @@ impl Default for StoreConfig {
         let registry = storage::StorageRegistry::default_for_config_home(default_config_home());
         let sqlite_path = registry
             .endpoint(&storage::StorageDomainId::Memory)
-            .expect("memory endpoint is part of the default Cowd storage inventory")
-            .as_handle()
-            .path;
+            .map(|endpoint| endpoint.as_handle().path)
+            .unwrap_or_else(|_| registry.layout.root.join("memory.sqlite"));
         let blob_dir = registry
             .endpoint(&storage::StorageDomainId::Blobs)
-            .expect("blob endpoint is part of the default Cowd storage inventory")
-            .as_handle()
-            .path;
+            .map(|endpoint| endpoint.as_handle().path)
+            .unwrap_or_else(|_| registry.layout.blobs.clone());
         Self {
             sqlite_path,
             blob_dir,

@@ -14,6 +14,7 @@ use harness_contract::agent::{
     AgentExecutorPolicy, AgentModelPolicy, AgentOutputContract, CognitiveReadScope,
     CognitiveWriteMode, DefaultPointer, DefinitionScope, ReleaseAssignment,
     ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel, RevisionLifecycle,
+    ValidationError,
 };
 use sha2::{Digest, Sha256};
 
@@ -64,7 +65,7 @@ where
     L: DefinitionStorageLayout,
 {
     let mut trust = BuiltinAgentTrust::default();
-    for builtin in builtin_agents() {
+    for builtin in builtin_agents().map_err(DefinitionStoreError::Contract)? {
         let stored = store.store_revision(builtin.manifest, builtin.instructions)?;
         store.record_release_assignment(&ReleaseAssignment {
             scope: DefinitionScope::Builtin,
@@ -108,8 +109,8 @@ struct BuiltinAgent {
     instructions: &'static str,
 }
 
-fn builtin_agents() -> [BuiltinAgent; 3] {
-    [
+fn builtin_agents() -> Result<Vec<BuiltinAgent>, ValidationError> {
+    Ok(vec![
         builtin(
             "direct",
             "Direct",
@@ -117,7 +118,7 @@ fn builtin_agents() -> [BuiltinAgent; 3] {
             "# Direct\n\nResolve bounded questions using the supplied context. State uncertainty instead of inventing evidence.\n",
             vec![AgentCapability::Read],
             vec![CognitiveReadScope::Session],
-        ),
+        )?,
         builtin(
             "explore",
             "Explore",
@@ -129,7 +130,7 @@ fn builtin_agents() -> [BuiltinAgent; 3] {
                 CognitiveReadScope::Project,
                 CognitiveReadScope::WorkspaceKnowledge,
             ],
-        ),
+        )?,
         builtin(
             "execute",
             "Execute",
@@ -147,8 +148,8 @@ fn builtin_agents() -> [BuiltinAgent; 3] {
                 CognitiveReadScope::Project,
                 CognitiveReadScope::DefinitionLineage,
             ],
-        ),
-    ]
+        )?,
+    ])
 }
 
 fn builtin(
@@ -158,12 +159,11 @@ fn builtin(
     instructions: &'static str,
     capabilities: Vec<AgentCapability>,
     read_scopes: Vec<CognitiveReadScope>,
-) -> BuiltinAgent {
+) -> Result<BuiltinAgent, ValidationError> {
     let definition_id =
-        AgentDefinitionId::new(DefinitionScope::Builtin, format!("cowd/{local_id}"))
-            .expect("static builtin id is valid");
+        AgentDefinitionId::new(DefinitionScope::Builtin, format!("cowd/{local_id}"))?;
     let instructions_digest = format!("{:x}", Sha256::digest(instructions.as_bytes()));
-    BuiltinAgent {
+    Ok(BuiltinAgent {
         manifest: AgentDefinitionManifest {
             api_version: "cowd.agent/v1".to_string(),
             definition_id,
@@ -200,7 +200,7 @@ fn builtin(
             instructions_digest,
         },
         instructions,
-    }
+    })
 }
 
 #[cfg(test)]

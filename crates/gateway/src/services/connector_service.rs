@@ -101,16 +101,16 @@ impl ConnectorService {
         &self,
         workspace_root: impl AsRef<Path>,
     ) -> ResourceDirectoryResult<std::sync::Arc<dyn ResourceDirectoryRepository>> {
-        let handle = self.resource_directory_handle(workspace_root);
+        let handle = self.resource_directory_handle(workspace_root)?;
         self.resource_directory_factory.open(&handle)
     }
 
     pub(crate) fn resource_directory_handle(
         &self,
         workspace_root: impl AsRef<Path>,
-    ) -> storage::StorageHandle {
+    ) -> ResourceDirectoryResult<storage::StorageHandle> {
         if let Some(handle) = self.resource_directory_handle.as_ref() {
-            return handle.clone();
+            return Ok(handle.clone());
         }
         let workspace_root = workspace_root.as_ref();
         let scope = storage::StorageScope::workspace_for_root(workspace_root);
@@ -121,12 +121,15 @@ impl ConnectorService {
                     .endpoint_in_scope(&storage::StorageDomainId::ConnectorDirectory, &scope)
                     .map(storage::StorageEndpoint::as_handle)
             })
-            .expect("workspace connector endpoint registration must be valid")
+            .map_err(connector::ResourceDirectoryError::backend)
     }
 
-    pub(crate) fn resource_directory_initialized(&self, workspace_root: impl AsRef<Path>) -> bool {
-        let handle = self.resource_directory_handle(workspace_root);
-        self.resource_directory_factory.is_initialized(&handle)
+    pub(crate) fn resource_directory_initialized(
+        &self,
+        workspace_root: impl AsRef<Path>,
+    ) -> ResourceDirectoryResult<bool> {
+        let handle = self.resource_directory_handle(workspace_root)?;
+        Ok(self.resource_directory_factory.is_initialized(&handle))
     }
 
     pub(crate) fn list_resources(

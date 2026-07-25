@@ -272,12 +272,7 @@ impl ApprovalQueue {
         // approval would leave a release review approved without its matching
         // Runtime release assignment.
         if request.source.kind == ApprovalSourceKind::Evolution {
-            return Err(match request.source.kind {
-                ApprovalSourceKind::Evolution => {
-                    "evolution_release_requires_typed_decision_service".to_string()
-                }
-                _ => unreachable!(),
-            });
+            return Err("evolution_release_requires_typed_decision_service".to_string());
         }
         if request.source.typed_application().is_some() {
             return Err("application_review_requires_typed_decision_service".to_string());
