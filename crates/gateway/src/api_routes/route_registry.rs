@@ -75,6 +75,25 @@ impl<Request, Query, Response> TypedRouteSpec<Request, Query, Response> {
             request_schema: request_schema.map(str::to_string),
             response_schema: response_schema.to_string(),
             streaming,
+            request_required: request_schema.is_some(),
+            session_writer: SessionWriterPolicy::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionWriterPolicy {
+    None,
+    Required,
+    Conditional,
+}
+
+impl SessionWriterPolicy {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Required => "required",
+            Self::Conditional => "conditional",
         }
     }
 }
@@ -90,6 +109,20 @@ pub(crate) struct StableRouteMetadata {
     pub(crate) request_schema: Option<String>,
     pub(crate) response_schema: String,
     pub(crate) streaming: bool,
+    pub(crate) request_required: bool,
+    pub(crate) session_writer: SessionWriterPolicy,
+}
+
+impl StableRouteMetadata {
+    fn with_writer(mut self, policy: SessionWriterPolicy) -> Self {
+        self.session_writer = policy;
+        self
+    }
+
+    fn with_optional_body(mut self) -> Self {
+        self.request_required = false;
+        self
+    }
 }
 
 fn execution_projection_snapshot_spec(
@@ -108,6 +141,42 @@ fn execution_projection_command_spec(
         "/api/runtime/executions/:id/commands",
         "runtime_execution_projection_command",
     )
+}
+
+fn send_message_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new("POST", "/api/sessions/:id/messages", "session_message_send")
+}
+
+fn session_input_cancel_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new(
+        "POST",
+        "/api/sessions/:id/inputs/:input_id/cancel",
+        "session_input_cancel",
+    )
+}
+
+fn session_input_reclassify_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new(
+        "POST",
+        "/api/sessions/:id/inputs/:input_id/reclassify",
+        "session_input_reclassify",
+    )
+}
+
+fn session_cancel_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new("POST", "/api/sessions/:id/cancel", "session_turn_cancel")
+}
+
+fn session_compact_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new("POST", "/api/sessions/:id/compact", "session_compact")
+}
+
+fn slash_dispatch_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new("POST", "/api/slash/dispatch", "slash_dispatch")
+}
+
+fn auth_verify_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new("GET", "/api/auth/verify", "auth_verify")
 }
 
 fn session_execution_indices_spec() -> TypedRouteSpec<(), (), SessionExecutionIndicesProjection> {
@@ -169,11 +238,45 @@ fn live_stream_spec() -> TypedRouteSpec<(), (), LiveEnvelope> {
 pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
     vec![
         execution_projection_snapshot_spec().metadata(None, "ExecutionProjection", false),
-        execution_projection_command_spec().metadata(
-            Some("ExecutionCommandRequest"),
-            "ExecutionCommandReceipt",
-            false,
-        ),
+        execution_projection_command_spec()
+            .metadata(
+                Some("ExecutionCommandRequest"),
+                "ExecutionCommandReceipt",
+                false,
+            )
+            .with_writer(SessionWriterPolicy::Required),
+        send_message_spec()
+            .metadata(Some("SendMessageRequest"), "SendMessageReceipt", false)
+            .with_writer(SessionWriterPolicy::Required),
+        session_input_cancel_spec()
+            .metadata(
+                Some("SessionInputCancelRequest"),
+                "SessionInputMutationReceipt",
+                false,
+            )
+            .with_writer(SessionWriterPolicy::Required),
+        session_input_reclassify_spec()
+            .metadata(
+                Some("SessionInputReclassifyRequest"),
+                "SessionInputMutationReceipt",
+                false,
+            )
+            .with_writer(SessionWriterPolicy::Required),
+        session_cancel_spec()
+            .metadata(
+                Some("CancelSessionTurnRequest"),
+                "CancelSessionTurnReceipt",
+                false,
+            )
+            .with_writer(SessionWriterPolicy::Required),
+        session_compact_spec()
+            .metadata(Some("Empty"), "ContextCompactionResult", false)
+            .with_optional_body()
+            .with_writer(SessionWriterPolicy::Required),
+        slash_dispatch_spec()
+            .metadata(Some("SlashDispatchRequest"), "SlashDispatchReceipt", false)
+            .with_writer(SessionWriterPolicy::Conditional),
+        auth_verify_spec().metadata(None, "AuthVerifyResponse", false),
         session_execution_indices_spec().metadata(None, "SessionExecutionIndicesProjection", false),
         session_execution_index_spec().metadata(None, "SessionExecutionIndexProjection", false),
         session_evidence_spec().metadata(None, "SessionEvidenceProjection", false),
@@ -214,31 +317,56 @@ pub(super) fn register_execution_projection_routes(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
     fn typed_specs_cover_projection_and_live_contracts() {
         let specs = typed_route_metadata();
-        assert_eq!(specs.len(), 10);
-        assert_eq!(specs[0].operation_id, "runtime_execution_projection_get");
-        assert_eq!(specs[0].response_schema, "ExecutionProjection");
+        let operation_ids = specs
+            .iter()
+            .map(|spec| spec.operation_id.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(operation_ids.len(), specs.len());
+        let spec = |operation_id: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.operation_id == operation_id)
+                .unwrap_or_else(|| panic!("missing typed route metadata for {operation_id}"))
+        };
+
         assert_eq!(
-            specs[1].request_schema,
+            spec("runtime_execution_projection_get").response_schema,
+            "ExecutionProjection"
+        );
+        let execution_command = spec("runtime_execution_projection_command");
+        assert_eq!(
+            execution_command.request_schema,
             Some("ExecutionCommandRequest".to_string())
         );
-        assert_eq!(specs[1].response_schema, "ExecutionCommandReceipt");
+        assert_eq!(execution_command.response_schema, "ExecutionCommandReceipt");
         assert_eq!(
-            specs[2].response_schema,
-            "SessionExecutionIndicesProjection"
+            execution_command.session_writer,
+            SessionWriterPolicy::Required
         );
-        assert_eq!(specs[3].operation_id, "session_execution_index_get");
-        assert_eq!(specs[4].response_schema, "SessionEvidenceProjection");
-        assert_eq!(specs[5].response_schema, "TurnEvidenceProjection");
+        let send_message = spec("session_message_send");
         assert_eq!(
-            specs[6].request_schema,
+            send_message.request_schema.as_deref(),
+            Some("SendMessageRequest")
+        );
+        assert_eq!(send_message.session_writer, SessionWriterPolicy::Required);
+        assert_eq!(
+            spec("slash_dispatch").session_writer,
+            SessionWriterPolicy::Conditional
+        );
+        assert_eq!(spec("auth_verify").response_schema, "AuthVerifyResponse");
+        assert_eq!(
+            spec("runtime_live_subscription_create").request_schema,
             Some("CreateLiveSubscriptionRequest".to_string())
         );
-        assert_eq!(specs[9].response_schema, "LiveEnvelope");
-        assert!(specs[9].streaming);
+        let live_stream = spec("runtime_live_stream_get");
+        assert_eq!(live_stream.response_schema, "LiveEnvelope");
+        assert!(live_stream.streaming);
     }
 }

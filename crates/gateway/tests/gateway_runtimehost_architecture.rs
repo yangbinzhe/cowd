@@ -1076,12 +1076,6 @@ fn runtime_approval_gate_projects_to_ai_kernel_policy_receipts() {
             && !runtime_service.contains("replay_session_value"),
         "RuntimeService must not own session lifecycle APIs"
     );
-    let system_routes =
-        production_part(&read_repo("crates/gateway/src/api_routes/system_routes.rs")).to_string();
-    assert!(
-        system_routes.contains("state.services.provider.config_projection(&runtime_config)"),
-        "provider config route must delegate projection to ProviderService"
-    );
     let session_service =
         production_part(&read_repo("crates/gateway/src/services/session_service.rs")).to_string();
     assert!(

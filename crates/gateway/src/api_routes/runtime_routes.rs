@@ -1560,7 +1560,7 @@ async fn acquire_runtime_session_lease(
             }),
         ));
     }
-    let owner = super::session_lease_owner(&principal, Some(observer_id));
+    let owner = super::session_lease_owner(&principal, observer_id);
     let result = registry.acquire(&request.session_id, &owner, mode).await;
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(Json(result))
@@ -1601,7 +1601,7 @@ async fn release_runtime_session_lease(
             }),
         ));
     };
-    let owner = super::session_lease_owner(&principal, Some(observer_id));
+    let owner = super::session_lease_owner(&principal, observer_id);
     let result = registry.release(&request.session_id, &owner).await;
     if result.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(Json(result))

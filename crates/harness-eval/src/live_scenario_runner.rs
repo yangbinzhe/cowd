@@ -10,7 +10,7 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 
-use crate::HarnessEvalRunnerOptions;
+use crate::{session_actor::SessionActor, HarnessEvalRunnerOptions};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
@@ -237,19 +237,25 @@ impl LiveScenarioRunner {
         let started = Instant::now();
         let mut trace = Vec::new();
         let timeout = spec.timeout.with_cap(self.timeout_cap);
-        let session = self.create_session(&mut trace);
-        let Ok(session) = session else {
-            return failed_scenario(spec, started, trace, session.err().unwrap_or_default());
+        let actor = SessionActor::create(
+            &self.client,
+            &self.base_url,
+            self.model.as_deref(),
+            "harness-eval-live",
+        );
+        let Ok(mut actor) = actor else {
+            return failed_scenario(spec, started, trace, actor.err().unwrap_or_default());
         };
-        let session_id = session;
-        let admission = self.post_json(
+        trace.extend(actor.drain_trace());
+        let session_id = actor.session_id().to_string();
+        let admission = actor.post_mutation(
             &format!("/api/sessions/{session_id}/messages"),
             json!({
                 "content": spec.prompt,
                 "idempotency_key": format!("live-eval-{}", uuid::Uuid::new_v4()),
             }),
-            &mut trace,
         );
+        trace.extend(actor.drain_trace());
         let admission = match admission {
             Ok(value) => value,
             Err(error) => {
@@ -288,7 +294,7 @@ impl LiveScenarioRunner {
         let Ok(terminal) = terminal else {
             let mut diagnostics =
                 self.capture_diagnostics(&session_id, Some(execution_id_ref), &mut trace);
-            let cleanup = self.cancel_execution_lineage(execution_id_ref, &mut trace);
+            let cleanup = self.cancel_execution_lineage(execution_id_ref, &mut actor, &mut trace);
             if let Some(object) = diagnostics.as_object_mut() {
                 object.insert("cancellation".to_string(), cleanup);
             }
@@ -356,6 +362,11 @@ impl LiveScenarioRunner {
             "passed": model_verified,
         }));
         acceptance.passed &= model_verified;
+        let cleanup = actor.finish().map_or_else(
+            |error| json!({"status":"failed","error":error}),
+            |_| json!({"status":"passed"}),
+        );
+        trace.extend(actor.drain_trace());
         json!({
             "scenario_id": spec.id,
             "status": if acceptance.passed { "passed" } else { "failed" },
@@ -368,6 +379,7 @@ impl LiveScenarioRunner {
             "elapsed_ms": started.elapsed().as_millis(),
             "metrics": metrics,
             "timeout": terminal_wait.report,
+            "session_actor_cleanup": cleanup,
             "trace": trace,
             "production_trace": {
                 "session_id": session_id,
@@ -377,22 +389,6 @@ impl LiveScenarioRunner {
                 "message_materialized": true,
             }
         })
-    }
-
-    fn create_session(&self, trace: &mut Vec<Value>) -> Result<String, String> {
-        let response = self.post_json("/api/sessions", json!({"model": self.model}), trace)?;
-        response
-            .get("id")
-            .or_else(|| response.get("session_id"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(ToString::to_string)
-            .ok_or_else(|| {
-                format!(
-                    "create session response lacks id: {}",
-                    summarize_json(&response)
-                )
-            })
     }
 
     fn wait_for_terminal_message(
@@ -628,7 +624,12 @@ impl LiveScenarioRunner {
     /// report has already declared failure. Cancel descendants first, then
     /// the root through the same revision-checked public command surface used
     /// by TUI/WebUI. Cleanup receipts stay in the raw trace for audit.
-    fn cancel_execution_lineage(&self, root_execution_id: &str, trace: &mut Vec<Value>) -> Value {
+    fn cancel_execution_lineage(
+        &self,
+        root_execution_id: &str,
+        actor: &mut SessionActor<'_>,
+        trace: &mut Vec<Value>,
+    ) -> Value {
         let projections = self.execution_lineage_projections(root_execution_id, trace);
         let mut receipts = Vec::new();
         for projection in projections.into_iter().rev() {
@@ -645,7 +646,8 @@ impl LiveScenarioRunner {
                 "command": "cancel",
                 "payload": {"reason": "isolated live evaluation timed out; canceling owned execution"},
             });
-            let response = self.post_json(&path, request, trace);
+            let response = actor.post_mutation(&path, request);
+            trace.extend(actor.drain_trace());
             receipts.push(json!({
                 "execution_id": execution_id,
                 "expected_revision": revision,
@@ -662,18 +664,6 @@ impl LiveScenarioRunner {
             .send()
             .map_err(|error| error.to_string())?;
         response_json(response)
-    }
-
-    fn post_json(&self, path: &str, body: Value, trace: &mut Vec<Value>) -> Result<Value, String> {
-        let response = self
-            .client
-            .post(format!("{}{}", self.base_url, path))
-            .json(&body)
-            .send()
-            .map_err(|error| error.to_string());
-        let parsed = response.and_then(response_json);
-        trace.push(trace_json_entry("POST", path.to_string(), body, &parsed));
-        parsed
     }
 }
 

@@ -331,14 +331,13 @@ async fn send_message(
     let source_kind = match (surface_id, observer_id) {
         (Some("cowd.tui"), Some(observer)) if observer.starts_with("tui:") => InputSourceKind::Tui,
         (Some("webui"), Some(observer)) if observer.starts_with("webui:") => InputSourceKind::Webui,
-        (None, None) => InputSourceKind::Webui,
         _ => InputSourceKind::Api,
     };
     let mut envelope = SessionInputEnvelope::text(session_id.clone(), source_kind, runtime_content)
         .with_source_ref(format!(
             "api:/api/sessions/{session_id}/messages;surface={};observer={}",
-            surface_id.unwrap_or("legacy-webui"),
-            observer_id.unwrap_or("principal-default")
+            surface_id.unwrap_or("api"),
+            observer_id.unwrap_or("unknown")
         ));
     if let Some(client_message_id) = body
         .client_message_id

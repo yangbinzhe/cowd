@@ -191,6 +191,89 @@ async fn lifecycle_keeps_each_authenticated_surface_attachment_distinct() {
 }
 
 #[tokio::test]
+async fn every_session_mutation_route_fails_closed_without_a_writer_observer() {
+    let harness = GatewayTestHarness::in_memory().expect("gateway test harness");
+    let app = harness.router();
+    let session_id = "writer-route-contract";
+    let ensured = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/sessions/{session_id}/ensure"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"test-model"}"#))
+                .expect("ensure request"),
+        )
+        .await
+        .expect("ensure response");
+    assert_eq!(ensured.status(), StatusCode::OK);
+
+    for (path, body) in [
+        (
+            format!("/api/sessions/{session_id}/messages"),
+            r#"{"content":"must not run"}"#,
+        ),
+        (
+            format!("/api/sessions/{session_id}/inputs/input-1/cancel"),
+            r#"{"reason":"must not run"}"#,
+        ),
+        (
+            format!("/api/sessions/{session_id}/inputs/input-1/reclassify"),
+            r#"{"decision":"enqueue_next_step","reason":"must not run"}"#,
+        ),
+        (
+            format!("/api/sessions/{session_id}/cancel"),
+            r#"{"reason":"must not run"}"#,
+        ),
+        (format!("/api/sessions/{session_id}/compact"), "{}"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("session mutation request"),
+            )
+            .await
+            .expect("session mutation response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+
+    let read_only_slash = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/slash/dispatch")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"command":"help","args":{}}"#))
+                .expect("read-only slash request"),
+        )
+        .await
+        .expect("read-only slash response");
+    assert_ne!(read_only_slash.status(), StatusCode::FORBIDDEN);
+
+    let mutating_slash = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/slash/dispatch")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    r#"{{"command":"compact","args":{{"session_id":"{session_id}"}}}}"#
+                )))
+                .expect("mutating slash request"),
+        )
+        .await
+        .expect("mutating slash response");
+    assert_eq!(mutating_slash.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn task_slash_dispatch_executes_the_gateway_owned_task_service() {
     let harness = GatewayTestHarness::in_memory().expect("gateway test harness");
     let app = harness.router();

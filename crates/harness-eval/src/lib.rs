@@ -34,6 +34,7 @@ mod real_provider_runner;
 mod report;
 mod report_store;
 mod runner;
+mod session_actor;
 mod terminal_gate;
 mod terminal_matrix;
 

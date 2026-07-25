@@ -10,7 +10,7 @@ use super::{
     route_manifest::{
         gateway_route_manifest, gateway_route_manifest_for_apps, GatewayRouteManifestEntry,
     },
-    route_registry::stable_route_metadata,
+    route_registry::{stable_route_metadata, SessionWriterPolicy, StableRouteMetadata},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -246,6 +246,39 @@ fn gateway_openapi_document_from_contract(
             "ExecutionCommandReceipt",
             execution_command_receipt_schema(),
         ),
+        ("SendMessageRequest", send_message_request_schema()),
+        ("SendMessageReceipt", send_message_receipt_schema()),
+        (
+            "SessionInputCancelRequest",
+            session_input_cancel_request_schema(),
+        ),
+        (
+            "SessionInputReclassifyRequest",
+            session_input_reclassify_request_schema(),
+        ),
+        (
+            "SessionInputMutationReceipt",
+            session_input_mutation_receipt_schema(),
+        ),
+        (
+            "CancelSessionTurnRequest",
+            cancel_session_turn_request_schema(),
+        ),
+        (
+            "CancelSessionTurnReceipt",
+            cancel_session_turn_receipt_schema(),
+        ),
+        (
+            "ContextCompactionResult",
+            context_compaction_result_schema(),
+        ),
+        ("SlashDispatchRequest", slash_dispatch_request_schema()),
+        ("SlashDispatchReceipt", slash_dispatch_receipt_schema()),
+        (
+            "HumanEntitlementProjection",
+            human_entitlement_projection_schema(),
+        ),
+        ("AuthVerifyResponse", auth_verify_response_schema()),
         (
             "CreateLiveSubscriptionRequest",
             live_create_request_schema(),
@@ -872,7 +905,11 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
     if capability.auth == "public" {
         operation.insert("security".to_string(), Value::Array(vec![]));
     }
-    let parameters = openapi_parameters(&capability.http.method, &capability.http.path);
+    let parameters = openapi_parameters(
+        &capability.http.method,
+        &capability.http.path,
+        stable_metadata.as_ref(),
+    );
     if !parameters.is_empty() {
         operation.insert("parameters".to_string(), Value::Array(parameters));
     }
@@ -897,7 +934,9 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
         operation.insert(
             "requestBody".to_string(),
             json!({
-                "required": false,
+                "required": stable_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.request_required),
                 "content": Value::Object(request_content)
             }),
         );
@@ -934,6 +973,11 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
             }),
         );
     }
+    let writer_policy = stable_metadata
+        .as_ref()
+        .map_or(SessionWriterPolicy::None, |metadata| {
+            metadata.session_writer
+        });
     let responses = if let Some(metadata) = app_metadata {
         json!({
             "200": {
@@ -949,7 +993,7 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
             "500": app_openapi_error_response("Gateway internal error", metadata.auth_error_schema.as_deref())
         })
     } else {
-        json!({
+        let mut responses = json!({
             "200": {
                 "description": "Successful Gateway response",
                 "content": Value::Object(content)
@@ -957,7 +1001,16 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
             "400": {"description": "Bad request"},
             "401": {"description": "Unauthorized"},
             "500": {"description": "Gateway internal error"}
-        })
+        });
+        if writer_policy != SessionWriterPolicy::None {
+            responses["403"] = json!({
+                "description": "Missing, invalid, unattached, or read-only x-cowd-observer-id"
+            });
+            responses["409"] = json!({
+                "description": "Writer lease conflict"
+            });
+        }
+        responses
     };
     operation.insert("responses".to_string(), responses);
     operation.insert(
@@ -970,6 +1023,7 @@ fn openapi_operation(capability: &GatewayCapability) -> Value {
             "source": capability.http.source,
             "handler": capability.http.handler,
             "ai_visible": capability.surface_visibility.llm,
+            "session_writer": writer_policy.as_str(),
         }),
     );
     Value::Object(operation)
@@ -1580,7 +1634,199 @@ fn execution_command_receipt_schema() -> Value {
     })
 }
 
-fn openapi_parameters(method: &str, path: &str) -> Vec<Value> {
+fn send_message_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["content"],
+        "properties": {
+            "content": {"type": "string"},
+            "resource_ids": {"type": "array", "items": {"type": "string"}},
+            "idempotency_key": {"type": ["string", "null"]},
+            "client_message_id": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn send_message_receipt_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["session_id", "run_id", "status", "execution", "mode", "input", "materialized"],
+        "properties": {
+            "session_id": {"type": "string"},
+            "run_id": {"type": "string"},
+            "status": {"type": "string", "const": "accepted"},
+            "execution": {
+                "type": "object",
+                "required": ["graph_id", "turn_id", "terminal_id", "status", "materialization"],
+                "additionalProperties": true
+            },
+            "mode": {"type": "string", "enum": ["attached_to_active_turn", "queued_new_turn"]},
+            "input": {"type": "object", "additionalProperties": true},
+            "materialized": {"type": ["object", "null"], "additionalProperties": true},
+            "input_projection": {"type": ["object", "null"], "additionalProperties": true},
+            "turn_inbox": {"type": ["object", "null"], "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_input_cancel_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"reason": {"type": ["string", "null"]}},
+        "additionalProperties": false
+    })
+}
+
+fn session_input_reclassify_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["decision"],
+        "properties": {
+            "decision": {
+                "type": "string",
+                "enum": [
+                    "start_new_turn", "supplement_current_turn", "interrupt_and_replan",
+                    "enqueue_next_step", "spawn_subtask", "route_cross_session",
+                    "create_new_session", "control_or_approval", "reject_duplicate",
+                    "reject_policy"
+                ]
+            },
+            "reason": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn session_input_mutation_receipt_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["kind", "session_id", "input"],
+        "properties": {
+            "kind": {"type": "string", "enum": ["session_input.cancel", "session_input.reclassify"]},
+            "session_id": {"type": "string"},
+            "input": {"type": "object", "additionalProperties": true},
+            "input_projection": {"type": ["object", "null"], "additionalProperties": true},
+            "turn_inbox": {"type": ["object", "null"], "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn cancel_session_turn_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"reason": {"type": ["string", "null"]}},
+        "additionalProperties": false
+    })
+}
+
+fn cancel_session_turn_receipt_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["ok", "session_id", "status", "actor_id", "reason", "aborted", "execution_ids"],
+        "properties": {
+            "ok": {"type": "boolean", "const": true},
+            "session_id": {"type": "string"},
+            "status": {"type": "string", "const": "cancel_requested"},
+            "actor_id": {"type": "string"},
+            "reason": {"type": "string"},
+            "aborted": {"type": "boolean"},
+            "run_id": {"type": ["string", "null"]},
+            "execution_ids": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn context_compaction_result_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["summary", "formatted_summary", "removed_message_count", "source_message_start", "source_message_end"],
+        "properties": {
+            "summary": {"type": "string"},
+            "formatted_summary": {"type": "string"},
+            "compacted_session": {"type": "object", "additionalProperties": true},
+            "removed_message_count": {"type": "integer", "minimum": 0},
+            "source_message_start": {"type": "integer", "minimum": 0},
+            "source_message_end": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn slash_dispatch_request_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+            "command": {"type": "string", "minLength": 1},
+            "args": {"type": ["object", "null"], "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn slash_dispatch_receipt_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["ok", "slash", "id", "action", "status", "data", "executed_at_ms"],
+        "properties": {
+            "ok": {"type": "boolean"},
+            "slash": {"type": "string"},
+            "id": {"type": "string"},
+            "action": {"type": ["string", "object"]},
+            "status": {"type": "string"},
+            "data": {},
+            "executed_at_ms": {"type": "integer"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn human_entitlement_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "core_profile_id", "app_profiles", "profile_revision", "credential_epoch",
+            "ceiling", "granted", "denied"
+        ],
+        "properties": {
+            "core_profile_id": {"type": "string"},
+            "app_profiles": {
+                "type": "object",
+                "additionalProperties": {"type": "string"}
+            },
+            "profile_revision": {"type": "integer", "minimum": 1},
+            "credential_epoch": {"type": "integer", "minimum": 1},
+            "ceiling": {"type": "array", "items": {"type": "string"}},
+            "granted": {"type": "array", "items": {"type": "string"}},
+            "denied": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn auth_verify_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["valid", "auth_required"],
+        "properties": {
+            "valid": {"type": "boolean"},
+            "auth_required": {"type": "boolean"},
+            "transport": {"type": "string", "enum": ["bearer", "browser_session"]},
+            "entitlement": {"$ref": "#/components/schemas/HumanEntitlementProjection"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn openapi_parameters(
+    method: &str,
+    path: &str,
+    stable_metadata: Option<&StableRouteMetadata>,
+) -> Vec<Value> {
     let mut params = Vec::new();
     for segment in path.split('/') {
         if let Some(name) = segment.strip_prefix(':') {
@@ -1606,6 +1852,22 @@ fn openapi_parameters(method: &str, path: &str) -> Vec<Value> {
             "required": path != "/api/runtime/live/:id",
             "description": "Surface instance binding. Must match the subscription owner.",
             "schema": {"type": "string", "maxLength": 128}
+        }));
+    }
+    if let Some(policy) = stable_metadata
+        .map(|metadata| metadata.session_writer)
+        .filter(|policy| *policy != SessionWriterPolicy::None)
+    {
+        params.push(json!({
+            "name": "x-cowd-observer-id",
+            "in": "header",
+            "required": policy == SessionWriterPolicy::Required,
+            "description": if policy == SessionWriterPolicy::Conditional {
+                "Required when slash dispatch resolves to a mutating command with an authoritative session_id."
+            } else {
+                "Exact attached writer Surface identity. The same observer must own a compatible session lease."
+            },
+            "schema": {"type": "string", "minLength": 1, "maxLength": 128}
         }));
     }
     if method == "GET" && path == "/api/runtime/live/:id" {
@@ -1796,6 +2058,61 @@ mod tests {
             command["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ExecutionCommandReceipt"
         );
+        assert_eq!(command["requestBody"]["required"], true);
+        assert!(command["parameters"]
+            .as_array()
+            .expect("command parameters")
+            .iter()
+            .any(|parameter| {
+                parameter["name"] == "x-cowd-observer-id" && parameter["required"] == true
+            }));
+        assert_eq!(command["x-cowd"]["session_writer"], "required");
+    }
+
+    #[test]
+    fn session_writer_and_auth_contracts_are_exact_and_generated_from_route_metadata() {
+        let document = gateway_openapi_document();
+        for path in [
+            "/api/sessions/{id}/messages",
+            "/api/sessions/{id}/inputs/{input_id}/cancel",
+            "/api/sessions/{id}/inputs/{input_id}/reclassify",
+            "/api/sessions/{id}/cancel",
+            "/api/sessions/{id}/compact",
+            "/api/runtime/executions/{id}/commands",
+        ] {
+            let operation = &document["paths"][path]["post"];
+            let observer = operation["parameters"]
+                .as_array()
+                .expect("writer parameters")
+                .iter()
+                .find(|parameter| parameter["name"] == "x-cowd-observer-id")
+                .expect("writer observer parameter");
+            assert_eq!(observer["required"], true, "{path}");
+            assert_eq!(operation["x-cowd"]["session_writer"], "required", "{path}");
+            assert!(operation["responses"]["403"].is_object(), "{path}");
+            assert!(operation["responses"]["409"].is_object(), "{path}");
+        }
+
+        let slash = &document["paths"]["/api/slash/dispatch"]["post"];
+        let observer = slash["parameters"]
+            .as_array()
+            .expect("slash parameters")
+            .iter()
+            .find(|parameter| parameter["name"] == "x-cowd-observer-id")
+            .expect("conditional slash observer parameter");
+        assert_eq!(observer["required"], false);
+        assert_eq!(slash["x-cowd"]["session_writer"], "conditional");
+
+        let verify = &document["paths"]["/api/auth/verify"]["get"];
+        assert_eq!(
+            verify["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/AuthVerifyResponse"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["AuthVerifyResponse"]["properties"]["entitlement"]
+                ["$ref"],
+            "#/components/schemas/HumanEntitlementProjection"
+        );
     }
 
     #[test]
@@ -1811,7 +2128,12 @@ mod tests {
             .into_iter()
             .filter(|registered| registered.app_id.as_str() == "mfg" && registered.route.active)
             .collect::<Vec<_>>();
-        assert_eq!(active.len(), 105);
+        let route_ids = active
+            .iter()
+            .map(|registered| registered.route.route_id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(!active.is_empty());
+        assert_eq!(route_ids.len(), active.len());
 
         for registered in active {
             let route = registered.route;

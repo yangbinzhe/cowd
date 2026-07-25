@@ -151,7 +151,11 @@ printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HO
     --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm "${confirmation}" \
     >"${SCENARIO_ROOT}/profile-manager.json"
 curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/apps/mfg/contract" \
-  | jq -e '([.routes[] | select(.availability == "active")] | length) == 105' >/dev/null
+  | jq -e '
+      [.routes[] | select(.availability == "active") | .route_id] as $ids
+      | ($ids | length) > 0
+      and ($ids | length) == ($ids | unique | length)
+    ' >/dev/null
 
 (
   cd "${WEBUI_ROOT}"

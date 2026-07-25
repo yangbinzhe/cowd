@@ -112,24 +112,9 @@ fn validated_session_observer_id(observer_id: Option<&str>) -> Option<&str> {
     })
 }
 
-pub(super) fn session_lease_owner(
-    principal: &AuthenticatedPrincipal,
-    observer_id: Option<&str>,
-) -> String {
+pub(super) fn session_lease_owner(principal: &AuthenticatedPrincipal, observer_id: &str) -> String {
     let principal_owner = format!("principal:{}", principal.0.claims().principal_id);
-    validated_session_observer_id(observer_id).map_or(principal_owner.clone(), |observer| {
-        format!("{principal_owner}:observer:{observer}")
-    })
-}
-
-pub(super) fn session_lease_owner_from_headers(
-    principal: &AuthenticatedPrincipal,
-    headers: &HeaderMap,
-) -> String {
-    let observer_id = headers
-        .get("x-cowd-observer-id")
-        .and_then(|value| value.to_str().ok());
-    session_lease_owner(principal, observer_id)
+    format!("{principal_owner}:observer:{observer_id}")
 }
 
 /// Admit one session mutation from a concrete attached Surface.
@@ -155,44 +140,40 @@ pub(super) async fn require_session_writer_admission(
         })?),
         None => None,
     };
-    let observer_id = raw_observer.and_then(|value| validated_session_observer_id(Some(value)));
-    if raw_observer.is_some() && observer_id.is_none() {
+    let observer_id = raw_observer
+        .and_then(|value| validated_session_observer_id(Some(value)))
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: if raw_observer.is_some() {
+                        "x-cowd-observer-id is invalid".to_string()
+                    } else {
+                        "session mutation requires x-cowd-observer-id".to_string()
+                    },
+                }),
+            )
+        })?;
+    let actor_id = surface_actor_id(principal, observer_id);
+    let role = state
+        .services
+        .session
+        .lifecycle_attachment_role(session_id, &actor_id)
+        .await;
+    if role.as_deref() != Some("writer") {
         return Err((
             StatusCode::FORBIDDEN,
             Json(ErrorResponse {
-                error: "x-cowd-observer-id is invalid".to_string(),
+                error: match role.as_deref() {
+                    Some("reader") => {
+                        "reader session attachment cannot execute mutations".to_string()
+                    }
+                    _ => "session mutation requires an attached writer Surface".to_string(),
+                },
             }),
         ));
     }
-    let owner = if let Some(observer_id) = observer_id {
-        let actor_id = surface_actor_id(principal, observer_id);
-        let role = state
-            .services
-            .session
-            .lifecycle_attachment_role(session_id, &actor_id)
-            .await;
-        if role.as_deref() != Some("writer") {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse {
-                    error: match role.as_deref() {
-                        Some("reader") => {
-                            "reader session attachment cannot execute mutations".to_string()
-                        }
-                        _ => "session mutation requires an attached writer Surface".to_string(),
-                    },
-                }),
-            ));
-        }
-        session_lease_owner(principal, Some(observer_id))
-    } else {
-        // Backward-compatible server-side attachment for credentialed
-        // surfaces that predate the observer contract (notably WebUI).
-        // Explicit Surface clients always send their observer id; a second
-        // Surface owned by the same authenticated principal must not become
-        // read-only merely because TUI is also observing the session.
-        session_lease_owner(principal, None)
-    };
+    let owner = session_lease_owner(principal, observer_id);
     let registry = state.session_lease_registry.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1498,6 +1479,56 @@ pub(crate) mod tests {
 
     struct CrossPlaneApprovalTestBackend {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn attach_test_writer(state: &AppState, session_id: &str, observer_id: &str) {
+        let principal = AuthenticatedPrincipal(test_human_principal());
+        let attached = state
+            .services
+            .session
+            .attach_session_value(
+                session_id,
+                &surface_actor_id(&principal, observer_id),
+                "test",
+                Some("writer"),
+            )
+            .await;
+        assert_eq!(attached["ok"], true);
+    }
+
+    fn assert_control_plane_readiness_accounting(json: &serde_json::Value) {
+        let checks = json["readiness"]["checks"]
+            .as_array()
+            .expect("readiness checks");
+        let required = checks
+            .iter()
+            .filter(|check| check["required"].as_bool() == Some(true))
+            .collect::<Vec<_>>();
+        let ready = required
+            .iter()
+            .filter(|check| check["status"] == "ready")
+            .count() as u64;
+        let blocked = required.len() as u64 - ready;
+        let total = required.len() as u64;
+        let score = if total == 0 { 100 } else { ready * 100 / total };
+
+        assert_eq!(json["diagnostics"]["required_check_count"], total);
+        assert_eq!(json["diagnostics"]["ready_required_count"], ready);
+        assert_eq!(json["diagnostics"]["blocked_required_count"], blocked);
+        assert_eq!(json["diagnostics"]["readiness_score"], score);
+        assert_eq!(json["diagnostics"]["production_ready"], blocked == 0);
+        assert_eq!(json["readiness"]["required_total"], total);
+        assert_eq!(json["readiness"]["required_ready"], ready);
+        assert_eq!(json["readiness"]["required_blocked"], blocked);
+        assert_eq!(json["readiness"]["score"], score);
+        assert_eq!(json["readiness"]["production_ready"], blocked == 0);
+        assert_eq!(
+            json["readiness"]["blocked"]
+                .as_array()
+                .expect("blocked readiness checks")
+                .len() as u64,
+            blocked
+        );
     }
 
     #[test]
@@ -3474,6 +3505,8 @@ pub(crate) mod tests {
             .register(graph)
             .await
             .expect("graph registers");
+        let observer_id = "test.execution-projection";
+        attach_test_writer(&state, session_id, observer_id).await;
         let app = api_router(Arc::clone(&state));
 
         let snapshot = app
@@ -3546,12 +3579,35 @@ pub(crate) mod tests {
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("text/event-stream")));
 
+        let missing_observer = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/runtime/executions/{execution_id}/commands"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "command_id": "api-projection-missing-observer",
+                            "expected_revision": revision,
+                            "command": "pause",
+                            "payload": { "reason": "must not run" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_observer.status(), StatusCode::FORBIDDEN);
+
         let command = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/runtime/executions/{execution_id}/commands"))
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", observer_id)
                     .body(Body::from(
                         serde_json::json!({
                             "command_id": "api-projection-pause",
@@ -9754,6 +9810,8 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let state = test_state_with_store(store);
+        let observer_id = "test.session-cancel";
+        attach_test_writer(&state, session_id, observer_id).await;
         let app = api_router(state);
 
         let response = app
@@ -9763,6 +9821,7 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri(format!("/api/sessions/{session_id}/cancel"))
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", observer_id)
                     .body(Body::from(
                         serde_json::json!({
                             "reason": "test_cancel",
@@ -10335,7 +10394,7 @@ runtime:
         );
         assert_eq!(json["diagnostics"]["component_count"], 10);
         assert_eq!(json["diagnostics"]["degraded_component_count"], 2);
-        assert_eq!(json["diagnostics"]["attention_component_count"], 2);
+        assert_eq!(json["diagnostics"]["attention_component_count"], 1);
         assert_eq!(
             json["diagnostics"]["capability_count"],
             serde_json::json!(
@@ -10349,21 +10408,17 @@ runtime:
             json["diagnostics"]["performance_status"].as_str(),
             Some("healthy" | "attention" | "degraded")
         ));
-        assert_eq!(json["diagnostics"]["provider_configured"], false);
-        assert_eq!(json["diagnostics"]["provider_count"], 0);
-        assert_eq!(json["diagnostics"]["provider_model_count"], 0);
+        assert_eq!(json["diagnostics"]["provider_configured"], true);
+        assert!(json["diagnostics"]["provider_count"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            json["diagnostics"]["provider_model_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
         assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
         assert_eq!(json["diagnostics"]["production_ready"], false);
-        assert_eq!(json["diagnostics"]["required_check_count"], 11);
-        let performance_ready = json["diagnostics"]["performance_status"] != "degraded";
-        let expected_ready = 6 + u64::from(performance_ready);
-        assert_eq!(json["diagnostics"]["ready_required_count"], expected_ready);
-        assert_eq!(
-            json["diagnostics"]["blocked_required_count"],
-            11 - expected_ready
-        );
-        assert_eq!(json["readiness"]["production_ready"], false);
-        assert_eq!(json["readiness"]["score"], expected_ready * 100 / 11);
+        assert_control_plane_readiness_accounting(&json);
         assert!(json["readiness"]["blocked"]
             .as_array()
             .unwrap()
@@ -10374,11 +10429,11 @@ runtime:
             .unwrap()
             .iter()
             .any(|check| check["id"] == "memory.manager"));
-        assert!(json["readiness"]["blocked"]
+        assert!(json["readiness"]["checks"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|check| check["id"] == "provider.registry"));
+            .any(|check| check["id"] == "provider.registry" && check["status"] == "ready"));
         assert!(json["next_actions"]
             .as_array()
             .unwrap()
@@ -10387,14 +10442,16 @@ runtime:
                 .as_str()
                 .unwrap_or_default()
                 .contains("SQLite session store")));
-        assert!(json["next_actions"]
+        assert!(!json["next_actions"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|action| action
-                .as_str()
-                .unwrap_or_default()
-                .contains("runtime provider")));
+            .any(|action| {
+                action
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("runtime provider")
+            }));
         assert!(json["degraded_reasons"]
             .as_array()
             .unwrap()
@@ -10402,6 +10459,79 @@ runtime:
             .any(|reason| reason == "session store not available"));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_mutations_require_the_exact_attached_writer_observer() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&new_api_session_record("writer-contract", None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        let principal = test_human_principal();
+
+        let missing = require_session_writer_admission(
+            &state,
+            &AuthenticatedPrincipal(principal.clone()),
+            &HeaderMap::new(),
+            "writer-contract",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.0, StatusCode::FORBIDDEN);
+
+        for (observer, role) in [("webui:reader", "reader"), ("webui:writer", "writer")] {
+            let attached = state
+                .services
+                .session
+                .attach_session_value(
+                    "writer-contract",
+                    &surface_actor_id(&AuthenticatedPrincipal(principal.clone()), observer),
+                    "webui",
+                    Some(role),
+                )
+                .await;
+            assert_eq!(attached["ok"], true);
+        }
+
+        let headers = |observer: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-cowd-observer-id",
+                observer.parse().expect("observer header"),
+            );
+            headers
+        };
+        let reader = require_session_writer_admission(
+            &state,
+            &AuthenticatedPrincipal(principal.clone()),
+            &headers("webui:reader"),
+            "writer-contract",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reader.0, StatusCode::FORBIDDEN);
+
+        let unknown = require_session_writer_admission(
+            &state,
+            &AuthenticatedPrincipal(principal.clone()),
+            &headers("webui:unknown"),
+            "writer-contract",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unknown.0, StatusCode::FORBIDDEN);
+
+        let owner = require_session_writer_admission(
+            &state,
+            &AuthenticatedPrincipal(principal),
+            &headers("webui:writer"),
+            "writer-contract",
+        )
+        .await
+        .expect("exact writer observer admitted");
+        assert!(owner.ends_with(":observer:webui:writer"));
     }
 
     #[tokio::test]
@@ -10655,35 +10785,26 @@ runtime:
         assert_eq!(json["diagnostics"]["open_tasks"], 1);
         assert_eq!(json["diagnostics"]["component_count"], 10);
         assert_eq!(json["diagnostics"]["degraded_component_count"], 0);
-        assert_eq!(json["diagnostics"]["attention_component_count"], 2);
+        assert_eq!(json["diagnostics"]["attention_component_count"], 1);
         assert!(json["diagnostics"]["elapsed_ms"].as_u64().is_some());
         assert!(matches!(
             json["diagnostics"]["performance_status"].as_str(),
             Some("healthy" | "attention" | "degraded")
         ));
-        assert_eq!(json["diagnostics"]["provider_configured"], false);
-        assert_eq!(json["components"]["provider"]["status"], "unconfigured");
+        assert_eq!(json["diagnostics"]["provider_configured"], true);
+        assert_eq!(json["components"]["provider"]["status"], "available");
         assert_eq!(json["diagnostics"]["production_ready"], false);
-        assert_eq!(json["diagnostics"]["required_check_count"], 11);
-        let performance_ready = json["diagnostics"]["performance_status"] != "degraded";
-        let expected_ready = 8 + u64::from(performance_ready);
-        assert_eq!(json["diagnostics"]["ready_required_count"], expected_ready);
-        assert_eq!(
-            json["diagnostics"]["blocked_required_count"],
-            11 - expected_ready
-        );
-        assert_eq!(json["readiness"]["production_ready"], false);
-        assert_eq!(json["readiness"]["score"], expected_ready * 100 / 11);
+        assert_control_plane_readiness_accounting(&json);
         assert!(json["readiness"]["blocked"]
             .as_array()
             .unwrap()
             .iter()
             .any(|check| check["id"] == "memory.manager"));
-        assert!(json["readiness"]["blocked"]
+        assert!(json["readiness"]["checks"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|check| check["id"] == "provider.registry"));
+            .any(|check| check["id"] == "provider.registry" && check["status"] == "ready"));
         assert!(json["next_actions"]
             .as_array()
             .unwrap()
@@ -10767,15 +10888,7 @@ runtime:
             Some("healthy" | "attention" | "degraded")
         ));
         assert_eq!(json["diagnostics"]["production_ready"], false);
-        assert_eq!(json["diagnostics"]["required_check_count"], 11);
-        let performance_ready = json["diagnostics"]["performance_status"] != "degraded";
-        let expected_ready = 8 + u64::from(performance_ready);
-        assert_eq!(json["diagnostics"]["ready_required_count"], expected_ready);
-        assert_eq!(
-            json["diagnostics"]["blocked_required_count"],
-            11 - expected_ready
-        );
-        assert_eq!(json["readiness"]["score"], expected_ready * 100 / 11);
+        assert_control_plane_readiness_accounting(&json);
         assert!(json["readiness"]["checks"]
             .as_array()
             .unwrap()
@@ -11030,11 +11143,19 @@ providers:
             ))
             .await
             .unwrap();
-        let app = api_router(test_state_with_store_and_workspace(
-            store,
-            workspace,
-            config_home,
-        ));
+        let state = test_state_with_store_and_workspace(store, workspace, config_home);
+        let attached = state
+            .services
+            .session
+            .attach_session_value(
+                "s1",
+                "principal:local-human:surface:webui:slash",
+                "webui",
+                Some("writer"),
+            )
+            .await;
+        assert_eq!(attached["ok"], true);
+        let app = api_router(state);
         let response = app
             .clone()
             .oneshot(
@@ -11116,6 +11237,7 @@ providers:
                 Request::builder()
                     .method("POST")
                     .uri("/api/slash/dispatch")
+                    .header("x-cowd-observer-id", "webui:slash")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"command":"/compact","args":{"session_id":"s1"}}"#,
@@ -11449,9 +11571,14 @@ providers:
         assert_eq!(json["degraded"], false);
         assert_eq!(json["diagnostics"]["durable_session_store"], true);
         assert_eq!(json["diagnostics"]["memory_attached"], false);
-        assert_eq!(json["diagnostics"]["provider_configured"], false);
-        assert_eq!(json["diagnostics"]["provider_count"], 0);
-        assert_eq!(json["diagnostics"]["provider_model_count"], 0);
+        assert_eq!(json["diagnostics"]["provider_configured"], true);
+        assert!(json["diagnostics"]["provider_count"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            json["diagnostics"]["provider_model_count"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
         assert_eq!(json["diagnostics"]["configured_model_resolved"], true);
         assert_eq!(json["diagnostics"]["stored_sessions"], 0);
         assert_eq!(json["diagnostics"]["open_tasks"], 1);

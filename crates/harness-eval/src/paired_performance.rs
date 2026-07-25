@@ -13,6 +13,8 @@ use reqwest::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::session_actor::SessionActor;
+
 use crate::measurement::{
     paired_delta_confidence, start_first_delta_observer, validate_metric_definitions,
     FaultDriverPlan, MeasurementFault, METRIC_DEFINITIONS, RELIABLE_TAIL_MIN_SAMPLES,
@@ -232,22 +234,21 @@ impl<'a> EndpointRunner<'a> {
     }
 
     fn run(&self, pair_index: usize) -> Value {
-        let session_response = self.post("/api/sessions", json!({"model": self.model}));
-        let session_id = session_response
-            .as_ref()
-            .ok()
-            .and_then(|value| extract_session_id(value))
-            .map(ToString::to_string);
-        let Some(session_id) = session_id else {
+        let actor = SessionActor::create(
+            self.client,
+            &self.base_url,
+            Some(self.model),
+            "harness-eval-paired",
+        );
+        let Ok(mut actor) = actor else {
             return failed_sample(
                 self.label,
                 pair_index,
                 "create_session",
-                session_response
-                    .err()
-                    .unwrap_or_else(|| "response lacks session id".to_string()),
+                actor.err().unwrap_or_default(),
             );
         };
+        let session_id = actor.session_id().to_string();
 
         let first_delta_observer =
             match start_first_delta_observer(self.client, &self.base_url, &session_id) {
@@ -257,7 +258,7 @@ impl<'a> EndpointRunner<'a> {
                 }
             };
         let started = Instant::now();
-        let admission = self.post(
+        let admission = actor.post_mutation(
             &format!("/api/sessions/{session_id}/messages"),
             json!({
                 "content": WORKLOAD_PROMPT,
@@ -331,6 +332,10 @@ impl<'a> EndpointRunner<'a> {
                     });
                     let first_surface_delta_source_cursor =
                         first_surface_delta.and_then(|observed| observed.source_cursor);
+                    let cleanup = actor.finish().map_or_else(
+                        |error| json!({"status":"failed","error":error}),
+                        |_| json!({"status":"passed"}),
+                    );
                     return json!({
                         "endpoint": self.label,
                         "pair_index": pair_index,
@@ -348,6 +353,7 @@ impl<'a> EndpointRunner<'a> {
                         },
                         "acceptance": {"passed": accepted, "required": "56"},
                         "response_summary": summarize(text, 240),
+                        "session_actor_cleanup": cleanup,
                     });
                 }
             }
@@ -366,15 +372,6 @@ impl<'a> EndpointRunner<'a> {
     fn get(&self, path: &str) -> Result<Value, String> {
         self.client
             .get(format!("{}{}", self.base_url, path))
-            .send()
-            .map_err(|error| error.to_string())
-            .and_then(response_json)
-    }
-
-    fn post(&self, path: &str, body: Value) -> Result<Value, String> {
-        self.client
-            .post(format!("{}{}", self.base_url, path))
-            .json(&body)
             .send()
             .map_err(|error| error.to_string())
             .and_then(response_json)
@@ -440,14 +437,6 @@ fn response_json(response: reqwest::blocking::Response) -> Result<Value, String>
     } else {
         Err(format!("HTTP {status}: {}", summarize_json(&value)))
     }
-}
-
-fn extract_session_id(value: &Value) -> Option<&str> {
-    value
-        .get("id")
-        .or_else(|| value.get("session_id"))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn latest_assistant_text(value: &Value) -> Option<String> {

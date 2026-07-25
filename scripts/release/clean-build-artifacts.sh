@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMP_ROOT="${COWD_TMP_ROOT:-/tmp}"
 
 usage() {
   cat <<'EOF'
@@ -38,28 +39,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$CLEAN_TMP" -eq 1 ]]; then
-  find /tmp -maxdepth 1 \( \
-    -name 'cowd-target-*' -o \
-    -name 'cowd-fix-target' -o \
-    -name 'cowd-validation-*' -o \
-    -name 'cowd-api-*' -o \
-    -name 'gateway-*' -o \
-    -name 'cowd-connector-*' -o \
-    -name 'cowd-context-*' -o \
-    -name 'cowd-feishu-*' -o \
-    -name 'cowd-l4-*' -o \
-    -name 'memory-*' -o \
-    -name 'memory-panel-*' -o \
-    -name 'cowd-native-*' -o \
-    -name 'cowd-output-format-*' -o \
-    -name 'cowd-resource-*' -o \
-    -name 'cowd-resume-*' -o \
-    -name 'cowd-sqlite-*' -o \
-    -name 'cowd-state-*' -o \
-    -name 'cowd-status-*' -o \
-    -name 'storage-*' -o \
-    -name 'cowd-tui-*' -o \
-    -name 'cowd-edge-webui-*' -o \
+  find "$TMP_ROOT" -maxdepth 1 \( \
+    -name 'cowd-*' -o \
     -name 'cowd_*' \
   \) -exec rm -rf {} + 2>/dev/null || true
 fi

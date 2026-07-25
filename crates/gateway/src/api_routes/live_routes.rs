@@ -757,7 +757,7 @@ async fn run_session_source(
                     let attachment_actor =
                         super::surface_actor_id(&principal, &entry.surface_instance);
                     let lease_owner =
-                        super::session_lease_owner(&principal, Some(&entry.surface_instance));
+                        super::session_lease_owner(&principal, &entry.surface_instance);
                     message_routes::cleanup_revoked_session_stream_authority(
                         &state,
                         &source.id,

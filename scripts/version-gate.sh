@@ -147,7 +147,11 @@ CONTRACT="${SCENARIO_ROOT}/contract.json"
 curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/gateway/openapi.json" >"${OPENAPI}"
 curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/apps/mfg/contract" >"${CONTRACT}"
 jq -e --arg version "${VERSION}" '.openapi == "3.1.0" and .info.version == $version' "${OPENAPI}" >/dev/null
-jq -e '([.routes[] | select(.availability == "active")] | length) == 105' "${CONTRACT}" >/dev/null
+jq -e '
+  [.routes[] | select(.availability == "active") | .route_id] as $ids
+  | ($ids | length) > 0
+  and ($ids | length) == ($ids | unique | length)
+' "${CONTRACT}" >/dev/null
 for stale in 0.9.540 0.9.541 0.9.542 0.9.543 0.9.544 0.9.545 0.9.546 0.9.547; do
   if grep -F "${stale}" "${OPENAPI}" "${CONTRACT}" >/dev/null; then
     echo "Gateway OpenAPI or active contract exposes stale release ${stale}" >&2

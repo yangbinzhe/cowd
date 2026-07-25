@@ -207,6 +207,8 @@ curl -fsS "$BASE_URL/api/runtime/snapshot" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert sys.argv[1] in (data.get("sessions") or []), data' "$SMOKE_ID"
 
 curl -fsS -X POST "$BASE_URL/api/sessions/$SMOKE_ID/messages" \
+  -H "x-cowd-observer-id: $SMOKE_OBSERVER_ID" \
+  -H 'x-cowd-surface-id: release-smoke' \
   -H 'content-type: application/json' \
   -d '{"content":"Run the release smoke evidence check using the available release skill.","idempotency_key":"release-smoke-skill-activation"}' \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("status") == "accepted", data'

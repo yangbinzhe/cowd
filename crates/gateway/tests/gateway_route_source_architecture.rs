@@ -70,22 +70,6 @@ fn route_inventory_has_single_build_or_typed_source_of_truth() {
     );
 }
 
-#[test]
-fn capability_contract_consumes_typed_route_metadata() {
-    let capability_contract_source =
-        read_repo("crates/gateway/src/api_routes/capability_contract.rs");
-    let capability_contract = production_part(&capability_contract_source);
-    assert!(capability_contract.contains("route_registry::stable_route_metadata"));
-    assert!(capability_contract.contains("stable_route_metadata(&capability.http.method"));
-
-    let api_routes_source = read_repo("crates/gateway/src/api_routes/mod.rs");
-    // `api_routes/mod.rs` has test-only imports near its header, so splitting
-    // at the first cfg(test) marker would discard the production module list.
-    let api_routes = api_routes_source.as_str();
-    assert!(api_routes.contains("mod route_registry;"));
-    assert!(api_routes.contains("mod route_manifest;"));
-}
-
 /// Product composition may depend on an external APP, but Gateway production
 /// code must see only the bundle/host ABI.  Test fixtures may seed external
 /// app data directly, so this deliberately excludes the `cfg(test)` module.

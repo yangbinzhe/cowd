@@ -1999,10 +1999,10 @@ mod generic_catalog_tests {
                 },
                 AuthorizationProfile {
                     id: "core_manager".to_string(),
-                    capabilities: vec![
-                        "approval.respond".to_string(),
-                        "definition.manage".to_string(),
-                    ],
+                    capabilities: CORE_HUMAN_CAPABILITIES
+                        .iter()
+                        .map(|capability| (*capability).to_string())
+                        .collect(),
                 },
             ],
             apps: vec![AuthorizationAppProfileCatalog {
@@ -2124,6 +2124,35 @@ mod generic_catalog_tests {
             vec!["workbench.webui.manage".to_string()],
         )
         .is_ok());
+    }
+
+    #[test]
+    fn empty_surface_request_projects_the_broker_owned_surface_catalog() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-auth-surface-catalog-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let catalog = fixture_catalog();
+        let authority = LocalAuthority::open_or_initialize(&root, "credential", catalog.clone())
+            .expect("authority");
+        let (principal, entitlement) = authority
+            .issue_human_principal_for_surface("credential", "webui", Vec::new(), None)
+            .expect("empty request resolves through broker catalogue");
+        let mut projected = entitlement
+            .granted
+            .iter()
+            .chain(&entitlement.denied)
+            .cloned()
+            .collect::<Vec<_>>();
+        projected.sort();
+        projected.dedup();
+        assert_eq!(projected, catalog.surface_capabilities("webui"));
+        assert_eq!(principal.claims.capabilities, entitlement.granted);
+        assert!(entitlement.granted.contains(&"workbench.read".to_string()));
+        assert!(!entitlement
+            .granted
+            .contains(&"workbench.manage".to_string()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

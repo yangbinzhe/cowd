@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::measurement::start_first_delta_observer;
+use crate::{measurement::start_first_delta_observer, session_actor::SessionActor};
 
 pub const AUTO_STRATEGY_SEED: u64 = 20_260_716;
 pub const DEFAULT_MAX_TOKENS: u64 = 20_000_000;
@@ -1182,22 +1182,20 @@ fn run_sample(
                 .replace("{{EXPECTED_CONTENT}}", &prepared.expected_content)
         },
     );
-    let session = match post_json(
+    let actor = SessionActor::create(
         client,
         endpoint,
-        "/api/sessions",
-        json!({"model": options.provider}),
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            sample.error = Some(format!("create_session:{error}"));
-            return sample;
-        }
-    };
-    let Some(session_id) = extract_string(&session, &["session_id", "id"]) else {
-        sample.error = Some("create_session:missing_session_id".to_string());
+        Some(&options.provider),
+        &format!("harness-eval-auto-{}", condition.as_str()),
+    );
+    let Ok(mut actor) = actor else {
+        sample.error = Some(format!(
+            "create_session:{}",
+            actor.err().unwrap_or_default()
+        ));
         return sample;
     };
+    let session_id = actor.session_id().to_string();
     sample.session_id = Some(session_id.clone());
     let ttft_observer = match start_first_delta_observer(client, endpoint, &session_id) {
         Ok(observer) => observer,
@@ -1227,9 +1225,7 @@ fn run_sample(
         }),
         effective_prompt
     );
-    let admission = match post_json(
-        client,
-        endpoint,
+    let admission = match actor.post_mutation(
         &format!("/api/sessions/{session_id}/messages"),
         json!({
             "content": controlled_prompt,
@@ -1371,7 +1367,7 @@ fn run_sample(
             if let Err(error) = cancel_and_wait_for_terminal(
                 client,
                 endpoint,
-                &session_id,
+                &mut actor,
                 &graph_id,
                 options.poll_interval,
             ) {
@@ -1421,6 +1417,12 @@ fn run_sample(
             }
         }
     }
+    if let Err(error) = actor.finish() {
+        sample.error = Some(format!("session_actor_cleanup:{error}"));
+        if sample.status == "completed" {
+            sample.status = "failed".to_string();
+        }
+    }
     sample
 }
 
@@ -1442,17 +1444,16 @@ fn clear_recovered_poll_error(sample: &mut Sample, recovered_prefixes: &[&str]) 
 fn cancel_and_wait_for_terminal(
     client: &Client,
     endpoint: &str,
-    session_id: &str,
+    actor: &mut SessionActor<'_>,
     graph_id: &str,
     poll_interval: Duration,
 ) -> Result<(), String> {
-    post_json(
-        client,
-        endpoint,
-        &format!("/api/sessions/{session_id}/cancel"),
-        json!({"reason": "auto-strategy evaluator timeout isolation"}),
-    )
-    .map_err(|error| format!("cancel timed-out session: {error}"))?;
+    actor
+        .post_mutation(
+            &format!("/api/sessions/{}/cancel", actor.session_id()),
+            json!({"reason": "auto-strategy evaluator timeout isolation"}),
+        )
+        .map_err(|error| format!("cancel timed-out session: {error}"))?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let projection = get_json(
@@ -2732,16 +2733,6 @@ fn exact_model_revisions(observed: &[String], requested: &str) -> bool {
     !observed.is_empty() && observed.iter().all(|model| model == requested)
 }
 
-fn post_json(client: &Client, base: &str, path: &str, body: Value) -> Result<Value, String> {
-    response_json(
-        client
-            .post(format!("{base}{path}"))
-            .json(&body)
-            .send()
-            .map_err(|error| error.to_string())?,
-    )
-}
-
 fn get_json(client: &Client, base: &str, path: &str) -> Result<Value, String> {
     response_json(
         client
@@ -2758,12 +2749,6 @@ fn response_json(response: reqwest::blocking::Response) -> Result<Value, String>
         return Err(format!("HTTP {status}: {text}"));
     }
     serde_json::from_str(&text).map_err(|error| format!("{error}: {text}"))
-}
-
-fn extract_string(value: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .map(str::to_string)
 }
 
 fn latest_assistant_text(value: &Value) -> Option<String> {

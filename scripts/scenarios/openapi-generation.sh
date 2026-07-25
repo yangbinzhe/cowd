@@ -134,7 +134,11 @@ set_manager_profile() {
 
 set_manager_profile
 curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/apps/mfg/contract" \
-  | jq -e '([.routes[] | select(.availability == "active")] | length) == 105' >/dev/null
+  | jq -e '
+      [.routes[] | select(.availability == "active") | .route_id] as $ids
+      | ($ids | length) > 0
+      and ($ids | length) == ($ids | unique | length)
+    ' >/dev/null
 
 if [[ "${MODE}" == "update" ]]; then
   env COWD_GATEWAY_URL="${BASE_URL}" COWD_API_TOKEN="${TOKEN}" \

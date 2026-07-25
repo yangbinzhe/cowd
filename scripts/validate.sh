@@ -255,6 +255,7 @@ run_release() {
   run_step artifact_report bash scripts/release/report-artifacts.sh "$install_dir" "$REPORT_DIR/artifacts.md"
   run_step setup_smoke bash -lc '"$COWD_BIN" --version && "$COWD_BIN" doctor'
   run_step full_product_smoke timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/full-product-smoke.sh "$install_dir"
+  run_step openapi_generation timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/openapi-generation.sh check
   run_step tui_daemon_attach timeout "${COWD_RELEASE_STEP_TIMEOUT_SECS:-240}" bash scripts/scenarios/tui-daemon-attach.sh
 }
 

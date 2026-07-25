@@ -40,17 +40,22 @@ async fn send_message_posts_json_and_parses_response() {
     );
     let server = spawn_server(
         state.clone(),
-        vec![http_response("200 OK", "application/json", body)],
+        vec![
+            count_tokens_response(16),
+            http_response("200 OK", "application/json", body),
+        ],
     )
     .await;
 
     let client = ApiClient::new("test-key")
         .with_auth_token(Some("proxy-token".to_string()))
-        .with_base_url(server.base_url());
+        .with_base_url(server.base_url())
+        .with_retry_policy(0, Duration::ZERO, Duration::ZERO);
     let response = client
         .send_message(&sample_request(false))
         .await
         .expect("request should succeed");
+    drop(server);
 
     assert_eq!(response.id, "msg_test");
     assert_eq!(response.total_tokens(), 16);
@@ -65,7 +70,9 @@ async fn send_message_posts_json_and_parses_response() {
     );
 
     let captured = state.lock().await;
-    let request = captured.first().expect("server should capture request");
+    let request = captured
+        .last()
+        .expect("server should capture message request");
     assert_eq!(request.method, "POST");
     assert_eq!(request.path, "/v1/messages");
     assert_eq!(
@@ -131,6 +138,7 @@ async fn send_message_blocks_oversized_requests_before_the_http_call() {
         })
         .await
         .expect_err("oversized request should fail local context-window preflight");
+    drop(server);
 
     assert!(matches!(error, ApiError::ContextWindowExceeded { .. }));
     assert!(
@@ -144,29 +152,33 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
         state.clone(),
-        vec![http_response_with_headers(
-            "200 OK",
-            "application/json",
-            concat!(
-                "{",
-                "\"id\":\"msg_profile\",",
-                "\"type\":\"message\",",
-                "\"role\":\"assistant\",",
-                "\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],",
-                "\"model\":\"claude-3-7-sonnet-latest\",",
-                "\"stop_reason\":\"end_turn\",",
-                "\"stop_sequence\":null,",
-                "\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3,\"output_tokens\":1}",
-                "}"
+        vec![
+            count_tokens_response(7),
+            http_response_with_headers(
+                "200 OK",
+                "application/json",
+                concat!(
+                    "{",
+                    "\"id\":\"msg_profile\",",
+                    "\"type\":\"message\",",
+                    "\"role\":\"assistant\",",
+                    "\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],",
+                    "\"model\":\"claude-3-7-sonnet-latest\",",
+                    "\"stop_reason\":\"end_turn\",",
+                    "\"stop_sequence\":null,",
+                    "\"usage\":{\"input_tokens\":1,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3,\"output_tokens\":1}",
+                    "}"
+                ),
+                &[("request-id", "req_profile_123")],
             ),
-            &[("request-id", "req_profile_123")],
-        )],
+        ],
     )
     .await;
     let sink = Arc::new(MemoryTelemetrySink::default());
 
     let client = AnthropicClient::new("test-key")
         .with_base_url(server.base_url())
+        .with_retry_policy(0, Duration::ZERO, Duration::ZERO)
         .with_client_identity(ClientIdentity::new("claude-code", "9.9.9").with_runtime("rust-cli"))
         .with_beta("tools-2026-04-01")
         .with_extra_body_param("metadata", json!({"source": "cowd-code"}))
@@ -176,11 +188,14 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
         .send_message(&sample_request(false))
         .await
         .expect("request should succeed");
+    drop(server);
 
     assert_eq!(response.request_id.as_deref(), Some("req_profile_123"));
 
     let captured = state.lock().await;
-    let request = captured.first().expect("server should capture request");
+    let request = captured
+        .last()
+        .expect("server should capture message request");
     assert_eq!(
         request.headers.get("anthropic-beta").map(String::as_str),
         Some("claude-code-20250219,prompt-caching-scope-2026-01-05,tools-2026-04-01")
@@ -257,15 +272,21 @@ async fn send_message_parses_prompt_cache_token_usage_from_response() {
     );
     let server = spawn_server(
         state,
-        vec![http_response("200 OK", "application/json", body)],
+        vec![
+            count_tokens_response(12),
+            http_response("200 OK", "application/json", body),
+        ],
     )
     .await;
 
-    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    let client = AnthropicClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(0, Duration::ZERO, Duration::ZERO);
     let response = client
         .send_message(&sample_request(false))
         .await
         .expect("request should succeed");
+    drop(server);
 
     assert_eq!(response.usage.input_tokens, 12);
     assert_eq!(response.usage.cache_creation_input_tokens, 321);
@@ -291,16 +312,22 @@ async fn given_empty_usage_object_when_send_message_parses_response_then_usage_d
     );
     let server = spawn_server(
         state,
-        vec![http_response("200 OK", "application/json", body)],
+        vec![
+            count_tokens_response(0),
+            http_response("200 OK", "application/json", body),
+        ],
     )
     .await;
-    let client = AnthropicClient::new("test-key").with_base_url(server.base_url());
+    let client = AnthropicClient::new("test-key")
+        .with_base_url(server.base_url())
+        .with_retry_policy(0, Duration::ZERO, Duration::ZERO);
 
     // when
     let response = client
         .send_message(&sample_request(false))
         .await
         .expect("response with empty usage object should still parse");
+    drop(server);
 
     // then
     assert_eq!(response.id, "msg_empty_usage");
@@ -331,18 +358,22 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     );
     let server = spawn_server(
         state.clone(),
-        vec![http_response_with_headers(
-            "200 OK",
-            "text/event-stream",
-            sse,
-            &[("request-id", "req_stream_456")],
-        )],
+        vec![
+            count_tokens_response(8),
+            http_response_with_headers(
+                "200 OK",
+                "text/event-stream",
+                sse,
+                &[("request-id", "req_stream_456")],
+            ),
+        ],
     )
     .await;
 
     let client = ApiClient::new("test-key")
         .with_auth_token(Some("proxy-token".to_string()))
-        .with_base_url(server.base_url());
+        .with_base_url(server.base_url())
+        .with_retry_policy(0, Duration::ZERO, Duration::ZERO);
     let mut stream = client
         .stream_message(&sample_request(false))
         .await
@@ -358,6 +389,7 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     {
         events.push(event);
     }
+    drop(server);
 
     assert_eq!(events.len(), 6);
     assert!(matches!(events[0], StreamEvent::MessageStart(_)));
@@ -394,7 +426,9 @@ async fn stream_message_parses_sse_events_with_tool_use() {
     }
 
     let captured = state.lock().await;
-    let request = captured.first().expect("server should capture request");
+    let request = captured
+        .last()
+        .expect("server should capture message request");
     assert!(request.body.contains("\"stream\":true"));
 }
 
@@ -404,6 +438,7 @@ async fn retries_retryable_failures_before_succeeding() {
     let server = spawn_server(
         state.clone(),
         vec![
+            count_tokens_response(3),
             http_response(
                 "429 Too Many Requests",
                 "application/json",
@@ -426,9 +461,18 @@ async fn retries_retryable_failures_before_succeeding() {
         .send_message(&sample_request(false))
         .await
         .expect("retry should eventually succeed");
+    drop(server);
 
     assert_eq!(response.total_tokens(), 5);
-    assert_eq!(state.lock().await.len(), 2);
+    assert_eq!(
+        state
+            .lock()
+            .await
+            .iter()
+            .filter(|request| request.path == "/v1/messages")
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -436,11 +480,14 @@ async fn provider_client_dispatches_anthropic_requests() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
         state.clone(),
-        vec![http_response(
-            "200 OK",
-            "application/json",
-            "{\"id\":\"msg_provider\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Dispatched\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
-        )],
+        vec![
+            count_tokens_response(3),
+            http_response(
+                "200 OK",
+                "application/json",
+                "{\"id\":\"msg_provider\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Dispatched\"}],\"model\":\"claude-3-7-sonnet-latest\",\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":2}}",
+            ),
+        ],
     )
     .await;
 
@@ -451,7 +498,11 @@ async fn provider_client_dispatches_anthropic_requests() {
     .expect("anthropic provider client should be constructed");
     let client = match client {
         ProviderClient::Anthropic(client) => {
-            ProviderClient::Anthropic(client.with_base_url(server.base_url()))
+            ProviderClient::Anthropic(client.with_base_url(server.base_url()).with_retry_policy(
+                0,
+                Duration::ZERO,
+                Duration::ZERO,
+            ))
         }
         other => panic!("expected anthropic provider, got {other:?}"),
     };
@@ -460,11 +511,14 @@ async fn provider_client_dispatches_anthropic_requests() {
         .send_message(&sample_request(false))
         .await
         .expect("provider-dispatched request should succeed");
+    drop(server);
 
     assert_eq!(response.total_tokens(), 5);
 
     let captured = state.lock().await;
-    let request = captured.first().expect("server should capture request");
+    let request = captured
+        .last()
+        .expect("server should capture message request");
     assert_eq!(request.path, "/v1/messages");
     assert_eq!(
         request.headers.get("x-api-key").map(String::as_str),
@@ -478,6 +532,7 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
     let server = spawn_server(
         state.clone(),
         vec![
+            count_tokens_response(3),
             http_response(
                 "503 Service Unavailable",
                 "application/json",
@@ -500,6 +555,7 @@ async fn surfaces_retry_exhaustion_for_persistent_retryable_errors() {
         .send_message(&sample_request(false))
         .await
         .expect_err("persistent 503 should fail");
+    drop(server);
 
     match error {
         ApiError::RetriesExhausted {
@@ -526,6 +582,7 @@ async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter
     let server = spawn_server(
         state.clone(),
         vec![
+            count_tokens_response(3),
             http_response(
                 "429 Too Many Requests",
                 "application/json",
@@ -569,11 +626,17 @@ async fn retries_multiple_retryable_failures_with_exponential_backoff_and_jitter
         .send_message(&sample_request(false))
         .await
         .expect("8-retry policy should absorb 5 retryable failures");
+    drop(server);
 
     let elapsed = started_at.elapsed();
     assert_eq!(response.total_tokens(), 5);
     assert_eq!(
-        state.lock().await.len(),
+        state
+            .lock()
+            .await
+            .iter()
+            .filter(|request| request.path == "/v1/messages")
+            .count(),
         6,
         "client should issue 1 original + 5 retry requests before the 200"
     );
@@ -732,6 +795,14 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 
 fn http_response(status: &str, content_type: &str, body: &str) -> String {
     http_response_with_headers(status, content_type, body, &[])
+}
+
+fn count_tokens_response(input_tokens: u32) -> String {
+    http_response(
+        "200 OK",
+        "application/json",
+        &serde_json::json!({"input_tokens": input_tokens}).to_string(),
+    )
 }
 
 fn http_response_with_headers(
