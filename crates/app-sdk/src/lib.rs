@@ -17,10 +17,10 @@ use thiserror::Error;
 mod execution;
 
 pub use execution::{
-    ApplicationExecutionCounterV1, ApplicationExecutionKind, ApplicationExecutionOutcomeIntentV1,
-    ApplicationExecutionOutcomeReceiptV1, ApplicationExecutionOutcomeV1, ApplicationExecutionRefV1,
-    ApplicationExecutionStatus, APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1,
-    APPLICATION_EXECUTION_OUTCOME_VERSION,
+    ApplicationExecutionCounterV1, ApplicationExecutionIdempotencyKeyV1, ApplicationExecutionKind,
+    ApplicationExecutionOutcomeIntentV1, ApplicationExecutionOutcomeReceiptV1,
+    ApplicationExecutionOutcomeV1, ApplicationExecutionRefV1, ApplicationExecutionStatus,
+    APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1, APPLICATION_EXECUTION_OUTCOME_VERSION,
 };
 
 pub const SDK_API_VERSION: u32 = 1;
@@ -779,11 +779,27 @@ pub enum AppContractError {
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum AppHostConflict {
+    #[error(
+        "idempotency conflict in {namespace} for producer `{producer_id}`, contract v{contract_version}, outcome `{outcome_id}`"
+    )]
+    Idempotency {
+        namespace: String,
+        key: String,
+        producer_id: String,
+        contract_version: u16,
+        outcome_id: String,
+    },
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AppHostError {
     #[error("host port unavailable: {0}")]
     Unavailable(String),
     #[error("host denied request: {0}")]
     Denied(String),
+    #[error("host request conflict: {0}")]
+    Conflict(AppHostConflict),
     #[error("host request failed: {0}")]
     Failed(String),
 }
@@ -791,6 +807,31 @@ pub enum AppHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_idempotency_conflict_is_typed_and_carries_stable_identity() {
+        let error = AppHostError::Conflict(AppHostConflict::Idempotency {
+            namespace: "session_domain_event".to_string(),
+            key: "application-execution:v1:fixture".to_string(),
+            producer_id: "app:mfg".to_string(),
+            contract_version: 1,
+            outcome_id: "outcome-1".to_string(),
+        });
+
+        assert!(matches!(
+            error,
+            AppHostError::Conflict(AppHostConflict::Idempotency {
+                namespace,
+                key,
+                producer_id,
+                contract_version: 1,
+                outcome_id,
+            }) if namespace == "session_domain_event"
+                && key == "application-execution:v1:fixture"
+                && producer_id == "app:mfg"
+                && outcome_id == "outcome-1"
+        ));
+    }
 
     #[test]
     fn descriptor_rejects_non_app_route_and_wrong_sdk() {

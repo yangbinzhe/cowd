@@ -7,6 +7,7 @@ pub const APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1: &str =
     "cowd.work_context.append_application_execution_outcome.v1";
 
 const MAX_ID_BYTES: usize = 256;
+const MAX_PRODUCER_ID_BYTES: usize = 256;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_REFS: usize = 128;
@@ -134,6 +135,65 @@ impl ApplicationExecutionOutcomeV1 {
         }
         Ok(())
     }
+
+    /// Return the canonical durable representation used for semantic replay
+    /// comparison. Reference and counter collections are sets of observations,
+    /// not ordered execution steps, so their transport order must not turn an
+    /// otherwise identical retry into an idempotency conflict.
+    pub fn normalized(&self) -> Result<Self, AppContractError> {
+        self.validate()?;
+        let mut normalized = self.clone();
+        normalized.refs.sort_by(|left, right| {
+            (&left.ref_type, &left.id, &left.label).cmp(&(&right.ref_type, &right.id, &right.label))
+        });
+        normalized.evidence_refs.sort();
+        normalized.metric_refs.sort();
+        normalized
+            .counters
+            .sort_by(|left, right| (&left.name, left.value).cmp(&(&right.name, right.value)));
+        Ok(normalized)
+    }
+}
+
+/// Host-created idempotency identity for an APP execution outcome.
+///
+/// `producer_id` is deliberately absent from
+/// [`ApplicationExecutionOutcomeIntentV1`]. Applications can submit an
+/// outcome, but only Gateway/Host can bind the authenticated producer before
+/// asking SessionService to persist it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationExecutionIdempotencyKeyV1 {
+    pub producer_id: String,
+    pub contract_version: u16,
+    pub outcome_id: String,
+}
+
+impl ApplicationExecutionIdempotencyKeyV1 {
+    pub fn new(
+        producer_id: impl Into<String>,
+        outcome: &ApplicationExecutionOutcomeV1,
+    ) -> Result<Self, AppContractError> {
+        outcome.validate()?;
+        let producer_id = producer_id.into();
+        validate_required("producer_id", &producer_id, MAX_PRODUCER_ID_BYTES)?;
+        Ok(Self {
+            producer_id,
+            contract_version: outcome.contract_version,
+            outcome_id: outcome.outcome_id.clone(),
+        })
+    }
+
+    /// Collision-free, bounded encoding of
+    /// `producer + contract_version + outcome_id`.
+    #[must_use]
+    pub fn event_id(&self) -> String {
+        format!(
+            "application-execution:v{}:p{}:o{}",
+            self.contract_version,
+            hex_component(&self.producer_id),
+            hex_component(&self.outcome_id)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +224,16 @@ fn validate_required(field: &str, value: &str, max_bytes: usize) -> Result<(), A
         ));
     }
     Ok(())
+}
+
+fn hex_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(value.len().saturating_mul(2));
+    for byte in value.as_bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 #[cfg(test)]
@@ -225,5 +295,46 @@ mod tests {
             "payload": {}
         });
         assert!(serde_json::from_value::<ApplicationExecutionOutcomeReceiptV1>(invalid).is_err());
+    }
+
+    #[test]
+    fn host_idempotency_key_is_producer_scoped_and_unambiguous() {
+        let left = ApplicationExecutionIdempotencyKeyV1::new("app:app-a", &outcome()).unwrap();
+        let right = ApplicationExecutionIdempotencyKeyV1::new("app:app-b", &outcome()).unwrap();
+        assert_ne!(left.event_id(), right.event_id());
+
+        let retry = ApplicationExecutionIdempotencyKeyV1::new("app:app-a", &outcome()).unwrap();
+        assert_eq!(left.event_id(), retry.event_id());
+        assert!(ApplicationExecutionIdempotencyKeyV1::new("", &outcome()).is_err());
+    }
+
+    #[test]
+    fn normalization_removes_collection_transport_order_only() {
+        let mut reordered = outcome();
+        reordered.refs.push(ApplicationExecutionRefV1 {
+            ref_type: "artifact".to_string(),
+            id: "artifact-2".to_string(),
+            label: Some("Artifact".to_string()),
+        });
+        reordered
+            .evidence_refs
+            .push("receipt://action-2".to_string());
+        reordered
+            .metric_refs
+            .push("metric://throughput".to_string());
+        reordered.counters.push(ApplicationExecutionCounterV1 {
+            name: "warnings".to_string(),
+            value: 1,
+        });
+        let first = reordered.normalized().unwrap();
+        reordered.refs.reverse();
+        reordered.evidence_refs.reverse();
+        reordered.metric_refs.reverse();
+        reordered.counters.reverse();
+        assert_eq!(first, reordered.normalized().unwrap());
+
+        let mut changed = outcome();
+        changed.summary.push_str(" changed");
+        assert_ne!(first, changed.normalized().unwrap());
     }
 }
