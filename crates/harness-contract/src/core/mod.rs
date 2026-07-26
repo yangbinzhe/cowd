@@ -60,6 +60,27 @@ pub enum TaskRisk {
     Critical,
 }
 
+/// Evidence quality for a measured or estimated control signal.
+///
+/// Unknown values remain explicit so callers cannot accidentally treat a
+/// missing observation as a zero-cost or zero-risk measurement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasureProvenance {
+    Observed,
+    Calibrated,
+    Assumed,
+    #[default]
+    Unknown,
+}
+
+impl MeasureProvenance {
+    #[must_use]
+    pub const fn supports_automatic_optimization(self) -> bool {
+        matches!(self, Self::Observed | Self::Calibrated)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPattern {

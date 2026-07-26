@@ -690,6 +690,7 @@ where
             turn_transcript_start,
             session_id: session_id.clone(),
             goal_id: String::new(),
+            context_window: 0,
             safety_lease: crate::execution_core::SafetyFusePolicy::derive(
                 0,
                 harness_contract::core::TaskComplexity::Simple,
@@ -808,6 +809,7 @@ where
         let compile_target = strategy.decision.compile_target;
         {
             let mut graph_state = state.lock().await;
+            graph_state.context_window = context_window;
             graph_state.safety_lease = crate::execution_core::SafetyFusePolicy::derive(
                 context_window,
                 strategy.decision.complexity(),
@@ -1580,7 +1582,7 @@ fn turn_strategy_resource_snapshot(
             },
         ),
         sample_count: 1,
-        assumed: false,
+        provenance: harness_contract::core::MeasureProvenance::Observed,
     })
 }
 
@@ -2469,8 +2471,15 @@ fn best_non_team_strategy(
         .filter(|estimate| {
             estimate.eligible
                 && estimate.candidate != harness_contract::strategy::ExecutionCandidateKind::Team
+                && estimate.duration_provenance != harness_contract::MeasureProvenance::Unknown
         })
-        .max_by_key(|estimate| estimate.net_benefit_score)
+        .min_by_key(|estimate| {
+            (
+                estimate.effective_duration_ms(),
+                estimate.context_duplication_tokens,
+                estimate.candidate,
+            )
+        })
         .map_or(
             harness_contract::strategy::ExecutionCandidateKind::Direct,
             |estimate| estimate.candidate,
@@ -2606,6 +2615,7 @@ struct TurnGraphState {
     turn_transcript_start: usize,
     session_id: String,
     goal_id: String,
+    context_window: u32,
     safety_lease: crate::execution_core::ExecutionBudgetLease,
     terminal_override: Option<(GoalCompletion, String)>,
     last_verified_progress: bool,
@@ -3130,27 +3140,6 @@ where
                         },
                     });
                 }
-                let provider_tokens_per_second = (step.wall_duration_ms > 0).then(|| {
-                    u32::try_from(
-                        u64::from(step.usage.output_tokens)
-                            .saturating_mul(1_000)
-                            .saturating_div(step.wall_duration_ms),
-                    )
-                    .unwrap_or(u32::MAX)
-                });
-                let context_pressure = context_pressure_basis_points(
-                    u64::from(step.usage.input_tokens),
-                    state.safety_lease.context_window,
-                );
-                state.safety_lease = crate::execution_core::SafetyFusePolicy::refresh(
-                    &state.safety_lease,
-                    crate::execution_core::SafetyFuseSignals {
-                        provider_tokens_per_second,
-                        resource_pressure_basis_points: u16::try_from(context_pressure)
-                            .unwrap_or(u16::MAX),
-                        novelty: if step.usage.output_tokens > 0 { 70 } else { 0 },
-                    },
-                );
                 state
                     .assistant_messages
                     .push(step.assistant_message.clone());
@@ -3325,31 +3314,29 @@ where
                         ("output_tokens".to_string(), usage.output_tokens as i64),
                         ("duration_ms".to_string(), usage.duration_ms as i64),
                     ]),
-                    progress_delta: i32::from(usage.output_tokens > 0),
-                    novelty: if usage.output_tokens > 0 { 70 } else { 0 },
+                    // Provider transport completion is not business progress
+                    // or new evidence. V602 replaces these compatibility
+                    // fields with typed provider observations.
+                    progress_delta: 0,
+                    novelty: 0,
                 };
-                let context_pressure_basis_points = context_pressure_basis_points(
-                    usage.input_tokens,
-                    state.safety_lease.context_window,
-                );
+                let context_pressure_basis_points =
+                    context_pressure_basis_points(usage.input_tokens, state.context_window);
                 let context_observation = RuntimeObservation {
                     goal_id: goal_id.clone(),
                     kind: RuntimeObservationKind::ContextPressure,
                     source: "runtime.context_ledger".to_string(),
                     summary: format!(
                         "model request consumed {} input tokens against a {} token context window",
-                        usage.input_tokens, state.safety_lease.context_window
+                        usage.input_tokens, state.context_window
                     ),
                     fingerprint: Some(format!(
                         "context-pressure:{}:{}",
-                        state.safety_lease.context_window, context_pressure_basis_points
+                        state.context_window, context_pressure_basis_points
                     )),
                     evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
                     metrics: BTreeMap::from([
-                        (
-                            "context_window".to_string(),
-                            state.safety_lease.context_window as i64,
-                        ),
+                        ("context_window".to_string(), state.context_window as i64),
                         ("input_tokens".to_string(), usage.input_tokens as i64),
                         (
                             "pressure_basis_points".to_string(),
@@ -6723,14 +6710,6 @@ fn terminal_recovery_retry_budget(lease: &crate::execution_core::ExecutionBudget
         TaskComplexity::Moderate => 2,
         TaskComplexity::Complex | TaskComplexity::Strategic => 3,
     };
-    if lease.resource_pressure_basis_points >= 8_500 {
-        retries = retries.min(1);
-    } else if lease
-        .provider_tokens_per_second
-        .is_some_and(|tokens_per_second| (1..12).contains(&tokens_per_second))
-    {
-        retries = retries.saturating_add(1).min(4);
-    }
     if lease.explicit_user_limit.is_some_and(|limit| limit <= 2) {
         retries = retries.min(1);
     }
@@ -10947,7 +10926,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_recovery_budget_tracks_runtime_lease_conditions() {
+    fn terminal_recovery_budget_tracks_complexity_and_explicit_limit() {
         use harness_contract::core::TaskComplexity;
 
         let simple =
@@ -10957,10 +10936,6 @@ mod tests {
             TaskComplexity::Strategic,
             None,
         );
-        let pressured = crate::execution_core::ExecutionBudgetLease {
-            resource_pressure_basis_points: 9_000,
-            ..strategic.clone()
-        };
         let constrained = crate::execution_core::ExecutionBudgetLease {
             explicit_user_limit: Some(2),
             ..strategic.clone()
@@ -10968,7 +10943,6 @@ mod tests {
 
         assert_eq!(terminal_recovery_retry_budget(&simple), 1);
         assert_eq!(terminal_recovery_retry_budget(&strategic), 3);
-        assert_eq!(terminal_recovery_retry_budget(&pressured), 1);
         assert_eq!(terminal_recovery_retry_budget(&constrained), 1);
     }
 

@@ -34,10 +34,14 @@
       "provider_concurrency_penalty_bp": 0,
       "risk_approval_penalty_bp": 0,
       "expected_quality_lift_bp": 0,
-      "net_benefit_score": 0,
-      "calibration_source": "strategy-experience-store:paired-and-absolute-cost:v1",
-      "calibration_sample_count": 18,
-      "assumed": false,
+      "duration_calibration_source": "strategy-experience-store:paired-and-absolute-cost:v1",
+      "duration_sample_count": 18,
+      "quality_calibration_source": "",
+      "quality_sample_count": 0,
+      "duration_provenance": "calibrated",
+      "token_provenance": "assumed",
+      "quality_provenance": "unknown",
+      "risk_provenance": "assumed",
       "reasons": [
         "eligible baseline"
       ]
@@ -54,10 +58,14 @@
       "provider_concurrency_penalty_bp": 200,
       "risk_approval_penalty_bp": 0,
       "expected_quality_lift_bp": 500,
-      "net_benefit_score": 4300,
-      "calibration_source": "strategy-experience-store:paired-and-absolute-cost:v1",
-      "calibration_sample_count": 18,
-      "assumed": false,
+      "duration_calibration_source": "strategy-experience-store:paired-and-absolute-cost:v1",
+      "duration_sample_count": 18,
+      "quality_calibration_source": "assumed-policy-v1",
+      "quality_sample_count": 0,
+      "duration_provenance": "calibrated",
+      "token_provenance": "assumed",
+      "quality_provenance": "assumed",
+      "risk_provenance": "assumed",
       "reasons": [
         "parallel tool lanes reduce the critical path"
       ]
@@ -74,10 +82,14 @@
       "provider_concurrency_penalty_bp": 300,
       "risk_approval_penalty_bp": 0,
       "expected_quality_lift_bp": 1800,
-      "net_benefit_score": 7600,
-      "calibration_source": "strategy-experience-store:paired-and-absolute-cost:v1",
-      "calibration_sample_count": 18,
-      "assumed": false,
+      "duration_calibration_source": "strategy-experience-store:paired-and-absolute-cost:v1",
+      "duration_sample_count": 18,
+      "quality_calibration_source": "strategy-experience-store:paired-quality-lift:v1",
+      "quality_sample_count": 18,
+      "duration_provenance": "calibrated",
+      "token_provenance": "assumed",
+      "quality_provenance": "calibrated",
+      "risk_provenance": "assumed",
       "reasons": [
         "independent evidence scopes improve coverage",
         "coordination and merge cost are included"
@@ -142,10 +154,14 @@
     "provider_concurrency_penalty_bp": 300,
     "risk_approval_penalty_bp": 0,
     "expected_quality_lift_bp": 1800,
-    "net_benefit_score": 7600,
-    "calibration_source": "strategy-experience-store:paired-and-absolute-cost:v1",
-    "calibration_sample_count": 18,
-    "assumed": false,
+    "duration_calibration_source": "strategy-experience-store:paired-and-absolute-cost:v1",
+    "duration_sample_count": 18,
+    "quality_calibration_source": "strategy-experience-store:paired-quality-lift:v1",
+    "quality_sample_count": 18,
+    "duration_provenance": "calibrated",
+    "token_provenance": "assumed",
+    "quality_provenance": "calibrated",
+    "risk_provenance": "assumed",
     "reasons": [
       "independent evidence scopes improve coverage",
       "coordination and merge cost are included"
@@ -187,7 +203,7 @@
     "provider_concurrency_penalty_bp": 300,
     "sample_source": "runtime-capability-ledger",
     "sample_count": 18,
-    "assumed": false
+    "provenance": "observed"
   },
   "policy_version": "strategy-policy-v1",
   "source": "experience_adapted",

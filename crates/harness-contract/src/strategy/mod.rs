@@ -5,8 +5,8 @@
 //! state; later layers consume its `StrategyDecision`.
 
 use crate::core::{
-    ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, KernelCapability, TaskComplexity,
-    TaskRisk,
+    ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, KernelCapability, MeasureProvenance,
+    TaskComplexity, TaskRisk,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -118,7 +118,7 @@ pub struct StrategyResourceSnapshot {
     pub provider_profile_fingerprint: String,
     pub sample_source: String,
     pub sample_count: u32,
-    pub assumed: bool,
+    pub provenance: MeasureProvenance,
 }
 
 impl Default for StrategyResourceSnapshot {
@@ -135,13 +135,16 @@ impl Default for StrategyResourceSnapshot {
             provider_profile_fingerprint: String::new(),
             sample_source: "assumed-detached-default".to_string(),
             sample_count: 0,
-            assumed: true,
+            provenance: MeasureProvenance::Assumed,
         }
     }
 }
 
-/// Integer-only estimate for one strategy candidate. Milliseconds, tokens and
-/// basis points keep ordering stable across platforms and serializations.
+/// Unit-preserving estimate for one strategy candidate.
+///
+/// Duration, token, quality, and risk fields are intentionally independent.
+/// Selection applies hard gates and lexicographic/Pareto comparisons instead
+/// of adding unlike units into a synthetic score.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionCandidateEstimate {
     pub candidate: ExecutionCandidateKind,
@@ -155,11 +158,35 @@ pub struct ExecutionCandidateEstimate {
     pub provider_concurrency_penalty_bp: u16,
     pub risk_approval_penalty_bp: u16,
     pub expected_quality_lift_bp: i32,
-    pub net_benefit_score: i64,
-    pub calibration_source: String,
-    pub calibration_sample_count: u32,
-    pub assumed: bool,
+    pub duration_calibration_source: String,
+    pub duration_sample_count: u32,
+    pub quality_calibration_source: String,
+    pub quality_sample_count: u32,
+    pub duration_provenance: MeasureProvenance,
+    pub token_provenance: MeasureProvenance,
+    pub quality_provenance: MeasureProvenance,
+    pub risk_provenance: MeasureProvenance,
     pub reasons: Vec<String>,
+}
+
+impl ExecutionCandidateEstimate {
+    #[must_use]
+    pub fn effective_duration_ms(&self) -> u64 {
+        self.estimated_critical_path_ms
+            .saturating_add(self.startup_overhead_ms)
+            .saturating_add(self.merge_cost_ms)
+    }
+
+    #[must_use]
+    pub const fn duration_optimization_ready(&self) -> bool {
+        self.duration_provenance.supports_automatic_optimization()
+            && self.duration_sample_count >= 3
+    }
+
+    #[must_use]
+    pub const fn quality_optimization_ready(&self) -> bool {
+        self.quality_provenance.supports_automatic_optimization() && self.quality_sample_count >= 3
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1680,7 +1707,6 @@ impl StrategyRouter {
                 .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
             {
                 team.eligible = false;
-                team.net_benefit_score = i64::MIN / 2;
                 team.reasons.push(format!(
                     "automatic Team vetoed by workload/profile-scoped negative benefit evidence {}",
                     &observation.report_sha256[..12]
@@ -1695,11 +1721,12 @@ impl StrategyRouter {
             && candidate_estimates.iter().any(|estimate| {
                 estimate.candidate == ExecutionCandidateKind::Team
                     && estimate.eligible
-                    && estimate.assumed
+                    && (!estimate.duration_optimization_ready()
+                        || !estimate.quality_optimization_ready())
             })
         {
             reasons.push(
-                "automatic Team requires observed positive net benefit; heuristic-only estimate is insufficient"
+                "automatic Team requires calibrated or observed topology evidence; heuristic-only estimates are insufficient"
                     .to_string(),
             );
         }
@@ -1744,18 +1771,21 @@ impl StrategyRouter {
         {
             pattern = pattern_for_candidate(selected_candidate, &understanding);
             reasons.push(format!(
-                "integer cost model selected {}",
+                "unit-preserving strategy policy selected {}",
                 selected_candidate.as_str()
             ));
         }
-        let explicit_team_negative_benefit = understanding.requests_multi_agent
+        let explicit_team_cost_warning = understanding.requests_multi_agent
             && selected_candidate == ExecutionCandidateKind::Team
             && candidate_estimates.iter().any(|estimate| {
-                estimate.candidate == ExecutionCandidateKind::Team && estimate.net_benefit_score < 0
+                estimate.candidate == ExecutionCandidateKind::Team
+                    && (estimate.effective_duration_ms() >= estimate.estimated_serial_ms
+                        || !estimate.duration_optimization_ready()
+                        || !estimate.quality_optimization_ready())
             });
-        if pattern == ExecutionPattern::Collaborate && explicit_team_negative_benefit {
+        if pattern == ExecutionPattern::Collaborate && explicit_team_cost_warning {
             reasons.push(
-                "explicit Team override retained despite a negative estimated lift; surface must show the cost warning"
+                "explicit Team override retained despite no measured duration advantage or paired quality proof; surface must show the cost warning"
                     .to_string(),
             );
         }
@@ -1973,12 +2003,31 @@ fn estimate_execution_candidates(
         .into_iter()
         .map(|mut estimate| {
             let cost = trusted_cost(estimate.candidate);
-            estimate.calibration_source = cost.map_or_else(
+            estimate.duration_calibration_source = cost.map_or_else(
                 || "assumed-policy-v1".to_string(),
                 |sample| sample.calibration_source.clone(),
             );
-            estimate.calibration_sample_count = cost.map_or(0, |sample| sample.sample_count);
-            estimate.assumed = cost.is_none();
+            estimate.duration_sample_count = cost.map_or(0, |sample| sample.sample_count);
+            estimate.duration_provenance = cost.map_or(MeasureProvenance::Assumed, |sample| {
+                if sample.sample_count >= 3 {
+                    MeasureProvenance::Calibrated
+                } else {
+                    MeasureProvenance::Observed
+                }
+            });
+            if estimate.candidate == ExecutionCandidateKind::Team {
+                if let Some(sample) =
+                    experience.filter(|sample| sample.multi_agent_lift_sample_count >= 3)
+                {
+                    estimate.quality_provenance = MeasureProvenance::Calibrated;
+                    estimate.quality_sample_count = sample.multi_agent_lift_sample_count;
+                    estimate.quality_calibration_source =
+                        "strategy-experience-store:paired-quality-lift".to_string();
+                } else {
+                    estimate.quality_provenance = MeasureProvenance::Assumed;
+                    estimate.quality_calibration_source = "assumed-policy-v1".to_string();
+                }
+            }
             if cost.is_some() {
                 estimate.reasons.push(
                     "critical path is an observed end-to-end value and is not divided again"
@@ -2005,22 +2054,6 @@ fn candidate_estimate(
     expected_quality_lift_bp: i32,
     reasons: Vec<String>,
 ) -> ExecutionCandidateEstimate {
-    let saved_ms = estimated_serial_ms
-        .saturating_sub(estimated_critical_path_ms)
-        .saturating_sub(startup_overhead_ms)
-        .saturating_sub(merge_cost_ms);
-    let penalty = i64::from(evidence_overlap_penalty_bp)
-        .saturating_add(i64::from(provider_concurrency_penalty_bp))
-        .saturating_add(i64::from(risk_approval_penalty_bp))
-        .saturating_add(i64::try_from(context_duplication_tokens / 4).unwrap_or(i64::MAX));
-    let net_benefit_score = if eligible {
-        i64::try_from(saved_ms)
-            .unwrap_or(i64::MAX)
-            .saturating_add(i64::from(expected_quality_lift_bp).saturating_mul(2))
-            .saturating_sub(penalty)
-    } else {
-        i64::MIN / 2
-    };
     ExecutionCandidateEstimate {
         candidate,
         eligible,
@@ -2033,10 +2066,14 @@ fn candidate_estimate(
         provider_concurrency_penalty_bp,
         risk_approval_penalty_bp,
         expected_quality_lift_bp,
-        net_benefit_score,
-        calibration_source: String::new(),
-        calibration_sample_count: 0,
-        assumed: true,
+        duration_calibration_source: String::new(),
+        duration_sample_count: 0,
+        quality_calibration_source: String::new(),
+        quality_sample_count: 0,
+        duration_provenance: MeasureProvenance::Assumed,
+        token_provenance: MeasureProvenance::Assumed,
+        quality_provenance: MeasureProvenance::Unknown,
+        risk_provenance: MeasureProvenance::Assumed,
         reasons,
     }
 }
@@ -2064,10 +2101,9 @@ fn select_execution_candidate(
                 estimate.candidate
             });
     }
-    // Automatic Team selection is allowed only for a genuinely strategic,
-    // multi-domain task.  A high provider-concurrency penalty is a runtime
-    // capacity fact: it blocks automatic fan-out, but must not erase an
-    // explicit Team request (which is retained with its cost warning).
+    // Automatic Team selection requires a genuinely multi-domain topology and
+    // calibrated evidence. Duration and quality are evaluated in their own
+    // dimensions; neither is converted into a synthetic cross-unit score.
     if (matches!(
         understanding.complexity,
         TaskComplexity::Complex | TaskComplexity::Strategic
@@ -2079,7 +2115,12 @@ fn select_execution_candidate(
             .iter()
             .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
             .filter(|estimate| {
-                estimate.eligible && !estimate.assumed && estimate.net_benefit_score > 0
+                estimate.eligible
+                    && estimate.duration_optimization_ready()
+                    && estimate.quality_optimization_ready()
+                    && estimate.expected_quality_lift_bp > 0
+                    && (estimate.effective_duration_ms() < estimate.estimated_serial_ms
+                        || estimate.expected_quality_lift_bp >= 1_000)
             })
         {
             return team.candidate;
@@ -2094,19 +2135,23 @@ fn select_execution_candidate(
                 estimate.candidate
             });
     }
+    // In the topology-neutral path, compare only Direct and ParallelTools by
+    // effective milliseconds. Context duplication tokens are a stable
+    // secondary preference, followed by the candidate enum for deterministic
+    // Direct-first ties. Team cannot appear here without the calibrated gate
+    // above.
     estimates
         .iter()
-        .filter(|estimate| estimate.eligible)
         .filter(|estimate| {
-            estimate.candidate != ExecutionCandidateKind::Team
-                || (resources.provider_concurrency_penalty_bp < 8_000
-                    && !estimate.assumed
-                    && estimate.net_benefit_score > 0)
+            estimate.eligible
+                && estimate.candidate != ExecutionCandidateKind::Team
+                && estimate.duration_provenance != MeasureProvenance::Unknown
         })
-        .max_by_key(|estimate| {
+        .min_by_key(|estimate| {
             (
-                estimate.net_benefit_score,
-                std::cmp::Reverse(estimate.candidate),
+                estimate.effective_duration_ms(),
+                estimate.context_duplication_tokens,
+                estimate.candidate,
             )
         })
         // No candidate is executable without a provider.  Keep the fallback
@@ -2777,6 +2822,18 @@ mod tests {
 
     fn with_proven_team_benefit(prompt: &str) -> StrategyInput {
         let mut input = StrategyInput::from_prompt(prompt);
+        input.experience = Some(StrategyExperienceSummary {
+            sample_count: 3,
+            success_rate_bp: 10_000,
+            verification_block_rate_bp: 0,
+            context_pressure_rate_bp: 0,
+            multi_agent_lift_rate_bp: 8_000,
+            multi_agent_lift_sample_count: 3,
+            average_duration_ms: 20_000,
+            average_total_tokens: 1_200,
+            average_coordination_cost_ms: 1_000,
+            actual_cost_sample_count: 3,
+        });
         input.candidate_costs.insert(
             ExecutionCandidateKind::Direct,
             StrategyCandidateCostSummary {
@@ -3067,9 +3124,9 @@ mod tests {
             .expect("Team estimate");
 
         assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
-        assert!(team.net_benefit_score < 0);
+        assert!(team.effective_duration_ms() >= team.estimated_serial_ms);
         assert!(decision.reasons.iter().any(|reason| {
-            reason.contains("negative estimated lift")
+            reason.contains("no measured duration advantage or paired quality proof")
                 && reason.contains("surface must show the cost warning")
         }));
     }
@@ -3105,7 +3162,10 @@ mod tests {
             ]
         );
         assert_eq!(decision.resource_snapshot.version, "strategy-resource-v1");
-        assert!(decision.resource_snapshot.assumed);
+        assert_eq!(
+            decision.resource_snapshot.provenance,
+            MeasureProvenance::Assumed
+        );
         assert_eq!(decision.resource_snapshot.sample_count, 0);
     }
 
@@ -3154,10 +3214,10 @@ mod tests {
         assert_eq!(direct.estimated_critical_path_ms, 40_000);
         assert_eq!(team.estimated_critical_path_ms, 30_000);
         assert_ne!(team.estimated_critical_path_ms, 10_000);
-        assert_eq!(direct.calibration_source, "test:direct");
-        assert_eq!(team.calibration_source, "test:team");
-        assert!(parallel.assumed);
-        assert_eq!(parallel.calibration_source, "assumed-policy-v1");
+        assert_eq!(direct.duration_calibration_source, "test:direct");
+        assert_eq!(team.duration_calibration_source, "test:team");
+        assert_eq!(parallel.duration_provenance, MeasureProvenance::Assumed);
+        assert_eq!(parallel.duration_calibration_source, "assumed-policy-v1");
     }
 
     #[test]
@@ -3686,9 +3746,11 @@ mod tests {
         store.record_negative_benefit(observation).unwrap();
 
         let candidate_costs = input.candidate_costs.clone();
+        let positive_experience = input.experience.clone();
         let enriched = |now_ms| {
             let mut enriched = store.enrich_input_at(input.clone(), now_ms);
             enriched.candidate_costs.clone_from(&candidate_costs);
+            enriched.experience.clone_from(&positive_experience);
             enriched
         };
         let vetoed = decide_strategy(&enriched(1_500));
@@ -3727,7 +3789,60 @@ mod tests {
             .iter()
             .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
             .unwrap();
-        assert!(team.assumed);
+        assert_eq!(team.duration_provenance, MeasureProvenance::Assumed);
+        assert_eq!(team.quality_provenance, MeasureProvenance::Assumed);
+    }
+
+    #[test]
+    fn unknown_duration_is_excluded_and_equal_duration_uses_stable_direct_tie_break() {
+        let input = StrategyInput::from_prompt("summarize the current state");
+        let understanding = understand(&input);
+        let resources = StrategyResourceSnapshot::default();
+        let mut direct = candidate_estimate(
+            ExecutionCandidateKind::Direct,
+            true,
+            1_000,
+            1_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+        );
+        direct.duration_provenance = MeasureProvenance::Observed;
+        let mut parallel = candidate_estimate(
+            ExecutionCandidateKind::ParallelTools,
+            true,
+            1_000,
+            1_000,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+        );
+        parallel.duration_provenance = MeasureProvenance::Observed;
+        assert_eq!(
+            select_execution_candidate(
+                &understanding,
+                &[parallel.clone(), direct.clone()],
+                &resources
+            ),
+            ExecutionCandidateKind::Direct
+        );
+
+        parallel.estimated_critical_path_ms = 1;
+        parallel.duration_provenance = MeasureProvenance::Unknown;
+        assert_eq!(
+            select_execution_candidate(&understanding, &[parallel, direct], &resources),
+            ExecutionCandidateKind::Direct
+        );
     }
 
     #[test]

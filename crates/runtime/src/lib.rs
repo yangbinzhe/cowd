@@ -731,10 +731,7 @@ pub use upgrade::{
     UpgradeInventory, UpgradeInventoryCollector, UpgradeMaintenanceSnapshot,
     LEGACY_EXECUTION_IMPORTED, UPGRADE_RECOVERY_REQUIRED,
 };
-pub use usage::{
-    pricing_for_model, ModelPerformanceRegistry, ModelPerformanceStats, ModelRouteCandidate,
-    ModelRouteDecision, ModelRouteIntent, UsageTracker,
-};
+pub use usage::{pricing_for_model, UsageTracker};
 pub use wave::{
     DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig,
     WaveError, WaveExecutor, WaveOrchestrator, WaveResult, WaveStatus, WaveTask,

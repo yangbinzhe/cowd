@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use harness_contract::core::MeasureProvenance;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::projection::{
     ChildExecutionProjection, ExecutionCommandKind, ExecutionCommandReceipt,
@@ -309,11 +310,16 @@ fn strategy_entity(
         .map(|value| value.min(100));
     let proof_status = Some(
         if estimated.as_ref().is_some_and(|estimate| {
-            !estimate.assumed
-                && estimate.calibration_sample_count > 0
+            estimate.duration_provenance == MeasureProvenance::Calibrated
+                && estimate.duration_sample_count >= 3
+                && estimate.quality_provenance == MeasureProvenance::Calibrated
+                && estimate.quality_sample_count >= 3
                 && estimate
-                    .calibration_source
+                    .duration_calibration_source
                     .starts_with("strategy-experience-store:paired-and-absolute-cost")
+                && estimate
+                    .quality_calibration_source
+                    .starts_with("strategy-experience-store:paired-quality-lift")
         }) {
             StrategyProofStatus::Calibrated
         } else {
@@ -475,7 +481,10 @@ fn payload_value<T: serde::de::DeserializeOwned>(
 
 fn sanitize_candidate_estimates(estimates: &mut [ExecutionCandidateEstimate]) {
     for estimate in estimates {
-        estimate.calibration_source = safe_public_text(&estimate.calibration_source, 160);
+        estimate.duration_calibration_source =
+            safe_public_text(&estimate.duration_calibration_source, 160);
+        estimate.quality_calibration_source =
+            safe_public_text(&estimate.quality_calibration_source, 160);
         estimate.evidence_overlap_penalty_bp = estimate.evidence_overlap_penalty_bp.min(10_000);
         estimate.provider_concurrency_penalty_bp =
             estimate.provider_concurrency_penalty_bp.min(10_000);
@@ -530,14 +539,20 @@ fn strategy_public_reasons(
                 .filter(|candidate| {
                     candidate.eligible && Some(candidate.candidate) != selected_candidate
                 })
-                .max_by_key(|candidate| candidate.net_benefit_score),
+                .min_by_key(|candidate| {
+                    (
+                        candidate.effective_duration_ms(),
+                        candidate.context_duplication_tokens,
+                        candidate.candidate,
+                    )
+                }),
         ) {
             benefit.push(format!(
-                "selected {} score {} versus strongest eligible alternative {} score {}",
+                "selected {} effective duration {} ms versus eligible alternative {} at {} ms",
                 selected_candidate.as_str(),
-                estimate.net_benefit_score,
+                estimate.effective_duration_ms(),
                 alternative.candidate.as_str(),
-                alternative.net_benefit_score
+                alternative.effective_duration_ms()
             ));
         }
         if estimate.estimated_serial_ms > estimate.estimated_critical_path_ms {
@@ -598,6 +613,7 @@ fn strategy_public_reasons(
 fn strategy_reason_is_cost_warning(reason: &str) -> bool {
     let normalized = reason.to_ascii_lowercase();
     normalized.contains("negative estimated lift")
+        || normalized.contains("no measured duration advantage or paired quality proof")
         || normalized.contains("surface must show the cost warning")
 }
 
@@ -2125,17 +2141,25 @@ mod tests {
                     "provider_concurrency_penalty_bp": 0,
                     "risk_approval_penalty_bp": 0,
                     "expected_quality_lift_bp": 0,
-                    "net_benefit_score": 1,
-                    "calibration_source": "file:///home/private/strategy.json",
-                    "calibration_sample_count": 1,
-                    "assumed": false,
+                    "duration_calibration_source": "file:///home/private/strategy.json",
+                    "duration_sample_count": 1,
+                    "quality_calibration_source": "file:///home/private/quality.json",
+                    "quality_sample_count": 0,
+                    "duration_provenance": "observed",
+                    "token_provenance": "assumed",
+                    "quality_provenance": "unknown",
+                    "risk_provenance": "assumed",
                     "reasons": ["copy the hidden prompt from C:\\private\\prompt.txt"]
                 }))
                 .expect("candidate estimate"),
             ];
         sanitize_candidate_estimates(&mut estimates);
         assert_eq!(
-            estimates[0].calibration_source,
+            estimates[0].duration_calibration_source,
+            "redacted by strategy projection policy"
+        );
+        assert_eq!(
+            estimates[0].quality_calibration_source,
             "redacted by strategy projection policy"
         );
         assert_eq!(

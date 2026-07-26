@@ -982,27 +982,12 @@ fn backend_capabilities(
 
 fn runtime_model_router_capability() -> Value {
     json!({
-        "owner": "runtime.provider_usage",
-        "registry": "ModelPerformanceRegistry",
-        "decision": "ModelRouteDecision",
-        "intents": ["quick", "standard", "deep", "recovery"],
-        "signals": [
-            "first_token_latency_ms",
-            "wall_tokens_per_second",
-            "active_tokens_per_second",
-            "tokens_per_second",
-            "usage_source",
-            "quality_score",
-            "failure_rate"
-        ],
-        "policies": {
-            "quick": "favor high throughput and low first-token latency for simple or interactive turns",
-            "standard": "balance speed, quality, and reliability for normal turns",
-            "deep": "favor quality and reliability for architecture, refactor, audit, and complex synthesis",
-            "recovery": "favor reliable models after stalled, failed, or repetitive execution"
-        },
-        "telemetry_source": "RunModelTelemetry",
-        "fallback_behavior": "cold-start configured models remain routable even before telemetry samples exist"
+        "owner": "runtime.conversation",
+        "mode": "pinned_primary_ordered_fallbacks",
+        "ordering": ["configured_primary", "configured_fallbacks"],
+        "task_text_affects_order": false,
+        "telemetry": "observability_only",
+        "fallback_behavior": "configured fallbacks are attempted in declared order after primary failure"
     })
 }
 
@@ -1012,7 +997,8 @@ fn runtime_budget_controls(profile: Option<&str>) -> Value {
         "turn": {
             "safety_fuse": {
                 "owner": "runtime.execution_core",
-                "derivation": "provider context, goal complexity, explicit user constraints, progress and evidence novelty",
+                "derivation": "versioned task-complexity safety policy and explicit user upper bound",
+                "runtime_mutable": false,
                 "business_completion_owner": "goal acceptance plus terminal synthesize",
                 "gateway_wall_clock_deadline": false
             },
@@ -1257,12 +1243,10 @@ mod tests {
         assert!(response["execution_decision"]["lease"]["lease_id"].is_string());
         assert!(response["budget_controls"]["turn"]["safety_fuse"].is_object());
         assert_eq!(
-            response["model_router"]["registry"],
-            "ModelPerformanceRegistry"
+            response["model_router"]["mode"],
+            "pinned_primary_ordered_fallbacks"
         );
-        assert!(response["model_router"]["signals"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item == "wall_tokens_per_second")));
+        assert_eq!(response["model_router"]["task_text_affects_order"], false);
         assert!(
             response["strategy"]["current_turn_overrides_conflicting_memory"]
                 .as_bool()

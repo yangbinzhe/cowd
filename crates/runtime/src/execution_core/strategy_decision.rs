@@ -1,5 +1,6 @@
 use harness_contract::core::{
-    ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, TaskComplexity, TaskRisk,
+    ExecutionModifier, ExecutionPattern, ExecutionPolicyGate, MeasureProvenance, TaskComplexity,
+    TaskRisk,
 };
 use harness_contract::strategy::{
     decide_strategy, CollaborationLiftEstimate, ExecutionCandidateKind, StrategyDecision,
@@ -340,7 +341,11 @@ fn build_runtime_execution_decision_inner(
                 "assumed-detached-default".to_string()
             },
             sample_count: u32::from(resource_health.observed),
-            assumed: true,
+            provenance: if resource_health.observed {
+                MeasureProvenance::Observed
+            } else {
+                MeasureProvenance::Assumed
+            },
         };
     }
     input.resource_snapshot.provider_available &= resource_health.provider_available;

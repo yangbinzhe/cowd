@@ -1,6 +1,7 @@
 use harness_contract::projection::{
     ProjectionEntity, StrategyActualStatus, StrategyDecisionProjection, StrategyProofStatus,
 };
+use harness_contract::MeasureProvenance;
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -123,13 +124,16 @@ pub fn strategy_summary_lines(
         return lines;
     }
 
-    let estimate_label = strategy.estimated.as_ref().map_or("unknown", |estimate| {
-        if estimate.assumed {
-            "assumed"
-        } else {
-            "calibrated"
-        }
-    });
+    let estimate_label = strategy.estimated.as_ref().map_or_else(
+        || "unknown".to_string(),
+        |estimate| {
+            format!(
+                "duration {} / quality {}",
+                provenance_label(estimate.duration_provenance),
+                provenance_label(estimate.quality_provenance)
+            )
+        },
+    );
     let proof = match strategy.proof_status {
         Some(StrategyProofStatus::Calibrated) => "paired proof",
         Some(StrategyProofStatus::NotProven) => "not proven",
@@ -166,8 +170,10 @@ pub fn strategy_summary_lines(
 
     let estimated = strategy.estimated.as_ref().map(|estimate| {
         format!(
-            "{}ms / merge {}ms / score {}",
-            estimate.estimated_critical_path_ms, estimate.merge_cost_ms, estimate.net_benefit_score
+            "{}ms effective / {}ms critical / merge {}ms",
+            estimate.effective_duration_ms(),
+            estimate.estimated_critical_path_ms,
+            estimate.merge_cost_ms
         )
     });
     let actual = strategy.actual.as_ref().map(|actual| {
@@ -340,6 +346,15 @@ pub fn strategy_summary_lines(
         }
     }
     lines
+}
+
+const fn provenance_label(provenance: MeasureProvenance) -> &'static str {
+    match provenance {
+        MeasureProvenance::Observed => "observed",
+        MeasureProvenance::Calibrated => "calibrated",
+        MeasureProvenance::Assumed => "assumed",
+        MeasureProvenance::Unknown => "unknown",
+    }
 }
 
 fn labelled_line(label: &'static str, value: &str, color: Color, width: usize) -> Line<'static> {
@@ -528,7 +543,7 @@ mod tests {
 
         assert!(rendered.contains("team / collaborate"));
         assert!(rendered.contains("calibrated · paired proof"));
-        assert!(rendered.contains("Estimate: 48000ms"));
+        assert!(rendered.contains("Estimate: 62000ms effective / 48000ms critical"));
         assert!(rendered.contains("Actual: 51000ms"));
         assert!(rendered.contains("2 lanes / 2 cropped refs"));
         assert!(rendered.contains("Team: team-547 · execution execution-547"));

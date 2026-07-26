@@ -309,7 +309,7 @@ use crate::skill::{
 use crate::tool_invocation::{
     now_ms, ToolFailureKind, ToolInvocationRecord, DEFAULT_OUTPUT_REF_MIN_LINES,
 };
-use crate::usage::{ModelPerformanceRegistry, ModelRouteIntent, UsageTracker};
+use crate::usage::UsageTracker;
 use crate::PromptAssembly;
 use crate::{
     HistoryView, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
@@ -1581,7 +1581,6 @@ pub struct ConversationRuntime<C, T> {
     permission_fingerprint: u64,
     system_prompt: Vec<String>,
     usage_tracker: UsageTracker,
-    model_performance_registry: std::sync::Mutex<ModelPerformanceRegistry>,
     hook_runner: HookRunner,
     cowd_bus: Option<Arc<crate::cowd_event::CowdEventBus>>,
     turn_callback: Option<Arc<TurnCallback>>,
@@ -1898,7 +1897,6 @@ where
             permission_fingerprint,
             system_prompt,
             usage_tracker,
-            model_performance_registry: std::sync::Mutex::new(ModelPerformanceRegistry::new()),
             hook_runner: HookRunner::from_feature_config(feature_config),
             cowd_bus: None,
             turn_callback: None,
@@ -6088,7 +6086,7 @@ where
         estimate_session_tokens(&self.session.blocking_read())
     }
 
-    fn model_candidates_for_turn(&self, user_input: &str) -> Vec<String> {
+    fn model_candidates_for_turn(&self, _user_input: &str) -> Vec<String> {
         let primary = self
             .model
             .as_deref()
@@ -6107,31 +6105,9 @@ where
             fallback_models.retain(|model| model != primary);
         }
 
-        let Ok(registry) = self.model_performance_registry.lock() else {
-            return primary
-                .into_iter()
-                .chain(fallback_models)
-                .collect::<Vec<_>>();
-        };
-        let routable = fallback_models.clone();
-        let decision = registry.route(ModelRouteIntent::from_task(user_input), &routable);
         let mut routed = Vec::with_capacity(fallback_models.len() + usize::from(primary.is_some()));
         if let Some(primary) = primary {
             routed.push(primary);
-        }
-        if routable
-            .iter()
-            .any(|model| model == &decision.selected_model)
-            && !routed.iter().any(|known| known == &decision.selected_model)
-        {
-            routed.push(decision.selected_model);
-        }
-        for candidate in decision.candidates {
-            if routable.iter().any(|model| model == &candidate.model)
-                && !routed.iter().any(|model| model == &candidate.model)
-            {
-                routed.push(candidate.model);
-            }
         }
         for model in fallback_models {
             if !routed.iter().any(|known| known == &model) {
@@ -9283,7 +9259,8 @@ fn apply_named_e2e_strategy_fixture(
                 "{};e2e-fixture=explicit-team-negative",
                 input.resource_snapshot.sample_source
             );
-            input.resource_snapshot.assumed = false;
+            input.resource_snapshot.provenance =
+                harness_contract::core::MeasureProvenance::Observed;
             Ok(())
         }
         unknown => Err(RuntimeError::new(format!(
@@ -9689,11 +9666,10 @@ mod tests {
             decision.selected_candidate,
             harness_contract::strategy::ExecutionCandidateKind::Team
         );
-        assert!(team.net_benefit_score < 0);
-        assert!(decision
-            .reasons
-            .iter()
-            .any(|reason| reason.contains("negative estimated lift")));
+        assert!(team.effective_duration_ms() >= team.estimated_serial_ms);
+        assert!(decision.reasons.iter().any(|reason| {
+            reason.contains("no measured duration advantage or paired quality proof")
+        }));
 
         let mut unmarked = harness_contract::strategy::StrategyInput::from_prompt(
             "must start a Team for runtime gateway frontend",
@@ -10828,7 +10804,7 @@ mod tests {
                 .first_mut()
                 .expect("candidate estimate");
             estimate.estimated_critical_path_ms = 987_654;
-            estimate.calibration_source = "frozen-before-restart".to_string();
+            estimate.duration_calibration_source = "frozen-before-restart".to_string();
         }
         let frozen = first_runtime
             .bind_turn_strategy_execution("recovery-cost-turn", "recovery-cost-graph")
@@ -10862,7 +10838,7 @@ mod tests {
             frozen.decision.strategy.candidate_estimates
         );
         assert_eq!(
-            recovered.decision.strategy.candidate_estimates[0].calibration_source,
+            recovered.decision.strategy.candidate_estimates[0].duration_calibration_source,
             "frozen-before-restart"
         );
     }
@@ -11078,7 +11054,7 @@ mod tests {
     }
 
     #[test]
-    fn model_router_keeps_primary_model_first_and_routes_fallbacks() {
+    fn model_candidates_keep_configured_primary_and_fallback_order() {
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
@@ -11090,70 +11066,14 @@ mod tests {
         runtime.model = Some("balanced-model".to_string());
         runtime.fallbacks = vec!["stepfun-fast".to_string(), "deepseek-depth".to_string()];
 
-        {
-            let mut registry = runtime
-                .model_performance_registry
-                .lock()
-                .expect("registry lock");
-            registry.record_telemetry(
-                &crate::cowd_event::RunModelTelemetry {
-                    model: Some("stepfun-fast".to_string()),
-                    models_used: vec!["stepfun-fast".to_string()],
-                    first_token_latency_ms: Some(160),
-                    active_stream_duration_ms: Some(1_000),
-                    wall_duration_ms: 1_200,
-                    output_chars: 1_000,
-                    output_chunks: 10,
-                    input_tokens: 400,
-                    output_tokens: 180,
-                    cache_create_tokens: 0,
-                    cache_read_tokens: 0,
-                    total_tokens: 580,
-                    usage_source: "provider".to_string(),
-                    wall_chars_per_second: Some(833.33),
-                    wall_tokens_per_second: Some(150.0),
-                    active_chars_per_second: Some(1_000.0),
-                    active_tokens_per_second: Some(180.0),
-                    chars_per_second: Some(833.33),
-                    tokens_per_second: Some(150.0),
-                },
-                Some(0.72),
-                false,
-            );
-            registry.record_telemetry(
-                &crate::cowd_event::RunModelTelemetry {
-                    model: Some("deepseek-depth".to_string()),
-                    models_used: vec!["deepseek-depth".to_string()],
-                    first_token_latency_ms: Some(950),
-                    active_stream_duration_ms: Some(4_000),
-                    wall_duration_ms: 5_000,
-                    output_chars: 4_000,
-                    output_chunks: 20,
-                    input_tokens: 900,
-                    output_tokens: 360,
-                    cache_create_tokens: 0,
-                    cache_read_tokens: 0,
-                    total_tokens: 1_260,
-                    usage_source: "provider".to_string(),
-                    wall_chars_per_second: Some(800.0),
-                    wall_tokens_per_second: Some(72.0),
-                    active_chars_per_second: Some(1_000.0),
-                    active_tokens_per_second: Some(90.0),
-                    chars_per_second: Some(800.0),
-                    tokens_per_second: Some(72.0),
-                },
-                Some(0.96),
-                false,
-            );
-        }
-
-        let quick = runtime.model_candidates_for_turn("快速回答这个简单问题");
-        let deep = runtime.model_candidates_for_turn("深度审计复杂架构方案");
-
-        assert_eq!(quick.first().map(String::as_str), Some("balanced-model"));
-        assert_eq!(deep.first().map(String::as_str), Some("balanced-model"));
-        assert_eq!(quick.get(1).map(String::as_str), Some("stepfun-fast"));
-        assert_eq!(deep.get(1).map(String::as_str), Some("deepseek-depth"));
+        assert_eq!(
+            runtime.model_candidates_for_turn("任务内容不得改变配置顺序"),
+            vec![
+                "balanced-model".to_string(),
+                "stepfun-fast".to_string(),
+                "deepseek-depth".to_string(),
+            ]
+        );
     }
 
     #[test]

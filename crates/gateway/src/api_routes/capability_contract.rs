@@ -1170,7 +1170,7 @@ fn execution_projection_entity_schema() -> Value {
 fn strategy_candidate_estimate_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["candidate", "eligible", "estimated_serial_ms", "estimated_critical_path_ms", "startup_overhead_ms", "context_duplication_tokens", "merge_cost_ms", "evidence_overlap_penalty_bp", "provider_concurrency_penalty_bp", "risk_approval_penalty_bp", "expected_quality_lift_bp", "net_benefit_score", "calibration_source", "calibration_sample_count", "assumed", "reasons"],
+        "required": ["candidate", "eligible", "estimated_serial_ms", "estimated_critical_path_ms", "startup_overhead_ms", "context_duplication_tokens", "merge_cost_ms", "evidence_overlap_penalty_bp", "provider_concurrency_penalty_bp", "risk_approval_penalty_bp", "expected_quality_lift_bp", "duration_calibration_source", "duration_sample_count", "quality_calibration_source", "quality_sample_count", "duration_provenance", "token_provenance", "quality_provenance", "risk_provenance", "reasons"],
         "properties": {
             "candidate": {"type": "string", "enum": ["direct", "parallel_tools", "team"]},
             "eligible": {"type": "boolean"},
@@ -1183,10 +1183,14 @@ fn strategy_candidate_estimate_schema() -> Value {
             "provider_concurrency_penalty_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
             "risk_approval_penalty_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
             "expected_quality_lift_bp": {"type": "integer"},
-            "net_benefit_score": {"type": "integer"},
-            "calibration_source": {"type": "string"},
-            "calibration_sample_count": {"type": "integer", "minimum": 0},
-            "assumed": {"type": "boolean"},
+            "duration_calibration_source": {"type": "string"},
+            "duration_sample_count": {"type": "integer", "minimum": 0},
+            "quality_calibration_source": {"type": "string"},
+            "quality_sample_count": {"type": "integer", "minimum": 0},
+            "duration_provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]},
+            "token_provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]},
+            "quality_provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]},
+            "risk_provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]},
             "reasons": {"type": "array", "items": {"type": "string"}}
         },
         "additionalProperties": false
@@ -1196,7 +1200,7 @@ fn strategy_candidate_estimate_schema() -> Value {
 fn strategy_resource_snapshot_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["version", "provider_available", "tools_available", "team_available", "provider_concurrency", "tool_concurrency", "team_slots", "provider_concurrency_penalty_bp", "sample_source", "sample_count", "assumed"],
+        "required": ["version", "provider_available", "tools_available", "team_available", "provider_concurrency", "tool_concurrency", "team_slots", "provider_concurrency_penalty_bp", "sample_source", "sample_count", "provenance"],
         "properties": {
             "version": {"type": "string"},
             "provider_available": {"type": "boolean"},
@@ -1208,7 +1212,7 @@ fn strategy_resource_snapshot_schema() -> Value {
             "provider_concurrency_penalty_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
             "sample_source": {"type": "string"},
             "sample_count": {"type": "integer", "minimum": 0},
-            "assumed": {"type": "boolean"}
+            "provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]}
         },
         "additionalProperties": false
     })

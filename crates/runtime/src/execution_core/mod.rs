@@ -59,9 +59,7 @@ pub use rewoo_plan::{
     rewoo_plan_for_intent, rewoo_plan_for_intent_with_evidence_plan, RewooEvidencePlan,
     RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
 };
-pub use safety_fuse::{
-    ExecutionBudgetLease, SafetyFuseDecision, SafetyFusePolicy, SafetyFuseSignals,
-};
+pub use safety_fuse::{ExecutionBudgetLease, SafetyFuseDecision, SafetyFusePolicy};
 #[cfg(feature = "test-fixtures")]
 pub use services::RuntimeFixtureEventPort;
 pub use services::{

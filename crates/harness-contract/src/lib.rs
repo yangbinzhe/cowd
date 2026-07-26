@@ -42,5 +42,5 @@ pub mod verification;
 
 pub use core::{
     AiKernelError, AiKernelResult, ExecutionModifier, ExecutionPattern, ExecutionPolicyGate,
-    KernelCapability, KernelRef, TaskComplexity, TaskRisk,
+    KernelCapability, KernelRef, MeasureProvenance, TaskComplexity, TaskRisk,
 };
