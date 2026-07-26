@@ -11,8 +11,8 @@ mod worktree_lease;
 
 pub use manager::{
     ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager,
-    ExecutionResourceSnapshot, ResourceAcquireError, ResourceObservation, ResourcePressure,
-    ResourceQuota, ResourceResultClass,
+    ExecutionResourceSnapshot, ResourceAcquireError, ResourceLimitAdjustment, ResourceObservation,
+    ResourceObservationFreshness, ResourceQuota, ResourceResultClass,
 };
 pub use scope_lock::{
     ScopeLockError, ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest,

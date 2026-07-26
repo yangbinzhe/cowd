@@ -463,32 +463,6 @@ impl ExecutionGraphRunner {
         let resources = self
             .acquire_node_resources(&self.state_store.load_async(graph_id).await?, &node)
             .await?;
-        let _coordination = self.graph_coordination_without_command(graph_id).await;
-        let graph = self.state_store.load_async(graph_id).await?;
-        if graph.node_statuses.get(&node.id) != Some(&ExecutionNodeStatus::Ready) {
-            return Err(ExecutionRunnerError::NodeMissing(node.id));
-        }
-        let executor = self.registry.get(&node.executor_kind).ok_or_else(|| {
-            NodeExecutorError::Unavailable {
-                executor_kind: node.executor_kind.clone(),
-                node_id: node.id.clone(),
-            }
-        })?;
-        let attempt = graph
-            .recovery_cursor
-            .node_attempts
-            .get(&node.id)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(1);
-        let ticket = executor
-            .start(NodeExecutionContext {
-                graph: Arc::new(graph.clone()),
-                node,
-                attempt,
-            })
-            .await?;
-        let binding = resources.binding(&ticket);
         let resource_kind = resources
             .resource
             .as_ref()
@@ -497,6 +471,61 @@ impl ExecutionGraphRunner {
             .resource
             .as_ref()
             .map_or(Duration::ZERO, ExecutionResourceLease::queue_wait);
+        let resource_started = std::time::Instant::now();
+        let _coordination = self.graph_coordination_without_command(graph_id).await;
+        let graph = self.state_store.load_async(graph_id).await?;
+        if graph.node_statuses.get(&node.id) != Some(&ExecutionNodeStatus::Ready) {
+            self.record_resource_terminal(
+                resource_kind.as_ref(),
+                resource_queue_wait,
+                resource_started,
+                crate::execution_core::graph::ResourceResultClass::Cancelled,
+            );
+            return Err(ExecutionRunnerError::NodeMissing(node.id));
+        }
+        let executor = match self.registry.get(&node.executor_kind) {
+            Some(executor) => executor,
+            None => {
+                self.record_resource_terminal(
+                    resource_kind.as_ref(),
+                    resource_queue_wait,
+                    resource_started,
+                    crate::execution_core::graph::ResourceResultClass::Failed,
+                );
+                return Err(NodeExecutorError::Unavailable {
+                    executor_kind: node.executor_kind.clone(),
+                    node_id: node.id.clone(),
+                }
+                .into());
+            }
+        };
+        let attempt = graph
+            .recovery_cursor
+            .node_attempts
+            .get(&node.id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let ticket = match executor
+            .start(NodeExecutionContext {
+                graph: Arc::new(graph.clone()),
+                node,
+                attempt,
+            })
+            .await
+        {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.record_resource_terminal(
+                    resource_kind.as_ref(),
+                    resource_queue_wait,
+                    resource_started,
+                    crate::execution_core::graph::ResourceResultClass::Failed,
+                );
+                return Err(error.into());
+            }
+        };
+        let binding = resources.binding(&ticket);
         self.active.lock().await.insert(
             (ticket.graph_id.clone(), ticket.node_id.clone()),
             ActiveNode {
@@ -515,6 +544,12 @@ impl ExecutionGraphRunner {
                 .await
                 .remove(&(ticket.graph_id.clone(), ticket.node_id.clone()));
             let _ = executor.cancel(&ticket).await;
+            self.record_resource_terminal(
+                resource_kind.as_ref(),
+                resource_queue_wait,
+                resource_started,
+                crate::execution_core::graph::ResourceResultClass::Failed,
+            );
             return Err(error.into());
         }
         drop(_coordination);
@@ -534,6 +569,12 @@ impl ExecutionGraphRunner {
                     .lock()
                     .await
                     .remove(&(ticket.graph_id.clone(), ticket.node_id.clone()));
+                self.record_resource_terminal(
+                    resource_kind.as_ref(),
+                    resource_queue_wait,
+                    resource_started,
+                    crate::execution_core::graph::ResourceResultClass::Cancelled,
+                );
                 return Ok((
                     ticket.node_id.clone(),
                     NodeExecutionOutcome::new(ExecutionNodeResult {
@@ -558,9 +599,21 @@ impl ExecutionGraphRunner {
         };
         match effect_state {
             ExecutionEffectState::Completed(outcome) => {
+                self.record_resource_terminal(
+                    resource_kind.as_ref(),
+                    resource_queue_wait,
+                    resource_started,
+                    crate::execution_core::graph::ResourceResultClass::Cancelled,
+                );
                 return Ok((ticket.node_id.clone(), outcome));
             }
             ExecutionEffectState::Uncertain => {
+                self.record_resource_terminal(
+                    resource_kind.as_ref(),
+                    resource_queue_wait,
+                    resource_started,
+                    crate::execution_core::graph::ResourceResultClass::Cancelled,
+                );
                 return Err(NodeExecutorError::Uncertain {
                     node_id: ticket.node_id.clone(),
                     reason: format!(
@@ -572,32 +625,30 @@ impl ExecutionGraphRunner {
             }
             ExecutionEffectState::Fresh => {}
         }
-        let resource_started = std::time::Instant::now();
         let outcome = executor.poll_or_await(&ticket).await;
         if let Some(resource_kind) = resource_kind {
-            let pressure_snapshot = self.resource_manager.snapshot(&resource_kind).ok();
-            let _ = self.resource_manager.observe_runtime_pressure(
+            let result_class = match &outcome {
+                Ok(outcome)
+                    if outcome.result.status
+                        == harness_contract::execution_graph::ExecutionNodeStatus::Cancelled =>
+                {
+                    crate::execution_core::graph::ResourceResultClass::Cancelled
+                }
+                Ok(outcome)
+                    if outcome.result.status
+                        == harness_contract::execution_graph::ExecutionNodeStatus::Completed =>
+                {
+                    crate::execution_core::graph::ResourceResultClass::Completed
+                }
+                Ok(_) | Err(_) => crate::execution_core::graph::ResourceResultClass::Failed,
+            };
+            let _ = self.resource_manager.record_observation(
                 &resource_kind,
-                crate::execution_core::graph::ResourceObservation {
-                    queue_wait: resource_queue_wait,
-                    service_time: resource_started.elapsed(),
-                    producer_wait: std::time::Duration::ZERO,
-                    queue_depth: pressure_snapshot
-                        .as_ref()
-                        .map_or(0, |snapshot| snapshot.queued_waiters),
-                    saturation: pressure_snapshot.as_ref().map_or(0.0, |snapshot| {
-                        if snapshot.effective_limit == 0 {
-                            1.0
-                        } else {
-                            snapshot.active_leases as f32 / snapshot.effective_limit as f32
-                        }
-                    }),
-                    result_class: if outcome.is_err() {
-                        crate::execution_core::graph::ResourceResultClass::Failed
-                    } else {
-                        crate::execution_core::graph::ResourceResultClass::Completed
-                    },
-                },
+                crate::execution_core::graph::ResourceObservation::terminal(
+                    resource_queue_wait,
+                    resource_started.elapsed(),
+                    result_class,
+                ),
             );
         }
         let outcome = outcome?;
@@ -608,19 +659,34 @@ impl ExecutionGraphRunner {
         Ok((ticket.node_id.clone(), outcome))
     }
 
+    fn record_resource_terminal(
+        &self,
+        kind: Option<&ExecutionResourceKind>,
+        queue_wait: Duration,
+        started: std::time::Instant,
+        result_class: crate::execution_core::graph::ResourceResultClass,
+    ) {
+        let Some(kind) = kind else {
+            return;
+        };
+        let _ = self.resource_manager.record_observation(
+            kind,
+            crate::execution_core::graph::ResourceObservation::terminal(
+                queue_wait,
+                started.elapsed(),
+                result_class,
+            ),
+        );
+    }
+
     async fn acquire_node_resources(
         &self,
         graph: &ExecutionGraph,
         node: &harness_contract::execution_graph::ExecutionNodeSpec,
     ) -> Result<NodeResourceGuards, ExecutionRunnerError> {
         let resource_kind = match node.kind {
-            harness_contract::execution_graph::ExecutionNodeKind::InlineModel
-            | harness_contract::execution_graph::ExecutionNodeKind::Synthesize
-            | harness_contract::execution_graph::ExecutionNodeKind::Verify => {
-                ExecutionResourceKind::Provider
-            }
             harness_contract::execution_graph::ExecutionNodeKind::AgentTask => {
-                ExecutionResourceKind::Agent
+                Some(ExecutionResourceKind::Agent)
             }
             harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => {
                 // ToolBatch is a container. Each leaf invocation is admitted
@@ -649,16 +715,29 @@ impl ExecutionGraphRunner {
                     worktree: None,
                 });
             }
-            _ => ExecutionResourceKind::Tool,
+            // InlineModel owns Provider admission in ConversationRuntime.
+            // ToolBatch leaves own Tool admission in ToolExecutionPlane.
+            // Deterministic control nodes do not consume either family.
+            harness_contract::execution_graph::ExecutionNodeKind::InlineModel
+            | harness_contract::execution_graph::ExecutionNodeKind::Verify
+            | harness_contract::execution_graph::ExecutionNodeKind::Synthesize
+            | harness_contract::execution_graph::ExecutionNodeKind::Approval
+            | harness_contract::execution_graph::ExecutionNodeKind::SessionDispatch
+            | harness_contract::execution_graph::ExecutionNodeKind::Timer => None,
         };
-        let resource = self
-            .resource_manager
-            .acquire(resource_kind, Some(std::time::Duration::from_secs(30)))
-            .await
-            .map_err(|error| ExecutionRunnerError::Resource {
-                node_id: node.id.clone(),
-                reason: error.to_string(),
-            })?;
+        let resource = if let Some(resource_kind) = resource_kind {
+            Some(
+                self.resource_manager
+                    .acquire(resource_kind, Some(std::time::Duration::from_secs(30)))
+                    .await
+                    .map_err(|error| ExecutionRunnerError::Resource {
+                        node_id: node.id.clone(),
+                        reason: error.to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
         let mut scope_requests = Vec::new();
         let mut worktree_path = None;
         for scope in &node.resource_scopes {
@@ -721,7 +800,7 @@ impl ExecutionGraphRunner {
                 reason: error.to_string(),
             })?;
         Ok(NodeResourceGuards {
-            resource: Some(resource),
+            resource,
             scope,
             worktree,
         })

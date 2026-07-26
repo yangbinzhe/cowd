@@ -535,11 +535,19 @@ async fn forward_provider_attempt(
         );
         let provider_context_window_limit = error.error.context_window_limit_hint();
         let provider_tool_protocol_failure = error.error.is_compatibility_tool_protocol_failure();
+        let provider_resource_result = if error.error.is_downstream_overload() {
+            crate::execution_core::graph::ResourceResultClass::DownstreamOverload
+        } else if error.error.is_timeout() {
+            crate::execution_core::graph::ResourceResultClass::TimedOut
+        } else {
+            crate::execution_core::graph::ResourceResultClass::Failed
+        };
         let _ = sender
             .send(Err(RuntimeError::with_provider_failure_metadata(
                 error.error.to_string(),
                 provider_context_window_limit,
                 provider_tool_protocol_failure,
+                provider_resource_result,
             )))
             .await;
     }

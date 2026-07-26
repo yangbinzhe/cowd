@@ -197,6 +197,27 @@ impl ApiError {
         }
     }
 
+    /// Typed capacity signal for the runtime resource controller.
+    #[must_use]
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Self::Http(error) => error.is_timeout(),
+            Self::Io(error) => error.kind() == std::io::ErrorKind::TimedOut,
+            Self::RetriesExhausted { last_error, .. } => last_error.is_timeout(),
+            _ => false,
+        }
+    }
+
+    /// Provider-declared saturation, distinct from generic transport failure.
+    #[must_use]
+    pub fn is_downstream_overload(&self) -> bool {
+        match self {
+            Self::Api { status, .. } => matches!(status.as_u16(), 429 | 502 | 503 | 504),
+            Self::RetriesExhausted { last_error, .. } => last_error.is_downstream_overload(),
+            _ => false,
+        }
+    }
+
     #[must_use]
     pub fn is_context_window_failure(&self) -> bool {
         match self {
@@ -698,6 +719,28 @@ mod tests {
         assert!(error.is_generic_fatal_wrapper());
         assert_eq!(error.safe_failure_class(), "provider_retry_exhausted");
         assert_eq!(error.request_id(), Some("req_nested_456"));
+    }
+
+    #[test]
+    fn resource_failures_keep_timeout_and_downstream_overload_distinct() {
+        let overloaded = ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("rate_limit".to_string()),
+            message: None,
+            request_id: None,
+            body: String::new(),
+            retryable: true,
+            suggested_action: None,
+        };
+        assert!(overloaded.is_downstream_overload());
+        assert!(!overloaded.is_timeout());
+
+        let timed_out = ApiError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "provider timed out",
+        ));
+        assert!(timed_out.is_timeout());
+        assert!(!timed_out.is_downstream_overload());
     }
 
     #[test]

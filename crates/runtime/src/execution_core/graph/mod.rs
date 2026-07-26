@@ -25,11 +25,11 @@ pub use registry::{
 };
 pub use resources::{
     ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager,
-    ExecutionResourceSnapshot, ResourceAcquireError, ResourceObservation, ResourcePressure,
-    ResourceQuota, ResourceResultClass, ScopeLockError, ScopeLockLease, ScopeLockManager,
-    ScopeLockMode, ScopeLockRequest, ScopedResource, WorktreeLease, WorktreeLeaseError,
-    WorktreeLeaseManager, WorktreeLeaseRecord, WorktreeLeaseRequest, WorktreeLeaseStatus,
-    WorktreeOwnership,
+    ExecutionResourceSnapshot, ResourceAcquireError, ResourceLimitAdjustment, ResourceObservation,
+    ResourceObservationFreshness, ResourceQuota, ResourceResultClass, ScopeLockError,
+    ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
+    WorktreeLease, WorktreeLeaseError, WorktreeLeaseManager, WorktreeLeaseRecord,
+    WorktreeLeaseRequest, WorktreeLeaseStatus, WorktreeOwnership,
 };
 #[cfg(test)]
 pub(crate) use runner::validate_worktree_path;

@@ -8653,6 +8653,7 @@ mod tests {
                         "malformed compatibility tool-call frame",
                         None,
                         true,
+                        crate::execution_core::graph::ResourceResultClass::Failed,
                     ),
                 )]));
             }
@@ -11307,6 +11308,7 @@ mod tests {
             "invalid sse frame: malformed compatibility tool-call frame",
             None,
             true,
+            crate::execution_core::graph::ResourceResultClass::Failed,
         )
         .is_provider_tool_protocol_failure());
         assert!(

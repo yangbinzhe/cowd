@@ -79,17 +79,17 @@ impl ToolExecutionPlane {
     {
         self.counters.submitted.fetch_add(1, Ordering::Relaxed);
         let admission_started = Instant::now();
-        let resource_demands = execution_resource_demands(demand);
-        let lease = self
-            .resources
-            .acquire_bundle(resource_demands, timeout)
-            .await
-            .map_err(|error| ToolExecutionPlaneError::Admission(error.to_string()))?;
         let scope_requests = scope_requests(demand)?;
         let scope_lease = self
             .scopes
-            .acquire(
-                scope_requests,
+            .acquire(scope_requests, timeout)
+            .await
+            .map_err(|error| ToolExecutionPlaneError::Admission(error.to_string()))?;
+        let resource_demands = execution_resource_demands(demand);
+        let lease = self
+            .resources
+            .acquire_bundle(
+                resource_demands,
                 remaining_timeout(timeout, admission_started),
             )
             .await
@@ -97,36 +97,9 @@ impl ToolExecutionPlane {
         let queue_wait = admission_started.elapsed();
         self.counters.active.fetch_add(1, Ordering::AcqRel);
         let counters = Arc::clone(&self.counters);
-        let resources = Arc::clone(&self.resources);
         let service_started = Instant::now();
         let mut worker = tokio::task::spawn_blocking(move || {
             let result = std::panic::catch_unwind(AssertUnwindSafe(operation));
-            let service_time = service_started.elapsed();
-            let snapshot = resources.snapshot(&ExecutionResourceKind::Tool).ok();
-            let result_class = if result.is_ok() {
-                ResourceResultClass::Completed
-            } else {
-                ResourceResultClass::Failed
-            };
-            let _ = resources.observe_runtime_pressure(
-                &ExecutionResourceKind::Tool,
-                ResourceObservation {
-                    queue_wait,
-                    service_time,
-                    producer_wait: Duration::ZERO,
-                    queue_depth: snapshot
-                        .as_ref()
-                        .map_or(0, |snapshot| snapshot.queued_waiters),
-                    saturation: snapshot.as_ref().map_or(0.0, |snapshot| {
-                        if snapshot.effective_limit == 0 {
-                            1.0
-                        } else {
-                            snapshot.active_leases as f32 / snapshot.effective_limit as f32
-                        }
-                    }),
-                    result_class,
-                },
-            );
             drop(scope_lease);
             drop(lease);
             counters.active.fetch_sub(1, Ordering::AcqRel);
@@ -143,7 +116,7 @@ impl ToolExecutionPlane {
             }
         });
 
-        if let Some(timeout) = timeout {
+        let execution = if let Some(timeout) = timeout {
             match tokio::time::timeout(timeout, &mut worker).await {
                 Ok(joined) => {
                     joined.map_err(|error| ToolExecutionPlaneError::Worker(error.to_string()))?
@@ -159,7 +132,20 @@ impl ToolExecutionPlane {
             worker
                 .await
                 .map_err(|error| ToolExecutionPlaneError::Worker(error.to_string()))?
-        }
+        };
+        let result_class = match &execution {
+            Ok(_) => ResourceResultClass::Completed,
+            Err(ToolExecutionPlaneError::TimedOut(_)) => ResourceResultClass::TimedOut,
+            Err(ToolExecutionPlaneError::Panicked | ToolExecutionPlaneError::Worker(_)) => {
+                ResourceResultClass::Failed
+            }
+            Err(ToolExecutionPlaneError::Admission(_)) => ResourceResultClass::DownstreamOverload,
+        };
+        let _ = self.resources.record_observation(
+            &ExecutionResourceKind::Tool,
+            ResourceObservation::terminal(queue_wait, service_started.elapsed(), result_class),
+        );
+        execution
     }
 
     #[must_use]

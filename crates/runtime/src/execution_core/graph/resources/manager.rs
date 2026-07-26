@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -46,39 +46,43 @@ impl ResourceQuota {
     }
 }
 
-/// Runtime pressure input. Values are normalized to `0.0..=1.0`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ResourcePressure {
-    pub saturation: f32,
-    pub failure_rate: f32,
-    pub latency_pressure: f32,
-}
-
-/// One completed resource operation, split into capacity and service signals.
-///
-/// Service latency is retained for diagnostics but deliberately does not
-/// reduce concurrency on its own. Capacity adapts only when work waited for
-/// admission, the resource was saturated, or a bounded producer was blocked.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// One terminal resource operation. Producers classify the result; the
+/// resource manager owns aggregation and effective-capacity decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceObservation {
+    pub observed_at_ms: u64,
     pub queue_wait: Duration,
     pub service_time: Duration,
-    pub producer_wait: Duration,
-    pub queue_depth: usize,
-    pub saturation: f32,
     pub result_class: ResourceResultClass,
 }
 
 impl ResourceObservation {
     #[must_use]
+    pub fn terminal(
+        queue_wait: Duration,
+        service_time: Duration,
+        result_class: ResourceResultClass,
+    ) -> Self {
+        Self::at(now_ms(), queue_wait, service_time, result_class)
+    }
+
+    #[must_use]
     pub fn completed(service_time: Duration) -> Self {
+        Self::terminal(Duration::ZERO, service_time, ResourceResultClass::Completed)
+    }
+
+    #[must_use]
+    pub const fn at(
+        observed_at_ms: u64,
+        queue_wait: Duration,
+        service_time: Duration,
+        result_class: ResourceResultClass,
+    ) -> Self {
         Self {
-            queue_wait: Duration::ZERO,
+            observed_at_ms,
+            queue_wait,
             service_time,
-            producer_wait: Duration::ZERO,
-            queue_depth: 0,
-            saturation: 0.0,
-            result_class: ResourceResultClass::Completed,
+            result_class,
         }
     }
 }
@@ -89,21 +93,29 @@ pub enum ResourceResultClass {
     Completed,
     Failed,
     Cancelled,
+    TimedOut,
+    DownstreamOverload,
 }
 
-impl ResourcePressure {
-    pub const HEALTHY: Self = Self {
-        saturation: 0.0,
-        failure_rate: 0.0,
-        latency_pressure: 0.0,
-    };
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceObservationFreshness {
+    #[default]
+    Unknown,
+    Fresh,
+    Stale,
+}
 
-    fn score(self) -> f32 {
-        let saturation = self.saturation.clamp(0.0, 1.0);
-        let failure = self.failure_rate.clamp(0.0, 1.0);
-        let latency = self.latency_pressure.clamp(0.0, 1.0);
-        (saturation * 0.35 + failure * 0.40 + latency * 0.25).clamp(0.0, 1.0)
-    }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceLimitAdjustment {
+    #[default]
+    Hold,
+    Increased,
+    DecreasedOverload,
+    DecreasedFailureUpperBound,
+    DecreasedServiceRegression,
+    ResetToConfiguredTarget,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +128,17 @@ pub struct ExecutionResourceSnapshot {
     pub active_leases: usize,
     pub queued_waiters: usize,
     pub queue_wait: ResourceLatencySnapshot,
-    pub run: ResourceLatencySnapshot,
+    pub service_time: ResourceLatencySnapshot,
+    pub throughput_per_minute: u64,
+    pub failure_rate_basis_points: Option<u16>,
+    pub timeout_rate_basis_points: Option<u16>,
+    pub overload_rate_basis_points: Option<u16>,
+    pub cancelled_rate_basis_points: Option<u16>,
+    pub failure_timeout_upper_bound_basis_points: Option<u16>,
+    pub sample_count: usize,
+    pub last_observed_at_ms: Option<u64>,
+    pub freshness: ResourceObservationFreshness,
+    pub last_adjustment: ResourceLimitAdjustment,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,13 +183,12 @@ struct ResourceState {
     quota: ResourceQuota,
     effective_limit: usize,
     active: HashMap<Uuid, ActiveResourceDemand>,
-    queue_wait_ms: VecDeque<u64>,
-    run_ms: VecDeque<u64>,
+    samples: VecDeque<ResourceSample>,
+    adaptive: AdaptiveState,
 }
 
 #[derive(Debug)]
 struct ActiveResourceDemand {
-    started: Instant,
     weight: usize,
 }
 
@@ -177,7 +198,13 @@ struct PendingResourceDemand {
     demands: Vec<(ExecutionResourceKind, usize)>,
 }
 
-const LATENCY_SAMPLE_CAPACITY: usize = 256;
+const RESOURCE_SAMPLE_CAPACITY: usize = 256;
+const ADAPTATION_WINDOW: usize = 16;
+const ADAPTATION_HALF_WINDOW: usize = ADAPTATION_WINDOW / 2;
+const ADJUSTMENT_COOLDOWN_MS: u64 = 5_000;
+const FRESHNESS_WINDOW_MS: u64 = 60_000;
+const HIGH_QUEUE_P95_MS: u64 = 100;
+const FAILURE_TIMEOUT_UCB_THRESHOLD_BP: u16 = 3_500;
 
 #[derive(Debug, Default)]
 struct ManagerState {
@@ -188,15 +215,31 @@ struct ManagerState {
 #[derive(Debug, Default)]
 struct Shared {
     state: Mutex<ManagerState>,
-    adaptive: Mutex<HashMap<ExecutionResourceKind, AdaptiveState>>,
     changed: Notify,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResourceSample {
+    observed_at_ms: u64,
+    queue_wait_ms: u64,
+    service_time_ms: u64,
+    result_class: ResourceResultClass,
 }
 
 #[derive(Debug, Default)]
 struct AdaptiveState {
-    pressure_streak: u8,
     healthy_streak: u8,
-    last_adjustment: Option<Instant>,
+    total_samples: u64,
+    last_adjustment_at_ms: Option<u64>,
+    last_adjustment: ResourceLimitAdjustment,
+    increase_baseline: Option<IncreaseBaseline>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IncreaseBaseline {
+    sample_sequence: u64,
+    service_p95_ms: u64,
+    throughput_per_minute: u64,
 }
 
 /// Instance-owned dynamic quota and backpressure manager.
@@ -216,8 +259,8 @@ impl ExecutionResourceManager {
                         quota,
                         effective_limit: quota.target,
                         active: HashMap::new(),
-                        queue_wait_ms: VecDeque::new(),
-                        run_ms: VecDeque::new(),
+                        samples: VecDeque::new(),
+                        adaptive: AdaptiveState::default(),
                     },
                 )
             })
@@ -228,21 +271,17 @@ impl ExecutionResourceManager {
                     resources,
                     waiters: VecDeque::new(),
                 }),
-                adaptive: Mutex::new(HashMap::new()),
                 changed: Notify::new(),
             }),
         }
     }
 
-    /// Adapt the effective limit without revoking already-running leases.
-    ///
-    /// Severe pressure converges toward `minimum`; healthy capacity converges
-    /// toward `maximum`. Existing leases finish naturally while new work is
-    /// backpressured against the new limit.
-    pub fn observe_pressure(
+    /// Records one typed terminal observation and applies the sole adaptive
+    /// capacity policy. Queueing alone never decreases concurrency.
+    pub fn record_observation(
         &self,
         kind: &ExecutionResourceKind,
-        pressure: ResourcePressure,
+        observation: ResourceObservation,
     ) -> Result<ExecutionResourceSnapshot, ResourceAcquireError> {
         let snapshot = {
             let mut guard = self
@@ -255,82 +294,27 @@ impl ExecutionResourceManager {
                 .resources
                 .get_mut(kind)
                 .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
-            let span = state.quota.maximum - state.quota.minimum;
-            let desired =
-                state.quota.maximum - ((span as f32 * pressure.score()).round() as usize).min(span);
-            state.effective_limit = desired.clamp(state.quota.minimum, state.quota.maximum);
-            snapshot_for(kind.clone(), state, queued_waiters)
+            let observed_at_ms = state
+                .samples
+                .back()
+                .map_or(observation.observed_at_ms, |sample| {
+                    sample.observed_at_ms.max(observation.observed_at_ms)
+                });
+            push_sample(
+                &mut state.samples,
+                ResourceSample {
+                    observed_at_ms,
+                    queue_wait_ms: duration_millis(observation.queue_wait),
+                    service_time_ms: duration_millis(observation.service_time),
+                    result_class: observation.result_class,
+                },
+            );
+            state.adaptive.total_samples = state.adaptive.total_samples.saturating_add(1);
+            apply_adaptive_policy(state, observed_at_ms);
+            snapshot_for(kind.clone(), state, queued_waiters, observed_at_ms)
         };
         self.shared.changed.notify_waiters();
         Ok(snapshot)
-    }
-
-    /// Feed real queue/run/error observations into the existing quota owner.
-    /// Three consecutive pressure samples lower capacity; eight healthy samples
-    /// raise it. A five-second cooldown prevents request-by-request oscillation.
-    pub fn observe_runtime_pressure(
-        &self,
-        kind: &ExecutionResourceKind,
-        observation: ResourceObservation,
-    ) -> Result<ExecutionResourceSnapshot, ResourceAcquireError> {
-        let snapshot = self.snapshot(kind)?;
-        let observed_saturation = if snapshot.effective_limit == 0 {
-            1.0
-        } else {
-            (snapshot.active_leases + snapshot.queued_waiters) as f32
-                / snapshot.effective_limit as f32
-        }
-        .clamp(0.0, 1.0);
-        let saturation = observation
-            .saturation
-            .max(observed_saturation)
-            .clamp(0.0, 1.0);
-        let queue_pressure =
-            observation.queue_depth > 0 || observation.queue_wait >= Duration::from_millis(250);
-        let producer_pressure = observation.producer_wait >= Duration::from_millis(50);
-        let pressured = saturation >= 1.0 && (queue_pressure || producer_pressure);
-        let healthy = !queue_pressure && !producer_pressure && snapshot.queued_waiters == 0;
-        let adjustment = {
-            let mut states = self
-                .shared
-                .adaptive
-                .lock()
-                .map_err(|_| ResourceAcquireError::Poisoned)?;
-            let state = states.entry(kind.clone()).or_default();
-            if pressured {
-                state.pressure_streak = state.pressure_streak.saturating_add(1);
-                state.healthy_streak = 0;
-            } else if healthy {
-                state.healthy_streak = state.healthy_streak.saturating_add(1);
-                state.pressure_streak = 0;
-            } else {
-                state.pressure_streak = 0;
-                state.healthy_streak = 0;
-            }
-            let cooldown_ready = state
-                .last_adjustment
-                .is_none_or(|last| last.elapsed() >= Duration::from_secs(5));
-            let pressure = if cooldown_ready && state.pressure_streak >= 3 {
-                state.pressure_streak = 0;
-                Some(ResourcePressure {
-                    saturation,
-                    failure_rate: 0.0,
-                    latency_pressure: if producer_pressure { 1.0 } else { 0.0 },
-                })
-            } else if cooldown_ready && state.healthy_streak >= 8 {
-                state.healthy_streak = 0;
-                Some(ResourcePressure::HEALTHY)
-            } else {
-                None
-            };
-            if pressure.is_some() {
-                state.last_adjustment = Some(Instant::now());
-            }
-            pressure
-        };
-        adjustment.map_or(Ok(snapshot), |pressure| {
-            self.observe_pressure(kind, pressure)
-        })
     }
 
     /// Replace quota bounds. Running leases are never cancelled when shrinking.
@@ -352,7 +336,12 @@ impl ExecutionResourceManager {
                 .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
             state.quota = quota;
             state.effective_limit = quota.target;
-            snapshot_for(kind.clone(), state, queued_waiters)
+            state.samples.clear();
+            state.adaptive = AdaptiveState {
+                last_adjustment: ResourceLimitAdjustment::ResetToConfiguredTarget,
+                ..AdaptiveState::default()
+            };
+            snapshot_for(kind.clone(), state, queued_waiters, now_ms())
         };
         self.shared.changed.notify_waiters();
         Ok(snapshot)
@@ -403,12 +392,14 @@ impl ExecutionResourceManager {
             });
         }
 
+        let started = Instant::now();
         let mut registration = WaiterRegistration {
             shared: Arc::clone(&self.shared),
             waiter_id,
+            demands: demands.clone(),
+            started,
             active: true,
         };
-        let started = Instant::now();
 
         loop {
             let notified = self.shared.changed.notified();
@@ -439,17 +430,9 @@ impl ExecutionResourceManager {
                         let Some(state) = guard.resources.get_mut(kind) else {
                             return Err(ResourceAcquireError::RegistrationLost);
                         };
-                        observe_latency(
-                            &mut state.queue_wait_ms,
-                            duration_millis(started.elapsed()),
-                        );
-                        state.active.insert(
-                            waiter_id,
-                            ActiveResourceDemand {
-                                started: Instant::now(),
-                                weight: *weight,
-                            },
-                        );
+                        state
+                            .active
+                            .insert(waiter_id, ActiveResourceDemand { weight: *weight });
                     }
                     true
                 } else {
@@ -470,12 +453,14 @@ impl ExecutionResourceManager {
 
             if let Some(limit) = timeout {
                 let Some(remaining) = limit.checked_sub(started.elapsed()) else {
+                    registration.finish(ResourceResultClass::TimedOut);
                     return Err(ResourceAcquireError::TimedOut {
                         kind: demands[0].0.clone(),
                         waited_ms: duration_millis(limit),
                     });
                 };
                 if tokio::time::timeout(remaining, notified).await.is_err() {
+                    registration.finish(ResourceResultClass::TimedOut);
                     return Err(ResourceAcquireError::TimedOut {
                         kind: demands[0].0.clone(),
                         waited_ms: duration_millis(limit),
@@ -504,6 +489,7 @@ impl ExecutionResourceManager {
             kind.clone(),
             state,
             queued_waiter_count(&guard.waiters, kind),
+            now_ms(),
         ))
     }
 
@@ -521,6 +507,7 @@ impl ExecutionResourceManager {
                     kind.clone(),
                     state,
                     queued_waiter_count(&guard.waiters, kind),
+                    now_ms(),
                 )
             })
             .collect::<Vec<_>>();
@@ -568,12 +555,7 @@ impl ExecutionResourceLease {
         if let Ok(mut guard) = self.shared.state.lock() {
             for (kind, _) in &self.demands {
                 if let Some(state) = guard.resources.get_mut(kind) {
-                    if let Some(active) = state.active.remove(&self.lease_id) {
-                        observe_latency(
-                            &mut state.run_ms,
-                            duration_millis(active.started.elapsed()),
-                        );
-                    }
+                    state.active.remove(&self.lease_id);
                 }
             }
         }
@@ -591,18 +573,44 @@ impl Drop for ExecutionResourceLease {
 struct WaiterRegistration {
     shared: Arc<Shared>,
     waiter_id: Uuid,
+    demands: Vec<(ExecutionResourceKind, usize)>,
+    started: Instant,
     active: bool,
 }
 
-impl Drop for WaiterRegistration {
-    fn drop(&mut self) {
+impl WaiterRegistration {
+    fn finish(&mut self, result_class: ResourceResultClass) {
         if !self.active {
             return;
         }
         if let Ok(mut guard) = self.shared.state.lock() {
             guard.waiters.retain(|waiter| waiter.id != self.waiter_id);
+            let observed_at_ms = now_ms();
+            let queue_wait_ms = duration_millis(self.started.elapsed());
+            for (kind, _) in &self.demands {
+                if let Some(state) = guard.resources.get_mut(kind) {
+                    push_sample(
+                        &mut state.samples,
+                        ResourceSample {
+                            observed_at_ms,
+                            queue_wait_ms,
+                            service_time_ms: 0,
+                            result_class,
+                        },
+                    );
+                    state.adaptive.total_samples = state.adaptive.total_samples.saturating_add(1);
+                    apply_adaptive_policy(state, observed_at_ms);
+                }
+            }
         }
+        self.active = false;
         self.shared.changed.notify_waiters();
+    }
+}
+
+impl Drop for WaiterRegistration {
+    fn drop(&mut self) {
+        self.finish(ResourceResultClass::Cancelled);
     }
 }
 
@@ -610,7 +618,10 @@ fn snapshot_for(
     kind: ExecutionResourceKind,
     state: &ResourceState,
     queued_waiters: usize,
+    now_ms: u64,
 ) -> ExecutionResourceSnapshot {
+    let metrics = window_metrics(state.samples.iter().copied());
+    let last_observed_at_ms = state.samples.back().map(|sample| sample.observed_at_ms);
     ExecutionResourceSnapshot {
         kind: kind.clone(),
         minimum: state.quota.minimum,
@@ -619,8 +630,26 @@ fn snapshot_for(
         effective_limit: state.effective_limit,
         active_leases: active_weight(state),
         queued_waiters,
-        queue_wait: latency_snapshot(&state.queue_wait_ms),
-        run: latency_snapshot(&state.run_ms),
+        queue_wait: latency_snapshot_from_samples(&state.samples, |sample| sample.queue_wait_ms),
+        service_time: latency_snapshot_from_samples(&state.samples, |sample| {
+            sample.service_time_ms
+        }),
+        throughput_per_minute: metrics.throughput_per_minute,
+        failure_rate_basis_points: rate_basis_points(metrics.failed, metrics.samples),
+        timeout_rate_basis_points: rate_basis_points(metrics.timed_out, metrics.samples),
+        overload_rate_basis_points: rate_basis_points(metrics.overloaded, metrics.samples),
+        cancelled_rate_basis_points: rate_basis_points(metrics.cancelled, metrics.samples),
+        failure_timeout_upper_bound_basis_points: failure_timeout_upper_bound(&metrics),
+        sample_count: metrics.samples,
+        last_observed_at_ms,
+        freshness: last_observed_at_ms.map_or(ResourceObservationFreshness::Unknown, |last| {
+            if now_ms.saturating_sub(last) <= FRESHNESS_WINDOW_MS {
+                ResourceObservationFreshness::Fresh
+            } else {
+                ResourceObservationFreshness::Stale
+            }
+        }),
+        last_adjustment: state.adaptive.last_adjustment,
     }
 }
 
@@ -664,15 +693,18 @@ fn demand_sets_overlap(
         .any(|(left, _)| right.iter().any(|(right, _)| left == right))
 }
 
-fn observe_latency(values: &mut VecDeque<u64>, value: u64) {
-    if values.len() == LATENCY_SAMPLE_CAPACITY {
-        values.pop_front();
+fn push_sample(samples: &mut VecDeque<ResourceSample>, sample: ResourceSample) {
+    if samples.len() == RESOURCE_SAMPLE_CAPACITY {
+        samples.pop_front();
     }
-    values.push_back(value);
+    samples.push_back(sample);
 }
 
-fn latency_snapshot(values: &VecDeque<u64>) -> ResourceLatencySnapshot {
-    let mut sorted = values.iter().copied().collect::<Vec<_>>();
+fn latency_snapshot_from_samples(
+    samples: &VecDeque<ResourceSample>,
+    value: impl Fn(&ResourceSample) -> u64,
+) -> ResourceLatencySnapshot {
+    let mut sorted = samples.iter().map(value).collect::<Vec<_>>();
     sorted.sort_unstable();
     let percentile = |numerator: usize| {
         sorted
@@ -688,8 +720,247 @@ fn latency_snapshot(values: &VecDeque<u64>) -> ResourceLatencySnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ResourceWindowMetrics {
+    samples: usize,
+    failed: usize,
+    cancelled: usize,
+    timed_out: usize,
+    overloaded: usize,
+    queue_p95_ms: u64,
+    service_p95_ms: u64,
+    throughput_per_minute: u64,
+}
+
+fn window_metrics(samples: impl IntoIterator<Item = ResourceSample>) -> ResourceWindowMetrics {
+    let mut samples = samples.into_iter().collect::<Vec<_>>();
+    if samples.is_empty() {
+        return ResourceWindowMetrics::default();
+    }
+    samples.sort_by_key(|sample| sample.observed_at_ms);
+    let mut queue = samples
+        .iter()
+        .map(|sample| sample.queue_wait_ms)
+        .collect::<Vec<_>>();
+    let mut service = samples
+        .iter()
+        .map(|sample| sample.service_time_ms)
+        .collect::<Vec<_>>();
+    queue.sort_unstable();
+    service.sort_unstable();
+    let percentile = |values: &[u64], numerator: usize| {
+        values
+            .get((values.len().saturating_sub(1) * numerator) / 100)
+            .copied()
+            .unwrap_or_default()
+    };
+    let first_at = samples.first().map_or(0, |sample| sample.observed_at_ms);
+    let last = samples.last().copied().unwrap_or(ResourceSample {
+        observed_at_ms: first_at,
+        queue_wait_ms: 0,
+        service_time_ms: 0,
+        result_class: ResourceResultClass::Cancelled,
+    });
+    let elapsed_ms = last
+        .observed_at_ms
+        .saturating_sub(first_at)
+        .saturating_add(last.service_time_ms)
+        .max(1);
+    let completed = samples
+        .iter()
+        .filter(|sample| sample.result_class == ResourceResultClass::Completed)
+        .count();
+    ResourceWindowMetrics {
+        samples: samples.len(),
+        failed: samples
+            .iter()
+            .filter(|sample| sample.result_class == ResourceResultClass::Failed)
+            .count(),
+        cancelled: samples
+            .iter()
+            .filter(|sample| sample.result_class == ResourceResultClass::Cancelled)
+            .count(),
+        timed_out: samples
+            .iter()
+            .filter(|sample| sample.result_class == ResourceResultClass::TimedOut)
+            .count(),
+        overloaded: samples
+            .iter()
+            .filter(|sample| sample.result_class == ResourceResultClass::DownstreamOverload)
+            .count(),
+        queue_p95_ms: percentile(&queue, 95),
+        service_p95_ms: percentile(&service, 95),
+        throughput_per_minute: (completed as u64)
+            .saturating_mul(60_000)
+            .saturating_div(elapsed_ms),
+    }
+}
+
+fn rate_basis_points(count: usize, samples: usize) -> Option<u16> {
+    (samples > 0).then(|| {
+        count
+            .saturating_mul(10_000)
+            .saturating_div(samples)
+            .min(10_000) as u16
+    })
+}
+
+fn failure_timeout_upper_bound(metrics: &ResourceWindowMetrics) -> Option<u16> {
+    let adverse = metrics.failed.saturating_add(metrics.timed_out);
+    if adverse == 0 {
+        return (metrics.samples > 0).then_some(0);
+    }
+    wilson_upper_bound_basis_points(adverse, metrics.samples)
+}
+
+fn wilson_upper_bound_basis_points(adverse: usize, samples: usize) -> Option<u16> {
+    if samples == 0 {
+        return None;
+    }
+    let n = samples as f64;
+    let p = adverse.min(samples) as f64 / n;
+    let z = 1.96_f64;
+    let z2 = z * z;
+    let denominator = 1.0 + z2 / n;
+    let centre = p + z2 / (2.0 * n);
+    let margin = z * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt();
+    Some(
+        (((centre + margin) / denominator) * 10_000.0)
+            .round()
+            .clamp(0.0, 10_000.0) as u16,
+    )
+}
+
+fn apply_adaptive_policy(state: &mut ResourceState, observed_at_ms: u64) {
+    let latest = state.samples.back().copied();
+    let cooldown_ready = state
+        .adaptive
+        .last_adjustment_at_ms
+        .is_none_or(|last| observed_at_ms.saturating_sub(last) >= ADJUSTMENT_COOLDOWN_MS);
+
+    if latest.is_some_and(|sample| sample.result_class == ResourceResultClass::DownstreamOverload)
+        && cooldown_ready
+        && state.effective_limit > state.quota.minimum
+    {
+        let reduced = state.effective_limit.div_ceil(2).max(state.quota.minimum);
+        apply_limit(
+            state,
+            reduced,
+            observed_at_ms,
+            ResourceLimitAdjustment::DecreasedOverload,
+        );
+        return;
+    }
+
+    if state.samples.len() < ADAPTATION_WINDOW {
+        state.adaptive.healthy_streak = 0;
+        return;
+    }
+    let recent = state
+        .samples
+        .iter()
+        .rev()
+        .take(ADAPTATION_WINDOW)
+        .copied()
+        .collect::<Vec<_>>();
+    let current = window_metrics(recent[..ADAPTATION_HALF_WINDOW].iter().copied());
+    let previous = window_metrics(recent[ADAPTATION_HALF_WINDOW..].iter().copied());
+    let whole = window_metrics(recent.iter().copied());
+    let failure_ucb = failure_timeout_upper_bound(&whole).unwrap_or_default();
+
+    if failure_ucb >= FAILURE_TIMEOUT_UCB_THRESHOLD_BP
+        && whole.failed.saturating_add(whole.timed_out) > 0
+        && cooldown_ready
+        && state.effective_limit > state.quota.minimum
+    {
+        apply_limit(
+            state,
+            state.effective_limit.saturating_sub(1),
+            observed_at_ms,
+            ResourceLimitAdjustment::DecreasedFailureUpperBound,
+        );
+        return;
+    }
+
+    if let Some(baseline) = state.adaptive.increase_baseline {
+        let enough_post_increase_samples = state
+            .adaptive
+            .total_samples
+            .saturating_sub(baseline.sample_sequence)
+            >= ADAPTATION_HALF_WINDOW as u64;
+        let service_regressed = baseline.service_p95_ms > 0
+            && current.service_p95_ms > baseline.service_p95_ms.saturating_mul(3) / 2;
+        let throughput_stalled = current.throughput_per_minute <= baseline.throughput_per_minute;
+        if enough_post_increase_samples
+            && service_regressed
+            && throughput_stalled
+            && cooldown_ready
+            && state.effective_limit > state.quota.minimum
+        {
+            apply_limit(
+                state,
+                state.effective_limit.saturating_sub(1),
+                observed_at_ms,
+                ResourceLimitAdjustment::DecreasedServiceRegression,
+            );
+            return;
+        }
+    }
+
+    let queue_high = current.queue_p95_ms >= HIGH_QUEUE_P95_MS;
+    let service_healthy = previous.service_p95_ms == 0
+        || current.service_p95_ms <= previous.service_p95_ms.saturating_mul(6) / 5;
+    let throughput_growing =
+        current.throughput_per_minute > previous.throughput_per_minute.saturating_mul(21) / 20;
+    let no_adverse = current.failed == 0 && current.timed_out == 0 && current.overloaded == 0;
+    if queue_high && service_healthy && throughput_growing && no_adverse {
+        state.adaptive.healthy_streak = state.adaptive.healthy_streak.saturating_add(1);
+    } else {
+        state.adaptive.healthy_streak = 0;
+    }
+    if state.adaptive.healthy_streak >= 3
+        && cooldown_ready
+        && state.effective_limit < state.quota.maximum
+    {
+        state.adaptive.healthy_streak = 0;
+        state.adaptive.increase_baseline = Some(IncreaseBaseline {
+            sample_sequence: state.adaptive.total_samples,
+            service_p95_ms: current.service_p95_ms,
+            throughput_per_minute: current.throughput_per_minute,
+        });
+        apply_limit(
+            state,
+            state.effective_limit.saturating_add(1),
+            observed_at_ms,
+            ResourceLimitAdjustment::Increased,
+        );
+    }
+}
+
+fn apply_limit(
+    state: &mut ResourceState,
+    desired: usize,
+    observed_at_ms: u64,
+    adjustment: ResourceLimitAdjustment,
+) {
+    state.effective_limit = desired.clamp(state.quota.minimum, state.quota.maximum);
+    state.adaptive.last_adjustment_at_ms = Some(observed_at_ms);
+    state.adaptive.last_adjustment = adjustment;
+    if adjustment != ResourceLimitAdjustment::Increased {
+        state.adaptive.increase_baseline = None;
+    }
+}
+
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -703,68 +974,311 @@ mod tests {
         )])
     }
 
+    fn observation(
+        at: u64,
+        queue_ms: u64,
+        service_ms: u64,
+        result_class: ResourceResultClass,
+    ) -> ResourceObservation {
+        ResourceObservation::at(
+            at,
+            Duration::from_millis(queue_ms),
+            Duration::from_millis(service_ms),
+            result_class,
+        )
+    }
+
     #[test]
-    fn runtime_pressure_uses_streak_and_cooldown_instead_of_oscillating() {
+    fn queue_only_pressure_never_decreases_capacity() {
         let manager = ExecutionResourceManager::new([(
             ExecutionResourceKind::Provider,
-            ResourceQuota::new(1, 4, 4).unwrap(),
+            ResourceQuota::new(1, 4, 8).unwrap(),
         )]);
-        for _ in 0..2 {
+        let base = now_ms();
+        for index in 0..24 {
             let snapshot = manager
-                .observe_runtime_pressure(
+                .record_observation(
                     &ExecutionResourceKind::Provider,
-                    ResourceObservation {
-                        queue_wait: Duration::from_secs(1),
-                        service_time: Duration::from_secs(60),
-                        producer_wait: Duration::ZERO,
-                        queue_depth: 1,
-                        saturation: 1.0,
-                        result_class: ResourceResultClass::Failed,
-                    },
+                    observation(
+                        base + index * 1_000,
+                        500,
+                        100,
+                        ResourceResultClass::Completed,
+                    ),
                 )
                 .unwrap();
             assert_eq!(snapshot.effective_limit, 4);
         }
-        let pressured = manager
-            .observe_runtime_pressure(
+    }
+
+    #[test]
+    fn explicit_downstream_overload_decreases_capacity_immediately() {
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 4, 8).unwrap(),
+        )]);
+        let snapshot = manager
+            .record_observation(
                 &ExecutionResourceKind::Provider,
-                ResourceObservation {
-                    queue_wait: Duration::from_secs(1),
-                    service_time: Duration::from_secs(60),
-                    producer_wait: Duration::ZERO,
-                    queue_depth: 1,
-                    saturation: 1.0,
-                    result_class: ResourceResultClass::Failed,
-                },
+                observation(now_ms(), 50, 10, ResourceResultClass::DownstreamOverload),
             )
             .unwrap();
-        assert!(pressured.effective_limit < 4);
-        for _ in 0..16 {
-            let stable = manager
-                .observe_runtime_pressure(
+        assert_eq!(snapshot.effective_limit, 2);
+        assert_eq!(
+            snapshot.last_adjustment,
+            ResourceLimitAdjustment::DecreasedOverload
+        );
+    }
+
+    #[test]
+    fn failure_timeout_upper_bound_requires_a_real_adverse_sample() {
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 4, 8).unwrap(),
+        )]);
+        let base = now_ms();
+        for index in 0..16 {
+            let result = if index >= 14 {
+                ResourceResultClass::TimedOut
+            } else {
+                ResourceResultClass::Completed
+            };
+            manager
+                .record_observation(
                     &ExecutionResourceKind::Provider,
-                    ResourceObservation::completed(Duration::from_millis(1)),
+                    observation(base + index * 1_000, 0, 100, result),
                 )
                 .unwrap();
-            assert_eq!(stable.effective_limit, pressured.effective_limit);
         }
+        let snapshot = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
+        assert_eq!(snapshot.effective_limit, 3);
+        assert!(snapshot
+            .failure_timeout_upper_bound_basis_points
+            .is_some_and(|value| value >= FAILURE_TIMEOUT_UCB_THRESHOLD_BP));
     }
 
     #[test]
     fn slow_service_without_capacity_pressure_does_not_reduce_limit() {
         let manager = ExecutionResourceManager::new([(
             ExecutionResourceKind::Provider,
-            ResourceQuota::new(1, 4, 4).unwrap(),
+            ResourceQuota::new(1, 4, 8).unwrap(),
         )]);
-        for _ in 0..8 {
+        let base = now_ms();
+        for index in 0..24 {
             let snapshot = manager
-                .observe_runtime_pressure(
+                .record_observation(
                     &ExecutionResourceKind::Provider,
-                    ResourceObservation::completed(Duration::from_secs(60)),
+                    observation(
+                        base + index * 61_000,
+                        0,
+                        60_000,
+                        ResourceResultClass::Completed,
+                    ),
                 )
                 .unwrap();
             assert_eq!(snapshot.effective_limit, 4);
         }
+    }
+
+    #[test]
+    fn high_queue_healthy_service_and_positive_throughput_increase_capacity() {
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 4, 8).unwrap(),
+        )]);
+        let base = now_ms();
+        for index in 0..8 {
+            manager
+                .record_observation(
+                    &ExecutionResourceKind::Provider,
+                    observation(
+                        base + index * 1_000,
+                        200,
+                        100,
+                        ResourceResultClass::Completed,
+                    ),
+                )
+                .unwrap();
+        }
+        let current_base = base + 8_000;
+        for index in 0..11 {
+            manager
+                .record_observation(
+                    &ExecutionResourceKind::Provider,
+                    observation(
+                        current_base + index * 250,
+                        200,
+                        100,
+                        ResourceResultClass::Completed,
+                    ),
+                )
+                .unwrap();
+        }
+        let snapshot = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
+        assert_eq!(snapshot.effective_limit, 5);
+    }
+
+    #[test]
+    fn post_increase_service_regression_without_throughput_gain_rolls_back() {
+        let manager = ExecutionResourceManager::new([(
+            ExecutionResourceKind::Provider,
+            ResourceQuota::new(1, 4, 8).unwrap(),
+        )]);
+        let base = now_ms();
+        for index in 0..8 {
+            manager
+                .record_observation(
+                    &ExecutionResourceKind::Provider,
+                    observation(
+                        base + index * 1_000,
+                        200,
+                        100,
+                        ResourceResultClass::Completed,
+                    ),
+                )
+                .unwrap();
+        }
+        for index in 0..11 {
+            manager
+                .record_observation(
+                    &ExecutionResourceKind::Provider,
+                    observation(
+                        base + 8_000 + index * 250,
+                        200,
+                        100,
+                        ResourceResultClass::Completed,
+                    ),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .effective_limit,
+            5
+        );
+        for index in 0..8 {
+            manager
+                .record_observation(
+                    &ExecutionResourceKind::Provider,
+                    observation(
+                        base + 16_000 + index * 1_000,
+                        200,
+                        1_000,
+                        ResourceResultClass::Completed,
+                    ),
+                )
+                .unwrap();
+        }
+        let snapshot = manager.snapshot(&ExecutionResourceKind::Provider).unwrap();
+        assert_eq!(snapshot.effective_limit, 4);
+        assert_eq!(
+            snapshot.last_adjustment,
+            ResourceLimitAdjustment::DecreasedServiceRegression
+        );
+    }
+
+    #[test]
+    fn provider_tool_and_agent_feedback_are_isolated() {
+        let manager = ExecutionResourceManager::new([
+            (
+                ExecutionResourceKind::Provider,
+                ResourceQuota::new(1, 4, 8).unwrap(),
+            ),
+            (
+                ExecutionResourceKind::Tool,
+                ResourceQuota::new(1, 4, 8).unwrap(),
+            ),
+            (
+                ExecutionResourceKind::Agent,
+                ResourceQuota::new(1, 4, 8).unwrap(),
+            ),
+        ]);
+        manager
+            .record_observation(
+                &ExecutionResourceKind::Provider,
+                observation(now_ms(), 0, 1, ResourceResultClass::DownstreamOverload),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Provider)
+                .unwrap()
+                .effective_limit,
+            2
+        );
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Tool)
+                .unwrap()
+                .effective_limit,
+            4
+        );
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Agent)
+                .unwrap()
+                .effective_limit,
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn increased_limit_admits_new_work_and_later_shrink_preserves_leases() {
+        let kind = ExecutionResourceKind::Provider;
+        let manager =
+            ExecutionResourceManager::new([(kind.clone(), ResourceQuota::new(1, 4, 8).unwrap())]);
+        let base = now_ms();
+        for index in 0..8 {
+            manager
+                .record_observation(
+                    &kind,
+                    observation(
+                        base + index * 1_000,
+                        200,
+                        100,
+                        ResourceResultClass::Completed,
+                    ),
+                )
+                .unwrap();
+        }
+        for index in 0..11 {
+            manager
+                .record_observation(
+                    &kind,
+                    observation(
+                        base + 8_000 + index * 250,
+                        200,
+                        100,
+                        ResourceResultClass::Completed,
+                    ),
+                )
+                .unwrap();
+        }
+        let leases = futures::future::try_join_all(
+            (0..5).map(|_| manager.acquire(kind.clone(), Some(Duration::from_millis(50)))),
+        )
+        .await
+        .expect("increased limit must admit five provider operations");
+        let overloaded = manager
+            .record_observation(
+                &kind,
+                observation(
+                    base + 20_000,
+                    200,
+                    10,
+                    ResourceResultClass::DownstreamOverload,
+                ),
+            )
+            .unwrap();
+        assert_eq!(overloaded.active_leases, 5);
+        assert_eq!(overloaded.effective_limit, 3);
+        assert!(matches!(
+            manager.acquire(kind, Some(Duration::from_millis(5))).await,
+            Err(ResourceAcquireError::TimedOut { .. })
+        ));
+        drop(leases);
     }
 
     #[tokio::test]
@@ -793,7 +1307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pressure_shrinks_without_revoking_active_leases() {
+    async fn overload_shrinks_without_revoking_active_leases() {
         let manager = ExecutionResourceManager::new([(
             ExecutionResourceKind::Provider,
             ResourceQuota::new(1, 3, 4).unwrap(),
@@ -807,16 +1321,12 @@ mod tests {
             .await
             .unwrap();
         let snapshot = manager
-            .observe_pressure(
+            .record_observation(
                 &ExecutionResourceKind::Provider,
-                ResourcePressure {
-                    saturation: 1.0,
-                    failure_rate: 1.0,
-                    latency_pressure: 1.0,
-                },
+                observation(now_ms(), 500, 10, ResourceResultClass::DownstreamOverload),
             )
             .unwrap();
-        assert_eq!(snapshot.effective_limit, 1);
+        assert_eq!(snapshot.effective_limit, 2);
         assert_eq!(snapshot.active_leases, 2);
         assert!(matches!(
             manager
@@ -923,18 +1433,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshots_report_bounded_queue_and_run_latency() {
+    async fn snapshots_report_bounded_typed_samples_and_rates() {
         let manager = manager(1);
-        for _ in 0..(LATENCY_SAMPLE_CAPACITY + 20) {
-            drop(
-                manager
-                    .acquire(ExecutionResourceKind::Tool, None)
-                    .await
-                    .unwrap(),
-            );
+        let base = now_ms();
+        for index in 0..(RESOURCE_SAMPLE_CAPACITY + 20) {
+            let result = if index % 11 == 0 {
+                ResourceResultClass::Failed
+            } else {
+                ResourceResultClass::Completed
+            };
+            manager
+                .record_observation(
+                    &ExecutionResourceKind::Tool,
+                    observation(base + index as u64, 10, 20, result),
+                )
+                .unwrap();
         }
         let snapshot = manager.snapshot(&ExecutionResourceKind::Tool).unwrap();
-        assert_eq!(snapshot.queue_wait.samples, LATENCY_SAMPLE_CAPACITY);
-        assert_eq!(snapshot.run.samples, LATENCY_SAMPLE_CAPACITY);
+        assert_eq!(snapshot.sample_count, RESOURCE_SAMPLE_CAPACITY);
+        assert_eq!(snapshot.queue_wait.samples, RESOURCE_SAMPLE_CAPACITY);
+        assert_eq!(snapshot.service_time.samples, RESOURCE_SAMPLE_CAPACITY);
+        assert!(snapshot.failure_rate_basis_points.is_some());
+        assert!(snapshot.throughput_per_minute > 0);
+        assert_eq!(snapshot.freshness, ResourceObservationFreshness::Fresh);
     }
 }

@@ -1265,6 +1265,7 @@ pub struct RuntimeError {
     message: String,
     provider_context_window_limit: Option<u32>,
     provider_tool_protocol_failure: bool,
+    provider_resource_result: crate::execution_core::graph::ResourceResultClass,
 }
 
 impl RuntimeError {
@@ -1274,6 +1275,7 @@ impl RuntimeError {
             message: message.into(),
             provider_context_window_limit: None,
             provider_tool_protocol_failure: false,
+            provider_resource_result: crate::execution_core::graph::ResourceResultClass::Failed,
         }
     }
 
@@ -1286,6 +1288,7 @@ impl RuntimeError {
             message: message.into(),
             provider_context_window_limit,
             provider_tool_protocol_failure: false,
+            provider_resource_result: crate::execution_core::graph::ResourceResultClass::Failed,
         }
     }
 
@@ -1294,11 +1297,13 @@ impl RuntimeError {
         message: impl Into<String>,
         provider_context_window_limit: Option<u32>,
         provider_tool_protocol_failure: bool,
+        provider_resource_result: crate::execution_core::graph::ResourceResultClass,
     ) -> Self {
         Self {
             message: message.into(),
             provider_context_window_limit,
             provider_tool_protocol_failure,
+            provider_resource_result,
         }
     }
 
@@ -1310,6 +1315,13 @@ impl RuntimeError {
     #[must_use]
     pub const fn is_provider_tool_protocol_failure(&self) -> bool {
         self.provider_tool_protocol_failure
+    }
+
+    #[must_use]
+    pub const fn provider_resource_result(
+        &self,
+    ) -> crate::execution_core::graph::ResourceResultClass {
+        self.provider_resource_result
     }
 }
 
@@ -4416,12 +4428,16 @@ where
             let mut calls = Vec::new();
             let mut usage = TokenUsage::default();
             let mut failed = None;
+            let mut resource_result_class =
+                crate::execution_core::graph::ResourceResultClass::Completed;
             let mut first_event_at = None;
             let mut first_text_delta_observed = false;
             use futures::StreamExt;
             loop {
                 let next = tokio::select! {
                     () = cancellation.cancelled() => {
+                        resource_result_class =
+                            crate::execution_core::graph::ResourceResultClass::Cancelled;
                         failed = Some(RuntimeError::new(
                             "turn cancelled during provider stream",
                         ));
@@ -4439,6 +4455,8 @@ where
                         // period before declaring a real transport stall.
                         let heartbeat = tokio::select! {
                             () = cancellation.cancelled() => {
+                                resource_result_class =
+                                    crate::execution_core::graph::ResourceResultClass::Cancelled;
                                 failed = Some(RuntimeError::new(
                                     "turn cancelled during provider heartbeat grace",
                                 ));
@@ -4450,6 +4468,8 @@ where
                             Ok(Some(event)) => event,
                             Ok(None) => break,
                             Err(_) => {
+                                resource_result_class =
+                                    crate::execution_core::graph::ResourceResultClass::TimedOut;
                                 failed = Some(RuntimeError::new(format!(
                                     "stream stalled after {}s idle plus {}s heartbeat grace",
                                     idle_timeout.as_secs(),
@@ -4520,6 +4540,7 @@ where
                         | AssistantEvent::ToolComplete { .. },
                     ) => {}
                     Err(error) => {
+                        resource_result_class = error.provider_resource_result();
                         failed = Some(error);
                         break;
                     }
@@ -4535,31 +4556,13 @@ where
                 provider_started.elapsed(),
             );
             if let Some(manager) = &self.provider_admission {
-                let pressure_snapshot = manager
-                    .snapshot(&crate::execution_core::graph::ExecutionResourceKind::Provider)
-                    .ok();
-                let _ = manager.observe_runtime_pressure(
+                let _ = manager.record_observation(
                     &crate::execution_core::graph::ExecutionResourceKind::Provider,
-                    crate::execution_core::graph::ResourceObservation {
-                        queue_wait: provider_queue_wait,
-                        service_time: provider_started.elapsed(),
-                        producer_wait: Duration::ZERO,
-                        queue_depth: pressure_snapshot
-                            .as_ref()
-                            .map_or(0, |snapshot| snapshot.queued_waiters),
-                        saturation: pressure_snapshot.as_ref().map_or(0.0, |snapshot| {
-                            if snapshot.effective_limit == 0 {
-                                1.0
-                            } else {
-                                snapshot.active_leases as f32 / snapshot.effective_limit as f32
-                            }
-                        }),
-                        result_class: if failed.is_some() {
-                            crate::execution_core::graph::ResourceResultClass::Failed
-                        } else {
-                            crate::execution_core::graph::ResourceResultClass::Completed
-                        },
-                    },
+                    crate::execution_core::graph::ResourceObservation::terminal(
+                        provider_queue_wait,
+                        provider_started.elapsed(),
+                        resource_result_class,
+                    ),
                 );
             }
             drop(provider_lease);
