@@ -26,7 +26,7 @@ pub mod tool_intents;
 pub use cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 pub use deliberation::{DeliberationMode, DeliberationPlan};
 pub use evidence::RuntimeEvidenceSummary;
-pub use goal::{policy::InterventionPolicy, GoalProjection, GoalStore};
+pub use goal::{policy::InterventionPolicy, GoalProgressReducer, GoalProjection, GoalStore};
 pub use graph::{
     ExecutionCommitService, ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
     ExecutionGraphHost, ExecutionGraphHostReceipt, ExecutionGraphReplan, ExecutionGraphRunner,

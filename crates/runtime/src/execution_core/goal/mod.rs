@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 pub mod policy;
 
 use harness_contract::goal::{
-    AcceptanceStatus, GoalCompletion, GoalContract, GoalRevision, RuntimeIntervention,
-    RuntimeObservation,
+    AcceptanceStatus, GoalCompletion, GoalContract, GoalProgressSnapshot, GoalRevision,
+    ResolutionDeltaKind, RuntimeIntervention, RuntimeInterventionTrace, RuntimeObservation,
 };
 
 use crate::{
@@ -34,6 +34,201 @@ pub struct GoalProjection {
     pub stream_revision: u64,
     pub observations: Vec<RuntimeObservation>,
     pub interventions: Vec<RuntimeIntervention>,
+    pub intervention_traces: Vec<RuntimeInterventionTrace>,
+    pub progress: GoalProgressSnapshot,
+}
+
+pub struct GoalProgressReducer;
+
+impl GoalProgressReducer {
+    #[must_use]
+    pub fn from_goal(goal: &GoalContract) -> GoalProgressSnapshot {
+        GoalProgressSnapshot {
+            goal_id: goal.id.clone(),
+            goal_revision: goal.revision,
+            observation_count: 0,
+            criteria: goal
+                .criteria
+                .iter()
+                .map(|criterion| (criterion.id.clone(), criterion.status))
+                .collect(),
+            evidence_refs: sorted_unique(goal.evidence_refs.clone()),
+            invalidated_evidence_refs: Vec::new(),
+            effects: std::collections::BTreeMap::new(),
+            open_conflicts: sorted_unique(goal.blockers.clone()),
+            open_unknowns: sorted_unique(goal.unresolved.clone()),
+            cumulative_cost: Default::default(),
+            last_observed_at_ms: 0,
+            applied_observation_keys: Vec::new(),
+        }
+    }
+
+    pub fn reconcile_goal(
+        snapshot: &mut GoalProgressSnapshot,
+        previous_goal: &GoalContract,
+        goal: &GoalContract,
+    ) {
+        snapshot.goal_revision = goal.revision;
+        for criterion in &goal.criteria {
+            let previous_status = previous_goal
+                .criteria
+                .iter()
+                .find(|previous| previous.id == criterion.id)
+                .map(|previous| previous.status);
+            if previous_status.is_none() || previous_status != Some(criterion.status) {
+                snapshot
+                    .criteria
+                    .insert(criterion.id.clone(), criterion.status);
+            }
+        }
+        snapshot.criteria.retain(|criterion_id, _| {
+            goal.criteria
+                .iter()
+                .any(|criterion| &criterion.id == criterion_id)
+        });
+        snapshot
+            .evidence_refs
+            .extend(goal.evidence_refs.iter().cloned());
+        normalize(&mut snapshot.evidence_refs);
+        for removed in previous_goal
+            .blockers
+            .iter()
+            .filter(|blocker| !goal.blockers.contains(blocker))
+        {
+            snapshot.open_conflicts.retain(|current| current != removed);
+        }
+        snapshot.open_conflicts.extend(
+            goal.blockers
+                .iter()
+                .filter(|blocker| !previous_goal.blockers.contains(blocker))
+                .cloned(),
+        );
+        normalize(&mut snapshot.open_conflicts);
+        for removed in previous_goal
+            .unresolved
+            .iter()
+            .filter(|unknown| !goal.unresolved.contains(unknown))
+        {
+            snapshot.open_unknowns.retain(|current| current != removed);
+        }
+        snapshot.open_unknowns.extend(
+            goal.unresolved
+                .iter()
+                .filter(|unknown| !previous_goal.unresolved.contains(unknown))
+                .cloned(),
+        );
+        normalize(&mut snapshot.open_unknowns);
+    }
+
+    /// Apply one typed observation exactly once. Human summaries and generic
+    /// numeric scores are deliberately absent from the reducer.
+    pub fn apply(
+        snapshot: &mut GoalProgressSnapshot,
+        observation: &RuntimeObservation,
+    ) -> Result<bool, String> {
+        validate_observation(observation)?;
+        if snapshot.goal_id != observation.goal_id() {
+            return Err(format!(
+                "observation goal {} does not match snapshot {}",
+                observation.goal_id(),
+                snapshot.goal_id
+            ));
+        }
+        let key = observation.idempotency_fingerprint();
+        if snapshot
+            .applied_observation_keys
+            .iter()
+            .any(|existing| existing == &key)
+        {
+            return Ok(false);
+        }
+        for delta in &observation.criterion_deltas {
+            let current = snapshot
+                .criteria
+                .get(&delta.criterion_id)
+                .copied()
+                .ok_or_else(|| format!("unknown goal criterion {}", delta.criterion_id))?;
+            if current != delta.previous {
+                return Err(format!(
+                    "criterion {} delta is stale: expected {:?}, actual {:?}",
+                    delta.criterion_id, delta.previous, current
+                ));
+            }
+            snapshot
+                .criteria
+                .insert(delta.criterion_id.clone(), delta.current);
+            snapshot
+                .evidence_refs
+                .extend(delta.evidence_refs.iter().cloned());
+        }
+        for reference in &observation.evidence_delta.invalidated {
+            snapshot
+                .evidence_refs
+                .retain(|current| current != reference);
+            snapshot.invalidated_evidence_refs.push(reference.clone());
+        }
+        snapshot
+            .evidence_refs
+            .extend(observation.evidence_delta.added.iter().cloned());
+        for effect in &observation.effect_deltas {
+            snapshot
+                .effects
+                .insert(effect.effect_id.clone(), effect.terminal_class);
+        }
+        for conflict in &observation.conflict_deltas {
+            apply_resolution_delta(
+                &mut snapshot.open_conflicts,
+                &conflict.conflict_id,
+                conflict.change,
+            );
+        }
+        for unknown in &observation.unknown_deltas {
+            apply_resolution_delta(
+                &mut snapshot.open_unknowns,
+                &unknown.unknown_id,
+                unknown.change,
+            );
+        }
+        snapshot.cumulative_cost.model_steps = snapshot
+            .cumulative_cost
+            .model_steps
+            .saturating_add(observation.cost_delta.model_steps);
+        snapshot.cumulative_cost.tool_calls = snapshot
+            .cumulative_cost
+            .tool_calls
+            .saturating_add(observation.cost_delta.tool_calls);
+        snapshot.cumulative_cost.duration_ms = snapshot
+            .cumulative_cost
+            .duration_ms
+            .saturating_add(observation.cost_delta.duration_ms);
+        snapshot.cumulative_cost.input_tokens = snapshot
+            .cumulative_cost
+            .input_tokens
+            .saturating_add(observation.cost_delta.input_tokens);
+        snapshot.cumulative_cost.output_tokens = snapshot
+            .cumulative_cost
+            .output_tokens
+            .saturating_add(observation.cost_delta.output_tokens);
+        snapshot.cumulative_cost.cached_tokens = snapshot
+            .cumulative_cost
+            .cached_tokens
+            .saturating_add(observation.cost_delta.cached_tokens);
+        snapshot.observation_count = snapshot.observation_count.saturating_add(1);
+        snapshot.last_observed_at_ms = snapshot
+            .last_observed_at_ms
+            .max(observation.freshness.observed_at_ms);
+        snapshot.applied_observation_keys.push(key);
+        if snapshot.applied_observation_keys.len() > 256 {
+            snapshot
+                .applied_observation_keys
+                .drain(..snapshot.applied_observation_keys.len() - 256);
+        }
+        normalize(&mut snapshot.evidence_refs);
+        normalize(&mut snapshot.invalidated_evidence_refs);
+        normalize(&mut snapshot.open_conflicts);
+        normalize(&mut snapshot.open_unknowns);
+        Ok(true)
+    }
 }
 
 impl GoalStore {
@@ -93,6 +288,8 @@ impl GoalStore {
         let mut goal = None;
         let mut observations = Vec::new();
         let mut interventions = Vec::new();
+        let mut intervention_traces = Vec::new();
+        let mut progress = None;
         let mut stream_revision = 0_u64;
         for event in self
             .event_store
@@ -104,29 +301,65 @@ impl GoalStore {
                 return Err(format!("goal stream {stream_id} contains a non-goal event"));
             }
             if let Some(value) = event.payload.get("goal") {
-                goal = Some(
-                    serde_json::from_value::<GoalContract>(value.clone())
-                        .map_err(|error| error.to_string())?,
-                );
+                let event_goal = serde_json::from_value::<GoalContract>(value.clone())
+                    .map_err(|error| error.to_string())?;
+                if progress.is_none() {
+                    progress = Some(GoalProgressReducer::from_goal(&event_goal));
+                } else if matches!(
+                    event.kind.as_str(),
+                    "goal.created" | "goal.revised" | "goal.completed"
+                ) {
+                    let previous_goal = goal
+                        .as_ref()
+                        .ok_or_else(|| "goal revision precedes goal creation".to_string())?;
+                    GoalProgressReducer::reconcile_goal(
+                        progress.as_mut().expect("goal progress initialized"),
+                        previous_goal,
+                        &event_goal,
+                    );
+                }
+                goal = Some(event_goal);
             }
             if let Some(value) = event.payload.get("observation") {
-                observations.push(
-                    serde_json::from_value::<RuntimeObservation>(value.clone())
-                        .map_err(|error| error.to_string())?,
-                );
+                let observation = serde_json::from_value::<RuntimeObservation>(value.clone())
+                    .map_err(|error| error.to_string())?;
+                GoalProgressReducer::apply(
+                    progress
+                        .as_mut()
+                        .ok_or_else(|| "goal observation precedes goal creation".to_string())?,
+                    &observation,
+                )?;
+                observations.push(observation);
+                if observations.len() > 256 {
+                    observations.remove(0);
+                }
             }
             if let Some(value) = event.payload.get("intervention") {
                 interventions.push(
                     serde_json::from_value::<RuntimeIntervention>(value.clone())
                         .map_err(|error| error.to_string())?,
                 );
+                intervention_traces.push(
+                    serde_json::from_value::<RuntimeInterventionTrace>(
+                        event
+                            .payload
+                            .get("intervention_trace")
+                            .cloned()
+                            .ok_or_else(|| {
+                                "goal intervention event has no typed trigger trace".to_string()
+                            })?,
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
             }
         }
         Ok(goal.map(|goal| GoalProjection {
+            progress: progress.unwrap_or_else(|| GoalProgressReducer::from_goal(&goal)),
             goal,
             stream_revision,
             observations,
             interventions,
+            intervention_traces,
         }))
     }
 
@@ -139,6 +372,12 @@ impl GoalStore {
             .filter_map(|event| event.payload.get("observation").cloned())
             .map(serde_json::from_value)
             .collect::<Result<Vec<_>, _>>()
+            .map(|mut observations| {
+                if observations.len() > 256 {
+                    observations.drain(..observations.len() - 256);
+                }
+                observations
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -225,8 +464,19 @@ impl GoalStore {
     }
 
     pub fn record_observation(&self, observation: RuntimeObservation) -> Result<(), String> {
-        let event =
-            self.observation_event(&observation, format!("direct:{}", uuid::Uuid::new_v4()))?;
+        let key = observation.idempotency_fingerprint();
+        let projection = self
+            .projection(observation.goal_id())?
+            .ok_or_else(|| format!("goal {} not found", observation.goal_id()))?;
+        if projection
+            .progress
+            .applied_observation_keys
+            .iter()
+            .any(|existing| existing == &key)
+        {
+            return Ok(());
+        }
+        let event = self.observation_event(&observation, format!("direct:{key}"))?;
         let stream_id = event.event.stream_id.clone();
         let revision = self
             .event_store
@@ -236,20 +486,23 @@ impl GoalStore {
             .append_batch_if_revision(
                 stream_id,
                 revision,
-                format!(
-                    "goal-observation:{}:{}",
-                    observation.goal_id,
-                    uuid::Uuid::new_v4()
-                ),
+                format!("goal-observation:{}:{key}", observation.goal_id()),
                 vec![event],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
     }
 
-    pub fn record_intervention(&self, intervention: RuntimeIntervention) -> Result<(), String> {
-        let event =
-            self.intervention_event(&intervention, format!("direct:{}", uuid::Uuid::new_v4()))?;
+    pub fn record_intervention(
+        &self,
+        intervention: RuntimeIntervention,
+        trigger_observations: &[RuntimeObservation],
+    ) -> Result<(), String> {
+        let event = self.intervention_event(
+            &intervention,
+            trigger_observations,
+            format!("direct:{}", uuid::Uuid::new_v4()),
+        )?;
         let stream_id = event.event.stream_id.clone();
         let revision = self
             .event_store
@@ -278,17 +531,20 @@ impl GoalStore {
         observation: &RuntimeObservation,
         idempotency_key: String,
     ) -> Result<RuntimeTransactionEventInput, String> {
+        validate_observation(observation)?;
         let goal = self
-            .get(&observation.goal_id)?
-            .ok_or_else(|| format!("goal {} not found", observation.goal_id))?;
+            .get(observation.goal_id())?
+            .ok_or_else(|| format!("goal {} not found", observation.goal_id()))?;
         Ok(goal_event(
             &goal,
             "goal.observation",
             "observed",
             observation.source.clone(),
             observation
-                .evidence_refs
+                .evidence_delta
+                .added
                 .iter()
+                .chain(observation.evidence_refs.iter())
                 .map(|id| RuntimeEventRef {
                     kind: "evidence".to_string(),
                     id: id.clone(),
@@ -304,8 +560,28 @@ impl GoalStore {
     pub fn intervention_event(
         &self,
         intervention: &RuntimeIntervention,
+        trigger_observations: &[RuntimeObservation],
         idempotency_key: String,
     ) -> Result<RuntimeTransactionEventInput, String> {
+        let trigger = trigger_observations
+            .iter()
+            .max_by_key(|observation| observation.freshness.observed_at_ms)
+            .ok_or_else(|| {
+                "runtime intervention requires at least one typed trigger observation".to_string()
+            })?;
+        if trigger_observations
+            .iter()
+            .any(|observation| observation.goal_id() != intervention.goal_id)
+        {
+            return Err("runtime intervention trigger crosses Goal identity".to_string());
+        }
+        let trace = RuntimeInterventionTrace {
+            identity: trigger.identity.clone(),
+            trigger_observation_keys: trigger_observations
+                .iter()
+                .map(RuntimeObservation::idempotency_fingerprint)
+                .collect(),
+        };
         let goal = self
             .get(&intervention.goal_id)?
             .ok_or_else(|| format!("goal {} not found", intervention.goal_id))?;
@@ -322,7 +598,11 @@ impl GoalStore {
                     id: id.clone(),
                 })
                 .collect(),
-            serde_json::json!({ "goal": goal, "intervention": intervention }),
+            serde_json::json!({
+                "goal": goal,
+                "intervention": intervention,
+                "intervention_trace": trace,
+            }),
             idempotency_key,
         ))
     }
@@ -339,18 +619,22 @@ impl GoalStore {
         reason: String,
         idempotency_key: String,
     ) -> Result<RuntimeTransactionEventInput, String> {
-        let mut goal = self
-            .get(goal_id)?
+        let projection = self
+            .projection(goal_id)?
             .ok_or_else(|| format!("goal {goal_id} not found"))?;
+        let mut goal = projection.goal;
         if goal.completion != GoalCompletion::Open {
             return Err(format!("goal {goal_id} is already terminal"));
         }
-        let mut durable_evidence = goal.evidence_refs.clone();
+        let mut durable_evidence = projection.progress.evidence_refs.clone();
         durable_evidence.extend(evidence_refs.iter().cloned());
         durable_evidence.sort();
         durable_evidence.dedup();
         if completion == GoalCompletion::Satisfied {
             for criterion in &mut goal.criteria {
+                if let Some(status) = projection.progress.criteria.get(&criterion.id) {
+                    criterion.status = *status;
+                }
                 if criterion.status == AcceptanceStatus::Open
                     && criterion
                         .required_evidence
@@ -369,6 +653,28 @@ impl GoalStore {
                 return Err(
                     "cannot satisfy a goal until every criterion has required evidence or a waiver"
                         .to_string(),
+                );
+            }
+            if !projection.progress.open_conflicts.is_empty() {
+                return Err(format!(
+                    "cannot satisfy a goal with unresolved conflicts: {}",
+                    projection.progress.open_conflicts.join(", ")
+                ));
+            }
+            if !projection.progress.open_unknowns.is_empty() {
+                return Err(format!(
+                    "cannot satisfy a goal with unresolved unknowns: {}",
+                    projection.progress.open_unknowns.join(", ")
+                ));
+            }
+            if projection
+                .progress
+                .effects
+                .values()
+                .any(|effect| *effect == harness_contract::goal::EffectTerminalClass::Uncertain)
+            {
+                return Err(
+                    "cannot satisfy a goal while an effect has no terminal receipt".to_string(),
                 );
             }
         }
@@ -435,9 +741,10 @@ impl GoalStore {
             .event_store
             .stream_revision(&stream_id)
             .map_err(|error| error.to_string())?;
-        let mut goal = self
-            .get(goal_id)?
+        let projection = self
+            .projection(goal_id)?
             .ok_or_else(|| format!("goal {goal_id} not found"))?;
+        let mut goal = projection.goal;
         if goal.revision != expected_revision {
             return Err(format!(
                 "goal completion has stale revision {expected_revision}"
@@ -445,6 +752,11 @@ impl GoalStore {
         }
         match completion {
             GoalCompletion::Satisfied => {
+                for criterion in &mut goal.criteria {
+                    if let Some(status) = projection.progress.criteria.get(&criterion.id) {
+                        criterion.status = *status;
+                    }
+                }
                 if goal.criteria.iter().any(|criterion| {
                     !matches!(
                         criterion.status,
@@ -453,6 +765,17 @@ impl GoalStore {
                 }) {
                     return Err(
                         "cannot satisfy a goal until every acceptance criterion is satisfied or waived"
+                            .to_string(),
+                        );
+                }
+                if !projection.progress.open_conflicts.is_empty()
+                    || !projection.progress.open_unknowns.is_empty()
+                    || projection.progress.effects.values().any(|effect| {
+                        *effect == harness_contract::goal::EffectTerminalClass::Uncertain
+                    })
+                {
+                    return Err(
+                        "cannot satisfy a goal while conflicts, unknowns, or uncertain effects remain unresolved"
                             .to_string(),
                     );
                 }
@@ -471,6 +794,7 @@ impl GoalStore {
                 return Err("completion cannot transition back to open".to_string())
             }
         };
+        goal.evidence_refs = projection.progress.evidence_refs;
         goal.revision = goal.revision.saturating_add(1);
         self.append_goal_event(
             &stream_id,
@@ -551,6 +875,53 @@ impl GoalStore {
     }
 }
 
+fn validate_observation(observation: &RuntimeObservation) -> Result<(), String> {
+    if observation.identity.workspace_id.trim().is_empty()
+        || observation.identity.session_id.trim().is_empty()
+        || observation.identity.graph_id.trim().is_empty()
+        || observation.identity.goal_id.trim().is_empty()
+        || observation.source.trim().is_empty()
+        || observation.source_revision == 0
+        || observation.freshness.observed_at_ms == 0
+        || observation.freshness.policy_revision.trim().is_empty()
+        || observation.fingerprint.trim().is_empty()
+        || observation
+            .identity
+            .turn_id
+            .as_deref()
+            .is_some_and(|turn_id| turn_id.trim().is_empty())
+    {
+        return Err("runtime observation has incomplete identity or provenance".to_string());
+    }
+    if observation.failed() && observation.failure_class.is_none() {
+        return Err("failed runtime observation requires a typed failure class".to_string());
+    }
+    if observation.result_class == harness_contract::goal::ObservationResultClass::Succeeded
+        && observation.failure_class.is_some()
+    {
+        return Err("successful runtime observation cannot carry a failure class".to_string());
+    }
+    Ok(())
+}
+
+fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
+    normalize(&mut values);
+    values
+}
+
+fn normalize(values: &mut Vec<String>) {
+    values.retain(|value| !value.trim().is_empty());
+    values.sort();
+    values.dedup();
+}
+
+fn apply_resolution_delta(values: &mut Vec<String>, id: &str, change: ResolutionDeltaKind) {
+    match change {
+        ResolutionDeltaKind::Opened => values.push(id.to_string()),
+        ResolutionDeltaKind::Resolved => values.retain(|value| value != id),
+    }
+}
+
 fn goal_event(
     goal: &GoalContract,
     kind: &str,
@@ -621,7 +992,14 @@ fn validate_goal(goal: &GoalContract) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::goal::{AcceptanceCriterion, AcceptanceStatus};
+    use harness_contract::{
+        core::MeasureProvenance,
+        goal::{
+            AcceptanceCriterion, AcceptanceStatus, ContextDelta, CostDelta, CriterionDelta,
+            EvidenceDelta, InformationGain, ObservationFreshness, ObservationResultClass,
+            ParallelismDelta, RuntimeObservationIdentity, RuntimeObservationKind, UnknownDelta,
+        },
+    };
 
     fn goal() -> GoalContract {
         GoalContract {
@@ -643,6 +1021,42 @@ mod tests {
             completion: GoalCompletion::Open,
             revision: 1,
             user_sequence: 1,
+        }
+    }
+
+    fn observation(revision: u64) -> RuntimeObservation {
+        RuntimeObservation {
+            identity: RuntimeObservationIdentity {
+                workspace_id: "workspace".to_string(),
+                session_id: "session-test".to_string(),
+                turn_id: Some("turn".to_string()),
+                task_id: None,
+                graph_id: "graph".to_string(),
+                goal_id: "goal-test".to_string(),
+                node_id: Some(format!("node-{revision}")),
+            },
+            kind: RuntimeObservationKind::ToolProgress,
+            source: "test.tool".to_string(),
+            source_revision: revision,
+            freshness: ObservationFreshness {
+                observed_at_ms: revision,
+                valid_until_ms: None,
+                policy_revision: "goal-observation-v2".to_string(),
+            },
+            summary: "summary is retained for people, not reduced".to_string(),
+            fingerprint: format!("tool-{revision}"),
+            evidence_refs: vec![format!("receipt:{revision}")],
+            criterion_deltas: Vec::new(),
+            evidence_delta: EvidenceDelta::default(),
+            effect_deltas: Vec::new(),
+            conflict_deltas: Vec::new(),
+            unknown_deltas: Vec::new(),
+            cost_delta: CostDelta::default(),
+            information_gain: InformationGain::default(),
+            context_delta: ContextDelta::default(),
+            parallelism_delta: ParallelismDelta::default(),
+            result_class: ObservationResultClass::Succeeded,
+            failure_class: None,
         }
     }
 
@@ -694,6 +1108,110 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<GoalContract>(event.event.payload["goal"].clone()).unwrap(),
             revised
+        );
+    }
+
+    #[test]
+    fn typed_observation_reducer_is_idempotent_and_completion_uses_its_evidence() {
+        let store = GoalStore::new(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()));
+        store.create(goal()).unwrap();
+        let mut observation = observation(1);
+        observation.criterion_deltas.push(CriterionDelta {
+            criterion_id: "checked".to_string(),
+            previous: AcceptanceStatus::Open,
+            current: AcceptanceStatus::Satisfied,
+            evidence_refs: vec!["evidence:checked".to_string()],
+        });
+        observation.evidence_delta.added = vec!["evidence:checked".to_string()];
+        observation.information_gain = InformationGain {
+            distinguishing_evidence_refs: vec!["evidence:checked".to_string()],
+            resolved_unknown_refs: Vec::new(),
+            provenance: MeasureProvenance::Observed,
+        };
+
+        store.record_observation(observation.clone()).unwrap();
+        store.record_observation(observation).unwrap();
+        let projection = store.projection("goal-test").unwrap().unwrap();
+        assert_eq!(projection.progress.observation_count, 1);
+        assert_eq!(
+            projection.progress.criteria["checked"],
+            AcceptanceStatus::Satisfied
+        );
+        assert_eq!(
+            projection.progress.evidence_refs,
+            vec!["evidence:checked".to_string()]
+        );
+
+        let completed = store
+            .complete("goal-test", 1, GoalCompletion::Satisfied, "typed evidence")
+            .unwrap();
+        assert_eq!(completed.completion, GoalCompletion::Satisfied);
+        assert_eq!(
+            completed.evidence_refs,
+            vec!["evidence:checked".to_string()]
+        );
+    }
+
+    #[test]
+    fn unrelated_goal_revision_preserves_reduced_progress_and_unknown_resolution() {
+        let store = GoalStore::new(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()));
+        store.create(goal()).unwrap();
+        let mut opened = observation(1);
+        opened.unknown_deltas.push(UnknownDelta {
+            unknown_id: "pending-check".to_string(),
+            change: ResolutionDeltaKind::Opened,
+            evidence_refs: Vec::new(),
+        });
+        store.record_observation(opened).unwrap();
+        let mut resolved = observation(2);
+        resolved.unknown_deltas.push(UnknownDelta {
+            unknown_id: "pending-check".to_string(),
+            change: ResolutionDeltaKind::Resolved,
+            evidence_refs: vec!["evidence:checked".to_string()],
+        });
+        resolved.evidence_delta.added = vec!["evidence:checked".to_string()];
+        store.record_observation(resolved).unwrap();
+        store
+            .revise("goal-test", 1, 2, "new user constraint", |goal| {
+                goal.constraints.push("keep evidence".to_string());
+                vec!["constraints".to_string()]
+            })
+            .unwrap();
+
+        let projection = store.projection("goal-test").unwrap().unwrap();
+        assert!(projection.progress.open_unknowns.is_empty());
+        assert_eq!(
+            projection.progress.evidence_refs,
+            vec!["evidence:checked".to_string()]
+        );
+    }
+
+    #[test]
+    fn intervention_projection_retains_full_trigger_identity() {
+        let store = GoalStore::new(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()));
+        store.create(goal()).unwrap();
+        let trigger = observation(1);
+        store.record_observation(trigger.clone()).unwrap();
+        store
+            .record_intervention(
+                RuntimeIntervention {
+                    goal_id: "goal-test".to_string(),
+                    kind: harness_contract::goal::RuntimeInterventionKind::Replan,
+                    reason: "typed trigger".to_string(),
+                    evidence_refs: Vec::new(),
+                    expected_graph_revision: None,
+                },
+                std::slice::from_ref(&trigger),
+            )
+            .unwrap();
+
+        let projection = store.projection("goal-test").unwrap().unwrap();
+        assert_eq!(projection.interventions.len(), 1);
+        assert_eq!(projection.intervention_traces.len(), 1);
+        assert_eq!(projection.intervention_traces[0].identity, trigger.identity);
+        assert_eq!(
+            projection.intervention_traces[0].trigger_observation_keys,
+            vec![trigger.idempotency_fingerprint()]
         );
     }
 }

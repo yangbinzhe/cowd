@@ -26,14 +26,18 @@ use harness_contract::execution_graph::{
     ExecutionNodeStatus, ExecutionUsage,
 };
 use harness_contract::goal::{
-    AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract, RuntimeIntervention,
-    RuntimeInterventionKind, RuntimeObservation, RuntimeObservationKind,
+    AcceptanceCriterion, AcceptanceStatus, ContextDelta, CostDelta, EffectDelta,
+    EffectTerminalClass, EvidenceDelta, GoalCompletion, GoalContract, InformationGain,
+    ObservationFailureClass, ObservationFreshness, ObservationResultClass, ParallelismDelta,
+    ResolutionDeltaKind, RuntimeIntervention, RuntimeInterventionKind, RuntimeObservation,
+    RuntimeObservationIdentity, RuntimeObservationKind, UnknownDelta,
 };
 use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
 use harness_contract::turn::{
     InputRoutingDecision, SessionInputEnvelope, SessionInputProjection, SessionInputReceipt,
     TurnId, TurnInboxSnapshot,
 };
+use harness_contract::MeasureProvenance;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -2949,13 +2953,27 @@ where
                                 "Execution blocked safely: {reason}\n\nChecked evidence and progress were preserved. Continue with a new constraint, additional evidence, or an explicit replan."
                             ),
                         ));
-                        Some(RuntimeIntervention {
+                        let mut observation = runtime_observation(
+                            runtime_observation_identity(&self.services, &state, ticket),
+                            RuntimeObservationKind::StrategyHistory,
+                            "runtime.safety_fuse",
+                            u64::try_from(state.iterations).unwrap_or(u64::MAX),
+                            reason.clone(),
+                            format!(
+                                "safety-fuse:{}:{}",
+                                ticket.node_id, state.safety_lease.max_model_steps
+                            ),
+                            ObservationResultClass::Failed,
+                        );
+                        observation.failure_class = Some(ObservationFailureClass::Policy);
+                        let intervention = RuntimeIntervention {
                             goal_id: state.goal_id.clone(),
                             kind: RuntimeInterventionKind::Block,
                             reason,
                             evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
                             expected_graph_revision: None,
-                        })
+                        };
+                        Some((intervention, observation))
                     }
                 }
             };
@@ -2974,7 +2992,7 @@ where
                 std::mem::take(&mut state.pending_next_model_context),
             )
         };
-        if let Some(intervention) = fuse_intervention {
+        if let Some((intervention, observation)) = fuse_intervention {
             let mut synthesize = dynamic_node(
                 ticket,
                 0,
@@ -2997,8 +3015,21 @@ where
             outcome.domain_events.push(
                 self.services
                     .goal_store()
+                    .observation_event(
+                        &observation,
+                        format!("{}:safety-observation", ticket.idempotency_key),
+                    )
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })?,
+            );
+            outcome.domain_events.push(
+                self.services
+                    .goal_store()
                     .intervention_event(
                         &intervention,
+                        std::slice::from_ref(&observation),
                         format!("{}:safety-intervention", ticket.idempotency_key),
                     )
                     .map_err(|reason| NodeExecutorError::Poll {
@@ -3048,6 +3079,15 @@ where
         drop(runtime);
         match result {
             Ok(step) => {
+                let committed_graph = self
+                    .services
+                    .graph_state_store()
+                    .load_async(ticket.graph_id.clone())
+                    .await
+                    .map_err(|error| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: format!("load committed predecessor results: {error}"),
+                    })?;
                 let step_output_chars = step
                     .assistant_message
                     .blocks
@@ -3158,41 +3198,74 @@ where
                     .map(|record| record.envelope.content.trim())
                     .filter(|content| !content.is_empty())
                     .collect::<Vec<_>>();
-                let input_observation = (!consumed_inputs.is_empty()).then(|| RuntimeObservation {
-                    goal_id: goal_id.clone(),
-                    kind: RuntimeObservationKind::UserInput,
-                    source: "runtime.session_input_checkpoint".to_string(),
-                    summary: format!(
-                        "consumed {} session input update(s); correction_count={}",
-                        consumed_inputs.len(),
-                        correction_inputs.len(),
-                    ),
-                    fingerprint: (!correction_inputs.is_empty()).then(|| {
-                        format!(
-                            "user-correction:{}",
-                            sha256_digest(&correction_inputs.join("\n")),
-                        )
-                    }),
-                    evidence_refs: consumed_inputs
+                let correction_fingerprint = (!correction_inputs.is_empty())
+                    .then(|| sha256_digest(&correction_inputs.join("\n")));
+                let observation_identity =
+                    runtime_observation_identity(&self.services, &state, ticket);
+                let observation_revision = state.iterations as u64;
+                let mut upstream_observations =
+                    predecessor_goal_observations(&committed_graph, ticket, &observation_identity);
+                let applied_observation_keys = self
+                    .services
+                    .goal_store()
+                    .projection(&goal_id)
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })?
+                    .map(|projection| projection.progress.applied_observation_keys)
+                    .unwrap_or_default();
+                upstream_observations.retain(|observation| {
+                    !applied_observation_keys
+                        .iter()
+                        .any(|key| key == &observation.idempotency_fingerprint())
+                });
+                let input_observation = (!consumed_inputs.is_empty()).then(|| {
+                    let evidence_refs = consumed_inputs
                         .iter()
                         .map(|record| format!("session_input:{}", record.envelope.input_id))
-                        .collect(),
-                    metrics: BTreeMap::from([
-                        (
-                            "consumed_input_count".to_string(),
-                            consumed_inputs.len() as i64,
+                        .collect::<Vec<_>>();
+                    let mut observation = runtime_observation(
+                        observation_identity.clone(),
+                        RuntimeObservationKind::UserInput,
+                        "runtime.session_input_checkpoint",
+                        observation_revision,
+                        format!(
+                            "consumed {} session input update(s); correction_count={}",
+                            consumed_inputs.len(),
+                            correction_inputs.len(),
                         ),
-                        (
-                            "correction_count".to_string(),
-                            correction_inputs.len() as i64,
-                        ),
-                    ]),
-                    progress_delta: if correction_inputs.is_empty() { 0 } else { 1 },
-                    novelty: if correction_inputs.is_empty() {
-                        40
-                    } else {
-                        100
-                    },
+                        if correction_inputs.is_empty() {
+                            format!("session-input:{}", sha256_digest(&evidence_refs.join("\n")))
+                        } else {
+                            format!(
+                                "user-correction:{}",
+                                correction_fingerprint
+                                    .as_deref()
+                                    .expect("non-empty correction has a fingerprint")
+                            )
+                        },
+                        ObservationResultClass::Informational,
+                    );
+                    observation.evidence_refs.clone_from(&evidence_refs);
+                    if !correction_inputs.is_empty() {
+                        observation.information_gain = InformationGain {
+                            distinguishing_evidence_refs: evidence_refs,
+                            resolved_unknown_refs: Vec::new(),
+                            provenance: MeasureProvenance::Observed,
+                        };
+                        observation.unknown_deltas.push(UnknownDelta {
+                            unknown_id: format!(
+                                "replan-after-user-correction:{}",
+                                correction_fingerprint
+                                    .as_deref()
+                                    .expect("non-empty correction has a fingerprint")
+                            ),
+                            change: ResolutionDeltaKind::Opened,
+                            evidence_refs: observation.evidence_refs.clone(),
+                        });
+                    }
+                    observation
                 });
                 let input_revision = if correction_inputs.is_empty() {
                     None
@@ -3277,99 +3350,105 @@ where
                         other => other,
                     };
                 }
-                let observation = RuntimeObservation {
-                    goal_id: goal_id.clone(),
-                    kind: RuntimeObservationKind::GraphProgress,
-                    source: "runtime.model_step".to_string(),
-                    summary: model_intent_summary(&intent),
-                    fingerprint: None,
-                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                    metrics: BTreeMap::from([
-                        ("model_step".to_string(), state.iterations as i64),
-                        (
-                            "parallel_ready_work".to_string(),
-                            independent_tool_call_count(&intent) as i64,
+                let mut observation = runtime_observation(
+                    observation_identity.clone(),
+                    RuntimeObservationKind::GraphProgress,
+                    "runtime.model_step",
+                    observation_revision,
+                    model_intent_summary(&intent),
+                    format!(
+                        "model-intent:{}:{}",
+                        model_intent_kind(&intent),
+                        state.iterations
+                    ),
+                    ObservationResultClass::Informational,
+                );
+                observation.evidence_refs = vec![format!("execution_node:{}", ticket.node_id)];
+                observation.parallelism_delta.ready_work =
+                    u16::try_from(independent_tool_call_count(&intent)).unwrap_or(u16::MAX);
+                if let Some(correction_fingerprint) = correction_fingerprint.as_deref() {
+                    observation.unknown_deltas.push(UnknownDelta {
+                        unknown_id: format!(
+                            "replan-after-user-correction:{correction_fingerprint}"
                         ),
-                    ]),
-                    // A provider intent only describes the next action. It is
-                    // not verified goal progress until the resulting tool,
-                    // agent, or synthesis evidence has committed.
-                    progress_delta: 0,
-                    novelty: model_intent_novelty(&intent),
-                };
-                let provider_observation = RuntimeObservation {
-                    goal_id: goal_id.clone(),
-                    kind: RuntimeObservationKind::ProviderProgress,
-                    source: "runtime.provider_stream".to_string(),
-                    summary: format!(
+                        change: ResolutionDeltaKind::Resolved,
+                        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+                    });
+                }
+                let mut provider_observation = runtime_observation(
+                    observation_identity.clone(),
+                    RuntimeObservationKind::ProviderProgress,
+                    "runtime.provider_stream",
+                    observation_revision,
+                    format!(
                         "provider completed model step input_tokens={} output_tokens={} duration_ms={}",
                         usage.input_tokens, usage.output_tokens, usage.duration_ms
                     ),
-                    fingerprint: state.model.as_ref().map(|model| {
-                        format!("provider-step:{model}:{}", model_intent_kind(&intent))
-                    }),
-                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                    metrics: BTreeMap::from([
-                        ("input_tokens".to_string(), usage.input_tokens as i64),
-                        ("output_tokens".to_string(), usage.output_tokens as i64),
-                        ("duration_ms".to_string(), usage.duration_ms as i64),
-                    ]),
-                    // Provider transport completion is not business progress
-                    // or new evidence. V602 replaces these compatibility
-                    // fields with typed provider observations.
-                    progress_delta: 0,
-                    novelty: 0,
+                    format!(
+                        "provider-step:{}:{}",
+                        state.model.as_deref().unwrap_or("configured-primary"),
+                        model_intent_kind(&intent)
+                    ),
+                    ObservationResultClass::Succeeded,
+                );
+                provider_observation.evidence_refs =
+                    vec![format!("execution_node:{}", ticket.node_id)];
+                provider_observation.cost_delta = CostDelta {
+                    model_steps: 1,
+                    duration_ms: usage.duration_ms,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    cached_tokens: usage.cached_tokens,
+                    ..CostDelta::default()
                 };
                 let context_pressure_basis_points =
                     context_pressure_basis_points(usage.input_tokens, state.context_window);
-                let context_observation = RuntimeObservation {
-                    goal_id: goal_id.clone(),
-                    kind: RuntimeObservationKind::ContextPressure,
-                    source: "runtime.context_ledger".to_string(),
-                    summary: format!(
+                let mut context_observation = runtime_observation(
+                    observation_identity.clone(),
+                    RuntimeObservationKind::ContextPressure,
+                    "runtime.context_ledger",
+                    observation_revision,
+                    format!(
                         "model request consumed {} input tokens against a {} token context window",
                         usage.input_tokens, state.context_window
                     ),
-                    fingerprint: Some(format!(
+                    format!(
                         "context-pressure:{}:{}",
                         state.context_window, context_pressure_basis_points
-                    )),
-                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                    metrics: BTreeMap::from([
-                        ("context_window".to_string(), state.context_window as i64),
-                        ("input_tokens".to_string(), usage.input_tokens as i64),
-                        (
-                            "pressure_basis_points".to_string(),
-                            context_pressure_basis_points,
-                        ),
-                    ]),
-                    progress_delta: 0,
-                    novelty: 20,
+                    ),
+                    ObservationResultClass::Informational,
+                );
+                context_observation.evidence_refs =
+                    vec![format!("execution_node:{}", ticket.node_id)];
+                context_observation.context_delta = ContextDelta {
+                    context_window_tokens: u64::from(state.context_window),
+                    input_tokens: usage.input_tokens,
+                    pressure_basis_points: u16::try_from(context_pressure_basis_points)
+                        .unwrap_or(10_000)
+                        .min(10_000),
                 };
-                let strategy_observation = RuntimeObservation {
-                    goal_id: goal_id.clone(),
-                    kind: RuntimeObservationKind::StrategyHistory,
-                    source: "runtime.strategy_checkpoint".to_string(),
-                    summary: format!(
+                let mut strategy_observation = runtime_observation(
+                    observation_identity,
+                    RuntimeObservationKind::StrategyHistory,
+                    "runtime.strategy_checkpoint",
+                    observation_revision,
+                    format!(
                         "model intent {} has {} independent ready tool action(s)",
                         model_intent_kind(&intent),
                         independent_tool_call_count(&intent)
                     ),
-                    fingerprint: Some(format!(
+                    format!(
                         "strategy:{}:{}",
                         model_intent_kind(&intent),
                         independent_tool_call_count(&intent)
-                    )),
-                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                    metrics: BTreeMap::from([
-                        (
-                            "parallel_ready_work".to_string(),
-                            independent_tool_call_count(&intent) as i64,
-                        ),
-                        ("model_step".to_string(), state.iterations as i64),
-                    ]),
-                    progress_delta: 0,
-                    novelty: 40,
+                    ),
+                    ObservationResultClass::Informational,
+                );
+                strategy_observation.evidence_refs =
+                    vec![format!("execution_node:{}", ticket.node_id)];
+                strategy_observation.parallelism_delta = ParallelismDelta {
+                    ready_work: u16::try_from(independent_tool_call_count(&intent))
+                        .unwrap_or(u16::MAX),
                 };
                 let mut committed_result_ref = format!("{}:model-result", ticket.graph_id);
                 let reasoning_only_response = step
@@ -4186,60 +4265,26 @@ where
                             edges,
                             reason: "provider intent advanced the turn graph".to_string(),
                         });
-                outcome.domain_events.push(
-                    self.services
-                        .goal_store()
-                        .observation_event(
-                            &observation,
-                            format!("{}:goal-observation", ticket.idempotency_key),
-                        )
-                        .map_err(|reason| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason,
-                        })?,
-                );
-                outcome.domain_events.push(
-                    self.services
-                        .goal_store()
-                        .observation_event(
-                            &strategy_observation,
-                            format!("{}:strategy-observation", ticket.idempotency_key),
-                        )
-                        .map_err(|reason| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason,
-                        })?,
-                );
-                outcome.domain_events.push(
-                    self.services
-                        .goal_store()
-                        .observation_event(
-                            &provider_observation,
-                            format!("{}:provider-observation", ticket.idempotency_key),
-                        )
-                        .map_err(|reason| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason,
-                        })?,
-                );
-                outcome.domain_events.push(
-                    self.services
-                        .goal_store()
-                        .observation_event(
-                            &context_observation,
-                            format!("{}:context-observation", ticket.idempotency_key),
-                        )
-                        .map_err(|reason| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason,
-                        })?,
-                );
-                if let Some(observation) = input_observation {
+                for (index, upstream) in upstream_observations.iter().enumerate() {
                     outcome.domain_events.push(
                         self.services
                             .goal_store()
                             .observation_event(
-                                &observation,
+                                upstream,
+                                format!("{}:upstream-observation:{index}", ticket.idempotency_key),
+                            )
+                            .map_err(|reason| NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason,
+                            })?,
+                    );
+                }
+                if let Some(input_observation) = input_observation.as_ref() {
+                    outcome.domain_events.push(
+                        self.services
+                            .goal_store()
+                            .observation_event(
+                                input_observation,
                                 format!("{}:input-observation", ticket.idempotency_key),
                             )
                             .map_err(|reason| NodeExecutorError::Poll {
@@ -4267,7 +4312,35 @@ where
                                     )],
                                     expected_graph_revision: None,
                                 },
+                                std::slice::from_ref(input_observation.as_ref().ok_or_else(
+                                    || {
+                                        NodeExecutorError::Poll {
+                                            node_id: ticket.node_id.clone(),
+                                            reason: "Goal revision has no user-input observation"
+                                                .to_string(),
+                                        }
+                                    },
+                                )?),
                                 format!("{}:input-replan", ticket.idempotency_key),
+                            )
+                            .map_err(|reason| NodeExecutorError::Poll {
+                                node_id: ticket.node_id.clone(),
+                                reason,
+                            })?,
+                    );
+                }
+                for (suffix, observation) in [
+                    ("goal-observation", &observation),
+                    ("strategy-observation", &strategy_observation),
+                    ("provider-observation", &provider_observation),
+                    ("context-observation", &context_observation),
+                ] {
+                    outcome.domain_events.push(
+                        self.services
+                            .goal_store()
+                            .observation_event(
+                                observation,
+                                format!("{}:{suffix}", ticket.idempotency_key),
                             )
                             .map_err(|reason| NodeExecutorError::Poll {
                                 node_id: ticket.node_id.clone(),
@@ -4281,6 +4354,7 @@ where
                             .goal_store()
                             .intervention_event(
                                 &intervention,
+                                std::slice::from_ref(&observation),
                                 format!("{}:goal-intervention", ticket.idempotency_key),
                             )
                             .map_err(|reason| NodeExecutorError::Poll {
@@ -4298,7 +4372,7 @@ where
                 // changes strategy, or produces an honest blocked result.
                 let protocol_failure = error.is_provider_tool_protocol_failure();
                 let reason = error.to_string();
-                let (goal_id, iteration, protocol_attempt) = {
+                let (goal_id, iteration, protocol_attempt, observation_identity) = {
                     let mut state = self.state.lock().await;
                     state.iterations = state.iterations.saturating_add(1);
                     // `execute_model_step` temporarily appends the ingress user
@@ -4320,45 +4394,28 @@ where
                             state.provider_protocol_recovery_attempts.saturating_add(1);
                         state.provider_protocol_recovery_attempts
                     });
-                    (state.goal_id.clone(), state.iterations, protocol_attempt)
+                    let identity = runtime_observation_identity(&self.services, &state, ticket);
+                    (
+                        state.goal_id.clone(),
+                        state.iterations,
+                        protocol_attempt,
+                        identity,
+                    )
                 };
-                let observation = RuntimeObservation {
-                    goal_id: goal_id.clone(),
-                    kind: RuntimeObservationKind::ProviderProgress,
-                    source: "runtime.provider_stream".to_string(),
-                    summary: format!("provider model step failed: {reason}"),
-                    // Keep the fingerprint stable across transport wording so
-                    // the policy detects a repeated failed execution path.
-                    fingerprint: Some("provider_failure".to_string()),
-                    evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
-                    metrics: BTreeMap::from([("failed_model_step".to_string(), 1)]),
-                    progress_delta: -1,
-                    novelty: 0,
-                };
-                let goal = self
-                    .services
-                    .goal_store()
-                    .get(&goal_id)
-                    .map_err(|reason| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason,
-                    })?
-                    .ok_or_else(|| NodeExecutorError::Poll {
-                        node_id: ticket.node_id.clone(),
-                        reason: format!("goal {goal_id} disappeared before provider recovery"),
-                    })?;
-                let mut observations =
-                    self.services
-                        .goal_store()
-                        .observations(&goal_id)
-                        .map_err(|reason| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason,
-                        })?;
-                observations.push(observation.clone());
-                let intervention = protocol_attempt.map_or_else(
-                    || crate::execution_core::InterventionPolicy.propose(&goal, &observations),
-                    |attempt| harness_contract::goal::RuntimeIntervention {
+                let mut observation = runtime_observation(
+                    observation_identity,
+                    RuntimeObservationKind::ProviderProgress,
+                    "runtime.provider_stream",
+                    iteration as u64,
+                    format!("provider model step failed: {reason}"),
+                    "provider_failure".to_string(),
+                    ObservationResultClass::Failed,
+                );
+                observation.evidence_refs = vec![format!("execution_node:{}", ticket.node_id)];
+                observation.cost_delta.model_steps = 1;
+                observation.failure_class = Some(ObservationFailureClass::Provider);
+                let intervention = if let Some(attempt) = protocol_attempt {
+                    harness_contract::goal::RuntimeIntervention {
                         goal_id: goal_id.clone(),
                         kind: provider_protocol_intervention_kind(attempt),
                         reason: if attempt <= PROVIDER_PROTOCOL_RECOVERY_BUDGET {
@@ -4370,8 +4427,18 @@ where
                         },
                         evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
                         expected_graph_revision: None,
-                    },
-                );
+                    }
+                } else {
+                    propose_intervention_after_observation(
+                        &self.services,
+                        &goal_id,
+                        observation.clone(),
+                    )
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })?
+                };
                 let (next, replan_reason, next_model_instruction) = {
                     let mut state = self.state.lock().await;
                     let (node, next_model_instruction) = match intervention.kind {
@@ -4492,6 +4559,7 @@ where
                         .goal_store()
                         .intervention_event(
                             &intervention,
+                            std::slice::from_ref(&observation),
                             format!("{}:provider-failure-intervention", ticket.idempotency_key),
                         )
                         .map_err(|reason| NodeExecutorError::Poll {
@@ -4875,8 +4943,9 @@ where
                 })?;
         let repeated_success = prior_observations.iter().any(|observation| {
             observation.kind == RuntimeObservationKind::ToolProgress
-                && observation.progress_delta > 0
-                && observation.fingerprint.as_deref() == Some(action_fingerprint.as_str())
+                && !observation.failed()
+                && observation.has_verified_gain()
+                && observation.fingerprint == action_fingerprint
         });
         let coverage_keys = tool_batch_coverage_keys(&calls);
         let scope_keys = tool_batch_scope_keys(&calls);
@@ -4980,7 +5049,7 @@ where
             && focus_acceptance_pending_scopes.is_empty();
         let focus_acceptance_pending =
             bounded_evidence_role && !focus_acceptance_scopes.is_empty() && !focus_acceptance_met;
-        state.focus_acceptance_pending_scopes = focus_acceptance_pending_scopes;
+        state.focus_acceptance_pending_scopes = focus_acceptance_pending_scopes.clone();
         if failed == 0 {
             state
                 .focus_observed_resource_scopes
@@ -5113,11 +5182,45 @@ where
             && !low_novelty
             && !scope_saturated
             && !evidence_saturated;
-        let observation = RuntimeObservation {
-            goal_id: state.goal_id.clone(),
-            kind: RuntimeObservationKind::ToolProgress,
-            source: "runtime.tool_batch".to_string(),
-            summary: if failed_tools.is_empty() && repeated_success {
+        let verified_evidence_refs = if state.last_verified_progress {
+            coverage_keys
+                .iter()
+                .filter(|coverage| !covered_before.contains(coverage.as_str()))
+                .map(|coverage| format!("tool_coverage:{coverage}"))
+                .chain(
+                    scope_keys
+                        .iter()
+                        .filter(|scope| !scopes_covered_before.contains(scope.as_str()))
+                        .map(|scope| format!("tool_scope:{scope}")),
+                )
+                .chain(
+                    successful_resource_scope_keys
+                        .iter()
+                        .filter(|scope| !resource_scopes_covered_before.contains(scope.as_str()))
+                        .map(|scope| format!("tool_resource_scope:{scope}")),
+                )
+                .chain(
+                    verified_focus_acceptance_scope_keys
+                        .iter()
+                        .map(|scope| format!("tool_resource_scope:{scope}")),
+                )
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let observation_fingerprint = if failed_tools.is_empty() {
+            action_fingerprint
+        } else {
+            format!("tool_failure:{}", failed_tools.join(","))
+        };
+        let mut observation = runtime_observation(
+            runtime_observation_identity(&self.services, &state, ticket),
+            RuntimeObservationKind::ToolProgress,
+            "runtime.tool_batch",
+            u64::try_from(state.iterations).unwrap_or(u64::MAX),
+            if failed_tools.is_empty() && repeated_success {
                 format!(
                     "tool batch reused an already-completed action calls={tool_calls}; retained receipt must be used before another identical request"
                 )
@@ -5137,63 +5240,73 @@ where
                     failed_tools.join(",")
                 )
             },
-            fingerprint: Some(if failed_tools.is_empty() {
-                action_fingerprint
+            observation_fingerprint.clone(),
+            if failed == 0 {
+                ObservationResultClass::Succeeded
+            } else if failed < calls.len() {
+                ObservationResultClass::Partial
             } else {
-                format!("tool_failure:{}", failed_tools.join(","))
-            }),
-            evidence_refs: calls
-                .iter()
-                .map(|call| format!("tool_call:{}", call.id))
-                .chain(
-                    coverage_keys
-                        .iter()
-                        .map(|coverage| format!("tool_coverage:{coverage}")),
-                )
-                .chain(scope_keys.iter().map(|scope| format!("tool_scope:{scope}")))
-                .chain(
-                    successful_resource_scope_keys
-                        .iter()
-                        .map(|scope| format!("tool_resource_scope:{scope}")),
-                )
-                .chain(
-                    verified_focus_acceptance_scope_keys
-                        .iter()
-                        .map(|scope| format!("tool_resource_scope:{scope}")),
-                )
-                .collect(),
-            metrics: BTreeMap::from([
-                ("tool_calls".to_string(), tool_calls as i64),
-                ("failed_tool_calls".to_string(), failed as i64),
-                ("coverage_total".to_string(), coverage_keys.len() as i64),
-                ("coverage_new".to_string(), newly_covered as i64),
-                ("scope_coverage_total".to_string(), scope_keys.len() as i64),
-                ("scope_coverage_new".to_string(), newly_scoped as i64),
-                ("novelty_bp".to_string(), i64::from(coverage_novelty_bp)),
-                (
-                    "novelty_target_bp".to_string(),
-                    i64::from(novelty_target_bp),
-                ),
-                (
-                    "focus_acceptance_met".to_string(),
-                    if focus_acceptance_met { 1 } else { 0 },
-                ),
-            ]),
-            progress_delta: if failed > 0 {
-                -1
-            } else if repeated_success || low_novelty || scope_saturated || evidence_saturated {
-                0
-            } else {
-                1
+                ObservationResultClass::Failed
             },
-            novelty: if failed > 0 {
-                20
-            } else if repeated_success || scope_saturated || evidence_saturated {
-                5
+        );
+        observation.failure_class = (failed > 0).then_some(ObservationFailureClass::Tool);
+        observation.evidence_refs = calls
+            .iter()
+            .map(|call| format!("tool_call:{}", call.id))
+            .chain(
+                coverage_keys
+                    .iter()
+                    .map(|coverage| format!("tool_coverage:{coverage}")),
+            )
+            .chain(scope_keys.iter().map(|scope| format!("tool_scope:{scope}")))
+            .chain(
+                successful_resource_scope_keys
+                    .iter()
+                    .map(|scope| format!("tool_resource_scope:{scope}")),
+            )
+            .chain(
+                verified_focus_acceptance_scope_keys
+                    .iter()
+                    .map(|scope| format!("tool_resource_scope:{scope}")),
+            )
+            .collect();
+        observation.evidence_delta.added = verified_evidence_refs.clone();
+        observation.effect_deltas.push(EffectDelta {
+            effect_id: format!("tool-batch:{observation_fingerprint}"),
+            terminal_class: if failed == 0 {
+                EffectTerminalClass::Completed
             } else {
-                u8::try_from(coverage_novelty_bp / 100).unwrap_or(100)
+                EffectTerminalClass::Failed
+            },
+            idempotency_ref: ticket.idempotency_key.clone(),
+        });
+        observation.cost_delta.tool_calls = tool_calls;
+        observation.information_gain = InformationGain {
+            distinguishing_evidence_refs: verified_evidence_refs,
+            resolved_unknown_refs: verified_focus_acceptance_scope_keys
+                .iter()
+                .map(|scope| format!("focus-acceptance:{scope}"))
+                .collect(),
+            provenance: if state.last_verified_progress {
+                MeasureProvenance::Observed
+            } else {
+                MeasureProvenance::Unknown
             },
         };
+        for scope in &focus_acceptance_pending_scopes {
+            observation.unknown_deltas.push(UnknownDelta {
+                unknown_id: format!("focus-acceptance:{scope}"),
+                change: ResolutionDeltaKind::Opened,
+                evidence_refs: Vec::new(),
+            });
+        }
+        for scope in &verified_focus_acceptance_scope_keys {
+            observation.unknown_deltas.push(UnknownDelta {
+                unknown_id: format!("focus-acceptance:{scope}"),
+                change: ResolutionDeltaKind::Resolved,
+                evidence_refs: vec![format!("tool_resource_scope:{scope}")],
+            });
+        }
         let goal_id = state.goal_id.clone();
         drop(state);
         if focus_acceptance_met
@@ -5287,26 +5400,16 @@ where
         } else {
             (!continue_with_tool_batch)
                 .then(|| {
-                    self.services
-                        .goal_store()
-                        .get(&goal_id)
-                        .map_err(|reason| NodeExecutorError::Poll {
-                            node_id: ticket.node_id.clone(),
-                            reason,
-                        })?
-                        .map(|goal| {
-                            let mut observations =
-                                self.services.goal_store().observations(&goal_id).map_err(
-                                    |reason| NodeExecutorError::Poll {
-                                        node_id: ticket.node_id.clone(),
-                                        reason,
-                                    },
-                                )?;
-                            observations.push(observation.clone());
-                            Ok(crate::execution_core::InterventionPolicy
-                                .propose(&goal, &observations))
-                        })
-                        .transpose()
+                    propose_intervention_after_observation(
+                        &self.services,
+                        &goal_id,
+                        observation.clone(),
+                    )
+                    .map(Some)
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason,
+                    })
                 })
                 .transpose()?
                 .flatten()
@@ -5470,6 +5573,7 @@ where
                     .goal_store()
                     .intervention_event(
                         intervention,
+                        std::slice::from_ref(&observation),
                         format!("{}:goal-intervention", ticket.idempotency_key),
                     )
                     .map_err(|reason| NodeExecutorError::Poll {
@@ -6284,6 +6388,206 @@ fn sha256_digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
+fn runtime_observation_identity(
+    services: &crate::RuntimeServices,
+    state: &TurnGraphState,
+    ticket: &NodeExecutionTicket,
+) -> RuntimeObservationIdentity {
+    RuntimeObservationIdentity {
+        workspace_id: services.workspace_key().to_string(),
+        session_id: state.session_id.clone(),
+        turn_id: state
+            .ingress
+            .as_ref()
+            .map(|ingress| ingress.turn_id.clone()),
+        task_id: None,
+        graph_id: ticket.graph_id.clone(),
+        goal_id: state.goal_id.clone(),
+        node_id: Some(ticket.node_id.clone()),
+    }
+}
+
+fn observation_freshness(observed_at_ms: u64) -> ObservationFreshness {
+    ObservationFreshness {
+        observed_at_ms,
+        valid_until_ms: None,
+        policy_revision: "goal-observation-v2".to_string(),
+    }
+}
+
+fn runtime_observation(
+    identity: RuntimeObservationIdentity,
+    kind: RuntimeObservationKind,
+    source: &str,
+    source_revision: u64,
+    summary: String,
+    fingerprint: String,
+    result_class: ObservationResultClass,
+) -> RuntimeObservation {
+    RuntimeObservation {
+        identity,
+        kind,
+        source: source.to_string(),
+        source_revision: source_revision.max(1),
+        freshness: observation_freshness(crate::tool_invocation::now_ms()),
+        summary,
+        fingerprint,
+        evidence_refs: Vec::new(),
+        criterion_deltas: Vec::new(),
+        evidence_delta: EvidenceDelta::default(),
+        effect_deltas: Vec::new(),
+        conflict_deltas: Vec::new(),
+        unknown_deltas: Vec::new(),
+        cost_delta: CostDelta::default(),
+        information_gain: InformationGain::default(),
+        context_delta: ContextDelta::default(),
+        parallelism_delta: ParallelismDelta::default(),
+        result_class,
+        failure_class: None,
+    }
+}
+
+fn predecessor_goal_observations(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    ticket: &NodeExecutionTicket,
+    current_identity: &RuntimeObservationIdentity,
+) -> Vec<RuntimeObservation> {
+    graph
+        .edges
+        .iter()
+        .filter(|edge| edge.to == ticket.node_id)
+        .filter_map(|edge| {
+            let node = graph.nodes.iter().find(|node| node.id == edge.from)?;
+            if !matches!(
+                node.kind,
+                ExecutionNodeKind::Approval
+                    | ExecutionNodeKind::AgentTask
+                    | ExecutionNodeKind::Verify
+            ) {
+                return None;
+            }
+            let result = graph.node_results.get(&node.id)?;
+            if !result.status.is_terminal() {
+                return None;
+            }
+            let source = match node.kind {
+                ExecutionNodeKind::Approval => "runtime.approval_result",
+                ExecutionNodeKind::Verify => "runtime.verification_result",
+                ExecutionNodeKind::AgentTask => {
+                    if serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(
+                        &node.payload_ref,
+                    )
+                    .ok()
+                    .is_some_and(|packet| packet.team_id.is_some())
+                    {
+                        "runtime.team_agent_result"
+                    } else {
+                        "runtime.agent_result"
+                    }
+                }
+                _ => return None,
+            };
+            let result_class = match result.status {
+                ExecutionNodeStatus::Completed => ObservationResultClass::Succeeded,
+                ExecutionNodeStatus::Blocked
+                | ExecutionNodeStatus::Failed
+                | ExecutionNodeStatus::Cancelled => ObservationResultClass::Failed,
+                _ => ObservationResultClass::Informational,
+            };
+            let mut identity = current_identity.clone();
+            identity.node_id = Some(node.id.clone());
+            let mut observation = runtime_observation(
+                identity,
+                RuntimeObservationKind::GraphProgress,
+                source,
+                result.finished_at_ms.max(1),
+                result
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?} node {} completed", node.kind, node.id)),
+                sha256_digest(&format!(
+                    "{}:{:?}:{}",
+                    node.id,
+                    result.status,
+                    result.result_ref.as_deref().unwrap_or_default()
+                )),
+                result_class,
+            );
+            let durable_result_ref = result
+                .result_ref
+                .as_ref()
+                .map(|reference| format!("execution_result:{reference}"));
+            let materialized_evidence = result
+                .evidence_refs
+                .iter()
+                .map(|reference| reference.evidence_ref.0.id.clone())
+                .filter(|reference| !reference.trim().is_empty())
+                .collect::<BTreeSet<_>>();
+            observation.evidence_refs = materialized_evidence
+                .iter()
+                .cloned()
+                .chain(durable_result_ref.iter().cloned())
+                .collect();
+            if result.status == ExecutionNodeStatus::Completed {
+                observation.evidence_delta.added = observation.evidence_refs.clone();
+                observation.information_gain = InformationGain {
+                    distinguishing_evidence_refs: materialized_evidence.into_iter().collect(),
+                    resolved_unknown_refs: Vec::new(),
+                    provenance: if result.evidence_refs.is_empty() {
+                        MeasureProvenance::Unknown
+                    } else {
+                        MeasureProvenance::Observed
+                    },
+                };
+            }
+            observation.effect_deltas.push(EffectDelta {
+                effect_id: format!("execution-node:{}", node.id),
+                terminal_class: match result.status {
+                    ExecutionNodeStatus::Completed => EffectTerminalClass::Completed,
+                    ExecutionNodeStatus::Cancelled => EffectTerminalClass::Cancelled,
+                    ExecutionNodeStatus::Blocked | ExecutionNodeStatus::Failed => {
+                        EffectTerminalClass::Failed
+                    }
+                    _ => EffectTerminalClass::Uncertain,
+                },
+                idempotency_ref: node.idempotency_key.clone(),
+            });
+            observation.cost_delta = CostDelta {
+                model_steps: u64::from(result.usage.model.is_some()),
+                tool_calls: result.usage.tool_calls,
+                duration_ms: result.usage.duration_ms,
+                input_tokens: result.usage.input_tokens,
+                output_tokens: result.usage.output_tokens,
+                cached_tokens: result.usage.cached_tokens,
+            };
+            observation.failure_class = (result.status != ExecutionNodeStatus::Completed)
+                .then_some(match node.kind {
+                    ExecutionNodeKind::Approval => ObservationFailureClass::Approval,
+                    ExecutionNodeKind::Verify => ObservationFailureClass::Verification,
+                    ExecutionNodeKind::AgentTask => ObservationFailureClass::Unknown,
+                    _ => ObservationFailureClass::Unknown,
+                });
+            Some(observation)
+        })
+        .collect()
+}
+
+fn propose_intervention_after_observation(
+    services: &crate::RuntimeServices,
+    goal_id: &str,
+    observation: RuntimeObservation,
+) -> Result<RuntimeIntervention, String> {
+    let projection = services
+        .goal_store()
+        .projection(goal_id)?
+        .ok_or_else(|| format!("goal {goal_id} disappeared before intervention"))?;
+    let mut progress = projection.progress;
+    crate::execution_core::GoalProgressReducer::apply(&mut progress, &observation)?;
+    let mut observations = projection.observations;
+    observations.push(observation);
+    crate::execution_core::InterventionPolicy.propose(&projection.goal, &progress, &observations)
+}
+
 fn dynamic_node(
     ticket: &NodeExecutionTicket,
     iteration: usize,
@@ -6799,21 +7103,6 @@ fn cited_workspace_paths(text: &str) -> Vec<String> {
         remainder = &candidate["crates/".len()..];
     }
     paths.into_iter().collect()
-}
-
-fn model_intent_novelty(intent: &ModelStepIntent) -> u8 {
-    match intent {
-        ModelStepIntent::FinalAnswer { .. } => 60,
-        ModelStepIntent::ToolCalls { calls }
-        | ModelStepIntent::AgentProposal { calls }
-        | ModelStepIntent::TeamProposal { calls }
-        | ModelStepIntent::ApprovalRequired { calls } => {
-            // The action kind is novel to the graph, but it is still only a
-            // proposal until a downstream executor commits evidence.
-            50_u8.saturating_add(u8::try_from(calls.len().min(50)).unwrap_or(50))
-        }
-        ModelStepIntent::Replan { .. } => 40,
-    }
 }
 
 fn model_intent_kind(intent: &ModelStepIntent) -> &'static str {
@@ -8057,6 +8346,68 @@ mod tests {
     use futures::stream::{self, Stream};
 
     use super::*;
+
+    #[test]
+    fn predecessor_results_become_typed_goal_observations() {
+        let mut graph = harness_contract::execution_graph::ExecutionGraph::new("typed predecessor");
+        let mut approval = ExecutionNodeSpec::new(ExecutionNodeKind::Approval, "approval", "{}");
+        approval.id = "approval-node".to_string();
+        approval.idempotency_key = "approval-effect".to_string();
+        let mut model =
+            ExecutionNodeSpec::new(ExecutionNodeKind::InlineModel, "inline_model", "{}");
+        model.id = "model-node".to_string();
+        graph.nodes = vec![approval.clone(), model.clone()];
+        graph.edges.push(ExecutionEdge {
+            from: approval.id.clone(),
+            to: model.id.clone(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        graph
+            .node_statuses
+            .insert(approval.id.clone(), ExecutionNodeStatus::Completed);
+        graph
+            .node_statuses
+            .insert(model.id.clone(), ExecutionNodeStatus::Running);
+        graph.node_results.insert(
+            approval.id.clone(),
+            completed_result(
+                Some("approval:v1:receipt".to_string()),
+                ExecutionUsage::default(),
+            ),
+        );
+        let ticket = NodeExecutionTicket {
+            graph_id: graph.id.clone(),
+            node_id: model.id,
+            executor_kind: "inline_model".to_string(),
+            attempt: 1,
+            idempotency_key: "model-attempt".to_string(),
+            payload_ref: "{}".to_string(),
+        };
+        let observations = predecessor_goal_observations(
+            &graph,
+            &ticket,
+            &RuntimeObservationIdentity {
+                workspace_id: "workspace".to_string(),
+                session_id: "session".to_string(),
+                turn_id: Some("turn".to_string()),
+                task_id: None,
+                graph_id: graph.id.clone(),
+                goal_id: format!("goal:{}", graph.id),
+                node_id: Some(ticket.node_id.clone()),
+            },
+        );
+
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].source, "runtime.approval_result");
+        assert_eq!(
+            observations[0].effect_deltas[0].terminal_class,
+            EffectTerminalClass::Completed
+        );
+        assert_eq!(
+            observations[0].evidence_delta.added,
+            vec!["execution_result:approval:v1:receipt".to_string()]
+        );
+    }
 
     #[test]
     fn committed_team_write_is_detected_before_any_fallback_replay() {
@@ -9475,14 +9826,18 @@ mod tests {
         let (_runtime, result) = submit_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
-            "全面核对 runtime gateway webui 的独立职责和验收并综合证据",
+            "必须启动 Team，全面核对 runtime gateway webui 的独立职责和验收并综合证据",
             &SharedPrompter::none(),
         )
         .await;
         let summary = result.expect("Host-selected Team must complete");
-        assert!(summary
-            .final_answer
-            .contains("bounded host-selected Team role completed"));
+        assert!(
+            summary
+                .final_answer
+                .contains("bounded host-selected Team role completed"),
+            "unexpected terminal answer: {}",
+            summary.final_answer
+        );
         let mut team_terminal_streamed = false;
         while let Ok(event) = visible_events.try_recv() {
             let event = match event {
