@@ -1753,6 +1753,11 @@ pub struct ConversationRuntime<C, T> {
     delegated_focus_required_output_fields: std::sync::Mutex<Vec<String>>,
 }
 
+enum MemoryManagerComposition {
+    Automatic,
+    HostSelected(Option<Arc<CognitiveContextManager>>),
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
@@ -1779,12 +1784,58 @@ where
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn new_with_features(
+        session: Session,
+        api_client: C,
+        tool_executor: Arc<T>,
+        permission_policy: PermissionPolicy,
+        system_prompt: Vec<String>,
+        feature_config: &RuntimeFeatureConfig,
+    ) -> Self {
+        Self::new_with_features_and_memory_composition(
+            session,
+            api_client,
+            tool_executor,
+            permission_policy,
+            system_prompt,
+            feature_config,
+            MemoryManagerComposition::Automatic,
+        )
+    }
+
+    /// Construct a conversation from the Memory owner already selected by the
+    /// embedding host. `None` is an explicit unavailable selection and never
+    /// falls back to the standalone SQLite constructor.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn new_with_features_and_selected_memory(
+        session: Session,
+        api_client: C,
+        tool_executor: Arc<T>,
+        permission_policy: PermissionPolicy,
+        system_prompt: Vec<String>,
+        feature_config: &RuntimeFeatureConfig,
+        memory_manager: Option<Arc<CognitiveContextManager>>,
+    ) -> Self {
+        Self::new_with_features_and_memory_composition(
+            session,
+            api_client,
+            tool_executor,
+            permission_policy,
+            system_prompt,
+            feature_config,
+            MemoryManagerComposition::HostSelected(memory_manager),
+        )
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn new_with_features_and_memory_composition(
         mut session: Session,
         api_client: C,
         tool_executor: Arc<T>,
         permission_policy: PermissionPolicy,
         system_prompt: Vec<String>,
         feature_config: &RuntimeFeatureConfig,
+        memory_composition: MemoryManagerComposition,
     ) -> Self {
         session.configure_history(feature_config.session_history());
         let usage_tracker = UsageTracker::from_session(&session);
@@ -1819,77 +1870,19 @@ where
             profile: ContextProfile::MainTurn,
             autonomy_mode: None,
         });
-        // Initialise the cognitive memory manager if the memory subsystem is enabled.
-        let (memory_manager, memory_status) = if feature_config.memory().enabled {
-            let mem_cfg = build_cc_memory_config_with_budget(feature_config, &initial_budget_plan);
-            match tokio::runtime::Handle::try_current() {
-                Ok(_) => {
-                    // Inside a runtime — spawn a fresh thread with its own runtime
-                    // to avoid nested enter_runtime panic.
-                    let mem_cfg = mem_cfg.clone();
-                    let handle = std::thread::spawn(move || -> Result<_, String> {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|error| {
-                                format!("failed to create memory init runtime: {error}")
-                            })?;
-                        rt.block_on(CognitiveContextManager::new(mem_cfg))
-                            .map_err(|error| error.to_string())
-                    });
-                    match handle.join() {
-                        Ok(Ok(mgr)) => {
-                            tracing::debug!(
-                                "memory: CognitiveContextManager initialised with explicit per-turn identity"
-                            );
-                            (Some(Arc::new(mgr)), None)
-                        }
-                        Ok(Err(err)) => {
-                            let msg = format!(
-                                "Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory."
-                            );
-                            tracing::error!("{msg}");
-                            (None, Some(msg))
-                        }
-                        Err(_) => {
-                            let msg = "Memory system unavailable: initialization thread panicked. Context will NOT persist between turns.".to_string();
-                            tracing::error!("{msg}");
-                            (None, Some(msg))
-                        }
-                    }
-                }
-                Err(_) => {
-                    match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => match rt.block_on(CognitiveContextManager::new(mem_cfg)) {
-                            Ok(mgr) => {
-                                tracing::debug!(
-                                    "memory: CognitiveContextManager initialised with explicit per-turn identity"
-                                );
-                                (Some(Arc::new(mgr)), None)
-                            }
-                            Err(err) => {
-                                let msg = format!(
-                                    "Memory system unavailable: {err}. Context will NOT persist between turns. Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory."
-                                );
-                                tracing::error!("{msg}");
-                                (None, Some(msg))
-                            }
-                        },
-                        Err(e) => {
-                            let msg = format!(
-                                "Memory system unavailable: failed to create runtime: {e}. Memory features will NOT work."
-                            );
-                            tracing::error!("{msg}");
-                            (None, Some(msg))
-                        }
-                    }
-                }
+        let (memory_manager, memory_status) = match memory_composition {
+            MemoryManagerComposition::HostSelected(manager) => {
+                let status = (feature_config.memory().enabled && manager.is_none()).then(|| {
+                    "Memory system unavailable: the composition root selected no Memory owner. \
+                     Runtime will not infer or open a fallback backend."
+                        .to_string()
+                });
+                (manager, status)
             }
-        } else {
-            (None, None)
+            MemoryManagerComposition::Automatic if feature_config.memory().enabled => {
+                initialize_automatic_memory_manager(feature_config, &initial_budget_plan)
+            }
+            MemoryManagerComposition::Automatic => (None, None),
         };
         let session_id = session.session_id.clone();
         let session = Arc::new(RwLock::new(session));
@@ -8749,12 +8742,84 @@ fn message_appended_session_event(
     }
 }
 
-/// Reads the automatic compaction threshold from the environment.
+/// Initialise standalone Memory when no embedding composition root exists.
 #[must_use]
+fn initialize_automatic_memory_manager(
+    feature_config: &RuntimeFeatureConfig,
+    budget_plan: &RuntimeBudgetPlan,
+) -> (Option<Arc<CognitiveContextManager>>, Option<String>) {
+    let mem_cfg = build_cc_memory_config_with_budget(feature_config, budget_plan);
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => {
+            // Standalone callers inside a runtime need a separate runtime to
+            // avoid nested enter_runtime. Host-composed callers never enter
+            // this branch because they inject their selected owner directly.
+            let handle = std::thread::spawn(move || -> Result<_, String> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| format!("failed to create memory init runtime: {error}"))?;
+                rt.block_on(CognitiveContextManager::new(mem_cfg))
+                    .map_err(|error| error.to_string())
+            });
+            match handle.join() {
+                Ok(Ok(manager)) => {
+                    tracing::debug!(
+                        "memory: standalone CognitiveContextManager initialised with explicit per-turn identity"
+                    );
+                    (Some(Arc::new(manager)), None)
+                }
+                Ok(Err(error)) => automatic_memory_initialization_failure(error),
+                Err(_) => {
+                    let message = "Memory system unavailable: initialization thread panicked. \
+                                   Context will NOT persist between turns."
+                        .to_string();
+                    tracing::error!("{message}");
+                    (None, Some(message))
+                }
+            }
+        }
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => match runtime.block_on(CognitiveContextManager::new(mem_cfg)) {
+                Ok(manager) => {
+                    tracing::debug!(
+                        "memory: standalone CognitiveContextManager initialised with explicit per-turn identity"
+                    );
+                    (Some(Arc::new(manager)), None)
+                }
+                Err(error) => automatic_memory_initialization_failure(error.to_string()),
+            },
+            Err(error) => {
+                let message = format!(
+                    "Memory system unavailable: failed to create runtime: {error}. \
+                     Memory features will NOT work."
+                );
+                tracing::error!("{message}");
+                (None, Some(message))
+            }
+        },
+    }
+}
+
+fn automatic_memory_initialization_failure(
+    error: impl std::fmt::Display,
+) -> (Option<Arc<CognitiveContextManager>>, Option<String>) {
+    let message = format!(
+        "Memory system unavailable: {error}. Context will NOT persist between turns. \
+         Check your memory store paths, vector API credentials, and ~/.cowd/memory/ directory."
+    );
+    tracing::error!("{message}");
+    (None, Some(message))
+}
+
 /// Convert a [`RuntimeFeatureConfig`] memory section into a [`CcMemoryConfig`]
 /// suitable for [`CognitiveContextManager::new`].
 #[doc(alias = "memory")]
 #[doc(alias = "CognitiveContextManager")]
+#[must_use]
 pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemoryConfig {
     let model_context_window = feature_config.model().map_or(0, |model| {
         provider::model_context_window_with_overrides(

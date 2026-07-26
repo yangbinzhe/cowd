@@ -128,7 +128,8 @@ where
             model_context_window_with_overrides(&active_model, Some(overrides))
         });
         let system_prompt = canonical_host_system_prompt(config.system_prompt);
-        let mut runtime = crate::ConversationRuntime::new_with_features(
+        let selected_memory_manager = services.memory_manager();
+        let mut runtime = crate::ConversationRuntime::new_with_features_and_selected_memory(
             config.session,
             ProviderRuntimeClient::new_with_transport_pool(
                 Arc::clone(&config.provider_registry),
@@ -142,6 +143,7 @@ where
             config.permission_policy,
             system_prompt,
             &config.feature_config,
+            selected_memory_manager,
         )
         .with_model_context_window(model_context_window)
         .with_knowledge_activation(services.knowledge_activation())
@@ -160,9 +162,6 @@ where
         .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
         if root_provider_owner {
             runtime = runtime.with_provider_admission(Arc::clone(services.resource_manager()));
-        }
-        if let Some(memory_manager) = services.memory_manager() {
-            runtime = runtime.with_memory_manager(memory_manager);
         }
         if let Some(binding) = config.reality_binding {
             runtime = runtime
@@ -8755,6 +8754,20 @@ mod tests {
             .position(|section| section == crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
             .expect("dynamic boundary");
         assert!(prompt[boundary + 1].contains("delegated Cowd agent"));
+    }
+
+    #[test]
+    fn standard_host_never_infers_a_memory_backend_when_services_selected_none() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        assert!(services.memory_manager().is_none());
+
+        let host = standard_host_with_services(services);
+
+        assert!(host.runtime_ref().memory_manager().is_none());
+        assert!(host
+            .runtime_ref()
+            .memory_status()
+            .is_some_and(|status| status.contains("composition root")));
     }
 
     #[test]

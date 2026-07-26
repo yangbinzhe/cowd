@@ -155,7 +155,7 @@ use runtime::{AssistantEvent, RuntimeError};
 use runtime_bootstrap::GatewayToolRegistry;
 use runtime_entry::GatewayRuntimeEntry;
 use serde_json::json;
-use services::GatewayServices;
+use services::SkillService;
 
 #[cfg(test)]
 static TEST_PROCESS_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -582,7 +582,7 @@ fn print_skills_command(
     output_format: CliOutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let skill_service = GatewayServices::baseline().skill;
+    let skill_service = SkillService::new();
     match output_format {
         CliOutputFormat::Text => println!("{}", skill_service.command_text(&cwd, args)?),
         CliOutputFormat::Json => println!(
@@ -825,10 +825,6 @@ fn run_gateway_action(
                 .unwrap_or_default();
             let auth_token: Option<String> =
                 api_server_platform.and_then(gateway_auth_token_from_platform);
-            // Ensure the unified session store is initialised before the
-            // runtime host starts so that the OnceLock is populated.
-            let _ = get_unified_store();
-
             let runtime_host_config = runtime_host::RuntimeHostConfig {
                 http_addr: format!("{effective_host}:{effective_port}"),
                 memory_config,
@@ -2376,7 +2372,7 @@ fn run_resume_command(
                 );
             }
             let cwd = env::current_dir()?;
-            let skill_service = GatewayServices::baseline().skill;
+            let skill_service = SkillService::new();
             Ok(ResumeCommandOutcome {
                 session: session.clone(),
                 session_path: None,
