@@ -17,8 +17,10 @@ use thiserror::Error;
 mod execution;
 
 pub use execution::{
-    ApplicationExecutionKind, ApplicationExecutionOutcomeV1, ApplicationExecutionRefV1,
-    ApplicationExecutionStatus, APPLICATION_EXECUTION_OUTCOME_VERSION,
+    ApplicationExecutionCounterV1, ApplicationExecutionKind, ApplicationExecutionOutcomeIntentV1,
+    ApplicationExecutionOutcomeReceiptV1, ApplicationExecutionOutcomeV1, ApplicationExecutionRefV1,
+    ApplicationExecutionStatus, APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1,
+    APPLICATION_EXECUTION_OUTCOME_VERSION,
 };
 
 pub const SDK_API_VERSION: u32 = 1;

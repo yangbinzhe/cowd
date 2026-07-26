@@ -1,16 +1,16 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::AppContractError;
 
 pub const APPLICATION_EXECUTION_OUTCOME_VERSION: u16 = 1;
+pub const APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1: &str =
+    "cowd.work_context.append_application_execution_outcome.v1";
 
 const MAX_ID_BYTES: usize = 256;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_SUMMARY_BYTES: usize = 16 * 1024;
 const MAX_REFS: usize = 128;
-const MAX_TAGS: usize = 128;
-const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+const MAX_COUNTERS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,7 +47,19 @@ pub struct ApplicationExecutionRefV1 {
     pub label: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationExecutionCounterV1 {
+    pub name: String,
+    pub value: i64,
+}
+
+/// Stable APP-to-host summary contract.
+///
+/// APP-owned facts and artifacts remain in their authoritative stores. This
+/// contract carries only bounded references and counters into the Session
+/// timeline, so replay never creates a second mutable copy of APP state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicationExecutionOutcomeV1 {
     pub contract_version: u16,
@@ -63,9 +75,9 @@ pub struct ApplicationExecutionOutcomeV1 {
     #[serde(default)]
     pub evidence_refs: Vec<String>,
     #[serde(default)]
-    pub metrics: Vec<String>,
+    pub metric_refs: Vec<String>,
     #[serde(default)]
-    pub payload: Value,
+    pub counters: Vec<ApplicationExecutionCounterV1>,
     pub occurred_at_ms: u64,
 }
 
@@ -92,11 +104,13 @@ impl ApplicationExecutionOutcomeV1 {
             ));
         }
         if self.refs.len() > MAX_REFS
-            || self.evidence_refs.len() > MAX_TAGS
-            || self.metrics.len() > MAX_TAGS
+            || self.evidence_refs.len() > MAX_REFS
+            || self.metric_refs.len() > MAX_REFS
+            || self.counters.len() > MAX_COUNTERS
         {
             return Err(AppContractError::InvalidApplicationExecutionOutcome(
-                "refs, evidence_refs, or metrics exceed the bounded collection size".to_string(),
+                "refs, evidence_refs, metric_refs, or counters exceed the bounded collection size"
+                    .to_string(),
             ));
         }
         for reference in &self.refs {
@@ -112,21 +126,35 @@ impl ApplicationExecutionOutcomeV1 {
                 ));
             }
         }
-        for value in self.evidence_refs.iter().chain(self.metrics.iter()) {
+        for value in self.evidence_refs.iter().chain(self.metric_refs.iter()) {
             validate_required("reference", value, MAX_ID_BYTES)?;
         }
-        let payload_bytes = serde_json::to_vec(&self.payload).map_err(|error| {
-            AppContractError::InvalidApplicationExecutionOutcome(format!(
-                "payload cannot be serialized: {error}"
-            ))
-        })?;
-        if payload_bytes.len() > MAX_PAYLOAD_BYTES {
-            return Err(AppContractError::InvalidApplicationExecutionOutcome(
-                "payload exceeds 1 MiB".to_string(),
-            ));
+        for counter in &self.counters {
+            validate_required("counter.name", &counter.name, MAX_ID_BYTES)?;
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationExecutionOutcomeIntentV1 {
+    pub session_id: String,
+    pub outcome: ApplicationExecutionOutcomeV1,
+}
+
+impl ApplicationExecutionOutcomeIntentV1 {
+    pub fn validate(&self) -> Result<(), AppContractError> {
+        validate_required("session_id", &self.session_id, MAX_ID_BYTES)?;
+        self.outcome.validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationExecutionOutcomeReceiptV1 {
+    pub sequence: u64,
+    pub replayed: bool,
 }
 
 fn validate_required(field: &str, value: &str, max_bytes: usize) -> Result<(), AppContractError> {
@@ -157,14 +185,17 @@ mod tests {
                 label: None,
             }],
             evidence_refs: vec!["receipt://action-1".to_string()],
-            metrics: Vec::new(),
-            payload: serde_json::json!({"revision": 3}),
+            metric_refs: vec!["metric://cycle-time".to_string()],
+            counters: vec![ApplicationExecutionCounterV1 {
+                name: "affected_rows".to_string(),
+                value: 3,
+            }],
             occurred_at_ms: 42,
         }
     }
 
     #[test]
-    fn execution_outcome_contract_is_versioned_and_bounded() {
+    fn execution_outcome_contract_is_versioned_bounded_and_payload_free() {
         outcome().validate().unwrap();
 
         let mut invalid = outcome();
@@ -172,7 +203,27 @@ mod tests {
         assert!(invalid.validate().is_err());
 
         let mut oversized = outcome();
-        oversized.payload = serde_json::json!({"value": "x".repeat(MAX_PAYLOAD_BYTES)});
+        oversized.summary = "x".repeat(MAX_SUMMARY_BYTES + 1);
         assert!(oversized.validate().is_err());
+
+        let serialized = serde_json::to_value(outcome()).unwrap();
+        assert!(serialized.get("payload").is_none());
+    }
+
+    #[test]
+    fn neutral_intent_and_receipt_reject_unknown_fields() {
+        ApplicationExecutionOutcomeIntentV1 {
+            session_id: "session-1".to_string(),
+            outcome: outcome(),
+        }
+        .validate()
+        .unwrap();
+
+        let invalid = serde_json::json!({
+            "sequence": 7,
+            "replayed": false,
+            "payload": {}
+        });
+        assert!(serde_json::from_value::<ApplicationExecutionOutcomeReceiptV1>(invalid).is_err());
     }
 }
