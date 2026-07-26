@@ -14,6 +14,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod execution;
+
+pub use execution::{
+    ApplicationExecutionKind, ApplicationExecutionOutcomeV1, ApplicationExecutionRefV1,
+    ApplicationExecutionStatus, APPLICATION_EXECUTION_OUTCOME_VERSION,
+};
+
 pub const SDK_API_VERSION: u32 = 1;
 pub const APP_STORAGE_CONTRACT_VERSION: u32 = 1;
 
@@ -765,6 +772,8 @@ pub enum AppContractError {
         expected: u32,
         actual: u32,
     },
+    #[error("invalid application execution outcome: {0}")]
+    InvalidApplicationExecutionOutcome(String),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
