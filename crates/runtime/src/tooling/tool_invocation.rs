@@ -1,11 +1,11 @@
 //! Lightweight tool invocation facts for runtime/session observability.
 
-use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::tool_orchestrator::ToolSafetyCategory;
+use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef};
 
 const INPUT_PREVIEW_CHARS: usize = 240;
 const OUTPUT_PREVIEW_CHARS: usize = 500;
@@ -284,7 +284,11 @@ impl ToolInvocationRecord {
     }
 
     #[must_use]
-    pub fn to_runtime_event(&self, sequence: usize, kind: impl Into<String>) -> SessionDomainEvent {
+    pub fn to_runtime_event(
+        &self,
+        sequence: usize,
+        kind: RuntimeSessionEventKind,
+    ) -> RuntimeSessionEvent {
         let payload = serde_json::json!({
             "contract_version": self.contract_version,
             "invocation_id": self.invocation_id,
@@ -314,10 +318,9 @@ impl ToolInvocationRecord {
             "is_error": self.is_error,
             "failure_kind": self.failure_kind.map(ToolFailureKind::as_str),
         });
-        let mut event = SessionDomainEvent::new(
+        let mut event = RuntimeSessionEvent::new(
             self.session_id.clone(),
             sequence,
-            SessionDomainScope::Tool,
             kind,
             payload,
             self.ended_at_ms.unwrap_or(self.started_at_ms),
@@ -326,17 +329,17 @@ impl ToolInvocationRecord {
         event.span_id = Some(self.invocation_id.clone());
         event.correlation_id = Some(self.tool_call_id.clone());
         event.refs = vec![
-            SessionDomainRef {
+            RuntimeSessionEventRef {
                 ref_type: "tool_invocation".to_string(),
                 id: self.invocation_id.clone(),
                 label: Some(self.tool_name.clone()),
             },
-            SessionDomainRef {
+            RuntimeSessionEventRef {
                 ref_type: "tool_call".to_string(),
                 id: self.tool_call_id.clone(),
                 label: Some(self.tool_name.clone()),
             },
-            SessionDomainRef {
+            RuntimeSessionEventRef {
                 ref_type: "tool".to_string(),
                 id: self.tool_name.clone(),
                 label: None,
@@ -488,9 +491,9 @@ mod tests {
         )
         .completed("ok", 125);
 
-        let event = record.to_runtime_event(9, "tool.invocation.completed");
+        let event = record.to_runtime_event(9, RuntimeSessionEventKind::ToolInvocationCompleted);
 
-        assert_eq!(event.scope, SessionDomainScope::Tool);
+        assert_eq!(event.kind.scope(), session::SessionDomainScope::Tool);
         assert_eq!(event.status.as_deref(), Some("completed"));
         assert_eq!(event.payload["contract_version"], TOOL_CONTRACT_VERSION);
         assert_eq!(event.payload["stale_registration"], false);
@@ -524,7 +527,7 @@ mod tests {
 
         assert_eq!(record.status, ToolInvocationStatus::Failed);
         assert_eq!(record.failure_kind, Some(ToolFailureKind::ExecutionError));
-        let event = record.to_runtime_event(10, "tool.invocation.failed");
+        let event = record.to_runtime_event(10, RuntimeSessionEventKind::ToolInvocationFailed);
         assert_eq!(event.payload["failure_kind"], "execution_error");
         assert_eq!(event.payload["output_preview"], "boom");
     }
@@ -551,7 +554,7 @@ mod tests {
         )
         .completed_with_output_policy(&output, 250, 3);
 
-        let event = record.to_runtime_event(10, "tool.invocation.completed");
+        let event = record.to_runtime_event(10, RuntimeSessionEventKind::ToolInvocationCompleted);
         assert_eq!(event.payload["output_line_count"], 80);
         assert_eq!(event.payload["output_ref"]["tool_call_id"], "toolu-large");
         assert!(event.payload["raw_output_tokens"].as_u64().unwrap() > 0);
@@ -633,7 +636,7 @@ mod tests {
         .with_effective_registration_id("tool-reg:v2:read_only:read:newer");
 
         assert!(record.stale_registration);
-        let event = record.to_runtime_event(10, "tool.invocation.started");
+        let event = record.to_runtime_event(10, RuntimeSessionEventKind::ToolInvocationStarted);
         assert_eq!(event.payload["stale_registration"], true);
     }
 }

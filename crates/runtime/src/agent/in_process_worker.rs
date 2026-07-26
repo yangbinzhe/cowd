@@ -253,11 +253,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             stream_callback: Some(provider_event_sender),
             tool_callback: None,
             model_context_window: None,
-            // A child agent shares the parent Session authority for durable
-            // tool evidence and context receipts. The session id is already
-            // bound to the parent above, so this cannot create a parallel
-            // store or leak raw tool output back inline as a fallback.
-            session_store: services.session_store(),
             hook_progress_reporter: None,
             external_context_items: Vec::new(),
             skill_profiles: skill_catalog.profiles(),
@@ -306,7 +301,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // Delegated Agents share the parent Session's evidence authority, but
         // only the parent Turn may publish conversation messages. The child
         // result returns through AgentReturnPacket and the Team reducer.
-        runtime.set_transcript_persistence(false);
         let input_stream = runtime.session_input_stream();
         let completion = Arc::new(tokio::sync::Notify::new());
         let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));

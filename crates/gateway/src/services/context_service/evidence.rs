@@ -537,7 +537,7 @@ mod tests {
         },
         core::EvidenceRef,
     };
-    use memory::{SessionDomainEvent, SessionDomainScope, SessionRecord, UnifiedSessionStore};
+    use session::{SessionDomainEvent, SessionDomainScope, SessionRecord, UnifiedSessionStore};
     use sha2::Digest;
 
     use super::{
@@ -545,8 +545,8 @@ mod tests {
         validated_artifact_selector, ContextService,
     };
     use crate::{
-        event_bus::SessionEventBus, gateway::ActiveSessions, services::SessionService,
-        session_kernel::SessionKernel,
+        event_bus::SessionProjectionHub, gateway::HotSessionPool,
+        services::session_service::repository::SessionRepository, services::SessionService,
     };
 
     fn projection(session_id: &str, raw: &str) -> EvidenceAuditProjection {
@@ -690,11 +690,14 @@ mod tests {
             .await
             .expect("persist context report");
 
-        let restarted_session = SessionService::with_kernel(Arc::new(SessionKernel::new(
-            Arc::new(ActiveSessions::new()),
-            Some(store),
-            SessionEventBus::new(),
-        )));
+        let restarted_session = SessionService::for_tests(
+            Arc::new(SessionRepository::new(
+                Arc::new(HotSessionPool::new()),
+                Some(store),
+                SessionProjectionHub::new(),
+            )),
+            Arc::new(crate::services::session_service::presence::SessionPresenceLedger::new()),
+        );
         let context = ContextService::new().with_artifact_store(artifact_store);
         let projections = context
             .evidence_audit_projections(&restarted_session, session_id, 0, 20)

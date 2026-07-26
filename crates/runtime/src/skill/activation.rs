@@ -1,10 +1,10 @@
 //! Session-domain event support for skill activation decisions.
 
 use harness_contract::skill::SkillInvocationEvidence;
-use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 
 use super::CowdSkillStructuredDependency;
+use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,7 +75,7 @@ impl SkillActivationRecord {
     }
 
     #[must_use]
-    pub fn to_session_domain_event(&self, sequence: usize) -> SessionDomainEvent {
+    pub fn to_runtime_session_event(&self, sequence: usize) -> RuntimeSessionEvent {
         let payload = serde_json::json!({
             "source": "conversation_runtime.skill_activation",
             "turn_index": self.turn_index,
@@ -85,30 +85,29 @@ impl SkillActivationRecord {
             "invocation_evidence": self.invocation_evidence,
             "structured_dependencies": self.structured_dependencies,
         });
-        let mut event = SessionDomainEvent::new(
+        let mut event = RuntimeSessionEvent::new(
             self.session_id.clone(),
             sequence,
-            SessionDomainScope::Context,
-            "skill_candidates",
+            RuntimeSessionEventKind::SkillCandidates,
             payload,
             now_ms(),
         );
         if let Some(selected) = &self.selected {
-            event.refs.push(SessionDomainRef {
+            event.refs.push(RuntimeSessionEventRef {
                 ref_type: "skill".to_string(),
                 id: selected.clone(),
                 label: Some("selected".to_string()),
             });
         }
         if let Some(evidence) = &self.invocation_evidence {
-            event.refs.push(SessionDomainRef {
+            event.refs.push(RuntimeSessionEventRef {
                 ref_type: "skill_invocation".to_string(),
                 id: evidence.skill_id.clone(),
                 label: Some(evidence.outcome.clone()),
             });
         }
         for dependency in &self.structured_dependencies {
-            event.refs.push(SessionDomainRef {
+            event.refs.push(RuntimeSessionEventRef {
                 ref_type: "skill_dependency".to_string(),
                 id: format!("{}:{}", dependency.skill_id, dependency.domain),
                 label: Some(dependency.quality_gate.clone()),
@@ -130,7 +129,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn activation_record_projects_to_session_domain_event() {
+    fn activation_record_projects_to_closed_runtime_session_event() {
         let record = SkillActivationRecord::new(
             "session-1",
             2,
@@ -144,12 +143,11 @@ mod tests {
             }],
         );
 
-        let event = record.to_session_domain_event(7);
+        let event = record.to_runtime_session_event(7);
 
         assert_eq!(event.session_id, "session-1");
-        assert_eq!(event.sequence, 7);
-        assert_eq!(event.scope, SessionDomainScope::Context);
-        assert_eq!(event.kind, "skill_candidates");
+        assert_eq!(event.sequence_hint, 7);
+        assert_eq!(event.kind, RuntimeSessionEventKind::SkillCandidates);
         assert_eq!(event.payload["selected"], "release");
         assert!(event.payload.get("invocation_evidence").is_some());
         assert!(event.payload["structured_dependencies"].is_array());

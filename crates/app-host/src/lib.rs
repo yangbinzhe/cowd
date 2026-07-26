@@ -910,6 +910,45 @@ impl AppRegistry {
             .collect()
     }
 
+    /// Resolve the owner of one concrete HTTP request from the immutable,
+    /// active APP route catalogue.
+    ///
+    /// A literal route wins over parameterized routes, mirroring router
+    /// specificity. Ambiguous parameterized matches fail closed with `None`;
+    /// callers must then use a non-APP producer namespace.
+    #[must_use]
+    pub fn active_app_id_for_route(&self, method: &str, path: &str) -> Option<AppId> {
+        let mut literal = None;
+        let mut parameterized = None;
+        let mut parameterized_ambiguous = false;
+        for (app_id, registered) in &self.http_contracts {
+            for route in &registered.contract.routes {
+                if !route.active || !route.method.eq_ignore_ascii_case(method) {
+                    continue;
+                }
+                if route.path == path {
+                    if literal.is_some() {
+                        return None;
+                    }
+                    literal = Some(app_id.clone());
+                } else if app_route_path_matches(&route.path, path) {
+                    if parameterized.is_some() {
+                        parameterized_ambiguous = true;
+                    } else {
+                        parameterized = Some(app_id.clone());
+                    }
+                }
+            }
+        }
+        literal.or_else(|| {
+            if parameterized_ambiguous {
+                None
+            } else {
+                parameterized
+            }
+        })
+    }
+
     #[must_use]
     pub fn openapi_components(&self) -> BTreeMap<String, Value> {
         self.http_contracts
@@ -1029,6 +1068,18 @@ impl AppRegistry {
             router.merge(app.router.clone())
         })
     }
+}
+
+fn app_route_path_matches(pattern: &str, concrete: &str) -> bool {
+    let pattern = pattern.trim_matches('/').split('/').collect::<Vec<_>>();
+    let concrete = concrete.trim_matches('/').split('/').collect::<Vec<_>>();
+    pattern.len() == concrete.len()
+        && pattern.iter().zip(concrete).all(|(expected, actual)| {
+            (!actual.is_empty()
+                && (expected.starts_with(':')
+                    || (expected.starts_with('{') && expected.ends_with('}'))))
+                || expected == &actual
+        })
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -1340,6 +1391,40 @@ mod tests {
         true
     }
 
+    fn register_fixture_http_contract(
+        registry: &mut AppRegistry,
+        app_id: &str,
+        method: &str,
+        path: &str,
+        active: bool,
+    ) {
+        let app_id = AppId::parse(app_id).expect("fixture app id");
+        registry
+            .register_app_http_contract(
+                &app_id,
+                AppHttpContract {
+                    routes: vec![AppRouteMetadata {
+                        method: method.to_string(),
+                        path: path.to_string(),
+                        route_id: format!("{app_id}.route"),
+                        operation_id: format!("{app_id}.ping"),
+                        request_schema: "FixtureNoBody".to_string(),
+                        response_schema: "FixtureResponse".to_string(),
+                        class: "write".to_string(),
+                        capability: format!("{app_id}.write"),
+                        risk: "low".to_string(),
+                        confirmation: "none".to_string(),
+                        streaming: false,
+                        active,
+                    }],
+                    openapi_components: BTreeMap::new(),
+                    auth_error_schema: None,
+                },
+                fixture_error,
+            )
+            .expect("register fixture HTTP contract");
+    }
+
     #[test]
     fn registry_has_a_real_generic_http_and_tui_consumer() {
         let mut registry = AppRegistry::default();
@@ -1430,6 +1515,77 @@ mod tests {
             registry.register(fixture("third", "/api/apps/third/ping", "fixture.read")),
             Err(AppRegistryError::CapabilityCollision { .. })
         ));
+    }
+
+    #[test]
+    fn active_route_lookup_resolves_trusted_app_identity_for_concrete_paths() {
+        let mut registry = AppRegistry::default();
+        registry
+            .register(fixture(
+                "app-a",
+                "/api/apps/app-a/outcomes/:id",
+                "app-a.write",
+            ))
+            .expect("register app A");
+        registry
+            .register(fixture(
+                "app-b",
+                "/api/apps/app-b/outcomes/:id",
+                "app-b.write",
+            ))
+            .expect("register app B");
+        registry
+            .register(fixture(
+                "inactive",
+                "/api/apps/inactive/outcomes/:id",
+                "inactive.write",
+            ))
+            .expect("register inactive app");
+        register_fixture_http_contract(
+            &mut registry,
+            "app-a",
+            "GET",
+            "/api/apps/app-a/outcomes/:id",
+            true,
+        );
+        register_fixture_http_contract(
+            &mut registry,
+            "app-b",
+            "GET",
+            "/api/apps/app-b/outcomes/:id",
+            true,
+        );
+        register_fixture_http_contract(
+            &mut registry,
+            "inactive",
+            "GET",
+            "/api/apps/inactive/outcomes/:id",
+            false,
+        );
+
+        assert_eq!(
+            registry
+                .active_app_id_for_route("GET", "/api/apps/app-a/outcomes/shared")
+                .expect("active app A route")
+                .as_str(),
+            "app-a"
+        );
+        assert_eq!(
+            registry
+                .active_app_id_for_route("GET", "/api/apps/app-b/outcomes/shared")
+                .expect("active app B route")
+                .as_str(),
+            "app-b"
+        );
+        assert!(registry
+            .active_app_id_for_route("POST", "/api/apps/app-a/outcomes/shared")
+            .is_none());
+        assert!(registry
+            .active_app_id_for_route("GET", "/api/apps/inactive/outcomes/shared")
+            .is_none());
+        assert!(registry
+            .active_app_id_for_route("POST", "/api/sessions")
+            .is_none());
     }
 
     #[test]

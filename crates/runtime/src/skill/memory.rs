@@ -3,11 +3,10 @@
 use super::activation::RuntimeSkillCandidateSource;
 use super::SkillActivationRecord;
 use chrono::Utc;
-use memory::{
-    MaintenanceCandidate, MaintenanceCandidateAction, MaintenanceCandidateStatus,
-    SessionDomainEvent, SessionDomainRef, SessionDomainScope,
-};
+use memory::{MaintenanceCandidate, MaintenanceCandidateAction, MaintenanceCandidateStatus};
 use uuid::Uuid;
+
+use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillMemoryPolicy {
@@ -93,16 +92,15 @@ pub fn skill_memory_candidate_session_event(
     activation: &SkillActivationRecord,
     candidate: &MaintenanceCandidate,
     sequence: usize,
-) -> Option<SessionDomainEvent> {
+) -> Option<RuntimeSessionEvent> {
     let selected = activation.selected.as_deref()?.trim();
     if selected.is_empty() {
         return None;
     }
-    let mut event = SessionDomainEvent::new(
+    let mut event = RuntimeSessionEvent::new(
         activation.session_id.clone(),
         sequence,
-        SessionDomainScope::Context,
-        "skill_memory_candidate",
+        RuntimeSessionEventKind::SkillMemoryCandidate,
         serde_json::json!({
             "source": "conversation_runtime.skill_memory_candidate",
             "turn_index": activation.turn_index,
@@ -122,7 +120,7 @@ pub fn skill_memory_candidate_session_event(
         }),
         now_ms(),
     );
-    event.refs.push(SessionDomainRef {
+    event.refs.push(RuntimeSessionEventRef {
         ref_type: "skill".to_string(),
         id: selected.to_string(),
         label: Some("memory_candidate_source".to_string()),
@@ -262,7 +260,7 @@ mod tests {
         let event = skill_memory_candidate_session_event(&activation, &candidate, 9)
             .expect("selected skill has session evidence");
 
-        assert_eq!(event.kind, "skill_memory_candidate");
+        assert_eq!(event.kind, RuntimeSessionEventKind::SkillMemoryCandidate);
         assert_eq!(
             event.payload["source"],
             "conversation_runtime.skill_memory_candidate"

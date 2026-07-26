@@ -10,8 +10,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use memory::store::session::{SessionEvent, SessionMessage, SessionRecord};
 use serde::{Deserialize, Serialize};
+use session::{SessionEvent, SessionMessage, SessionRecord};
+use sha2::{Digest, Sha256};
 
 use super::{surface_actor_id, AppState, AuthenticatedPrincipal, ErrorResponse};
 use crate::services::{
@@ -27,8 +28,12 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
         .route("/api/sessions/search", get(search_messages_handler))
         .route("/api/sessions/:id/evidence", get(get_session_evidence))
-        .route("/api/sessions/:id/ensure", post(ensure_session_handler))
+        .route(
+            "/api/sessions/:id/ensure",
+            post(ensure_surface_session_handler),
+        )
         .route("/api/sessions/:id/branch", post(branch_session_handler))
+        .route("/api/sessions/:id/archive", post(archive_session_handler))
         .route("/api/sessions/:id/attach", post(attach_session_handler))
         .route("/api/sessions/:id/detach", post(detach_session_handler))
         .route(
@@ -115,6 +120,11 @@ async fn session_evidence_projection(
         EvidenceFreshness, ProjectionDetailScope, SessionEvidenceProjection, TurnEvidenceProjection,
     };
 
+    // Authorize the durable Session boundary before inspecting its outbox.
+    // A pruned execution graph cannot turn an unauthorized request into an
+    // "unavailable" projection that still leaks turn, message or receipt
+    // identifiers from the outbox.
+    authorize_session_evidence_read(state, principal, session_id).await?;
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -123,24 +133,10 @@ async fn session_evidence_projection(
             }),
         )
     })?;
-    let store = runtime_service
-        .session_kernel()
-        .unified_store()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse {
-                    error: "unified session store unavailable".to_string(),
-                }),
-            )
-        })?;
-    // Authorize the durable Session boundary before inspecting its outbox.
-    // A pruned execution graph cannot turn an unauthorized request into an
-    // "unavailable" projection that still leaks turn, message or receipt
-    // identifiers from the outbox.
-    authorize_session_evidence_read(state, principal, session_id).await?;
-    let mut records = store
-        .session_runtime_outbox_for_session(session_id, 100)
+    let mut records = state
+        .services
+        .session
+        .runtime_inputs(session_id, 100)
         .await
         .map_err(|error| {
             (
@@ -212,7 +208,7 @@ async fn session_evidence_projection(
         } else {
             EvidenceFreshness::Unavailable
         };
-        let terminal_ref = (record.status == memory::OutboxStatus::Materialized)
+        let terminal_ref = (record.status == session::SessionRuntimeInputStatus::Completed)
             .then(|| format!("turn-terminal:{}", record.request_id));
         let assistant_message_id = terminal_ref
             .as_ref()
@@ -478,6 +474,53 @@ struct CreateSessionRequest {
     model: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BranchSessionRequest {
+    pub(super) idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct BranchSessionReceipt {
+    pub(super) id: String,
+    pub(super) status: String,
+    pub(super) message_count: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) output_tokens: Option<i64>,
+    pub(super) operation_id: String,
+    pub(super) source_session_id: String,
+    pub(super) source_message_count: usize,
+    pub(super) copied_message_count: usize,
+    pub(super) replayed: bool,
+}
+
+fn branch_operation_identity(
+    source_session_id: &str,
+    principal_id: &str,
+    idempotency_key: &str,
+) -> (String, String) {
+    let mut digest = Sha256::new();
+    for value in [source_session_id, principal_id, idempotency_key] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    let digest = format!("{:x}", digest.finalize());
+    (
+        format!("session-branch:v1:{digest}"),
+        format!("branch-{}", &digest[..32]),
+    )
+}
+
 #[derive(Deserialize)]
 struct ListSessionsParams {
     #[serde(default = "default_sort")]
@@ -515,23 +558,13 @@ fn default_session_model(state: &AppState) -> String {
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string())
 }
 
-fn required_session_manager(
+fn required_session_service(
     state: &AppState,
-) -> Result<
-    &Arc<crate::unified_session_manager::UnifiedSessionManager>,
-    (StatusCode, Json<ErrorResponse>),
-> {
-    state.services.session_manager.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "unified session manager unavailable".to_string(),
-            }),
-        )
-    })
+) -> Result<&crate::services::SessionService, (StatusCode, Json<ErrorResponse>)> {
+    Ok(&state.services.session)
 }
 
-fn session_manager_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
+fn session_service_error(error: String) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
@@ -884,18 +917,18 @@ async fn create_session(
         .model
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| default_session_model(&state));
-    let manager = required_session_manager(&state)?;
-    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+    let session_service = required_session_service(&state)?;
+    let mut request = crate::services::EnsureSessionRequest::new(
         &session_id,
         Some(model),
-        crate::unified_session_manager::SessionSource::WebUi,
+        crate::services::SessionSource::WebUi,
     );
     request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
     request.allow_legacy_owner_migration = principal_can_migrate_legacy_session(&principal);
-    let outcome = manager
-        .ensure_session(request)
+    let outcome = session_service
+        .create_user_session(request)
         .await
-        .map_err(session_manager_error)?;
+        .map_err(session_service_error)?;
     let info = session_info_from_record(outcome.record);
 
     Ok((StatusCode::CREATED, Json(info)))
@@ -905,6 +938,7 @@ async fn branch_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(id): Path<String>,
+    Json(body): Json<BranchSessionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     if id.trim().is_empty() {
         return Err((
@@ -937,6 +971,20 @@ async fn branch_session_handler(
     }
 
     authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    let idempotency_key = body.idempotency_key.trim();
+    if idempotency_key.is_empty()
+        || idempotency_key.len() > 256
+        || idempotency_key.chars().any(char::is_control)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "idempotency_key must be a non-empty bounded non-control value".to_string(),
+            }),
+        ));
+    }
+    let principal_id = principal.0.claims().principal_id.clone();
+    let (operation_id, branch_id) = branch_operation_identity(&id, &principal_id, idempotency_key);
 
     let source_record = state
         .services
@@ -959,91 +1007,47 @@ async fn branch_session_handler(
         .as_ref()
         .and_then(|record| record.model.clone())
         .unwrap_or_else(|| default_session_model(&state));
-    let branch_id = uuid::Uuid::new_v4().to_string();
-    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
-        &branch_id,
-        Some(model),
-        crate::unified_session_manager::SessionSource::WebUi,
-    );
-    request.title = Some(format!("{} / branch", source_title));
-    request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
-    request.allow_legacy_owner_migration = principal_can_migrate_legacy_session(&principal);
-    request.metadata = serde_json::json!({
-        "branched_from": id,
-        "branch_source_title": source_title,
-    });
-    let outcome = required_session_manager(&state)?
-        .ensure_session(request)
-        .await
-        .map_err(session_manager_error)?;
-    let mut info = session_info_from_record(outcome.record.clone());
-    let mut copied_messages = 0usize;
-    if state.services.session.has_unified_store() {
-        let mut record = outcome.record;
-        copied_messages = state
-            .services
-            .session
-            .copy_stored_messages(&id, &branch_id)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to copy branch messages: {error}"),
-                    }),
-                )
-            })?
-            .unwrap_or(0);
-        record.message_count = copied_messages as i64;
-        state
-            .services
-            .session
-            .update_stored_session(&record)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse {
-                        error: format!("failed to update branch session: {error}"),
-                    }),
-                )
-            })?;
-        let _ = state
-            .services
-            .session
-            .append_timeline_event(
-                &branch_id,
-                "BranchCreated",
-                serde_json::json!({
-                    "source_session_id": id,
-                    "branch_session_id": branch_id,
-                    "copied_message_count": copied_messages,
-                    "status": "created",
-                }),
-            )
-            .await;
-        info = session_info_from_record(record);
-    }
-
-    let _ = state
-        .services
-        .session
-        .append_timeline_event(
+    let outcome = required_session_service(&state)?
+        .branch_session(
             &id,
-            "SessionBranched",
-            serde_json::json!({
-                "source_session_id": id,
-                "branch_session_id": branch_id,
-                "copied_message_count": copied_messages,
-                "status": "created",
-            }),
+            &branch_id,
+            operation_id,
+            format!("{} / branch", source_title),
+            model,
+            principal_id,
         )
-        .await;
-
-    Ok((StatusCode::CREATED, Json(info)))
+        .await
+        .map_err(session_service_error)?;
+    tracing::info!(
+        source_session_id = %id,
+        branch_session_id = %branch_id,
+        copied_message_count = outcome.copied_message_count,
+        source_message_count = outcome.source_message_count,
+        "session branch committed atomically"
+    );
+    let info = session_info_from_record(outcome.session.record);
+    Ok((
+        StatusCode::OK,
+        Json(BranchSessionReceipt {
+            id: info.id,
+            status: info.status,
+            message_count: info.message_count,
+            title: info.title,
+            model: info.model,
+            created_at: info.created_at,
+            updated_at: info.updated_at,
+            input_tokens: info.input_tokens,
+            output_tokens: info.output_tokens,
+            operation_id: outcome.operation_id,
+            source_session_id: id,
+            source_message_count: outcome.source_message_count,
+            copied_message_count: outcome.copied_message_count,
+            replayed: outcome.replayed,
+        }),
+    ))
 }
 
-async fn ensure_session_handler(
+async fn ensure_surface_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(id): Path<String>,
@@ -1075,17 +1079,17 @@ async fn ensure_session_handler(
         authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     }
 
-    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+    let mut request = crate::services::EnsureSessionRequest::new(
         &id,
         body.model.filter(|model| !model.trim().is_empty()),
-        crate::unified_session_manager::SessionSource::Tui,
+        crate::services::SessionSource::Tui,
     );
     request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
     request.allow_legacy_owner_migration = principal_can_migrate_legacy_session(&principal);
-    let outcome = required_session_manager(&state)?
-        .ensure_session(request)
+    let outcome = required_session_service(&state)?
+        .ensure_surface_session(request)
         .await
-        .map_err(session_manager_error)?;
+        .map_err(session_service_error)?;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -1119,12 +1123,7 @@ async fn get_session(
         }
     }
 
-    if state
-        .services
-        .runtime
-        .as_ref()
-        .is_some_and(|runtime_service| runtime_service.has_active_session(&id))
-    {
+    if state.services.session.has_active_session(&id) {
         Ok(Json(active_session_info(id)))
     } else {
         Err((
@@ -1162,24 +1161,18 @@ async fn cancel_session_turn_handler(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("user_requested");
-    let cancelled_execution_ids = state
-        .services
-        .runtime
-        .as_ref()
-        .map(|runtime| runtime.cancel_active_session(&id, reason))
-        .unwrap_or_default();
+    let cancelled_execution_ids = required_session_service(&state)?
+        .cancel_active_turns(&id, reason)
+        .map_err(session_service_error)?;
     let aborted_run_id = cancelled_execution_ids.first().cloned();
-    let event = serde_json::json!({
-        "type": "TurnCancelRequested",
-        "session_id": id,
-        "actor_id": actor_id,
-        "reason": reason,
-        "status": "accepted",
-        "aborted": aborted_run_id.is_some(),
-        "run_id": aborted_run_id,
-        "execution_ids": cancelled_execution_ids,
-    });
-    state.event_bus().broadcast(&id, &event.to_string()).await;
+    let event = crate::event_bus::SessionProjectionEvent::TurnCancelRequested {
+        session_id: id.clone(),
+        actor_id: actor_id.clone(),
+        reason: reason.to_string(),
+        aborted_run_id: aborted_run_id.clone(),
+        execution_ids: cancelled_execution_ids.clone(),
+    };
+    state.event_bus().publish(&id, event).await;
 
     Ok(Json(serde_json::json!({
         "ok": true,
@@ -1187,10 +1180,32 @@ async fn cancel_session_turn_handler(
         "status": "cancel_requested",
         "actor_id": actor_id,
         "reason": reason,
-        "aborted": event["aborted"],
-        "run_id": event["run_id"],
-        "execution_ids": event["execution_ids"],
+        "aborted": aborted_run_id.is_some(),
+        "run_id": aborted_run_id,
+        "execution_ids": cancelled_execution_ids,
     })))
+}
+
+async fn archive_session_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    authorize_session_access(&state, &principal, &id, SessionAccess::Destructive).await?;
+    let archived = required_session_service(&state)?
+        .archive_session(&id)
+        .await
+        .map_err(session_service_error)?;
+    if archived {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("session {id} not found"),
+            }),
+        ))
+    }
 }
 
 async fn delete_session(
@@ -1199,10 +1214,10 @@ async fn delete_session(
     Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Destructive).await?;
-    let removed = required_session_manager(&state)?
+    let removed = required_session_service(&state)?
         .delete_session(&id)
         .await
-        .map_err(session_manager_error)?;
+        .map_err(session_service_error)?;
     if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1247,20 +1262,8 @@ async fn get_session_events(
         ));
     };
     let events: Vec<serde_json::Value> = stored_events
-        .into_iter()
-        .map(|event| {
-            let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
-                .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
-            let payload =
-                session_event_payload_for_response(&event.event_type, payload, include_payload);
-            serde_json::json!({
-                "session_id": event.session_id,
-                "type": event.event_type,
-                "sequence": event.sequence,
-                "created_at_ms": event.created_at_ms,
-                "payload": payload,
-            })
-        })
+        .iter()
+        .map(|event| canonical_session_event_value(event, include_payload))
         .collect();
     let has_more = events.len() < total;
 
@@ -1458,8 +1461,48 @@ fn runtime_run_tree_summary(runs: &[serde_json::Value]) -> serde_json::Value {
 }
 
 fn session_event_value(event: &SessionEvent) -> serde_json::Value {
+    canonical_session_event_value(event, true)
+}
+
+fn canonical_session_event_value(event: &SessionEvent, include_payload: bool) -> serde_json::Value {
+    if event.event_type == session::SESSION_DOMAIN_EVENT_TYPE {
+        return match session::SessionDomainEvent::from_session_event(event) {
+            Ok(domain) => {
+                let payload = session_event_payload_for_response(
+                    &domain.kind,
+                    domain.payload,
+                    include_payload,
+                );
+                serde_json::json!({
+                    "event_id": domain.event_id,
+                    "session_id": domain.session_id,
+                    "type": domain.kind,
+                    "scope": domain.scope,
+                    "status": domain.status,
+                    "span_id": domain.span_id,
+                    "parent_span_id": domain.parent_span_id,
+                    "correlation_id": domain.correlation_id,
+                    "refs": domain.refs,
+                    "sequence": event.sequence,
+                    "created_at_ms": domain.created_at_ms,
+                    "payload": payload,
+                })
+            }
+            Err(error) => serde_json::json!({
+                "session_id": event.session_id,
+                "type": session::SESSION_DOMAIN_EVENT_TYPE,
+                "sequence": event.sequence,
+                "created_at_ms": event.created_at_ms,
+                "payload": {
+                    "raw": event.event_json,
+                    "parse_error": error.to_string(),
+                },
+            }),
+        };
+    }
     let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
         .unwrap_or_else(|_| serde_json::json!({ "raw": event.event_json }));
+    let payload = session_event_payload_for_response(&event.event_type, payload, include_payload);
     serde_json::json!({
         "session_id": event.session_id,
         "type": event.event_type,
@@ -1500,9 +1543,29 @@ fn runtime_tool_payload_from_event(event: &serde_json::Value) -> Option<serde_js
     let payload = event.get("payload").unwrap_or(&serde_json::Value::Null);
     if matches!(
         event_type,
-        "ToolStart" | "ToolProgress" | "ToolComplete" | "ToolFailure"
+        "ToolStart"
+            | "ToolProgress"
+            | "ToolComplete"
+            | "ToolFailure"
+            | "tool.invocation.started"
+            | "tool.invocation.completed"
+            | "tool.invocation.failed"
+            | "tool.execution_plan.created"
     ) {
-        return Some(payload.clone());
+        let mut tool_payload = payload.clone();
+        if let Some(object) = tool_payload.as_object_mut() {
+            object.insert(
+                "runtime_event_kind".to_string(),
+                serde_json::Value::String(event_type.to_string()),
+            );
+            if let Some(status) = event.get("status").cloned() {
+                object.insert("runtime_event_status".to_string(), status);
+            }
+            if let Some(event_id) = event.get("event_id").cloned() {
+                object.insert("runtime_event_id".to_string(), event_id);
+            }
+        }
+        return Some(tool_payload);
     }
     if event_type != "RuntimeEvent" {
         return None;
@@ -1746,13 +1809,20 @@ impl TurnProjectionAccumulator {
                 "ApprovalRequested" | "ApprovalResolved" | "RiskApproval" => {
                     self.approvals.push(payload.clone());
                 }
-                "ContextEnvelope" | "ContextTurnReport" | "ContextRecommendationAction" => {
+                "ContextEnvelope"
+                | "ContextTurnReport"
+                | "ContextRecommendationAction"
+                | "context.turn_report"
+                | "context.governance_report"
+                | "context.fact_candidate_review"
+                | "context.session_compacted"
+                | "context.recommendation_action" => {
                     self.context_events.push(payload.clone());
                 }
                 "TokenUsage" | "RunModelTelemetry" => {
                     self.usage.push(payload.clone());
                 }
-                "SurfaceMessageProcessed" => {
+                "SurfaceMessageProcessed" | "surface.message_replied" => {
                     if let Some(preview) = payload
                         .get("response_preview")
                         .and_then(serde_json::Value::as_str)
@@ -1765,6 +1835,7 @@ impl TurnProjectionAccumulator {
             }
         }
         collect_projection_evidence_refs(payload, &mut self.evidence_refs);
+        collect_projection_evidence_refs(event, &mut self.evidence_refs);
     }
 
     fn observe_turn_journal(&mut self, event: &serde_json::Value, payload: &serde_json::Value) {
@@ -1843,6 +1914,19 @@ fn collect_projection_evidence_refs(payload: &serde_json::Value, out: &mut BTree
         for value in values {
             if let Some(value) = value.as_str() {
                 out.insert(value.to_string());
+            }
+        }
+    }
+    if let Some(references) = payload.get("refs").and_then(serde_json::Value::as_array) {
+        for reference in references {
+            let ref_type = reference
+                .get("type")
+                .or_else(|| reference.get("ref_type"))
+                .and_then(serde_json::Value::as_str);
+            if matches!(ref_type, Some("evidence" | "raw_evidence")) {
+                if let Some(id) = reference.get("id").and_then(serde_json::Value::as_str) {
+                    out.insert(id.to_string());
+                }
             }
         }
     }
@@ -2541,7 +2625,7 @@ fn stored_session_duration_ms(record: &SessionRecord) -> u64 {
         .max(0) as u64
 }
 
-fn token_count_from_usage(message: &memory::store::session::SessionMessage, key: &str) -> u32 {
+fn token_count_from_usage(message: &session::SessionMessage, key: &str) -> u32 {
     message
         .token_usage_json
         .as_deref()
@@ -2927,6 +3011,152 @@ mod tests {
         assert_eq!(
             projection["tool_timeline"][0]["runtime_event_kind"],
             "tool.invocation.completed"
+        );
+    }
+
+    #[test]
+    fn session_domain_events_project_logical_kind_refs_and_tool_payload() {
+        let mut domain = session::SessionDomainEvent::new(
+            "session-v31",
+            0,
+            session::SessionDomainScope::Tool,
+            "tool.invocation.completed",
+            serde_json::json!({
+                "contract_version": 2,
+                "invocation_id": "tool-domain-1",
+                "tool_name": "read",
+                "turn_id": "turn-domain-1",
+                "status": "completed",
+                "full_output_ref": "tool://domain-raw-1"
+            }),
+            1_000,
+        );
+        domain.event_id = "event-domain-tool-1".to_string();
+        domain.status = Some("completed".to_string());
+        domain.refs.push(session::SessionDomainRef {
+            ref_type: "evidence".to_string(),
+            id: "tool://domain-raw-1".to_string(),
+            label: None,
+        });
+        let stored = domain.to_session_event().unwrap();
+
+        let logical = session_event_value(&stored);
+        assert_eq!(logical["type"], "tool.invocation.completed");
+        assert_eq!(logical["scope"], "tool");
+        assert_eq!(logical["event_id"], "event-domain-tool-1");
+        assert_eq!(logical["refs"][0]["id"], "tool://domain-raw-1");
+
+        let projection = session_run_projection_from_events("session-v31", vec![stored], &[], None);
+        assert_eq!(projection["tool_timeline"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            projection["tool_timeline"][0]["runtime_event_kind"],
+            "tool.invocation.completed"
+        );
+        assert_eq!(
+            projection["turn_projection"]["turns"][0]["evidence_refs"][0],
+            "tool://domain-raw-1"
+        );
+    }
+
+    #[test]
+    fn surface_domain_phases_keep_logical_semantics_and_empty_terminal() {
+        let phases = [
+            (
+                session::SessionDomainScope::Message,
+                "surface.message_received",
+                "received",
+                serde_json::json!({
+                    "type": "SurfaceMessageReceived",
+                    "surface": "feishu",
+                    "message_id": "om-1",
+                    "content_preview": "inspect incident"
+                }),
+            ),
+            (
+                session::SessionDomainScope::Session,
+                "surface.runtime_activated",
+                "active",
+                serde_json::json!({
+                    "type": "SurfaceSessionRuntimeActivated",
+                    "surface": "feishu",
+                    "session_id": "session-v31",
+                    "message_id": "om-1"
+                }),
+            ),
+            (
+                session::SessionDomainScope::Tool,
+                "surface.resources_registered",
+                "registered",
+                serde_json::json!({
+                    "type": "SurfaceMessageResourcesRegistered",
+                    "surface": "feishu",
+                    "message_id": "om-1",
+                    "current": [],
+                    "recent": []
+                }),
+            ),
+            (
+                session::SessionDomainScope::Turn,
+                "surface.message_accepted",
+                "accepted",
+                serde_json::json!({
+                    "type": "SurfaceMessageAccepted",
+                    "surface": "feishu",
+                    "message_id": "om-1",
+                    "turn_id": "turn-surface-1",
+                    "execution_id": "execution-surface-1"
+                }),
+            ),
+            (
+                session::SessionDomainScope::Message,
+                "surface.message_replied",
+                "empty_terminal",
+                serde_json::json!({
+                    "type": "SurfaceMessageReplied",
+                    "surface": "feishu",
+                    "message_id": "om-1",
+                    "turn_id": "turn-surface-1",
+                    "execution_id": "execution-surface-1",
+                    "terminal_id": "terminal-surface-1",
+                    "empty_terminal": true
+                }),
+            ),
+        ];
+        let stored = phases
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, (scope, kind, status, payload))| {
+                let mut event = session::SessionDomainEvent::new(
+                    "session-v31",
+                    sequence,
+                    scope,
+                    kind,
+                    payload,
+                    1_000 + sequence as u64,
+                );
+                event.event_id = format!("surface-projection:{kind}:om-1");
+                event.correlation_id = Some("feishu:om-1".to_string());
+                event.status = Some(status.to_string());
+                event.to_session_event().unwrap()
+            })
+            .collect::<Vec<_>>();
+        let logical = stored.iter().map(session_event_value).collect::<Vec<_>>();
+
+        assert_eq!(logical.len(), 5);
+        assert_eq!(logical[0]["type"], "surface.message_received");
+        assert_eq!(logical[3]["status"], "accepted");
+        assert_eq!(logical[4]["status"], "empty_terminal");
+        assert_eq!(logical[4]["payload"]["empty_terminal"], true);
+        assert!(logical
+            .iter()
+            .all(|event| event["correlation_id"] == "feishu:om-1"));
+
+        let projection = turn_projection_from_event_values("session-v31", &logical);
+        assert_eq!(projection["turn_count"], 1);
+        assert_eq!(projection["turns"][0]["turn_id"], "turn-surface-1");
+        assert_eq!(
+            projection["turns"][0]["event_sequences"],
+            serde_json::json!([3, 4])
         );
     }
 

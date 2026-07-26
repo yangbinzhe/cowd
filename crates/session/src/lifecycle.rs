@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use memory::{SessionEvent, UnifiedSessionStore};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+
+use crate::{SessionEvent, UnifiedSessionStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,13 +103,13 @@ struct SessionLifecycleEntry {
 }
 
 #[derive(Debug, Default)]
-pub struct SessionLifecycleKernel {
+pub struct SessionPresenceLedger {
     sessions: RwLock<HashMap<String, SessionLifecycleEntry>>,
     store: Option<Arc<UnifiedSessionStore>>,
     mutation_gate: tokio::sync::Mutex<()>,
 }
 
-impl SessionLifecycleKernel {
+impl SessionPresenceLedger {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -442,7 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_attach_does_not_create_duplicate_runtime() {
-        let kernel = SessionLifecycleKernel::new();
+        let kernel = SessionPresenceLedger::new();
         let first = kernel
             .attach("session-a", SessionActor::new("tui-1", "tui"))
             .await
@@ -461,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn tui_detach_keeps_session_active_for_other_surfaces() {
-        let kernel = SessionLifecycleKernel::new();
+        let kernel = SessionPresenceLedger::new();
         kernel
             .attach("session-a", SessionActor::new("tui-1", "tui"))
             .await
@@ -480,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_event_sequence_is_monotonic_under_concurrent_append() {
-        let kernel = std::sync::Arc::new(SessionLifecycleKernel::new());
+        let kernel = std::sync::Arc::new(SessionPresenceLedger::new());
         let mut handles = Vec::new();
         for idx in 0..16 {
             let kernel = kernel.clone();
@@ -506,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_attach_can_replay_from_sequence_contract() {
-        let kernel = SessionLifecycleKernel::new();
+        let kernel = SessionPresenceLedger::new();
         kernel
             .attach("session-a", SessionActor::new("tui-1", "tui"))
             .await
@@ -522,7 +523,7 @@ mod tests {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().expect("store"));
         let now = "2026-01-01T00:00:00Z".to_string();
         store
-            .create_session(&memory::SessionRecord {
+            .create_session(&crate::SessionRecord {
                 session_id: "session-a".to_string(),
                 platform: "test".to_string(),
                 chat_id: "session-a".to_string(),
@@ -540,7 +541,7 @@ mod tests {
             })
             .await
             .expect("session record");
-        let first = SessionLifecycleKernel::with_store(Arc::clone(&store));
+        let first = SessionPresenceLedger::with_store(Arc::clone(&store));
         first
             .attach("session-a", SessionActor::new("web-1", "webui"))
             .await
@@ -555,7 +556,7 @@ mod tests {
         );
         first.mark_active("session-a").await.expect("active");
 
-        let rebuilt = SessionLifecycleKernel::with_store(Arc::clone(&store));
+        let rebuilt = SessionPresenceLedger::with_store(Arc::clone(&store));
         let snapshot = rebuilt.snapshot("session-a").await.expect("rehydrated");
         assert_eq!(snapshot.state, SessionLifecycleState::Active);
         assert_eq!(snapshot.attachments.len(), 1);
@@ -576,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn failed_durable_append_restores_the_hot_cache() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().expect("store"));
-        let kernel = SessionLifecycleKernel::with_store(store);
+        let kernel = SessionPresenceLedger::with_store(store);
         let error = kernel
             .attach("missing-session", SessionActor::new("web-1", "webui"))
             .await

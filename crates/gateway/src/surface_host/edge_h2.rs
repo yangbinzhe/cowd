@@ -30,6 +30,7 @@ pub(super) struct EdgeH2Client {
     surface_id: Arc<str>,
     token: Arc<str>,
     sender: Arc<Mutex<SendRequest<Full<Bytes>>>>,
+    gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
 }
 
 impl std::fmt::Debug for EdgeH2Client {
@@ -46,6 +47,7 @@ impl EdgeH2Client {
         socket: &std::path::Path,
         surface_id: &str,
         token: &str,
+        gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     ) -> Result<Self, SurfaceError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let stream = loop {
@@ -71,15 +73,32 @@ impl EdgeH2Client {
                     reason: format!("managed edge H2 handshake failed: {error}"),
                 })?;
         let owned_surface = surface_id.to_string();
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                tracing::warn!(surface = %owned_surface, error = %error, "managed edge H2 connection closed");
-            }
-        });
+        gateway_tasks
+            .spawn_owned(
+                crate::runtime_host::task_set::GatewayTaskKind::SurfaceTransport,
+                crate::runtime_host::task_set::GatewayTaskOwner::Surface(
+                    owned_surface.clone(),
+                ),
+                move |cancellation| async move {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {}
+                        result = connection => {
+                            if let Err(error) = result {
+                                tracing::warn!(surface = %owned_surface, error = %error, "managed edge H2 connection closed");
+                            }
+                        }
+                    }
+                },
+            )
+            .map_err(|error| SurfaceError::Invocation {
+                surface: surface_id.to_string(),
+                reason: format!("managed edge H2 connection admission failed: {error}"),
+            })?;
         Ok(Self {
             surface_id: Arc::from(surface_id.to_string()),
             token: Arc::from(token.to_string()),
             sender: Arc::new(Mutex::new(sender)),
+            gateway_tasks,
         })
     }
 
@@ -112,62 +131,84 @@ impl EdgeH2Client {
         }
         let surface = self.surface_id.clone();
         let (tx, rx) = mpsc::channel(STREAM_BUFFER);
-        tokio::spawn(async move {
-            let mut body = response.into_body();
-            let mut buffered = Vec::new();
-            while let Some(frame) = body.frame().await {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(error) => {
+        self.gateway_tasks
+            .spawn_owned(
+                crate::runtime_host::task_set::GatewayTaskKind::SurfaceStream,
+                crate::runtime_host::task_set::GatewayTaskOwner::Surface(
+                    self.surface_id.to_string(),
+                ),
+                move |cancellation| async move {
+                    let mut body = response.into_body();
+                    let mut buffered = Vec::new();
+                    loop {
+                        let frame = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            frame = body.frame() => frame,
+                        };
+                        let Some(frame) = frame else {
+                            break;
+                        };
+                        let frame = match frame {
+                            Ok(frame) => frame,
+                            Err(error) => {
+                                let _ = tx
+                                    .send(Err(SurfaceError::Invocation {
+                                        surface: surface.to_string(),
+                                        reason: format!("managed edge stream read failed: {error}"),
+                                    }))
+                                    .await;
+                                return;
+                            }
+                        };
+                        let Ok(data) = frame.into_data() else {
+                            continue;
+                        };
+                        buffered.extend_from_slice(&data);
+                        if buffered.len() > MAX_STREAM_LINE {
+                            let _ = tx
+                                .send(Err(SurfaceError::Invocation {
+                                    surface: surface.to_string(),
+                                    reason: "managed edge stream exceeded line limit".to_string(),
+                                }))
+                                .await;
+                            return;
+                        }
+                        while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
+                            let line = buffered.drain(..=position).collect::<Vec<_>>();
+                            let line = &line[..line.len().saturating_sub(1)];
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let decoded =
+                                serde_json::from_slice::<SurfaceFrame>(line).map_err(|error| {
+                                    SurfaceError::Invocation {
+                                        surface: surface.to_string(),
+                                        reason: format!(
+                                            "managed edge stream decode failed: {error}"
+                                        ),
+                                    }
+                                });
+                            if tx.send(decoded).await.is_err() {
+                                // 下游取消时立即丢弃 Incoming，HTTP/2 会重置该流。
+                                return;
+                            }
+                        }
+                    }
+                    if !buffered.is_empty() {
                         let _ = tx
                             .send(Err(SurfaceError::Invocation {
                                 surface: surface.to_string(),
-                                reason: format!("managed edge stream read failed: {error}"),
+                                reason: "managed edge stream ended with an incomplete frame"
+                                    .to_string(),
                             }))
                             .await;
-                        return;
                     }
-                };
-                let Ok(data) = frame.into_data() else {
-                    continue;
-                };
-                buffered.extend_from_slice(&data);
-                if buffered.len() > MAX_STREAM_LINE {
-                    let _ = tx
-                        .send(Err(SurfaceError::Invocation {
-                            surface: surface.to_string(),
-                            reason: "managed edge stream exceeded line limit".to_string(),
-                        }))
-                        .await;
-                    return;
-                }
-                while let Some(position) = buffered.iter().position(|byte| *byte == b'\n') {
-                    let line = buffered.drain(..=position).collect::<Vec<_>>();
-                    let line = &line[..line.len().saturating_sub(1)];
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let decoded = serde_json::from_slice::<SurfaceFrame>(line).map_err(|error| {
-                        SurfaceError::Invocation {
-                            surface: surface.to_string(),
-                            reason: format!("managed edge stream decode failed: {error}"),
-                        }
-                    });
-                    if tx.send(decoded).await.is_err() {
-                        // 下游取消时立即丢弃 Incoming，HTTP/2 会重置该流。
-                        return;
-                    }
-                }
-            }
-            if !buffered.is_empty() {
-                let _ = tx
-                    .send(Err(SurfaceError::Invocation {
-                        surface: surface.to_string(),
-                        reason: "managed edge stream ended with an incomplete frame".to_string(),
-                    }))
-                    .await;
-            }
-        });
+                },
+            )
+            .map_err(|error| SurfaceError::Invocation {
+                surface: self.surface_id.to_string(),
+                reason: format!("managed edge stream admission failed: {error}"),
+            })?;
         Ok(rx)
     }
 
@@ -176,13 +217,30 @@ impl EdgeH2Client {
         events: Arc<Mutex<VecDeque<SurfaceFrame>>>,
         event_tx: broadcast::Sender<SurfaceFrame>,
         messages: Arc<dyn SurfaceMessageLedger>,
-    ) {
+    ) -> Result<(), SurfaceError> {
         let client = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = client.consume_events(events, event_tx, messages).await {
-                tracing::warn!(surface = %client.surface_id, error = %error, "managed edge event stream stopped");
-            }
-        });
+        self.gateway_tasks
+            .spawn_owned(
+                crate::runtime_host::task_set::GatewayTaskKind::SurfaceStream,
+                crate::runtime_host::task_set::GatewayTaskOwner::Surface(
+                    self.surface_id.to_string(),
+                ),
+                move |cancellation| async move {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {}
+                        result = client.consume_events(events, event_tx, messages) => {
+                            if let Err(error) = result {
+                                tracing::warn!(surface = %client.surface_id, error = %error, "managed edge event stream stopped");
+                            }
+                        }
+                    }
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| SurfaceError::Invocation {
+                surface: self.surface_id.to_string(),
+                reason: format!("managed edge event stream admission failed: {error}"),
+            })
     }
 
     async fn consume_events(
@@ -509,6 +567,7 @@ mod tests {
             &socket,
             "fixture",
             "fixture-token-at-least-thirty-two-bytes",
+            crate::runtime_host::task_set::GatewayRuntimeTaskSet::new(Duration::from_secs(1)),
         )
         .await
         .unwrap();
@@ -684,6 +743,7 @@ mod tests {
             &socket,
             "fixture",
             "fixture-token-at-least-thirty-two-bytes",
+            crate::runtime_host::task_set::GatewayRuntimeTaskSet::new(Duration::from_secs(1)),
         )
         .await
         .unwrap();
@@ -696,7 +756,9 @@ mod tests {
             .await
             .unwrap();
         let (event_tx, _event_rx) = broadcast::channel(8);
-        client.spawn_event_stream(Arc::new(Mutex::new(VecDeque::new())), event_tx, store);
+        client
+            .spawn_event_stream(Arc::new(Mutex::new(VecDeque::new())), event_tx, store)
+            .unwrap();
 
         tokio::time::timeout(Duration::from_secs(1), acked.notified())
             .await

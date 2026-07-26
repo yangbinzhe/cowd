@@ -20,7 +20,7 @@ mod cross_plane_service;
 mod error;
 mod evolution_service;
 mod growth_service;
-mod harness_eval_service;
+pub(crate) mod harness_eval_service;
 mod matrix_app_reality;
 mod matrix_service;
 mod memory_service;
@@ -30,7 +30,7 @@ pub(crate) mod reality_service;
 mod receipt;
 mod registry;
 mod runtime_event_service;
-mod session_service;
+pub(crate) mod session_service;
 mod skill_service;
 mod slash_controller;
 mod surface_service;
@@ -59,11 +59,13 @@ pub(crate) use mission_service::{
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
-pub(crate) use registry::{broker_backed_app_registry_with_storage, enabled_app_descriptors};
+pub(crate) use registry::{
+    broker_backed_app_registry_with_storage, embedded_app_registry, enabled_app_descriptors,
+};
 pub(crate) use runtime_event_service::RuntimeEventService;
 pub(crate) use session_service::{
-    ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionService,
-    SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
+    ActiveMessagesPage, EnsureSessionRequest, SessionCompactResult, SessionMessageCounts,
+    SessionService, SessionSource, SessionStatsSnapshot, SessionTokenCounts, SessionUpdateRequest,
 };
 pub(crate) use skill_service::profile_provider::runtime_skill_assets_for_workspace;
 pub(crate) use skill_service::{
@@ -242,6 +244,7 @@ pub(crate) struct HarnessEvalService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     pub(crate) active_jobs: HarnessEvalJobRegistry,
+    pub(crate) gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
 }
 
 /// Process-local worker registry owned by the Gateway service instance.
@@ -253,6 +256,7 @@ pub(crate) struct ActiveHarnessEvalJob {
     pub(crate) level: String,
     pub(crate) requested_at_ms: u128,
     pub(crate) cancel_requested: Arc<AtomicBool>,
+    pub(crate) cancellation: runtime::CancellationToken,
 }
 
 pub(crate) type HarnessEvalJobRegistry = Arc<Mutex<HashMap<String, ActiveHarnessEvalJob>>>;
@@ -565,11 +569,10 @@ pub(crate) struct GatewayServices {
     /// before the final `AppState` exists.
     pub(crate) app_host_binding: GatewayAppHostBinding,
     pub(crate) runtime: Option<Arc<RuntimeService>>,
-    pub(crate) session_manager: Option<Arc<crate::unified_session_manager::UnifiedSessionManager>>,
     pub(crate) runtime_events: RuntimeEventService,
     pub(crate) surface: SurfaceService,
     pub(crate) slash: SlashController,
-    pub(crate) session: SessionService,
+    pub(crate) session: Arc<SessionService>,
     pub(crate) task: TaskService,
     pub(crate) approval: ApprovalService,
     pub(crate) memory: MemoryService,
@@ -856,7 +859,7 @@ mod tests {
         );
         assert!(services.has_minimum_service_contract());
         assert_eq!(services.session.create_session().operation, "create");
-        assert_eq!(services.session.chat().status, "service_boundary_ready");
+        assert_eq!(services.session.chat().status, "service_ready");
         assert_eq!(services.task.complete().service, "task");
         assert_eq!(services.approval.respond_contract().operation, "respond");
         assert_eq!(services.memory.status().operation, "status");

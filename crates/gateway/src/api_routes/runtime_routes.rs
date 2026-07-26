@@ -16,8 +16,8 @@ pub(super) use control::{
     agent_value_summary, execution_graph_summary, get_runtime_control_plane, health_summary,
     session_lease_projection, value_loop_summary,
 };
-use memory::store::session::SessionListOptions;
 use runtime::{AgentControlPolicy, RuntimeConfig};
+use session::SessionListOptions;
 
 #[derive(Clone, serde::Serialize)]
 struct RuntimeTimelineRef {
@@ -33,6 +33,8 @@ pub(in crate::api_routes) struct RuntimeEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     commit_cursor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    transaction_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream_id: Option<String>,
     scope: String,
     kind: String,
@@ -43,8 +45,8 @@ pub(in crate::api_routes) struct RuntimeEvent {
     source: &'static str,
 }
 
-impl From<memory::SessionDomainEvent> for RuntimeEvent {
-    fn from(event: memory::SessionDomainEvent) -> Self {
+impl From<session::SessionDomainEvent> for RuntimeEvent {
+    fn from(event: session::SessionDomainEvent) -> Self {
         let payload_refs = runtime_timeline_refs_from_payload(&event.payload);
         let refs = if event.refs.is_empty() {
             payload_refs
@@ -66,17 +68,11 @@ impl From<memory::SessionDomainEvent> for RuntimeEvent {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         });
-        let kind = if matches!(
-            event.kind.as_str(),
-            "matrix.execution_outcome" | "mfg.execution_outcome"
-        ) {
-            "execution.outcome".to_string()
-        } else {
-            event.kind
-        };
+        let kind = event.kind;
         Self {
             sequence: event.sequence as u64,
             commit_cursor: None,
+            transaction_index: None,
             stream_id: None,
             scope: session_domain_scope_label(event.scope).to_string(),
             kind,
@@ -89,17 +85,17 @@ impl From<memory::SessionDomainEvent> for RuntimeEvent {
     }
 }
 
-fn session_domain_scope_label(scope: memory::SessionDomainScope) -> &'static str {
+fn session_domain_scope_label(scope: session::SessionDomainScope) -> &'static str {
     match scope {
-        memory::SessionDomainScope::Session => "session",
-        memory::SessionDomainScope::Message => "message",
-        memory::SessionDomainScope::Turn => "turn",
-        memory::SessionDomainScope::Context => "context",
-        memory::SessionDomainScope::Tool => "tool",
-        memory::SessionDomainScope::Memory => "memory",
-        memory::SessionDomainScope::Policy => "policy",
-        memory::SessionDomainScope::ApplicationTask => "task",
-        memory::SessionDomainScope::Mfg => "mfg",
+        session::SessionDomainScope::Session => "session",
+        session::SessionDomainScope::Message => "message",
+        session::SessionDomainScope::Turn => "turn",
+        session::SessionDomainScope::Context => "context",
+        session::SessionDomainScope::Tool => "tool",
+        session::SessionDomainScope::Memory => "memory",
+        session::SessionDomainScope::Policy => "policy",
+        session::SessionDomainScope::ApplicationTask => "task",
+        session::SessionDomainScope::Mfg => "mfg",
     }
 }
 
@@ -132,6 +128,7 @@ impl From<runtime::DurableRuntimeEvent> for RuntimeEvent {
         Self {
             sequence: event.sequence,
             commit_cursor: Some(event.commit_cursor),
+            transaction_index: Some(event.transaction_index),
             stream_id: Some(event.stream_id),
             scope: event.scope.as_str().to_string(),
             kind: event.kind,
@@ -476,15 +473,16 @@ async fn get_runtime_outbox_status(
     Query(params): Query<RuntimeOutboxQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
     let limit = params.limit.unwrap_or(100).clamp(1, 500);
-    let session_store = state.services.session.unified_store().ok_or_else(|| {
-        runtime_event_error(StatusCode::SERVICE_UNAVAILABLE, "session store unavailable")
-    })?;
-    let ingress_health = session_store
-        .session_runtime_outbox_health()
+    let ingress_health = state
+        .services
+        .session
+        .runtime_outbox_health()
         .await
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
-    let ingress_poison = session_store
-        .blocked_session_runtime_outbox(limit)
+    let ingress_poison = state
+        .services
+        .session
+        .blocked_runtime_inputs(limit)
         .await
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let runtime = state.services.runtime.as_ref().ok_or_else(|| {
@@ -531,31 +529,19 @@ async fn retry_runtime_outbox(
     }
     let actor = principal.0.claims().principal_id.clone();
     let record = match direction.as_str() {
-        "ingress" => {
-            let store = state.services.session.unified_store().ok_or_else(|| {
-                runtime_event_error(StatusCode::SERVICE_UNAVAILABLE, "session store unavailable")
-            })?;
-            let current = store
-                .get_session_runtime_outbox(&id)
+        "ingress" => serde_json::to_value(
+            state
+                .services
+                .session
+                .retry_blocked_runtime_input(
+                    &id,
+                    request.expected_revision,
+                    &actor,
+                    request.reason.trim(),
+                )
                 .await
-                .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
-                .ok_or_else(|| {
-                    runtime_event_error(StatusCode::NOT_FOUND, "outbox item not found")
-                })?;
-            let expected_revision = request.expected_revision.unwrap_or(current.revision);
-            serde_json::to_value(
-                store
-                    .retry_blocked_session_runtime_outbox(
-                        &id,
-                        expected_revision,
-                        &actor,
-                        request.reason.trim(),
-                        now_ms(),
-                    )
-                    .await
-                    .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?,
-            )
-        }
+                .map_err(|error| runtime_event_error(StatusCode::CONFLICT, error))?,
+        ),
         "terminal" => {
             let runtime = state.services.runtime.as_ref().ok_or_else(|| {
                 runtime_event_error(
@@ -617,12 +603,112 @@ async fn get_runtime_source_repair_plan(AxumState(state): AxumState<Arc<AppState
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RuntimeTimelineParams {
     session_id: String,
     #[serde(default)]
-    from_seq: Option<usize>,
+    cursor: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RuntimeTimelineRuntimePosition {
+    commit_cursor: u64,
+    transaction_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RuntimeTimelineCursor {
+    session_position: usize,
+    runtime_position: Option<RuntimeTimelineRuntimePosition>,
+}
+
+impl RuntimeTimelineCursor {
+    const VERSION: &'static str = "v2";
+
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        let mut parts = value.split(':');
+        let version = parts.next().unwrap_or_default();
+        let session_position = parts
+            .next()
+            .ok_or_else(|| "timeline cursor is missing session position".to_string())?
+            .parse::<usize>()
+            .map_err(|_| "timeline cursor has invalid session position".to_string())?;
+        let runtime_commit_cursor = parts
+            .next()
+            .ok_or_else(|| "timeline cursor is missing runtime commit cursor".to_string())?;
+        let runtime_transaction_index = parts
+            .next()
+            .ok_or_else(|| "timeline cursor is missing runtime transaction index".to_string())?;
+        if version != Self::VERSION || parts.next().is_some() {
+            return Err("unsupported runtime timeline cursor".to_string());
+        }
+        let runtime_position = match (runtime_commit_cursor, runtime_transaction_index) {
+            ("-", "-") => None,
+            ("-", _) | (_, "-") => {
+                return Err("timeline cursor has an incomplete runtime position".to_string());
+            }
+            (commit_cursor, transaction_index) => Some(RuntimeTimelineRuntimePosition {
+                commit_cursor: commit_cursor
+                    .parse::<u64>()
+                    .map_err(|_| "timeline cursor has invalid runtime commit cursor".to_string())?,
+                transaction_index: transaction_index.parse::<u32>().map_err(|_| {
+                    "timeline cursor has invalid runtime transaction index".to_string()
+                })?,
+            }),
+        };
+        Ok(Self {
+            session_position,
+            runtime_position,
+        })
+    }
+
+    fn encode(self) -> String {
+        match self.runtime_position {
+            Some(runtime) => format!(
+                "{}:{}:{}:{}",
+                Self::VERSION,
+                self.session_position,
+                runtime.commit_cursor,
+                runtime.transaction_index
+            ),
+            None => format!("{}:{}:-:-", Self::VERSION, self.session_position),
+        }
+    }
+}
+
+#[cfg(test)]
+mod timeline_cursor_tests {
+    use super::{RuntimeTimelineCursor, RuntimeTimelineRuntimePosition};
+
+    #[test]
+    fn cursor_roundtrips_runtime_transaction_position() {
+        let cursor = RuntimeTimelineCursor {
+            session_position: 17,
+            runtime_position: Some(RuntimeTimelineRuntimePosition {
+                commit_cursor: 41,
+                transaction_index: 3,
+            }),
+        };
+
+        let encoded = cursor.encode();
+        assert_eq!(encoded, "v2:17:41:3");
+        assert_eq!(
+            RuntimeTimelineCursor::parse(Some(&encoded)).expect("cursor parses"),
+            cursor
+        );
+    }
+
+    #[test]
+    fn cursor_rejects_old_or_incomplete_runtime_positions() {
+        assert!(RuntimeTimelineCursor::parse(Some("v1:17:41")).is_err());
+        assert!(RuntimeTimelineCursor::parse(Some("v2:17:41:-")).is_err());
+        assert!(RuntimeTimelineCursor::parse(Some("v2:17:-:3")).is_err());
+    }
 }
 
 #[derive(Deserialize)]
@@ -1328,13 +1414,15 @@ pub(super) async fn get_runtime_timeline(
     AxumState(state): AxumState<Arc<AppState>>,
     Query(params): Query<RuntimeTimelineParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let from_seq = params.from_seq.unwrap_or(0);
+    let cursor = RuntimeTimelineCursor::parse(params.cursor.as_deref())
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
     let limit = params.limit.unwrap_or(100).min(500);
+    let source_limit = limit.saturating_add(1);
     let agent_policy = load_agent_control_policy(&state);
     let page = state
         .services
         .session
-        .stored_timeline_runtime_page(&params.session_id, from_seq, limit)
+        .stored_timeline_runtime_page(&params.session_id, cursor.session_position, source_limit)
         .await
         .map_err(|e| {
             (
@@ -1346,11 +1434,10 @@ pub(super) async fn get_runtime_timeline(
         })?;
 
     let session_store_available = page.is_some();
-    let (domain_total, domain_next_seq, domain_has_more, mut events) = page
+    let (domain_total, domain_has_more, mut events) = page
         .map(|page| {
             (
                 page.total,
-                page.next_seq,
                 page.has_more,
                 page.events
                     .into_iter()
@@ -1358,15 +1445,36 @@ pub(super) async fn get_runtime_timeline(
                     .collect::<Vec<_>>(),
             )
         })
-        .unwrap_or((0, None, false, Vec::new()));
+        .unwrap_or((0, false, Vec::new()));
     let lifecycle_events = state
         .services
         .runtime_events
-        .session_timeline_events(&params.session_id, from_seq as u64, limit)
+        .session_timeline_events(
+            &params.session_id,
+            cursor
+                .runtime_position
+                .map(|position| (position.commit_cursor, position.transaction_index)),
+            source_limit,
+        )
         .map_err(|error| runtime_event_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
     let lifecycle_total = lifecycle_events.len();
     events.extend(lifecycle_events.into_iter().map(RuntimeEvent::from));
-    events.sort_by_key(|event| (event.created_at_ms, event.sequence));
+    events.sort_by(|left, right| {
+        (
+            left.created_at_ms,
+            left.source,
+            left.commit_cursor.unwrap_or(left.sequence),
+            left.transaction_index.unwrap_or_default(),
+            left.sequence,
+        )
+            .cmp(&(
+                right.created_at_ms,
+                right.source,
+                right.commit_cursor.unwrap_or(right.sequence),
+                right.transaction_index.unwrap_or_default(),
+                right.sequence,
+            ))
+    });
     events.dedup_by(|left, right| {
         left.source == right.source
             && left.stream_id == right.stream_id
@@ -1376,6 +1484,33 @@ pub(super) async fn get_runtime_timeline(
     let combined_total = domain_total + lifecycle_total;
     let combined_has_more = domain_has_more || events.len() > limit;
     events.truncate(limit);
+    let mut next_cursor = cursor;
+    for event in &events {
+        match event.source {
+            "session_domain" => {
+                next_cursor.session_position = next_cursor
+                    .session_position
+                    .max(event.sequence.saturating_add(1) as usize);
+            }
+            "runtime_lifecycle" => {
+                if let (Some(commit_cursor), Some(transaction_index)) =
+                    (event.commit_cursor, event.transaction_index)
+                {
+                    let position = RuntimeTimelineRuntimePosition {
+                        commit_cursor,
+                        transaction_index,
+                    };
+                    next_cursor.runtime_position = Some(
+                        next_cursor
+                            .runtime_position
+                            .map_or(position, |current| current.max(position)),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let next_cursor = (!events.is_empty()).then(|| next_cursor.encode());
 
     let execution_graph_summary = execution_graph_summary(&events);
     let degraded_reason = (!session_store_available).then_some("session store not available");
@@ -1388,8 +1523,15 @@ pub(super) async fn get_runtime_timeline(
         "session_id": params.session_id,
         "events": events,
         "total": combined_total,
-        "from_seq": from_seq,
-        "next_seq": domain_next_seq,
+        "cursor": params.cursor,
+        "next_cursor": next_cursor,
+        "source_positions": {
+            "session": cursor.session_position,
+            "runtime": cursor.runtime_position.map(|position| serde_json::json!({
+                "commit_cursor": position.commit_cursor,
+                "transaction_index": position.transaction_index,
+            })),
+        },
         "limit": limit,
         "has_more": combined_has_more,
         "degraded": !session_store_available,

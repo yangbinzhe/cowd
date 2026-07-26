@@ -1,16 +1,18 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use chrono::Utc;
 use futures::{stream, StreamExt};
-use memory::{
+use runtime::session_lifecycle::SessionWorkingSetManager;
+use session::{
     SessionMissionOutboxOperation, SessionMissionOutboxRequest, SessionRecord,
     SessionRecoveryManifest, SessionRecoverySignal,
 };
-use runtime::session_lifecycle::SessionLifecycleManager;
 use tokio::sync::Mutex;
 
 use crate::runtime_service::RuntimeService;
+use crate::services::session_service::presence::SessionPresenceLedger;
+use crate::services::session_service::repository::SessionRepository;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionSource {
@@ -109,6 +111,13 @@ pub(crate) struct EnsureSessionOutcome {
     pub(crate) record: SessionRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionActivationIntent {
+    CreateNew,
+    Ensure,
+    ExistingOnly,
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct SessionRecoverySummary {
     pub(crate) discovered: usize,
@@ -146,7 +155,10 @@ pub(crate) struct SessionWorkingSetEntry {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct SessionWorkingSetProjection {
     pub(crate) hot_bytes: u64,
+    pub(crate) reserved_bytes: u64,
+    pub(crate) evicting_bytes: u64,
     pub(crate) byte_budget: u64,
+    pub(crate) concurrent_hydrations: usize,
     pub(crate) metadata_loaded: usize,
     pub(crate) hydrating: usize,
     pub(crate) ready: usize,
@@ -157,33 +169,50 @@ pub(crate) struct SessionWorkingSetProjection {
 #[derive(Default)]
 struct WorkingSetState {
     hot_bytes: u64,
+    reserved_bytes: u64,
+    evicting_bytes: u64,
+    concurrent_hydrations: usize,
     entries: HashMap<String, SessionWorkingSetEntry>,
 }
 
 /// Exclusive coordinator for durable Session identity and process-local Runtime state.
 ///
-/// RuntimeService remains the low-level Runtime factory/cache. SessionKernel remains
+/// RuntimeService remains the low-level Runtime factory/cache. SessionRepository remains
 /// the durable store boundary. Callers must use this manager so those resources and
 /// both lifecycle projections change as one operation.
-pub(crate) struct UnifiedSessionManager {
+pub(crate) struct SessionActivationCoordinator {
     runtime: Arc<RuntimeService>,
-    resource_lifecycle: Arc<SessionLifecycleManager>,
-    session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    repository: Arc<SessionRepository>,
+    presence_ledger: Arc<SessionPresenceLedger>,
+    resource_lifecycle: Arc<SessionWorkingSetManager>,
+    session_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     working_set: Mutex<WorkingSetState>,
     max_active_sessions: usize,
     recovery: runtime::SessionRecoveryConfig,
 }
 
-impl UnifiedSessionManager {
+impl SessionActivationCoordinator {
+    pub(crate) async fn activate_existing(
+        &self,
+        request: EnsureSessionRequest,
+    ) -> Result<EnsureSessionOutcome, String> {
+        self.activate(request, SessionActivationIntent::ExistingOnly)
+            .await
+    }
+
     #[must_use]
     pub(crate) fn new(
         runtime: Arc<RuntimeService>,
-        resource_lifecycle: Arc<SessionLifecycleManager>,
+        repository: Arc<SessionRepository>,
+        presence_ledger: Arc<SessionPresenceLedger>,
+        resource_lifecycle: Arc<SessionWorkingSetManager>,
         max_active_sessions: usize,
         recovery: runtime::SessionRecoveryConfig,
     ) -> Self {
         Self {
             runtime,
+            repository,
+            presence_ledger,
             resource_lifecycle,
             session_locks: Mutex::new(HashMap::new()),
             working_set: Mutex::new(WorkingSetState::default()),
@@ -192,12 +221,31 @@ impl UnifiedSessionManager {
         }
     }
 
+    #[cfg(test)]
+    async fn activate_for_test(
+        &self,
+        request: EnsureSessionRequest,
+    ) -> Result<EnsureSessionOutcome, String> {
+        self.activate(request, SessionActivationIntent::Ensure)
+            .await
+    }
+
     async fn lock_for(&self, session_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.session_locks.lock().await;
-        locks
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    pub(super) async fn acquire_exclusive(
+        &self,
+        session_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.lock_for(session_id).await.lock_owned().await
     }
 
     async fn register_manifest_metadata(
@@ -233,12 +281,34 @@ impl UnifiedSessionManager {
         );
     }
 
-    async fn begin_hydration(&self, session_id: &str, manifest: &SessionRecoveryManifest) {
+    async fn begin_hydration(
+        &self,
+        session_id: &str,
+        manifest: &SessionRecoveryManifest,
+    ) -> Result<(), String> {
         self.register_manifest_metadata(manifest, []).await;
-        let victims = {
+        let requested = manifest.transcript_bytes;
+        let budget = self.recovery.hot_bytes as u64;
+        if requested > budget {
+            return Err(format!(
+                "session {session_id} requires {requested} hot bytes, exceeding the configured {budget}-byte working-set budget"
+            ));
+        }
+        loop {
             let mut state = self.working_set.lock().await;
-            let requested = manifest.transcript_bytes;
-            let budget = self.recovery.hot_bytes as u64;
+            let projected = state
+                .hot_bytes
+                .saturating_add(state.reserved_bytes)
+                .saturating_add(requested);
+            if projected <= budget {
+                if let Some(entry) = state.entries.get_mut(session_id) {
+                    entry.status = SessionHydrationStatus::Hydrating;
+                    entry.last_error = None;
+                }
+                state.reserved_bytes = state.reserved_bytes.saturating_add(requested);
+                state.concurrent_hydrations = state.concurrent_hydrations.saturating_add(1);
+                return Ok(());
+            }
             let mut candidates = state
                 .entries
                 .values()
@@ -247,71 +317,109 @@ impl UnifiedSessionManager {
                         && entry.status == SessionHydrationStatus::Ready
                         && entry.pin_reasons.is_empty()
                 })
-                .map(|entry| {
-                    (
-                        entry.last_activity_ms,
-                        entry.session_id.clone(),
-                        entry.transcript_bytes,
-                    )
-                })
+                .map(|entry| (entry.last_activity_ms, entry.session_id.clone()))
                 .collect::<Vec<_>>();
-            candidates.sort_by_key(|candidate| (candidate.0, candidate.1.clone()));
-            let mut victims = Vec::new();
-            let mut projected = state.hot_bytes.saturating_add(requested);
-            for (_, victim, bytes) in candidates {
-                if projected <= budget {
+            candidates.sort();
+            drop(state);
+            if candidates.is_empty() {
+                return Err(format!(
+                    "session {session_id} cannot reserve {requested} hot bytes because all remaining Runtime carriers are pinned"
+                ));
+            }
+            let mut evicted = false;
+            for (_, candidate) in &candidates {
+                if self.try_evict_under_keyed_gate(candidate).await {
+                    evicted = true;
                     break;
                 }
-                projected = projected.saturating_sub(bytes);
-                victims.push(victim);
             }
-            for victim in &victims {
-                let bytes = state
-                    .entries
-                    .get(victim)
-                    .map_or(0, |entry| entry.transcript_bytes);
-                state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
-                if let Some(entry) = state.entries.get_mut(victim) {
-                    entry.status = SessionHydrationStatus::MetadataLoaded;
-                    entry.last_error = None;
-                }
+            if !evicted {
+                return Err(format!(
+                    "session {session_id} cannot reserve {requested} hot bytes because every eviction candidate is executing"
+                ));
             }
-            if let Some(entry) = state.entries.get_mut(session_id) {
-                entry.status = SessionHydrationStatus::Hydrating;
-                entry.last_error = None;
-            }
-            victims
-        };
-        for victim in victims {
-            self.runtime.remove_active_runtime_if_present(&victim);
-            self.resource_lifecycle.unregister(&victim).await;
-            tracing::info!(
-                session_id = victim,
-                "evicted unpinned hot Runtime carrier under byte budget"
-            );
         }
     }
 
-    async fn finish_hydration(&self, session_id: &str, result: Result<(), &str>) {
+    async fn try_evict_under_keyed_gate(&self, session_id: &str) -> bool {
+        let lock = self.lock_for(session_id).await;
+        let Ok(_guard) = lock.try_lock_owned() else {
+            return false;
+        };
+        let victim_bytes = {
+            let mut state = self.working_set.lock().await;
+            let Some(entry) = state.entries.get(session_id) else {
+                return false;
+            };
+            if entry.status != SessionHydrationStatus::Ready || !entry.pin_reasons.is_empty() {
+                return false;
+            }
+            let bytes = entry.transcript_bytes;
+            state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
+            state.evicting_bytes = state.evicting_bytes.saturating_add(bytes);
+            if let Some(entry) = state.entries.get_mut(session_id) {
+                entry.status = SessionHydrationStatus::MetadataLoaded;
+                entry.last_error = None;
+            }
+            bytes
+        };
+        self.runtime
+            .remove_active_runtime_if_present(session_id)
+            .await;
+        self.resource_lifecycle.unregister(session_id).await;
+        let mut state = self.working_set.lock().await;
+        state.evicting_bytes = state.evicting_bytes.saturating_sub(victim_bytes);
+        drop(state);
+        tracing::info!(
+            session_id,
+            "evicted unpinned hot Runtime carrier under keyed working-set gate"
+        );
+        true
+    }
+
+    async fn finish_hydration(
+        &self,
+        session_id: &str,
+        actual_bytes: u64,
+        result: Result<(), &str>,
+    ) -> Result<(), String> {
         let mut state = self.working_set.lock().await;
         let previous = state.entries.get(session_id).map(|entry| entry.status);
-        let bytes = state
+        let reserved_bytes = state
             .entries
             .get(session_id)
             .map_or(0, |entry| entry.transcript_bytes);
+        if previous == Some(SessionHydrationStatus::Hydrating) {
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(reserved_bytes);
+            state.concurrent_hydrations = state.concurrent_hydrations.saturating_sub(1);
+        }
         match result {
             Ok(()) => {
+                let budget = self.recovery.hot_bytes as u64;
+                let projected = state.hot_bytes.saturating_add(actual_bytes);
+                if previous == Some(SessionHydrationStatus::Hydrating) && projected > budget {
+                    let error = format!(
+                        "session {session_id} hydrated to {actual_bytes} bytes and would exceed the {budget}-byte working-set budget"
+                    );
+                    if let Some(entry) = state.entries.get_mut(session_id) {
+                        entry.status = SessionHydrationStatus::Degraded;
+                        entry.transcript_bytes = actual_bytes;
+                        entry.last_error = Some(error.clone());
+                    }
+                    return Err(error);
+                }
                 if previous != Some(SessionHydrationStatus::Ready) {
-                    state.hot_bytes = state.hot_bytes.saturating_add(bytes);
+                    state.hot_bytes = state.hot_bytes.saturating_add(actual_bytes);
                 }
                 if let Some(entry) = state.entries.get_mut(session_id) {
                     entry.status = SessionHydrationStatus::Ready;
+                    entry.transcript_bytes = actual_bytes;
                     entry.last_error = None;
                 }
             }
             Err(error) => {
                 if previous == Some(SessionHydrationStatus::Ready) {
-                    state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
+                    state.hot_bytes = state.hot_bytes.saturating_sub(reserved_bytes);
                 }
                 if let Some(entry) = state.entries.get_mut(session_id) {
                     entry.status = SessionHydrationStatus::Degraded;
@@ -319,6 +427,16 @@ impl UnifiedSessionManager {
                 }
             }
         }
+        Ok(())
+    }
+
+    async fn actual_hydration_bytes(&self, session_id: &str, fallback: u64) -> u64 {
+        self.repository
+            .stored_recovery_manifest(session_id)
+            .await
+            .ok()
+            .flatten()
+            .map_or(fallback, |manifest| manifest.transcript_bytes)
     }
 
     async fn mark_metadata_only(&self, session_id: &str) {
@@ -328,7 +446,16 @@ impl UnifiedSessionManager {
             .get(session_id)
             .filter(|entry| entry.status == SessionHydrationStatus::Ready)
             .map_or(0, |entry| entry.transcript_bytes);
+        let reserved = state
+            .entries
+            .get(session_id)
+            .filter(|entry| entry.status == SessionHydrationStatus::Hydrating)
+            .map_or(0, |entry| entry.transcript_bytes);
         state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(reserved);
+        if reserved > 0 {
+            state.concurrent_hydrations = state.concurrent_hydrations.saturating_sub(1);
+        }
         if let Some(entry) = state.entries.get_mut(session_id) {
             entry.status = SessionHydrationStatus::MetadataLoaded;
             entry.last_error = None;
@@ -339,7 +466,10 @@ impl UnifiedSessionManager {
         let state = self.working_set.lock().await;
         let mut projection = SessionWorkingSetProjection {
             hot_bytes: state.hot_bytes,
+            reserved_bytes: state.reserved_bytes,
+            evicting_bytes: state.evicting_bytes,
             byte_budget: self.recovery.hot_bytes as u64,
+            concurrent_hydrations: state.concurrent_hydrations,
             ..SessionWorkingSetProjection::default()
         };
         projection.entries = state.entries.values().cloned().collect();
@@ -390,19 +520,15 @@ impl UnifiedSessionManager {
             .cloned()
             .collect::<Vec<_>>();
         for session_id in session_ids {
-            let Ok(Some(mut manifest)) = self
-                .runtime
-                .session_kernel()
-                .stored_recovery_manifest(&session_id)
-                .await
+            let Ok(Some(mut manifest)) =
+                self.repository.stored_recovery_manifest(&session_id).await
             else {
                 continue;
             };
             let pending_approval = pending.contains(&session_id);
             if manifest.pending_approval != pending_approval {
                 if let Ok(Some(updated)) = self
-                    .runtime
-                    .session_kernel()
+                    .repository
                     .set_recovery_signal(
                         &session_id,
                         SessionRecoverySignal::PendingApproval,
@@ -416,8 +542,7 @@ impl UnifiedSessionManager {
             }
             if continuations.contains(&session_id) && !manifest.mission_agent_team_continuation {
                 if let Ok(Some(updated)) = self
-                    .runtime
-                    .session_kernel()
+                    .repository
                     .set_recovery_signal(
                         &session_id,
                         SessionRecoverySignal::MissionAgentTeamContinuation,
@@ -448,9 +573,9 @@ impl UnifiedSessionManager {
     }
 
     async fn evict_one_unpinned_for_capacity(&self, exclude: &str) -> Option<String> {
-        let victim = {
-            let mut state = self.working_set.lock().await;
-            let victim = state
+        let candidates = {
+            let state = self.working_set.lock().await;
+            let mut candidates = state
                 .entries
                 .values()
                 .filter(|entry| {
@@ -458,26 +583,23 @@ impl UnifiedSessionManager {
                         && entry.status == SessionHydrationStatus::Ready
                         && entry.pin_reasons.is_empty()
                 })
-                .min_by_key(|entry| (entry.last_activity_ms, entry.session_id.clone()))
-                .map(|entry| entry.session_id.clone())?;
-            let bytes = state
-                .entries
-                .get(&victim)
-                .map_or(0, |entry| entry.transcript_bytes);
-            state.hot_bytes = state.hot_bytes.saturating_sub(bytes);
-            if let Some(entry) = state.entries.get_mut(&victim) {
-                entry.status = SessionHydrationStatus::MetadataLoaded;
-            }
-            victim
+                .map(|entry| (entry.last_activity_ms, entry.session_id.clone()))
+                .collect::<Vec<_>>();
+            candidates.sort();
+            candidates
         };
-        self.runtime.remove_active_runtime_if_present(&victim);
-        self.resource_lifecycle.unregister(&victim).await;
-        Some(victim)
+        for (_, candidate) in candidates {
+            if self.try_evict_under_keyed_gate(&candidate).await {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
-    pub(crate) async fn ensure_session(
+    pub(super) async fn activate(
         &self,
         request: EnsureSessionRequest,
+        intent: SessionActivationIntent,
     ) -> Result<EnsureSessionOutcome, String> {
         let session_id = request.session_id.trim();
         if session_id.is_empty() {
@@ -485,11 +607,31 @@ impl UnifiedSessionManager {
         }
         let lock = self.lock_for(session_id).await;
         let _guard = lock.lock().await;
-        let session_kernel = self.runtime.session_kernel();
-        let mut existing = session_kernel
+        let session_repository = &self.repository;
+        let mut existing = session_repository
             .stored_session(session_id)
             .await
             .map_err(|error| error.to_string())?;
+        match (intent, existing.is_some()) {
+            (SessionActivationIntent::CreateNew, true) => {
+                return Err(format!("session {session_id} already exists"));
+            }
+            (SessionActivationIntent::ExistingOnly, false) => {
+                return Err(format!("session {session_id} not found"));
+            }
+            _ => {}
+        }
+        if let Some(record) = existing.as_ref() {
+            if matches!(
+                record.status.as_str(),
+                "archiving" | "archived" | "deleting" | "deleted"
+            ) {
+                return Err(format!(
+                    "session {session_id} cannot be activated from terminal lifecycle state {}",
+                    record.status
+                ));
+            }
+        }
         if let Some(requested_owner) = request.owner_principal_id.as_deref() {
             if let Some(record) = existing.as_mut() {
                 let existing_owner = record
@@ -536,7 +678,7 @@ impl UnifiedSessionManager {
                         }),
                     );
                     record.metadata_json = Some(serde_json::Value::Object(metadata).to_string());
-                    session_kernel
+                    session_repository
                         .update_stored_session(record)
                         .await
                         .map_err(|error| error.to_string())?;
@@ -551,12 +693,7 @@ impl UnifiedSessionManager {
                 Some(record) => record,
                 None => {
                     let record = self.persist_new_record(&request).await?;
-                    if let Err(error) = self
-                        .runtime
-                        .lifecycle_kernel()
-                        .mark_active(session_id)
-                        .await
-                    {
+                    if let Err(error) = self.presence_ledger.mark_active(session_id).await {
                         return Err(self
                             .rollback_created_session(&record, error.to_string())
                             .await);
@@ -565,14 +702,25 @@ impl UnifiedSessionManager {
                 }
             };
             let manifest = self
-                .runtime
-                .session_kernel()
+                .repository
                 .stored_recovery_manifest(session_id)
                 .await
                 .map_err(|error| error.to_string())?
                 .unwrap_or_else(|| manifest_from_record(&record));
             self.register_manifest_metadata(&manifest, []).await;
-            self.finish_hydration(session_id, Ok(())).await;
+            let actual_bytes = self
+                .actual_hydration_bytes(session_id, manifest.transcript_bytes)
+                .await;
+            if let Err(error) = self
+                .finish_hydration(session_id, actual_bytes, Ok(()))
+                .await
+            {
+                self.runtime
+                    .remove_active_runtime_if_present(session_id)
+                    .await;
+                self.resource_lifecycle.unregister(session_id).await;
+                return Err(error);
+            }
             return Ok(EnsureSessionOutcome {
                 session_id: session_id.to_string(),
                 model: record
@@ -586,7 +734,7 @@ impl UnifiedSessionManager {
         }
 
         if existing.is_none()
-            && session_kernel.list_active_session_ids().len() >= self.max_active_sessions
+            && session_repository.list_active_session_ids().len() >= self.max_active_sessions
         {
             self.refresh_working_set_signals().await;
             self.evict_one_unpinned_for_capacity(session_id)
@@ -604,14 +752,7 @@ impl UnifiedSessionManager {
             Some(record) => record,
             None => self.persist_new_record(&request).await?,
         };
-        if !created
-            && self
-                .runtime
-                .session_kernel()
-                .list_active_session_ids()
-                .len()
-                >= self.max_active_sessions
-        {
+        if !created && self.repository.list_active_session_ids().len() >= self.max_active_sessions {
             self.refresh_working_set_signals().await;
             let victim = self
                 .evict_one_unpinned_for_capacity(session_id)
@@ -636,13 +777,17 @@ impl UnifiedSessionManager {
             .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
 
         let manifest = self
-            .runtime
-            .session_kernel()
+            .repository
             .stored_recovery_manifest(session_id)
             .await
             .map_err(|error| error.to_string())?
             .unwrap_or_else(|| manifest_from_record(&record));
-        self.begin_hydration(session_id, &manifest).await;
+        if let Err(error) = self.begin_hydration(session_id, &manifest).await {
+            if created {
+                return Err(self.rollback_created_session(&record, error).await);
+            }
+            return Err(error);
+        }
         if let Err(error) = self
             .runtime
             .activate_persisted_session(
@@ -653,15 +798,31 @@ impl UnifiedSessionManager {
             )
             .await
         {
-            self.finish_hydration(session_id, Err(&error)).await;
+            let _ = self.finish_hydration(session_id, 0, Err(&error)).await;
             if created {
                 return Err(self.rollback_created_session(&record, error).await);
             }
             return Err(error);
         }
-        self.finish_hydration(session_id, Ok(())).await;
+        let actual_bytes = self
+            .actual_hydration_bytes(session_id, manifest.transcript_bytes)
+            .await;
+        if let Err(error) = self
+            .finish_hydration(session_id, actual_bytes, Ok(()))
+            .await
+        {
+            self.runtime
+                .remove_active_runtime_if_present(session_id)
+                .await;
+            if created {
+                return Err(self.rollback_created_session(&record, error).await);
+            }
+            return Err(error);
+        }
         if let Err(error) = self.register_lifecycle(session_id, !created).await {
-            self.runtime.remove_active_runtime_if_present(session_id);
+            self.runtime
+                .remove_active_runtime_if_present(session_id)
+                .await;
             self.mark_metadata_only(session_id).await;
             self.resource_lifecycle.unregister(session_id).await;
             if created {
@@ -756,8 +917,7 @@ impl UnifiedSessionManager {
             operation: request.mission_operation,
             created_at_ms: current_time_ms(),
         };
-        self.runtime
-            .session_kernel()
+        self.repository
             .upsert_stored_session_with_mission_outbox(&record, &outbox)
             .await
             .map_err(|error| error.to_string())?;
@@ -798,8 +958,7 @@ impl UnifiedSessionManager {
     async fn rollback_created_session(&self, record: &SessionRecord, cause: String) -> String {
         let close = self.close_outbox_request(record);
         match self
-            .runtime
-            .session_kernel()
+            .repository
             .delete_stored_session_with_mission_outbox(&close)
             .await
         {
@@ -814,8 +973,7 @@ impl UnifiedSessionManager {
     async fn register_lifecycle(&self, session_id: &str, restored: bool) -> Result<(), String> {
         self.resource_lifecycle.register(session_id).await;
         self.resource_lifecycle.mark_active(session_id).await;
-        self.runtime
-            .lifecycle_kernel()
+        self.presence_ledger
             .mark_active(session_id)
             .await
             .map_err(|error| {
@@ -833,37 +991,17 @@ impl UnifiedSessionManager {
     pub(crate) async fn unload_runtime(&self, session_id: &str) -> bool {
         let lock = self.lock_for(session_id).await;
         let _guard = lock.lock().await;
-        let removed = self.runtime.remove_active_runtime_if_present(session_id);
+        self.unload_runtime_under_guard(session_id).await
+    }
+
+    pub(super) async fn unload_runtime_under_guard(&self, session_id: &str) -> bool {
+        let removed = self
+            .runtime
+            .remove_active_runtime_if_present(session_id)
+            .await;
         self.resource_lifecycle.unregister(session_id).await;
         self.mark_metadata_only(session_id).await;
         removed
-    }
-
-    pub(crate) async fn delete_session(&self, session_id: &str) -> Result<bool, String> {
-        let lock = self.lock_for(session_id).await;
-        let _guard = lock.lock().await;
-        let session_kernel = self.runtime.session_kernel();
-        let record = session_kernel
-            .stored_session(session_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let removed_active = self.runtime.remove_active_runtime_if_present(session_id);
-        self.resource_lifecycle.unregister(session_id).await;
-        let Some(record) = record else {
-            return Ok(removed_active);
-        };
-        let request = self.close_outbox_request(&record);
-        session_kernel
-            .delete_stored_session_with_mission_outbox(&request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut state = self.working_set.lock().await;
-        if let Some(entry) = state.entries.remove(session_id) {
-            if entry.status == SessionHydrationStatus::Ready {
-                state.hot_bytes = state.hot_bytes.saturating_sub(entry.transcript_bytes);
-            }
-        }
-        Ok(true)
     }
 
     pub(crate) async fn recover_active_sessions(&self) -> SessionRecoverySummary {
@@ -873,8 +1011,7 @@ impl UnifiedSessionManager {
         let page_size = self.recovery.manifest_page_size;
         loop {
             let page = match self
-                .runtime
-                .session_kernel()
+                .repository
                 .active_recovery_manifests(offset, page_size)
                 .await
             {
@@ -917,8 +1054,7 @@ impl UnifiedSessionManager {
             let pending_approval = pending_approval_sessions.contains(&manifest.session_id);
             if manifest.pending_approval != pending_approval {
                 match self
-                    .runtime
-                    .session_kernel()
+                    .repository
                     .set_recovery_signal(
                         &manifest.session_id,
                         SessionRecoverySignal::PendingApproval,
@@ -942,8 +1078,7 @@ impl UnifiedSessionManager {
                 && !manifest.mission_agent_team_continuation
             {
                 match self
-                    .runtime
-                    .session_kernel()
+                    .repository
                     .set_recovery_signal(
                         &manifest.session_id,
                         SessionRecoverySignal::MissionAgentTeamContinuation,
@@ -1028,7 +1163,9 @@ impl UnifiedSessionManager {
                 let was_active = self.runtime.has_active_session(&manifest.session_id);
                 let request =
                     EnsureSessionRequest::new(&manifest.session_id, None, SessionSource::Internal);
-                let result = self.ensure_session(request).await;
+                let result = self
+                    .activate(request, SessionActivationIntent::ExistingOnly)
+                    .await;
                 (manifest.session_id, was_active, result)
             })
             .buffer_unordered(self.recovery.hydrate_concurrency)
@@ -1089,18 +1226,15 @@ impl UnifiedSessionManager {
     pub(crate) fn runtime(&self) -> &Arc<RuntimeService> {
         &self.runtime
     }
-}
 
-#[async_trait::async_trait]
-impl crate::runtime_service::SessionActivationPort for UnifiedSessionManager {
-    async fn activate(&self, session_id: &str) -> Result<(), String> {
-        self.ensure_session(EnsureSessionRequest::new(
-            session_id,
-            None,
-            SessionSource::Internal,
-        ))
-        .await
-        .map(|_| ())
+    #[must_use]
+    pub(super) fn repository(&self) -> Arc<SessionRepository> {
+        Arc::clone(&self.repository)
+    }
+
+    #[must_use]
+    pub(super) fn presence_ledger(&self) -> Arc<SessionPresenceLedger> {
+        Arc::clone(&self.presence_ledger)
     }
 }
 
@@ -1147,10 +1281,10 @@ fn manifest_from_record(record: &SessionRecord) -> SessionRecoveryManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_bus::SessionEventBus;
-    use crate::gateway::ActiveSessions;
-    use crate::session_kernel::SessionKernel;
-    use crate::session_lifecycle_kernel::SessionLifecycleKernel;
+    use crate::event_bus::SessionProjectionHub;
+    use crate::gateway::HotSessionPool;
+    use crate::services::session_service::presence::SessionPresenceLedger;
+    use crate::services::session_service::repository::SessionRepository;
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
 
     fn test_provider_registry() -> Arc<runtime::ProviderRegistry> {
@@ -1174,10 +1308,10 @@ mod tests {
     fn test_manager(
         max_active_sessions: usize,
     ) -> (
-        Arc<UnifiedSessionManager>,
-        Arc<memory::UnifiedSessionStore>,
-        Arc<ActiveSessions>,
-        Arc<SessionLifecycleManager>,
+        Arc<SessionActivationCoordinator>,
+        Arc<session::UnifiedSessionStore>,
+        Arc<HotSessionPool>,
+        Arc<SessionWorkingSetManager>,
     ) {
         test_manager_with_limits(max_active_sessions, max_active_sessions)
     }
@@ -1186,32 +1320,41 @@ mod tests {
         runtime_max_active_sessions: usize,
         manager_max_active_sessions: usize,
     ) -> (
-        Arc<UnifiedSessionManager>,
-        Arc<memory::UnifiedSessionStore>,
-        Arc<ActiveSessions>,
-        Arc<SessionLifecycleManager>,
+        Arc<SessionActivationCoordinator>,
+        Arc<session::UnifiedSessionStore>,
+        Arc<HotSessionPool>,
+        Arc<SessionWorkingSetManager>,
     ) {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let active = Arc::new(ActiveSessions::with_max_sessions(
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let active = Arc::new(HotSessionPool::with_max_sessions(
             runtime_max_active_sessions,
         ));
-        let event_bus = SessionEventBus::new();
-        let session_kernel = Arc::new(SessionKernel::new(
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = Arc::new(SessionRepository::new(
             Arc::clone(&active),
             Some(Arc::clone(&store)),
-            event_bus,
+            Arc::clone(&event_bus),
         ));
-        let lifecycle_kernel = Arc::new(SessionLifecycleKernel::with_store(Arc::clone(&store)));
+        let presence_ledger = Arc::new(SessionPresenceLedger::with_store(Arc::clone(&store)));
         let runtime_services = runtime::RuntimeServices::in_memory().unwrap();
+        let session_runtime_port =
+            crate::session_runtime_data_port::GatewaySessionRuntimePort::new_for_test(
+                Arc::clone(&session_repository),
+                Arc::clone(&presence_ledger),
+            );
         runtime_services
-            .install_session_store(Arc::clone(&store))
+            .install_session_ports(
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+            )
             .unwrap();
         let runtime = Arc::new(
             RuntimeService::new(
                 Arc::clone(&active),
                 Arc::new(session::SessionLeaseRegistry::default()),
-                session_kernel,
-                lifecycle_kernel,
+                session_runtime_port,
+                event_bus,
                 std::time::Instant::now(),
                 test_provider_registry(),
                 Arc::new(runtime::UpgradeCoordinator::new()),
@@ -1219,7 +1362,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let resource_lifecycle = Arc::new(SessionLifecycleManager::new(
+        let resource_lifecycle = Arc::new(SessionWorkingSetManager::new(
             runtime::session_lifecycle::SessionLifecycleConfig::default(),
         ));
         let recovery = runtime::SessionRecoveryConfig {
@@ -1227,8 +1370,10 @@ mod tests {
             ..runtime::SessionRecoveryConfig::default()
         };
         (
-            Arc::new(UnifiedSessionManager::new(
+            Arc::new(SessionActivationCoordinator::new(
                 runtime,
+                session_repository,
+                presence_ledger,
                 Arc::clone(&resource_lifecycle),
                 manager_max_active_sessions,
                 recovery,
@@ -1240,10 +1385,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_session_creates_hot_durable_and_lifecycle_state() {
+    async fn activation_creates_hot_durable_and_lifecycle_state() {
         let (manager, store, active, lifecycle) = test_manager(8);
         let outcome = manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-new",
                 Some("test-model".to_string()),
                 SessionSource::WebUi,
@@ -1261,8 +1406,7 @@ mod tests {
         );
         assert_eq!(
             manager
-                .runtime()
-                .lifecycle_kernel()
+                .presence_ledger()
                 .snapshot("session-new")
                 .await
                 .unwrap()
@@ -1272,14 +1416,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_ensure_creates_exactly_one_session() {
+    async fn concurrent_surface_activation_creates_exactly_one_session() {
         let (manager, store, active, _) = test_manager(32);
         let mut tasks = Vec::new();
         for _ in 0..20 {
             let manager = Arc::clone(&manager);
             tasks.push(tokio::spawn(async move {
                 manager
-                    .ensure_session(EnsureSessionRequest::new(
+                    .activate_for_test(EnsureSessionRequest::new(
                         "session-concurrent",
                         Some("test-model".to_string()),
                         SessionSource::Socket,
@@ -1311,7 +1455,7 @@ mod tests {
             SessionSource::Tui,
         );
         owner_request.owner_principal_id = Some("principal-a".to_string());
-        manager.ensure_session(owner_request).await.unwrap();
+        manager.activate_for_test(owner_request).await.unwrap();
         assert!(manager.unload_runtime("session-owned").await);
         assert!(active.get("session-owned").is_none());
         assert!(lifecycle.check_session("session-owned").await.is_none());
@@ -1319,7 +1463,10 @@ mod tests {
         let mut foreign_request =
             EnsureSessionRequest::new("session-owned", None, SessionSource::MissionControl);
         foreign_request.owner_principal_id = Some("principal-b".to_string());
-        let error = manager.ensure_session(foreign_request).await.unwrap_err();
+        let error = manager
+            .activate_for_test(foreign_request)
+            .await
+            .unwrap_err();
 
         assert!(error.contains("owned by another"), "{error}");
         assert!(active.get("session-owned").is_none());
@@ -1344,7 +1491,7 @@ mod tests {
     async fn legacy_ownerless_session_requires_privileged_audited_migration() {
         let (manager, store, active, lifecycle) = test_manager(8);
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-legacy-ownerless",
                 Some("test-model".to_string()),
                 SessionSource::WebUi,
@@ -1356,7 +1503,7 @@ mod tests {
         let mut ordinary =
             EnsureSessionRequest::new("session-legacy-ownerless", None, SessionSource::Tui);
         ordinary.owner_principal_id = Some("ordinary-principal".to_string());
-        let error = manager.ensure_session(ordinary).await.unwrap_err();
+        let error = manager.activate_for_test(ordinary).await.unwrap_err();
         assert!(
             error.contains("requires privileged owner migration"),
             "{error}"
@@ -1372,7 +1519,7 @@ mod tests {
         privileged.owner_principal_id = Some("manager-principal".to_string());
         privileged.allow_legacy_owner_migration = true;
         manager
-            .ensure_session(privileged)
+            .activate_for_test(privileged)
             .await
             .expect("privileged migration succeeds");
         let record = store
@@ -1398,7 +1545,7 @@ mod tests {
     async fn activation_failure_compensates_session_and_mission_lifecycle() {
         let (manager, store, active, _) = test_manager_with_limits(1, 2);
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-capacity-owner",
                 None,
                 SessionSource::WebUi,
@@ -1407,7 +1554,7 @@ mod tests {
             .unwrap();
 
         let error = manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-activation-failure",
                 None,
                 SessionSource::WebUi,
@@ -1439,10 +1586,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hot_ensure_path_averages_below_five_milliseconds() {
+    async fn hot_surface_activation_averages_below_five_milliseconds() {
         let (manager, _, _, _) = test_manager(8);
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-hot",
                 None,
                 SessionSource::Tui,
@@ -1452,7 +1599,7 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..100 {
             let outcome = manager
-                .ensure_session(EnsureSessionRequest::new(
+                .activate_for_test(EnsureSessionRequest::new(
                     "session-hot",
                     None,
                     SessionSource::Tui,
@@ -1464,7 +1611,7 @@ mod tests {
         }
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
-            "100 hot ensures took {:?}",
+            "100 hot surface activations took {:?}",
             started.elapsed()
         );
     }
@@ -1497,7 +1644,7 @@ mod tests {
     async fn unloaded_session_is_recovered_without_losing_durable_state() {
         let (manager, store, active, _) = test_manager(8);
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-recover",
                 Some("test-model".to_string()),
                 SessionSource::Cli,
@@ -1513,7 +1660,7 @@ mod tests {
             .is_some());
 
         let outcome = manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-recover",
                 None,
                 SessionSource::Internal,
@@ -1526,27 +1673,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_session_cleans_hot_durable_and_lifecycle_state() {
-        let (manager, store, active, lifecycle) = test_manager(8);
-        manager
-            .ensure_session(EnsureSessionRequest::new(
-                "session-delete",
-                None,
-                SessionSource::WebUi,
-            ))
-            .await
-            .unwrap();
-        assert!(manager.delete_session("session-delete").await.unwrap());
-        assert!(active.get("session-delete").is_none());
-        assert!(store.get_session("session-delete").await.unwrap().is_none());
-        assert!(lifecycle.check_session("session-delete").await.is_none());
-    }
-
-    #[tokio::test]
     async fn capacity_limit_evicts_only_hot_state_and_never_blocks_durable_recovery() {
         let (manager, store, active, lifecycle) = test_manager(1);
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-one",
                 None,
                 SessionSource::WebUi,
@@ -1572,7 +1702,7 @@ mod tests {
         store.upsert_session(&record).await.unwrap();
 
         let recovered = manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-durable",
                 None,
                 SessionSource::Internal,
@@ -1586,7 +1716,7 @@ mod tests {
             Some(runtime::session_lifecycle::SessionStatus::Active)
         );
         let replacement = manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-over-limit",
                 None,
                 SessionSource::WebUi,
@@ -1607,7 +1737,7 @@ mod tests {
     async fn cleanup_does_not_remove_a_recent_session_or_its_durable_identity() {
         let (manager, store, active, _) = test_manager(8);
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-recent",
                 None,
                 SessionSource::WebUi,
@@ -1623,7 +1753,7 @@ mod tests {
     #[tokio::test]
     async fn idle_cleanup_unloads_only_hot_state_and_preserves_durable_identity() {
         let (base, store, active, _) = test_manager(8);
-        let lifecycle = Arc::new(SessionLifecycleManager::new(
+        let lifecycle = Arc::new(SessionWorkingSetManager::new(
             runtime::session_lifecycle::SessionLifecycleConfig {
                 idle_timeout: Some(std::time::Duration::from_millis(10)),
                 max_ttl: None,
@@ -1632,14 +1762,16 @@ mod tests {
                 cleanup_interval: std::time::Duration::from_millis(5),
             },
         ));
-        let manager = UnifiedSessionManager::new(
+        let manager = SessionActivationCoordinator::new(
             base.runtime().clone(),
+            Arc::clone(&base.repository),
+            Arc::clone(&base.presence_ledger),
             lifecycle,
             8,
             runtime::SessionRecoveryConfig::default(),
         );
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-idle-cleanup",
                 None,
                 SessionSource::WebUi,
@@ -1660,7 +1792,7 @@ mod tests {
     #[tokio::test]
     async fn writer_lease_pins_hot_runtime_without_becoming_restart_durable() {
         let (base, store, active, _) = test_manager(8);
-        let lifecycle = Arc::new(SessionLifecycleManager::new(
+        let lifecycle = Arc::new(SessionWorkingSetManager::new(
             runtime::session_lifecycle::SessionLifecycleConfig {
                 idle_timeout: Some(std::time::Duration::from_millis(10)),
                 max_ttl: None,
@@ -1669,14 +1801,16 @@ mod tests {
                 cleanup_interval: std::time::Duration::from_millis(5),
             },
         ));
-        let manager = UnifiedSessionManager::new(
+        let manager = SessionActivationCoordinator::new(
             base.runtime().clone(),
+            Arc::clone(&base.repository),
+            Arc::clone(&base.presence_ledger),
             lifecycle,
             8,
             runtime::SessionRecoveryConfig::default(),
         );
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-writer-pin",
                 None,
                 SessionSource::WebUi,
@@ -1776,10 +1910,15 @@ mod tests {
                 "user",
                 Some(r#"[{"type":"text","text":"resume"}]"#),
                 1,
-                &memory::SessionRuntimeOutboxRequest {
+                &session::SessionRuntimeOutboxRequest {
+                    input_id: "input-required".to_string(),
                     request_id: "request-required".to_string(),
                     turn_id: "turn-required".to_string(),
                     message_id: "message-required".to_string(),
+                    session_generation: 1,
+                    decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                    target_turn_id: None,
+                    classification_json: None,
                     created_at_ms: 1,
                     runtime_options_json: None,
                 },
@@ -1886,8 +2025,7 @@ mod tests {
                 .unwrap();
         }
         manager
-            .runtime()
-            .lifecycle_kernel()
+            .presence_ledger()
             .attach(
                 "session-attached",
                 session::SessionActor::new("web:test", "webui"),
@@ -1953,7 +2091,7 @@ mod tests {
         };
         store.upsert_session(&record).await.unwrap();
         store
-            .insert_message(&memory::SessionMessage {
+            .insert_message(&session::SessionMessage {
                 stable_message_id: "single-flight-message".to_string(),
                 session_id: "session-single-flight".to_string(),
                 sequence: 0,
@@ -1972,7 +2110,7 @@ mod tests {
             let manager = Arc::clone(&manager);
             async move {
                 manager
-                    .ensure_session(EnsureSessionRequest::new(
+                    .activate_for_test(EnsureSessionRequest::new(
                         "session-single-flight",
                         None,
                         SessionSource::WebUi,
@@ -1991,13 +2129,18 @@ mod tests {
     #[tokio::test]
     async fn byte_budget_evicts_unpinned_hot_runtime_but_keeps_durable_history() {
         let (base, store, active, _) = test_manager(8);
-        let lifecycle = Arc::new(SessionLifecycleManager::default());
-        let manager = UnifiedSessionManager::new(
+        let lifecycle = Arc::new(SessionWorkingSetManager::default());
+        let manager = SessionActivationCoordinator::new(
             base.runtime().clone(),
+            Arc::clone(&base.repository),
+            Arc::clone(&base.presence_ledger),
             Arc::clone(&lifecycle),
             8,
             runtime::SessionRecoveryConfig {
-                hot_bytes: 1,
+                // Each fixture transcript is currently 74 bytes. Keep enough
+                // room for exactly one hot carrier so the second activation
+                // proves eviction rather than impossible admission.
+                hot_bytes: 100,
                 attached_bytes: 0,
                 recent_bytes: 0,
                 recent_window_ms: 0,
@@ -2025,7 +2168,7 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .insert_message(&memory::SessionMessage {
+                .insert_message(&session::SessionMessage {
                     stable_message_id: format!("{session_id}-message"),
                     session_id: session_id.to_string(),
                     sequence: 0,
@@ -2041,7 +2184,7 @@ mod tests {
                 .unwrap();
         }
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-byte-a",
                 None,
                 SessionSource::WebUi,
@@ -2049,7 +2192,7 @@ mod tests {
             .await
             .unwrap();
         manager
-            .ensure_session(EnsureSessionRequest::new(
+            .activate_for_test(EnsureSessionRequest::new(
                 "session-byte-b",
                 None,
                 SessionSource::WebUi,
@@ -2066,7 +2209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_runtime_bridge_activates_only_through_unified_manager() {
+    async fn cold_runtime_is_activated_before_one_way_runtime_execution() {
         let (manager, store, active, _) = test_manager(8);
         let record = SessionRecord {
             session_id: "session-cold-bridge".to_string(),
@@ -2085,29 +2228,39 @@ mod tests {
             status: "active".to_string(),
         };
         store.upsert_session(&record).await.unwrap();
-        let activation_port: Arc<dyn crate::runtime_service::SessionActivationPort> =
-            manager.clone();
         manager
-            .runtime()
-            .install_session_activator(Arc::downgrade(&activation_port))
+            .activate_for_test(EnsureSessionRequest::new(
+                &record.session_id,
+                None,
+                SessionSource::Internal,
+            ))
+            .await
             .unwrap();
-        let ingress = memory::SessionRuntimeOutboxRecord {
+        let ingress = session::SessionRuntimeOutboxRecord {
+            input_id: "cold-input".to_string(),
             request_id: "cold-request".to_string(),
             turn_id: "cold-turn".to_string(),
             message_id: "cold-message".to_string(),
             session_id: record.session_id.clone(),
             sequence: 0,
-            status: memory::OutboxStatus::Claimed,
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
+            status: session::SessionRuntimeInputStatus::Claimed,
             runtime_commit_cursor: None,
             attempts: 1,
             next_attempt_at_ms: 0,
             claim_owner: Some("test-worker".to_string()),
+            claim_token: Some("cold-claim".to_string()),
+            claim_fence_epoch: Some(1),
             claim_expires_at_ms: Some(u64::MAX),
             failure_class: None,
             last_error: None,
             revision: 1,
             created_at_ms: 1,
             updated_at_ms: 1,
+            terminal_at_ms: None,
             runtime_options_json: None,
         };
 
@@ -2118,13 +2271,27 @@ mod tests {
         assert!(active.get(&record.session_id).is_some());
         assert_eq!(
             manager
-                .runtime()
-                .lifecycle_kernel()
+                .presence_ledger
                 .snapshot(&record.session_id)
                 .await
                 .unwrap()
                 .state,
             session::SessionLifecycleState::Active
         );
+    }
+
+    #[tokio::test]
+    async fn keyed_session_lock_registry_reclaims_completed_keys() {
+        let (manager, _, _, _) = test_manager(8);
+        {
+            let _guard = manager.acquire_exclusive("session-lock-a").await;
+            assert_eq!(manager.session_locks.lock().await.len(), 1);
+        }
+        {
+            let _guard = manager.acquire_exclusive("session-lock-b").await;
+            let locks = manager.session_locks.lock().await;
+            assert_eq!(locks.len(), 1);
+            assert!(locks.contains_key("session-lock-b"));
+        }
     }
 }

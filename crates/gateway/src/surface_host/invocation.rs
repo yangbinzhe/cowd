@@ -1,4 +1,3 @@
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -10,6 +9,7 @@ use surface::{
     SurfaceError, SurfaceFailureKind, SurfaceFrame, SurfaceLifecycle, SurfaceOperationResult,
     SurfaceRoute, SurfaceRuntimeSnapshot, SurfaceRuntimeStatus, SurfaceSendRequest,
 };
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use super::{classify_surface_error, managed_actions, normalize_request_path, SurfaceHost};
@@ -222,14 +222,32 @@ impl SurfaceHost {
             reason: "managed surface stream start timed out".to_string(),
         })??;
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(async move {
-            while let Some(frame) = frames.recv().await {
-                let result = frame.map(|frame| operation_result_from_frame(&surface.id, frame));
-                if tx.send(result).await.is_err() {
-                    return;
-                }
-            }
-        });
+        let surface_id = surface.id.clone();
+        self.gateway_tasks()
+            .spawn_owned(
+                crate::runtime_host::task_set::GatewayTaskKind::SurfaceStream,
+                crate::runtime_host::task_set::GatewayTaskOwner::Surface(surface_id.clone()),
+                move |cancellation| async move {
+                    loop {
+                        let frame = tokio::select! {
+                            _ = cancellation.cancelled() => break,
+                            frame = frames.recv() => frame,
+                        };
+                        let Some(frame) = frame else {
+                            break;
+                        };
+                        let result =
+                            frame.map(|frame| operation_result_from_frame(&surface.id, frame));
+                        if tx.send(result).await.is_err() {
+                            break;
+                        }
+                    }
+                },
+            )
+            .map_err(|error| SurfaceError::Invocation {
+                surface: surface_id,
+                reason: format!("managed Surface action stream admission failed: {error}"),
+            })?;
         Ok(rx)
     }
 
@@ -376,12 +394,7 @@ impl SurfaceHost {
             };
             return Ok(operation_result_from_frame(&surface_id, response));
         }
-        tokio::task::spawn_blocking(move || invoke_sidecar(surface, frame))
-            .await
-            .map_err(|error| SurfaceError::Invocation {
-                surface: "unknown".to_string(),
-                reason: format!("surface task join failed: {error}"),
-            })?
+        invoke_sidecar(surface, frame).await
     }
 
     pub(super) async fn invoke_h2(
@@ -406,7 +419,7 @@ fn is_retryable_surface_error(code: &str) -> bool {
     )
 }
 
-fn invoke_sidecar(
+async fn invoke_sidecar(
     surface: SurfaceDescriptor,
     frame: SurfaceFrame,
 ) -> Result<SurfaceOperationResult, SurfaceError> {
@@ -437,29 +450,35 @@ fn invoke_sidecar(
             surface: surface_id.clone(),
             reason: format!("sidecar sandbox unavailable: {error}"),
         })?;
-    let mut child = prepared
-        .into_command()
+    let mut command = tokio::process::Command::from(prepared.into_command());
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| SurfaceError::Invocation {
-            surface: surface_id.clone(),
-            reason: format!("failed to launch `{}`: {error}", command_path.display()),
-        })?;
+        .stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| SurfaceError::Invocation {
+        surface: surface_id.clone(),
+        reason: format!("failed to launch `{}`: {error}", command_path.display()),
+    })?;
 
     let mut stdin = child.stdin.take().ok_or_else(|| SurfaceError::Invocation {
         surface: surface_id.clone(),
         reason: "sidecar stdin is not available".to_string(),
     })?;
     let encoded = frame.encode_jsonl()?;
-    stdin
-        .write_all(encoded.as_bytes())
-        .and_then(|_| stdin.flush())
-        .map_err(|error| SurfaceError::Invocation {
-            surface: surface_id.clone(),
-            reason: format!("failed to write jsonl request: {error}"),
-        })?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        stdin.write_all(encoded.as_bytes()).await?;
+        stdin.shutdown().await
+    })
+    .await
+    .map_err(|_| SurfaceError::Invocation {
+        surface: surface_id.clone(),
+        reason: "one-shot sidecar stdin timed out after 30s".to_string(),
+    })?
+    .map_err(|error| SurfaceError::Invocation {
+        surface: surface_id.clone(),
+        reason: format!("failed to write jsonl request: {error}"),
+    })?;
     drop(stdin);
 
     let stdout = child
@@ -476,41 +495,32 @@ fn invoke_sidecar(
             surface: surface_id.clone(),
             reason: "sidecar stderr is not available".to_string(),
         })?;
-    let (status, stdout, stderr, stdout_truncated, stderr_truncated) =
-        std::thread::scope(|scope| {
-            let stdout_reader = scope.spawn(|| drain_limited(stdout, 2 * 1024 * 1024));
-            let stderr_reader = scope.spawn(|| drain_limited(stderr, 1024 * 1024));
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break Ok(status),
-                    Ok(None) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break Err("one-shot sidecar timed out after 30s".to_string());
-                    }
-                    Err(error) => break Err(format!("one-shot sidecar wait failed: {error}")),
-                }
-            };
-            let stdout = stdout_reader
-                .join()
-                .map_err(|_| "one-shot stdout reader panicked".to_string())?;
-            let stderr = stderr_reader
-                .join()
-                .map_err(|_| "one-shot stderr reader panicked".to_string())?;
-            Ok::<_, String>((status, stdout.0, stderr.0, stdout.1, stderr.1))
-        })
-        .map_err(|reason| SurfaceError::Invocation {
-            surface: surface_id.clone(),
-            reason,
-        })?;
-    status.map_err(|reason| SurfaceError::Invocation {
-        surface: surface_id.clone(),
-        reason,
-    })?;
+    let execution = tokio::time::timeout(Duration::from_secs(30), async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            drain_limited(stdout, 2 * 1024 * 1024),
+            drain_limited(stderr, 1024 * 1024),
+        );
+        Ok::<_, std::io::Error>((status?, stdout?, stderr?))
+    })
+    .await;
+    let (status, (stdout, stdout_truncated), (stderr, stderr_truncated)) = match execution {
+        Ok(Ok(execution)) => execution,
+        Ok(Err(error)) => {
+            return Err(SurfaceError::Invocation {
+                surface: surface_id,
+                reason: format!("one-shot sidecar I/O failed: {error}"),
+            })
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(SurfaceError::Invocation {
+                surface: surface_id,
+                reason: "one-shot sidecar timed out after 30s".to_string(),
+            });
+        }
+    };
     if stdout_truncated {
         return Err(SurfaceError::Invocation {
             surface: surface_id,
@@ -519,6 +529,15 @@ fn invoke_sidecar(
     }
     if stderr_truncated {
         tracing::warn!(surface = %surface_id, "one-shot sidecar stderr exceeded 1 MiB and was truncated");
+    }
+    if !status.success() {
+        return Err(SurfaceError::Invocation {
+            surface: surface_id,
+            reason: format!(
+                "one-shot sidecar exited with {status}: {}",
+                String::from_utf8_lossy(&stderr)
+            ),
+        });
     }
     let line = String::from_utf8(stdout)
         .map_err(|error| SurfaceError::Invocation {
@@ -541,14 +560,15 @@ fn invoke_sidecar(
     Ok(operation_result_from_frame(&surface_id, response))
 }
 
-fn drain_limited<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
+async fn drain_limited<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
     let mut kept = Vec::with_capacity(limit.min(64 * 1024));
     let mut buffer = [0_u8; 16 * 1024];
     let mut truncated = false;
     loop {
-        let Ok(read) = reader.read(&mut buffer) else {
-            break;
-        };
+        let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
@@ -560,7 +580,7 @@ fn drain_limited<R: Read>(mut reader: R, limit: usize) -> (Vec<u8>, bool) {
             truncated = true;
         }
     }
-    (kept, truncated)
+    Ok((kept, truncated))
 }
 
 fn operation_result_from_frame(surface: &str, frame: SurfaceFrame) -> SurfaceOperationResult {

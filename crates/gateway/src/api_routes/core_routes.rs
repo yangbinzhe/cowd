@@ -305,15 +305,14 @@ fn surface_repo_file_exists(relative: &str) -> bool {
 }
 
 async fn execution_outcome_timeline_available(state: &AppState) -> bool {
-    let Some(store) = state.services.session.unified_store() else {
-        return false;
-    };
-    let Ok(sessions) = store.list_sessions().await else {
+    let Ok(Some(sessions)) = state.services.session.list_stored_sessions().await else {
         return false;
     };
     for session in sessions.into_iter().take(50) {
-        let Ok(page) = store
-            .timeline_events_page(&session.session_id, 0, 100)
+        let Ok(Some(page)) = state
+            .services
+            .session
+            .stored_timeline_runtime_page(&session.session_id, 0, 100)
             .await
         else {
             continue;
@@ -325,26 +324,22 @@ async fn execution_outcome_timeline_available(state: &AppState) -> bool {
     false
 }
 
-fn is_execution_outcome_event(event: &memory::SessionDomainEvent) -> bool {
-    matches!(
-        event.kind.as_str(),
-        "execution.outcome" | "matrix.execution_outcome" | "mfg.execution_outcome"
-    )
+fn is_execution_outcome_event(event: &session::SessionDomainEvent) -> bool {
+    event.kind == "application.execution_outcome"
 }
 
 async fn memory_context_bridge_available(state: &AppState) -> bool {
-    let Some(store) = state.services.session.unified_store() else {
-        return false;
-    };
-    let Ok(sessions) = store.list_sessions().await else {
+    let Ok(Some(sessions)) = state.services.session.list_stored_sessions().await else {
         return false;
     };
     for session in sessions.into_iter().take(50) {
         let mut from_sequence = 0;
         let mut events = Vec::new();
         for _ in 0..10 {
-            let Ok(page) = store
-                .timeline_events_page(&session.session_id, from_sequence, 100)
+            let Ok(Some(page)) = state
+                .services
+                .session
+                .stored_timeline_runtime_page(&session.session_id, from_sequence, 100)
                 .await
             else {
                 break;
@@ -362,7 +357,7 @@ async fn memory_context_bridge_available(state: &AppState) -> bool {
     false
 }
 
-fn runtime_skill_memory_bridge_session(events: &[memory::SessionDomainEvent]) -> bool {
+fn runtime_skill_memory_bridge_session(events: &[session::SessionDomainEvent]) -> bool {
     let invocations = events
         .iter()
         .filter_map(runtime_skill_invocation)
@@ -391,7 +386,7 @@ struct RuntimeSkillBridgeKey {
     sequence: usize,
 }
 
-fn runtime_skill_invocation(event: &memory::SessionDomainEvent) -> Option<RuntimeSkillBridgeKey> {
+fn runtime_skill_invocation(event: &session::SessionDomainEvent) -> Option<RuntimeSkillBridgeKey> {
     if event.kind != "skill_candidates" {
         return None;
     }
@@ -437,7 +432,7 @@ fn runtime_skill_invocation(event: &memory::SessionDomainEvent) -> Option<Runtim
 }
 
 fn runtime_skill_memory_candidate(
-    event: &memory::SessionDomainEvent,
+    event: &session::SessionDomainEvent,
 ) -> Option<RuntimeSkillBridgeKey> {
     if event.kind != "skill_memory_candidate" {
         return None;
@@ -516,11 +511,11 @@ fn store_error(error: GatewayMatrixRepositoryError) -> (StatusCode, Json<ErrorRe
 mod tests {
     use super::*;
 
-    fn skill_activation_event(sequence: usize, source: &str) -> memory::SessionDomainEvent {
-        let mut event = memory::SessionDomainEvent::new(
+    fn skill_activation_event(sequence: usize, source: &str) -> session::SessionDomainEvent {
+        let mut event = session::SessionDomainEvent::new(
             "session-1",
             sequence,
-            memory::SessionDomainScope::Context,
+            session::SessionDomainScope::Context,
             "skill_candidates",
             serde_json::json!({
                 "source": source,
@@ -533,7 +528,7 @@ mod tests {
             }),
             sequence as u64,
         );
-        event.refs.push(memory::SessionDomainRef {
+        event.refs.push(session::SessionDomainRef {
             ref_type: "skill_invocation".to_string(),
             id: "release-review".to_string(),
             label: Some("selected_for_runtime".to_string()),
@@ -541,11 +536,11 @@ mod tests {
         event
     }
 
-    fn skill_memory_event(sequence: usize, source: &str) -> memory::SessionDomainEvent {
-        let mut event = memory::SessionDomainEvent::new(
+    fn skill_memory_event(sequence: usize, source: &str) -> session::SessionDomainEvent {
+        let mut event = session::SessionDomainEvent::new(
             "session-1",
             sequence,
-            memory::SessionDomainScope::Context,
+            session::SessionDomainScope::Context,
             "skill_memory_candidate",
             serde_json::json!({
                 "source": source,
@@ -558,7 +553,7 @@ mod tests {
             }),
             sequence as u64,
         );
-        event.refs.push(memory::SessionDomainRef {
+        event.refs.push(session::SessionDomainRef {
             ref_type: "skill".to_string(),
             id: "release-review".to_string(),
             label: Some("memory_candidate_source".to_string()),
@@ -591,22 +586,16 @@ mod tests {
     }
 
     #[test]
-    fn release_gate_recognizes_all_runtime_execution_outcome_domains() {
-        for kind in [
-            "execution.outcome",
-            "matrix.execution_outcome",
-            "mfg.execution_outcome",
-        ] {
-            let event = memory::SessionDomainEvent::new(
-                "session-1",
-                1,
-                memory::SessionDomainScope::Memory,
-                kind,
-                serde_json::json!({"status": "succeeded"}),
-                1,
-            );
-            assert!(is_execution_outcome_event(&event), "missing {kind}");
-        }
+    fn release_gate_recognizes_application_execution_outcome() {
+        let event = session::SessionDomainEvent::new(
+            "session-1",
+            1,
+            session::SessionDomainScope::ApplicationTask,
+            "application.execution_outcome",
+            serde_json::json!({"status": "succeeded"}),
+            1,
+        );
+        assert!(is_execution_outcome_event(&event));
     }
 
     #[test]

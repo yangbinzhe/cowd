@@ -1,6 +1,6 @@
 //! Durable session ingress and canonical SessionDispatch execution.
 //!
-//! Memory owns accepted user messages and the ingress outbox. Runtime claims
+//! Session owns accepted user messages and the ingress outbox. Runtime claims
 //! those rows, compiles one canonical graph per request and acknowledges the
 //! row only after the graph commit is durable. There is deliberately no
 //! process-global dispatcher or graph-external session execution API.
@@ -14,12 +14,12 @@ use harness_contract::execution_graph::{
 use harness_contract::turn::{
     SessionDispatchAction, SessionDispatchCommand, SessionDispatchReceipt, SessionResultPacket,
 };
-use memory::{
-    OutboxFailureClass, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
-    UnifiedSessionStore,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(test)]
+use session::OutboxFailureClass;
+#[cfg(test)]
+use session::UnifiedSessionStore;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -29,6 +29,11 @@ use crate::execution_core::{
 };
 use crate::runtime_event_store::{
     RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeTransactionEventInput,
+};
+use crate::{
+    RuntimeSessionIngressCommand as SessionRuntimeOutboxRequest,
+    RuntimeSessionInputRecord as SessionRuntimeOutboxRecord,
+    RuntimeSessionInputStatus as SessionRuntimeInputStatus,
 };
 
 pub const SESSION_DISPATCH_EXECUTOR: &str = "session_dispatch";
@@ -168,6 +173,138 @@ pub struct SessionIngressExecutionReceipt {
     pub commit_cursor: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionExecutionFencePhase {
+    ProviderRequest,
+    ToolExecution,
+    ToolCommit,
+    TerminalCommit,
+}
+
+/// Durable ownership fence carried by one claimed Session input.
+///
+/// Runtime may keep rich process-local state, but it is allowed to start a
+/// provider/tool side effect or commit a terminal only while this durable
+/// claim remains current. Lease renewal may advance the record revision, so
+/// the immutable fence is generation + claim token rather than a stale copy
+/// of the revision.
+#[derive(Clone)]
+pub struct SessionExecutionFence {
+    query: Arc<dyn crate::SessionRuntimeQueryPort>,
+    request_id: String,
+    session_id: String,
+    generation: u64,
+    input_sequence: usize,
+    claim_owner: String,
+    claim_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExecutionFenceSnapshot {
+    pub request_id: String,
+    pub session_id: String,
+    pub session_generation: u64,
+    pub claim_owner: String,
+    pub claim_token: String,
+    pub claim_revision: u64,
+}
+
+impl std::fmt::Debug for SessionExecutionFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionExecutionFence")
+            .field("request_id", &self.request_id)
+            .field("session_id", &self.session_id)
+            .field("generation", &self.generation)
+            .field("input_sequence", &self.input_sequence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionExecutionFence {
+    pub fn from_claim(
+        query: Arc<dyn crate::SessionRuntimeQueryPort>,
+        request_id: impl Into<String>,
+        session_id: impl Into<String>,
+        generation: u64,
+        input_sequence: usize,
+        claim_owner: impl Into<String>,
+        claim_token: impl Into<String>,
+    ) -> Result<Self, String> {
+        let request_id = request_id.into();
+        let session_id = session_id.into();
+        let claim_owner = claim_owner.into();
+        let claim_token = claim_token.into();
+        if request_id.trim().is_empty()
+            || session_id.trim().is_empty()
+            || claim_owner.trim().is_empty()
+            || claim_token.trim().is_empty()
+        {
+            return Err(
+                "Session execution fence requires request, session, owner and claim identity"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            query,
+            request_id,
+            session_id,
+            generation,
+            input_sequence,
+            claim_owner,
+            claim_token,
+        })
+    }
+
+    pub async fn verify(
+        &self,
+        phase: SessionExecutionFencePhase,
+    ) -> Result<SessionExecutionFenceSnapshot, String> {
+        let record = self
+            .query
+            .runtime_input(&self.request_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "Session execution fence rejected {phase:?}: request {} no longer exists",
+                    self.request_id
+                )
+            })?;
+        let claim_is_current = record.session_id == self.session_id
+            && record.session_generation == self.generation
+            && record.sequence == self.input_sequence
+            && record.claim_owner.as_deref() == Some(self.claim_owner.as_str())
+            && record.claim_token.as_deref() == Some(self.claim_token.as_str())
+            && matches!(
+                record.status,
+                SessionRuntimeInputStatus::Claimed | SessionRuntimeInputStatus::Running
+            )
+            && record
+                .claim_expires_at_ms
+                .is_some_and(|deadline| deadline > now_ms());
+        if claim_is_current {
+            Ok(SessionExecutionFenceSnapshot {
+                request_id: self.request_id.clone(),
+                session_id: self.session_id.clone(),
+                session_generation: self.generation,
+                claim_owner: self.claim_owner.clone(),
+                claim_token: self.claim_token.clone(),
+                claim_revision: record.revision,
+            })
+        } else {
+            Err(format!(
+                "Session execution fence rejected {phase:?}: request={} session={} generation={} status={:?}",
+                self.request_id,
+                self.session_id,
+                self.generation,
+                record.status
+            ))
+        }
+    }
+}
+
 #[async_trait]
 pub trait SessionIngressExecutor: Send + Sync {
     async fn execute_ingress(
@@ -299,42 +436,79 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
 #[derive(Debug, Error)]
 pub enum SessionInputRouterError {
     #[error("session ingress persistence failed: {0}")]
-    Memory(#[from] memory::MemoryError),
+    Session(#[from] session::SessionError),
     #[error("session dispatch graph failed: {0}")]
     Runtime(String),
 }
 
 /// Workspace-scoped bridge from Memory ingress to the canonical graph runner.
 pub struct SessionInputRouter {
-    store: Arc<UnifiedSessionStore>,
+    query: Arc<dyn crate::SessionRuntimeQueryPort>,
+    ingress: Arc<dyn crate::SessionRuntimeIngressPort>,
     event_store: Arc<crate::RuntimeEventStore>,
+    wake: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    test_store: Option<Arc<UnifiedSessionStore>>,
+    #[cfg(test)]
     worker_id: String,
+    #[cfg(test)]
     lease_ms: u64,
+    #[cfg(test)]
     max_attempts: u32,
 }
 
 impl SessionInputRouter {
     pub fn install(
+        query: Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress: Arc<dyn crate::SessionRuntimeIngressPort>,
+        workspace_key: &str,
+        event_store: Arc<crate::RuntimeEventStore>,
+    ) -> Result<Arc<Self>, NodeExecutorError> {
+        #[cfg(not(test))]
+        let _ = workspace_key;
+        Ok(Arc::new(Self {
+            query,
+            ingress,
+            event_store,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            test_store: None,
+            #[cfg(test)]
+            worker_id: format!("session-router:{workspace_key}"),
+            #[cfg(test)]
+            lease_ms: 30_000,
+            #[cfg(test)]
+            max_attempts: 5,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_for_test(
+        query: Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress: Arc<dyn crate::SessionRuntimeIngressPort>,
         store: Arc<UnifiedSessionStore>,
         workspace_key: &str,
         event_store: Arc<crate::RuntimeEventStore>,
     ) -> Result<Arc<Self>, NodeExecutorError> {
         Ok(Arc::new(Self {
-            store,
+            query,
+            ingress,
             event_store,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            test_store: Some(store),
             worker_id: format!("session-router:{workspace_key}"),
             lease_ms: 30_000,
             max_attempts: 5,
         }))
     }
 
-    /// The canonical session authority shared by ingress and all in-process
-    /// execution children. Exposing this handle does not transfer lifecycle
-    /// ownership: callers may append durable evidence, but only the router
-    /// materializes SessionInput work into Runtime graphs.
     #[must_use]
-    pub fn session_store(&self) -> Arc<UnifiedSessionStore> {
-        Arc::clone(&self.store)
+    pub fn wake_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.wake)
+    }
+
+    pub fn notify_pending(&self) {
+        self.wake.notify_one();
     }
 
     async fn route_dispatch_payload(
@@ -348,8 +522,8 @@ impl SessionInputRouter {
             let ingress: crate::TurnIngressRef =
                 serde_json::from_str(payload).map_err(|error| error.to_string())?;
             let record = self
-                .store
-                .get_session_runtime_outbox(&ingress.request_id)
+                .query
+                .runtime_input(&ingress.request_id)
                 .await
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| {
@@ -374,8 +548,8 @@ impl SessionInputRouter {
             let handoff = command.handoff;
             let target = handoff.target_session_id.as_str();
             if self
-                .store
-                .get_session(target)
+                .query
+                .session_record(target)
                 .await
                 .map_err(|error| error.to_string())?
                 .is_none()
@@ -388,10 +562,29 @@ impl SessionInputRouter {
                 "{idempotency_key}:{}:{target}:{}",
                 handoff.source_session_id, handoff.correlation_id
             ));
+            let admission = self
+                .query
+                .input_admission(target)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!("SessionDispatch target session `{target}` has no admission authority")
+                })?;
             let request = SessionRuntimeOutboxRequest {
+                input_id: format!("cross-session-input:{stable}"),
                 request_id: format!("cross-session-request:{stable}"),
                 turn_id: format!("cross-session-turn:{stable}"),
                 message_id: format!("cross-session-message:{stable}"),
+                session_generation: admission.generation,
+                decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                target_turn_id: None,
+                classification_json: Some(
+                    serde_json::json!({
+                        "kind": "session_handoff",
+                        "correlation_id": handoff.correlation_id,
+                    })
+                    .to_string(),
+                ),
                 created_at_ms: now_ms(),
                 runtime_options_json: None,
             };
@@ -428,8 +621,8 @@ impl SessionInputRouter {
 
         let payload = SessionDispatchPayload::parse(payload_ref)?;
         let record = self
-            .store
-            .get_session_runtime_outbox(&payload.request_id)
+            .query
+            .runtime_input(&payload.request_id)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("session dispatch `{}` does not exist", payload.request_id))?;
@@ -701,8 +894,9 @@ impl SessionInputRouter {
             "cowd_turn_ingress_message_id": request.message_id,
         }]))
         .map_err(|error| SessionInputRouterError::Runtime(error.to_string()))?;
-        self.store
-            .append_ingress_with_runtime_outbox(
+        let record = self
+            .ingress
+            .append_ingress(
                 session_id,
                 "user",
                 Some(&content_json),
@@ -710,17 +904,27 @@ impl SessionInputRouter {
                 request,
             )
             .await
-            .map_err(Into::into)
+            .map_err(SessionInputRouterError::from)?;
+        self.notify_pending();
+        Ok(record)
     }
 
+    #[cfg(test)]
     pub async fn route_pending_with(
         &self,
         executor: &dyn SessionIngressExecutor,
         limit: usize,
     ) -> Result<SessionInputRouteReport, SessionInputRouterError> {
+        let store = self.test_store.as_ref().ok_or_else(|| {
+            SessionInputRouterError::Runtime(
+                "route_pending_with requires the test Session store adapter".to_string(),
+            )
+        })?;
         let now = now_ms();
         let claimed = self
-            .store
+            .test_store
+            .as_ref()
+            .expect("test store checked")
             .claim_session_runtime_outbox(&self.worker_id, now, self.lease_ms, limit)
             .await?;
         let mut report = SessionInputRouteReport {
@@ -728,9 +932,30 @@ impl SessionInputRouter {
             ..Default::default()
         };
         for record in claimed {
-            let mut claim_revision = record.revision;
+            let claim_token = record.claim_token.clone().ok_or_else(|| {
+                SessionInputRouterError::Runtime(format!(
+                    "claimed ingress {} has no claim token",
+                    record.request_id
+                ))
+            })?;
+            let running = self
+                .test_store
+                .as_ref()
+                .expect("test store checked")
+                .mark_session_runtime_outbox_running(
+                    &record.request_id,
+                    &self.worker_id,
+                    record.session_generation,
+                    &claim_token,
+                    record.revision,
+                    now_ms(),
+                )
+                .await?;
+            let mut claim_revision = running.revision;
             let content = self
-                .store
+                .test_store
+                .as_ref()
+                .expect("test store checked")
                 .get_messages_from_sequence(&record.session_id, record.sequence, 1)
                 .await
                 .ok()
@@ -748,16 +973,20 @@ impl SessionInputRouter {
                 });
             let outcome = match content {
                 Some(content) => {
-                    let execution = executor.execute_ingress(&record, &content);
+                    let runtime_record =
+                        crate::session_runtime_port::to_runtime_input_record(running.clone());
+                    let execution = executor.execute_ingress(&runtime_record, &content);
                     tokio::pin!(execution);
                     let heartbeat_ms = (self.lease_ms / 3).max(1);
                     loop {
                         tokio::select! {
                             outcome = &mut execution => break outcome,
                             _ = tokio::time::sleep(std::time::Duration::from_millis(heartbeat_ms)) => {
-                                match self.store.renew_session_runtime_outbox_lease(
+                                match store.renew_session_runtime_outbox_lease(
                                     &record.request_id,
                                     &self.worker_id,
+                                    record.session_generation,
+                                    &claim_token,
                                     claim_revision,
                                     now_ms(),
                                     self.lease_ms,
@@ -775,11 +1004,16 @@ impl SessionInputRouter {
             };
             let receipt = match outcome {
                 Ok(executed) => match self
-                    .store
+                    .test_store
+                    .as_ref()
+                    .expect("test store checked")
                     .ack_session_runtime_outbox(
                         &record.request_id,
                         &self.worker_id,
+                        record.session_generation,
+                        &claim_token,
                         claim_revision,
+                        session::SessionRuntimeInputStatus::Completed,
                         executed.commit_cursor,
                         now_ms(),
                     )
@@ -805,10 +1039,14 @@ impl SessionInputRouter {
                 Err(error) => {
                     let class = classify_router_failure(&error);
                     let failed = self
-                        .store
+                        .test_store
+                        .as_ref()
+                        .expect("test store checked")
                         .fail_session_runtime_outbox(
                             &record.request_id,
                             &self.worker_id,
+                            record.session_generation,
+                            &claim_token,
                             claim_revision,
                             class,
                             &error,
@@ -824,7 +1062,7 @@ impl SessionInputRouter {
                         status: failed
                             .ok()
                             .map_or("blocked_failure_record", |item| {
-                                if item.status == memory::OutboxStatus::RetryScheduled {
+                                if item.status == session::SessionRuntimeInputStatus::Queued {
                                     "retry_scheduled"
                                 } else {
                                     "blocked"
@@ -950,6 +1188,7 @@ fn stable_digest(value: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn classify_router_failure(error: &str) -> OutboxFailureClass {
     if error.contains("authorization") || error.contains("approval") {
         OutboxFailureClass::AuthorizationBlocked
@@ -962,6 +1201,7 @@ fn classify_router_failure(error: &str) -> OutboxFailureClass {
     }
 }
 
+#[cfg(test)]
 fn retry_delay_ms(attempt: u32) -> u64 {
     250_u64.saturating_mul(1_u64 << attempt.min(8))
 }
@@ -978,7 +1218,7 @@ mod tests {
     use super::*;
     use crate::RuntimeServices;
     use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeStatus};
-    use memory::{SessionRecord, SessionRuntimeOutboxRequest};
+    use session::SessionRecord;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::Duration;
 
@@ -1009,7 +1249,9 @@ mod tests {
             .await
             .unwrap();
         let services = RuntimeServices::in_memory().unwrap();
-        let router = services.install_session_store(Arc::clone(&store)).unwrap();
+        let router = services
+            .install_test_session_store(Arc::clone(&store))
+            .unwrap();
         (store, services, router)
     }
 
@@ -1017,9 +1259,14 @@ mod tests {
     async fn ingress_is_durable_and_exactly_once_across_restart_claims() {
         let (store, _services, router) = fixture().await;
         let request = SessionRuntimeOutboxRequest {
+            input_id: "i1".to_string(),
             request_id: "r1".to_string(),
             turn_id: "t1".to_string(),
             message_id: "m1".to_string(),
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
             created_at_ms: 1,
             runtime_options_json: None,
         };
@@ -1046,7 +1293,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stored.status, memory::OutboxStatus::Materialized);
+        assert_eq!(stored.status, session::SessionRuntimeInputStatus::Completed);
         assert_eq!(stored.runtime_commit_cursor, Some(42));
         assert!(router
             .route_pending_with(&Executor, 8)
@@ -1106,22 +1353,35 @@ mod tests {
     async fn heartbeat_prevents_second_worker_reclaim_during_long_execution() {
         let (store, services, _router) = fixture().await;
         let request = SessionRuntimeOutboxRequest {
+            input_id: "long-i1".into(),
             request_id: "long-r1".into(),
             turn_id: "long-t1".into(),
             message_id: "long-m1".into(),
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
             created_at_ms: now_ms(),
             runtime_options_json: None,
         };
+        let ports_a = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
+        let ports_b = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
         let router_a = Arc::new(SessionInputRouter {
-            store: Arc::clone(&store),
+            query: ports_a.clone(),
+            ingress: ports_a,
             event_store: Arc::clone(services.event_store()),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            test_store: Some(Arc::clone(&store)),
             worker_id: "worker-a".into(),
             lease_ms: 30,
             max_attempts: 3,
         });
         let router_b = SessionInputRouter {
-            store: Arc::clone(&store),
+            query: ports_b.clone(),
+            ingress: ports_b,
             event_store: Arc::clone(services.event_store()),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            test_store: Some(Arc::clone(&store)),
             worker_id: "worker-b".into(),
             lease_ms: 30,
             max_attempts: 3,
@@ -1178,6 +1438,8 @@ mod tests {
                         .renew_session_runtime_outbox_lease(
                             &record.request_id,
                             "worker-a",
+                            record.session_generation,
+                            record.claim_token.as_deref().expect("claim token"),
                             record.revision,
                             now_ms(),
                             5,
@@ -1198,22 +1460,35 @@ mod tests {
 
         let (store, services, _router) = fixture().await;
         let request = SessionRuntimeOutboxRequest {
+            input_id: "ack-loss-i1".into(),
             request_id: "ack-loss-r1".into(),
             turn_id: "ack-loss-t1".into(),
             message_id: "ack-loss-m1".into(),
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
             created_at_ms: now_ms(),
             runtime_options_json: None,
         };
+        let ports_a = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
+        let ports_b = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
         let router_a = SessionInputRouter {
-            store: Arc::clone(&store),
+            query: ports_a.clone(),
+            ingress: ports_a,
             event_store: Arc::clone(services.event_store()),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            test_store: Some(Arc::clone(&store)),
             worker_id: "worker-a".into(),
             lease_ms: 5,
             max_attempts: 3,
         };
         let router_b = SessionInputRouter {
-            store: Arc::clone(&store),
+            query: ports_b.clone(),
+            ingress: ports_b,
             event_store: Arc::clone(services.event_store()),
+            wake: Arc::new(tokio::sync::Notify::new()),
+            test_store: Some(Arc::clone(&store)),
             worker_id: "worker-b".into(),
             lease_ms: 20,
             max_attempts: 3,
@@ -1311,7 +1586,11 @@ mod tests {
             .content_json
             .contains("review the active change"));
         let error = router
-            .record_target_terminal(&claimed[0], "target-graph", 99)
+            .record_target_terminal(
+                &crate::session_runtime_port::to_runtime_input_record(claimed[0].clone()),
+                "target-graph",
+                99,
+            )
             .expect_err("a missing target graph must not become a fake successful handoff");
         assert!(error.contains("without the target's durable execution graph"));
         assert!(router
@@ -1522,7 +1801,11 @@ mod tests {
         let report = services.graph_runner().start(target.clone()).await.unwrap();
         assert_eq!(report.completed, 1);
         let resolution = router
-            .record_target_terminal(&claimed[0], &target.id, 777)
+            .record_target_terminal(
+                &crate::session_runtime_port::to_runtime_input_record(claimed[0].clone()),
+                &target.id,
+                777,
+            )
             .expect("durable target result")
             .expect("cross-session resolution");
         assert_eq!(

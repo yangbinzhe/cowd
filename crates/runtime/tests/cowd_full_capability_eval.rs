@@ -6,17 +6,16 @@
 )]
 
 use chrono::Utc;
-use memory::store::session::SessionRecord;
 use memory::{
     AgentVisibility, CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig,
     MemoryEntry, MemoryLayer, MemoryScope, MemorySource, MemoryTurnContext, Priority,
-    UnifiedSessionStore,
 };
 use memory::{DocumentCategory, DocumentContent, DocumentIngestor};
 use runtime::{
     L4CandidateLifecycle, L4PromotionCandidate, L4PromotionService, RuntimeEventInput,
     RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
 };
+use session::{SessionRecord, UnifiedSessionStore};
 use std::sync::Arc;
 
 fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {

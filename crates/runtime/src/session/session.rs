@@ -969,11 +969,7 @@ impl ConversationMessage {
 
     /// Convert to a database-persistable SessionMessage record.
     /// All ContentBlocks are serialized as a JSON array in content_json.
-    pub fn to_session_message(
-        &self,
-        session_id: &str,
-        sequence: usize,
-    ) -> memory::store::session::SessionMessage {
+    pub fn to_session_message(&self, session_id: &str, sequence: usize) -> session::SessionMessage {
         let content_json =
             JsonValue::Array(self.blocks.iter().map(|b| b.to_json()).collect()).render();
 
@@ -993,7 +989,7 @@ impl ConversationMessage {
             })
             .unwrap_or((None, None));
 
-        memory::store::session::SessionMessage {
+        session::SessionMessage {
             stable_message_id: format!("runtime:{session_id}:{sequence}"),
             session_id: session_id.to_string(),
             sequence,

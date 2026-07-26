@@ -38,45 +38,6 @@ pub(crate) fn create_runtime_entry(
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
     let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
     create_runtime_entry_with_bootstrap_state(
-        None,
-        runtime_services,
-        provider_registry,
-        tool_host,
-        session,
-        session_id,
-        model,
-        system_prompt,
-        enable_tools,
-        emit_output,
-        allowed_tools,
-        permission_mode,
-        tool_callback,
-        stream_callback,
-        runtime_plugin_state,
-    )
-}
-
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn create_runtime_entry_with_session_store(
-    session_store: Arc<memory::session_store::UnifiedSessionStore>,
-    runtime_services: Arc<runtime::RuntimeServices>,
-    provider_registry: Arc<runtime::ProviderRegistry>,
-    tool_host: Arc<tools::ToolHost>,
-    session: Session,
-    session_id: &str,
-    model: String,
-    system_prompt: Vec<String>,
-    enable_tools: bool,
-    emit_output: bool,
-    allowed_tools: Option<AllowedToolSet>,
-    permission_mode: PermissionMode,
-    tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
-) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
-    create_runtime_entry_with_bootstrap_state(
-        Some(session_store),
         runtime_services,
         provider_registry,
         tool_host,
@@ -97,7 +58,6 @@ pub(crate) fn create_runtime_entry_with_session_store(
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn create_runtime_entry_with_bootstrap_state(
-    session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
     runtime_services: Arc<runtime::RuntimeServices>,
     provider_registry: Arc<runtime::ProviderRegistry>,
     tool_host: Arc<tools::ToolHost>,
@@ -119,9 +79,9 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     }
     let session_resume_packet = merge_resume_context_packets(
         session_db_resume_context_packet(&session),
-        session_store.as_ref().and_then(|store| {
-            semantic_checkpoint_resume_context_packet(Arc::clone(store), session_id)
-        }),
+        runtime_services
+            .session_history_reader()
+            .and_then(|history| semantic_checkpoint_resume_context_packet(history, session_id)),
     );
     let RuntimeBootstrapState {
         feature_config,
@@ -185,7 +145,6 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         stream_callback: stream_callback.clone(),
         tool_callback,
         model_context_window: Some(model_ctx),
-        session_store,
         hook_progress_reporter: emit_output.then(|| {
             Box::new(GatewayHookProgressReporter) as Box<dyn runtime::HookProgressReporter>
         }),

@@ -16,8 +16,8 @@ use surface::{
 pub(crate) use surface::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
     SurfaceIngressFrameRecord, SurfaceMessageLedgerMigrationSnapshot, SurfaceMessageSnapshot,
-    SurfaceOutboxRecord, SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord,
-    SurfaceTurnCorrelation,
+    SurfaceOutboxRecord, SurfaceSessionProjectionDraft, SurfaceTriggerEventReceipt,
+    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 
 const INBOX_FILE: &str = "surface_inbox.jsonl";
@@ -332,18 +332,27 @@ impl SqliteSurfaceMessageStore {
         runtime_session_id: &str,
         thread_id: Option<String>,
         sender_id: Option<String>,
+        projections: &[SurfaceSessionProjectionDraft],
     ) -> Result<SurfaceInboxReceipt, String> {
         let surface = normalize_surface_id(surface);
         let idempotency_key = inbound_idempotency_key(&surface, message_id);
         let mut state = self.lock_state()?;
-        if let Some(existing) = state.inbox.get(&idempotency_key) {
+        if state.inbox.contains_key(&idempotency_key) {
+            drop(state);
+            self.stage_inbox_projections(&idempotency_key, projections)?;
+            let existing = self
+                .lock_state()?
+                .inbox
+                .get(&idempotency_key)
+                .cloned()
+                .ok_or_else(|| "surface inbox disappeared during duplicate repair".to_string())?;
             return Ok(SurfaceInboxReceipt {
-                record: existing.clone(),
+                record: existing,
                 duplicate: true,
             });
         }
         let now = now_ms();
-        let record = SurfaceInboxRecord {
+        let mut record = SurfaceInboxRecord {
             id: idempotency_key.clone(),
             surface: surface.clone(),
             message_id: message_id.to_string(),
@@ -359,10 +368,14 @@ impl SqliteSurfaceMessageStore {
             runtime_session_id: Some(runtime_session_id.to_string()),
             runtime_turn_id: None,
             correlation: None,
+            session_projections: Vec::new(),
             last_error: None,
         };
+        record.stage_session_projections(projections)?;
         state.inbox.insert(idempotency_key.clone(), record.clone());
         if !self.insert_record_if_absent(INBOX_FILE, &record)? {
+            drop(state);
+            self.stage_inbox_projections(&idempotency_key, projections)?;
             let existing = self
                 .lock_state()?
                 .inbox
@@ -396,8 +409,36 @@ impl SqliteSurfaceMessageStore {
         })
     }
 
-    pub(crate) fn mark_inbox_processing(&self, idempotency_key: &str) -> Result<(), String> {
-        self.update_inbox_status(idempotency_key, "processing", None, None)
+    pub(crate) fn mark_inbox_processing(
+        &self,
+        idempotency_key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        let (record, staged) = self.update_record_by_key(
+            INBOX_FILE,
+            idempotency_key,
+            |record: &mut SurfaceInboxRecord| -> Result<(), String> {
+                record.stage_session_projections(projections)?;
+                record.status = "processing".to_string();
+                record.updated_at_ms = now_ms();
+                record.last_error = None;
+                Ok(())
+            },
+        )?;
+        staged?;
+        self.push_event(SurfaceDeliveryEvent {
+            event_id: new_event_id(),
+            surface: record.surface,
+            delivery_id: None,
+            message_id: Some(record.message_id),
+            kind: "inbox.processing".to_string(),
+            status: "processing".to_string(),
+            detail_json: serde_json::json!({
+                "session_projection_count": record.session_projections.len(),
+            }),
+            created_at_ms: now_ms(),
+        })?;
+        Ok(())
     }
 
     pub(crate) fn mark_inbox_processed(
@@ -412,19 +453,23 @@ impl SqliteSurfaceMessageStore {
         &self,
         idempotency_key: &str,
         correlation: SurfaceTurnCorrelation,
+        projections: &[SurfaceSessionProjectionDraft],
     ) -> Result<(), String> {
-        let (record, ()) = self.update_record_by_key(
+        let (record, staged) = self.update_record_by_key(
             INBOX_FILE,
             idempotency_key,
-            |record: &mut SurfaceInboxRecord| {
+            |record: &mut SurfaceInboxRecord| -> Result<(), String> {
+                record.stage_session_projections(projections)?;
                 record.status = "processed".to_string();
                 record.updated_at_ms = now_ms();
                 record.runtime_session_id = Some(correlation.session_id.clone());
                 record.runtime_turn_id = Some(correlation.turn_id.clone());
                 record.correlation = Some(correlation);
                 record.last_error = None;
+                Ok(())
             },
         )?;
+        staged?;
         self.push_event(SurfaceDeliveryEvent {
             event_id: new_event_id(),
             surface: record.surface.clone(),
@@ -478,8 +523,88 @@ impl SqliteSurfaceMessageStore {
         })
     }
 
-    pub(crate) fn mark_inbox_replied(&self, idempotency_key: &str) -> Result<(), String> {
-        self.update_inbox_status(idempotency_key, "replied", None, None)
+    pub(crate) fn mark_inbox_replied(
+        &self,
+        idempotency_key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        let (record, staged) = self.update_record_by_key(
+            INBOX_FILE,
+            idempotency_key,
+            |record: &mut SurfaceInboxRecord| -> Result<(), String> {
+                record.stage_session_projections(projections)?;
+                record.status = "replied".to_string();
+                record.updated_at_ms = now_ms();
+                record.last_error = None;
+                Ok(())
+            },
+        )?;
+        staged?;
+        self.push_event(SurfaceDeliveryEvent {
+            event_id: new_event_id(),
+            surface: record.surface,
+            delivery_id: None,
+            message_id: Some(record.message_id),
+            kind: "inbox.replied".to_string(),
+            status: "replied".to_string(),
+            detail_json: serde_json::json!({
+                "session_projection_count": record.session_projections.len(),
+            }),
+            created_at_ms: now_ms(),
+        })
+    }
+
+    pub(crate) fn mark_inbox_projection_applied(
+        &self,
+        idempotency_key: &str,
+        event_id: &str,
+        projected_at_ms: i64,
+    ) -> Result<(), String> {
+        let (_, result) = self.update_record_by_key(
+            INBOX_FILE,
+            idempotency_key,
+            |record: &mut SurfaceInboxRecord| {
+                record.mark_session_projection_applied(event_id, projected_at_ms)?;
+                record.updated_at_ms = now_ms();
+                Ok::<(), String>(())
+            },
+        )?;
+        result
+    }
+
+    pub(crate) fn stage_inbox_projections(
+        &self,
+        idempotency_key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        let (_, result) = self.update_record_by_key(
+            INBOX_FILE,
+            idempotency_key,
+            |record: &mut SurfaceInboxRecord| {
+                record.stage_session_projections(projections)?;
+                record.updated_at_ms = now_ms();
+                Ok::<(), String>(())
+            },
+        )?;
+        result
+    }
+
+    pub(crate) fn mark_inbox_projection_failed(
+        &self,
+        idempotency_key: &str,
+        event_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let (_, result) = self.update_record_by_key(
+            INBOX_FILE,
+            idempotency_key,
+            |record: &mut SurfaceInboxRecord| {
+                record.mark_session_projection_failed(event_id, error)?;
+                record.updated_at_ms = now_ms();
+                Ok::<(), String>(())
+            },
+        )?;
+        result
     }
 
     pub(crate) fn mark_inbox_reply_failed(
@@ -1598,11 +1723,24 @@ impl SurfaceMessageLedger for SqliteSurfaceMessageStore {
         session: &str,
         thread: Option<String>,
         sender: Option<String>,
+        projections: &[SurfaceSessionProjectionDraft],
     ) -> Result<SurfaceInboxReceipt, String> {
-        self.record_inbox_received(surface, message_id, payload, session, thread, sender)
+        self.record_inbox_received(
+            surface,
+            message_id,
+            payload,
+            session,
+            thread,
+            sender,
+            projections,
+        )
     }
-    fn mark_inbox_processing(&self, key: &str) -> Result<(), String> {
-        self.mark_inbox_processing(key)
+    fn mark_inbox_processing(
+        &self,
+        key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.mark_inbox_processing(key, projections)
     }
     fn mark_inbox_processed(&self, key: &str, turn: Option<String>) -> Result<(), String> {
         self.mark_inbox_processed(key, turn)
@@ -1611,14 +1749,42 @@ impl SurfaceMessageLedger for SqliteSurfaceMessageStore {
         &self,
         key: &str,
         correlation: SurfaceTurnCorrelation,
+        projections: &[SurfaceSessionProjectionDraft],
     ) -> Result<(), String> {
-        self.mark_inbox_admitted(key, correlation)
+        self.mark_inbox_admitted(key, correlation, projections)
     }
     fn record_inbox_terminal_delivery(&self, key: &str, terminal: &str) -> Result<(), String> {
         self.record_inbox_terminal_delivery(key, terminal)
     }
-    fn mark_inbox_replied(&self, key: &str) -> Result<(), String> {
-        self.mark_inbox_replied(key)
+    fn mark_inbox_replied(
+        &self,
+        key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.mark_inbox_replied(key, projections)
+    }
+    fn stage_inbox_projections(
+        &self,
+        key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.stage_inbox_projections(key, projections)
+    }
+    fn mark_inbox_projection_applied(
+        &self,
+        key: &str,
+        event_id: &str,
+        projected_at_ms: i64,
+    ) -> Result<(), String> {
+        self.mark_inbox_projection_applied(key, event_id, projected_at_ms)
+    }
+    fn mark_inbox_projection_failed(
+        &self,
+        key: &str,
+        event_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        self.mark_inbox_projection_failed(key, event_id, error)
     }
     fn mark_inbox_reply_failed(&self, key: &str, error: &str) -> Result<(), String> {
         self.mark_inbox_reply_failed(key, error)
@@ -2471,6 +2637,18 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn session_projection(phase: &str) -> SurfaceSessionProjectionDraft {
+        SurfaceSessionProjectionDraft {
+            phase: phase.to_string(),
+            session_id: "surface:feishu:sender".to_string(),
+            scope: "message".to_string(),
+            kind: format!("surface.message_{phase}"),
+            status: phase.to_string(),
+            payload_json: serde_json::json!({"type": phase, "message_id": "msg-1"}),
+            phase_offset_ms: 0,
+        }
+    }
+
     #[test]
     fn surface_message_store_rejects_non_sqlite_storage_endpoint() {
         let endpoint = storage::StorageEndpoint::postgres(
@@ -2620,6 +2798,7 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("cowd-edge-inbox-store-{}", uuid::Uuid::new_v4()));
         let store = SqliteSurfaceMessageStore::new(&root);
+        let received_projection = session_projection("received");
         let receipt = store
             .record_inbox_received(
                 "Lark",
@@ -2628,9 +2807,20 @@ mod tests {
                 "surface:feishu:sender",
                 Some("thread-1".to_string()),
                 Some("user-1".to_string()),
+                std::slice::from_ref(&received_projection),
             )
             .unwrap();
         assert!(!receipt.duplicate);
+        let projection = receipt
+            .record
+            .session_projections
+            .first()
+            .expect("projection is staged");
+        assert_eq!(projection.projection_state, "pending");
+        let event_id = projection.event_id.clone();
+        store
+            .mark_inbox_projection_applied(&receipt.record.idempotency_key, &event_id, 42)
+            .unwrap();
 
         let reloaded = SqliteSurfaceMessageStore::new(&root);
         let duplicate = reloaded
@@ -2641,10 +2831,15 @@ mod tests {
                 "surface:feishu:sender",
                 Some("thread-1".to_string()),
                 Some("user-1".to_string()),
+                std::slice::from_ref(&received_projection),
             )
             .unwrap();
         assert!(duplicate.duplicate);
         assert_eq!(reloaded.list_inbox("feishu").len(), 1);
+        let projection = &duplicate.record.session_projections[0];
+        assert_eq!(projection.event_id, event_id);
+        assert_eq!(projection.projection_state, "applied");
+        assert_eq!(projection.projected_at_ms, Some(42));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2783,10 +2978,11 @@ mod tests {
                 "feishu:user:chat",
                 Some("chat".to_string()),
                 Some("user".to_string()),
+                &[],
             )
             .unwrap();
         store
-            .mark_inbox_processing(&inbox.record.idempotency_key)
+            .mark_inbox_processing(&inbox.record.idempotency_key, &[])
             .unwrap();
         store
             .mark_inbox_processed(&inbox.record.idempotency_key, Some("turn-1".to_string()))
@@ -2843,6 +3039,7 @@ mod tests {
                 "surface:wecom:chat-1",
                 Some("thread-1".to_string()),
                 Some("user-1".to_string()),
+                &[],
             )
             .unwrap();
         let correlation = SurfaceTurnCorrelation {
@@ -2858,7 +3055,7 @@ mod tests {
             terminal_delivery_revision: 0,
         };
         store
-            .mark_inbox_admitted(&inbox.record.idempotency_key, correlation)
+            .mark_inbox_admitted(&inbox.record.idempotency_key, correlation, &[])
             .unwrap();
         store
             .record_inbox_terminal_delivery(&inbox.record.idempotency_key, "turn-terminal:req-1")
@@ -2909,10 +3106,11 @@ mod tests {
                 "feishu:user:chat",
                 Some("chat".to_string()),
                 Some("user".to_string()),
+                &[],
             )
             .unwrap();
         store
-            .mark_inbox_processing(&inbox.record.idempotency_key)
+            .mark_inbox_processing(&inbox.record.idempotency_key, &[])
             .unwrap();
         store
             .mark_inbox_failed(&inbox.record.idempotency_key, "turn timed out after 240s")
@@ -2984,10 +3182,11 @@ mod tests {
                 "feishu:user:chat",
                 Some("chat".to_string()),
                 Some("user".to_string()),
+                &[],
             )
             .unwrap();
         store
-            .mark_inbox_processing(&inbox.record.idempotency_key)
+            .mark_inbox_processing(&inbox.record.idempotency_key, &[])
             .unwrap();
 
         let reloaded = SqliteSurfaceMessageStore::new(&root);
@@ -3117,6 +3316,7 @@ mod tests {
                 "session-1",
                 None,
                 None,
+                &[],
             )
             .unwrap();
 
@@ -3149,6 +3349,7 @@ mod tests {
             runtime_session_id: Some("legacy-session".to_string()),
             runtime_turn_id: None,
             correlation: None,
+            session_projections: Vec::new(),
             last_error: None,
         };
         std::fs::write(
@@ -3343,6 +3544,7 @@ mod tests {
                 "migration-session",
                 None,
                 None,
+                &[],
             )
             .unwrap();
         source
@@ -3450,6 +3652,7 @@ mod tests {
                 "postgres-migration-session",
                 None,
                 None,
+                &[],
             )
             .unwrap();
         source

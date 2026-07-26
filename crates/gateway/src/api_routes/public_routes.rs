@@ -49,7 +49,7 @@ async fn gateway_health_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     Json(
-        serde_json::to_value(crate::gateway_health::gateway_health_snapshot(&state))
+        serde_json::to_value(crate::gateway_health::gateway_health_snapshot(&state).await)
             .unwrap_or_else(|_| serde_json::json!({"status":"error"})),
     )
 }
@@ -57,7 +57,7 @@ async fn gateway_health_handler(
 async fn gateway_ready_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let snapshot = crate::gateway_health::gateway_readiness_snapshot(&state);
+    let snapshot = crate::gateway_health::gateway_readiness_snapshot(&state).await;
     let status = if snapshot.ready {
         StatusCode::OK
     } else {
@@ -75,7 +75,7 @@ async fn gateway_ready_handler(
 async fn webui_manifest_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let health = crate::gateway_health::gateway_health_snapshot(&state);
+    let health = crate::gateway_health::gateway_health_snapshot(&state).await;
     let enabled_app_ids = state
         .services
         .app_registry

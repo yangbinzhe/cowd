@@ -16,7 +16,7 @@
 //! - FTS5 search (English + Chinese)
 //! - Multi-block content extraction for FTS indexing
 
-use memory::store::session::{SessionMessage, SqliteSessionStore};
+use session::{SessionMessage, SqliteSessionStore};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -30,7 +30,7 @@ fn make_store() -> (SqliteSessionStore, tempfile::TempDir) {
 }
 
 fn make_session(store: &SqliteSessionStore, id: &str) {
-    use memory::store::session::SessionRecord;
+    use session::SessionRecord;
     store
         .create_session(&SessionRecord {
             session_id: id.to_string(),

@@ -72,8 +72,6 @@ pub mod context_profiler;
 pub mod context_runtime;
 #[path = "context/tool_exposure.rs"]
 pub mod context_tool_exposure;
-#[path = "infrastructure/execution_outcome.rs"]
-pub mod execution_outcome;
 #[path = "context/knowledge_activation.rs"]
 pub mod knowledge_activation;
 #[path = "context/knowledge_compliance.rs"]
@@ -249,6 +247,8 @@ pub mod session_input;
 pub mod session_lifecycle;
 #[path = "session/session_relation_graph.rs"]
 pub mod session_relation_graph;
+#[path = "session/session_runtime_port.rs"]
+pub mod session_runtime_port;
 #[path = "skill/mod.rs"]
 pub mod skill;
 #[path = "recovery/source_self_audit.rs"]
@@ -391,8 +391,7 @@ pub use conflict_arbiter::{
     ConflictSeverity, ConflictSourceKind,
 };
 pub use context_evidence::{
-    audit_projection as project_evidence_audit, migrate_legacy_raw_evidence, AuditProjection,
-    ModelReceipt, RawEvidenceMigrationOptions, RawEvidenceMigrationReport,
+    audit_projection as project_evidence_audit, AuditProjection, ModelReceipt,
 };
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
@@ -478,6 +477,16 @@ pub use managed_agent::{
     ManagedAgentRuntimeDispatchReport,
 };
 pub use runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
+pub use session_execution::{
+    SessionExecutionFence, SessionExecutionFencePhase, SessionExecutionFenceSnapshot,
+};
+pub use session_runtime_port::{
+    RuntimeContextEnvelopeRecord, RuntimeSessionEvent, RuntimeSessionEventKind,
+    RuntimeSessionEventReceipt, RuntimeSessionEventRef, RuntimeSessionIngressCommand,
+    RuntimeSessionInputAdmission, RuntimeSessionInputRecord, RuntimeSessionInputStatus,
+    RuntimeSessionRecord, SessionRuntimeIngressPort, SessionRuntimeJournalPort,
+    SessionRuntimeQueryPort,
+};
 
 pub use artifact::{
     ArtifactError, ArtifactGcPort, ArtifactGcReport, ArtifactMetadataPort,
@@ -640,8 +649,8 @@ pub use runtime_event_store::{
     RuntimeEventStoreBackend, RuntimeEventStoreError, RuntimeEventStoreResult,
     RuntimeEventStoreSnapshot, RuntimeEventStreamHeadSnapshot,
     RuntimeEventTransactionStreamSnapshot, RuntimeSessionOutboxFailureClass,
-    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeTransactionEventInput,
-    SessionTerminalInput,
+    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption,
+    RuntimeTransactionEventInput, SessionTerminalInput,
 };
 pub use sandbox::{
     detect_container_environment, detect_container_environment_from, resolve_sandbox_status,

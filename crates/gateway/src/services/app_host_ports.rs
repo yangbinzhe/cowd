@@ -12,10 +12,11 @@ use std::{
 
 use async_trait::async_trait;
 use cowd_app_sdk::{
-    AppHostError, AppHostPorts, AppId, ApprovalPort, ConnectorPort, CowdAppContext,
-    CredentialLifecycleCheck, CredentialLifecycleError, CredentialLifecyclePort, CrossPlanePort,
-    HostIntent, HostReceipt, InvocationContext, PlatformPort, RealityPort, RuntimePort,
-    WorkContextPort,
+    AppHostConflict, AppHostError, AppHostPorts, AppId, ApplicationExecutionOutcomeIntentV1,
+    ApprovalPort, ConnectorPort, CowdAppContext, CredentialLifecycleCheck,
+    CredentialLifecycleError, CredentialLifecyclePort, CrossPlanePort, HostIntent, HostReceipt,
+    InvocationContext, PlatformPort, RealityPort, RuntimePort, WorkContextPort,
+    APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1,
 };
 use harness_contract::{
     core::TaskRisk,
@@ -29,7 +30,6 @@ use runtime::{
 use serde::Deserialize;
 
 use matrix_core::MatrixEvidencePacket;
-use memory::store::session::SessionRecord;
 use surface::SurfaceSendRequest;
 
 use crate::api_routes::{connector_routes::connector_snapshot, AppState};
@@ -59,11 +59,6 @@ pub(crate) const REALITY_RUN_COMPUTE_JOB_INTENT_V1: &str = "cowd.reality.run_com
 /// product projection while Gateway owns the selected Reality backend.
 pub(crate) const REALITY_MATRIX_OPERATION_INTENT_V1: &str =
     matrix_app_reality::MATRIX_OPERATION_INTENT_V1;
-/// Closed, application-neutral append-only session-domain-event effect.
-/// The application supplies data only; Gateway owns the verified-principal
-/// binding, session lifecycle and durable event allocation.
-pub(crate) const WORK_CONTEXT_APPEND_SESSION_EVENT_INTENT_V1: &str =
-    "cowd.work_context.append_session_event.v1";
 /// Closed context projection for Matrix evidence. Matrix is a Cowd core
 /// domain; the application never receives the Context service or its types.
 pub(crate) const WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_INTENT_V1: &str =
@@ -97,6 +92,7 @@ const APP_REQUEST_PRINCIPAL_LIMIT: usize = 4096;
 #[derive(Clone)]
 struct BoundAppPrincipal {
     principal: VerifiedPrincipal,
+    producer_id: String,
     workspace_id: String,
     surface: String,
     bound_at: Instant,
@@ -141,6 +137,7 @@ impl GatewayAppHostBinding {
         &self,
         principal: &VerifiedPrincipal,
         context: &InvocationContext,
+        producer_id: String,
     ) {
         let now = Instant::now();
         let mut principals = self
@@ -164,6 +161,7 @@ impl GatewayAppHostBinding {
             context.request_id.clone(),
             BoundAppPrincipal {
                 principal: principal.clone(),
+                producer_id,
                 workspace_id: context.workspace_id.clone(),
                 surface: context.surface.clone(),
                 bound_at: now,
@@ -185,6 +183,13 @@ impl GatewayAppHostBinding {
         &self,
         context: &InvocationContext,
     ) -> Result<VerifiedPrincipal, AppHostError> {
+        self.verified_binding(context).map(|bound| bound.principal)
+    }
+
+    fn verified_binding(
+        &self,
+        context: &InvocationContext,
+    ) -> Result<BoundAppPrincipal, AppHostError> {
         let now = Instant::now();
         let mut principals = self
             .request_principals
@@ -205,7 +210,7 @@ impl GatewayAppHostBinding {
                 "application effect invocation does not match its verified Gateway request".into(),
             ));
         }
-        Ok(bound.principal.clone())
+        Ok(bound.clone())
     }
 
     fn unsupported(port: &str, kind: &str) -> AppHostError {
@@ -628,6 +633,26 @@ impl ApplicationApprovalDecisionIntentV1 {
     }
 }
 
+fn application_execution_host_error(
+    error: session::SessionError,
+    producer_id: &str,
+    contract_version: u16,
+    outcome_id: &str,
+) -> AppHostError {
+    match error {
+        session::SessionError::IdempotencyConflict { namespace, key } => {
+            AppHostError::Conflict(AppHostConflict::Idempotency {
+                namespace: namespace.to_string(),
+                key,
+                producer_id: producer_id.to_string(),
+                contract_version,
+                outcome_id: outcome_id.to_string(),
+            })
+        }
+        other => AppHostError::Failed(other.to_string()),
+    }
+}
+
 fn registered_application_approval_source(
     app_registry: &cowd_app_host::AppRegistry,
     app_id: &str,
@@ -659,6 +684,78 @@ fn registered_application_approval_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn producer_principal(
+        principal_id: &str,
+        credential_fingerprint: &str,
+    ) -> runtime::VerifiedPrincipal {
+        runtime::VerifiedPrincipal::from_test_claims(harness_contract::security::PrincipalClaims {
+            principal_id: principal_id.to_string(),
+            kind: harness_contract::security::PrincipalKind::Service,
+            scopes: vec!["gateway".to_string()],
+            capabilities: Vec::new(),
+            assurance: harness_contract::security::PrincipalAssurance::Normal,
+            issuer: "test.gateway".to_string(),
+            issued_at_ms: 1,
+            expires_at_ms: None,
+            credential_fingerprint: credential_fingerprint.to_string(),
+            credential_epoch: 1,
+            profile_revision: 1,
+        })
+    }
+
+    #[test]
+    fn application_producer_is_read_only_from_the_gateway_bound_request_record() {
+        let host = GatewayAppHostBinding::new();
+        let principal = producer_principal("same-human", "credential-1");
+        let app_a = InvocationContext {
+            principal_id: "same-human".to_string(),
+            workspace_id: "workspace".to_string(),
+            surface: "gateway".to_string(),
+            request_id: "request-app-a".to_string(),
+        };
+        let app_b = InvocationContext {
+            request_id: "request-app-b".to_string(),
+            ..app_a.clone()
+        };
+        host.bind_request_principal(&principal, &app_a, "app:app-a".to_string());
+        host.bind_request_principal(&principal, &app_b, "app:app-b".to_string());
+        assert_eq!(
+            host.verified_binding(&app_a).unwrap().producer_id,
+            "app:app-a"
+        );
+        assert_eq!(
+            host.verified_binding(&app_b).unwrap().producer_id,
+            "app:app-b"
+        );
+    }
+
+    #[test]
+    fn session_idempotency_conflict_maps_to_typed_app_host_conflict() {
+        let error = application_execution_host_error(
+            session::SessionError::IdempotencyConflict {
+                namespace: "session_domain_event",
+                key: "application-execution:v1:fixture".to_string(),
+            },
+            "app:mfg",
+            1,
+            "outcome-1",
+        );
+
+        assert!(matches!(
+            error,
+            AppHostError::Conflict(AppHostConflict::Idempotency {
+                namespace,
+                key,
+                producer_id,
+                contract_version: 1,
+                outcome_id,
+            }) if namespace == "session_domain_event"
+                && key == "application-execution:v1:fixture"
+                && producer_id == "app:mfg"
+                && outcome_id == "outcome-1"
+        ));
+    }
 
     #[test]
     fn approval_source_must_match_a_registered_app_and_declared_capability() {
@@ -1001,26 +1098,45 @@ impl WorkContextPort for GatewayAppHostBinding {
         let state = self.state()?;
         // Every WorkContext effect is request-bound before it can touch
         // durable session state or reveal a host projection.
-        let _principal = self.verified_principal(context)?;
+        let binding = self.verified_binding(context)?;
         match intent.kind.as_str() {
-            WORK_CONTEXT_APPEND_SESSION_EVENT_INTENT_V1 => {
-                let request: WorkContextAppendSessionEventIntentV1 =
+            APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1 => {
+                let request: ApplicationExecutionOutcomeIntentV1 =
                     serde_json::from_value(intent.payload).map_err(|error| {
                         AppHostError::Denied(format!(
-                            "append_session_event intent must contain only the closed session event envelope: {error}"
+                            "application execution outcome intent is invalid: {error}"
                         ))
                     })?;
-                validate_work_context_session_event(&request)?;
-                let scope = parse_work_context_scope(&request.scope)?;
-                append_work_context_session_event(&state, &request, scope).await?;
+                request.validate().map_err(|error| {
+                    AppHostError::Denied(format!(
+                        "application execution outcome intent is invalid: {error}"
+                    ))
+                })?;
+                let receipt = state
+                    .services
+                    .session
+                    .append_application_execution_outcome_for_producer(
+                        &request.session_id,
+                        &binding.producer_id,
+                        &request.outcome,
+                    )
+                    .await
+                    .map_err(|error| {
+                        application_execution_host_error(
+                            error,
+                            &binding.producer_id,
+                            request.outcome.contract_version,
+                            &request.outcome.outcome_id,
+                        )
+                    })?;
                 Ok(HostReceipt {
-                    id: format!("work-context:session-event:{}", context.request_id),
+                    id: format!("work-context:execution-outcome:{}", context.request_id),
                     status: "completed".to_string(),
-                    replayed: false,
+                    replayed: receipt.replayed,
                     payload: serde_json::json!({
-                        "kind": "cowd.work_context.append_session_event.receipt.v1",
+                        "kind": "cowd.work_context.append_application_execution_outcome.receipt.v1",
                         "session_id": request.session_id,
-                        "event_type": request.event_type,
+                        "receipt": receipt,
                     }),
                 })
             }
@@ -1204,17 +1320,6 @@ impl PlatformPort for GatewayAppHostBinding {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkContextAppendSessionEventIntentV1 {
-    session_id: String,
-    platform: String,
-    scope: String,
-    event_type: String,
-    payload: serde_json::Value,
-    occurred_at_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct WorkContextStructuredEvidenceItemIntentV1 {
     packet: MatrixEvidencePacket,
 }
@@ -1349,137 +1454,6 @@ async fn observe_task_terminal(
         }));
     }
     Ok(None)
-}
-
-fn validate_work_context_session_event(
-    request: &WorkContextAppendSessionEventIntentV1,
-) -> Result<(), AppHostError> {
-    let valid_label = |value: &str, limit: usize| {
-        !value.trim().is_empty()
-            && value.len() <= limit
-            && value.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
-            })
-    };
-    // Session identifiers are host keys, not application capability names.
-    // Preserve existing session formats (for example provider-prefixed or
-    // slash-containing IDs) while rejecting blank, oversized and control
-    // character input before it reaches a durable store.
-    if request.session_id.trim().is_empty()
-        || request.session_id.len() > 256
-        || request.session_id.chars().any(char::is_control)
-    {
-        return Err(AppHostError::Denied(
-            "work-context session_id must be a non-empty bounded non-control value".to_string(),
-        ));
-    }
-    if !valid_label(&request.platform, 64) {
-        return Err(AppHostError::Denied(
-            "work-context platform must be a non-empty bounded identifier".to_string(),
-        ));
-    }
-    if !valid_label(&request.event_type, 128) {
-        return Err(AppHostError::Denied(
-            "work-context event_type must be a non-empty bounded identifier".to_string(),
-        ));
-    }
-    if !request.payload.is_object() {
-        return Err(AppHostError::Denied(
-            "work-context event payload must be a JSON object".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn parse_work_context_scope(value: &str) -> Result<memory::SessionDomainScope, AppHostError> {
-    match value {
-        "memory" => Ok(memory::SessionDomainScope::Memory),
-        "application_task" => Ok(memory::SessionDomainScope::ApplicationTask),
-        "context" => Ok(memory::SessionDomainScope::Context),
-        "tool" => Ok(memory::SessionDomainScope::Tool),
-        _ => Err(AppHostError::Denied(
-            "work-context scope must be one of memory, application_task, context or tool"
-                .to_string(),
-        )),
-    }
-}
-
-async fn append_work_context_session_event(
-    state: &AppState,
-    request: &WorkContextAppendSessionEventIntentV1,
-    scope: memory::SessionDomainScope,
-) -> Result<(), AppHostError> {
-    let Some(store) = state.services.session.unified_store() else {
-        // Embedded products may intentionally omit the optional unified
-        // session store. Preserve Matrix's existing best-effort projection
-        // behavior while keeping the outcome explicit at the host boundary.
-        return Ok(());
-    };
-    ensure_work_context_session_record(state, &request.session_id, &request.platform)
-        .await
-        .map_err(AppHostError::Failed)?;
-    let event = memory::SessionDomainEvent::new(
-        &request.session_id,
-        0,
-        scope,
-        &request.event_type,
-        request.payload.clone(),
-        request.occurred_at_ms,
-    );
-    store
-        .append_session_domain_event_allocating_sequence(&event)
-        .await
-        .map(|_| ())
-        .map_err(|error| AppHostError::Failed(error.to_string()))
-}
-
-async fn ensure_work_context_session_record(
-    state: &AppState,
-    session_id: &str,
-    platform: &str,
-) -> Result<(), String> {
-    let Some(store) = state.services.session.unified_store() else {
-        return Ok(());
-    };
-    let now = chrono::Utc::now().to_rfc3339();
-    if let Some(mut record) = store
-        .get_session(session_id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        record.last_activity = now;
-        record.platform = platform.to_string();
-        return store
-            .update_session(&record)
-            .await
-            .map_err(|error| error.to_string());
-    }
-    let metadata_json = serde_json::json!({
-        "kind": "cowd.work_context.session",
-        "session_id": session_id,
-        "platform": platform,
-    })
-    .to_string();
-    let record = SessionRecord {
-        session_id: session_id.to_string(),
-        platform: platform.to_string(),
-        chat_id: session_id.to_string(),
-        user_id: None,
-        model: None,
-        created_at: now.clone(),
-        last_activity: now,
-        message_count: 0,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(metadata_json),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-        status: "active".to_string(),
-    };
-    store
-        .create_session(&record)
-        .await
-        .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Deserialize)]

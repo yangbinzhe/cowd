@@ -11,6 +11,7 @@ use uuid::Uuid;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionResourceKind {
+    SessionTurn,
     Provider,
     Agent,
     Tool,

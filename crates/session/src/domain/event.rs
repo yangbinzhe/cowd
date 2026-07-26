@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::store::session::SessionEvent;
+use crate::persistence::SessionEvent;
 
 /// Wire event type used by canonical session-domain events.
 pub const SESSION_DOMAIN_EVENT_TYPE: &str = "SessionDomainEvent";
@@ -110,88 +110,25 @@ impl SessionDomainEvent {
         serde_json::from_str(&event.event_json)
     }
 
-    /// Project legacy non-lifecycle session events into the domain timeline.
-    pub(crate) fn from_session_event_lossy(event: &SessionEvent) -> Self {
-        if event.event_type == SESSION_DOMAIN_EVENT_TYPE {
-            if let Ok(domain_event) = Self::from_session_event(event) {
-                return domain_event;
-            }
+    /// Compare the semantic content of two stored domain events while
+    /// ignoring only the store-allocated sequence. `serde_json::Value`
+    /// equality already ignores object-key insertion order while preserving
+    /// array order and scalar values.
+    pub fn semantically_equivalent(
+        left: &SessionEvent,
+        right: &SessionEvent,
+    ) -> Result<bool, serde_json::Error> {
+        if left.session_id != right.session_id
+            || left.event_type != right.event_type
+            || left.created_at_ms != right.created_at_ms
+        {
+            return Ok(false);
         }
-
-        let (payload, raw_parse_failed) = match serde_json::from_str::<Value>(&event.event_json) {
-            Ok(value) => (value, false),
-            Err(_) => (serde_json::json!({ "raw": event.event_json }), true),
-        };
-        let payload = if event.event_type == SESSION_DOMAIN_EVENT_TYPE && raw_parse_failed {
-            serde_json::json!({
-                "raw": event.event_json,
-                "parse_error": "invalid_session_domain_event_json"
-            })
-        } else {
-            payload
-        };
-        let status = if event.event_type == SESSION_DOMAIN_EVENT_TYPE {
-            Some("degraded".to_string())
-        } else {
-            payload
-                .get("status")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        };
-
-        Self {
-            event_id: format!("legacy-domain:{}:{}", event.session_id, event.sequence),
-            session_id: event.session_id.clone(),
-            sequence: event.sequence,
-            scope: scope_for_legacy_event_type(&event.event_type),
-            kind: event.event_type.clone(),
-            span_id: None,
-            parent_span_id: None,
-            correlation_id: None,
-            status,
-            refs: refs_from_payload(&payload),
-            payload,
-            created_at_ms: event.created_at_ms,
-        }
-    }
-}
-
-fn refs_from_payload(payload: &Value) -> Vec<SessionDomainRef> {
-    payload
-        .get("refs")
-        .and_then(Value::as_array)
-        .map(|refs| {
-            refs.iter()
-                .filter_map(|reference| {
-                    let ref_type = reference
-                        .get("type")
-                        .or_else(|| reference.get("ref_type"))
-                        .and_then(Value::as_str)?;
-                    let id = reference.get("id").and_then(Value::as_str)?;
-                    Some(SessionDomainRef {
-                        ref_type: ref_type.to_string(),
-                        id: id.to_string(),
-                        label: reference
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn scope_for_legacy_event_type(event_type: &str) -> SessionDomainScope {
-    match event_type {
-        "RuntimeRun" => SessionDomainScope::Turn,
-        "ContextEnvelope" => SessionDomainScope::Context,
-        "ToolObservationRaw" | "ToolStart" | "ToolComplete" => SessionDomainScope::Tool,
-        "TextDelta" | "message_appended" => SessionDomainScope::Message,
-        "MemoryPulse" => SessionDomainScope::Memory,
-        "PolicyDecision" => SessionDomainScope::Policy,
-        "MfgOutcome" => SessionDomainScope::Mfg,
-        _ => SessionDomainScope::Session,
+        let mut left = Self::from_session_event(left)?;
+        let mut right = Self::from_session_event(right)?;
+        left.sequence = 0;
+        right.sequence = 0;
+        Ok(left == right)
     }
 }
 
@@ -220,16 +157,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_transcript_event_projects_without_execution_scope() {
-        let stored = SessionEvent {
-            session_id: "s-legacy".to_string(),
-            event_type: "ToolStart".to_string(),
-            event_json: serde_json::json!({"tool": "shell"}).to_string(),
-            sequence: 3,
-            created_at_ms: 44,
-        };
-        let event = SessionDomainEvent::from_session_event_lossy(&stored);
-        assert_eq!(event.scope, SessionDomainScope::Tool);
-        assert_eq!(event.event_id, "legacy-domain:s-legacy:3");
+    fn semantic_equivalence_ignores_sequence_and_object_key_order_only() {
+        let mut first = SessionDomainEvent::new(
+            "s-semantic",
+            0,
+            SessionDomainScope::ApplicationTask,
+            "application.execution_outcome",
+            serde_json::json!({"a": 1, "b": 2}),
+            1234,
+        );
+        first.event_id = "app-outcome-1".to_string();
+        let first = first.to_session_event().unwrap();
+
+        let mut second = SessionDomainEvent::from_session_event(&first).unwrap();
+        second.sequence = 99;
+        second.payload = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
+        let second = second.to_session_event().unwrap();
+        assert!(SessionDomainEvent::semantically_equivalent(&first, &second).unwrap());
+
+        let mut changed = SessionDomainEvent::from_session_event(&second).unwrap();
+        changed.payload["b"] = serde_json::json!(3);
+        let changed = changed.to_session_event().unwrap();
+        assert!(!SessionDomainEvent::semantically_equivalent(&first, &changed).unwrap());
     }
 }

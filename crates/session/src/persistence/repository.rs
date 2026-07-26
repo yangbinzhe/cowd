@@ -8,7 +8,7 @@
 //! Replace:
 //!
 //! ```rust,no_run
-//! use memory::store::session::SqliteSessionStore;
+//! use session::SqliteSessionStore;
 //! use std::path::Path;
 //! let store = SqliteSessionStore::open(Path::new("sessions.db")).unwrap();
 //! ```
@@ -16,7 +16,7 @@
 //! with:
 
 //! ```rust,no_run
-//! use memory::UnifiedSessionStore;
+//! use session::UnifiedSessionStore;
 //! use std::path::Path;
 //! let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();
 //! ```
@@ -24,19 +24,26 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::runtime_event::{SessionDomainEvent, SessionDomainEventPage, SESSION_DOMAIN_EVENT_TYPE};
-use crate::session_backend::SharedSessionStoreBackend;
-use crate::session_execution_plane::{
-    StorageExecutionPlane, StorageExecutionPlaneConfig, StorageExecutionPlaneStats,
+use crate::domain::{
+    SessionBranchActivation, SessionBranchActivationTransition, SessionDomainEvent,
+    SessionDomainEventPage, SessionLifecycleIntent, SessionLifecyclePlan,
+    SessionLifecycleTransition, SESSION_DOMAIN_EVENT_TYPE,
 };
-use crate::store::session::{
-    OutboxFailureClass, SessionEvent, SessionListOptions, SessionListPage, SessionMessage,
+use crate::error::{Result, SessionError};
+use crate::persistence::backend::{SessionStoreBackend, SharedSessionStoreBackend};
+use crate::persistence::execution_plane::{
+    StorageExecutionLane, StorageExecutionPlane, StorageExecutionPlaneConfig,
+    StorageExecutionPlaneStats,
+};
+use crate::persistence::sqlite::{
+    OutboxFailureClass, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
+    SessionLifecycleTombstoneRequest, SessionListOptions, SessionListPage, SessionMessage,
     SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
-    SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeOutboxHealth,
-    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
-    SqliteSessionStore,
+    SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionSearchResult, SessionSnapshot, SessionTerminalTranscriptCommit,
+    SessionTerminalTranscriptReceipt, SqliteSessionStore,
 };
-use crate::store::Result;
 
 // ---------------------------------------------------------------------------
 // UnifiedSessionStore
@@ -51,7 +58,7 @@ use crate::store::Result;
 /// # Example
 ///
 /// ```rust,no_run
-/// use memory::UnifiedSessionStore;
+/// use session::UnifiedSessionStore;
 /// use std::path::Path;
 ///
 /// let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();
@@ -73,7 +80,10 @@ impl UnifiedSessionStore {
     /// the database is new.
     pub fn open(path: &Path) -> Result<Self> {
         let store = SqliteSessionStore::open(path)?;
-        Ok(Self::from_backend(Arc::new(store)))
+        Ok(Self {
+            inner: Arc::new(store),
+            execution: Arc::new(StorageExecutionPlane::sqlite_default_plane()),
+        })
     }
 
     /// Open a SQLite session database from an explicitly SQLite storage
@@ -93,19 +103,25 @@ impl UnifiedSessionStore {
         config: StorageExecutionPlaneConfig,
     ) -> Result<Self> {
         if handle.backend != storage::StorageBackendKind::Sqlite {
-            return Err(crate::error::MemoryError::Store(format!(
+            return Err(SessionError::Store(format!(
                 "storage handle `{}` is not sqlite-backed",
                 handle.domain
             )));
         }
         let store = SqliteSessionStore::open_storage_handle(handle)?;
-        Self::from_backend_with_execution_config(Arc::new(store), config)
+        Ok(Self {
+            inner: Arc::new(store),
+            execution: Arc::new(StorageExecutionPlane::new_sqlite(config)?),
+        })
     }
 
     /// Open an in-memory session database (useful for testing).
     pub fn open_in_memory() -> Result<Self> {
         let store = SqliteSessionStore::open_in_memory()?;
-        Ok(Self::from_backend(Arc::new(store)))
+        Ok(Self {
+            inner: Arc::new(store),
+            execution: Arc::new(StorageExecutionPlane::sqlite_default_plane()),
+        })
     }
 
     /// Build the application-facing store from the selected durable backend.
@@ -134,14 +150,62 @@ impl UnifiedSessionStore {
         self.execution.stats()
     }
 
-    async fn execute<T, F>(&self, operation: F) -> Result<T>
+    /// Derive the read-only capability consumed by memory reconstruction.
+    #[must_use]
+    pub fn history_reader(&self) -> crate::persistence::SessionHistoryReader {
+        crate::persistence::SessionHistoryReader::new(self.clone())
+    }
+
+    /// Stop accepting repository operations, drain every admitted lane, and
+    /// wait for all blocking backend work to finish. All clones share this
+    /// lifecycle boundary.
+    pub async fn shutdown_and_drain(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<StorageExecutionPlaneStats> {
+        self.execution.shutdown_and_drain(timeout).await
+    }
+
+    async fn execute_on<T, F>(
+        &self,
+        lane: StorageExecutionLane,
+        write: bool,
+        operation: F,
+    ) -> Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&dyn crate::session_backend::SessionStoreBackend) -> Result<T> + Send + 'static,
+        F: FnOnce(&dyn SessionStoreBackend) -> Result<T> + Send + 'static,
     {
         let backend = Arc::clone(&self.inner);
         self.execution
-            .execute(move || operation(backend.as_ref()))
+            .execute(lane, write, move || operation(backend.as_ref()))
+            .await
+    }
+
+    async fn execute_read<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn SessionStoreBackend) -> Result<T> + Send + 'static,
+    {
+        self.execute_on(StorageExecutionLane::InteractiveRead, false, operation)
+            .await
+    }
+
+    async fn execute_write<T, F>(&self, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn SessionStoreBackend) -> Result<T> + Send + 'static,
+    {
+        self.execute_on(StorageExecutionLane::InteractiveWrite, true, operation)
+            .await
+    }
+
+    async fn execute_background<T, F>(&self, write: bool, operation: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&dyn SessionStoreBackend) -> Result<T> + Send + 'static,
+    {
+        self.execute_on(StorageExecutionLane::Background, write, operation)
             .await
     }
 
@@ -155,14 +219,14 @@ impl UnifiedSessionStore {
     /// is a harmless no-op.
     pub async fn create_session(&self, session: &SessionRecord) -> Result<()> {
         let session = session.clone();
-        self.execute(move |backend| backend.create_session(&session))
+        self.execute_write(move |backend| backend.create_session(&session))
             .await
     }
 
     /// Retrieve a session record by its ID, or `None` if not found.
     pub async fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_session(&session_id))
+        self.execute_read(move |backend| backend.get_session(&session_id))
             .await
     }
 
@@ -172,7 +236,7 @@ impl UnifiedSessionStore {
         session_id: &str,
     ) -> Result<Option<SessionRecoveryManifest>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_session_recovery_manifest(&session_id))
+        self.execute_read(move |backend| backend.get_session_recovery_manifest(&session_id))
             .await
     }
 
@@ -182,8 +246,10 @@ impl UnifiedSessionStore {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<SessionRecoveryManifest>> {
-        self.execute(move |backend| backend.list_active_session_recovery_manifests(offset, limit))
-            .await
+        self.execute_background(false, move |backend| {
+            backend.list_active_session_recovery_manifests(offset, limit)
+        })
+        .await
     }
 
     /// Persist one externally-owned recovery signal.
@@ -195,7 +261,7 @@ impl UnifiedSessionStore {
         observed_at_ms: u64,
     ) -> Result<SessionRecoveryManifest> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.set_session_recovery_signal(&session_id, signal, active, observed_at_ms)
         })
         .await
@@ -207,7 +273,7 @@ impl UnifiedSessionStore {
     /// if it does not exist.
     pub async fn update_session(&self, session: &SessionRecord) -> Result<()> {
         let session = session.clone();
-        self.execute(move |backend| backend.update_session(&session))
+        self.execute_write(move |backend| backend.update_session(&session))
             .await
     }
 
@@ -217,7 +283,7 @@ impl UnifiedSessionStore {
     /// this when you don't know whether the row already exists.
     pub async fn upsert_session(&self, session: &SessionRecord) -> Result<()> {
         let session = session.clone();
-        self.execute(move |backend| backend.upsert_session(&session))
+        self.execute_write(move |backend| backend.upsert_session(&session))
             .await
     }
 
@@ -230,14 +296,71 @@ impl UnifiedSessionStore {
     ) -> Result<SessionMissionOutboxRecord> {
         let session = session.clone();
         let request = request.clone();
-        self.execute(move |backend| backend.upsert_session_with_mission_outbox(&session, &request))
+        self.execute_write(move |backend| {
+            backend.upsert_session_with_mission_outbox(&session, &request)
+        })
+        .await
+    }
+
+    pub async fn plan_session_lifecycle(
+        &self,
+        plan: &SessionLifecyclePlan,
+    ) -> Result<SessionLifecycleIntent> {
+        let plan = plan.clone();
+        self.execute_write(move |backend| backend.plan_session_lifecycle(&plan))
+            .await
+    }
+
+    pub async fn get_session_lifecycle_intent(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<SessionLifecycleIntent>> {
+        let operation_id = operation_id.to_string();
+        self.execute_read(move |backend| backend.get_session_lifecycle_intent(&operation_id))
+            .await
+    }
+
+    pub async fn list_recoverable_session_lifecycle_intents(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionLifecycleIntent>> {
+        self.execute_background(false, move |backend| {
+            backend.list_recoverable_session_lifecycle_intents(limit)
+        })
+        .await
+    }
+
+    pub async fn fence_session_lifecycle(
+        &self,
+        request: &SessionLifecycleFenceRequest,
+    ) -> Result<SessionLifecycleIntent> {
+        let request = request.clone();
+        self.execute_write(move |backend| backend.fence_session_lifecycle(&request))
+            .await
+    }
+
+    pub async fn transition_session_lifecycle(
+        &self,
+        transition: &SessionLifecycleTransition,
+    ) -> Result<SessionLifecycleIntent> {
+        let transition = transition.clone();
+        self.execute_write(move |backend| backend.transition_session_lifecycle(&transition))
+            .await
+    }
+
+    pub async fn commit_session_lifecycle_tombstone(
+        &self,
+        request: &SessionLifecycleTombstoneRequest,
+    ) -> Result<SessionLifecycleIntent> {
+        let request = request.clone();
+        self.execute_write(move |backend| backend.commit_session_lifecycle_tombstone(&request))
             .await
     }
 
     /// Permanently remove a session and all its memory associations.
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.delete_session(&session_id))
+        self.execute_write(move |backend| backend.delete_session(&session_id))
             .await
     }
 
@@ -247,7 +370,7 @@ impl UnifiedSessionStore {
         request: &SessionMissionOutboxRequest,
     ) -> Result<bool> {
         let request = request.clone();
-        self.execute(move |backend| backend.delete_session_with_mission_outbox(&request))
+        self.execute_write(move |backend| backend.delete_session_with_mission_outbox(&request))
             .await
     }
 
@@ -257,13 +380,13 @@ impl UnifiedSessionStore {
     /// `last_activity`.  Messages are preserved for auditing.
     pub async fn mark_session_closed(&self, session_id: &str) -> Result<()> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.mark_session_closed(&session_id))
+        self.execute_write(move |backend| backend.mark_session_closed(&session_id))
             .await
     }
 
     /// List all session records ordered by `last_activity DESC`.
     pub async fn list_sessions(&self) -> Result<Vec<SessionRecord>> {
-        self.execute(|backend| backend.list_sessions()).await
+        self.execute_read(|backend| backend.list_sessions()).await
     }
 
     /// List a filtered, sorted page of sessions directly in the backing store.
@@ -278,7 +401,7 @@ impl UnifiedSessionStore {
         let order = opts.order.to_string();
         let limit = opts.limit;
         let offset = opts.offset;
-        self.execute(move |backend| {
+        self.execute_read(move |backend| {
             backend.list_sessions_page(&SessionListOptions {
                 query: query.as_deref(),
                 model: model.as_deref(),
@@ -295,7 +418,7 @@ impl UnifiedSessionStore {
     /// List all sessions for a given platform, ordered by `last_activity DESC`.
     pub async fn list_sessions_by_platform(&self, platform: &str) -> Result<Vec<SessionRecord>> {
         let platform = platform.to_string();
-        self.execute(move |backend| backend.list_sessions_by_platform(&platform))
+        self.execute_read(move |backend| backend.list_sessions_by_platform(&platform))
             .await
     }
 
@@ -309,7 +432,7 @@ impl UnifiedSessionStore {
         workspace_root: &str,
     ) -> Result<Vec<SessionRecord>> {
         let workspace_root = workspace_root.to_string();
-        self.execute(move |backend| backend.list_sessions_by_workspace_root(&workspace_root))
+        self.execute_read(move |backend| backend.list_sessions_by_workspace_root(&workspace_root))
             .await
     }
 
@@ -323,7 +446,7 @@ impl UnifiedSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionSearchResult>> {
         let query = query.to_string();
-        self.execute(move |backend| backend.search_sessions(&query, limit))
+        self.execute_read(move |backend| backend.search_sessions(&query, limit))
             .await
     }
 
@@ -336,8 +459,10 @@ impl UnifiedSessionStore {
     ) -> Result<Vec<SessionSearchResult>> {
         let query = query.to_string();
         let platform = platform.to_string();
-        self.execute(move |backend| backend.search_sessions_by_platform(&query, &platform, limit))
-            .await
+        self.execute_read(move |backend| {
+            backend.search_sessions_by_platform(&query, &platform, limit)
+        })
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -350,14 +475,14 @@ impl UnifiedSessionStore {
     pub async fn associate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
         let session_id = session_id.to_string();
         let memory_id = memory_id.to_string();
-        self.execute(move |backend| backend.associate_memory(&session_id, &memory_id))
+        self.execute_write(move |backend| backend.associate_memory(&session_id, &memory_id))
             .await
     }
 
     /// Return all memory IDs associated with `session_id`.
     pub async fn get_session_memories(&self, session_id: &str) -> Result<Vec<String>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_session_memories(&session_id))
+        self.execute_read(move |backend| backend.get_session_memories(&session_id))
             .await
     }
 
@@ -365,7 +490,7 @@ impl UnifiedSessionStore {
     pub async fn disassociate_memory(&self, session_id: &str, memory_id: &str) -> Result<()> {
         let session_id = session_id.to_string();
         let memory_id = memory_id.to_string();
-        self.execute(move |backend| backend.disassociate_memory(&session_id, &memory_id))
+        self.execute_write(move |backend| backend.disassociate_memory(&session_id, &memory_id))
             .await
     }
 
@@ -376,7 +501,7 @@ impl UnifiedSessionStore {
     /// Append a mutation event to the session's event log.
     pub async fn append_event(&self, event: &SessionEvent) -> Result<()> {
         let event = event.clone();
-        self.execute(move |backend| backend.append_event(&event))
+        self.execute_write(move |backend| backend.append_event(&event))
             .await
     }
 
@@ -386,7 +511,7 @@ impl UnifiedSessionStore {
         event: &SessionEvent,
     ) -> Result<SessionEvent> {
         let event = event.clone();
-        self.execute(move |backend| backend.append_event_allocating_sequence(&event))
+        self.execute_write(move |backend| backend.append_event_allocating_sequence(&event))
             .await
     }
 
@@ -396,7 +521,7 @@ impl UnifiedSessionStore {
         events: &[SessionEvent],
     ) -> Result<Vec<SessionEvent>> {
         let events = events.to_vec();
-        self.execute(move |backend| backend.append_events_allocating_sequence(&events))
+        self.execute_write(move |backend| backend.append_events_allocating_sequence(&events))
             .await
     }
 
@@ -406,7 +531,7 @@ impl UnifiedSessionStore {
         event: &SessionEvent,
     ) -> Result<bool> {
         let event = event.clone();
-        self.execute(move |backend| backend.append_context_envelope_event_if_absent(&event))
+        self.execute_write(move |backend| backend.append_context_envelope_event_if_absent(&event))
             .await
     }
 
@@ -416,7 +541,7 @@ impl UnifiedSessionStore {
         event: &SessionEvent,
     ) -> Result<Option<SessionEvent>> {
         let event = event.clone();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.append_context_envelope_event_if_absent_allocating_sequence(&event)
         })
         .await
@@ -436,6 +561,37 @@ impl UnifiedSessionStore {
     ) -> Result<SessionEvent> {
         let event = event.to_session_event()?;
         self.append_event_allocating_sequence(&event).await
+    }
+
+    /// Atomically append a canonical domain event once per
+    /// `session_id + event_id`. The receipt returns the durable row and whether
+    /// it was replayed from an earlier successful commit.
+    pub async fn append_session_domain_event_if_absent_allocating_sequence(
+        &self,
+        event: &SessionDomainEvent,
+    ) -> Result<(SessionEvent, bool)> {
+        let event_id = event.event_id.clone();
+        let event = event.to_session_event()?;
+        self.execute_write(move |backend| {
+            backend.append_session_domain_event_if_absent_allocating_sequence(&event, &event_id)
+        })
+        .await
+    }
+
+    pub async fn get_session_domain_event_by_id(
+        &self,
+        session_id: &str,
+        event_id: &str,
+    ) -> Result<Option<SessionDomainEvent>> {
+        let session_id = session_id.to_string();
+        let event_id = event_id.to_string();
+        self.execute_read(move |backend| {
+            backend.get_session_domain_event_by_id(&session_id, &event_id)
+        })
+        .await?
+        .map(|event| SessionDomainEvent::from_session_event(&event))
+        .transpose()
+        .map_err(Into::into)
     }
 
     /// Persist related session-domain records as one ordered transaction. This
@@ -465,7 +621,7 @@ impl UnifiedSessionStore {
             wire_events.push(event.to_session_event()?);
         }
         let checkpoint_id = checkpoint_id.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.append_events_allocating_sequence_if_checkpoint_absent(
                 &wire_events,
                 &checkpoint_id,
@@ -478,7 +634,7 @@ impl UnifiedSessionStore {
     /// Retrieve events for a session starting from `from_seq` (inclusive).
     pub async fn get_events(&self, session_id: &str, from_seq: usize) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_events(&session_id, from_seq))
+        self.execute_read(move |backend| backend.get_events(&session_id, from_seq))
             .await
     }
 
@@ -490,8 +646,37 @@ impl UnifiedSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_events_limited(&session_id, from_seq, limit))
+        self.execute_read(move |backend| backend.get_events_limited(&session_id, from_seq, limit))
             .await
+    }
+
+    pub async fn get_session_domain_events_by_kind_limited(
+        &self,
+        session_id: &str,
+        kind: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        let session_id = session_id.to_string();
+        let kind = kind.to_string();
+        self.execute_read(move |backend| {
+            backend.get_session_domain_events_by_kind_limited(&session_id, &kind, from_seq, limit)
+        })
+        .await
+    }
+
+    pub async fn count_session_domain_events_by_kind_from(
+        &self,
+        session_id: &str,
+        kind: &str,
+        from_seq: usize,
+    ) -> Result<usize> {
+        let session_id = session_id.to_string();
+        let kind = kind.to_string();
+        self.execute_read(move |backend| {
+            backend.count_session_domain_events_by_kind_from(&session_id, &kind, from_seq)
+        })
+        .await
     }
 
     async fn get_session_domain_timeline_limited(
@@ -501,7 +686,7 @@ impl UnifiedSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| {
+        self.execute_read(move |backend| {
             backend.get_session_domain_timeline_limited(&session_id, from_seq, limit)
         })
         .await
@@ -513,7 +698,7 @@ impl UnifiedSessionStore {
         from_seq: usize,
     ) -> Result<usize> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| {
+        self.execute_read(move |backend| {
             backend.count_session_domain_timeline_from(&session_id, from_seq)
         })
         .await
@@ -529,7 +714,7 @@ impl UnifiedSessionStore {
     ) -> Result<Vec<SessionEvent>> {
         let session_id = session_id.to_string();
         let event_type = event_type.to_string();
-        self.execute(move |backend| {
+        self.execute_read(move |backend| {
             backend.get_events_by_type_limited(&session_id, &event_type, from_seq, limit)
         })
         .await
@@ -538,7 +723,7 @@ impl UnifiedSessionStore {
     /// Count events for a session from `from_seq`.
     pub async fn count_events_from(&self, session_id: &str, from_seq: usize) -> Result<usize> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.count_events_from(&session_id, from_seq))
+        self.execute_read(move |backend| backend.count_events_from(&session_id, from_seq))
             .await
     }
 
@@ -551,7 +736,7 @@ impl UnifiedSessionStore {
     ) -> Result<usize> {
         let session_id = session_id.to_string();
         let event_type = event_type.to_string();
-        self.execute(move |backend| {
+        self.execute_read(move |backend| {
             backend.count_events_by_type_from(&session_id, &event_type, from_seq)
         })
         .await
@@ -572,8 +757,10 @@ impl UnifiedSessionStore {
             .get_events_by_type_limited(session_id, SESSION_DOMAIN_EVENT_TYPE, from_seq, limit)
             .await?
             .into_iter()
-            .map(|event| SessionDomainEvent::from_session_event_lossy(&event))
-            .collect::<Vec<_>>();
+            .map(|event| {
+                SessionDomainEvent::from_session_event(&event).map_err(SessionError::Serialization)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let next_seq = events.last().map(|event| event.sequence + 1);
         let has_more = events.len() < total;
 
@@ -585,7 +772,10 @@ impl UnifiedSessionStore {
         })
     }
 
-    /// Retrieve a domain-shaped projection of every session event type.
+    /// Retrieve the canonical Session-domain timeline.
+    ///
+    /// Legacy transcript/runtime rows are intentionally not projected into a
+    /// synthetic domain DTO. Their owners must migrate them explicitly.
     pub async fn timeline_events_page(
         &self,
         session_id: &str,
@@ -600,8 +790,10 @@ impl UnifiedSessionStore {
             .get_session_domain_timeline_limited(session_id, from_seq, limit)
             .await?
             .into_iter()
-            .map(|event| SessionDomainEvent::from_session_event_lossy(&event))
-            .collect::<Vec<_>>();
+            .map(|event| {
+                SessionDomainEvent::from_session_event(&event).map_err(SessionError::Serialization)
+            })
+            .collect::<Result<Vec<_>>>()?;
         let next_seq = events.last().map(|event| event.sequence + 1);
         let has_more = events.len() < total;
 
@@ -619,14 +811,14 @@ impl UnifiedSessionStore {
         envelope_id: &str,
     ) -> Result<Option<SessionEvent>> {
         let envelope_id = envelope_id.to_string();
-        self.execute(move |backend| backend.get_context_event_by_envelope_id(&envelope_id))
+        self.execute_read(move |backend| backend.get_context_event_by_envelope_id(&envelope_id))
             .await
     }
 
     /// Return the next append sequence for a session event.
     pub async fn next_event_sequence(&self, session_id: &str) -> Result<usize> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.next_event_sequence(&session_id))
+        self.execute_read(move |backend| backend.next_event_sequence(&session_id))
             .await
     }
 
@@ -639,7 +831,7 @@ impl UnifiedSessionStore {
         from_sequence: usize,
     ) -> Result<usize> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.delete_events_from(&session_id, from_sequence))
+        self.execute_write(move |backend| backend.delete_events_from(&session_id, from_sequence))
             .await
     }
 
@@ -654,7 +846,7 @@ impl UnifiedSessionStore {
     ) -> Result<usize> {
         let session_id = session_id.to_string();
         let event_type = event_type.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.delete_events_by_type_from(&session_id, &event_type, from_sequence)
         })
         .await
@@ -663,14 +855,14 @@ impl UnifiedSessionStore {
     /// Save a full-message-list snapshot at a given event index.
     pub async fn save_snapshot(&self, snapshot: &SessionSnapshot) -> Result<()> {
         let snapshot = snapshot.clone();
-        self.execute(move |backend| backend.save_snapshot(&snapshot))
+        self.execute_write(move |backend| backend.save_snapshot(&snapshot))
             .await
     }
 
     /// Return the most recent snapshot for a session, or `None`.
     pub async fn get_latest_snapshot(&self, session_id: &str) -> Result<Option<SessionSnapshot>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_latest_snapshot(&session_id))
+        self.execute_read(move |backend| backend.get_latest_snapshot(&session_id))
             .await
     }
 
@@ -683,7 +875,7 @@ impl UnifiedSessionStore {
     /// Returns the number of sessions that were removed.
     pub async fn prune_before(&self, cutoff_iso8601: &str) -> Result<usize> {
         let cutoff_iso8601 = cutoff_iso8601.to_string();
-        self.execute(move |backend| backend.prune_before(&cutoff_iso8601))
+        self.execute_background(true, move |backend| backend.prune_before(&cutoff_iso8601))
             .await
     }
 
@@ -694,66 +886,83 @@ impl UnifiedSessionStore {
     /// Insert a single message into a session.
     pub async fn insert_message(&self, msg: &SessionMessage) -> Result<()> {
         let msg = msg.clone();
-        self.execute(move |backend| backend.insert_message(&msg))
+        self.execute_write(move |backend| backend.insert_message(&msg))
             .await
     }
 
-    pub async fn append_terminal_message_idempotent(
+    /// Atomically materialize a Runtime transcript and settle the exact
+    /// Session input claim that produced it.
+    pub async fn commit_terminal_transcript_if_fenced(
         &self,
-        message_id: &str,
-        session_id: &str,
-        content_json: &str,
-        token_usage_json: Option<&str>,
-        created_at_ms: u64,
-    ) -> Result<(SessionMessage, bool)> {
-        let message_id = message_id.to_string();
-        let session_id = session_id.to_string();
-        let content_json = content_json.to_string();
-        let token_usage_json = token_usage_json.map(str::to_string);
-        self.execute(move |backend| {
-            backend.append_terminal_message_idempotent(
-                &message_id,
-                &session_id,
-                &content_json,
-                token_usage_json.as_deref(),
-                created_at_ms,
-            )
-        })
-        .await
-    }
-
-    /// Atomically materialize every message produced by a Runtime turn.
-    ///
-    /// The last input row must carry `terminal_message_id`. Re-delivery is
-    /// idempotent only when every immutable transcript field still matches.
-    pub async fn append_terminal_transcript_idempotent(
-        &self,
-        terminal_message_id: &str,
-        ingress_message_id: &str,
-        session_id: &str,
-        messages: &[SessionMessage],
-        created_at_ms: u64,
-    ) -> Result<(Vec<SessionMessage>, bool)> {
-        let terminal_message_id = terminal_message_id.to_string();
-        let ingress_message_id = ingress_message_id.to_string();
-        let session_id = session_id.to_string();
-        let messages = messages.to_vec();
-        self.execute(move |backend| {
-            backend.append_terminal_transcript_idempotent(
-                &terminal_message_id,
-                &ingress_message_id,
-                &session_id,
-                &messages,
-                created_at_ms,
-            )
-        })
-        .await
+        request: &SessionTerminalTranscriptCommit,
+    ) -> Result<SessionTerminalTranscriptReceipt> {
+        let request = request.clone();
+        self.execute_write(move |backend| backend.commit_terminal_transcript_if_fenced(&request))
+            .await
     }
 
     /// Insert multiple messages into a session in a single batch.
     pub async fn insert_messages_batch(&self, messages: &[SessionMessage]) -> Result<()> {
         let messages = messages.to_vec();
-        self.execute(move |backend| backend.insert_messages_batch(&messages))
+        self.execute_write(move |backend| backend.insert_messages_batch(&messages))
+            .await
+    }
+
+    /// Copy a stable source prefix into an empty branch transcript in one
+    /// backend transaction. Concurrent source appends after the captured
+    /// cutoff are deliberately excluded.
+    pub async fn copy_session_messages_at_cutoff(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        source_message_count: usize,
+    ) -> Result<usize> {
+        let source_session_id = source_session_id.to_string();
+        let target_session_id = target_session_id.to_string();
+        self.execute_write(move |backend| {
+            backend.copy_session_messages_at_cutoff(
+                &source_session_id,
+                &target_session_id,
+                source_message_count,
+            )
+        })
+        .await
+    }
+
+    pub async fn branch_session_at_cutoff(
+        &self,
+        request: &crate::persistence::sqlite::SessionBranchRequest,
+    ) -> Result<crate::persistence::sqlite::SessionBranchResult> {
+        let request = request.clone();
+        self.execute_write(move |backend| backend.branch_session_at_cutoff(&request))
+            .await
+    }
+
+    pub async fn get_session_branch_activation(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<SessionBranchActivation>> {
+        let operation_id = operation_id.to_string();
+        self.execute_read(move |backend| backend.get_session_branch_activation(&operation_id))
+            .await
+    }
+
+    pub async fn list_recoverable_session_branch_activations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionBranchActivation>> {
+        self.execute_background(false, move |backend| {
+            backend.list_recoverable_session_branch_activations(limit)
+        })
+        .await
+    }
+
+    pub async fn transition_session_branch_activation(
+        &self,
+        transition: &SessionBranchActivationTransition,
+    ) -> Result<SessionBranchActivation> {
+        let transition = transition.clone();
+        self.execute_write(move |backend| backend.transition_session_branch_activation(&transition))
             .await
     }
 
@@ -765,8 +974,10 @@ impl UnifiedSessionStore {
     ) -> Result<SessionRuntimeOutboxRecord> {
         let message = message.clone();
         let request = request.clone();
-        self.execute(move |backend| backend.append_message_with_runtime_outbox(&message, &request))
-            .await
+        self.execute_write(move |backend| {
+            backend.append_message_with_runtime_outbox(&message, &request)
+        })
+        .await
     }
 
     /// Atomically allocate a message sequence and persist the Runtime ingress
@@ -783,7 +994,7 @@ impl UnifiedSessionStore {
         let role = role.to_string();
         let content_json = content_json.map(str::to_string);
         let request = request.clone();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.append_ingress_with_runtime_outbox(
                 &session_id,
                 &role,
@@ -803,27 +1014,61 @@ impl UnifiedSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
         let worker_id = worker_id.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.claim_session_runtime_outbox(&worker_id, now_ms, lease_ms, limit)
         })
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mark_session_runtime_outbox_running(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
+        expected_revision: u64,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        let request_id = request_id.to_string();
+        let worker_id = worker_id.to_string();
+        let claim_token = claim_token.to_string();
+        self.execute_write(move |backend| {
+            backend.mark_session_runtime_outbox_running(
+                &request_id,
+                &worker_id,
+                session_generation,
+                &claim_token,
+                expected_revision,
+                now_ms,
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub async fn ack_session_runtime_outbox(
         &self,
         request_id: &str,
         worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
         expected_revision: u64,
+        terminal_status: SessionRuntimeInputStatus,
         runtime_commit_cursor: u64,
         now_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord> {
         let request_id = request_id.to_string();
         let worker_id = worker_id.to_string();
-        self.execute(move |backend| {
+        let claim_token = claim_token.to_string();
+        self.execute_write(move |backend| {
             backend.ack_session_runtime_outbox(
                 &request_id,
                 &worker_id,
+                session_generation,
+                &claim_token,
                 expected_revision,
+                terminal_status,
                 runtime_commit_cursor,
                 now_ms,
             )
@@ -831,20 +1076,26 @@ impl UnifiedSessionStore {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn renew_session_runtime_outbox_lease(
         &self,
         request_id: &str,
         worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
         expected_revision: u64,
         now_ms: u64,
         lease_ms: u64,
     ) -> Result<SessionRuntimeOutboxRecord> {
         let request_id = request_id.to_string();
         let worker_id = worker_id.to_string();
-        self.execute(move |backend| {
+        let claim_token = claim_token.to_string();
+        self.execute_write(move |backend| {
             backend.renew_session_runtime_outbox_lease(
                 &request_id,
                 &worker_id,
+                session_generation,
+                &claim_token,
                 expected_revision,
                 now_ms,
                 lease_ms,
@@ -858,6 +1109,8 @@ impl UnifiedSessionStore {
         &self,
         request_id: &str,
         worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
         expected_revision: u64,
         failure_class: OutboxFailureClass,
         error: &str,
@@ -867,11 +1120,14 @@ impl UnifiedSessionStore {
     ) -> Result<SessionRuntimeOutboxRecord> {
         let request_id = request_id.to_string();
         let worker_id = worker_id.to_string();
+        let claim_token = claim_token.to_string();
         let error = error.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.fail_session_runtime_outbox(
                 &request_id,
                 &worker_id,
+                session_generation,
+                &claim_token,
                 expected_revision,
                 failure_class,
                 &error,
@@ -883,9 +1139,47 @@ impl UnifiedSessionStore {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn requeue_claimed_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
+        expected_revision: u64,
+        decision: harness_contract::turn::InputRoutingDecision,
+        target_turn_id: Option<&str>,
+        classification_json: Option<&str>,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        let request_id = request_id.to_string();
+        let worker_id = worker_id.to_string();
+        let claim_token = claim_token.to_string();
+        let target_turn_id = target_turn_id.map(str::to_string);
+        let classification_json = classification_json.map(str::to_string);
+        let reason = reason.to_string();
+        self.execute_write(move |backend| {
+            backend.requeue_claimed_session_runtime_outbox(
+                &request_id,
+                &worker_id,
+                session_generation,
+                &claim_token,
+                expected_revision,
+                decision,
+                target_turn_id.as_deref(),
+                classification_json.as_deref(),
+                &reason,
+                now_ms,
+            )
+        })
+        .await
+    }
+
     pub async fn retry_blocked_session_runtime_outbox(
         &self,
         request_id: &str,
+        session_generation: u64,
         expected_revision: u64,
         actor: &str,
         reason: &str,
@@ -894,10 +1188,127 @@ impl UnifiedSessionStore {
         let request_id = request_id.to_string();
         let actor = actor.to_string();
         let reason = reason.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.retry_blocked_session_runtime_outbox(
                 &request_id,
+                session_generation,
                 expected_revision,
+                &actor,
+                &reason,
+                now_ms,
+            )
+        })
+        .await
+    }
+
+    pub async fn cancel_session_runtime_outbox(
+        &self,
+        input_id: &str,
+        session_generation: u64,
+        expected_revision: u64,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        let input_id = input_id.to_string();
+        let actor = actor.to_string();
+        let reason = reason.to_string();
+        self.execute_write(move |backend| {
+            backend.cancel_session_runtime_outbox(
+                &input_id,
+                session_generation,
+                expected_revision,
+                &actor,
+                &reason,
+                now_ms,
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reclassify_session_runtime_outbox(
+        &self,
+        input_id: &str,
+        session_generation: u64,
+        expected_revision: u64,
+        decision: harness_contract::turn::InputRoutingDecision,
+        target_turn_id: Option<&str>,
+        classification_json: Option<&str>,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionRuntimeOutboxRecord> {
+        let input_id = input_id.to_string();
+        let target_turn_id = target_turn_id.map(str::to_string);
+        let classification_json = classification_json.map(str::to_string);
+        let actor = actor.to_string();
+        let reason = reason.to_string();
+        self.execute_write(move |backend| {
+            backend.reclassify_session_runtime_outbox(
+                &input_id,
+                session_generation,
+                expected_revision,
+                decision,
+                target_turn_id.as_deref(),
+                classification_json.as_deref(),
+                &actor,
+                &reason,
+                now_ms,
+            )
+        })
+        .await
+    }
+
+    pub async fn get_session_input_admission(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionInputAdmission>> {
+        let session_id = session_id.to_string();
+        self.execute_read(move |backend| backend.get_session_input_admission(&session_id))
+            .await
+    }
+
+    pub async fn close_session_input_admission(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionInputAdmission> {
+        let session_id = session_id.to_string();
+        let actor = actor.to_string();
+        let reason = reason.to_string();
+        self.execute_write(move |backend| {
+            backend.close_session_input_admission(
+                &session_id,
+                expected_generation,
+                &actor,
+                &reason,
+                now_ms,
+            )
+        })
+        .await
+    }
+
+    pub async fn advance_session_input_generation(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+        open: bool,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<SessionInputAdmission> {
+        let session_id = session_id.to_string();
+        let actor = actor.to_string();
+        let reason = reason.to_string();
+        self.execute_write(move |backend| {
+            backend.advance_session_input_generation(
+                &session_id,
+                expected_generation,
+                open,
                 &actor,
                 &reason,
                 now_ms,
@@ -911,7 +1322,16 @@ impl UnifiedSessionStore {
         request_id: &str,
     ) -> Result<Option<SessionRuntimeOutboxRecord>> {
         let request_id = request_id.to_string();
-        self.execute(move |backend| backend.get_session_runtime_outbox(&request_id))
+        self.execute_read(move |backend| backend.get_session_runtime_outbox(&request_id))
+            .await
+    }
+
+    pub async fn get_session_runtime_outbox_by_input_id(
+        &self,
+        input_id: &str,
+    ) -> Result<Option<SessionRuntimeOutboxRecord>> {
+        let input_id = input_id.to_string();
+        self.execute_read(move |backend| backend.get_session_runtime_outbox_by_input_id(&input_id))
             .await
     }
 
@@ -921,20 +1341,24 @@ impl UnifiedSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.session_runtime_outbox_for_session(&session_id, limit))
-            .await
+        self.execute_read(move |backend| {
+            backend.session_runtime_outbox_for_session(&session_id, limit)
+        })
+        .await
     }
 
     pub async fn active_session_runtime_outbox(
         &self,
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
-        self.execute(move |backend| backend.active_session_runtime_outbox(limit))
-            .await
+        self.execute_background(false, move |backend| {
+            backend.active_session_runtime_outbox(limit)
+        })
+        .await
     }
 
     pub async fn session_runtime_outbox_health(&self) -> Result<SessionRuntimeOutboxHealth> {
-        self.execute(|backend| backend.session_runtime_outbox_health())
+        self.execute_background(false, |backend| backend.session_runtime_outbox_health())
             .await
     }
 
@@ -942,8 +1366,10 @@ impl UnifiedSessionStore {
         &self,
         limit: usize,
     ) -> Result<Vec<SessionRuntimeOutboxRecord>> {
-        self.execute(move |backend| backend.blocked_session_runtime_outbox(limit))
-            .await
+        self.execute_background(false, move |backend| {
+            backend.blocked_session_runtime_outbox(limit)
+        })
+        .await
     }
 
     pub async fn claim_session_mission_outbox(
@@ -956,7 +1382,7 @@ impl UnifiedSessionStore {
     ) -> Result<Vec<SessionMissionOutboxRecord>> {
         let workspace_key = workspace_key.to_string();
         let worker_id = worker_id.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.claim_session_mission_outbox(
                 &workspace_key,
                 &worker_id,
@@ -977,7 +1403,7 @@ impl UnifiedSessionStore {
     ) -> Result<SessionMissionOutboxRecord> {
         let request_id = request_id.to_string();
         let worker_id = worker_id.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.ack_session_mission_outbox(&request_id, &worker_id, expected_revision, now_ms)
         })
         .await
@@ -998,7 +1424,7 @@ impl UnifiedSessionStore {
         let request_id = request_id.to_string();
         let worker_id = worker_id.to_string();
         let error = error.to_string();
-        self.execute(move |backend| {
+        self.execute_write(move |backend| {
             backend.fail_session_mission_outbox(
                 &request_id,
                 &worker_id,
@@ -1018,7 +1444,7 @@ impl UnifiedSessionStore {
         request_id: &str,
     ) -> Result<Option<SessionMissionOutboxRecord>> {
         let request_id = request_id.to_string();
-        self.execute(move |backend| backend.get_session_mission_outbox(&request_id))
+        self.execute_read(move |backend| backend.get_session_mission_outbox(&request_id))
             .await
     }
 
@@ -1030,7 +1456,7 @@ impl UnifiedSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_messages(&session_id, offset, limit))
+        self.execute_read(move |backend| backend.get_messages(&session_id, offset, limit))
             .await
     }
 
@@ -1042,7 +1468,7 @@ impl UnifiedSessionStore {
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| {
+        self.execute_read(move |backend| {
             backend.get_messages_from_sequence(&session_id, from_sequence, limit)
         })
         .await
@@ -1051,14 +1477,14 @@ impl UnifiedSessionStore {
     /// Retrieve ALL messages for a session (unbounded, no pagination).
     pub async fn get_all_messages(&self, session_id: &str) -> Result<Vec<SessionMessage>> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_all_messages(&session_id))
+        self.execute_read(move |backend| backend.get_all_messages(&session_id))
             .await
     }
 
     /// Get the total number of messages in a session.
     pub async fn get_message_count(&self, session_id: &str) -> Result<usize> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.get_message_count(&session_id))
+        self.execute_read(move |backend| backend.get_message_count(&session_id))
             .await
     }
 
@@ -1071,7 +1497,7 @@ impl UnifiedSessionStore {
         from_sequence: usize,
     ) -> Result<usize> {
         let session_id = session_id.to_string();
-        self.execute(move |backend| backend.delete_messages_from(&session_id, from_sequence))
+        self.execute_write(move |backend| backend.delete_messages_from(&session_id, from_sequence))
             .await
     }
 
@@ -1086,8 +1512,10 @@ impl UnifiedSessionStore {
     ) -> Result<Vec<SessionMessage>> {
         let query = query.to_string();
         let session_id = session_id.map(str::to_string);
-        self.execute(move |backend| backend.search_messages(&query, session_id.as_deref(), limit))
-            .await
+        self.execute_read(move |backend| {
+            backend.search_messages(&query, session_id.as_deref(), limit)
+        })
+        .await
     }
 
     /// Search a pre-authorized set of sessions in one FTS query.  The caller
@@ -1101,7 +1529,7 @@ impl UnifiedSessionStore {
     ) -> Result<Vec<SessionMessage>> {
         let query = query.to_string();
         let session_ids = session_ids.to_vec();
-        self.execute(move |backend| {
+        self.execute_read(move |backend| {
             backend.search_messages_in_sessions(&query, &session_ids, limit)
         })
         .await
@@ -1115,7 +1543,7 @@ fn clamp_event_page_limit(limit: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_event::SessionDomainScope;
+    use crate::domain::SessionDomainScope;
 
     fn make_record(id: &str) -> SessionRecord {
         SessionRecord {
@@ -1298,7 +1726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeline_events_page_projects_legacy_and_runtime_events() {
+    async fn timeline_events_page_excludes_legacy_rows() {
         let store = UnifiedSessionStore::open_in_memory().unwrap();
         store
             .create_session(&make_record("s-runtime-timeline"))
@@ -1330,12 +1758,12 @@ mod tests {
             .timeline_events_page("s-runtime-timeline", 0, 1)
             .await
             .unwrap();
-        assert_eq!(page.total, 2);
+        assert_eq!(page.total, 1);
         assert_eq!(page.events.len(), 1);
-        assert_eq!(page.events[0].kind, "ToolStart");
-        assert_eq!(page.events[0].scope, SessionDomainScope::Tool);
-        assert_eq!(page.next_seq, Some(1));
-        assert!(page.has_more);
+        assert_eq!(page.events[0].kind, "memory.pulse.created");
+        assert_eq!(page.events[0].scope, SessionDomainScope::Memory);
+        assert_eq!(page.next_seq, Some(2));
+        assert!(!page.has_more);
     }
 
     #[tokio::test]
@@ -1410,5 +1838,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["unified-a-newer", "unified-a-older"]
         );
+    }
+
+    #[tokio::test]
+    async fn repository_operations_are_attributed_to_their_semantic_lanes() {
+        let store = UnifiedSessionStore::open_in_memory().unwrap();
+        store
+            .create_session(&make_record("lane-routing"))
+            .await
+            .unwrap();
+        assert!(store.get_session("lane-routing").await.unwrap().is_some());
+        let _ = store
+            .list_active_session_recovery_manifests(0, 10)
+            .await
+            .unwrap();
+
+        let stats = store.execution_stats();
+        assert_eq!(stats.interactive_write.submitted, 1);
+        assert_eq!(stats.interactive_read.submitted, 1);
+        assert_eq!(stats.background.submitted, 1);
+        assert_eq!(stats.submitted, 3);
+        assert_eq!(stats.completed, 3);
+        assert_eq!(stats.active, 0);
+        assert_eq!(stats.queued, 0);
     }
 }

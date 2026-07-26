@@ -4,7 +4,6 @@ pub(crate) mod init_entry;
 pub(crate) mod local_command_entry;
 pub(crate) mod mcp_entry;
 pub(crate) mod plugin_entry;
-pub(crate) mod session_archive_entry;
 pub(crate) mod session_store_entry;
 pub(crate) mod skill_entry;
 pub(crate) mod static_entry;

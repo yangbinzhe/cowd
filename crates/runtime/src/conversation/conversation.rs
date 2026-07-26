@@ -1610,6 +1610,9 @@ pub struct ConversationRuntime<C, T> {
     session_tracer: Option<SessionTracer>,
     /// Optional cognitive memory manager – `None` when memory is disabled.
     memory_manager: Option<Arc<CognitiveContextManager>>,
+    /// Runtime-owned owner for post-turn maintenance tasks.
+    maintenance_supervisor:
+        Option<Arc<crate::execution_core::services::RuntimeMaintenanceSupervisor>>,
     /// Human-readable memory status message. `None` when healthy; `Some(msg)` when degraded.
     memory_status: Option<String>,
     /// Runtime-owned Fact/Matrix recall boundary for this conversation.  It
@@ -1626,14 +1629,11 @@ pub struct ConversationRuntime<C, T> {
     last_reality_recall_report: std::sync::Mutex<Option<crate::RealityRecallReport>>,
     /// Optional tool callback for real-time visualization (P0-2).
     tool_callback: Option<Arc<dyn ToolCallback>>,
-    /// Optional managed SQLite session store for messages and domain events.
-    session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
+    /// Optional Gateway-owned Session application port for durable Runtime
+    /// evidence and context records.
+    session_journal_port: Option<Arc<dyn crate::SessionRuntimeJournalPort>>,
     /// Runtime-selected Artifact plane shared by attachments and raw evidence.
     artifact_store: Option<Arc<crate::ArtifactStore>>,
-    /// Whether the in-memory transcript may also write message rows directly.
-    /// Gateway ingress owns durable user/terminal writes through its outboxes;
-    /// disabling this for an ingress turn prevents a second transcript writer.
-    transcript_persistence: bool,
     /// Durable execution lifecycle store. Session-domain events never use it.
     runtime_event_store: Option<Arc<RuntimeEventStore>>,
     /// Optional event log for time-travel debugging and session rebuild.
@@ -1762,6 +1762,9 @@ pub struct ConversationRuntime<C, T> {
     delegated_focus_novelty_target_bp: AtomicU64,
     delegated_focus_acceptance_scopes: std::sync::Mutex<Vec<String>>,
     delegated_focus_required_output_fields: std::sync::Mutex<Vec<String>>,
+    /// Present only for a Gateway-owned durable Session ingress. It fences
+    /// provider/tool/terminal side effects against generation and claim loss.
+    session_execution_fence: Option<crate::SessionExecutionFence>,
 }
 
 enum MemoryManagerComposition {
@@ -1928,14 +1931,14 @@ where
             hook_progress_reporter: Arc::new(std::sync::Mutex::new(None)),
             session_tracer: None,
             memory_manager,
+            maintenance_supervisor: None,
             memory_status,
             reality_recall: None,
             knowledge_activation: None,
             last_reality_recall_report: std::sync::Mutex::new(None),
             tool_callback: None,
-            session_store: None,
+            session_journal_port: None,
             artifact_store: None,
-            transcript_persistence: true,
             runtime_event_store: None,
             event_log: None,
             tool_output_sandbox: memory::ToolOutputSandbox::new()
@@ -2058,6 +2061,41 @@ where
             delegated_focus_novelty_target_bp: AtomicU64::new(0),
             delegated_focus_acceptance_scopes: std::sync::Mutex::new(Vec::new()),
             delegated_focus_required_output_fields: std::sync::Mutex::new(Vec::new()),
+            session_execution_fence: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_execution_fence(mut self, fence: crate::SessionExecutionFence) -> Self {
+        self.session_execution_fence = Some(fence);
+        self
+    }
+
+    pub(crate) async fn verify_session_execution_fence(
+        &self,
+        phase: crate::SessionExecutionFencePhase,
+    ) -> Result<(), RuntimeError> {
+        match self.session_execution_fence.as_ref() {
+            Some(fence) => fence
+                .verify(phase)
+                .await
+                .map(|_| ())
+                .map_err(RuntimeError::new),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn capture_session_execution_fence(
+        &self,
+        phase: crate::SessionExecutionFencePhase,
+    ) -> Result<Option<crate::SessionExecutionFenceSnapshot>, RuntimeError> {
+        match self.session_execution_fence.as_ref() {
+            Some(fence) => fence
+                .verify(phase)
+                .await
+                .map(Some)
+                .map_err(RuntimeError::new),
+            None => Ok(None),
         }
     }
 
@@ -2293,12 +2331,11 @@ where
             }
         }
 
-        let Some(store) = self.session_store.as_ref() else {
+        let Some(port) = self.session_journal_port.as_ref() else {
             return Ok(());
         };
-        let activation_event = activation.activation.to_session_domain_event(0);
-        store
-            .append_session_domain_event_allocating_sequence(&activation_event)
+        let activation_event = activation.activation.to_runtime_session_event(0);
+        port.append_event(&activation_event)
             .await
             .map_err(|error| {
                 RuntimeError::new(format!(
@@ -2313,15 +2350,12 @@ where
             if let Some(event) =
                 skill_memory_candidate_session_event(&activation.activation, &candidate, 0)
             {
-                store
-                    .append_session_domain_event_allocating_sequence(&event)
-                    .await
-                    .map_err(|error| {
-                        RuntimeError::new(format!(
-                            "runtime skill memory bridge persistence failed for session {}: {error}",
-                            activation.activation.session_id
-                        ))
-                    })?;
+                port.append_event(&event).await.map_err(|error| {
+                    RuntimeError::new(format!(
+                        "runtime skill memory bridge persistence failed for session {}: {error}",
+                        activation.activation.session_id
+                    ))
+                })?;
             }
         }
         Ok(())
@@ -2899,18 +2933,18 @@ where
         }
     }
 
-    fn remember_context_envelope(&self, envelope: ContextEnvelope) {
+    async fn remember_context_envelope(&self, envelope: ContextEnvelope) {
         if let Ok(mut guard) = self.last_context_envelope.lock() {
             *guard = Some(envelope.clone());
         }
-        self.persist_context_envelope(envelope.clone());
+        self.persist_context_envelope(envelope.clone()).await;
         if let Some(cowd) = self.cowd_bus() {
             cowd.emit(crate::cowd_event::CowdEvent::ContextEnvelope { envelope });
         }
     }
 
-    fn persist_context_envelope(&self, envelope: ContextEnvelope) {
-        let Some(store) = self.session_store.as_ref() else {
+    async fn persist_context_envelope(&self, envelope: ContextEnvelope) {
+        let Some(port) = self.session_journal_port.as_ref() else {
             return;
         };
         let session_id = envelope.identity.session_id.clone();
@@ -2930,32 +2964,24 @@ where
             },
             "envelope": envelope,
         });
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            let created_at_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            let event = memory::SessionEvent {
-                session_id: session_id.clone(),
-                event_type: "ContextEnvelope".to_string(),
-                event_json: payload.to_string(),
-                sequence: 0,
-                created_at_ms,
-            };
-            match store
-                .append_context_envelope_event_if_absent_allocating_sequence(&event)
-                .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    tracing::debug!(session_id, "context envelope event already persisted");
-                }
-                Err(error) => {
-                    tracing::warn!(%error, session_id, "context envelope event append failed");
-                }
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0);
+        let record = crate::RuntimeContextEnvelopeRecord {
+            session_id: session_id.clone(),
+            payload,
+            created_at_ms,
+        };
+        match port.append_context_envelope_if_absent(&record).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::debug!(session_id, "context envelope event already persisted");
             }
-        });
+            Err(error) => {
+                tracing::warn!(%error, session_id, "context envelope event append failed");
+            }
+        }
     }
 
     async fn remember_context_turn_report(
@@ -2973,7 +2999,7 @@ where
         &self,
         report: &ContextTurnReport,
     ) -> Result<(), RuntimeError> {
-        let Some(store) = self.session_store.as_ref() else {
+        let Some(port) = self.session_journal_port.as_ref() else {
             // Embedding callers may intentionally run without a durable
             // session carrier. They receive the in-memory report but cannot
             // claim restart/audit durability.
@@ -2988,50 +3014,48 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let event = memory::SessionDomainEvent::new(
+        let event = crate::RuntimeSessionEvent::new(
             session_id.clone(),
             0,
-            memory::SessionDomainScope::Context,
-            "context.turn_report",
+            crate::RuntimeSessionEventKind::ContextTurnReport,
             payload,
             created_at_ms,
         );
-        store
-            .append_session_domain_event_allocating_sequence(&event)
-            .await
-            .map_err(|error| {
-                RuntimeError::new(format!(
-                    "context governance persistence failed for session `{session_id}`: {error}"
-                ))
-            })?;
+        port.append_event(&event).await.map_err(|error| {
+            RuntimeError::new(format!(
+                "context governance persistence failed for session `{session_id}`: {error}"
+            ))
+        })?;
         Ok(())
     }
 
-    fn finalize_context_prompt(
+    async fn finalize_context_prompt(
         &self,
         user_input: &str,
         envelope: ContextEnvelope,
         knowledge: Option<KnowledgeTurnReport>,
     ) -> PromptAssembly {
-        let fact_decision = self.runtime_fact_decision_for_context(user_input, &envelope);
+        let fact_decision = self
+            .runtime_fact_decision_for_context(user_input, &envelope)
+            .await;
         let report = ContextRuntimeKernel::governance_report(
             &envelope,
             knowledge.as_ref(),
             fact_decision,
             None,
         );
-        self.remember_context_governance_report(report);
+        self.remember_context_governance_report(report).await;
         let prompt = Self::provider_prompt_from_envelope(&envelope);
-        self.remember_context_envelope(envelope);
+        self.remember_context_envelope(envelope).await;
         prompt
     }
 
-    fn remember_context_governance_report(&self, report: RuntimeContextGovernanceReport) {
-        self.persist_context_governance_report(report);
+    async fn remember_context_governance_report(&self, report: RuntimeContextGovernanceReport) {
+        self.persist_context_governance_report(report).await;
     }
 
-    fn persist_context_governance_report(&self, report: RuntimeContextGovernanceReport) {
-        let Some(store) = self.session_store.as_ref() else {
+    async fn persist_context_governance_report(&self, report: RuntimeContextGovernanceReport) {
+        let Some(port) = self.session_journal_port.as_ref() else {
             return;
         };
         let session_id = report.session_id.clone();
@@ -3041,37 +3065,33 @@ where
             "type": "RuntimeContextGovernanceReport",
             "report": report,
         });
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            let created_at_ms = now_ms();
-            let mut event = memory::SessionDomainEvent::new(
-                session_id.clone(),
-                0,
-                memory::SessionDomainScope::Context,
-                "context.governance_report",
-                payload,
-                created_at_ms,
-            );
-            event.status = Some("recorded".to_string());
-            event.refs.extend([
-                memory::SessionDomainRef {
-                    ref_type: "context_envelope".to_string(),
-                    id: envelope_id,
-                    label: None,
-                },
-                memory::SessionDomainRef {
-                    ref_type: "context_epoch".to_string(),
-                    id: context_epoch,
-                    label: None,
-                },
-            ]);
-            if let Err(error) = store.append_session_domain_event(&event).await {
-                tracing::warn!(%error, session_id, "context governance domain event append failed");
-            }
-        });
+        let created_at_ms = now_ms();
+        let mut event = crate::RuntimeSessionEvent::new(
+            session_id.clone(),
+            0,
+            crate::RuntimeSessionEventKind::ContextGovernanceReport,
+            payload,
+            created_at_ms,
+        );
+        event.status = Some("recorded".to_string());
+        event.refs.extend([
+            crate::RuntimeSessionEventRef {
+                ref_type: "context_envelope".to_string(),
+                id: envelope_id,
+                label: None,
+            },
+            crate::RuntimeSessionEventRef {
+                ref_type: "context_epoch".to_string(),
+                id: context_epoch,
+                label: None,
+            },
+        ]);
+        if let Err(error) = port.append_event(&event).await {
+            tracing::warn!(%error, session_id, "context governance domain event append failed");
+        }
     }
 
-    fn runtime_fact_decision_for_context(
+    async fn runtime_fact_decision_for_context(
         &self,
         user_input: &str,
         envelope: &ContextEnvelope,
@@ -3106,12 +3126,11 @@ where
             batch.source_evidence.len(),
             batch.token_usage,
         );
-        if let Some(store) = self.session_store.as_ref() {
-            let mut domain_event = memory::SessionDomainEvent::new(
+        if let Some(port) = self.session_journal_port.as_ref() {
+            let mut domain_event = crate::RuntimeSessionEvent::new(
                 envelope.identity.session_id.clone(),
                 0,
-                memory::SessionDomainScope::Context,
-                "context.fact_candidate_review",
+                crate::RuntimeSessionEventKind::ContextFactCandidateReview,
                 serde_json::json!({
                     "event": event,
                     "batch_id": batch.batch_id.as_str(),
@@ -3122,18 +3141,15 @@ where
                 now_ms(),
             );
             domain_event.status = Some("reviewable".to_string());
-            domain_event.refs.push(memory::SessionDomainRef {
+            domain_event.refs.push(crate::RuntimeSessionEventRef {
                 ref_type: "context_envelope".to_string(),
                 id: envelope.id.clone(),
                 label: None,
             });
-            let store = Arc::clone(store);
             let session_id = envelope.identity.session_id.clone();
-            tokio::spawn(async move {
-                if let Err(error) = store.append_session_domain_event(&domain_event).await {
-                    tracing::warn!(%error, session_id, "fact candidate domain event append failed");
-                }
-            });
+            if let Err(error) = port.append_event(&domain_event).await {
+                tracing::warn!(%error, session_id, "fact candidate domain event append failed");
+            }
         }
         Some(RuntimeContextFactDecision {
             trigger: format!("{:?}", decision.trigger),
@@ -3560,11 +3576,11 @@ where
     }
 
     #[must_use]
-    pub fn with_session_store(
+    pub fn with_session_journal_port(
         mut self,
-        store: Arc<memory::session_store::UnifiedSessionStore>,
+        port: Arc<dyn crate::SessionRuntimeJournalPort>,
     ) -> Self {
-        self.session_store = Some(store);
+        self.session_journal_port = Some(port);
         self
     }
 
@@ -3572,12 +3588,6 @@ where
     pub fn with_artifact_store(mut self, store: Arc<crate::ArtifactStore>) -> Self {
         self.artifact_store = Some(store);
         self
-    }
-
-    /// Select whether `dual_write_message` may persist transcript rows. Runtime
-    /// domain events and context/evidence persistence remain enabled.
-    pub fn set_transcript_persistence(&mut self, enabled: bool) {
-        self.transcript_persistence = enabled;
     }
 
     /// Attach the durable store that owns tool, graph, agent, and task execution state.
@@ -3827,6 +3837,15 @@ where
         self
     }
 
+    #[must_use]
+    pub(crate) fn with_maintenance_supervisor(
+        mut self,
+        supervisor: Arc<crate::execution_core::services::RuntimeMaintenanceSupervisor>,
+    ) -> Self {
+        self.maintenance_supervisor = Some(supervisor);
+        self
+    }
+
     /// Attach the Runtime-owned Fact/Matrix recall port to this conversation.
     /// The Binding is immutable for the host lifetime, so each turn evaluates
     /// the same data lease rather than re-resolving a surface default.
@@ -4036,7 +4055,7 @@ where
                 .await
                 .push_user_text(user_input.to_string())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            self.dual_write_message(
+            self.record_message_event(
                 &ConversationMessage::user_text(user_input.to_string()),
                 self.session().message_count().wrapping_sub(1),
             );
@@ -4252,7 +4271,8 @@ where
             }
         };
         apply_runtime_controls(&mut prompt);
-        self.record_runtime_policy_decision(&decision, self.session().message_count());
+        self.record_runtime_policy_decision(&decision, self.session().message_count())
+            .await;
         self.record_context_event(
             "evidence_plan",
             "runtime",
@@ -4418,6 +4438,8 @@ where
                 None
             };
             let provider_queue_wait = provider_queue_started.elapsed();
+            self.verify_session_execution_fence(crate::SessionExecutionFencePhase::ProviderRequest)
+                .await?;
             let provider_started = Instant::now();
             let mut stream = self.api_client.stream(request);
             let stream_started = Instant::now();
@@ -4615,7 +4637,7 @@ where
                 .await
                 .push_message(assistant_message.clone())
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            self.dual_write_message(
+            self.record_message_event(
                 &assistant_message,
                 self.session().message_count().wrapping_sub(1),
             );
@@ -4873,7 +4895,7 @@ where
                     .await
                     .push_message(message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(&message, self.session().message_count().wrapping_sub(1));
+                self.record_message_event(&message, self.session().message_count().wrapping_sub(1));
                 result_map.insert(call.id.clone(), (message, None));
             }
         }
@@ -5324,7 +5346,7 @@ where
                                 .await
                                 .push_message(denied.clone())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            self.dual_write_message(
+                            self.record_message_event(
                                 &denied,
                                 self.session().message_count().wrapping_sub(1),
                             );
@@ -5387,7 +5409,7 @@ where
                             .await
                             .push_message(denied.clone())
                             .map_err(|error| RuntimeError::new(error.to_string()))?;
-                        self.dual_write_message(
+                        self.record_message_event(
                             &denied,
                             self.session().message_count().wrapping_sub(1),
                         );
@@ -5403,6 +5425,10 @@ where
                         iterations,
                     )
                     .with_governed_plan(plan_id, plan_revision);
+                self.verify_session_execution_fence(
+                    crate::SessionExecutionFencePhase::ToolExecution,
+                )
+                .await?;
                 self.record_tool_invocation_event(
                     &invocation_record,
                     "tool.invocation.started",
@@ -5569,6 +5595,10 @@ where
                 };
                 let output = output_draft.model_text().to_string();
                 if execute_fresh {
+                    self.verify_session_execution_fence(
+                        crate::SessionExecutionFencePhase::ToolCommit,
+                    )
+                    .await?;
                     if let Some(commit) = effect_commit.as_ref() {
                         commit
                             .commit_tool_effect(
@@ -5750,7 +5780,7 @@ where
                     .await
                     .push_message(result.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(&result, self.session().message_count().wrapping_sub(1));
+                self.record_message_event(&result, self.session().message_count().wrapping_sub(1));
                 if let Some(payload) = prepared_vision {
                     let image_message = vision_user_message(&payload);
                     self.session
@@ -5758,7 +5788,7 @@ where
                         .await
                         .push_message(image_message.clone())
                         .map_err(|error| RuntimeError::new(error.to_string()))?;
-                    self.dual_write_message(
+                    self.record_message_event(
                         &image_message,
                         self.session().message_count().wrapping_sub(1),
                     );
@@ -5801,7 +5831,7 @@ where
                     .await
                     .push_message(denied.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
-                self.dual_write_message(&denied, self.session().message_count().wrapping_sub(1));
+                self.record_message_event(&denied, self.session().message_count().wrapping_sub(1));
                 Ok(denied)
             }
         }
@@ -6207,7 +6237,7 @@ where
             .map_err(|error| RuntimeError::new(error.to_string()))?;
         let sequence = session.message_count().wrapping_sub(1);
         drop(session);
-        self.dual_write_message(&message, sequence);
+        self.record_message_event(&message, sequence);
         Ok(())
     }
 
@@ -6227,9 +6257,9 @@ where
         &mut self,
         config: CompactionConfig,
     ) -> Result<Option<AutoCompactionEvent>, RuntimeError> {
-        if self.session_store.is_none() {
+        if self.session_journal_port.is_none() {
             return Err(RuntimeError::new(
-                "semantic compaction requires a durable UnifiedSessionStore; transcript was retained",
+                "semantic compaction requires a durable Session journal port; transcript was retained",
             ));
         }
         let original_session = self.session.read().await.clone();
@@ -6434,9 +6464,9 @@ where
         receipt: Option<CompactionReceipt>,
         semantic_checkpoint: SessionSemanticCheckpoint,
     ) -> Result<bool, RuntimeError> {
-        let store = self.session_store.as_ref().ok_or_else(|| {
+        let port = self.session_journal_port.as_ref().ok_or_else(|| {
             RuntimeError::new(
-                "semantic compaction requires a durable UnifiedSessionStore; transcript was retained",
+                "semantic compaction requires a durable Session journal port; transcript was retained",
             )
         })?;
         let session_id = self.session().session_id;
@@ -6451,23 +6481,21 @@ where
             "receipt": receipt,
         });
         let created_at_ms = now_ms();
-        let context_event = memory::SessionDomainEvent::new(
+        let context_event = crate::RuntimeSessionEvent::new(
             session_id.clone(),
             0,
-            memory::SessionDomainScope::Context,
-            "context.session_compacted",
+            crate::RuntimeSessionEventKind::ContextSessionCompacted,
             payload,
             created_at_ms,
         );
         let checkpoint_id = semantic_checkpoint.checkpoint_id.clone();
-        let compaction_event_id = context_event.event_id.clone();
+        let compaction_event_id = format!("compaction:{session_id}:{checkpoint_id}");
         let events = vec![
             context_event,
-            memory::SessionDomainEvent::new(
+            crate::RuntimeSessionEvent::new(
                 session_id.clone(),
                 0,
-                memory::SessionDomainScope::Memory,
-                "memory.semantic_checkpoint.created",
+                crate::RuntimeSessionEventKind::MemorySemanticCheckpointCreated,
                 serde_json::json!({
                     "source": "conversation_runtime.compaction",
                     "compaction_event_id": compaction_event_id,
@@ -6477,8 +6505,8 @@ where
                 created_at_ms,
             ),
         ];
-        let committed = store
-            .append_session_domain_events_if_checkpoint_absent(&events, &checkpoint_id)
+        let committed = port
+            .append_compaction_bundle_if_absent(&events, &checkpoint_id)
             .await;
         let committed = match committed {
             Ok(true) => true,
@@ -6672,7 +6700,9 @@ where
                 unavailable_sources,
                 total_budget_tokens,
             );
-            return self.finalize_context_prompt(user_input, envelope, None);
+            return self
+                .finalize_context_prompt(user_input, envelope, None)
+                .await;
         };
 
         // Convert session messages to memory's Message type for context scoring.
@@ -6776,7 +6806,9 @@ where
                         Vec::new(),
                         total_budget_tokens,
                     );
-                    return self.finalize_context_prompt(user_input, envelope, None);
+                    return self
+                        .finalize_context_prompt(user_input, envelope, None)
+                        .await;
                 }
 
                 if let Some(cb) = &self.memory_callback {
@@ -6872,6 +6904,7 @@ where
                     total_budget_tokens,
                 );
                 self.finalize_context_prompt(user_input, envelope, knowledge_report)
+                    .await
             }
             Err(err) => {
                 tracing::warn!(%err, "memory: prepare_context failed, using base system prompt");
@@ -6889,6 +6922,7 @@ where
                     total_budget_tokens,
                 );
                 self.finalize_context_prompt(user_input, envelope, None)
+                    .await
             }
         }
     }
@@ -6934,9 +6968,17 @@ where
         else {
             return;
         };
-        tokio::spawn(async move {
+        let owner = format!("memory-post-turn:{}", memory_ctx.session_id);
+        let work = async move {
             Self::complete_memory_post_turn(mgr, memory_ctx, mem_messages, callback).await;
-        });
+        };
+        if let Some(supervisor) = &self.maintenance_supervisor {
+            if !supervisor.submit(owner, work).await {
+                tracing::debug!("runtime maintenance supervisor is closed; post-turn work skipped");
+            }
+        } else {
+            work.await;
+        }
     }
 
     async fn memory_post_turn_work(
@@ -7311,7 +7353,7 @@ where
         if let Some(access) = self.existing_evidence_access(&evidence_ref) {
             return Ok((evidence_ref, access));
         }
-        let Some(ref store) = self.session_store else {
+        let Some(ref session_port) = self.session_journal_port else {
             return Err(RuntimeError::new(
                 "raw tool evidence cannot be published without the Session store",
             ));
@@ -7336,8 +7378,8 @@ where
             "source_evidence_ref": source_evidence_ref,
         });
         let facade = crate::context_evidence::raw::RawEvidenceFacade::new(
-            crate::context_evidence::raw::SessionStoreRawEvidenceStore::new(
-                Arc::clone(store),
+            crate::context_evidence::raw::SessionPortRawEvidenceStore::new(
+                Arc::clone(session_port),
                 Arc::clone(artifacts),
             ),
         );
@@ -7393,7 +7435,7 @@ where
         if let Some(access) = self.existing_evidence_access(&evidence_ref) {
             return Ok((evidence_ref, access));
         }
-        let Some(ref store) = self.session_store else {
+        let Some(ref session_port) = self.session_journal_port else {
             return Err(RuntimeError::new(
                 "staged tool evidence cannot be published without the Session store",
             ));
@@ -7418,8 +7460,8 @@ where
             "source_evidence_ref": source_evidence_ref,
             "native_staged_artifact": true,
         });
-        let access = crate::context_evidence::raw::SessionStoreRawEvidenceStore::new(
-            Arc::clone(store),
+        let access = crate::context_evidence::raw::SessionPortRawEvidenceStore::new(
+            Arc::clone(session_port),
             Arc::clone(artifacts),
         )
         .persist_artifact(evidence_ref.clone(), session_id, artifact.clone(), metadata)
@@ -8572,7 +8614,7 @@ where
         }
     }
 
-    fn dual_write_message(&self, msg: &crate::session::ConversationMessage, sequence: usize) {
+    fn record_message_event(&self, msg: &crate::session::ConversationMessage, _sequence: usize) {
         // Record the message in the event log for time-travel debugging.
         if let Some(ref log) = self.event_log {
             if let Ok(mut guard) = log.lock() {
@@ -8581,31 +8623,9 @@ where
                 });
             }
         }
-        if !self.transcript_persistence {
-            return;
-        }
-        if let Some(ref store) = self.session_store {
-            let session_id = self.session().session_id;
-            let record = msg.to_session_message(&session_id, sequence);
-            let event =
-                message_appended_session_event(msg, &session_id, sequence, record.created_at_ms);
-            let store = Arc::clone(store);
-            tokio::spawn(async move {
-                if let Err(e) = store.insert_message(&record).await {
-                    tracing::warn!(%e, session_id, sequence, "dual_write: SQLite insert failed, retrying");
-                    if let Err(retry_error) = store.insert_message(&record).await {
-                        tracing::warn!(%retry_error, session_id, sequence, "dual_write: SQLite retry failed");
-                        return;
-                    }
-                }
-                if let Err(e) = store.append_event_allocating_sequence(&event).await {
-                    tracing::warn!(%e, session_id, sequence, "dual_write: session event append failed");
-                }
-            });
-        }
     }
 
-    fn record_runtime_policy_decision(
+    async fn record_runtime_policy_decision(
         &self,
         decision: &crate::execution_core::RuntimeExecutionDecision,
         sequence: usize,
@@ -8632,7 +8652,7 @@ where
             });
         }
 
-        let Some(ref store) = self.session_store else {
+        let Some(ref port) = self.session_journal_port else {
             return;
         };
         let session_id = self.session().session_id;
@@ -8655,21 +8675,17 @@ where
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        let mut event = memory::SessionDomainEvent::new(
+        let mut event = crate::RuntimeSessionEvent::new(
             session_id.clone(),
             sequence,
-            memory::SessionDomainScope::Policy,
-            "runtime.policy.decided",
+            crate::RuntimeSessionEventKind::RuntimePolicyDecided,
             payload,
             created_at_ms,
         );
         event.status = Some("completed".to_string());
-        let store = Arc::clone(store);
-        tokio::spawn(async move {
-            if let Err(error) = store.append_session_domain_event(&event).await {
-                tracing::warn!(%error, session_id, sequence, "runtime policy domain event append failed");
-            }
-        });
+        if let Err(error) = port.append_event(&event).await {
+            tracing::warn!(%error, session_id, sequence, "runtime policy domain event append failed");
+        }
     }
 }
 
@@ -8696,29 +8712,6 @@ fn turn_strategy_event_kind_allowed(kind: &str) -> bool {
             | "runtime.strategy.early_stopped"
             | "runtime.strategy.outcome"
     )
-}
-
-fn message_appended_session_event(
-    msg: &crate::session::ConversationMessage,
-    session_id: &str,
-    sequence: usize,
-    created_at_ms: u64,
-) -> memory::SessionEvent {
-    let message = serde_json::from_str::<serde_json::Value>(&msg.to_json().render())
-        .unwrap_or(serde_json::Value::Null);
-    memory::SessionEvent {
-        session_id: session_id.to_string(),
-        event_type: "message_appended".to_string(),
-        event_json: serde_json::json!({
-            "type": "message_appended",
-            "sequence": sequence,
-            "role": msg.role.role_str(),
-            "message": message,
-        })
-        .to_string(),
-        sequence,
-        created_at_ms,
-    }
 }
 
 /// Initialise standalone Memory when no embedding composition root exists.
@@ -10026,6 +10019,173 @@ mod tests {
         }
     }
 
+    async fn stale_session_execution_fence(
+        session_id: &str,
+        request_id: &str,
+    ) -> crate::SessionExecutionFence {
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&session::SessionRecord {
+                session_id: session_id.to_string(),
+                platform: "test".to_string(),
+                chat_id: session_id.to_string(),
+                user_id: None,
+                model: Some("test-model".to_string()),
+                created_at: "2026-07-26T00:00:00Z".to_string(),
+                last_activity: "2026-07-26T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let now = super::now_ms();
+        let request = session::SessionRuntimeOutboxRequest {
+            input_id: format!("input-{request_id}"),
+            request_id: request_id.to_string(),
+            turn_id: format!("turn-{request_id}"),
+            message_id: format!("message-{request_id}"),
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
+            created_at_ms: now,
+            runtime_options_json: None,
+        };
+        store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                Some(r#"[{"type":"text","text":"fenced"}]"#),
+                now,
+                &request,
+            )
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("fence-worker", now, 60_000, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let token = claimed.claim_token.clone().expect("claim token");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                request_id,
+                "fence-worker",
+                1,
+                &token,
+                claimed.revision,
+                now,
+            )
+            .await
+            .unwrap();
+        let fence = crate::SessionExecutionFence::from_claim(
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store)),
+            request_id,
+            session_id,
+            1,
+            running.sequence,
+            "fence-worker",
+            token,
+        )
+        .unwrap();
+        store
+            .advance_session_input_generation(
+                session_id,
+                1,
+                true,
+                "test",
+                "invalidate execution before side effect",
+                now + 1,
+            )
+            .await
+            .unwrap();
+        fence
+    }
+
+    #[tokio::test]
+    async fn stale_session_fence_blocks_provider_before_transport_side_effect() {
+        #[derive(Clone)]
+        struct CountingApi(Arc<AtomicUsize>);
+        impl ApiClient for CountingApi {
+            fn stream(
+                &mut self,
+                _request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(futures::stream::iter([Ok(AssistantEvent::MessageStop)]))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fence = stale_session_execution_fence("fence-provider", "request-provider").await;
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            CountingApi(Arc::clone(&calls)),
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_session_execution_fence(fence);
+        runtime
+            .begin_turn_strategy("fence-provider-turn", "answer")
+            .unwrap();
+
+        let result = runtime.execute_model_step("answer", true).await;
+        assert!(result.is_err(), "stale provider fence result: {result:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "provider transport must not start after durable ownership is lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_session_fence_blocks_tool_before_executor_side_effect() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let fence = stale_session_execution_fence("fence-tool", "request-tool").await;
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new().register("read_file", move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok("should not execute".to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_session_execution_fence(fence);
+        runtime
+            .begin_turn_strategy("fence-tool-turn", "read")
+            .unwrap();
+        let result = runtime
+            .execute_tool_batch_step(
+                &[ModelToolCall {
+                    id: "read-fenced".to_string(),
+                    name: "read_file".to_string(),
+                    input: r#"{"path":"README.md"}"#.to_string(),
+                    depends_on: Vec::new(),
+                }],
+                &crate::SharedPrompter::none(),
+                1,
+            )
+            .await;
+        assert!(result.is_err(), "stale tool fence result: {result:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "tool executor must not start after durable ownership is lost"
+        );
+    }
+
     #[tokio::test]
     async fn ordinary_conversations_share_one_provider_admission_owner() {
         use crate::execution_core::graph::{
@@ -10317,9 +10477,10 @@ mod tests {
                 text: "recent assistant response".to_string(),
             }]),
         ]);
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().expect("session store"));
+        let store =
+            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("session store"));
         store
-            .create_session(&memory::SessionRecord {
+            .create_session(&session::SessionRecord {
                 session_id: session.session_id.clone(),
                 platform: "test".to_string(),
                 chat_id: "semantic-compaction".to_string(),
@@ -10346,7 +10507,9 @@ mod tests {
         )
         .without_memory()
         .with_memory_manager(manager)
-        .with_session_store(store);
+        .with_session_journal_port(
+            crate::session_runtime_port::TestSessionPortAdapter::new(store),
+        );
         runtime.session_compaction_config.preserve_recent = 2;
 
         let receipt = runtime
@@ -10405,7 +10568,7 @@ mod tests {
             .await
             .expect_err("a non-durable runtime must not compact history");
 
-        assert!(error.to_string().contains("durable UnifiedSessionStore"));
+        assert!(error.to_string().contains("durable Session journal port"));
         assert_eq!(runtime.session_async().await, before);
     }
 
@@ -11169,11 +11332,11 @@ mod tests {
 
     #[tokio::test]
     async fn first_model_step_activates_skill_persists_bridge_and_injects_asset() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let session = Session::new();
         let session_id = session.session_id.clone();
         store
-            .create_session(&memory::SessionRecord {
+            .create_session(&session::SessionRecord {
                 session_id: session_id.clone(),
                 platform: "test".to_string(),
                 chat_id: "skill-activation".to_string(),
@@ -11223,7 +11386,9 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory()
-        .with_session_store(Arc::clone(&store))
+        .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+            Arc::clone(&store),
+        ))
         .with_skill_profiles(vec![profile])
         .with_agent_skill_profile(AgentSkillProfile {
             adapter_ceiling: vec![SkillAdapterKind::PromptOnly],
@@ -11612,9 +11777,9 @@ mod tests {
         };
         let artifact_root = tempfile::tempdir().unwrap();
         let session = Session::new();
-        let session_store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let session_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         session_store
-            .create_session(&memory::SessionRecord {
+            .create_session(&session::SessionRecord {
                 session_id: session.session_id.clone(),
                 platform: "test".to_string(),
                 chat_id: "dynamic-exposure".to_string(),
@@ -11641,7 +11806,9 @@ mod tests {
         )
         .without_memory()
         .with_runtime_event_store(Arc::new(RuntimeEventStore::try_open_in_memory().unwrap()))
-        .with_session_store(session_store)
+        .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+            session_store,
+        ))
         .with_artifact_store(Arc::new(
             crate::ArtifactStore::sqlite(
                 artifact_root.path(),
@@ -11804,11 +11971,11 @@ mod tests {
     #[tokio::test]
     async fn governed_tool_results_persist_raw_evidence_and_bound_model_receipt() {
         let artifact_root = tempfile::tempdir().unwrap();
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let session = Session::new();
         let session_id = session.session_id.clone();
         store
-            .create_session(&memory::SessionRecord {
+            .create_session(&session::SessionRecord {
                 session_id: session_id.clone(),
                 platform: "test".to_string(),
                 chat_id: "test-chat".to_string(),
@@ -11841,7 +12008,9 @@ mod tests {
             )
             .expect("artifact store"),
         ))
-        .with_session_store(Arc::clone(&store));
+        .with_session_journal_port(
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store)),
+        );
         let raw = format!("first\n{}\nlast", "middle-evidence ".repeat(8_000));
 
         let receipt = runtime
@@ -11917,9 +12086,11 @@ mod tests {
         .without_memory()
         // No matching SessionRecord is created: the SessionStore adapter must
         // fail instead of fabricating an evidence receipt.
-        .with_session_store(Arc::new(
-            memory::UnifiedSessionStore::open_in_memory().unwrap(),
-        ));
+        .with_session_journal_port(
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::new(
+                session::UnifiedSessionStore::open_in_memory().unwrap(),
+            )),
+        );
         let raw = "raw output retained only in the active runtime when durable write fails\n"
             .repeat(1_000);
 
@@ -11939,11 +12110,11 @@ mod tests {
 
     #[tokio::test]
     async fn context_turn_report_is_durable_before_runtime_exposes_it() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let session = Session::new();
         let session_id = session.session_id.clone();
         store
-            .create_session(&memory::SessionRecord {
+            .create_session(&session::SessionRecord {
                 session_id: session_id.clone(),
                 platform: "test".to_string(),
                 chat_id: "context-report".to_string(),
@@ -11969,7 +12140,9 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory()
-        .with_session_store(Arc::clone(&store));
+        .with_session_journal_port(
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store)),
+        );
         let report = runtime.build_context_turn_report("turn-durable", TokenUsage::default(), None);
 
         runtime
@@ -11989,7 +12162,7 @@ mod tests {
 
     #[tokio::test]
     async fn context_turn_report_write_failure_does_not_expose_a_successful_report() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
@@ -11998,7 +12171,9 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory()
-        .with_session_store(store);
+        .with_session_journal_port(
+            crate::session_runtime_port::TestSessionPortAdapter::new(store),
+        );
         let report = runtime.build_context_turn_report("turn-failure", TokenUsage::default(), None);
 
         let error = runtime
@@ -12013,7 +12188,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_event_failure_is_terminal_and_does_not_claim_durable_recovery() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
@@ -12022,7 +12197,9 @@ mod tests {
             vec!["system".to_string()],
         )
         .without_memory()
-        .with_session_store(store);
+        .with_session_journal_port(
+            crate::session_runtime_port::TestSessionPortAdapter::new(store),
+        );
 
         let error = runtime
             .record_session_compacted(

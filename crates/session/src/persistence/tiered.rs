@@ -11,7 +11,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use memory::{UnifiedSessionStore, TieredSessionStore};
+//! use session::{TieredSessionStore, UnifiedSessionStore};
 //! use std::path::Path;
 //!
 //! let store = UnifiedSessionStore::open(Path::new("sessions.db")).unwrap();
@@ -25,23 +25,20 @@ use std::path::PathBuf;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::MemoryError;
-use crate::session_store::UnifiedSessionStore;
-use crate::store::session::SessionMessage;
+use crate::error::{Result, SessionError};
+use crate::persistence::sqlite::SessionMessage;
+use crate::persistence::UnifiedSessionStore;
 
 // ---------------------------------------------------------------------------
 // TieredSessionStore Error
 // ---------------------------------------------------------------------------
 
-/// Alias for results from this module.
-type Result<T> = std::result::Result<T, MemoryError>;
-
-fn store_err(msg: impl Into<String>) -> MemoryError {
-    MemoryError::Store(msg.into())
+fn store_err(msg: impl Into<String>) -> SessionError {
+    SessionError::Store(msg.into())
 }
 
-fn other_err(msg: impl Into<String>) -> MemoryError {
-    MemoryError::Other(msg.into())
+fn other_err(msg: impl Into<String>) -> SessionError {
+    SessionError::Other(msg.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -486,8 +483,8 @@ mod tests {
         session_id: &str,
         message_count: i64,
         last_activity: &str,
-    ) -> crate::store::session::SessionRecord {
-        crate::store::session::SessionRecord {
+    ) -> crate::persistence::sqlite::SessionRecord {
+        crate::persistence::sqlite::SessionRecord {
             session_id: session_id.to_string(),
             platform: "test".to_string(),
             chat_id: "chat-1".to_string(),

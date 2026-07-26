@@ -25,9 +25,10 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use chrono::Utc;
+use session::SessionHistoryReader;
 
 use crate::performance_monitor::{AutoTuner, PerformanceMonitor};
 use crate::{
@@ -71,7 +72,7 @@ use crate::{
     write_guard::{
         AuditEntry, AuditLog, AuditOperation, IntegrityChecker, MemoryWriteGuard, WriteSource,
     },
-    MemoryScope, SessionResume, UnifiedSessionStore,
+    MemoryScope, SessionResume,
 };
 
 /// Result alias used throughout this module.
@@ -175,6 +176,14 @@ pub struct BackgroundExtractionHealth {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryBackgroundShutdownReport {
+    pub joined_tasks: usize,
+    pub forced_aborts: usize,
+    pub watcher_joined: bool,
+    pub errors: Vec<String>,
+}
+
 #[derive(Default)]
 struct BackgroundExtractionState {
     pending_requests: AtomicU64,
@@ -194,6 +203,30 @@ impl BackgroundExtractionState {
             completed_requests: self.completed_requests.load(Ordering::Relaxed),
             failed_requests: self.failed_requests.load(Ordering::Relaxed),
             last_error: self.last_error.lock().clone(),
+        }
+    }
+}
+
+struct OwnedBackgroundTask {
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl OwnedBackgroundTask {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
+    fn take(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.handle.lock().take()
+    }
+}
+
+impl Drop for OwnedBackgroundTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.get_mut().take() {
+            handle.abort();
         }
     }
 }
@@ -251,8 +284,11 @@ pub struct CognitiveContextManager {
     /// drained at the start of each turn-end cycle.
     pending_llm_entries: Arc<Mutex<Vec<PendingLlmEntries>>>,
     /// Handle to the background LLM extraction task.
-    #[allow(dead_code)]
-    extract_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    extract_handle: OwnedBackgroundTask,
+    /// Handle to the in-memory knowledge graph replacement task.
+    kg_rebuild_handle: OwnedBackgroundTask,
+    /// Shared close signal for every Tokio task owned by this manager.
+    background_shutdown: watch::Sender<bool>,
     background_extraction_state: Arc<BackgroundExtractionState>,
     /// Freshness-priority context manager for session budget management.
     fresh_ctx: FreshContextManager,
@@ -305,7 +341,7 @@ impl CognitiveContextManager {
 
     /// Initialise the manager from `config`, opening all storage backends.
     pub async fn new(config: MemoryConfig) -> Result<Self> {
-        Self::new_with_workspace_and_session_store(config, None, None).await
+        Self::new_with_workspace_and_session_history(config, None, None).await
     }
 
     /// Initialise the manager with an explicit workspace root for L2 project
@@ -314,17 +350,17 @@ impl CognitiveContextManager {
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
     ) -> Result<Self> {
-        Self::new_with_workspace_and_session_store(config, workspace_root, None).await
+        Self::new_with_workspace_and_session_history(config, workspace_root, None).await
     }
 
     /// Initialise with the selected durable session owner.  Session recovery
     /// is deliberately injected rather than inferred from a SQLite path.
-    pub async fn new_with_workspace_and_session_store(
+    pub async fn new_with_workspace_and_session_history(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
-        session_store: Option<Arc<UnifiedSessionStore>>,
+        session_history: Option<Arc<SessionHistoryReader>>,
     ) -> Result<Self> {
-        Self::new_with_storage_selection(config, workspace_root, session_store, None, true).await
+        Self::new_with_storage_selection(config, workspace_root, session_history, None, true).await
     }
 
     /// Initialise the complete cognitive runtime over a host-selected durable
@@ -335,11 +371,17 @@ impl CognitiveContextManager {
     pub async fn new_with_selected_store(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
-        session_store: Option<Arc<UnifiedSessionStore>>,
+        session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
     ) -> Result<Self> {
-        Self::new_with_storage_selection(config, workspace_root, session_store, Some(store), false)
-            .await
+        Self::new_with_storage_selection(
+            config,
+            workspace_root,
+            session_history,
+            Some(store),
+            false,
+        )
+        .await
     }
 
     /// Variant used by a composition root that selected SQLite and therefore
@@ -348,14 +390,14 @@ impl CognitiveContextManager {
     pub async fn new_with_selected_store_and_auxiliaries(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
-        session_store: Option<Arc<UnifiedSessionStore>>,
+        session_history: Option<Arc<SessionHistoryReader>>,
         store: Arc<dyn MemoryStore>,
         sqlite_auxiliaries: bool,
     ) -> Result<Self> {
         Self::new_with_storage_selection(
             config,
             workspace_root,
-            session_store,
+            session_history,
             Some(store),
             sqlite_auxiliaries,
         )
@@ -365,7 +407,7 @@ impl CognitiveContextManager {
     async fn new_with_storage_selection(
         config: MemoryConfig,
         workspace_root: Option<PathBuf>,
-        session_store: Option<Arc<UnifiedSessionStore>>,
+        session_history: Option<Arc<SessionHistoryReader>>,
         selected_store: Option<Arc<dyn MemoryStore>>,
         sqlite_auxiliaries: bool,
     ) -> Result<Self> {
@@ -429,6 +471,7 @@ impl CognitiveContextManager {
         let pending_llm_entries: Arc<Mutex<Vec<PendingLlmEntries>>> =
             Arc::new(Mutex::new(Vec::new()));
         let background_extraction_state = Arc::new(BackgroundExtractionState::default());
+        let (background_shutdown, mut extraction_shutdown) = watch::channel(false);
 
         let bg_extractor = Arc::clone(&extractor);
         let bg_pending = Arc::clone(&pending_llm_entries);
@@ -438,7 +481,21 @@ impl CognitiveContextManager {
 
         let extract_handle = tokio::spawn(async move {
             let debounce = Duration::from_secs(extractor_debounce_secs);
-            while let Some(first_request) = extract_rx.recv().await {
+            loop {
+                let first_request = tokio::select! {
+                    changed = extraction_shutdown.changed() => {
+                        if changed.is_err() || *extraction_shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    request = extract_rx.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        request
+                    }
+                };
                 let mut batches = HashMap::new();
                 let first_key = background_extraction_key(&first_request.turn);
                 batches.insert(first_key, (first_request, 1_u64));
@@ -448,6 +505,11 @@ impl CognitiveContextManager {
                     tokio::pin!(timer);
                     loop {
                         tokio::select! {
+                            changed = extraction_shutdown.changed() => {
+                                if changed.is_err() || *extraction_shutdown.borrow() {
+                                    return;
+                                }
+                            }
                             request = extract_rx.recv() => {
                                 let Some(request) = request else {
                                     break;
@@ -468,7 +530,17 @@ impl CognitiveContextManager {
                     if bg_extractor.llm_client().is_none() {
                         continue;
                     }
-                    match bg_extractor.llm_extract(&request.messages).await {
+                    let extraction = bg_extractor.llm_extract(&request.messages);
+                    let extraction = tokio::select! {
+                        changed = extraction_shutdown.changed() => {
+                            if changed.is_err() || *extraction_shutdown.borrow() {
+                                return;
+                            }
+                            continue;
+                        }
+                        result = extraction => result,
+                    };
+                    match extraction {
                         Ok(llm_entries) => {
                             let final_entries = bg_extractor.finalize_entries(llm_entries);
                             let entry_count = final_entries.len();
@@ -575,8 +647,23 @@ impl CognitiveContextManager {
         // replaces the in-memory graph.  The task holds a clone of the Arc.
         let kg_for_receiver = kg.clone();
         let l2_cache_for_receiver = l2_cache.clone();
-        tokio::spawn(async move {
-            while let Some(new_kg) = kg_rebuild_rx.recv().await {
+        let mut kg_shutdown = background_shutdown.subscribe();
+        let kg_rebuild_handle = tokio::spawn(async move {
+            loop {
+                let new_kg = tokio::select! {
+                    changed = kg_shutdown.changed() => {
+                        if changed.is_err() || *kg_shutdown.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    item = kg_rebuild_rx.recv() => {
+                        let Some(item) = item else {
+                            break;
+                        };
+                        item
+                    }
+                };
                 let mut guard = kg_for_receiver.lock();
                 let old_count = guard.list_entities().len();
                 *guard = new_kg;
@@ -650,8 +737,8 @@ impl CognitiveContextManager {
         // Build state_rebuilder if workspace_root is available
         let ws_root = workspace_root.clone();
         let state_rebuilder = ws_root.as_ref().and_then(|workspace| {
-            session_store.as_ref().map(|store| {
-                StateRebuilder::with_session_store(workspace.clone(), Arc::clone(store))
+            session_history.as_ref().map(|history| {
+                StateRebuilder::with_session_history(workspace.clone(), Arc::clone(history))
             })
         });
         let tool_sandbox = ToolOutputSandbox::new().map(Mutex::new).map_err(|error| {
@@ -733,7 +820,9 @@ impl CognitiveContextManager {
             background_watcher: Mutex::new(watcher_handle),
             extract_tx,
             pending_llm_entries,
-            extract_handle: Mutex::new(Some(extract_handle)),
+            extract_handle: OwnedBackgroundTask::new(extract_handle),
+            kg_rebuild_handle: OwnedBackgroundTask::new(kg_rebuild_handle),
+            background_shutdown,
             background_extraction_state,
         })
     }
@@ -3308,6 +3397,32 @@ impl CognitiveContextManager {
         self.background_extraction_state.snapshot()
     }
 
+    /// Stop every background execution body owned by this manager.
+    ///
+    /// Gateway calls this during normal shutdown and startup rollback. Handles
+    /// are taken before awaiting, making repeated calls idempotent.
+    pub async fn shutdown_background_tasks(&self) -> MemoryBackgroundShutdownReport {
+        let _ = self.background_shutdown.send(true);
+        let mut report = MemoryBackgroundShutdownReport::default();
+        let watcher = self.background_watcher.lock().take();
+        if let Some(watcher) = watcher {
+            match tokio::task::spawn_blocking(move || watcher.shutdown()).await {
+                Ok(Ok(())) => report.watcher_joined = true,
+                Ok(Err(error)) => report.errors.push(error),
+                Err(error) => report
+                    .errors
+                    .push(format!("join background watcher shutdown: {error}")),
+            }
+        } else {
+            report.watcher_joined = true;
+        }
+        let handles = [self.extract_handle.take(), self.kg_rebuild_handle.take()];
+        for handle in handles.into_iter().flatten() {
+            join_memory_background_task(handle, &mut report).await;
+        }
+        report
+    }
+
     // ── Performance report (P9.4) ────────────────────────────────────────
 
     /// Return a snapshot of current performance metrics and auto-tuner state.
@@ -3324,6 +3439,23 @@ impl CognitiveContextManager {
         let tuning_config = self.auto_tuner.config();
         self.perf_monitor
             .report(&tuning_config, tuning_applied, last_tuning)
+    }
+}
+
+async fn join_memory_background_task(
+    mut handle: tokio::task::JoinHandle<()>,
+    report: &mut MemoryBackgroundShutdownReport,
+) {
+    match tokio::time::timeout(Duration::from_secs(5), &mut handle).await {
+        Ok(Ok(())) => report.joined_tasks += 1,
+        Ok(Err(error)) => report
+            .errors
+            .push(format!("memory background task failed: {error}")),
+        Err(_) => {
+            handle.abort();
+            let _ = handle.await;
+            report.forced_aborts += 1;
+        }
     }
 }
 
@@ -3718,5 +3850,25 @@ mod tests {
 
         // build_context_with_code wraps prepare_context
         assert!(ctx.code_context.is_none()); // non-code query
+    }
+
+    #[tokio::test]
+    async fn background_tasks_are_joined_and_shutdown_is_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.store.sqlite_path = tmp.path().join("test.db");
+
+        let mgr = CognitiveContextManager::new(cfg).await.unwrap();
+        let first = mgr.shutdown_background_tasks().await;
+        assert_eq!(first.forced_aborts, 0);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+        assert!(first.watcher_joined);
+        assert_eq!(first.joined_tasks, 2);
+
+        let second = mgr.shutdown_background_tasks().await;
+        assert_eq!(second.forced_aborts, 0);
+        assert!(second.errors.is_empty());
+        assert!(second.watcher_joined);
+        assert_eq!(second.joined_tasks, 0);
     }
 }

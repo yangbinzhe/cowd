@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -6,35 +7,44 @@ use surface::{SurfaceLifecycle, SurfaceRuntimeStatus};
 use super::SurfaceHost;
 
 impl SurfaceHost {
-    pub(crate) fn start_monitor(&self) {
-        let mut monitor = self
-            .monitor_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if monitor.is_some() {
-            return;
+    pub(crate) fn start_monitor(&self) -> Result<(), String> {
+        if self
+            .monitor_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
         }
 
         let host = self.clone();
-        *monitor = Some(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                host.monitor_tick().await;
-            }
-        }));
+        let started = self.monitor_started.clone();
+        self.gateway_tasks
+            .spawn_owned(
+                crate::runtime_host::task_set::GatewayTaskKind::SurfaceMonitor,
+                crate::runtime_host::task_set::GatewayTaskOwner::Surface(
+                    "__surface_host__".to_string(),
+                ),
+                move |cancellation| async move {
+                    loop {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                                host.monitor_tick().await;
+                            }
+                        }
+                    }
+                    started.store(false, Ordering::Release);
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                self.monitor_started.store(false, Ordering::Release);
+                format!("failed to start Surface monitor: {error}")
+            })
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
-        let monitor = self
-            .monitor_task
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(monitor) = monitor {
-            monitor.abort();
-            let _ = monitor.await;
-        }
-
+        self.monitor_started.store(false, Ordering::Release);
         let surfaces = self
             .managed
             .lock()
@@ -47,6 +57,34 @@ impl SurfaceHost {
             if let Err(error) = self.stop_surface(&surface).await {
                 failures.push(format!("{surface}: {error}"));
             }
+            let report = self
+                .gateway_tasks
+                .close_owner_and_drain(
+                    crate::runtime_host::task_set::GatewayTaskOwner::Surface(surface.clone()),
+                    Duration::from_secs(5),
+                )
+                .await;
+            if report.forced_aborts > 0 {
+                failures.push(format!(
+                    "{surface}: {} Surface tasks required forced abort",
+                    report.forced_aborts
+                ));
+            }
+        }
+        let monitor = self
+            .gateway_tasks
+            .close_owner_and_drain(
+                crate::runtime_host::task_set::GatewayTaskOwner::Surface(
+                    "__surface_host__".to_string(),
+                ),
+                Duration::from_secs(5),
+            )
+            .await;
+        if monitor.forced_aborts > 0 {
+            failures.push(format!(
+                "Surface monitor required {} forced aborts",
+                monitor.forced_aborts
+            ));
         }
         if failures.is_empty() {
             Ok(())

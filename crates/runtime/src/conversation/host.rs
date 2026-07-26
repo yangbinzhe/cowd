@@ -74,6 +74,11 @@ pub struct TurnIngressRef {
     pub turn_id: String,
     pub message_id: String,
     pub session_id: String,
+    pub session_generation: u64,
+    pub input_sequence: u64,
+    pub claim_owner: String,
+    pub claim_token: String,
+    pub claim_revision: u64,
 }
 
 /// Inputs required to build a standard provider-backed runtime host.
@@ -94,7 +99,6 @@ where
     pub stream_callback: Option<std::sync::mpsc::SyncSender<CowdEvent>>,
     pub tool_callback: Option<Arc<dyn ToolCallback>>,
     pub model_context_window: Option<u32>,
-    pub session_store: Option<Arc<memory::session_store::UnifiedSessionStore>>,
     pub hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     pub external_context_items: Vec<ContextItem>,
     pub skill_profiles: Vec<SkillCapabilityProfile>,
@@ -163,6 +167,7 @@ where
             config.memory_team_id,
             config.memory_read_scopes,
         )
+        .with_maintenance_supervisor(services.maintenance_supervisor())
         .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
         if root_provider_owner {
             runtime = runtime.with_provider_admission(Arc::clone(services.resource_manager()));
@@ -173,8 +178,8 @@ where
         }
         runtime.set_active_model(active_model);
 
-        if let Some(store) = config.session_store {
-            runtime = runtime.with_session_store(store);
+        if let Some(journal) = services.session_journal_port() {
+            runtime = runtime.with_session_journal_port(journal);
         }
         if let Some(callback) = config.tool_callback {
             runtime = runtime.with_tool_callback(callback);
@@ -297,13 +302,6 @@ where
         );
     }
 
-    /// Control whether this host may publish transcript rows. Delegated
-    /// Agent hosts disable it while retaining durable evidence and domain
-    /// events under the parent Session authority.
-    pub fn set_transcript_persistence(&mut self, enabled: bool) {
-        self.runtime_mut().set_transcript_persistence(enabled);
-    }
-
     pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
         self.runtime_ref().inject_resume_context(packet);
     }
@@ -349,15 +347,13 @@ where
         ingress: TurnIngressRef,
     ) -> Result<TurnSummary, RuntimeError> {
         self.restore_inflight_turn().await?;
-        let Some(mut runtime) = self.runtime.take() else {
+        let Some(runtime) = self.runtime.take() else {
             return Err(RuntimeError::new(
                 "Runtime host has no conversation available for ingress execution",
             ));
         };
-        // The gateway ingress outbox owns the user record and the terminal
-        // outbox owns the assistant record. Keep the in-memory transcript for
-        // model context, but prohibit a second SQLite transcript writer.
-        runtime.set_transcript_persistence(false);
+        // Gateway ingress owns the user row and the terminal outbox atomically
+        // commits the complete Runtime transcript.
         let execution_id = crate::session_execution::session_ingress_graph_id(
             &ingress.session_id,
             &ingress.request_id,
@@ -428,7 +424,7 @@ where
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.inflight_turn = Some(receiver);
         tokio::spawn(async move {
-            let (mut runtime, result) = match ingress {
+            let (runtime, result) = match ingress {
                 Some((ingress, execution_id)) => {
                     // Scope every provider/tool/approval event to the
                     // deterministic SessionIngress execution. The guard lives
@@ -441,15 +437,40 @@ where
                             turn_id: ingress.turn_id.clone(),
                         })
                     });
-                    let completed = submit_owned_conversation_turn_with_ingress(
-                        runtime,
-                        services,
-                        &content,
-                        &prompter,
-                        Some(ingress),
-                        execution_parent,
-                    )
-                    .await;
+                    let runtime = runtime;
+                    let fence = match usize::try_from(ingress.input_sequence) {
+                        Ok(input_sequence) => match services.session_query_port() {
+                            Some(query) => crate::SessionExecutionFence::from_claim(
+                                query,
+                                ingress.request_id.clone(),
+                                ingress.session_id.clone(),
+                                ingress.session_generation,
+                                input_sequence,
+                                ingress.claim_owner.clone(),
+                                ingress.claim_token.clone(),
+                            ),
+                            None => Err("Session ingress requires a durable execution fence store"
+                                .to_string()),
+                        },
+                        Err(_) => Err(format!(
+                            "Session ingress sequence {} exceeds this platform's durable index range",
+                            ingress.input_sequence
+                        )),
+                    };
+                    let completed = match fence {
+                        Ok(fence) => {
+                            submit_owned_conversation_turn_with_ingress(
+                                runtime.with_session_execution_fence(fence),
+                                services,
+                                &content,
+                                &prompter,
+                                Some(ingress),
+                                execution_parent,
+                            )
+                            .await
+                        }
+                        Err(error) => (runtime, Err(RuntimeError::new(error))),
+                    };
                     drop(execution_scope);
                     completed
                 }
@@ -465,7 +486,6 @@ where
                     .await
                 }
             };
-            runtime.set_transcript_persistence(true);
             let _ = sender.send((runtime, result));
         });
     }
@@ -619,9 +639,10 @@ where
     let mut runtime = runtime
         .with_runtime_event_store(Arc::clone(services.event_store()))
         .with_artifact_store(Arc::clone(services.artifact_store()))
+        .with_maintenance_supervisor(services.maintenance_supervisor())
         .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
-    if let Some(store) = services.session_store() {
-        runtime = runtime.with_session_store(store);
+    if let Some(journal) = services.session_journal_port() {
+        runtime = runtime.with_session_journal_port(journal);
     }
     let evaluation_control = match evaluation_turn_control(content) {
         Ok(control) => control,
@@ -6193,6 +6214,16 @@ where
                 .map_err(|error| format!("goal completion cannot commit: {error}"))?,
         );
         if let Some(ingress) = ingress {
+            let terminal_fence = self
+                .runtime
+                .lock()
+                .await
+                .capture_session_execution_fence(crate::SessionExecutionFencePhase::TerminalCommit)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "Session terminal requires a durable execution fence snapshot".to_string()
+                })?;
             let mut transcript = {
                 let runtime = self.runtime.lock().await;
                 let session = runtime.session_async().await;
@@ -6238,6 +6269,12 @@ where
                 session_id: ingress.session_id,
                 execution_id: Some(ticket.graph_id.clone()),
                 turn_id: Some(ingress.turn_id.clone()),
+                request_id: Some(terminal_fence.request_id),
+                session_generation: Some(terminal_fence.session_generation),
+                input_sequence: Some(ingress.input_sequence),
+                input_claim_owner: Some(terminal_fence.claim_owner),
+                input_claim_token: Some(terminal_fence.claim_token),
+                input_claim_revision: Some(terminal_fence.claim_revision),
                 payload_ref: format!(
                     "assistant_terminal_v2:{}",
                     serde_json::to_string(&serde_json::json!({
@@ -9046,7 +9083,6 @@ mod tests {
             stream_callback: None,
             tool_callback: None,
             model_context_window: None,
-            session_store: None,
             hook_progress_reporter: None,
             external_context_items: Vec::new(),
             skill_profiles: Vec::new(),
@@ -9978,9 +10014,9 @@ mod tests {
         let executions_seen_before_second_model = Arc::new(AtomicUsize::new(0));
         let order = Arc::new(Mutex::new(Vec::new()));
         let session = Session::new();
-        let session_store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let session_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         session_store
-            .create_session(&memory::SessionRecord {
+            .create_session(&session::SessionRecord {
                 session_id: session.session_id.clone(),
                 platform: "test".to_string(),
                 chat_id: "dependent-wave".to_string(),
@@ -10015,7 +10051,9 @@ mod tests {
             vec!["use requested tools".to_string()],
         )
         .without_memory()
-        .with_session_store(session_store)
+        .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+            session_store,
+        ))
         .with_artifact_store(Arc::clone(services.artifact_store()));
 
         let (_runtime, result) = submit_owned_conversation_turn(

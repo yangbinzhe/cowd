@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, RwLock,
+};
 
 use surface::{
     SurfaceDescriptor, SurfaceFrame, SurfaceMessageLedger, SurfaceRuntimeSnapshot,
@@ -24,8 +27,8 @@ pub(crate) use ingress::spawn_surface_ingress_dispatcher;
 pub(crate) use message_store::SqliteSurfaceMessageStore;
 pub(crate) use message_store::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
-    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
-    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
+    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceSessionProjectionDraft,
+    SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 pub(crate) use types::{
     SurfaceDiscoveryFailure, SurfaceDiscoveryReport, SurfaceHostHealth, SurfaceResourceSummary,
@@ -47,7 +50,8 @@ pub(crate) struct SurfaceHost {
     ledger: Arc<AsyncMutex<HashMap<String, VecDeque<SurfaceSupervisorEvent>>>>,
     messages: Arc<dyn SurfaceMessageLedger>,
     event_tx: broadcast::Sender<SurfaceFrame>,
-    monitor_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
+    monitor_started: Arc<AtomicBool>,
 }
 
 impl SurfaceHost {
@@ -97,6 +101,22 @@ impl SurfaceHost {
         configs: BTreeMap<String, serde_json::Value>,
         messages: Arc<dyn SurfaceMessageLedger>,
     ) -> Self {
+        Self::with_configs_message_store_and_tasks(
+            roots,
+            configs,
+            messages,
+            crate::runtime_host::task_set::GatewayRuntimeTaskSet::new(
+                std::time::Duration::from_secs(5),
+            ),
+        )
+    }
+
+    pub(crate) fn with_configs_message_store_and_tasks(
+        roots: Vec<PathBuf>,
+        configs: BTreeMap<String, serde_json::Value>,
+        messages: Arc<dyn SurfaceMessageLedger>,
+        gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(1024);
         let host = Self {
             registry: Arc::new(RwLock::new(BTreeMap::new())),
@@ -107,7 +127,8 @@ impl SurfaceHost {
             ledger: Arc::new(AsyncMutex::new(HashMap::new())),
             messages,
             event_tx,
-            monitor_task: Arc::new(Mutex::new(None)),
+            gateway_tasks,
+            monitor_started: Arc::new(AtomicBool::new(false)),
         };
         host.register_builtin_surfaces();
         host
@@ -129,6 +150,16 @@ impl SurfaceHost {
 
     pub(crate) fn message_store_root(&self) -> PathBuf {
         self.messages.diagnostic_root()
+    }
+
+    pub(crate) fn gateway_tasks(
+        &self,
+    ) -> Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet> {
+        Arc::clone(&self.gateway_tasks)
+    }
+
+    pub(super) fn monitor_is_running(&self) -> bool {
+        self.monitor_started.load(Ordering::Acquire)
     }
 }
 

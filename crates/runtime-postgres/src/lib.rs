@@ -27,7 +27,8 @@ use runtime::{
     RuntimeEventStoreError, RuntimeEventStoreResult, RuntimeEventStoreSnapshot,
     RuntimeEventStreamHeadSnapshot, RuntimeEventTransactionStreamSnapshot,
     RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
-    RuntimeTransactionEventInput, SessionTerminalInput, VerifiedDecisionLease,
+    RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput, SessionTerminalInput,
+    VerifiedDecisionLease,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -93,6 +94,12 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
             payload_ref TEXT NOT NULL,
             execution_id TEXT,
             turn_id TEXT,
+            request_id TEXT,
+            session_generation BIGINT,
+            input_sequence BIGINT,
+            input_claim_owner TEXT,
+            input_claim_token TEXT,
+            input_claim_revision BIGINT,
             status TEXT NOT NULL,
             attempts BIGINT NOT NULL DEFAULT 0,
             next_attempt_at BIGINT,
@@ -137,6 +144,26 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
     statements: &[
         "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS execution_id TEXT",
         "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS turn_id TEXT",
+    ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0003.terminal-execution-fence",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 3,
+    description: "persist terminal Session generation and input claim fence",
+    statements: &[
+        "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS request_id TEXT",
+        "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS session_generation BIGINT",
+        "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS input_claim_owner TEXT",
+        "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS input_claim_token TEXT",
+        "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS input_claim_revision BIGINT",
+    ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0004.terminal-input-sequence-fence",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 4,
+    description: "persist the exact durable Session input sequence in terminal fences",
+    statements: &[
+        "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS input_sequence BIGINT",
     ],
 }];
 
@@ -528,7 +555,7 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     fn execution_events_for_session(
         &self,
         session_id: &str,
-        after_commit_cursor: u64,
+        after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         if session_id.trim().is_empty() || limit == 0 {
@@ -581,7 +608,11 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         related.dedup_by(|left, right| left.event_id == right.event_id);
         Ok(related
             .into_iter()
-            .filter(|event| event.commit_cursor > after_commit_cursor)
+            .filter(|event| {
+                after_position.is_none_or(|position| {
+                    (event.commit_cursor, event.transaction_index) > position
+                })
+            })
             .take(limit)
             .collect())
     }
@@ -650,25 +681,17 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         commit_cursor: u64,
         payload_ref: &str,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        let mut connection = self.executor.checkout_runtime()?;
-        let mut tx = pg(connection.transaction())?;
-        insert_terminal_in_tx(
-            &mut tx,
-            &SessionTerminalInput {
-                terminal_id: terminal_id.to_string(),
-                message_id: message_id.to_string(),
-                session_id: session_id.to_string(),
-                execution_id: None,
-                turn_id: None,
-                payload_ref: payload_ref.to_string(),
-            },
+        let _ = (
+            terminal_id,
+            message_id,
+            session_id,
             commit_cursor,
-        )?;
-        let record = query_runtime_session_outbox(&mut tx, terminal_id)?.ok_or_else(|| {
-            RuntimeEventStoreError::Corrupt(format!("terminal outbox `{terminal_id}` disappeared"))
-        })?;
-        pg(tx.commit())?;
-        Ok(record)
+            payload_ref,
+        );
+        Err(RuntimeEventStoreError::InvalidTransaction(
+            "unfenced terminal enqueue is test-only; use append_transaction_with_terminal"
+                .to_string(),
+        ))
     }
 
     fn claim_session_terminals(
@@ -699,6 +722,8 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
                  WHERE outbox.terminal_id=candidates.terminal_id
                 RETURNING outbox.terminal_id, outbox.message_id, outbox.session_id,
                     outbox.commit_cursor, outbox.payload_ref, outbox.execution_id, outbox.turn_id,
+                    outbox.request_id, outbox.session_generation, outbox.input_sequence, outbox.input_claim_owner,
+                    outbox.input_claim_token, outbox.input_claim_revision,
                     outbox.status, outbox.attempts, outbox.next_attempt_at, outbox.claim_owner,
                     outbox.claim_expires_at, outbox.failure_class, outbox.last_error,
                     outbox.materialized_at, outbox.revision
@@ -726,6 +751,18 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         query_runtime_session_outbox(&mut connection, terminal_id)
     }
 
+    fn has_unsettled_session_terminals(&self, session_id: &str) -> RuntimeEventStoreResult<bool> {
+        let mut connection = self.executor.checkout_runtime()?;
+        let row = pg(connection.query_one(
+            "SELECT EXISTS(
+                 SELECT 1 FROM runtime_session_outbox
+                  WHERE session_id=$1 AND status!='materialized'
+             )",
+            &[&session_id],
+        ))?;
+        pg(row.try_get(0))
+    }
+
     fn materialized_session_terminals_after(
         &self,
         session_id: &str,
@@ -734,7 +771,9 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
         let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                    request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                    input_claim_revision, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox WHERE session_id=$1 AND status='materialized'
@@ -776,7 +815,9 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
         let mut connection = self.executor.checkout_runtime()?;
         let rows = pg(connection.query(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                    request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                    input_claim_revision, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox WHERE status='blocked'
@@ -835,6 +876,140 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             None,
             now_ms,
         )
+    }
+
+    fn adopt_session_terminal_fence(
+        &self,
+        request: &RuntimeSessionTerminalFenceAdoption,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        if request.terminal_id.trim().is_empty()
+            || request.request_id.trim().is_empty()
+            || request.session_id.trim().is_empty()
+            || request.turn_id.trim().is_empty()
+            || request.claim_owner.trim().is_empty()
+            || request.claim_token.trim().is_empty()
+            || request.session_generation == 0
+            || request.claim_revision == 0
+            || request.claim_expires_at_ms <= request.adopted_at_ms
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "terminal fence adoption requires live terminal, request, session, turn and claim identities"
+                    .to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_runtime()?;
+        let mut tx = pg(connection.transaction())?;
+        let current = pg(tx.query_opt(
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                    request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                    input_claim_revision, status, attempts, next_attempt_at, claim_owner,
+                    claim_expires_at, failure_class, last_error, materialized_at, revision
+               FROM runtime_session_outbox WHERE terminal_id=$1 FOR UPDATE",
+            &[&request.terminal_id],
+        ))?
+        .map(|row| row_to_runtime_session_outbox(&row))
+        .transpose()?
+        .ok_or_else(|| {
+            RuntimeEventStoreError::Corrupt(format!(
+                "terminal `{}` is missing",
+                request.terminal_id
+            ))
+        })?;
+        if current.request_id.as_deref() != Some(request.request_id.as_str())
+            || current.session_id != request.session_id
+            || current.turn_id.as_deref() != Some(request.turn_id.as_str())
+            || current.session_generation != Some(request.session_generation)
+            || current.input_sequence != Some(request.input_sequence)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "terminal `{}` identity does not match the current Session claim",
+                request.terminal_id
+            )));
+        }
+        let already_adopted = current.input_claim_owner.as_deref()
+            == Some(request.claim_owner.as_str())
+            && current.input_claim_token.as_deref() == Some(request.claim_token.as_str())
+            && current.input_claim_revision == Some(request.claim_revision)
+            && current.input_sequence == Some(request.input_sequence);
+        if already_adopted {
+            return Ok(current);
+        }
+        if current.revision != request.expected_terminal_revision {
+            return Err(RuntimeEventStoreError::StaleRevision {
+                stream_id: format!("session-terminal:{}", request.terminal_id),
+                expected: request.expected_terminal_revision,
+                actual: current.revision,
+            });
+        }
+        if current.status == "materialized" {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "materialized terminal `{}` cannot adopt a different Session claim",
+                request.terminal_id
+            )));
+        }
+        if !matches!(
+            current.status.as_str(),
+            "pending" | "retry_scheduled" | "blocked" | "claimed"
+        ) {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "terminal `{}` in state `{}` cannot adopt a Session claim",
+                request.terminal_id, current.status
+            )));
+        }
+        if current
+            .input_claim_revision
+            .is_some_and(|revision| request.claim_revision <= revision)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "terminal `{}` cannot regress Session claim revision",
+                request.terminal_id
+            )));
+        }
+        if current.status == "claimed"
+            && !current
+                .claim_expires_at_ms
+                .is_some_and(|expires| expires <= request.adopted_at_ms)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "terminal `{}` has an active delivery claim",
+                request.terminal_id
+            )));
+        }
+        let changed = pg(tx.execute(
+            "UPDATE runtime_session_outbox
+                SET input_sequence=$1, input_claim_owner=$2, input_claim_token=$3, input_claim_revision=$4,
+                    status='pending', next_attempt_at=0, claim_owner=NULL,
+                    claim_expires_at=NULL, failure_class=NULL, last_error=NULL,
+                    materialized_at=NULL, revision=revision+1
+              WHERE terminal_id=$5 AND revision=$6",
+            &[
+                &to_i64(request.input_sequence, "input_sequence")?,
+                &request.claim_owner,
+                &request.claim_token,
+                &to_i64(request.claim_revision, "claim_revision")?,
+                &request.terminal_id,
+                &to_i64(
+                    request.expected_terminal_revision,
+                    "expected_terminal_revision",
+                )?,
+            ],
+        ))?;
+        if changed != 1 {
+            return Err(RuntimeEventStoreError::StaleRevision {
+                stream_id: format!("session-terminal:{}", request.terminal_id),
+                expected: request.expected_terminal_revision,
+                actual: current.revision,
+            });
+        }
+        let adopted =
+            query_runtime_session_outbox(&mut tx, &request.terminal_id)?.ok_or_else(|| {
+                RuntimeEventStoreError::Corrupt(format!(
+                    "terminal `{}` vanished after fence adoption",
+                    request.terminal_id
+                ))
+            })?;
+        pg(tx.commit())?;
+        Ok(adopted)
     }
 
     fn fail_session_terminal(
@@ -898,8 +1073,9 @@ impl PostgresRuntimeEventStore {
              materialized_at=CASE WHEN $1='materialized' THEN $5 ELSE materialized_at END,
              revision=revision+1 WHERE terminal_id=$6 AND status='claimed'
              AND claim_owner=$7 AND revision=$8
-             RETURNING terminal_id, message_id, session_id, commit_cursor, payload_ref,
-                 execution_id, turn_id, status, attempts, next_attempt_at, claim_owner,
+              RETURNING terminal_id, message_id, session_id, commit_cursor, payload_ref,
+                 execution_id, turn_id, request_id, session_generation, input_sequence, input_claim_owner,
+                 input_claim_token, input_claim_revision, status, attempts, next_attempt_at, claim_owner,
                  claim_expires_at, failure_class, last_error, materialized_at, revision",
             &[
                 &status,
@@ -1025,7 +1201,9 @@ fn export_postgres_migration_snapshot(
     })
     .collect::<RuntimeEventStoreResult<Vec<_>>>()?;
     let session_outbox = pg(connection.query(
-        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
+        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                input_claim_revision, status,
                 attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                 last_error, materialized_at, revision
            FROM runtime_session_outbox ORDER BY terminal_id ASC",
@@ -1159,12 +1337,26 @@ fn import_postgres_migration_snapshot(
             .materialized_at_ms
             .map(|value| to_i64(value, "materialized_at"))
             .transpose()?;
+        let session_generation = terminal
+            .session_generation
+            .map(|value| to_i64(value, "session_generation"))
+            .transpose()?;
+        let input_claim_revision = terminal
+            .input_claim_revision
+            .map(|value| to_i64(value, "input_claim_revision"))
+            .transpose()?;
+        let input_sequence = terminal
+            .input_sequence
+            .map(|value| to_i64(value, "input_sequence"))
+            .transpose()?;
         pg(tx.execute(
             "INSERT INTO runtime_session_outbox
-             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, attempts,
+             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+              request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+              input_claim_revision, status, attempts,
               next_attempt_at, claim_owner, claim_expires_at, failure_class, last_error,
               materialized_at, revision)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)",
             &[
                 &terminal.terminal_id,
                 &terminal.message_id,
@@ -1173,6 +1365,12 @@ fn import_postgres_migration_snapshot(
                 &terminal.payload_ref,
                 &terminal.execution_id,
                 &terminal.turn_id,
+                &terminal.request_id,
+                &session_generation,
+                &input_sequence,
+                &terminal.input_claim_owner,
+                &terminal.input_claim_token,
+                &input_claim_revision,
                 &terminal.status,
                 &i64::from(terminal.attempts),
                 &next_attempt_at,
@@ -1239,7 +1437,15 @@ fn append_transaction_in_tx(
     terminal: Option<&SessionTerminalInput>,
 ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
     validate_transaction(request)?;
-    let request_hash = request_hash(request)?;
+    if let Some(terminal) = terminal {
+        validate_fenced_terminal(terminal)?;
+        if serde_json::to_vec(&(request, terminal))?.len() > MAX_TRANSACTION_BYTES {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "serialized terminal transaction exceeds hard limit {MAX_TRANSACTION_BYTES} bytes"
+            )));
+        }
+    }
+    let request_hash = request_hash_with_terminal(request, terminal)?;
     let transaction_lock = format!("cowd-runtime-event-transaction:{}", request.transaction_id);
     pg(tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -1257,7 +1463,7 @@ fn append_transaction_in_tx(
         }
         let receipt = load_receipt(tx, &request.transaction_id, true)?;
         if let Some(terminal) = terminal {
-            insert_terminal_in_tx(tx, terminal, receipt.commit_cursor)?;
+            verify_terminal_for_commit(tx, terminal, receipt.commit_cursor)?;
         }
         return Ok(receipt);
     }
@@ -1384,8 +1590,11 @@ fn insert_terminal_in_tx(
 ) -> RuntimeEventStoreResult<()> {
     pg(tx.execute(
         "INSERT INTO runtime_session_outbox
-         (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, revision)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0) ON CONFLICT(terminal_id) DO NOTHING",
+         (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+          request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+          input_claim_revision, status, revision)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',0)
+         ON CONFLICT(terminal_id) DO NOTHING",
         &[
             &terminal.terminal_id,
             &terminal.message_id,
@@ -1394,6 +1603,21 @@ fn insert_terminal_in_tx(
             &terminal.payload_ref,
             &terminal.execution_id,
             &terminal.turn_id,
+            &terminal.request_id,
+            &terminal
+                .session_generation
+                .map(|value| to_i64(value, "session_generation"))
+                .transpose()?,
+            &terminal
+                .input_sequence
+                .map(|value| to_i64(value, "input_sequence"))
+                .transpose()?,
+            &terminal.input_claim_owner,
+            &terminal.input_claim_token,
+            &terminal
+                .input_claim_revision
+                .map(|value| to_i64(value, "input_claim_revision"))
+                .transpose()?,
         ],
     ))?;
     let stored = query_runtime_session_outbox(tx, &terminal.terminal_id)?.ok_or_else(|| {
@@ -1408,6 +1632,49 @@ fn insert_terminal_in_tx(
         || stored.payload_ref != terminal.payload_ref
         || stored.execution_id != terminal.execution_id
         || stored.turn_id != terminal.turn_id
+        || stored.request_id != terminal.request_id
+        || stored.session_generation != terminal.session_generation
+        || stored.input_sequence != terminal.input_sequence
+        || stored.input_claim_owner != terminal.input_claim_owner
+        || stored.input_claim_token != terminal.input_claim_token
+        || stored.input_claim_revision != terminal.input_claim_revision
+    {
+        return Err(RuntimeEventStoreError::TransactionConflict {
+            transaction_id: terminal.terminal_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_terminal_for_commit(
+    client: &mut impl PostgresClient,
+    terminal: &SessionTerminalInput,
+    commit_cursor: u64,
+) -> RuntimeEventStoreResult<()> {
+    let rows = pg(client.query(
+        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                input_claim_revision, status, attempts, next_attempt_at, claim_owner,
+                claim_expires_at, failure_class, last_error, materialized_at, revision
+           FROM runtime_session_outbox WHERE commit_cursor=$1
+           ORDER BY terminal_id LIMIT 2",
+        &[&to_i64(commit_cursor, "commit_cursor")?],
+    ))?;
+    if rows.len() != 1 {
+        return Err(RuntimeEventStoreError::TransactionConflict {
+            transaction_id: terminal.terminal_id.clone(),
+        });
+    }
+    let stored = row_to_runtime_session_outbox(&rows[0])?;
+    if stored.terminal_id != terminal.terminal_id
+        || stored.message_id != terminal.message_id
+        || stored.session_id != terminal.session_id
+        || stored.payload_ref != terminal.payload_ref
+        || stored.execution_id != terminal.execution_id
+        || stored.turn_id != terminal.turn_id
+        || stored.request_id != terminal.request_id
+        || stored.session_generation != terminal.session_generation
+        || stored.input_sequence != terminal.input_sequence
     {
         return Err(RuntimeEventStoreError::TransactionConflict {
             transaction_id: terminal.terminal_id.clone(),
@@ -1484,7 +1751,9 @@ fn query_runtime_session_outbox(
     terminal_id: &str,
 ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
     pg(client.query_opt(
-        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
+        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                input_claim_revision, status,
                 attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                 last_error, materialized_at, revision
            FROM runtime_session_outbox WHERE terminal_id=$1",
@@ -1533,22 +1802,34 @@ fn row_to_runtime_session_outbox(row: &Row) -> RuntimeEventStoreResult<RuntimeSe
         payload_ref: pg(row.try_get(4))?,
         execution_id: pg(row.try_get(5))?,
         turn_id: pg(row.try_get(6))?,
-        status: pg(row.try_get(7))?,
-        attempts: u32::try_from(from_i64(pg(row.try_get(8))?, "attempts")?)
+        request_id: pg(row.try_get(7))?,
+        session_generation: pg(row.try_get::<_, Option<i64>>(8))?
+            .map(|value| from_i64(value, "session_generation"))
+            .transpose()?,
+        input_sequence: pg(row.try_get::<_, Option<i64>>(9))?
+            .map(|value| from_i64(value, "input_sequence"))
+            .transpose()?,
+        input_claim_owner: pg(row.try_get(10))?,
+        input_claim_token: pg(row.try_get(11))?,
+        input_claim_revision: pg(row.try_get::<_, Option<i64>>(12))?
+            .map(|value| from_i64(value, "input_claim_revision"))
+            .transpose()?,
+        status: pg(row.try_get(13))?,
+        attempts: u32::try_from(from_i64(pg(row.try_get(14))?, "attempts")?)
             .map_err(|_| RuntimeEventStoreError::Corrupt("attempts exceeds u32".to_string()))?,
-        next_attempt_at_ms: pg(row.try_get::<_, Option<i64>>(9))?
+        next_attempt_at_ms: pg(row.try_get::<_, Option<i64>>(15))?
             .map(|value| from_i64(value, "next_attempt_at"))
             .transpose()?,
-        claim_owner: pg(row.try_get(10))?,
-        claim_expires_at_ms: pg(row.try_get::<_, Option<i64>>(11))?
+        claim_owner: pg(row.try_get(16))?,
+        claim_expires_at_ms: pg(row.try_get::<_, Option<i64>>(17))?
             .map(|value| from_i64(value, "claim_expires_at"))
             .transpose()?,
-        failure_class: pg(row.try_get(12))?,
-        last_error: pg(row.try_get(13))?,
-        materialized_at_ms: pg(row.try_get::<_, Option<i64>>(14))?
+        failure_class: pg(row.try_get(18))?,
+        last_error: pg(row.try_get(19))?,
+        materialized_at_ms: pg(row.try_get::<_, Option<i64>>(20))?
             .map(|value| from_i64(value, "materialized_at"))
             .transpose()?,
-        revision: from_i64(pg(row.try_get(15))?, "revision")?,
+        revision: from_i64(pg(row.try_get(21))?, "revision")?,
     })
 }
 
@@ -1594,6 +1875,35 @@ fn validate_transaction(request: &AppendTransactionRequest) -> RuntimeEventStore
                 event.event.stream_id
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_fenced_terminal(terminal: &SessionTerminalInput) -> RuntimeEventStoreResult<()> {
+    let required = [
+        terminal.terminal_id.as_str(),
+        terminal.message_id.as_str(),
+        terminal.session_id.as_str(),
+        terminal.payload_ref.as_str(),
+        terminal.execution_id.as_deref().unwrap_or_default(),
+        terminal.turn_id.as_deref().unwrap_or_default(),
+        terminal.request_id.as_deref().unwrap_or_default(),
+        terminal.input_claim_owner.as_deref().unwrap_or_default(),
+        terminal.input_claim_token.as_deref().unwrap_or_default(),
+    ];
+    if required.iter().any(|value| value.trim().is_empty())
+        || terminal
+            .session_generation
+            .is_none_or(|generation| generation == 0)
+        || terminal.input_sequence.is_none()
+        || terminal
+            .input_claim_revision
+            .is_none_or(|revision| revision == 0)
+    {
+        return Err(RuntimeEventStoreError::InvalidTransaction(
+            "terminal transaction requires complete execution, turn and Session claim fences"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -1648,6 +1958,21 @@ fn request_hash(request: &AppendTransactionRequest) -> RuntimeEventStoreResult<S
         "{:x}",
         Sha256::digest(serde_json::to_vec(request)?)
     ))
+}
+
+fn request_hash_with_terminal(
+    request: &AppendTransactionRequest,
+    terminal: Option<&SessionTerminalInput>,
+) -> RuntimeEventStoreResult<String> {
+    terminal.map_or_else(
+        || request_hash(request),
+        |terminal| {
+            Ok(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&(request, terminal))?)
+            ))
+        },
+    )
 }
 
 fn now_ms() -> u64 {
@@ -2347,33 +2672,38 @@ mod tests {
         );
         assert_eq!(store.stream_revision("graph:concurrent").unwrap(), 2);
 
+        let terminal_request = AppendTransactionRequest {
+            transaction_id: "terminal-transaction".to_string(),
+            expected_streams: vec![ExpectedStreamRevision {
+                stream_id: "session-input:real".to_string(),
+                expected_revision: 0,
+            }],
+            events: vec![RuntimeTransactionEventInput {
+                event: input(
+                    "session-input:real",
+                    RuntimeEventScope::SessionInput,
+                    "runtime.session.terminal_requested",
+                ),
+                idempotency_key: Some("terminal-request".to_string()),
+                schema_version: 1,
+            }],
+        };
+        let terminal_input = SessionTerminalInput {
+            terminal_id: "terminal-real".to_string(),
+            message_id: "message-real".to_string(),
+            session_id: "session-real".to_string(),
+            execution_id: Some("execution-real".to_string()),
+            turn_id: Some("turn-real".to_string()),
+            request_id: Some("request-real".to_string()),
+            session_generation: Some(1),
+            input_sequence: Some(0),
+            input_claim_owner: Some("worker-real".to_string()),
+            input_claim_token: Some("claim-real".to_string()),
+            input_claim_revision: Some(3),
+            payload_ref: "payload-real".to_string(),
+        };
         let terminal_receipt = store
-            .append_transaction_with_terminal(
-                AppendTransactionRequest {
-                    transaction_id: "terminal-transaction".to_string(),
-                    expected_streams: vec![ExpectedStreamRevision {
-                        stream_id: "session-input:real".to_string(),
-                        expected_revision: 0,
-                    }],
-                    events: vec![RuntimeTransactionEventInput {
-                        event: input(
-                            "session-input:real",
-                            RuntimeEventScope::SessionInput,
-                            "runtime.session.terminal_requested",
-                        ),
-                        idempotency_key: Some("terminal-request".to_string()),
-                        schema_version: 1,
-                    }],
-                },
-                SessionTerminalInput {
-                    terminal_id: "terminal-real".to_string(),
-                    message_id: "message-real".to_string(),
-                    session_id: "session-real".to_string(),
-                    execution_id: Some("execution-real".to_string()),
-                    turn_id: Some("turn-real".to_string()),
-                    payload_ref: "payload-real".to_string(),
-                },
-            )
+            .append_transaction_with_terminal(terminal_request.clone(), terminal_input.clone())
             .expect("terminal transaction");
         assert!(terminal_receipt.commit_cursor > 0);
 
@@ -2395,12 +2725,92 @@ mod tests {
         let claimed = claims.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(claimed.len(), 1);
         let claim = &claimed[0];
+        assert_eq!(claim.request_id.as_deref(), Some("request-real"));
+        assert_eq!(claim.session_generation, Some(1));
+        assert_eq!(claim.input_sequence, Some(0));
+        assert_eq!(claim.input_claim_owner.as_deref(), Some("worker-real"));
+        assert_eq!(claim.input_claim_token.as_deref(), Some("claim-real"));
+        assert_eq!(claim.input_claim_revision, Some(3));
+        assert_eq!(claim.status, "claimed");
+        assert_eq!(claim.attempts, 1);
+        assert_eq!(claim.claim_expires_at_ms, Some(1_100));
+        drop(store);
+        let crash_resolver = StaticSecretRefResolver::new([("test.pg".to_string(), url.clone())]);
+        let store = Arc::new(
+            PostgresRuntimeEventStore::connect(
+                PostgresConnectionConfig::new(
+                    "runtime-event-crash-recovery-test",
+                    "test.pg",
+                    "cowd-runtime-event-postgres-crash-recovery-contract",
+                ),
+                &crash_resolver,
+            )
+            .expect("postgres event store reopens after delivery crash")
+            .into_runtime_event_store(),
+        );
+        assert!(matches!(
+            store.adopt_session_terminal_fence(&RuntimeSessionTerminalFenceAdoption {
+                terminal_id: claim.terminal_id.clone(),
+                expected_terminal_revision: claim.revision,
+                request_id: "request-real".to_string(),
+                session_id: "session-real".to_string(),
+                turn_id: "turn-real".to_string(),
+                session_generation: 1,
+                input_sequence: 0,
+                claim_owner: "session-worker-reclaimed".to_string(),
+                claim_token: "session-claim-reclaimed".to_string(),
+                claim_revision: 5,
+                claim_expires_at_ms: 2_000,
+                adopted_at_ms: 1_099,
+            }),
+            Err(RuntimeEventStoreError::InvalidTransaction(_))
+        ));
+        let adoption = RuntimeSessionTerminalFenceAdoption {
+            terminal_id: claim.terminal_id.clone(),
+            expected_terminal_revision: claim.revision,
+            request_id: "request-real".to_string(),
+            session_id: "session-real".to_string(),
+            turn_id: "turn-real".to_string(),
+            session_generation: 1,
+            input_sequence: 0,
+            claim_owner: "session-worker-reclaimed".to_string(),
+            claim_token: "session-claim-reclaimed".to_string(),
+            claim_revision: 5,
+            claim_expires_at_ms: 2_000,
+            adopted_at_ms: 1_100,
+        };
+        let adopted = store
+            .adopt_session_terminal_fence(&adoption)
+            .expect("expired delivery claim adopts reclaimed Session fence");
+        assert_eq!(adopted.status, "pending");
+        assert_eq!(adopted.input_claim_revision, Some(5));
+        let replay = store
+            .append_transaction_with_terminal(terminal_request.clone(), terminal_input.clone())
+            .expect("initial terminal transaction replays after fence adoption");
+        assert!(replay.duplicate);
+        let mut conflicting_initial_fence = terminal_input;
+        conflicting_initial_fence.input_claim_token = Some("different-initial-fence".to_string());
+        assert!(matches!(
+            store.append_transaction_with_terminal(terminal_request, conflicting_initial_fence),
+            Err(RuntimeEventStoreError::TransactionConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .adopt_session_terminal_fence(&adoption)
+                .expect("adoption replay")
+                .revision,
+            adopted.revision
+        );
+        let claim = store
+            .claim_session_terminals("worker-after-adoption", 1_101, 1_000, 1)
+            .expect("claim adopted terminal")
+            .remove(0);
         let materialized = store
             .ack_session_terminal(
                 &claim.terminal_id,
                 claim.claim_owner.as_deref().expect("claim owner"),
                 claim.revision,
-                200,
+                1_102,
             )
             .expect("ack claimed terminal");
         assert_eq!(materialized.status, "materialized");
@@ -2411,6 +2821,16 @@ mod tests {
                 .len(),
             1
         );
+        assert!(matches!(
+            store.enqueue_session_terminal(
+                "terminal-unfenced",
+                "message-unfenced",
+                "session-real",
+                terminal_receipt.commit_cursor,
+                "payload-unfenced",
+            ),
+            Err(RuntimeEventStoreError::InvalidTransaction(_))
+        ));
 
         let duplicate_request = AppendTransactionRequest {
             transaction_id: "duplicate-transaction".to_string(),

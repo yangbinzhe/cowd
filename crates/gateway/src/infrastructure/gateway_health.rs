@@ -19,8 +19,12 @@ pub(crate) struct GatewayRuntimeSnapshot {
     pub(crate) unified_store: bool,
     pub(crate) memory_manager: bool,
     pub(crate) surface_runtime: bool,
-    pub(crate) event_bus: bool,
-    pub(crate) session_kernel: bool,
+    pub(crate) session_repository: bool,
+    pub(crate) session_projection: crate::event_bus::SessionProjectionHubMetrics,
+    pub(crate) session_workers: Option<crate::session_runtime_bridge::SessionWorkerHealth>,
+    pub(crate) session_working_set:
+        Option<crate::services::session_service::activation::SessionWorkingSetProjection>,
+    pub(crate) session_ingress: Option<session::SessionRuntimeOutboxHealth>,
     pub(crate) provider_transport: Option<runtime::ProviderTransportPoolStats>,
 }
 
@@ -44,7 +48,7 @@ pub(crate) struct StorageGatewaySnapshot {
     pub(crate) locks: Vec<StorageLockDiagnostics>,
     pub(crate) executors: Vec<storage::SqliteExecutorHealth>,
     pub(crate) postgres: Option<storage::PostgresExecutorHealth>,
-    pub(crate) session_execution: Option<memory::StorageExecutionPlaneStats>,
+    pub(crate) session_execution: Option<session::StorageExecutionPlaneStats>,
     pub(crate) artifacts: Option<runtime::ArtifactStoreStats>,
 }
 
@@ -59,7 +63,7 @@ pub(crate) struct GatewayReadinessSnapshot {
     pub(crate) health: GatewayHealthSnapshot,
 }
 
-pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot {
+pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot {
     let (server_status, server_status_error) = match crate::server::get_server_status() {
         Ok(status) => (status, None),
         Err(error) => (None, Some(error.to_string())),
@@ -70,8 +74,11 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
         unified_store: state.has_unified_store(),
         memory_manager: state.services.memory.manager().is_some(),
         surface_runtime: state.services.surface.is_runtime_available(),
-        event_bus: true,
-        session_kernel: true,
+        session_repository: state.has_unified_store(),
+        session_projection: state.services.session.event_bus().metrics(),
+        session_workers: state.services.session.worker_health().ok(),
+        session_working_set: state.services.session.working_set_projection().await.ok(),
+        session_ingress: state.services.session.runtime_outbox_health().await.ok(),
         provider_transport: state
             .services
             .runtime
@@ -129,12 +136,23 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
             .as_ref()
             .and_then(|info| info.discovery_warning.clone())
     });
-    let status =
-        if runtime.session_kernel && runtime.event_bus && process_discovery_warning.is_none() {
-            "healthy"
-        } else {
-            "degraded"
-        };
+    let workers_healthy = runtime
+        .session_workers
+        .as_ref()
+        .is_some_and(session_workers_healthy);
+    let ingress_healthy = runtime
+        .session_ingress
+        .as_ref()
+        .is_some_and(|health| health.blocked == 0);
+    let status = if runtime.session_repository
+        && workers_healthy
+        && ingress_healthy
+        && process_discovery_warning.is_none()
+    {
+        "healthy"
+    } else {
+        "degraded"
+    };
 
     GatewayHealthSnapshot {
         status: status.to_string(),
@@ -155,14 +173,27 @@ pub(crate) fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot
     }
 }
 
-pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSnapshot {
-    let health = gateway_health_snapshot(state);
+pub(crate) async fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSnapshot {
+    let health = gateway_health_snapshot(state).await;
     let mut degraded = Vec::new();
-    if !health.runtime.session_kernel {
-        degraded.push("runtime.session_kernel_unavailable".to_string());
+    if !health.runtime.session_repository {
+        degraded.push("runtime.session_repository_unavailable".to_string());
     }
-    if !health.runtime.event_bus {
-        degraded.push("runtime.event_bus_unavailable".to_string());
+    if health
+        .runtime
+        .session_workers
+        .as_ref()
+        .is_none_or(|workers| !session_workers_healthy(workers))
+    {
+        degraded.push("runtime.session_workers_degraded".to_string());
+    }
+    if health
+        .runtime
+        .session_ingress
+        .as_ref()
+        .is_none_or(|ingress| ingress.blocked > 0)
+    {
+        degraded.push("runtime.session_ingress_degraded".to_string());
     }
     if health.process.discovery_warning.is_some() {
         degraded.push("gateway.process_discovery_degraded".to_string());
@@ -195,14 +226,160 @@ pub(crate) fn gateway_readiness_snapshot(state: &AppState) -> GatewayReadinessSn
         required: vec![
             "gateway-runtime-host".to_string(),
             "gateway-api-router".to_string(),
-            "session-kernel".to_string(),
-            "event-bus".to_string(),
+            "session-service".to_string(),
+            "session-projection".to_string(),
             "storage-registry".to_string(),
             "capacity-controller".to_string(),
+            "session-worker-supervisor".to_string(),
         ],
         optional: vec!["static-webui".to_string()],
         optional_missing,
         degraded,
         health,
+    }
+}
+
+fn session_workers_healthy(health: &crate::session_runtime_bridge::SessionWorkerHealth) -> bool {
+    health.accepting
+        && health.recovery.failed == 0
+        && crate::session_runtime_bridge::REQUIRED_SESSION_WORKERS
+            .iter()
+            .all(|name| {
+                health.workers.get(*name).is_some_and(|worker| {
+                    worker.state == crate::session_runtime_bridge::SessionWorkerState::Running
+                        && worker.last_backend_success_at_ms.is_some()
+                        && worker.consecutive_backend_failures == 0
+                })
+            })
+        && [
+            "lifecycle_reconciliation",
+            "branch_activation_reconciliation",
+        ]
+        .iter()
+        .all(|name| {
+            health
+                .reconciliation
+                .get(*name)
+                .is_some_and(|progress| progress.consecutive_failures == 0)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn complete_worker_health() -> crate::session_runtime_bridge::SessionWorkerHealth {
+        let workers = crate::session_runtime_bridge::REQUIRED_SESSION_WORKERS
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    crate::session_runtime_bridge::SessionWorkerObservation {
+                        state: crate::session_runtime_bridge::SessionWorkerState::Running,
+                        restart_count: 0,
+                        last_error: None,
+                        next_retry_at_ms: None,
+                        last_backend_success_at_ms: Some(1),
+                        last_backend_error_at_ms: None,
+                        last_backend_error: None,
+                        consecutive_backend_failures: 0,
+                        oldest_queue_age_ms: None,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        crate::session_runtime_bridge::SessionWorkerHealth {
+            accepting: true,
+            forced_aborts: 0,
+            claim_lease_lost: 0,
+            workers,
+            recovery: Default::default(),
+            recovery_completed_at_ms: 1,
+            reconciliation: [
+                "lifecycle_reconciliation",
+                "branch_activation_reconciliation",
+            ]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    crate::session_runtime_bridge::SessionReconciliationProgress::default(),
+                )
+            })
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn readiness_requires_every_named_session_worker() {
+        let mut health = complete_worker_health();
+        assert!(session_workers_healthy(&health));
+
+        health.workers.remove("terminal_delivery");
+        assert!(!session_workers_healthy(&health));
+    }
+
+    #[test]
+    fn empty_worker_map_is_never_healthy() {
+        let mut health = complete_worker_health();
+        health.workers.clear();
+        assert!(!session_workers_healthy(&health));
+    }
+
+    #[test]
+    fn worker_backend_failure_or_missing_success_degrades_readiness() {
+        let mut health = complete_worker_health();
+        let ingress = health.workers.get_mut("ingress").unwrap();
+        ingress.consecutive_backend_failures = 1;
+        ingress.last_backend_error = Some("repository unavailable".to_string());
+        assert!(!session_workers_healthy(&health));
+
+        let mut health = complete_worker_health();
+        health
+            .workers
+            .get_mut("working_set_cleanup")
+            .unwrap()
+            .last_backend_success_at_ms = None;
+        assert!(!session_workers_healthy(&health));
+    }
+
+    #[test]
+    fn starting_worker_is_not_ready_and_reconciliation_error_degrades_health() {
+        let mut health = complete_worker_health();
+        health.workers.get_mut("ingress").unwrap().state =
+            crate::session_runtime_bridge::SessionWorkerState::Starting;
+        assert!(!session_workers_healthy(&health));
+
+        health.workers.get_mut("ingress").unwrap().state =
+            crate::session_runtime_bridge::SessionWorkerState::Running;
+        health
+            .reconciliation
+            .get_mut("lifecycle_reconciliation")
+            .unwrap()
+            .consecutive_failures = 1;
+        assert!(!session_workers_healthy(&health));
+    }
+
+    #[test]
+    fn health_snapshot_serializes_continuous_reconciliation_progress() {
+        let mut health = complete_worker_health();
+        let progress = health
+            .reconciliation
+            .get_mut("branch_activation_reconciliation")
+            .unwrap();
+        progress.scan_count = 7;
+        progress.pending_count = 3;
+        progress.oldest_pending_age_ms = Some(2_500);
+        progress.last_success_at_ms = Some(10_000);
+        progress.last_error = Some("previous transient failure".to_string());
+
+        let value = serde_json::to_value(health).unwrap();
+        let progress = &value["reconciliation"]["branch_activation_reconciliation"];
+        assert_eq!(progress["scan_count"], 7);
+        assert_eq!(progress["pending_count"], 3);
+        assert_eq!(progress["oldest_pending_age_ms"], 2_500);
+        assert_eq!(progress["last_success_at_ms"], 10_000);
+        assert_eq!(progress["last_error"], "previous transient failure");
     }
 }

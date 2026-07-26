@@ -8,7 +8,7 @@ use crate::runtime_entry::GatewayRuntimeEntry;
 /// Callback trait for session lifecycle events.
 ///
 /// Implementors receive notifications when sessions are registered or
-/// removed from the `ActiveSessions` registry.
+/// removed from the `HotSessionPool` registry.
 pub trait SessionLifecycle: Send + Sync {
     fn register(&self, id: &str);
     fn unregister(&self, id: &str);
@@ -25,13 +25,13 @@ type SessionEntry = Arc<Mutex<GatewayRuntimeEntry>>;
 /// Each session is identified by a string key and maps to a built runtime
 /// wrapped in `Arc<Mutex<GatewayRuntimeEntry>>`, allowing exclusive mutable access
 /// across async tasks without TOCTOU races.
-pub struct ActiveSessions {
+pub struct HotSessionPool {
     sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
     max_sessions: usize,
     lifecycle: Option<Arc<dyn SessionLifecycle>>,
 }
 
-impl ActiveSessions {
+impl HotSessionPool {
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -124,7 +124,7 @@ impl ActiveSessions {
     }
 }
 
-impl Default for ActiveSessions {
+impl Default for HotSessionPool {
     fn default() -> Self {
         Self::new()
     }
@@ -142,13 +142,13 @@ mod tests {
 
     #[test]
     fn new_creates_empty_registry() {
-        let sessions = ActiveSessions::new();
+        let sessions = HotSessionPool::new();
         assert!(sessions.list().is_empty());
     }
 
     #[test]
     fn register_and_get() {
-        let sessions = ActiveSessions::new();
+        let sessions = HotSessionPool::new();
         let rt = test_runtime();
         sessions.register("sess-1".into(), rt).unwrap();
         let entry = sessions.get("sess-1");
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn list_returns_sorted_ids() {
-        let sessions = ActiveSessions::new();
+        let sessions = HotSessionPool::new();
         sessions.register("b".into(), test_runtime()).unwrap();
         sessions.register("a".into(), test_runtime()).unwrap();
         sessions.register("c".into(), test_runtime()).unwrap();
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn remove_drops_session() {
-        let sessions = ActiveSessions::new();
+        let sessions = HotSessionPool::new();
         sessions.register("sess-1".into(), test_runtime()).unwrap();
         let removed = sessions.remove("sess-1");
         assert!(removed.is_some(), "remove should return the entry");
@@ -179,19 +179,19 @@ mod tests {
 
     #[test]
     fn remove_nonexistent_returns_none() {
-        let sessions = ActiveSessions::new();
+        let sessions = HotSessionPool::new();
         assert!(sessions.remove("no-such-session").is_none());
     }
 
     #[test]
     fn get_nonexistent_returns_none() {
-        let sessions = ActiveSessions::new();
+        let sessions = HotSessionPool::new();
         assert!(sessions.get("no-such-session").is_none());
     }
 
     #[test]
     fn register_overwrite() {
-        let sessions = ActiveSessions::new();
+        let sessions = HotSessionPool::new();
         sessions.register("sess-1".into(), test_runtime()).unwrap();
         let prev = sessions.register("sess-1".into(), test_runtime()).unwrap();
         assert!(prev.is_some(), "overwrite should return the previous entry");

@@ -489,7 +489,7 @@ mod tests {
                 .map(|evidence| evidence.skill_id.as_str()),
             Some("release-plan")
         );
-        let event = decision.activation.to_session_domain_event(9);
+        let event = decision.activation.to_runtime_session_event(9);
         assert_eq!(
             event.payload["invocation_evidence"]["outcome"],
             "selected_for_runtime"
@@ -530,7 +530,7 @@ mod tests {
         });
 
         assert_eq!(decision.structured_dependencies.len(), 1);
-        let event = decision.activation.to_session_domain_event(10);
+        let event = decision.activation.to_runtime_session_event(10);
         assert_eq!(
             event.payload["structured_dependencies"][0]["domain"],
             "supply_chain"
@@ -562,7 +562,7 @@ mod tests {
             decision.activation.candidates[0].source,
             RuntimeSkillCandidateSource::CapabilityRefFallback
         );
-        let event = decision.activation.to_session_domain_event(2);
+        let event = decision.activation.to_runtime_session_event(2);
         assert!(event.payload.get("invocation_evidence").is_some());
         assert!(!event
             .refs

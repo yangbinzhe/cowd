@@ -8,13 +8,34 @@
     )
 )]
 
-pub mod event_bus;
+pub mod domain;
+pub mod error;
 pub mod lease;
 pub mod lifecycle;
+pub mod persistence;
 
-pub use event_bus::{EventSender, SessionEventBus};
+pub use domain::{
+    SessionBranchActivation, SessionBranchActivationPhase, SessionBranchActivationTransition,
+    SessionCloseDisposition, SessionDomainEvent, SessionDomainEventPage, SessionDomainRef,
+    SessionDomainScope, SessionLifecycleIntent, SessionLifecyclePhase, SessionLifecyclePlan,
+    SessionLifecycleTransition, SESSION_DOMAIN_EVENT_TYPE,
+};
+pub use error::{Result as SessionResult, SessionError};
 pub use lease::{SessionLease, SessionLeaseRegistry};
 pub use lifecycle::{
-    SessionActor, SessionAttachment, SessionLifecycleEvent, SessionLifecycleKernel,
-    SessionLifecycleSnapshot, SessionLifecycleState,
+    SessionActor, SessionAttachment, SessionLifecycleEvent, SessionLifecycleSnapshot,
+    SessionLifecycleState, SessionPresenceLedger,
+};
+pub use persistence::{
+    CompressionAlgo, OutboxFailureClass, OutboxStatus, SessionBranchRequest, SessionBranchResult,
+    SessionEvent, SessionHistoryReader, SessionInputAdmission, SessionLifecycleFenceRequest,
+    SessionLifecycleTombstoneRequest, SessionListOptions, SessionListPage, SessionMessage,
+    SessionMissionOutboxOperation, SessionMissionOutboxRecord, SessionMissionOutboxRequest,
+    SessionRecord, SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeInputStatus,
+    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
+    SessionSearchResult, SessionSnapshot, SessionStoreBackend, SessionTerminalExecutionFence,
+    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SharedSessionStoreBackend,
+    SqliteSessionStore, StorageExecutionLane, StorageExecutionLaneStats,
+    StorageExecutionPlaneConfig, StorageExecutionPlaneStats, StorageTier, TieredSessionStore,
+    TieredSessionStoreConfig, UnifiedSessionStore,
 };

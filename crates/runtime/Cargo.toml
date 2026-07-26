@@ -28,6 +28,7 @@ matrix-core = { path = "../matrix/core" }
 matrix-repository = { path = "../matrix/repository" }
 model-protocol = { path = "../model-protocol" }
 memory = { path = "../memory" }
+session = { path = "../session" }
 storage = { path = "../storage" }
 approval = { path = "../approval" }
 async-trait = "0.1"

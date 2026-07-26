@@ -1,36 +1,31 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::{Arc, OnceLock, Weak};
-use std::time::Instant;
-use tokio::task::JoinHandle;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 
-use crate::gateway::ActiveSessions;
+use crate::event_bus::{RuntimeStreamRange, SessionProjectionEvent, SessionProjectionHub};
+use crate::gateway::HotSessionPool;
 use crate::runtime_boundary::{
     RuntimeBoundaryClock, RuntimeBoundarySnapshot, RuntimeBoundaryStatus,
 };
 use crate::runtime_protocol::{RuntimeErrorKind, RuntimeRequest, RuntimeResponse};
-use crate::session_kernel::SessionKernel;
-use crate::session_lifecycle_kernel::SessionLifecycleKernel;
+use crate::session_runtime_data_port::SessionInputJournalKind;
 use harness_contract::{
     context::ContextTurnReport,
     projection::{ExecutionLiveState, ExecutionLiveStatus, SessionExecutionIndexProjection},
     task::{TaskId, TaskTurnBinding},
     turn::{
-        InputRoutingDecision, SessionInputEnvelope, SessionInputId, SessionInputProjection,
-        SessionInputReceipt, TurnEvent, TurnId, TurnInboxSnapshot, TurnInput, TurnJournalEnvelope,
+        InputPayloadKind, InputRoutingDecision, InputRoutingReason, InputSourceKind,
+        SessionInputEnvelope, SessionInputId, SessionInputProjection, SessionInputReceipt,
+        SessionInputStatus, TurnEvent, TurnId, TurnInboxSnapshot, TurnInput, TurnJournalEnvelope,
         TurnJournalPhase, TurnReceipt, TurnStatus,
     },
 };
 use session::SessionLeaseRegistry;
-
-#[async_trait::async_trait]
-pub(crate) trait SessionActivationPort: Send + Sync {
-    async fn activate(&self, session_id: &str) -> Result<(), String>;
-}
 
 use crate::services::{
     ActiveMessagesPage, SessionCompactResult, SessionMessageCounts, SessionStatsSnapshot,
@@ -52,65 +47,6 @@ impl RuntimeTurnExecutionError {
             }
         }
     }
-}
-
-/// Convert the Runtime's externally tagged event enum into the stable
-/// browser/TUI event envelope. This is transport shaping only: it must never
-/// manufacture lifecycle facts or terminal state.
-fn runtime_event_stream_payload(event: runtime::CowdEvent) -> serde_json::Value {
-    let execution_context = event.execution_context().cloned();
-    let value = serde_json::to_value(event.domain_event()).unwrap_or_else(|error| {
-        serde_json::json!({
-            "type": "RuntimeEventEncodingError",
-            "error": error.to_string(),
-        })
-    });
-    let mut payload = match value {
-        serde_json::Value::String(event_type) => serde_json::json!({"type": event_type}),
-        serde_json::Value::Object(envelope) if envelope.len() == 1 => {
-            let Some((event_type, payload)) = envelope.into_iter().next() else {
-                return serde_json::json!({"type": "RuntimeEvent"});
-            };
-            match payload {
-                serde_json::Value::Object(mut fields) => {
-                    fields.insert("type".to_string(), serde_json::Value::String(event_type));
-                    serde_json::Value::Object(fields)
-                }
-                payload => serde_json::json!({"type": event_type, "value": payload}),
-            }
-        }
-        payload => serde_json::json!({"type": "RuntimeEvent", "value": payload}),
-    };
-    if let (Some(context), serde_json::Value::Object(fields)) = (execution_context, &mut payload) {
-        fields.insert(
-            "session_id".to_string(),
-            serde_json::Value::String(context.session_id),
-        );
-        fields.insert(
-            "execution_id".to_string(),
-            serde_json::Value::String(context.execution_id),
-        );
-        fields.insert(
-            "turn_id".to_string(),
-            serde_json::Value::String(context.turn_id),
-        );
-        if !fields.contains_key("part_id") {
-            let part_id = match fields.get("type").and_then(serde_json::Value::as_str) {
-                Some("TextDelta") => Some("assistant_text".to_string()),
-                Some("ThinkingDelta") => Some("thinking".to_string()),
-                Some("ToolStart" | "ToolProgress" | "ToolComplete") => fields
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|id| !id.trim().is_empty())
-                    .map(ToOwned::to_owned),
-                _ => None,
-            };
-            if let Some(part_id) = part_id {
-                fields.insert("part_id".to_string(), serde_json::Value::String(part_id));
-            }
-        }
-    }
-    payload
 }
 
 fn tool_event_identity(event: &runtime::CowdEvent) -> Option<(&str, bool, bool)> {
@@ -146,6 +82,14 @@ pub(crate) struct RuntimeTurnExecution {
 pub(crate) struct RuntimeTurnOptions {
     pub(crate) profile: runtime::ContextProfile,
     pub(crate) pre_messages: Vec<runtime::ConversationMessage>,
+}
+
+#[derive(serde::Serialize)]
+struct SessionInputDomainEventPayload<'a> {
+    input: Option<&'a SessionInputReceipt>,
+    record: Option<&'a runtime::SessionInputRecord>,
+    input_projection: SessionInputProjection,
+    turn_inbox: TurnInboxSnapshot,
 }
 
 /// Persisted verbatim in the Session ingress row.  The Session store treats it
@@ -226,25 +170,56 @@ struct ActiveTurnControl {
     cancellation_token: runtime::CancellationToken,
 }
 
+struct ActiveTurnRegistryState {
+    accepting: bool,
+    controls: BTreeMap<String, ActiveTurnControl>,
+}
+
+struct ActiveTurnRegistry {
+    state: Mutex<ActiveTurnRegistryState>,
+    changed: tokio::sync::Notify,
+}
+
+impl ActiveTurnRegistry {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ActiveTurnRegistryState {
+                accepting: true,
+                controls: BTreeMap::new(),
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
 struct ActiveTurnControlGuard {
     turn_id: String,
-    controls: Arc<Mutex<BTreeMap<String, ActiveTurnControl>>>,
+    registry: Arc<ActiveTurnRegistry>,
 }
 
 impl Drop for ActiveTurnControlGuard {
     fn drop(&mut self) {
-        self.controls
+        self.registry
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
             .remove(&self.turn_id);
+        self.registry.changed.notify_waiters();
     }
 }
 
-/// Restores a moved Runtime host even if the request future is aborted.  The
-/// normal path awaits `restore`; cancellation uses Drop to schedule the same
-/// restoration before another turn can acquire the session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ActiveTurnDrainReport {
+    pub(crate) cancelled: usize,
+    pub(crate) drained: usize,
+    pub(crate) remaining_turn_ids: Vec<String>,
+}
+
 struct RuntimeTurnOwner {
+    session_id: String,
     entry: Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>,
+    gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     runtime:
         Option<runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor>>,
 }
@@ -294,11 +269,15 @@ async fn lock_runtime_entry(
 
 impl RuntimeTurnOwner {
     fn new(
+        session_id: String,
         entry: Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>,
+        gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
         runtime: runtime::StandardRuntimeHost<crate::gateway_tool_executor::GatewayToolExecutor>,
     ) -> Self {
         Self {
+            session_id,
             entry,
+            gateway_tasks,
             runtime: Some(runtime),
         }
     }
@@ -329,9 +308,11 @@ impl Drop for RuntimeTurnOwner {
             return;
         };
         let entry = Arc::clone(&self.entry);
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
+        let session_id = self.session_id.clone();
+        if let Err(error) = self.gateway_tasks.spawn(
+            crate::runtime_host::task_set::GatewayTaskKind::RuntimeRestoration,
+            Some(session_id.clone()),
+            move |_| async move {
                     let mut entry = lock_runtime_entry(&entry).await;
                     if entry.turn_is_owned() {
                         entry.restore_runtime_after_turn(runtime);
@@ -340,18 +321,20 @@ impl Drop for RuntimeTurnOwner {
                             "cancelled turn attempted to restore a Runtime host into an occupied session"
                         );
                     }
-                });
-            }
-            Err(_) => tracing::error!(
-                "cancelled turn dropped outside Tokio and could not restore its Runtime host"
-            ),
+                },
+        ) {
+            tracing::warn!(
+                %session_id,
+                %error,
+                "cancelled turn restoration was rejected because Gateway lifecycle is closing"
+            );
         }
     }
 }
 
 fn session_execution_index_from_outbox(
     session_id: &str,
-    records: &[memory::SessionRuntimeOutboxRecord],
+    records: &[session::SessionRuntimeOutboxRecord],
 ) -> SessionExecutionIndexProjection {
     let mut ordered = records.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|record| {
@@ -362,16 +345,24 @@ fn session_execution_index_from_outbox(
         )
     });
     let latest = ordered.last().copied();
-    let execution_for = |record: &memory::SessionRuntimeOutboxRecord| {
+    let execution_for = |record: &session::SessionRuntimeOutboxRecord| {
         runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id)
     };
-    let status_for = |record: &memory::SessionRuntimeOutboxRecord| match record.status {
-        memory::OutboxStatus::Pending | memory::OutboxStatus::RetryScheduled => {
-            ExecutionLiveStatus::Queued
-        }
-        memory::OutboxStatus::Claimed => ExecutionLiveStatus::PreparingContext,
-        memory::OutboxStatus::Materialized => ExecutionLiveStatus::Complete,
-        memory::OutboxStatus::BlockedMaterialization => ExecutionLiveStatus::Error,
+    let status_for = |record: &session::SessionRuntimeOutboxRecord| match record.status {
+        session::SessionRuntimeInputStatus::Accepted
+        | session::SessionRuntimeInputStatus::Classified
+        | session::SessionRuntimeInputStatus::Queued
+        | session::SessionRuntimeInputStatus::Reclassified => ExecutionLiveStatus::Queued,
+        session::SessionRuntimeInputStatus::Claimed => ExecutionLiveStatus::PreparingContext,
+        session::SessionRuntimeInputStatus::Running => ExecutionLiveStatus::CallingModel,
+        session::SessionRuntimeInputStatus::Completed
+        | session::SessionRuntimeInputStatus::Supplemented => ExecutionLiveStatus::Complete,
+        session::SessionRuntimeInputStatus::Cancelled => ExecutionLiveStatus::Cancelled,
+        session::SessionRuntimeInputStatus::Failed
+        | session::SessionRuntimeInputStatus::Blocked
+        | session::SessionRuntimeInputStatus::Expired
+        | session::SessionRuntimeInputStatus::RejectedDuplicate
+        | session::SessionRuntimeInputStatus::RejectedPolicy => ExecutionLiveStatus::Error,
     };
     let latest_status = latest.map(status_for);
     SessionExecutionIndexProjection {
@@ -386,7 +377,13 @@ fn session_execution_index_from_outbox(
         latest_live_revision: None,
         last_progress_at_ms: latest.map(|record| record.updated_at_ms),
         terminal_ref: latest
-            .filter(|record| record.status == memory::OutboxStatus::Materialized)
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    session::SessionRuntimeInputStatus::Completed
+                        | session::SessionRuntimeInputStatus::Supplemented
+                )
+            })
             .map(|record| format!("turn-terminal:{}", record.request_id)),
     }
 }
@@ -420,7 +417,7 @@ fn reconcile_session_execution_indices(
     }
 }
 
-fn stored_message_bytes(message: &memory::SessionMessage) -> usize {
+fn stored_message_bytes(message: &session::SessionMessage) -> usize {
     message
         .stable_message_id
         .len()
@@ -449,19 +446,18 @@ fn stored_message_bytes(message: &memory::SessionMessage) -> usize {
 
 #[derive(Clone)]
 pub(crate) struct RuntimeService {
-    sessions: Arc<ActiveSessions>,
+    sessions: Arc<HotSessionPool>,
     lease_registry: Arc<SessionLeaseRegistry>,
-    session_kernel: Arc<SessionKernel>,
-    lifecycle_kernel: Arc<SessionLifecycleKernel>,
+    session_data: Arc<crate::session_runtime_data_port::GatewaySessionRuntimePort>,
+    projection_hub: Arc<SessionProjectionHub>,
     started_at: Instant,
     turns: Arc<Mutex<BTreeMap<String, TurnReceipt>>>,
     turn_bindings: Arc<Mutex<BTreeMap<String, TaskTurnBinding>>>,
-    active_turn_controls: Arc<Mutex<BTreeMap<String, ActiveTurnControl>>>,
+    active_turns: Arc<ActiveTurnRegistry>,
     session_inputs: Arc<Mutex<BTreeMap<String, runtime::SessionInputStream>>>,
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
-    session_event_relays: Arc<Mutex<BTreeMap<String, JoinHandle<()>>>>,
+    gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     session_models: Arc<Mutex<BTreeMap<String, String>>>,
-    session_activation_locks: Arc<Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     hydration_attempts: Arc<AtomicU64>,
     hydration_body_reads: Arc<AtomicU64>,
     hydration_body_bytes: Arc<AtomicU64>,
@@ -473,7 +469,6 @@ pub(crate) struct RuntimeService {
     resource_capabilities: runtime::ResourceCapabilityIndex,
     runtime_services: Arc<runtime::RuntimeServices>,
     session_input_router: Arc<runtime::SessionInputRouter>,
-    session_activator: Arc<OnceLock<Weak<dyn SessionActivationPort>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -499,14 +494,39 @@ pub(crate) struct SessionInputAdmission {
 impl RuntimeService {
     #[must_use]
     pub(crate) fn new(
-        sessions: Arc<ActiveSessions>,
+        sessions: Arc<HotSessionPool>,
         lease_registry: Arc<SessionLeaseRegistry>,
-        session_kernel: Arc<SessionKernel>,
-        lifecycle_kernel: Arc<SessionLifecycleKernel>,
+        session_data: Arc<crate::session_runtime_data_port::GatewaySessionRuntimePort>,
+        projection_hub: Arc<SessionProjectionHub>,
         started_at: Instant,
         provider_registry: Arc<runtime::ProviderRegistry>,
         upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
         runtime_services: Arc<runtime::RuntimeServices>,
+    ) -> Result<Self, String> {
+        Self::new_with_gateway_tasks(
+            sessions,
+            lease_registry,
+            session_data,
+            projection_hub,
+            started_at,
+            provider_registry,
+            upgrade_coordinator,
+            runtime_services,
+            crate::runtime_host::task_set::GatewayRuntimeTaskSet::new(Duration::from_secs(5)),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_gateway_tasks(
+        sessions: Arc<HotSessionPool>,
+        lease_registry: Arc<SessionLeaseRegistry>,
+        session_data: Arc<crate::session_runtime_data_port::GatewaySessionRuntimePort>,
+        projection_hub: Arc<SessionProjectionHub>,
+        started_at: Instant,
+        provider_registry: Arc<runtime::ProviderRegistry>,
+        upgrade_coordinator: Arc<runtime::UpgradeCoordinator>,
+        runtime_services: Arc<runtime::RuntimeServices>,
+        gateway_tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
     ) -> Result<Self, String> {
         let session_input_router = runtime_services
             .session_input_router()
@@ -518,17 +538,16 @@ impl RuntimeService {
         Ok(Self {
             sessions,
             lease_registry,
-            session_kernel,
-            lifecycle_kernel,
+            session_data,
+            projection_hub,
             started_at,
             turns: Arc::new(Mutex::new(BTreeMap::new())),
             turn_bindings: Arc::new(Mutex::new(BTreeMap::new())),
-            active_turn_controls: Arc::new(Mutex::new(BTreeMap::new())),
+            active_turns: Arc::new(ActiveTurnRegistry::new()),
             session_inputs: Arc::new(Mutex::new(BTreeMap::new())),
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
-            session_event_relays: Arc::new(Mutex::new(BTreeMap::new())),
+            gateway_tasks,
             session_models: Arc::new(Mutex::new(BTreeMap::new())),
-            session_activation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             hydration_attempts: Arc::new(AtomicU64::new(0)),
             hydration_body_reads: Arc::new(AtomicU64::new(0)),
             hydration_body_bytes: Arc::new(AtomicU64::new(0)),
@@ -540,7 +559,6 @@ impl RuntimeService {
             resource_capabilities,
             runtime_services,
             session_input_router,
-            session_activator: Arc::new(OnceLock::new()),
         })
     }
 
@@ -557,13 +575,8 @@ impl RuntimeService {
         Arc::clone(&self.session_input_router)
     }
 
-    pub(crate) fn install_session_activator(
-        &self,
-        activator: Weak<dyn SessionActivationPort>,
-    ) -> Result<(), String> {
-        self.session_activator
-            .set(activator)
-            .map_err(|_| "session activation port is already installed".to_string())
+    pub(crate) fn notify_session_input_scheduler(&self) {
+        self.session_input_router.notify_pending();
     }
 
     pub(crate) fn resource_capability_index(&self) -> runtime::ResourceCapabilityIndex {
@@ -594,13 +607,7 @@ impl RuntimeService {
         session_id: &str,
     ) -> SessionExecutionIndexProjection {
         let volatile = self.session_execution_index(session_id);
-        let Some(store) = self.session_kernel.unified_store() else {
-            return volatile;
-        };
-        let Ok(records) = store
-            .session_runtime_outbox_for_session(session_id, 100)
-            .await
-        else {
+        let Ok(records) = self.session_data.runtime_inputs(session_id, 100).await else {
             return volatile;
         };
         let durable = session_execution_index_from_outbox(session_id, &records);
@@ -615,10 +622,8 @@ impl RuntimeService {
             .into_iter()
             .map(|index| index.session_id)
             .collect::<BTreeSet<_>>();
-        if let Some(store) = self.session_kernel.unified_store() {
-            if let Ok(records) = store.active_session_runtime_outbox(500).await {
-                session_ids.extend(records.into_iter().map(|record| record.session_id));
-            }
+        if let Ok(records) = self.session_data.active_runtime_inputs(500).await {
+            session_ids.extend(records.into_iter().map(|record| record.session_id));
         }
         let mut indices = Vec::with_capacity(session_ids.len());
         for session_id in session_ids {
@@ -677,33 +682,44 @@ impl RuntimeService {
         turn_id: &str,
         session_id: &str,
         execution_id: Option<String>,
-    ) -> (runtime::CancellationToken, ActiveTurnControlGuard) {
+    ) -> Result<(runtime::CancellationToken, ActiveTurnControlGuard), String> {
         let cancellation_token = runtime::CancellationToken::new();
-        self.active_turn_controls
+        let mut state = self
+            .active_turns
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                turn_id.to_string(),
-                ActiveTurnControl {
-                    session_id: session_id.to_string(),
-                    execution_id,
-                    cancellation_token: cancellation_token.clone(),
-                },
-            );
-        (
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.accepting {
+            return Err("Gateway Runtime turn admission is closing".to_string());
+        }
+        if state.controls.contains_key(turn_id) {
+            return Err(format!("Runtime turn {turn_id} is already active"));
+        }
+        state.controls.insert(
+            turn_id.to_string(),
+            ActiveTurnControl {
+                session_id: session_id.to_string(),
+                execution_id,
+                cancellation_token: cancellation_token.clone(),
+            },
+        );
+        drop(state);
+        Ok((
             cancellation_token,
             ActiveTurnControlGuard {
                 turn_id: turn_id.to_string(),
-                controls: Arc::clone(&self.active_turn_controls),
+                registry: Arc::clone(&self.active_turns),
             },
-        )
+        ))
     }
 
     fn cancel_active_turn_control(&self, turn_id: &str, reason: &str) -> Option<String> {
         let control = self
-            .active_turn_controls
+            .active_turns
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
             .get(turn_id)
             .cloned()?;
         control.cancellation_token.cancel();
@@ -716,9 +732,11 @@ impl RuntimeService {
 
     fn cancel_active_session_turns(&self, session_id: &str, reason: &str) -> Vec<String> {
         let turn_ids = self
-            .active_turn_controls
+            .active_turns
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
             .iter()
             .filter(|(_, control)| control.session_id == session_id)
             .map(|(turn_id, _)| turn_id.clone())
@@ -736,13 +754,243 @@ impl RuntimeService {
         self.cancel_active_session_turns(session_id, reason)
     }
 
+    /// Atomically close Runtime turn admission and cancel every turn that was
+    /// already accepted. The registry lock is the admission fence: no turn can
+    /// be inserted between the snapshot and cancellation.
+    pub(crate) fn stop_accepting_and_cancel_active_turns(&self, reason: &str) -> Vec<String> {
+        let controls = {
+            let mut state = self
+                .active_turns
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.accepting = false;
+            state
+                .controls
+                .iter()
+                .map(|(turn_id, control)| (turn_id.clone(), control.clone()))
+                .collect::<Vec<_>>()
+        };
+        for (_, control) in &controls {
+            control.cancellation_token.cancel();
+            if let Some(execution_id) = &control.execution_id {
+                self.runtime_services
+                    .cancel_live_execution(execution_id, reason.to_string());
+            }
+        }
+        controls
+            .into_iter()
+            .map(|(turn_id, control)| control.execution_id.unwrap_or(turn_id))
+            .collect()
+    }
+
+    pub(crate) async fn wait_for_active_turns(
+        &self,
+        cancelled: usize,
+        timeout: Duration,
+    ) -> ActiveTurnDrainReport {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let changed = self.active_turns.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let remaining_turn_ids = self
+                .active_turns
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .controls
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            if remaining_turn_ids.is_empty() {
+                return ActiveTurnDrainReport {
+                    cancelled,
+                    drained: cancelled,
+                    remaining_turn_ids,
+                };
+            }
+            if tokio::time::timeout_at(deadline, &mut changed)
+                .await
+                .is_err()
+            {
+                let remaining_turn_ids = self
+                    .active_turns
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .controls
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                return ActiveTurnDrainReport {
+                    cancelled,
+                    drained: cancelled.saturating_sub(remaining_turn_ids.len()),
+                    remaining_turn_ids,
+                };
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn active_turn_count(&self) -> usize {
+        self.active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
+            .len()
+    }
+
+    pub(crate) fn session_input_runtime_state(
+        &self,
+        session_id: &str,
+    ) -> runtime::RuntimeInputState {
+        let active_turn_id = self
+            .active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
+            .iter()
+            .find_map(|(turn_id, control)| {
+                (control.session_id == session_id).then(|| TurnId::from_string(turn_id.clone()))
+            });
+        runtime::RuntimeInputState {
+            active_turn_id,
+            waiting_for_approval: false,
+            waiting_for_clarification: false,
+        }
+    }
+
+    pub(crate) fn is_session_turn_active(&self, session_id: &str, turn_id: &str) -> bool {
+        self.active_turns
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .controls
+            .get(turn_id)
+            .is_some_and(|control| control.session_id == session_id)
+    }
+
+    pub(crate) async fn deliver_durable_session_input_view(
+        &self,
+        record: &session::SessionRuntimeOutboxRecord,
+        content: String,
+        status: SessionInputStatus,
+    ) -> Result<(), RuntimeTurnExecutionError> {
+        let active_turn_id = record
+            .target_turn_id
+            .as_ref()
+            .map(|turn_id| TurnId::from_string(turn_id.clone()));
+        let created_at = chrono::DateTime::<Utc>::from_timestamp_millis(
+            record.created_at_ms.min(i64::MAX as u64) as i64,
+        )
+        .unwrap_or_else(Utc::now);
+        let envelope = SessionInputEnvelope {
+            input_id: SessionInputId::from_string(record.input_id.clone()),
+            session_id: record.session_id.clone(),
+            source_kind: InputSourceKind::Runtime,
+            payload_kind: InputPayloadKind::Text,
+            content_preview: content.chars().take(160).collect(),
+            content,
+            source_ref: Some(format!("session-input:{}", record.input_id)),
+            source_message_id: Some(record.message_id.clone()),
+            idempotency_key: record.request_id.clone(),
+            metadata: serde_json::json!({
+                "durable_request_id": record.request_id,
+                "session_generation": record.session_generation,
+            }),
+            created_at,
+        };
+        let receipt = SessionInputReceipt {
+            input_id: envelope.input_id.clone(),
+            session_id: record.session_id.clone(),
+            status,
+            decision: record.decision,
+            relation_proposal: None,
+            reason: Some(InputRoutingReason::new(
+                "durable_delivery",
+                "input delivered from the durable Session queue",
+                10_000,
+            )),
+            active_turn_id,
+            evidence_refs: vec![format!("session-input:{}", record.input_id)],
+            created_at,
+        };
+        self.project_durable_session_input(envelope, receipt).await
+    }
+
+    /// Refresh the process-local turn inbox from a durable Session admission.
+    /// Gateway/Memory retain lifecycle authority; Runtime only receives the
+    /// content needed by active-turn checkpoints.
+    pub(crate) async fn project_durable_session_input(
+        &self,
+        envelope: SessionInputEnvelope,
+        receipt: SessionInputReceipt,
+    ) -> Result<(), RuntimeTurnExecutionError> {
+        let session_id = envelope.session_id.clone();
+        let stream = self.session_input_stream_for(&session_id).await?;
+        stream.project_durable(envelope, receipt.clone());
+        self.emit_session_input_events(&session_id, &stream, Some(receipt));
+        Ok(())
+    }
+
+    pub(crate) fn project_durable_session_receipt(
+        &self,
+        session_id: &str,
+        receipt: SessionInputReceipt,
+    ) {
+        let stream = self
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .cloned();
+        if let Some(stream) = stream {
+            stream.project_durable_receipt(&receipt);
+            self.emit_session_input_events(session_id, &stream, Some(receipt));
+        }
+    }
+
+    pub(crate) async fn publish_user_message_committed(
+        &self,
+        record: &session::SessionRuntimeOutboxRecord,
+        content: &str,
+    ) {
+        let execution_id = runtime::session_ingress_graph_id(
+            &record.session_id,
+            &record.request_id,
+            &record.turn_id,
+        );
+        self.record_live_execution(
+            &record.session_id,
+            execution_id.clone(),
+            record.turn_id.clone(),
+        );
+        self.projection_hub
+            .publish(
+                &record.session_id,
+                SessionProjectionEvent::UserMessageCommitted {
+                    session_id: record.session_id.clone(),
+                    message_id: record.message_id.clone(),
+                    sequence: record.sequence,
+                    execution_id,
+                    turn_id: record.turn_id.clone(),
+                    content: content.to_string(),
+                    created_at_ms: record.created_at_ms,
+                },
+            )
+            .await;
+    }
+
     pub(crate) fn refresh_resource_capabilities(&self) -> runtime::ResourceCapabilitySnapshot {
         self.resource_capabilities.refresh_from_environment()
     }
 
     pub(crate) async fn execute_ingress_record(
         &self,
-        record: &memory::SessionRuntimeOutboxRecord,
+        record: &session::SessionRuntimeOutboxRecord,
         content: &str,
     ) -> Result<runtime::SessionIngressExecutionReceipt, String> {
         let terminal_id = format!("turn-terminal:{}", record.request_id);
@@ -757,6 +1005,14 @@ impl RuntimeService {
             .get(&terminal_id)
             .map_err(|error| error.to_string())?
         {
+            let terminal = if terminal.status == "materialized" {
+                terminal
+            } else {
+                self.adopt_existing_terminal_for_claim(record, terminal)
+                    .await?;
+                self.await_session_terminal_materialization(&terminal_id)
+                    .await?
+            };
             // A worker may be replaying an already-committed terminal after
             // process recovery. Re-establish the exact primary marker before
             // settling so an in-memory projection created by a fresh Surface
@@ -765,8 +1021,10 @@ impl RuntimeService {
                 .await;
             self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
                 .await;
+            let runtime_record =
+                crate::session_runtime_data_port::to_runtime_input_record(record.clone());
             if let Some(resolution) = self.session_input_router.record_target_terminal(
-                record,
+                &runtime_record,
                 &graph_id,
                 terminal.commit_cursor,
             )? {
@@ -796,28 +1054,36 @@ impl RuntimeService {
             }
         }
         if !self.has_active_session(&record.session_id) {
-            let activator = self
-                .session_activator
-                .get()
-                .and_then(Weak::upgrade)
-                .ok_or_else(|| {
-                    format!(
-                        "session {} requires UnifiedSessionManager activation, but no activation port is installed",
-                        record.session_id
-                    )
-                })?;
-            activator.activate(&record.session_id).await?;
+            return Err(format!(
+                "session {} is not active; Gateway Session scheduler must activate it before Runtime execution",
+                record.session_id
+            ));
         }
         let runtime_entry = self
             .sessions
             .get(&record.session_id)
             .ok_or_else(|| format!("session {} has no active runtime", record.session_id))?;
-        let ingress = runtime::TurnIngressRef {
-            request_id: record.request_id.clone(),
-            turn_id: record.turn_id.clone(),
-            message_id: record.message_id.clone(),
-            session_id: record.session_id.clone(),
-        };
+        let ingress =
+            runtime::TurnIngressRef {
+                request_id: record.request_id.clone(),
+                turn_id: record.turn_id.clone(),
+                message_id: record.message_id.clone(),
+                session_id: record.session_id.clone(),
+                session_generation: record.session_generation,
+                input_sequence: record.sequence as u64,
+                claim_owner: record.claim_owner.clone().ok_or_else(|| {
+                    format!("session input {} has no claim owner", record.request_id)
+                })?,
+                claim_token: record.claim_token.clone().ok_or_else(|| {
+                    format!("session input {} has no claim token", record.request_id)
+                })?,
+                claim_revision: record.claim_fence_epoch.ok_or_else(|| {
+                    format!(
+                        "session input {} has no immutable claim fence epoch",
+                        record.request_id
+                    )
+                })?,
+            };
         self.record_live_execution(&record.session_id, graph_id.clone(), record.turn_id.clone());
         let ingress_options = match record
             .runtime_options_json
@@ -836,7 +1102,7 @@ impl RuntimeService {
             &record.turn_id,
             &record.session_id,
             Some(graph_id.clone()),
-        );
+        )?;
         let mut owned_runtime = match async {
             let mut runtime = lock_runtime_entry(&runtime_entry).await;
             runtime.set_context_profile(ingress_options.profile);
@@ -853,7 +1119,12 @@ impl RuntimeService {
             let host = runtime
                 .take_runtime_for_turn()
                 .map_err(|error| error.to_string())?;
-            Ok::<_, String>(RuntimeTurnOwner::new(Arc::clone(&runtime_entry), host))
+            Ok::<_, String>(RuntimeTurnOwner::new(
+                record.session_id.clone(),
+                Arc::clone(&runtime_entry),
+                Arc::clone(&self.gateway_tasks),
+                host,
+            ))
         }
         .await
         {
@@ -909,6 +1180,12 @@ impl RuntimeService {
                 return Err(error);
             }
         };
+        let terminal = if terminal.status == "materialized" {
+            terminal
+        } else {
+            self.await_session_terminal_materialization(&terminal_id)
+                .await?
+        };
         self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
             .await;
         match summary.terminal_completion {
@@ -936,12 +1213,8 @@ impl RuntimeService {
                     },
                     event: Box::new(runtime::CowdEvent::TurnError { error: reason }),
                 };
-                self.session_kernel
-                    .event_bus()
-                    .broadcast(
-                        &record.session_id,
-                        &runtime_event_stream_payload(event).to_string(),
-                    )
+                self.projection_hub
+                    .publish(&record.session_id, SessionProjectionEvent::runtime(event))
                     .await;
             }
             harness_contract::goal::GoalCompletion::Cancelled => {
@@ -949,8 +1222,10 @@ impl RuntimeService {
                     .cancel_live_execution(&graph_id, "Runtime turn cancelled".to_string());
             }
         }
+        let runtime_record =
+            crate::session_runtime_data_port::to_runtime_input_record(record.clone());
         if let Some(resolution) = self.session_input_router.record_target_terminal(
-            record,
+            &runtime_record,
             &graph_id,
             terminal.commit_cursor,
         )? {
@@ -963,6 +1238,150 @@ impl RuntimeService {
             graph_id,
             commit_cursor: terminal.commit_cursor,
         })
+    }
+
+    async fn await_session_terminal_materialization(
+        &self,
+        terminal_id: &str,
+    ) -> Result<runtime::RuntimeSessionOutboxRecord, String> {
+        const MATERIALIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        tokio::time::timeout(MATERIALIZATION_TIMEOUT, async {
+            loop {
+                let terminal = self
+                    .runtime_services
+                    .session_terminal_delivery()
+                    .get(terminal_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("runtime terminal `{terminal_id}` disappeared"))?;
+                match terminal.status.as_str() {
+                    "materialized" => return Ok(terminal),
+                    "blocked" => {
+                        return Err(format!(
+                            "runtime terminal `{terminal_id}` materialization blocked: {}",
+                            terminal.last_error.as_deref().unwrap_or("unknown error")
+                        ));
+                    }
+                    _ => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "runtime terminal `{terminal_id}` was not materialized within {}ms",
+                MATERIALIZATION_TIMEOUT.as_millis()
+            )
+        })?
+    }
+
+    async fn adopt_existing_terminal_for_claim(
+        &self,
+        record: &session::SessionRuntimeOutboxRecord,
+        mut terminal: runtime::RuntimeSessionOutboxRecord,
+    ) -> Result<runtime::RuntimeSessionOutboxRecord, String> {
+        let claim_owner = record.claim_owner.as_ref().ok_or_else(|| {
+            format!(
+                "running Session input `{}` has no claim owner",
+                record.request_id
+            )
+        })?;
+        let claim_token = record.claim_token.as_ref().ok_or_else(|| {
+            format!(
+                "running Session input `{}` has no claim token",
+                record.request_id
+            )
+        })?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if terminal.status == "materialized"
+                || (terminal.request_id.as_deref() == Some(record.request_id.as_str())
+                    && terminal.session_id == record.session_id
+                    && terminal.session_generation == Some(record.session_generation)
+                    && terminal.input_claim_owner.as_deref() == Some(claim_owner.as_str())
+                    && terminal.input_claim_token.as_deref() == Some(claim_token.as_str()))
+            {
+                return Ok(terminal);
+            }
+            if terminal.request_id.as_deref() != Some(record.request_id.as_str())
+                || terminal.session_id != record.session_id
+                || terminal.session_generation != Some(record.session_generation)
+            {
+                return Err(format!(
+                    "runtime terminal `{}` cannot be adopted by Session input `{}` at generation {}",
+                    terminal.terminal_id, record.request_id, record.session_generation
+                ));
+            }
+            let now = Utc::now().timestamp_millis().max(0) as u64;
+            if terminal.status == "claimed"
+                && terminal
+                    .claim_expires_at_ms
+                    .is_some_and(|expires| expires > now)
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "runtime terminal `{}` retained an active delivery claim during recovery",
+                        terminal.terminal_id
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                terminal = self
+                    .runtime_services
+                    .session_terminal_delivery()
+                    .get(&terminal.terminal_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        format!("runtime terminal `{}` disappeared", terminal.terminal_id)
+                    })?;
+                continue;
+            }
+            let adoption = runtime::RuntimeSessionTerminalFenceAdoption {
+                terminal_id: terminal.terminal_id.clone(),
+                expected_terminal_revision: terminal.revision,
+                request_id: record.request_id.clone(),
+                session_id: record.session_id.clone(),
+                turn_id: record.turn_id.clone(),
+                session_generation: record.session_generation,
+                input_sequence: record.sequence as u64,
+                claim_owner: claim_owner.clone(),
+                claim_token: claim_token.clone(),
+                claim_revision: record.claim_fence_epoch.ok_or_else(|| {
+                    format!(
+                        "Session input `{}` cannot adopt a terminal without a claim fence epoch",
+                        record.input_id
+                    )
+                })?,
+                claim_expires_at_ms: record.claim_expires_at_ms.ok_or_else(|| {
+                    format!(
+                        "Session input `{}` cannot adopt a terminal without an active claim deadline",
+                        record.input_id
+                    )
+                })?,
+                adopted_at_ms: now,
+            };
+            match self
+                .runtime_services
+                .session_terminal_delivery()
+                .adopt_fence(&adoption)
+            {
+                Ok(adopted) => {
+                    self.notify_session_input_scheduler();
+                    return Ok(adopted);
+                }
+                Err(runtime::RuntimeEventStoreError::StaleRevision { .. })
+                    if std::time::Instant::now() < deadline =>
+                {
+                    terminal = self
+                        .runtime_services
+                        .session_terminal_delivery()
+                        .get(&terminal.terminal_id)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            format!("runtime terminal `{}` disappeared", terminal.terminal_id)
+                        })?;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     #[must_use]
@@ -981,16 +1400,6 @@ impl RuntimeService {
             "active_sessions": status.active_sessions,
             "uptime_secs": status.uptime_secs,
         })
-    }
-
-    #[must_use]
-    pub(crate) fn session_kernel(&self) -> Arc<SessionKernel> {
-        self.session_kernel.clone()
-    }
-
-    #[must_use]
-    pub(crate) fn lifecycle_kernel(&self) -> Arc<SessionLifecycleKernel> {
-        self.lifecycle_kernel.clone()
     }
 
     #[must_use]
@@ -1021,6 +1430,13 @@ impl RuntimeService {
     }
 
     #[must_use]
+    pub(crate) fn gateway_tasks(
+        &self,
+    ) -> Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet> {
+        Arc::clone(&self.gateway_tasks)
+    }
+
+    #[must_use]
     pub(crate) fn status(&self) -> RuntimeBoundaryStatus {
         RuntimeBoundaryStatus {
             protocol_version: crate::runtime_protocol::RUNTIME_PROTOCOL_VERSION,
@@ -1047,7 +1463,7 @@ impl RuntimeService {
                 "total": leases.len(),
                 "items": leases,
             },
-            "lifecycle": self.lifecycle_kernel.snapshots().await,
+            "lifecycle": self.session_data.presence_snapshots().await,
             "turns": turns,
             "turn_bindings": turn_bindings,
             "transport": {
@@ -1313,7 +1729,7 @@ impl RuntimeService {
         input: &TurnInput,
         phase: TurnJournalPhase,
         message: Option<String>,
-    ) -> Option<Result<Option<usize>, memory::MemoryError>> {
+    ) -> Option<Result<Option<usize>, session::SessionError>> {
         let session_id = input
             .session_id
             .as_deref()
@@ -1333,8 +1749,8 @@ impl RuntimeService {
             }),
         );
         Some(
-            self.session_kernel
-                .append_turn_journal_event(session_id, envelope)
+            self.session_data
+                .append_turn_journal(session_id, envelope)
                 .await,
         )
     }
@@ -1344,7 +1760,7 @@ impl RuntimeService {
         receipt: &TurnReceipt,
         phase: TurnJournalPhase,
         message: Option<String>,
-    ) -> Option<Result<Option<usize>, memory::MemoryError>> {
+    ) -> Option<Result<Option<usize>, session::SessionError>> {
         let session_id = receipt
             .session_id
             .as_deref()
@@ -1363,8 +1779,8 @@ impl RuntimeService {
             }),
         );
         Some(
-            self.session_kernel
-                .append_turn_journal_event(session_id, envelope)
+            self.session_data
+                .append_turn_journal(session_id, envelope)
                 .await,
         )
     }
@@ -1434,35 +1850,12 @@ impl RuntimeService {
         system_prompt: Vec<String>,
         recovery: runtime::SessionRecoveryConfig,
     ) -> Result<(), String> {
-        let activation_lock = {
-            let mut locks = self
-                .session_activation_locks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
-                lock
-            } else {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(session_id.to_string(), Arc::downgrade(&lock));
-                lock
-            }
-        };
-        let activation_queue_started = Instant::now();
-        let _activation_guard = activation_lock.lock().await;
-        runtime::execution_core::performance::observe_duration(
-            "session_activation_queue_ms",
-            activation_queue_started.elapsed(),
-        );
-        // Recheck only after acquiring the keyed gate. Multiple Surfaces can
-        // submit the first ingress concurrently, but exactly one may hydrate
-        // and install the session carrier.
         if self.has_active_session(session_id) {
             return Ok(());
         }
         let hydration_started = std::time::Instant::now();
         let stored_record = self
-            .session_kernel
+            .session_data
             .stored_session(session_id)
             .await
             .map_err(|error| error.to_string())?;
@@ -1480,22 +1873,20 @@ impl RuntimeService {
             let mut messages = None;
             for attempt in 1..=recovery.stable_snapshot_attempts {
                 let total_before = self
-                    .session_kernel
+                    .session_data
                     .stored_message_count(session_id)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .unwrap_or_default();
+                    .map_err(|error| error.to_string())?;
                 let mut candidate = Vec::with_capacity(total_before);
                 let mut hydrated_bytes = 0usize;
                 while candidate.len() < total_before {
                     let remaining = total_before.saturating_sub(candidate.len());
                     let page_limit = recovery.hydrate_page_messages.min(remaining);
                     let page = self
-                        .session_kernel
+                        .session_data
                         .stored_messages(session_id, candidate.len(), page_limit)
                         .await
-                        .map_err(|error| error.to_string())?
-                        .unwrap_or_default();
+                        .map_err(|error| error.to_string())?;
                     self.hydration_body_reads.fetch_add(1, Ordering::Relaxed);
                     if page.is_empty() {
                         break;
@@ -1516,11 +1907,10 @@ impl RuntimeService {
                     candidate.extend(page);
                 }
                 let total_after = self
-                    .session_kernel
+                    .session_data
                     .stored_message_count(session_id)
                     .await
-                    .map_err(|error| error.to_string())?
-                    .unwrap_or_default();
+                    .map_err(|error| error.to_string())?;
                 let sequences_are_contiguous = candidate
                     .iter()
                     .enumerate()
@@ -1565,7 +1955,8 @@ impl RuntimeService {
         }
         let runtime =
             self.build_session_runtime_entry(session, session_id, &model, system_prompt)?;
-        self.register_runtime(session_id.to_string(), runtime)?;
+        self.register_runtime(session_id.to_string(), runtime)
+            .await?;
         runtime::execution_core::performance::observe_duration(
             "hydrate_ms",
             hydration_started.elapsed(),
@@ -1573,7 +1964,7 @@ impl RuntimeService {
         Ok(())
     }
 
-    pub(crate) fn register_runtime(
+    pub(crate) async fn register_runtime(
         &self,
         session_id: String,
         mut runtime: crate::runtime_entry::GatewayRuntimeEntry,
@@ -1584,6 +1975,10 @@ impl RuntimeService {
                 "session {session_id} already has an active Runtime carrier; refusing replacement"
             ));
         }
+        self.gateway_tasks
+            .open_session(&session_id)
+            .await
+            .map_err(|error| format!("cannot activate Runtime carrier during shutdown: {error}"))?;
         if let Some(approval_gate) = &self.approval_gate {
             runtime.install_approval_gate(Arc::clone(approval_gate));
         }
@@ -1615,7 +2010,27 @@ impl RuntimeService {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(session_id.clone(), cowd_bus.clone());
-                self.install_session_event_relay(&session_id, cowd_bus);
+                if let Err(error) = self
+                    .install_session_event_relay(&session_id, cowd_bus)
+                    .await
+                {
+                    self.session_inputs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&session_id);
+                    self.session_event_buses
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&session_id);
+                    self.session_models
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&session_id);
+                    self.sessions.remove(&session_id);
+                    return Err(format!(
+                        "failed to install Runtime event relay for session {session_id}: {error}"
+                    ));
+                }
             } else {
                 self.session_event_buses
                     .lock()
@@ -1626,10 +2041,23 @@ impl RuntimeService {
         result
     }
 
-    pub(crate) fn remove_active_runtime(
+    pub(crate) async fn remove_active_runtime(
         &self,
         session_id: &str,
     ) -> Option<Arc<tokio::sync::Mutex<crate::runtime_entry::GatewayRuntimeEntry>>> {
+        let task_report = self
+            .gateway_tasks
+            .close_session_and_drain(session_id, Duration::from_secs(5))
+            .await;
+        if task_report.forced_aborts > 0 || task_report.panicked > 0 {
+            tracing::warn!(
+                %session_id,
+                joined = task_report.joined,
+                panicked = task_report.panicked,
+                forced_aborts = task_report.forced_aborts,
+                "session-scoped Gateway background tasks required forced cleanup"
+            );
+        }
         self.session_inputs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1638,14 +2066,6 @@ impl RuntimeService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
-        if let Some(handle) = self
-            .session_event_relays
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id)
-        {
-            handle.abort();
-        }
         self.session_models
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1656,129 +2076,121 @@ impl RuntimeService {
     /// Runtime emits transient rendering/progress events on its own bus while
     /// Gateway owns the cross-surface transport. Relay them once per active
     /// session so every surface observes the same stream. Durable terminal
-    /// settlement is deliberately emitted by `SessionRuntimeBridge` only
+    /// settlement is deliberately emitted by `SessionWorkerSupervisor` only
     /// after the transcript append succeeds.
-    fn install_session_event_relay(&self, session_id: &str, bus: runtime::CowdEventBus) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            // Unit-only construction outside Tokio has no live surface to
-            // relay to; production runtime registration always has a handle.
-            return;
-        };
-        if let Some(handle) = self
-            .session_event_relays
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id)
-        {
-            handle.abort();
-        }
+    async fn install_session_event_relay(
+        &self,
+        session_id: &str,
+        bus: runtime::CowdEventBus,
+    ) -> Result<(), crate::runtime_host::task_set::GatewayTaskSpawnError> {
         let session_id = session_id.to_string();
         let relay_session_id = session_id.clone();
-        let gateway_bus = self.session_kernel.event_bus();
+        let gateway_bus = Arc::clone(&self.projection_hub);
         let runtime_services = Arc::clone(&self.runtime_services);
         let mut receiver = bus.subscribe();
-        let handle = runtime.spawn(async move {
-            let mut tool_ordinals = HashMap::<(String, String, String), u64>::new();
-            let mut active_tool_instances = HashMap::<(String, String, String), String>::new();
-            let mut text_stream_offsets = HashMap::<(String, String, String), usize>::new();
-            loop {
-                match receiver.recv().await {
-                    Ok(mut event) => {
-                        if let (Some(context), Some((provider_id, started, completed))) = (
-                            event.execution_context().cloned(),
-                            tool_event_identity(&event),
-                        ) {
-                            let provider_id = provider_id.to_string();
-                            let key = (context.execution_id, context.turn_id, provider_id.clone());
-                            let instance_id = if started {
-                                let ordinal = tool_ordinals.entry(key.clone()).or_default();
-                                let instance_id = format!("{provider_id}#cowd-{ordinal}");
-                                *ordinal = ordinal.saturating_add(1);
-                                active_tool_instances.insert(key.clone(), instance_id.clone());
-                                instance_id
-                            } else {
-                                active_tool_instances.get(&key).cloned().unwrap_or_else(|| {
-                                    let ordinal = tool_ordinals.entry(key.clone()).or_default();
-                                    let instance_id = format!("{provider_id}#cowd-{ordinal}");
-                                    *ordinal = ordinal.saturating_add(1);
-                                    instance_id
-                                })
-                            };
-                            rewrite_tool_event_identity(&mut event, &instance_id);
-                            if completed {
-                                active_tool_instances.remove(&key);
+        self.gateway_tasks
+            .replace_session_task(
+                crate::runtime_host::task_set::GatewayTaskKind::SessionEventRelay,
+                &session_id,
+                move |cancellation| async move {
+                    let mut tool_ordinals = HashMap::<(String, String, String), u64>::new();
+                    let mut active_tool_instances =
+                        HashMap::<(String, String, String), String>::new();
+                    let mut text_stream_offsets = HashMap::<(String, String, String), usize>::new();
+                    loop {
+                        let received = tokio::select! {
+                            _ = cancellation.cancelled() => break,
+                            received = receiver.recv() => received,
+                        };
+                        match received {
+                            Ok(mut event) => {
+                                if let (Some(context), Some((provider_id, started, completed))) = (
+                                    event.execution_context().cloned(),
+                                    tool_event_identity(&event),
+                                ) {
+                                    let provider_id = provider_id.to_string();
+                                    let key = (
+                                        context.execution_id,
+                                        context.turn_id,
+                                        provider_id.clone(),
+                                    );
+                                    let instance_id = if started {
+                                        let ordinal = tool_ordinals.entry(key.clone()).or_default();
+                                        let instance_id = format!("{provider_id}#cowd-{ordinal}");
+                                        *ordinal = ordinal.saturating_add(1);
+                                        active_tool_instances
+                                            .insert(key.clone(), instance_id.clone());
+                                        instance_id
+                                    } else {
+                                        active_tool_instances.get(&key).cloned().unwrap_or_else(
+                                            || {
+                                                let ordinal =
+                                                    tool_ordinals.entry(key.clone()).or_default();
+                                                let instance_id =
+                                                    format!("{provider_id}#cowd-{ordinal}");
+                                                *ordinal = ordinal.saturating_add(1);
+                                                instance_id
+                                            },
+                                        )
+                                    };
+                                    rewrite_tool_event_identity(&mut event, &instance_id);
+                                    if completed {
+                                        active_tool_instances.remove(&key);
+                                    }
+                                }
+                                runtime_services
+                                    .observe_live_execution_event(&relay_session_id, &event);
+                                let stream_range =
+                                    match (event.execution_context(), event.domain_event()) {
+                                        (Some(context), runtime::CowdEvent::TextDelta { text }) => {
+                                            let stream_key = (
+                                                context.execution_id.clone(),
+                                                context.turn_id.clone(),
+                                                "assistant_text".to_string(),
+                                            );
+                                            let start_bytes = *text_stream_offsets
+                                                .entry(stream_key.clone())
+                                                .or_default();
+                                            let end_bytes = start_bytes.saturating_add(text.len());
+                                            text_stream_offsets.insert(stream_key, end_bytes);
+                                            Some(RuntimeStreamRange {
+                                                start_bytes,
+                                                end_bytes,
+                                                stream_revision: end_bytes,
+                                            })
+                                        }
+                                        _ => None,
+                                    };
+                                gateway_bus
+                                    .publish(
+                                        &relay_session_id,
+                                        SessionProjectionEvent::Runtime {
+                                            event,
+                                            tool_instance_id: None,
+                                            stream_range,
+                                        },
+                                    )
+                                    .await;
                             }
-                        }
-                        runtime_services.observe_live_execution_event(&relay_session_id, &event);
-                        let mut payload = runtime_event_stream_payload(event);
-                        if payload.get("type").and_then(serde_json::Value::as_str)
-                            == Some("TextDelta")
-                        {
-                            let execution_id = payload
-                                .get("execution_id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            let turn_id = payload
-                                .get("turn_id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            let part_id = payload
-                                .get("part_id")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("assistant_text")
-                                .to_string();
-                            let text_bytes = payload
-                                .get("text")
-                                .and_then(serde_json::Value::as_str)
-                                .map_or(0, str::len);
-                            let stream_key = (execution_id, turn_id, part_id);
-                            let start_bytes =
-                                *text_stream_offsets.entry(stream_key.clone()).or_default();
-                            let end_bytes = start_bytes.saturating_add(text_bytes);
-                            if let serde_json::Value::Object(fields) = &mut payload {
-                                fields.insert(
-                                    "start_bytes".to_string(),
-                                    serde_json::json!(start_bytes),
-                                );
-                                fields
-                                    .insert("end_bytes".to_string(), serde_json::json!(end_bytes));
-                                fields.insert(
-                                    "stream_revision".to_string(),
-                                    serde_json::json!(end_bytes),
-                                );
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                gateway_bus
+                                    .publish(
+                                        &relay_session_id,
+                                        SessionProjectionEvent::RuntimeStreamLagged { skipped },
+                                    )
+                                    .await;
                             }
-                            text_stream_offsets.insert(stream_key, end_bytes);
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                        gateway_bus
-                            .broadcast(&relay_session_id, &payload.to_string())
-                            .await;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        gateway_bus
-                            .broadcast(
-                                &relay_session_id,
-                                &serde_json::json!({
-                                    "type": "RuntimeStreamLagged",
-                                    "skipped": skipped,
-                                })
-                                .to_string(),
-                            )
-                            .await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-        self.session_event_relays
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(session_id, handle);
+                },
+            )
+            .await?;
+        Ok(())
     }
 
-    pub(crate) fn remove_active_runtime_if_present(&self, session_id: &str) -> bool {
-        self.remove_active_runtime(session_id).is_some()
+    pub(crate) async fn remove_active_runtime_if_present(&self, session_id: &str) -> bool {
+        self.remove_active_runtime(session_id).await.is_some()
     }
 
     pub(crate) async fn cowd_event_receiver(
@@ -1793,6 +2205,7 @@ impl RuntimeService {
         runtime_guard.cowd_bus().map(|bus| bus.subscribe())
     }
 
+    #[cfg(test)]
     pub(crate) async fn admit_session_input(
         &self,
         envelope: SessionInputEnvelope,
@@ -1802,23 +2215,15 @@ impl RuntimeService {
             .map(|admission| admission.receipt)
     }
 
-    pub(crate) async fn route_pending_session_inputs(
-        &self,
-        limit: usize,
-    ) -> Result<runtime::SessionInputRouteReport, RuntimeTurnExecutionError> {
-        self.session_input_router
-            .route_pending_with(self, limit.max(1))
-            .await
-            .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))
-    }
-
+    #[cfg(test)]
     pub(crate) async fn admit_session_input_with_materialized(
         &self,
         envelope: SessionInputEnvelope,
     ) -> Result<SessionInputAdmission, RuntimeTurnExecutionError> {
         let session_id = envelope.session_id.clone();
         let content = envelope.content.clone();
-        let request = memory::SessionRuntimeOutboxRequest {
+        let request = runtime::RuntimeSessionIngressCommand {
+            input_id: envelope.input_id.to_string(),
             request_id: envelope.idempotency_key.clone(),
             turn_id: envelope
                 .metadata
@@ -1830,6 +2235,20 @@ impl RuntimeService {
                 .source_message_id
                 .clone()
                 .unwrap_or_else(|| envelope.input_id.to_string()),
+            session_generation: self
+                .session_data
+                .session_input_admission(&session_id)
+                .await
+                .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?
+                .ok_or_else(|| {
+                    RuntimeTurnExecutionError::NotFound(format!(
+                        "session `{session_id}` does not exist"
+                    ))
+                })?
+                .generation,
+            decision: InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
             created_at_ms: envelope.created_at.timestamp_millis().max(0) as u64,
             runtime_options_json: envelope
                 .metadata
@@ -1849,11 +2268,10 @@ impl RuntimeService {
         self.emit_session_input_events(&session_id, &stream, Some(receipt.clone()));
         self.persist_session_input_domain_event(
             &session_id,
-            "SessionInputReceived",
+            SessionInputJournalKind::Received,
             Some(&receipt),
             record_for_event.as_ref(),
             &stream,
-            None,
         )
         .await;
         let execution_graph_id =
@@ -1864,21 +2282,18 @@ impl RuntimeService {
             execution_graph_id.clone(),
             request.turn_id.clone(),
         );
-        self.session_kernel
-            .event_bus()
-            .broadcast(
+        self.projection_hub
+            .publish(
                 &session_id,
-                &serde_json::json!({
-                    "type": "UserMessageCommitted",
-                    "session_id": session_id,
-                    "message_id": &request.message_id,
-                    "sequence": persisted.sequence,
-                    "execution_id": &execution_graph_id,
-                    "turn_id": &request.turn_id,
-                    "content": &content,
-                    "created_at_ms": request.created_at_ms,
-                })
-                .to_string(),
+                SessionProjectionEvent::UserMessageCommitted {
+                    session_id: session_id.clone(),
+                    message_id: request.message_id.clone(),
+                    sequence: persisted.sequence,
+                    execution_id: execution_graph_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                    content: content.clone(),
+                    created_at_ms: request.created_at_ms,
+                },
             )
             .await;
         Ok(SessionInputAdmission {
@@ -1896,7 +2311,7 @@ impl RuntimeService {
     /// source of truth.
     async fn bind_primary_ingress_projection(
         &self,
-        outbox: &memory::SessionRuntimeOutboxRecord,
+        outbox: &session::SessionRuntimeOutboxRecord,
         execution_id: &str,
     ) {
         let stream = match self.session_input_stream_for(&outbox.session_id).await {
@@ -1918,11 +2333,10 @@ impl RuntimeService {
                 self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
                 self.persist_session_input_domain_event(
                     &outbox.session_id,
-                    "SessionInputIngressBound",
+                    SessionInputJournalKind::IngressBound,
                     Some(&receipt),
                     Some(&record),
                     &stream,
-                    None,
                 )
                 .await;
             }
@@ -1942,7 +2356,7 @@ impl RuntimeService {
 
     async fn settle_primary_ingress_projection(
         &self,
-        outbox: &memory::SessionRuntimeOutboxRecord,
+        outbox: &session::SessionRuntimeOutboxRecord,
         execution_id: &str,
         terminal_id: &str,
     ) {
@@ -1966,11 +2380,10 @@ impl RuntimeService {
                 self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
                 self.persist_session_input_domain_event(
                     &outbox.session_id,
-                    "SessionInputIngressSettled",
+                    SessionInputJournalKind::IngressSettled,
                     Some(&receipt),
                     Some(&record),
                     &stream,
-                    None,
                 )
                 .await;
             }
@@ -1986,7 +2399,7 @@ impl RuntimeService {
 
     async fn fail_primary_ingress_projection(
         &self,
-        outbox: &memory::SessionRuntimeOutboxRecord,
+        outbox: &session::SessionRuntimeOutboxRecord,
         error: &str,
     ) {
         let stream = match self.session_input_stream_for(&outbox.session_id).await {
@@ -2000,11 +2413,10 @@ impl RuntimeService {
                 self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
                 self.persist_session_input_domain_event(
                     &outbox.session_id,
-                    "SessionInputIngressFailed",
+                    SessionInputJournalKind::IngressFailed,
                     Some(&receipt),
                     Some(&record),
                     &stream,
-                    None,
                 )
                 .await;
             }
@@ -2032,11 +2444,10 @@ impl RuntimeService {
         self.emit_session_input_events(session_id, &stream, Some(receipt.clone()));
         self.persist_session_input_domain_event(
             session_id,
-            "SessionInputCancelled",
+            SessionInputJournalKind::Cancelled,
             Some(&receipt),
             Some(&record),
             &stream,
-            None,
         )
         .await;
         let cancelled_execution_ids = self.cancel_active_session_turns(session_id, reason);
@@ -2062,28 +2473,13 @@ impl RuntimeService {
             .reclassify_input(&input_id, decision, reason)
             .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
         let receipt = record.to_receipt();
-        let graph_materialized = Some(
-            serde_json::to_value(
-                self.session_input_router
-                    .route_pending_with(self, 32)
-                    .await
-                    .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?,
-            )
-            .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?,
-        );
-        let materialized = graph_materialized;
-        let materialized_for_event = materialized.clone();
         self.emit_session_input_events(session_id, &stream, Some(receipt.clone()));
-        if let Some(materialized) = materialized {
-            self.emit_session_input_materialized(session_id, materialized);
-        }
         self.persist_session_input_domain_event(
             session_id,
-            "SessionInputReclassified",
+            SessionInputJournalKind::Reclassified,
             Some(&receipt),
             Some(&record),
             &stream,
-            materialized_for_event.as_ref(),
         )
         .await;
         Ok(receipt)
@@ -2096,42 +2492,22 @@ impl RuntimeService {
         model: &str,
         system_prompt: Vec<String>,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
-        if let Some(store) = self.session_kernel.unified_store() {
-            crate::runtime_factory::create_runtime_entry_with_session_store(
-                store,
-                self.runtime_services(),
-                self.provider_registry(),
-                self.tool_host(),
-                session,
-                session_id,
-                model.to_string(),
-                system_prompt,
-                true,
-                true,
-                None,
-                runtime::PermissionMode::WorkspaceWrite,
-                None,
-                None,
-            )
-            .map_err(|error| error.to_string())
-        } else {
-            crate::runtime_factory::create_runtime_entry(
-                self.runtime_services(),
-                self.provider_registry(),
-                self.tool_host(),
-                session,
-                session_id,
-                model.to_string(),
-                system_prompt,
-                true,
-                true,
-                None,
-                runtime::PermissionMode::WorkspaceWrite,
-                None,
-                None,
-            )
-            .map_err(|error| error.to_string())
-        }
+        crate::runtime_factory::create_runtime_entry(
+            self.runtime_services(),
+            self.provider_registry(),
+            self.tool_host(),
+            session,
+            session_id,
+            model.to_string(),
+            system_prompt,
+            true,
+            true,
+            None,
+            runtime::PermissionMode::WorkspaceWrite,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())
     }
 
     fn emit_session_input_materialized(&self, session_id: &str, materialized: serde_json::Value) {
@@ -2231,40 +2607,50 @@ impl RuntimeService {
     async fn persist_session_input_domain_event(
         &self,
         session_id: &str,
-        kind: &str,
+        kind: SessionInputJournalKind,
         receipt: Option<&SessionInputReceipt>,
         record: Option<&runtime::SessionInputRecord>,
         stream: &runtime::SessionInputStream,
-        materialized: Option<&serde_json::Value>,
     ) {
         if let Err(error) = self.ensure_session_domain_record(session_id).await {
             tracing::warn!(
                 %session_id,
-                %kind,
+                kind = kind.as_str(),
                 error = %error,
                 "failed to ensure session before persisting session input runtime event"
             );
             return;
         }
+        let payload = match serde_json::to_value(SessionInputDomainEventPayload {
+            input: receipt,
+            record,
+            input_projection: stream.projection(),
+            turn_inbox: stream.inbox_snapshot(None),
+        }) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(
+                    %session_id,
+                    kind = kind.as_str(),
+                    error = %error,
+                    "failed to encode typed Session input domain event"
+                );
+                return;
+            }
+        };
         if let Err(error) = self
-            .session_kernel
-            .append_session_domain_event(
+            .session_data
+            .append_session_input_journal(
                 session_id,
-                memory::SessionDomainScope::Turn,
                 kind,
-                serde_json::json!({
-                    "input": receipt,
-                    "record": record,
-                    "input_projection": stream.projection(),
-                    "turn_inbox": stream.inbox_snapshot(None),
-                    "materialized": materialized,
-                }),
+                payload,
+                Utc::now().timestamp_millis().max(0) as u64,
             )
             .await
         {
             tracing::warn!(
                 %session_id,
-                %kind,
+                kind = kind.as_str(),
                 error = %error,
                 "failed to persist session input runtime event"
             );
@@ -2274,17 +2660,17 @@ impl RuntimeService {
     async fn ensure_session_domain_record(
         &self,
         session_id: &str,
-    ) -> Result<(), memory::MemoryError> {
+    ) -> Result<(), session::SessionError> {
         if self
-            .session_kernel
+            .session_data
             .stored_session(session_id)
             .await?
             .is_some()
         {
             return Ok(());
         }
-        Err(memory::MemoryError::NotFound(format!(
-            "session {session_id} must be created through UnifiedSessionManager before runtime events are persisted"
+        Err(session::SessionError::InvalidArgument(format!(
+            "session {session_id} must be created through SessionActivationCoordinator before runtime events are persisted"
         )))
     }
 
@@ -2398,9 +2784,9 @@ impl RuntimeService {
         let runtime_entry = self.sessions.get(session_id).ok_or_else(|| {
             RuntimeTurnExecutionError::NotFound(format!("session {session_id} not found"))
         })?;
-        let queued_next_options = options.clone();
-        let (cancellation_token, _turn_control) =
-            self.install_active_turn_control(&turn_id.to_string(), session_id, None);
+        let (cancellation_token, _turn_control) = self
+            .install_active_turn_control(&turn_id.to_string(), session_id, None)
+            .map_err(RuntimeTurnExecutionError::Runtime)?;
         let mut owned_runtime = {
             let mut runtime_guard = lock_runtime_entry(&runtime_entry).await;
             runtime_guard.set_context_profile(options.profile);
@@ -2417,7 +2803,12 @@ impl RuntimeService {
             let host = runtime_guard
                 .take_runtime_for_turn()
                 .map_err(|error| RuntimeTurnExecutionError::Runtime(error.to_string()))?;
-            RuntimeTurnOwner::new(Arc::clone(&runtime_entry), host)
+            RuntimeTurnOwner::new(
+                session_id.to_string(),
+                Arc::clone(&runtime_entry),
+                Arc::clone(&self.gateway_tasks),
+                host,
+            )
         };
         // Do not hold `GatewayRuntimeEntry`'s mutex while a provider/tool turn
         // awaits.  The host returns to the entry before this method settles
@@ -2445,21 +2836,6 @@ impl RuntimeService {
                         turn_id = %turn_id,
                         error = %error,
                         "failed to persist completed turn journal"
-                    );
-                }
-                if let Some(stream) = self
-                    .session_inputs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(session_id)
-                    .cloned()
-                {
-                    let queued_next = stream.drain_queued_next_for_dispatch(4);
-                    self.emit_session_input_events(session_id, &stream, None);
-                    self.dispatch_queued_next_turns(
-                        session_id.to_string(),
-                        queued_next,
-                        queued_next_options,
                     );
                 }
                 Ok(RuntimeTurnExecution { summary, receipt })
@@ -2500,45 +2876,6 @@ impl RuntimeService {
         if stream.active_turn_id().as_ref() == Some(turn_id) {
             stream.set_active_turn(None);
             self.emit_session_input_events(session_id, &stream, None);
-        }
-    }
-
-    fn dispatch_queued_next_turns(
-        &self,
-        session_id: String,
-        records: Vec<runtime::SessionInputRecord>,
-        options: RuntimeTurnOptions,
-    ) {
-        for record in records {
-            let service = self.clone();
-            let prompt = record.envelope.content.clone();
-            let task_id = None;
-            let session_id = session_id.clone();
-            let options = options.clone();
-            tokio::spawn(async move {
-                let Ok(receipt) = service
-                    .accept_turn_with_options(&session_id, task_id, prompt.clone())
-                    .await
-                else {
-                    return;
-                };
-                if let Err(error) = service
-                    .run_accepted_turn_with_options(
-                        &session_id,
-                        receipt.turn_id.clone(),
-                        prompt,
-                        options,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        %session_id,
-                        turn_id = %receipt.turn_id,
-                        error = %error.message(),
-                        "queued next turn failed"
-                    );
-                }
-            });
         }
     }
 
@@ -2621,21 +2958,10 @@ impl RuntimeService {
         Some(runtime_guard.session_async().await)
     }
 
-    pub(crate) async fn sync_session_snapshot(
-        &self,
-        session_id: &str,
-        session: &runtime::Session,
-    ) -> Result<(), memory::MemoryError> {
-        self.session_kernel
-            .sync_runtime_session_snapshot(session_id, session)
-            .await
-            .map(|_| ())
-    }
-
     pub(crate) async fn compact_active_session(
         &self,
         session_id: &str,
-    ) -> Result<Option<SessionCompactResult>, memory::MemoryError> {
+    ) -> Result<Option<SessionCompactResult>, session::SessionError> {
         let Some(runtime_entry) = self.sessions.get(session_id) else {
             return Ok(None);
         };
@@ -2644,12 +2970,7 @@ impl RuntimeService {
         let (result, session_snapshot) = runtime_guard
             .compact_active_session()
             .await
-            .map_err(|error| memory::MemoryError::Compression(error.to_string()))?;
-        drop(runtime_guard);
-
-        self.sync_session_snapshot(session_id, &session_snapshot)
-            .await?;
-
+            .map_err(|error| session::SessionError::Other(error.to_string()))?;
         let removed_message_count = result
             .as_ref()
             .map_or(0, |event| event.removed_message_count);
@@ -3029,21 +3350,38 @@ fn upgrade_mission_status(status: &runtime::MissionSessionStatus) -> runtime::Up
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::session_service::{
+        presence::SessionPresenceLedger, repository::SessionRepository,
+    };
 
     fn test_runtime_service_with_services(
-        active_sessions: Arc<ActiveSessions>,
-        store: Arc<memory::UnifiedSessionStore>,
+        active_sessions: Arc<HotSessionPool>,
+        store: Arc<session::UnifiedSessionStore>,
         runtime_services: Arc<runtime::RuntimeServices>,
     ) -> RuntimeService {
+        let projection_hub = crate::event_bus::SessionProjectionHub::new();
+        let repository = Arc::new(SessionRepository::new(
+            active_sessions.clone(),
+            Some(Arc::clone(&store)),
+            Arc::clone(&projection_hub),
+        ));
+        let presence = Arc::new(SessionPresenceLedger::new());
+        let session_runtime_port =
+            crate::session_runtime_data_port::GatewaySessionRuntimePort::new_for_test(
+                repository, presence,
+            );
+        runtime_services
+            .install_session_ports(
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+            )
+            .expect("test Session runtime port");
         RuntimeService::new(
             active_sessions.clone(),
             Arc::new(SessionLeaseRegistry::default()),
-            Arc::new(SessionKernel::new(
-                active_sessions,
-                Some(store),
-                crate::event_bus::SessionEventBus::new(),
-            )),
-            Arc::new(SessionLifecycleKernel::new()),
+            session_runtime_port,
+            projection_hub,
             Instant::now(),
             Arc::new(runtime::ProviderRegistry::empty()),
             Arc::new(runtime::UpgradeCoordinator::new()),
@@ -3053,18 +3391,60 @@ mod tests {
     }
 
     fn test_runtime_service(
-        active_sessions: Arc<ActiveSessions>,
-        store: Option<Arc<memory::UnifiedSessionStore>>,
+        active_sessions: Arc<HotSessionPool>,
+        store: Option<Arc<session::UnifiedSessionStore>>,
     ) -> RuntimeService {
         let store = store.unwrap_or_else(|| {
-            Arc::new(memory::UnifiedSessionStore::open_in_memory().expect("test session store"))
+            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("test session store"))
         });
         let runtime_services =
             runtime::RuntimeServices::in_memory().expect("test runtime services");
-        runtime_services
-            .install_session_store(Arc::clone(&store))
-            .expect("test session router");
         test_runtime_service_with_services(active_sessions, store, runtime_services)
+    }
+
+    #[tokio::test]
+    async fn remove_active_runtime_keeps_other_session_restorations_isolated() {
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        service
+            .gateway_tasks
+            .open_session("session-a")
+            .await
+            .unwrap();
+        service
+            .gateway_tasks
+            .open_session("session-b")
+            .await
+            .unwrap();
+        service
+            .gateway_tasks
+            .spawn(
+                crate::runtime_host::task_set::GatewayTaskKind::RuntimeRestoration,
+                Some("session-a".to_string()),
+                |cancellation| async move {
+                    cancellation.cancelled().await;
+                },
+            )
+            .unwrap();
+        service
+            .gateway_tasks
+            .spawn(
+                crate::runtime_host::task_set::GatewayTaskKind::RuntimeRestoration,
+                Some("session-b".to_string()),
+                |cancellation| async move {
+                    cancellation.cancelled().await;
+                },
+            )
+            .unwrap();
+
+        assert!(service.remove_active_runtime("session-a").await.is_none());
+
+        assert_eq!(service.gateway_tasks.tracked_task_count(), 1);
+        service
+            .gateway_tasks
+            .close_session_and_drain("session-b", Duration::from_secs(1))
+            .await;
+        assert_eq!(service.gateway_tasks.tracked_task_count(), 0);
+        service.gateway_tasks.shutdown().await;
     }
 
     #[tokio::test]
@@ -3073,42 +3453,165 @@ mod tests {
         let home = temp.path().join("home");
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let record = memory::SessionRuntimeOutboxRecord {
-            request_id: "restart-request".into(),
-            turn_id: "restart-turn".into(),
-            message_id: "restart-message".into(),
-            session_id: "restart-session".into(),
-            sequence: 0,
-            status: memory::OutboxStatus::Claimed,
-            runtime_commit_cursor: None,
-            attempts: 1,
-            next_attempt_at_ms: 0,
-            claim_owner: Some("worker-a".into()),
-            claim_expires_at_ms: Some(u64::MAX),
-            failure_class: None,
-            last_error: None,
-            revision: 1,
-            created_at_ms: 1,
-            updated_at_ms: 1,
-            runtime_options_json: None,
-        };
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let now = chrono::Utc::now().to_rfc3339();
+        store
+            .create_session(&session::SessionRecord {
+                session_id: "restart-session".to_string(),
+                platform: "test".to_string(),
+                chat_id: "restart-session".to_string(),
+                user_id: None,
+                model: None,
+                created_at: now.clone(),
+                last_activity: now,
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        store
+            .append_ingress_with_runtime_outbox(
+                "restart-session",
+                "user",
+                Some(r#"[{"type":"text","text":"must not run"}]"#),
+                1,
+                &session::SessionRuntimeOutboxRequest {
+                    input_id: "restart-input".to_string(),
+                    request_id: "restart-request".to_string(),
+                    turn_id: "restart-turn".to_string(),
+                    message_id: "restart-message".to_string(),
+                    session_generation: 1,
+                    decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                    target_turn_id: None,
+                    classification_json: None,
+                    created_at_ms: 1,
+                    runtime_options_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        let claim_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let claimed = store
+            .claim_session_runtime_outbox("worker-a", claim_at, 30_000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let claim_token = claimed.claim_token.clone().unwrap();
+        let record = store
+            .mark_session_runtime_outbox_running(
+                "restart-request",
+                "worker-a",
+                claimed.session_generation,
+                &claim_token,
+                claimed.revision,
+                claim_at,
+            )
+            .await
+            .unwrap();
+        let event_store_path = temp.path().join("runtime-events.sqlite");
+        let runtime_event_store =
+            Arc::new(runtime::RuntimeEventStore::try_open(&event_store_path).unwrap());
         let services = runtime::RuntimeServices::builder(&home, &workspace)
-            .session_store(Arc::clone(&store))
+            .runtime_event_store(Arc::clone(&runtime_event_store))
             .build()
             .unwrap();
-        services
-            .session_terminal_delivery()
-            .enqueue(
-                "turn-terminal:restart-request",
-                "assistant-restart-message",
-                "restart-session",
-                41,
-                "assistant_json:\"done\"",
+        let terminal_receipt = runtime_event_store
+            .append_transaction_with_terminal(
+                runtime::AppendTransactionRequest {
+                    transaction_id: "restart-terminal-transaction".to_string(),
+                    expected_streams: vec![runtime::ExpectedStreamRevision {
+                        stream_id: "turn:restart-turn".to_string(),
+                        expected_revision: 0,
+                    }],
+                    events: vec![runtime::RuntimeTransactionEventInput {
+                        event: runtime::RuntimeEventInput {
+                            stream_id: "turn:restart-turn".to_string(),
+                            scope: runtime::RuntimeEventScope::SessionInput,
+                            kind: "turn.terminal_committed".to_string(),
+                            status: Some("completed".to_string()),
+                            actor: Some("restart-test".to_string()),
+                            refs: Vec::new(),
+                            payload: serde_json::json!({"result": "done"}),
+                        },
+                        idempotency_key: Some("restart-terminal-event".to_string()),
+                        schema_version: 1,
+                    }],
+                },
+                runtime::SessionTerminalInput {
+                    terminal_id: "turn-terminal:restart-request".to_string(),
+                    message_id: "assistant-restart-message".to_string(),
+                    session_id: "restart-session".to_string(),
+                    execution_id: Some(runtime::session_ingress_graph_id(
+                        "restart-session",
+                        "restart-request",
+                        "restart-turn",
+                    )),
+                    turn_id: Some("restart-turn".to_string()),
+                    request_id: Some("restart-request".to_string()),
+                    session_generation: Some(record.session_generation),
+                    input_sequence: Some(record.sequence as u64),
+                    input_claim_owner: record.claim_owner.clone(),
+                    input_claim_token: record.claim_token.clone(),
+                    input_claim_revision: record.claim_fence_epoch,
+                    payload_ref: "assistant_json:\"done\"".to_string(),
+                },
+            )
+            .unwrap();
+        let terminal_port = services.session_terminal_delivery();
+        let claimed_terminal = terminal_port
+            .claim("delivery-worker", claim_at, 30_000, 1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        store
+            .commit_terminal_transcript_if_fenced(&session::SessionTerminalTranscriptCommit {
+                terminal_message_id: "assistant-restart-message".to_string(),
+                ingress_message_id: "restart-message".to_string(),
+                session_id: "restart-session".to_string(),
+                turn_id: "restart-turn".to_string(),
+                messages: vec![session::SessionMessage {
+                    stable_message_id: "assistant-restart-message".to_string(),
+                    session_id: "restart-session".to_string(),
+                    sequence: 0,
+                    role: "assistant".to_string(),
+                    content_json: r#"[{"type":"text","text":"done"}]"#.to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: claim_at,
+                }],
+                runtime_commit_cursor: terminal_receipt.commit_cursor,
+                created_at_ms: claim_at,
+                fence: session::SessionTerminalExecutionFence {
+                    request_id: record.request_id.clone(),
+                    input_sequence: record.sequence,
+                    session_generation: record.session_generation,
+                    claim_owner: record.claim_owner.clone().unwrap(),
+                    claim_token: record.claim_token.clone().unwrap(),
+                    claim_fence_epoch: record
+                        .claim_fence_epoch
+                        .expect("running input owns an immutable claim fence"),
+                },
+            })
+            .await
+            .unwrap();
+        terminal_port
+            .acknowledge(
+                &claimed_terminal.terminal_id,
+                "delivery-worker",
+                claimed_terminal.revision,
+                claim_at,
             )
             .unwrap();
         let first = test_runtime_service_with_services(
-            Arc::new(ActiveSessions::new()),
+            Arc::new(HotSessionPool::new()),
             Arc::clone(&store),
             services,
         );
@@ -3118,16 +3621,19 @@ mod tests {
                 .await
                 .unwrap()
                 .commit_cursor,
-            41
+            terminal_receipt.commit_cursor
         );
         drop(first);
+        drop(runtime_event_store);
 
+        let restarted_event_store =
+            Arc::new(runtime::RuntimeEventStore::try_open(&event_store_path).unwrap());
         let restarted_services = runtime::RuntimeServices::builder(&home, &workspace)
-            .session_store(Arc::clone(&store))
+            .runtime_event_store(restarted_event_store)
             .build()
             .unwrap();
         let restarted = test_runtime_service_with_services(
-            Arc::new(ActiveSessions::new()),
+            Arc::new(HotSessionPool::new()),
             store,
             restarted_services,
         );
@@ -3135,7 +3641,7 @@ mod tests {
             .execute_ingress_record(&record, "must still not run")
             .await
             .unwrap();
-        assert_eq!(receipt.commit_cursor, 41);
+        assert_eq!(receipt.commit_cursor, terminal_receipt.commit_cursor);
         assert_eq!(
             receipt.graph_id,
             runtime::session_ingress_graph_id("restart-session", "restart-request", "restart-turn")
@@ -3144,14 +3650,25 @@ mod tests {
 
     #[tokio::test]
     async fn recovered_terminal_settles_the_exact_primary_input_projection() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let service = test_runtime_service(
-            Arc::new(ActiveSessions::default()),
-            Some(Arc::clone(&store)),
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let runtime_event_store =
+            Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap());
+        let runtime_services = runtime::RuntimeServices::builder(&home, &workspace)
+            .runtime_event_store(Arc::clone(&runtime_event_store))
+            .build()
+            .unwrap();
+        let service = test_runtime_service_with_services(
+            Arc::new(HotSessionPool::default()),
+            Arc::clone(&store),
+            runtime_services,
         );
         let now = chrono::Utc::now().to_rfc3339();
         store
-            .create_session(&memory::SessionRecord {
+            .create_session(&session::SessionRecord {
                 session_id: "projection-session".to_string(),
                 platform: "test".to_string(),
                 chat_id: "projection-session".to_string(),
@@ -3188,22 +3705,144 @@ mod tests {
             )
             .await
             .expect("admission");
-        let record = store
+        let queued = store
             .get_session_runtime_outbox("projection-primary")
             .await
             .expect("outbox lookup")
             .expect("persisted ingress");
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let claimed = store
+            .claim_session_runtime_outbox("projection-worker", now_ms, 30_000, 1)
+            .await
+            .expect("claim persisted ingress")
+            .into_iter()
+            .next()
+            .expect("claim result");
+        assert_eq!(claimed.request_id, queued.request_id);
+        let claim_token = claimed
+            .claim_token
+            .clone()
+            .expect("claim token is part of the execution fence");
+        let record = store
+            .mark_session_runtime_outbox_running(
+                &claimed.request_id,
+                "projection-worker",
+                claimed.session_generation,
+                &claim_token,
+                claimed.revision,
+                now_ms,
+            )
+            .await
+            .expect("mark claimed ingress running");
+        let terminal_commit = runtime_event_store
+            .append_transaction_with_terminal(
+                runtime::AppendTransactionRequest {
+                    transaction_id: "projection-terminal-transaction".to_string(),
+                    expected_streams: vec![runtime::ExpectedStreamRevision {
+                        stream_id: "turn:projection-primary".to_string(),
+                        expected_revision: 0,
+                    }],
+                    events: vec![runtime::RuntimeTransactionEventInput {
+                        event: runtime::RuntimeEventInput {
+                            stream_id: "turn:projection-primary".to_string(),
+                            scope: runtime::RuntimeEventScope::SessionInput,
+                            kind: "turn.terminal_committed".to_string(),
+                            status: Some("completed".to_string()),
+                            actor: Some("projection-test".to_string()),
+                            refs: Vec::new(),
+                            payload: serde_json::json!({"result": "done"}),
+                        },
+                        idempotency_key: Some("projection-terminal-event".to_string()),
+                        schema_version: 1,
+                    }],
+                },
+                runtime::SessionTerminalInput {
+                    terminal_id: admission.terminal_id.clone(),
+                    message_id: "assistant-projection-primary".to_string(),
+                    session_id: record.session_id.clone(),
+                    execution_id: Some(admission.execution_graph_id.clone()),
+                    turn_id: Some(record.turn_id.clone()),
+                    request_id: Some(record.request_id.clone()),
+                    session_generation: Some(record.session_generation),
+                    input_sequence: Some(record.sequence as u64),
+                    input_claim_owner: record.claim_owner.clone(),
+                    input_claim_token: record.claim_token.clone(),
+                    input_claim_revision: record.claim_fence_epoch,
+                    payload_ref: "assistant_json:\"done\"".to_string(),
+                },
+            )
+            .expect("terminal and its exact Session fence commit atomically");
+        let persisted_terminal = service
+            .runtime_services()
+            .session_terminal_delivery()
+            .get(&admission.terminal_id)
+            .expect("terminal lookup")
+            .expect("terminal persisted");
+        assert_eq!(
+            persisted_terminal.request_id.as_deref(),
+            Some(record.request_id.as_str())
+        );
+        assert_eq!(
+            persisted_terminal.input_claim_revision,
+            record.claim_fence_epoch
+        );
+        assert_eq!(
+            persisted_terminal.commit_cursor,
+            terminal_commit.commit_cursor
+        );
+        assert_eq!(persisted_terminal.input_claim_owner, record.claim_owner);
+        assert_eq!(persisted_terminal.input_claim_token, record.claim_token);
+        assert_eq!(
+            persisted_terminal.session_generation,
+            Some(record.session_generation)
+        );
+        assert_eq!(
+            persisted_terminal.turn_id.as_deref(),
+            Some(record.turn_id.as_str())
+        );
+        assert_eq!(
+            persisted_terminal.execution_id.as_deref(),
+            Some(admission.execution_graph_id.as_str())
+        );
+        assert_eq!(persisted_terminal.session_id, record.session_id);
+        assert_eq!(persisted_terminal.terminal_id, admission.terminal_id);
+        assert_eq!(
+            persisted_terminal.message_id,
+            "assistant-projection-primary"
+        );
+        assert_eq!(persisted_terminal.payload_ref, "assistant_json:\"done\"");
+        assert_eq!(persisted_terminal.status, "pending");
+        assert_eq!(persisted_terminal.revision, 0);
+        assert_eq!(persisted_terminal.attempts, 0);
+        assert_eq!(persisted_terminal.next_attempt_at_ms, None);
+        assert_eq!(persisted_terminal.claim_owner, None);
+        assert_eq!(persisted_terminal.claim_expires_at_ms, None);
+        assert_eq!(persisted_terminal.failure_class, None);
+        assert_eq!(persisted_terminal.last_error, None);
+        assert_eq!(persisted_terminal.materialized_at_ms, None);
+        let terminal_claim = service
+            .runtime_services()
+            .session_terminal_delivery()
+            .claim("projection-delivery", now_ms.saturating_add(1), 30_000, 1)
+            .expect("claim terminal delivery")
+            .into_iter()
+            .find(|terminal| terminal.terminal_id == admission.terminal_id)
+            .expect("terminal delivery claim");
+        assert_eq!(
+            terminal_claim.input_claim_revision,
+            record.claim_fence_epoch
+        );
+        assert!(terminal_claim.revision > persisted_terminal.revision);
         service
             .runtime_services()
             .session_terminal_delivery()
-            .enqueue(
-                &admission.terminal_id,
-                "assistant-projection-primary",
-                "projection-session",
-                42,
-                "assistant_json:\"done\"",
+            .acknowledge(
+                &terminal_claim.terminal_id,
+                "projection-delivery",
+                terminal_claim.revision,
+                now_ms.saturating_add(2),
             )
-            .expect("durable terminal");
+            .expect("materialize recovered terminal");
 
         service
             .execute_ingress_record(&record, "must not call provider")
@@ -3291,7 +3930,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_service_status_does_not_initialize_model_provider() {
-        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
 
         let value = service.status_value();
         assert_eq!(value["ok"], true);
@@ -3303,7 +3942,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_service_snapshot_reports_lease_projection() {
-        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
 
         let lease = service
             .acquire_session_lease_value("session-1", "tui:test", "collaborative")
@@ -3321,9 +3960,9 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_service_records_durable_turn_journal() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let service =
-            test_runtime_service(Arc::new(ActiveSessions::default()), Some(store.clone()));
+            test_runtime_service(Arc::new(HotSessionPool::default()), Some(store.clone()));
 
         let submitted = service
             .submit_turn_value(
@@ -3349,10 +3988,10 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_service_persists_session_input_runtime_event() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let now = chrono::Utc::now().to_rfc3339();
         store
-            .create_session(&memory::SessionRecord {
+            .create_session(&session::SessionRecord {
                 session_id: "input-session".to_string(),
                 platform: "test".to_string(),
                 chat_id: "input-session".to_string(),
@@ -3370,7 +4009,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let active_sessions = Arc::new(ActiveSessions::default());
+        let active_sessions = Arc::new(HotSessionPool::default());
         let service = test_runtime_service(active_sessions, Some(store.clone()));
         service
             .session_inputs
@@ -3395,20 +4034,24 @@ mod tests {
             .session_domain_events_page("input-session", 0, 10)
             .await
             .expect("runtime events page");
-        let event = page
+        let kinds = page
             .events
             .iter()
-            .find(|event| event.kind == "SessionInputReceived")
-            .expect("session input event persisted");
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            event.payload["input"]["input_id"],
-            receipt.input_id.to_string()
+            kinds,
+            vec![
+                "session.input.accepted.v1",
+                "session.input.classified.v1",
+                "session.input.queued.v1",
+            ],
+            "durable admission owns one canonical accepted/classified/queued timeline"
         );
-        assert_eq!(
-            event.payload["record"]["envelope"]["content"],
-            "remember this during the current work"
-        );
-        assert_eq!(event.payload["input_projection"]["total"], 1);
+        let event = &page.events[0];
+        assert_eq!(event.payload["input_id"], receipt.input_id.to_string());
+        assert_eq!(event.payload["message_id"], receipt.input_id.to_string());
+        assert_eq!(event.status.as_deref(), Some("accepted"));
     }
 
     #[test]
@@ -3433,7 +4076,7 @@ mod tests {
 
     #[test]
     fn runtime_service_records_executing_turn_lifecycle() {
-        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
 
         let running = service.start_running_turn(
             Some("session-turn".to_string()),
@@ -3462,21 +4105,23 @@ mod tests {
 
     #[test]
     fn runtime_event_relay_preserves_event_type_without_inventing_lifecycle() {
-        let text = runtime_event_stream_payload(runtime::CowdEvent::TextDelta {
+        let text = SessionProjectionEvent::runtime(runtime::CowdEvent::TextDelta {
             text: "partial".to_string(),
-        });
+        })
+        .to_transport_value();
         assert_eq!(text["type"], "TextDelta");
         assert_eq!(text["text"], "partial");
 
-        let completed = runtime_event_stream_payload(runtime::CowdEvent::TurnComplete {
+        let completed = SessionProjectionEvent::runtime(runtime::CowdEvent::TurnComplete {
             assistant_text: "draft".to_string(),
             iterations: 2,
-        });
+        })
+        .to_transport_value();
         assert_eq!(completed["type"], "TurnComplete");
         assert_eq!(completed["assistant_text"], "draft");
         assert!(completed.get("committed").is_none());
 
-        let scoped = runtime_event_stream_payload(runtime::CowdEvent::ExecutionScoped {
+        let scoped = SessionProjectionEvent::runtime(runtime::CowdEvent::ExecutionScoped {
             context: runtime::CowdExecutionContext {
                 execution_id: "execution-1".to_string(),
                 session_id: "session-1".to_string(),
@@ -3486,7 +4131,8 @@ mod tests {
                 status: ExecutionLiveStatus::CallingModel,
                 detail: Some("requesting model".to_string()),
             }),
-        });
+        })
+        .to_transport_value();
         assert_eq!(scoped["type"], "ExecutionPhase");
         assert_eq!(scoped["execution_id"], "execution-1");
         assert_eq!(scoped["turn_id"], "turn-1");
@@ -3494,28 +4140,61 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_event_relay_forwards_render_events_to_gateway_session_bus() {
-        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
-        let gateway_bus = service.session_kernel.event_bus();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        gateway_bus.subscribe("relay-session", tx).await;
-        let runtime_bus = runtime::CowdEventBus::new();
-        service.install_session_event_relay("relay-session", runtime_bus.clone());
-        runtime_bus.emit(runtime::CowdEvent::TextDelta {
-            text: "streamed through gateway".to_string(),
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        let gateway_bus = Arc::clone(&service.projection_hub);
+        let mut rx = gateway_bus.subscribe("relay-session", 8).await;
+        let old_runtime_bus = runtime::CowdEventBus::new();
+        service
+            .install_session_event_relay("relay-session", old_runtime_bus.clone())
+            .await
+            .unwrap();
+        old_runtime_bus.emit(runtime::CowdEvent::TextDelta {
+            text: "before replacement".to_string(),
         });
         let payload = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
             .await
             .expect("relay should forward within bounded time")
             .expect("gateway subscriber remains open");
-        let payload: serde_json::Value = serde_json::from_str(&payload).expect("relay JSON");
+        let payload = payload.to_transport_value();
         assert_eq!(payload["type"], "TextDelta");
-        assert_eq!(payload["text"], "streamed through gateway");
-        service.remove_active_runtime("relay-session");
+        assert_eq!(payload["text"], "before replacement");
+
+        let current_runtime_bus = runtime::CowdEventBus::new();
+        service
+            .install_session_event_relay("relay-session", current_runtime_bus.clone())
+            .await
+            .unwrap();
+        old_runtime_bus.emit(runtime::CowdEvent::TextDelta {
+            text: "stale relay".to_string(),
+        });
+        current_runtime_bus.emit(runtime::CowdEvent::TextDelta {
+            text: "current relay".to_string(),
+        });
+        let payload = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("replacement relay should forward within bounded time")
+            .expect("gateway subscriber remains open")
+            .to_transport_value();
+        assert_eq!(payload["text"], "current relay");
+        assert_eq!(service.gateway_tasks.tracked_task_count(), 1);
+
+        service.remove_active_runtime("relay-session").await;
+        assert_eq!(service.gateway_tasks.tracked_task_count(), 0);
+        current_runtime_bus.emit(runtime::CowdEvent::TextDelta {
+            text: "after removal".to_string(),
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "removed relay must not forward additional events"
+        );
+        service.gateway_tasks.shutdown().await;
     }
 
     #[test]
     fn session_execution_index_exposes_running_only_and_retains_terminal_reference() {
-        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
         service.record_live_execution(
             "session-index",
             "execution-running".to_string(),
@@ -3554,12 +4233,14 @@ mod tests {
 
     #[test]
     fn session_cancel_reaches_the_runtime_turn_control_instead_of_only_emitting_ui_state() {
-        let service = test_runtime_service(Arc::new(ActiveSessions::default()), None);
-        let (cancellation, _guard) = service.install_active_turn_control(
-            "turn-cancel",
-            "session-cancel",
-            Some("execution-cancel".to_string()),
-        );
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        let (cancellation, _guard) = service
+            .install_active_turn_control(
+                "turn-cancel",
+                "session-cancel",
+                Some("execution-cancel".to_string()),
+            )
+            .unwrap();
 
         let cancelled =
             service.cancel_active_session("session-cancel", "evaluator timeout isolation");
@@ -3568,45 +4249,102 @@ mod tests {
         assert!(cancellation.is_cancelled());
     }
 
+    #[tokio::test]
+    async fn process_shutdown_rejects_new_turns_and_waits_for_active_turn_guard() {
+        let service = Arc::new(test_runtime_service(
+            Arc::new(HotSessionPool::default()),
+            None,
+        ));
+        let (cancellation, guard) = service
+            .install_active_turn_control(
+                "turn-shutdown",
+                "session-shutdown",
+                Some("execution-shutdown".to_string()),
+            )
+            .unwrap();
+
+        let cancelled =
+            service.stop_accepting_and_cancel_active_turns("Gateway process shutdown test");
+        assert_eq!(cancelled, vec!["execution-shutdown"]);
+        assert!(cancellation.is_cancelled());
+        assert_eq!(service.active_turn_count(), 1);
+        assert!(service
+            .install_active_turn_control("turn-late", "session-shutdown", None)
+            .is_err());
+
+        let waiter_service = Arc::clone(&service);
+        let waiter = tokio::spawn(async move {
+            waiter_service
+                .wait_for_active_turns(cancelled.len(), Duration::from_secs(1))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(guard);
+        let report = waiter.await.unwrap();
+        assert_eq!(report.cancelled, 1);
+        assert_eq!(report.drained, 1);
+        assert!(report.remaining_turn_ids.is_empty());
+        assert_eq!(service.active_turn_count(), 0);
+        service.gateway_tasks.shutdown().await;
+    }
+
     #[test]
     fn durable_ingress_index_recovers_execution_identity_without_mixing_cursors() {
         let records = vec![
-            memory::SessionRuntimeOutboxRecord {
+            session::SessionRuntimeOutboxRecord {
+                input_id: "input-complete".to_string(),
                 request_id: "request-complete".to_string(),
                 turn_id: "turn-complete".to_string(),
                 message_id: "message-complete".to_string(),
                 session_id: "session-recovery".to_string(),
                 sequence: 1,
-                status: memory::OutboxStatus::Materialized,
+                session_generation: 1,
+                decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                target_turn_id: None,
+                classification_json: None,
+                status: session::SessionRuntimeInputStatus::Completed,
                 runtime_commit_cursor: Some(44),
                 attempts: 1,
                 next_attempt_at_ms: 0,
                 claim_owner: None,
+                claim_token: None,
+                claim_fence_epoch: None,
                 claim_expires_at_ms: None,
                 failure_class: None,
                 last_error: None,
                 revision: 9,
                 created_at_ms: 10,
                 updated_at_ms: 20,
+                terminal_at_ms: Some(20),
                 runtime_options_json: None,
             },
-            memory::SessionRuntimeOutboxRecord {
+            session::SessionRuntimeOutboxRecord {
+                input_id: "input-pending".to_string(),
                 request_id: "request-pending".to_string(),
                 turn_id: "turn-pending".to_string(),
                 message_id: "message-pending".to_string(),
                 session_id: "session-recovery".to_string(),
                 sequence: 2,
-                status: memory::OutboxStatus::Pending,
+                session_generation: 1,
+                decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                target_turn_id: None,
+                classification_json: None,
+                status: session::SessionRuntimeInputStatus::Queued,
                 runtime_commit_cursor: None,
                 attempts: 0,
                 next_attempt_at_ms: 0,
                 claim_owner: None,
+                claim_token: None,
+                claim_fence_epoch: None,
                 claim_expires_at_ms: None,
                 failure_class: None,
                 last_error: None,
                 revision: 3,
                 created_at_ms: 21,
                 updated_at_ms: 30,
+                terminal_at_ms: None,
                 runtime_options_json: None,
             },
         ];

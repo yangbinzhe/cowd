@@ -20,6 +20,7 @@ pub fn dispatch_internal_process(args: &[String]) -> Option<ExitCode> {
     let role_args = args.get(2..).unwrap_or_default();
     Some(match role {
         "auth-broker" => auth_broker::internal_process_entry(role_args),
+        "harness-eval" => gateway::harness_eval_worker_entry(role_args),
         "sandbox-launcher" => sandbox_launcher::internal_process_entry(role_args),
         _ => {
             eprintln!("unsupported Cowd internal process role: {role}");

@@ -2,12 +2,12 @@ use std::{collections::HashMap, path::Path};
 
 use connector::ExternalResourceRef;
 use matrix_core::MatrixEvidencePacket;
-use memory::store::session::SessionEvent;
 use runtime::{
     AgentContextLease, AgentReturnRequirement, ContextAuthority, ContextEnvelope,
     ContextEnvelopeRequest, ContextIdentity, ContextItem, ContextOmission, ContextProfile,
     ContextRole, ContextSourceKind, ContextVisibility,
 };
+use session::SessionEvent;
 
 use super::{
     ConnectorService, ContextService, MemoryService, RuntimeContextBoundary, SessionService,
@@ -128,16 +128,21 @@ impl ContextService {
         } else {
             action
         };
-        let payload = serde_json::json!({
-            "type": "ContextRecommendationAction",
-            "session_id": session_id,
-            "envelope_id": envelope_id,
-            "recommendation": recommendation,
-            "action": action,
-            "note": note,
-        });
+        let event =
+            crate::services::session_service::ContextSessionJournalEvent::recommendation_action(
+                session_id,
+                envelope_id,
+                recommendation,
+                action,
+                note,
+            );
+        let payload = serde_json::to_value(&event).map_err(|error| {
+            ContextServiceError::Internal(format!(
+                "failed to serialize context recommendation action: {error}"
+            ))
+        })?;
         session
-            .append_timeline_event(session_id, "ContextRecommendationAction", payload.clone())
+            .append_context_event(&event)
             .await
             .map_err(|error| {
                 ContextServiceError::Internal(format!(

@@ -1,9 +1,13 @@
 //! Workspace-owned runtime service graph.
 
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures::FutureExt;
 use harness_contract::agent::{
     AgentEvaluationBinding, AgentReleaseBinding, AgentTaskIntent, AgentTaskPacket,
     AgentTerminalStatus, DefinitionScope, ReleaseChannel, RevisionLifecycle, RevisionSelector,
@@ -81,6 +85,8 @@ pub enum RuntimeServicesError {
     AgentRuntime(String),
     #[error("session input router was concurrently installed")]
     DuplicateSessionRouter,
+    #[error("session integration requires query, ingress and journal ports together")]
+    IncompleteSessionPorts,
     #[error("workspace mutation is blocked because upgrade recovery is required")]
     UpgradeRecoveryRequired,
     #[error("durable session handoff recovery failed: {0}")]
@@ -130,7 +136,9 @@ pub struct RuntimeServicesBuilder {
     resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
     provider_registry: Arc<crate::ProviderRegistry>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
-    session_store: Option<Arc<memory::UnifiedSessionStore>>,
+    session_query_port: Option<Arc<dyn crate::SessionRuntimeQueryPort>>,
+    session_ingress_port: Option<Arc<dyn crate::SessionRuntimeIngressPort>>,
+    session_journal_port: Option<Arc<dyn crate::SessionRuntimeJournalPort>>,
     artifact_store: Option<Arc<crate::ArtifactStore>>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
     reality_recall_port: Option<Arc<RealityRecallPort>>,
@@ -138,6 +146,285 @@ pub struct RuntimeServicesBuilder {
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
     skill_catalog: crate::RuntimeSkillCatalog,
     mission_schedule_policy: crate::MissionSchedulePolicy,
+}
+
+/// Runtime-owned supervisor for non-critical-path maintenance.
+///
+/// Tasks are serialized per logical owner, retained until completion, and
+/// drained explicitly during process shutdown. This keeps post-turn work off
+/// the response path without creating detached tasks.
+type MaintenanceWork = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceLifecycle {
+    Open,
+    Closing,
+    Closed,
+}
+
+struct MaintenanceOwner {
+    generation: u64,
+    queued: VecDeque<MaintenanceWork>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct MaintenanceState {
+    lifecycle: MaintenanceLifecycle,
+    next_generation: u64,
+    owners: HashMap<String, MaintenanceOwner>,
+    reaping: usize,
+}
+
+struct MaintenanceCompletion {
+    owner: MaintenanceOwner,
+}
+
+pub(crate) struct RuntimeMaintenanceSupervisor {
+    state: Arc<Mutex<MaintenanceState>>,
+    changed: Arc<tokio::sync::Notify>,
+    completion_tx: tokio::sync::mpsc::UnboundedSender<MaintenanceCompletion>,
+    completion_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<MaintenanceCompletion>>>,
+    reaper: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    reaper_cancellation: crate::CancellationToken,
+    shutdown_lock: tokio::sync::Mutex<()>,
+    shutdown_timeout: Duration,
+}
+
+impl RuntimeMaintenanceSupervisor {
+    fn new() -> Self {
+        Self::with_shutdown_timeout(Duration::from_secs(10))
+    }
+
+    fn with_shutdown_timeout(shutdown_timeout: Duration) -> Self {
+        let (completion_tx, completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            state: Arc::new(Mutex::new(MaintenanceState {
+                lifecycle: MaintenanceLifecycle::Open,
+                next_generation: 0,
+                owners: HashMap::new(),
+                reaping: 0,
+            })),
+            changed: Arc::new(tokio::sync::Notify::new()),
+            completion_tx,
+            completion_rx: Mutex::new(Some(completion_rx)),
+            reaper: Mutex::new(None),
+            reaper_cancellation: crate::CancellationToken::new(),
+            shutdown_lock: tokio::sync::Mutex::new(()),
+            shutdown_timeout,
+        }
+    }
+
+    pub(crate) async fn submit<F>(&self, owner: String, work: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if !self.ensure_reaper() {
+            return false;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.lifecycle != MaintenanceLifecycle::Open {
+            return false;
+        }
+
+        if let Some(existing) = state.owners.get_mut(&owner) {
+            existing.queued.push_back(Box::pin(work));
+            return true;
+        }
+
+        state.next_generation = state.next_generation.saturating_add(1);
+        let generation = state.next_generation;
+        let worker_state = Arc::downgrade(&self.state);
+        let worker_changed = Arc::clone(&self.changed);
+        let completion_tx = self.completion_tx.clone();
+        let worker_owner = owner.clone();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
+            let mut current: MaintenanceWork = Box::pin(work);
+            loop {
+                let _ = std::panic::AssertUnwindSafe(current).catch_unwind().await;
+                let Some(state) = worker_state.upgrade() else {
+                    return;
+                };
+                let next = {
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let Some(entry) = state.owners.get_mut(&worker_owner) else {
+                        return;
+                    };
+                    if entry.generation != generation {
+                        return;
+                    }
+                    if let Some(next) = entry.queued.pop_front() {
+                        Some(next)
+                    } else {
+                        let completed = state
+                            .owners
+                            .remove(&worker_owner)
+                            .expect("maintenance owner exists while its worker is running");
+                        state.reaping = state.reaping.saturating_add(1);
+                        let _ = completion_tx.send(MaintenanceCompletion { owner: completed });
+                        None
+                    }
+                };
+                worker_changed.notify_waiters();
+                match next {
+                    Some(next) => current = next,
+                    None => return,
+                }
+            }
+        });
+        state.owners.insert(
+            owner,
+            MaintenanceOwner {
+                generation,
+                queued: VecDeque::new(),
+                handle,
+            },
+        );
+        let _ = start_tx.send(());
+        true
+    }
+
+    fn ensure_reaper(&self) -> bool {
+        let mut reaper = self
+            .reaper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reaper.is_some() {
+            return true;
+        }
+        let Some(mut receiver) = self
+            .completion_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return false;
+        };
+        let state = Arc::downgrade(&self.state);
+        let changed = Arc::clone(&self.changed);
+        let cancellation = self.reaper_cancellation.clone();
+        *reaper = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    completion = receiver.recv() => {
+                        let Some(mut completion) = completion else {
+                            break;
+                        };
+                        let _ = (&mut completion.owner.handle).await;
+                        let Some(state) = state.upgrade() else {
+                            break;
+                        };
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.reaping = state.reaping.saturating_sub(1);
+                        drop(state);
+                        changed.notify_waiters();
+                    }
+                }
+            }
+        }));
+        true
+    }
+
+    async fn shutdown_and_drain(&self) {
+        let _shutdown = self.shutdown_lock.lock().await;
+        let wait_for_existing_shutdown = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.lifecycle {
+                MaintenanceLifecycle::Open => {
+                    state.lifecycle = MaintenanceLifecycle::Closing;
+                    false
+                }
+                MaintenanceLifecycle::Closing => true,
+                MaintenanceLifecycle::Closed => return,
+            }
+        };
+
+        let deadline = tokio::time::Instant::now() + self.shutdown_timeout;
+        loop {
+            let notified = self.changed.notified();
+            let lifecycle = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.owners.is_empty() && state.reaping == 0 {
+                    Some(state.lifecycle)
+                } else {
+                    None
+                }
+            };
+            if matches!(lifecycle, Some(MaintenanceLifecycle::Closed)) {
+                return;
+            }
+            if lifecycle.is_some() {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.lifecycle = MaintenanceLifecycle::Closed;
+                self.changed.notify_waiters();
+                break;
+            }
+            if wait_for_existing_shutdown && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
+
+        let owners = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.lifecycle = MaintenanceLifecycle::Closed;
+            std::mem::take(&mut state.owners)
+        };
+        for (_, owner) in owners {
+            owner.handle.abort();
+            let _ = owner.handle.await;
+        }
+        self.reaper_cancellation.cancel();
+        let reaper = self
+            .reaper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut reaper) = reaper {
+            if tokio::time::timeout(self.shutdown_timeout, &mut reaper)
+                .await
+                .is_err()
+            {
+                reaper.abort();
+                let _ = reaper.await;
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    fn tracked_task_count(&self) -> usize {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.owners.len().saturating_add(state.reaping)
+    }
 }
 
 /// Read-only projection port for the durable runtime ledger.
@@ -174,26 +461,27 @@ impl RuntimeEventReader {
     pub fn session_timeline_events(
         &self,
         session_id: &str,
-        from_sequence: u64,
+        after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         let mut events = self
             .store
             .list_stream(session_id)?
             .into_iter()
-            .filter(|event| event.sequence >= from_sequence)
+            .filter(|event| {
+                after_position.is_none_or(|position| {
+                    (event.commit_cursor, event.transaction_index) > position
+                })
+            })
             .collect::<Vec<_>>();
-        events.extend(
-            self.store
-                .execution_events_for_session(session_id, 0, limit)?,
-        );
-        events.sort_by_key(|event| (event.created_at_ms, event.sequence));
-        events.dedup_by(|left, right| {
-            left.event_id == right.event_id
-                || (left.stream_id == right.stream_id
-                    && left.sequence == right.sequence
-                    && left.kind == right.kind)
-        });
+        events.extend(self.store.execution_events_for_session(
+            session_id,
+            after_position,
+            limit,
+        )?);
+        events.sort_by_key(|event| (event.commit_cursor, event.transaction_index));
+        events.dedup_by(|left, right| left.event_id == right.event_id);
+        events.truncate(limit);
         Ok(events)
     }
 }
@@ -298,6 +586,13 @@ impl SessionTerminalDeliveryPort {
         self.store.session_terminal_health()
     }
 
+    pub fn has_unsettled_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, RuntimeEventStoreError> {
+        self.store.has_unsettled_session_terminals(session_id)
+    }
+
     pub fn blocked(
         &self,
         limit: usize,
@@ -324,6 +619,13 @@ impl SessionTerminalDeliveryPort {
     ) -> Result<RuntimeSessionOutboxRecord, RuntimeEventStoreError> {
         self.store
             .retry_session_terminal(terminal_id, actor, reason, now_ms)
+    }
+
+    pub fn adopt_fence(
+        &self,
+        request: &crate::RuntimeSessionTerminalFenceAdoption,
+    ) -> Result<RuntimeSessionOutboxRecord, RuntimeEventStoreError> {
+        self.store.adopt_session_terminal_fence(request)
     }
 }
 
@@ -390,8 +692,20 @@ impl RuntimeServicesBuilder {
     }
 
     #[must_use]
-    pub fn session_store(mut self, store: Arc<memory::UnifiedSessionStore>) -> Self {
-        self.session_store = Some(store);
+    pub fn session_query_port(mut self, port: Arc<dyn crate::SessionRuntimeQueryPort>) -> Self {
+        self.session_query_port = Some(port);
+        self
+    }
+
+    #[must_use]
+    pub fn session_ingress_port(mut self, port: Arc<dyn crate::SessionRuntimeIngressPort>) -> Self {
+        self.session_ingress_port = Some(port);
+        self
+    }
+
+    #[must_use]
+    pub fn session_journal_port(mut self, port: Arc<dyn crate::SessionRuntimeJournalPort>) -> Self {
+        self.session_journal_port = Some(port);
         self
     }
 
@@ -474,6 +788,15 @@ impl RuntimeServicesBuilder {
         if self.cowd_home.as_os_str().is_empty() || self.workspace_root.as_os_str().is_empty() {
             return Err(RuntimeServicesError::EmptyRoot);
         }
+        let session_ports = match (
+            self.session_query_port,
+            self.session_ingress_port,
+            self.session_journal_port,
+        ) {
+            (Some(query), Some(ingress), Some(journal)) => Some((query, ingress, journal)),
+            (None, None, None) => None,
+            _ => return Err(RuntimeServicesError::IncompleteSessionPorts),
+        };
         let legacy_team_state_path = self
             .cowd_home
             .join("agents")
@@ -570,8 +893,8 @@ impl RuntimeServicesBuilder {
                 &legacy_team_profile_archive_root,
             )
             .map_err(RuntimeServicesError::Mission)?;
-        if let Some(store) = self.session_store {
-            services.install_session_store(store)?;
+        if let Some((query, ingress, journal)) = session_ports {
+            services.install_session_ports(query, ingress, journal)?;
         }
         Ok(services)
     }
@@ -622,6 +945,10 @@ pub struct RuntimeServices {
     knowledge_activation: crate::knowledge_activation::KnowledgeActivationRuntime,
     session_dispatch_executor: Arc<crate::session_execution::SessionDispatchNodeExecutor>,
     session_input_router: OnceLock<Arc<SessionInputRouter>>,
+    session_query_port: OnceLock<Arc<dyn crate::SessionRuntimeQueryPort>>,
+    session_ingress_port: OnceLock<Arc<dyn crate::SessionRuntimeIngressPort>>,
+    session_journal_port: OnceLock<Arc<dyn crate::SessionRuntimeJournalPort>>,
+    maintenance_supervisor: Arc<RuntimeMaintenanceSupervisor>,
     // Keep this field last so filesystem-backed components are dropped before
     // the temporary root removes their files.
     _ephemeral_root: Option<tempfile::TempDir>,
@@ -641,7 +968,9 @@ impl RuntimeServices {
             resource_quotas: default_resource_quotas(),
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),
             tool_execution_host: None,
-            session_store: None,
+            session_query_port: None,
+            session_ingress_port: None,
+            session_journal_port: None,
             artifact_store: None,
             memory_manager: None,
             reality_recall_port: None,
@@ -907,22 +1236,78 @@ impl RuntimeServices {
             }),
             session_dispatch_executor,
             session_input_router: OnceLock::new(),
+            session_query_port: OnceLock::new(),
+            session_ingress_port: OnceLock::new(),
+            session_journal_port: OnceLock::new(),
+            maintenance_supervisor: Arc::new(RuntimeMaintenanceSupervisor::new()),
             _ephemeral_root: ephemeral_root,
         })
     }
 
-    pub fn install_session_store(
+    pub fn install_session_ports(
         self: &Arc<Self>,
-        store: Arc<memory::UnifiedSessionStore>,
+        query: Arc<dyn crate::SessionRuntimeQueryPort>,
+        ingress: Arc<dyn crate::SessionRuntimeIngressPort>,
+        journal: Arc<dyn crate::SessionRuntimeJournalPort>,
     ) -> Result<Arc<SessionInputRouter>, RuntimeServicesError> {
         if let Some(router) = self.session_input_router.get() {
             return Ok(Arc::clone(router));
         }
-        let router =
-            SessionInputRouter::install(store, &self.workspace_key, Arc::clone(&self.event_store))?;
+        let router = SessionInputRouter::install(
+            Arc::clone(&query),
+            Arc::clone(&ingress),
+            &self.workspace_key,
+            Arc::clone(&self.event_store),
+        )?;
         self.session_dispatch_executor
             .install_router(Arc::clone(&router))
             .map_err(RuntimeServicesError::Mission)?;
+        self.session_query_port
+            .set(query)
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
+        self.session_ingress_port
+            .set(ingress)
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
+        self.session_journal_port
+            .set(journal)
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
+        self.session_input_router
+            .set(Arc::clone(&router))
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
+        Ok(router)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_session_store(
+        self: &Arc<Self>,
+        store: Arc<session::UnifiedSessionStore>,
+    ) -> Result<Arc<SessionInputRouter>, RuntimeServicesError> {
+        if let Some(router) = self.session_input_router.get() {
+            return Ok(Arc::clone(router));
+        }
+        let port = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
+        let query: Arc<dyn crate::SessionRuntimeQueryPort> = port.clone();
+        let ingress: Arc<dyn crate::SessionRuntimeIngressPort> = port.clone();
+        let journal: Arc<dyn crate::SessionRuntimeJournalPort> = port;
+        let router = SessionInputRouter::install_for_test(
+            Arc::clone(&query),
+            Arc::clone(&ingress),
+            store,
+            &self.workspace_key,
+            Arc::clone(&self.event_store),
+        )?;
+        self.session_dispatch_executor
+            .install_router(Arc::clone(&router))
+            .map_err(RuntimeServicesError::Mission)?;
+        self.session_query_port
+            .set(query)
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
+        self.session_ingress_port
+            .set(ingress)
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
+        self.session_journal_port
+            .set(journal)
+            .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
         self.session_input_router
             .set(Arc::clone(&router))
             .map_err(|_| RuntimeServicesError::DuplicateSessionRouter)?;
@@ -942,6 +1327,15 @@ impl RuntimeServices {
     #[must_use]
     pub fn memory_manager(&self) -> Option<Arc<memory::CognitiveContextManager>> {
         self.memory_manager.clone()
+    }
+
+    pub(crate) fn maintenance_supervisor(&self) -> Arc<RuntimeMaintenanceSupervisor> {
+        Arc::clone(&self.maintenance_supervisor)
+    }
+
+    /// Stop accepting detached maintenance and await every retained task.
+    pub async fn shutdown_maintenance(&self) {
+        self.maintenance_supervisor.shutdown_and_drain().await;
     }
 
     /// Return a stable copy for primary or delegated turn construction.
@@ -3119,14 +3513,27 @@ impl RuntimeServices {
         self.session_input_router.get()
     }
 
-    /// Return the workspace's canonical Session authority when it is
-    /// installed. In-process agents use this exact store for durable raw
-    /// evidence; they never create a second session database.
     #[must_use]
-    pub fn session_store(&self) -> Option<Arc<memory::UnifiedSessionStore>> {
-        self.session_input_router
+    pub(crate) fn session_query_port(&self) -> Option<Arc<dyn crate::SessionRuntimeQueryPort>> {
+        self.session_query_port.get().cloned()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn session_ingress_port(&self) -> Option<Arc<dyn crate::SessionRuntimeIngressPort>> {
+        self.session_ingress_port.get().cloned()
+    }
+
+    #[must_use]
+    pub(crate) fn session_journal_port(&self) -> Option<Arc<dyn crate::SessionRuntimeJournalPort>> {
+        self.session_journal_port.get().cloned()
+    }
+
+    #[must_use]
+    pub fn session_history_reader(&self) -> Option<Arc<session::SessionHistoryReader>> {
+        self.session_query_port
             .get()
-            .map(|router| router.session_store())
+            .and_then(|port| port.history_reader())
     }
 }
 
@@ -3354,6 +3761,14 @@ fn install_builtin_executors(
 fn default_resource_quotas() -> Vec<(ExecutionResourceKind, ResourceQuota)> {
     vec![
         (
+            ExecutionResourceKind::SessionTurn,
+            ResourceQuota {
+                minimum: 1,
+                target: 16,
+                maximum: 128,
+            },
+        ),
+        (
             ExecutionResourceKind::Provider,
             ResourceQuota {
                 minimum: 1,
@@ -3522,7 +3937,7 @@ mod tests {
         RoleCardinalityPolicy, TeamInstantiationRequest, TeamRoleCardinalityOverride,
         TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
     };
-    use memory::SessionRecord;
+    use session::SessionRecord;
 
     #[test]
     fn in_memory_services_reclaim_their_filesystem_state() {
@@ -3542,6 +3957,190 @@ mod tests {
             !root.exists(),
             "dropping the final RuntimeServices owner must remove {root:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn maintenance_supervisor_serializes_owner_tasks_and_drains_them() {
+        let supervisor = Arc::new(RuntimeMaintenanceSupervisor::new());
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first_order = Arc::clone(&order);
+        assert!(
+            supervisor
+                .submit("session-a".to_string(), async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    first_order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(1);
+                })
+                .await
+        );
+        let second_order = Arc::clone(&order);
+        assert!(
+            supervisor
+                .submit("session-a".to_string(), async move {
+                    second_order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(2);
+                })
+                .await
+        );
+
+        assert_eq!(supervisor.tracked_task_count(), 1);
+        supervisor.shutdown_and_drain().await;
+        assert_eq!(supervisor.tracked_task_count(), 0);
+        assert_eq!(
+            *order
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn maintenance_supervisor_serializes_concurrent_submissions_per_owner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let supervisor = Arc::new(RuntimeMaintenanceSupervisor::new());
+        let start = Arc::new(tokio::sync::Barrier::new(9));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut submitters = Vec::new();
+        for _ in 0..8 {
+            let supervisor = Arc::clone(&supervisor);
+            let start = Arc::clone(&start);
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let completed = Arc::clone(&completed);
+            submitters.push(tokio::spawn(async move {
+                start.wait().await;
+                assert!(
+                    supervisor
+                        .submit("session-a".to_string(), async move {
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            maximum.fetch_max(now, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            completed.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                );
+            }));
+        }
+        start.wait().await;
+        for submitter in submitters {
+            submitter.await.expect("submitter joins");
+        }
+        supervisor.shutdown_and_drain().await;
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 8);
+        assert_eq!(supervisor.tracked_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_supervisor_rejects_work_after_shutdown_starts() {
+        let supervisor = Arc::new(RuntimeMaintenanceSupervisor::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_work = Arc::clone(&release);
+        assert!(
+            supervisor
+                .submit("session-a".to_string(), async move {
+                    release_work.notified().await;
+                })
+                .await
+        );
+
+        let draining = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move { supervisor.shutdown_and_drain().await })
+        };
+        tokio::task::yield_now().await;
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let executed_work = Arc::clone(&executed);
+        assert!(
+            !supervisor
+                .submit("session-b".to_string(), async move {
+                    executed_work.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+                .await
+        );
+        release.notify_waiters();
+        draining.await.expect("shutdown joins");
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn maintenance_supervisor_contains_panics_and_reclaims_owner() {
+        let supervisor = RuntimeMaintenanceSupervisor::new();
+        assert!(
+            supervisor
+                .submit("session-a".to_string(), async move {
+                    panic!("maintenance failure");
+                })
+                .await
+        );
+        supervisor.shutdown_and_drain().await;
+        assert_eq!(supervisor.tracked_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_supervisor_reclaims_idle_owner_without_shutdown() {
+        let supervisor = RuntimeMaintenanceSupervisor::new();
+        let completed = Arc::new(tokio::sync::Notify::new());
+        let completed_work = Arc::clone(&completed);
+        assert!(
+            supervisor
+                .submit("session-a".to_string(), async move {
+                    completed_work.notify_one();
+                })
+                .await
+        );
+        completed.notified().await;
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while supervisor.tracked_task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle owner is reclaimed");
+        supervisor.shutdown_and_drain().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn maintenance_supervisor_never_strands_immediate_owner_completion() {
+        let supervisor = RuntimeMaintenanceSupervisor::new();
+        for index in 0..128 {
+            assert!(
+                supervisor
+                    .submit(format!("immediate-{index}"), async {})
+                    .await
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while supervisor.tracked_task_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every immediate owner is reaped");
+        supervisor.shutdown_and_drain().await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_supervisor_aborts_timed_out_work() {
+        let supervisor =
+            RuntimeMaintenanceSupervisor::with_shutdown_timeout(Duration::from_millis(10));
+        assert!(
+            supervisor
+                .submit("session-a".to_string(), std::future::pending())
+                .await
+        );
+        tokio::time::timeout(Duration::from_millis(100), supervisor.shutdown_and_drain())
+            .await
+            .expect("bounded shutdown");
+        assert_eq!(supervisor.tracked_task_count(), 0);
     }
 
     #[test]
@@ -4334,27 +4933,50 @@ mod tests {
     }
 
     #[test]
+    fn builder_rejects_partial_session_port_sets() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let ports = crate::session_runtime_port::TestSessionPortAdapter::new(store);
+        let result = RuntimeServices::builder(temp.path(), temp.path().join("partial"))
+            .session_query_port(ports)
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(RuntimeServicesError::IncompleteSessionPorts)
+        ));
+    }
+
+    #[test]
     fn workspace_builders_isolate_provider_tool_host_and_session_router() {
         let temp = tempfile::tempdir().unwrap();
         let left_provider = Arc::new(crate::ProviderRegistry::empty());
         let right_provider = Arc::new(crate::ProviderRegistry::empty());
         let left_tool: Arc<dyn crate::RuntimeExecutionHost> = Arc::new(TestExecutionHost);
         let right_tool: Arc<dyn crate::RuntimeExecutionHost> = Arc::new(TestExecutionHost);
-        let left_store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
-        let right_store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let left_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        let right_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         std::fs::create_dir_all(temp.path().join("left")).unwrap();
         std::fs::create_dir_all(temp.path().join("right")).unwrap();
 
+        let left_ports =
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&left_store));
+        let right_ports =
+            crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&right_store));
         let left = RuntimeServices::builder(temp.path(), temp.path().join("left"))
             .provider_registry(Arc::clone(&left_provider))
             .tool_execution_host(Arc::clone(&left_tool))
-            .session_store(Arc::clone(&left_store))
+            .session_query_port(left_ports.clone())
+            .session_ingress_port(left_ports.clone())
+            .session_journal_port(left_ports)
             .build()
             .unwrap();
         let right = RuntimeServices::builder(temp.path(), temp.path().join("right"))
             .provider_registry(Arc::clone(&right_provider))
             .tool_execution_host(Arc::clone(&right_tool))
-            .session_store(Arc::clone(&right_store))
+            .session_query_port(right_ports.clone())
+            .session_ingress_port(right_ports.clone())
+            .session_journal_port(right_ports)
             .build()
             .unwrap();
 
@@ -4377,19 +4999,17 @@ mod tests {
             left.session_input_router().unwrap(),
             right.session_input_router().unwrap()
         ));
-        assert!(Arc::ptr_eq(
-            &left.session_store().expect("left session store"),
-            &left_store
-        ));
-        assert!(Arc::ptr_eq(
-            &right.session_store().expect("right session store"),
-            &right_store
-        ));
+        assert!(left.session_query_port().is_some());
+        assert!(left.session_ingress_port().is_some());
+        assert!(left.session_journal_port().is_some());
+        assert!(right.session_query_port().is_some());
+        assert!(right.session_ingress_port().is_some());
+        assert!(right.session_journal_port().is_some());
     }
 
     #[tokio::test]
     async fn due_schedule_submits_one_durable_handoff_graph_and_never_duplicates_it() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let timestamp = chrono::Utc::now().to_rfc3339();
         store
             .create_session(&SessionRecord {
@@ -4411,7 +5031,9 @@ mod tests {
             .await
             .unwrap();
         let services = RuntimeServices::in_memory().unwrap();
-        services.install_session_store(Arc::clone(&store)).unwrap();
+        services
+            .install_test_session_store(Arc::clone(&store))
+            .unwrap();
         let due_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5197,5 +5819,59 @@ mod tests {
         assert_eq!(imported.status.as_deref(), Some("blocked"));
         assert_eq!(imported.payload["team_id"], "legacy");
         assert_eq!(imported.payload["disposition"], "blocked_unbound");
+    }
+
+    #[test]
+    fn runtime_timeline_position_never_skips_events_inside_one_transaction() {
+        let store =
+            Arc::new(crate::RuntimeEventStore::try_open_in_memory().expect("runtime event store"));
+        store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: "timeline-transaction".to_string(),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id: "timeline-session".to_string(),
+                    expected_revision: 0,
+                }],
+                events: vec![
+                    crate::RuntimeEventInput {
+                        stream_id: "timeline-session".to_string(),
+                        scope: crate::RuntimeEventScope::SessionInput,
+                        kind: "timeline.first".to_string(),
+                        status: None,
+                        actor: None,
+                        refs: Vec::new(),
+                        payload: serde_json::Value::Null,
+                    }
+                    .into(),
+                    crate::RuntimeEventInput {
+                        stream_id: "timeline-session".to_string(),
+                        scope: crate::RuntimeEventScope::SessionInput,
+                        kind: "timeline.second".to_string(),
+                        status: None,
+                        actor: None,
+                        refs: Vec::new(),
+                        payload: serde_json::Value::Null,
+                    }
+                    .into(),
+                ],
+            })
+            .expect("transaction commits");
+        let reader = super::RuntimeEventReader { store };
+
+        let first = reader
+            .session_timeline_events("timeline-session", None, 1)
+            .expect("first page");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].transaction_index, 0);
+        let second = reader
+            .session_timeline_events(
+                "timeline-session",
+                Some((first[0].commit_cursor, first[0].transaction_index)),
+                1,
+            )
+            .expect("second page");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].transaction_index, 1);
+        assert_eq!(second[0].kind, "timeline.second");
     }
 }

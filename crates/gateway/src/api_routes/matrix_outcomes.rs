@@ -1,8 +1,8 @@
-use matrix_core::{MatrixDataPlaneIngestPlan, MatrixEvidencePacket, MatrixFact};
-use memory::store::session::SessionRecord;
-use runtime::execution_outcome::{
-    CowdExecutionOutcome, CowdExecutionOutcomeKind, CowdExecutionOutcomeStatus, CowdExecutionRef,
+use cowd_app_sdk::{
+    ApplicationExecutionCounterV1, ApplicationExecutionKind, ApplicationExecutionOutcomeV1,
+    ApplicationExecutionRefV1, ApplicationExecutionStatus, APPLICATION_EXECUTION_OUTCOME_VERSION,
 };
+use matrix_core::{MatrixDataPlaneIngestPlan, MatrixEvidencePacket, MatrixFact};
 use serde_json::Value;
 
 use super::AppState;
@@ -10,37 +10,27 @@ use super::AppState;
 pub(super) async fn append_matrix_execution_outcome(
     state: &AppState,
     session_id: Option<&str>,
-    outcome: CowdExecutionOutcome,
+    outcome: ApplicationExecutionOutcomeV1,
 ) -> Result<(), String> {
     let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
         return Ok(());
     };
-    let Some(store) = state.services.session.unified_store() else {
-        return Ok(());
-    };
-    ensure_matrix_outcome_session_record(state, session_id)
-        .await
-        .map_err(|error| format!("failed to prepare Matrix outcome session: {error}"))?;
-    let event = memory::SessionDomainEvent::new(
-        session_id,
-        0,
-        memory::SessionDomainScope::Memory,
-        "matrix.execution_outcome",
-        serde_json::to_value(&outcome).map_err(|error| error.to_string())?,
-        outcome.created_at.timestamp_millis().max(0) as u64,
-    );
-    store
-        .append_session_domain_event_allocating_sequence(&event)
+    state
+        .services
+        .session
+        .append_application_execution_outcome(session_id, &outcome)
         .await
         .map(|_| ())
-        .map_err(|error| error.to_string())
 }
 
-pub(super) fn matrix_ingest_plan_outcome(plan: &MatrixDataPlaneIngestPlan) -> CowdExecutionOutcome {
-    CowdExecutionOutcome {
+pub(super) fn matrix_ingest_plan_outcome(
+    plan: &MatrixDataPlaneIngestPlan,
+) -> ApplicationExecutionOutcomeV1 {
+    ApplicationExecutionOutcomeV1 {
+        contract_version: APPLICATION_EXECUTION_OUTCOME_VERSION,
         outcome_id: format!("structured-ingest:{}", plan.batch_id),
-        kind: CowdExecutionOutcomeKind::StructuredIngest,
-        status: CowdExecutionOutcomeStatus::Planned,
+        kind: ApplicationExecutionKind::StructuredIngest,
+        status: ApplicationExecutionStatus::Planned,
         title: format!("Structured ingest plan for {}", plan.fact_type),
         summary: format!(
             "Plan {} ingests {} estimated rows from {} partition {}.",
@@ -48,41 +38,41 @@ pub(super) fn matrix_ingest_plan_outcome(plan: &MatrixDataPlaneIngestPlan) -> Co
         ),
         domain: Some("matrix".to_string()),
         refs: vec![
-            CowdExecutionRef {
-                ref_type: "structured_source".to_string(),
-                id: plan.source_ref.clone(),
-                label: Some(plan.source_ref.clone()),
-            },
-            CowdExecutionRef {
-                ref_type: "structured_batch".to_string(),
-                id: plan.batch_id.clone(),
-                label: Some(plan.fact_type.clone()),
-            },
+            execution_ref(
+                "structured_source",
+                &plan.source_ref,
+                Some(&plan.source_ref),
+            ),
+            execution_ref("structured_batch", &plan.batch_id, Some(&plan.fact_type)),
         ],
         evidence_refs: Vec::new(),
-        metrics: plan.affected_metric_ids.clone(),
-        payload: serde_json::to_value(plan).unwrap_or(Value::Null),
-        created_at: plan.planned_at,
+        metric_refs: plan.affected_metric_ids.clone(),
+        counters: vec![counter(
+            "estimated_rows",
+            i64::try_from(plan.estimated_rows).unwrap_or(i64::MAX),
+        )],
+        occurred_at_ms: timestamp_ms(plan.planned_at.timestamp_millis()),
     }
 }
 
-pub(super) fn matrix_fact_outcome(fact: &MatrixFact) -> CowdExecutionOutcome {
-    let mut refs = vec![CowdExecutionRef {
-        ref_type: "structured_fact".to_string(),
-        id: fact.fact_id.clone(),
-        label: Some(fact.fact_type.clone()),
-    }];
+pub(super) fn matrix_fact_outcome(fact: &MatrixFact) -> ApplicationExecutionOutcomeV1 {
+    let mut refs = vec![execution_ref(
+        "structured_fact",
+        &fact.fact_id,
+        Some(&fact.fact_type),
+    )];
     if let Some(source_ref) = fact.source_ref.as_ref() {
-        refs.push(CowdExecutionRef {
-            ref_type: "structured_source".to_string(),
-            id: source_ref.clone(),
-            label: Some(source_ref.clone()),
-        });
+        refs.push(execution_ref(
+            "structured_source",
+            source_ref,
+            Some(source_ref),
+        ));
     }
-    CowdExecutionOutcome {
+    ApplicationExecutionOutcomeV1 {
+        contract_version: APPLICATION_EXECUTION_OUTCOME_VERSION,
         outcome_id: format!("structured-fact:{}", fact.fact_id),
-        kind: CowdExecutionOutcomeKind::StructuredFact,
-        status: CowdExecutionOutcomeStatus::Succeeded,
+        kind: ApplicationExecutionKind::StructuredFact,
+        status: ApplicationExecutionStatus::Succeeded,
         title: format!("Structured fact {}", fact.fact_type),
         summary: format!(
             "Fact {} of type {} references {} entities with confidence {:.2}.",
@@ -98,22 +88,26 @@ pub(super) fn matrix_fact_outcome(fact: &MatrixFact) -> CowdExecutionOutcome {
             .iter()
             .map(|source_ref| format!("structured-source:{source_ref}"))
             .collect(),
-        metrics: fact.metric_key.iter().cloned().collect(),
-        payload: serde_json::to_value(fact).unwrap_or(Value::Null),
-        created_at: fact.event_time,
+        metric_refs: fact.metric_key.iter().cloned().collect(),
+        counters: vec![counter(
+            "entity_refs",
+            i64::try_from(fact.entity_refs.len()).unwrap_or(i64::MAX),
+        )],
+        occurred_at_ms: timestamp_ms(fact.event_time.timestamp_millis()),
     }
 }
 
 pub(super) fn matrix_evidence_packet_outcome(
     packet: &MatrixEvidencePacket,
-) -> CowdExecutionOutcome {
-    CowdExecutionOutcome {
+) -> ApplicationExecutionOutcomeV1 {
+    ApplicationExecutionOutcomeV1 {
+        contract_version: APPLICATION_EXECUTION_OUTCOME_VERSION,
         outcome_id: format!("structured-evidence:{}", packet.packet_id),
-        kind: CowdExecutionOutcomeKind::StructuredEvidence,
+        kind: ApplicationExecutionKind::StructuredEvidence,
         status: if packet.missing_evidence.is_empty() {
-            CowdExecutionOutcomeStatus::Succeeded
+            ApplicationExecutionStatus::Succeeded
         } else {
-            CowdExecutionOutcomeStatus::Partial
+            ApplicationExecutionStatus::Partial
         },
         title: format!("Evidence packet {}", packet.packet_id),
         summary: format!(
@@ -124,84 +118,59 @@ pub(super) fn matrix_evidence_packet_outcome(
             packet.confidence
         ),
         domain: Some("matrix".to_string()),
-        refs: vec![CowdExecutionRef {
-            ref_type: "structured_evidence".to_string(),
-            id: packet.packet_id.clone(),
-            label: packet.attention_id.clone(),
-        }],
+        refs: vec![execution_ref(
+            "structured_evidence",
+            &packet.packet_id,
+            packet.attention_id.as_deref(),
+        )],
         evidence_refs: packet
             .source_refs
             .iter()
             .map(|source| source.reference.clone())
             .collect(),
-        metrics: packet
+        metric_refs: packet
             .metric_evidence
             .iter()
             .filter_map(|item| item.get("metric_id").and_then(Value::as_str))
             .map(ToString::to_string)
             .collect(),
-        payload: serde_json::to_value(packet).unwrap_or(Value::Null),
-        created_at: packet.created_at,
+        counters: vec![
+            counter(
+                "metric_items",
+                i64::try_from(packet.metric_evidence.len()).unwrap_or(i64::MAX),
+            ),
+            counter(
+                "change_items",
+                i64::try_from(packet.change_evidence.len()).unwrap_or(i64::MAX),
+            ),
+            counter(
+                "missing_evidence",
+                i64::try_from(packet.missing_evidence.len()).unwrap_or(i64::MAX),
+            ),
+        ],
+        occurred_at_ms: timestamp_ms(packet.created_at.timestamp_millis()),
     }
 }
 
-fn execution_status(status: &str) -> CowdExecutionOutcomeStatus {
-    match status {
-        "planned" | "dry_run_ready" | "queued_for_human_review" => {
-            CowdExecutionOutcomeStatus::Planned
-        }
-        "running" | "cross_plane_dispatched" => CowdExecutionOutcomeStatus::Running,
-        "completed" | "success" | "feedback_resolved" => CowdExecutionOutcomeStatus::Succeeded,
-        "failed" | "error" | "feedback_rejected" => CowdExecutionOutcomeStatus::Failed,
-        "blocked" | "cross_plane_blocked" => CowdExecutionOutcomeStatus::Blocked,
-        _ => CowdExecutionOutcomeStatus::Partial,
+fn execution_ref(
+    ref_type: impl Into<String>,
+    id: impl Into<String>,
+    label: Option<&str>,
+) -> ApplicationExecutionRefV1 {
+    ApplicationExecutionRefV1 {
+        ref_type: ref_type.into(),
+        id: id.into(),
+        label: label.map(ToString::to_string),
     }
 }
 
-async fn ensure_matrix_outcome_session_record(
-    state: &AppState,
-    session_id: &str,
-) -> Result<(), String> {
-    let Some(store) = state.services.session.unified_store() else {
-        return Ok(());
-    };
-    let now = chrono::Utc::now().to_rfc3339();
-    if let Some(mut record) = store
-        .get_session(session_id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        record.last_activity = now;
-        record.platform = "mfg".to_string();
-        store
-            .update_session(&record)
-            .await
-            .map_err(|error| error.to_string())?;
-        return Ok(());
+fn counter(name: impl Into<String>, value: i64) -> ApplicationExecutionCounterV1 {
+    ApplicationExecutionCounterV1 {
+        name: name.into(),
+        value,
     }
-    let metadata_json = serde_json::json!({
-        "kind": "mfg.execution_outcome.session",
-        "session_id": session_id,
-    })
-    .to_string();
-    let record = SessionRecord {
-        session_id: session_id.to_string(),
-        platform: "mfg".to_string(),
-        chat_id: session_id.to_string(),
-        user_id: None,
-        model: None,
-        created_at: now.clone(),
-        last_activity: now,
-        message_count: 0,
-        reset_policy: "none".to_string(),
-        metadata_json: Some(metadata_json),
-        input_tokens: 0,
-        output_tokens: 0,
-        estimated_cost_usd: 0.0,
-        status: "active".to_string(),
-    };
-    store
-        .create_session(&record)
-        .await
-        .map_err(|error| error.to_string())
+}
+
+fn timestamp_ms(value: i64) -> u64 {
+    u64::try_from(value).unwrap_or_default()
 }

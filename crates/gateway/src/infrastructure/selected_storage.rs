@@ -8,7 +8,8 @@ use std::{path::Path, sync::Arc};
 
 use fact_kernel::FactLedger;
 use matrix_repository::MatrixStore;
-use memory::{KnowledgeFabric, KnowledgeStore, MemoryStore, UnifiedSessionStore};
+use memory::{KnowledgeFabric, KnowledgeStore, MemoryStore};
+use session::UnifiedSessionStore;
 use storage::{
     PostgresConnectionConfig, PostgresExecutor, ResolvedPostgresUrl, SecretRefResolver,
     StorageDomainId, StorageEndpoint, StorageRegistry, StorageScope,
@@ -130,7 +131,7 @@ impl SelectedStorageTopology {
         let session_store = Arc::new(
             UnifiedSessionStore::open_sqlite_storage_handle_with_execution_config(
                 &session_endpoint.as_handle(),
-                memory::StorageExecutionPlaneConfig {
+                session::StorageExecutionPlaneConfig {
                     workers: session_execution.workers,
                     queue_capacity: session_execution.queue_capacity,
                 },
@@ -231,11 +232,13 @@ impl SelectedStorageTopology {
 
         let session =
             session_postgres::PostgresSessionStore::new(executor.clone()).map_err(stringify)?;
+        let session_workers =
+            postgres_session_workers(session_execution.workers, executor.health().max_connections);
         let session_store = Arc::new(
             UnifiedSessionStore::from_backend_with_execution_config(
                 Arc::new(session),
-                memory::StorageExecutionPlaneConfig {
-                    workers: session_execution.workers,
+                session::StorageExecutionPlaneConfig {
+                    workers: session_workers,
                     queue_capacity: session_execution.queue_capacity,
                 },
             )
@@ -443,9 +446,22 @@ fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
 
+fn postgres_session_workers(configured: usize, max_connections: u32) -> usize {
+    const SHARED_POOL_RESERVE: u32 = 4;
+    let available = max_connections.saturating_sub(SHARED_POOL_RESERVE).max(1) as usize;
+    configured.max(1).min(available)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_session_workers_preserve_shared_pool_capacity() {
+        assert_eq!(postgres_session_workers(32, 16), 12);
+        assert_eq!(postgres_session_workers(2, 16), 2);
+        assert_eq!(postgres_session_workers(8, 4), 1);
+    }
 
     #[test]
     fn sqlite_topology_selects_every_business_domain_once() {

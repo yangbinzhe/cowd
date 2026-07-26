@@ -5,15 +5,22 @@
 
 use std::{fs, path::Path};
 
-use memory::store::session::{
-    OutboxFailureClass, OutboxStatus, SessionEvent, SessionListOptions, SessionListPage,
-    SessionMessage, SessionMissionOutboxOperation, SessionMissionOutboxRecord,
-    SessionMissionOutboxRequest, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
-    SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest,
-    SessionSearchResult, SessionSnapshot, SqliteSessionStore,
-};
+use harness_contract::turn::InputRoutingDecision;
 use postgres::{types::ToSql, Row};
 use serde::{Deserialize, Serialize};
+use session::{
+    OutboxFailureClass, OutboxStatus, SessionBranchActivation, SessionBranchActivationPhase,
+    SessionBranchActivationTransition, SessionBranchRequest, SessionBranchResult,
+    SessionCloseDisposition, SessionEvent, SessionInputAdmission, SessionLifecycleFenceRequest,
+    SessionLifecycleIntent, SessionLifecyclePhase, SessionLifecyclePlan,
+    SessionLifecycleTombstoneRequest, SessionLifecycleTransition, SessionListOptions,
+    SessionListPage, SessionMessage, SessionMissionOutboxOperation, SessionMissionOutboxRecord,
+    SessionMissionOutboxRequest, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
+    SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
+    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
+    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SqliteSessionStore,
+};
+use session::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use sha2::{Digest, Sha256};
 use storage::{
     PostgresConnection, PostgresConnectionConfig, PostgresExecutor, PostgresMigrationSpec,
@@ -29,6 +36,9 @@ const SESSION_DOMAIN: &str = "session";
 pub struct SessionMigrationSnapshot {
     pub schema_version: u32,
     pub sessions: Vec<SessionRecord>,
+    pub input_admissions: Vec<SessionInputAdmission>,
+    pub lifecycle_intents: Vec<SessionLifecycleIntent>,
+    pub branch_activations: Vec<SessionBranchActivation>,
     pub associations: Vec<SessionMemoryAssociation>,
     pub messages: Vec<SessionMessage>,
     pub events: Vec<SessionEvent>,
@@ -77,9 +87,9 @@ pub struct SessionMigrationManifest {
 }
 
 impl SessionMigrationSnapshot {
-    pub fn canonical_digest(&self) -> memory::store::Result<String> {
+    pub fn canonical_digest(&self) -> session::SessionResult<String> {
         let bytes = serde_json::to_vec(self).map_err(|error| {
-            memory::MemoryError::Store(format!("encode session migration snapshot: {error}"))
+            session::SessionError::Store(format!("encode session migration snapshot: {error}"))
         })?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
@@ -88,9 +98,35 @@ impl SessionMigrationSnapshot {
 /// Export every durable Session table from a quiesced SQLite owner.
 pub fn export_sqlite_session_snapshot(
     source: &SqliteSessionStore,
-) -> memory::store::Result<SessionMigrationSnapshot> {
+) -> session::SessionResult<SessionMigrationSnapshot> {
     let connection = source.conn()?;
     let sessions = sqlite_rows(&connection, "SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status FROM sessions ORDER BY session_id", sqlite_row_to_session)?;
+    let input_admissions = sqlite_rows(
+        &connection,
+        "SELECT session_id,input_generation,input_admission_open FROM sessions ORDER BY session_id",
+        |row| {
+            Ok(SessionInputAdmission {
+                session_id: row.get(0)?,
+                generation: u64::try_from(row.get::<_, i64>(1)?)
+                    .map_err(sqlite_conversion_error)?,
+                open: row.get(2)?,
+            })
+        },
+    )?;
+    let lifecycle_intents = sqlite_rows(
+        &connection,
+        "SELECT operation_id,session_id,disposition,phase,last_stable_phase,
+                expected_generation,created_at_ms,updated_at_ms,last_error,revision
+           FROM session_lifecycle_intents ORDER BY operation_id",
+        sqlite_row_to_lifecycle_intent,
+    )?;
+    let branch_activations = sqlite_rows(
+        &connection,
+        "SELECT operation_id,source_session_id,target_session_id,source_message_count,
+                phase,created_at_ms,updated_at_ms,last_error,revision
+           FROM session_branch_activations ORDER BY operation_id",
+        sqlite_row_to_branch_activation,
+    )?;
     let associations = sqlite_rows(&connection, "SELECT session_id,memory_id,created_at FROM session_memories ORDER BY session_id,memory_id", |row| {
         Ok(SessionMemoryAssociation { session_id: row.get(0)?, memory_id: row.get(1)?, created_at: row.get(2)? })
     })?;
@@ -108,13 +144,16 @@ pub fn export_sqlite_session_snapshot(
         })
         .collect::<Vec<_>>();
     let snapshots = sqlite_rows(&connection, "SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx", sqlite_row_to_snapshot)?;
-    let runtime_outbox = sqlite_rows(&connection, "SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,runtime_options_json FROM session_runtime_outbox ORDER BY request_id", sqlite_row_to_runtime_outbox)?;
+    let runtime_outbox = sqlite_rows(&connection, "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox ORDER BY request_id", sqlite_row_to_runtime_outbox)?;
     let mission_outbox = sqlite_rows(&connection, "SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms FROM session_mission_outbox ORDER BY request_id", sqlite_row_to_mission_outbox)?;
     let runtime_history = sqlite_rows(&connection, "SELECT request_id,action,actor,reason,from_status,to_status,attempts,created_at_ms FROM session_runtime_outbox_history ORDER BY id", sqlite_row_to_history)?;
     let mission_history = sqlite_rows(&connection, "SELECT request_id,action,actor,reason,from_status,to_status,attempts,created_at_ms FROM session_mission_outbox_history ORDER BY id", sqlite_row_to_history)?;
     Ok(SessionMigrationSnapshot {
-        schema_version: 2,
+        schema_version: 5,
         sessions,
+        input_admissions,
+        lifecycle_intents,
+        branch_activations,
         associations,
         messages,
         events,
@@ -131,15 +170,15 @@ fn sqlite_rows<T>(
     connection: &rusqlite::Connection,
     statement: &str,
     map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
-) -> memory::store::Result<Vec<T>> {
+) -> session::SessionResult<Vec<T>> {
     let mut prepared = connection
         .prepare(statement)
-        .map_err(|error| memory::MemoryError::Store(error.to_string()))?;
+        .map_err(|error| session::SessionError::Store(error.to_string()))?;
     let rows = prepared
         .query_map([], map)
-        .map_err(|error| memory::MemoryError::Store(error.to_string()))?;
+        .map_err(|error| session::SessionError::Store(error.to_string()))?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|error| memory::MemoryError::Store(error.to_string()))
+        .map_err(|error| session::SessionError::Store(error.to_string()))
 }
 
 fn sqlite_row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
@@ -176,6 +215,45 @@ fn sqlite_row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
     })
 }
 
+fn sqlite_row_to_lifecycle_intent(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SessionLifecycleIntent> {
+    Ok(SessionLifecycleIntent {
+        operation_id: row.get(0)?,
+        session_id: row.get(1)?,
+        disposition: SessionCloseDisposition::parse(&row.get::<_, String>(2)?)
+            .map_err(sqlite_text_conversion_error)?,
+        phase: SessionLifecyclePhase::parse(&row.get::<_, String>(3)?)
+            .map_err(sqlite_text_conversion_error)?,
+        last_stable_phase: SessionLifecyclePhase::parse(&row.get::<_, String>(4)?)
+            .map_err(sqlite_text_conversion_error)?,
+        expected_generation: u64::try_from(row.get::<_, i64>(5)?)
+            .map_err(sqlite_conversion_error)?,
+        created_at_ms: u64::try_from(row.get::<_, i64>(6)?).map_err(sqlite_conversion_error)?,
+        updated_at_ms: u64::try_from(row.get::<_, i64>(7)?).map_err(sqlite_conversion_error)?,
+        last_error: row.get(8)?,
+        revision: u64::try_from(row.get::<_, i64>(9)?).map_err(sqlite_conversion_error)?,
+    })
+}
+
+fn sqlite_row_to_branch_activation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SessionBranchActivation> {
+    Ok(SessionBranchActivation {
+        operation_id: row.get(0)?,
+        source_session_id: row.get(1)?,
+        target_session_id: row.get(2)?,
+        source_message_count: usize::try_from(row.get::<_, i64>(3)?)
+            .map_err(sqlite_conversion_error)?,
+        phase: SessionBranchActivationPhase::parse(&row.get::<_, String>(4)?)
+            .map_err(sqlite_text_conversion_error)?,
+        created_at_ms: u64::try_from(row.get::<_, i64>(5)?).map_err(sqlite_conversion_error)?,
+        updated_at_ms: u64::try_from(row.get::<_, i64>(6)?).map_err(sqlite_conversion_error)?,
+        last_error: row.get(7)?,
+        revision: u64::try_from(row.get::<_, i64>(8)?).map_err(sqlite_conversion_error)?,
+    })
+}
+
 fn sqlite_row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
         session_id: row.get(0)?,
@@ -199,34 +277,49 @@ fn sqlite_row_to_runtime_outbox(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<SessionRuntimeOutboxRecord> {
     Ok(SessionRuntimeOutboxRecord {
-        request_id: row.get(0)?,
-        turn_id: row.get(1)?,
-        message_id: row.get(2)?,
-        session_id: row.get(3)?,
-        sequence: usize::try_from(row.get::<_, i64>(4)?).map_err(sqlite_conversion_error)?,
-        status: OutboxStatus::parse(&row.get::<_, String>(5)?)?,
+        input_id: row.get(0)?,
+        request_id: row.get(1)?,
+        turn_id: row.get(2)?,
+        message_id: row.get(3)?,
+        session_id: row.get(4)?,
+        sequence: usize::try_from(row.get::<_, i64>(5)?).map_err(sqlite_conversion_error)?,
+        session_generation: u64::try_from(row.get::<_, i64>(6)?)
+            .map_err(sqlite_conversion_error)?,
+        decision: parse_input_decision_sqlite(&row.get::<_, String>(7)?)?,
+        target_turn_id: row.get(8)?,
+        classification_json: row.get(9)?,
+        status: SessionRuntimeInputStatus::parse(&row.get::<_, String>(10)?)?,
         runtime_commit_cursor: row
-            .get::<_, Option<i64>>(6)?
+            .get::<_, Option<i64>>(11)?
             .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
             .transpose()?,
-        attempts: u32::try_from(row.get::<_, i64>(7)?).map_err(sqlite_conversion_error)?,
-        next_attempt_at_ms: u64::try_from(row.get::<_, i64>(8)?)
+        attempts: u32::try_from(row.get::<_, i64>(12)?).map_err(sqlite_conversion_error)?,
+        next_attempt_at_ms: u64::try_from(row.get::<_, i64>(13)?)
             .map_err(sqlite_conversion_error)?,
-        claim_owner: row.get(9)?,
+        claim_owner: row.get(14)?,
+        claim_token: row.get(15)?,
         claim_expires_at_ms: row
-            .get::<_, Option<i64>>(10)?
+            .get::<_, Option<i64>>(16)?
             .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
             .transpose()?,
         failure_class: row
-            .get::<_, Option<String>>(11)?
+            .get::<_, Option<String>>(17)?
             .as_deref()
             .map(OutboxFailureClass::parse)
             .transpose()?,
-        last_error: row.get(12)?,
-        revision: u64::try_from(row.get::<_, i64>(13)?).map_err(sqlite_conversion_error)?,
-        created_at_ms: u64::try_from(row.get::<_, i64>(14)?).map_err(sqlite_conversion_error)?,
-        updated_at_ms: u64::try_from(row.get::<_, i64>(15)?).map_err(sqlite_conversion_error)?,
-        runtime_options_json: row.get(16)?,
+        last_error: row.get(18)?,
+        revision: u64::try_from(row.get::<_, i64>(19)?).map_err(sqlite_conversion_error)?,
+        created_at_ms: u64::try_from(row.get::<_, i64>(20)?).map_err(sqlite_conversion_error)?,
+        updated_at_ms: u64::try_from(row.get::<_, i64>(21)?).map_err(sqlite_conversion_error)?,
+        terminal_at_ms: row
+            .get::<_, Option<i64>>(22)?
+            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
+            .transpose()?,
+        runtime_options_json: row.get(23)?,
+        claim_fence_epoch: row
+            .get::<_, Option<i64>>(24)?
+            .map(|value| u64::try_from(value).map_err(sqlite_conversion_error))
+            .transpose()?,
     })
 }
 
@@ -277,6 +370,24 @@ fn sqlite_conversion_error(
     error: impl std::error::Error + Send + Sync + 'static,
 ) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(error))
+}
+
+fn sqlite_text_conversion_error(error: session::SessionError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        0,
+        rusqlite::types::Type::Text,
+        error.to_string().into(),
+    )
+}
+
+fn parse_input_decision_sqlite(value: &str) -> rusqlite::Result<InputRoutingDecision> {
+    parse_input_decision(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            error.to_string().into(),
+        )
+    })
 }
 
 const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
@@ -340,6 +451,13 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
         )",
         "CREATE INDEX IF NOT EXISTS idx_session_events_type_sequence
             ON session_events(session_id, event_type, sequence ASC)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_session_domain_event_id
+            ON session_events(session_id, (event_json::jsonb ->> 'event_id'))
+            WHERE event_type = 'SessionDomainEvent'
+              AND (event_json::jsonb ->> 'event_id') IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_session_domain_kind_sequence
+            ON session_events(session_id, (event_json::jsonb ->> 'kind'), sequence ASC)
+            WHERE event_type = 'SessionDomainEvent'",
         "CREATE TABLE IF NOT EXISTS session_event_checkpoints (
             session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
             checkpoint_id TEXT NOT NULL,
@@ -767,6 +885,232 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
            ) AS latest
           WHERE manifest.session_id=latest.session_id",
     ],
+}, PostgresMigrationSpec {
+    id: "session.0008.durable-session-input-authority",
+    domain: SESSION_DOMAIN,
+    version: 8,
+    description: "add durable classified input, admission generation and fenced ownership",
+    statements: &[
+        "ALTER TABLE session_records
+             ADD COLUMN IF NOT EXISTS input_generation BIGINT NOT NULL DEFAULT 1",
+        "ALTER TABLE session_records
+             ADD COLUMN IF NOT EXISTS input_admission_open BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS input_id TEXT",
+        "ALTER TABLE session_runtime_outbox
+             ADD COLUMN IF NOT EXISTS session_generation BIGINT NOT NULL DEFAULT 1",
+        "ALTER TABLE session_runtime_outbox
+             ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'start_new_turn'",
+        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS target_turn_id TEXT",
+        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS classification_json TEXT",
+        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS claim_token TEXT",
+        "ALTER TABLE session_runtime_outbox ADD COLUMN IF NOT EXISTS terminal_at_ms BIGINT",
+        "UPDATE session_runtime_outbox
+            SET input_id=request_id
+          WHERE input_id IS NULL OR btrim(input_id)=''",
+        "UPDATE session_runtime_outbox
+            SET status=CASE status
+                WHEN 'pending' THEN 'queued'
+                WHEN 'retry_scheduled' THEN 'queued'
+                WHEN 'materialized' THEN 'completed'
+                WHEN 'blocked_materialization' THEN 'blocked'
+                ELSE status
+            END",
+        "UPDATE session_runtime_outbox
+            SET terminal_at_ms=COALESCE(terminal_at_ms,updated_at_ms)
+          WHERE status IN ('completed','supplemented','failed','cancelled','expired')",
+        "ALTER TABLE session_runtime_outbox ALTER COLUMN input_id SET NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_runtime_outbox_input_id
+             ON session_runtime_outbox(input_id)",
+        "DROP INDEX IF EXISTS idx_session_runtime_outbox_claim",
+        "CREATE INDEX idx_session_runtime_outbox_claim
+             ON session_runtime_outbox(
+                 status, next_attempt_at_ms, claim_expires_at_ms,
+                 session_id, sequence, request_id
+             )",
+        "CREATE INDEX IF NOT EXISTS idx_session_runtime_outbox_session_head
+             ON session_runtime_outbox(
+                 session_id, session_generation, sequence, request_id, status
+             )",
+        "CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
+             target_session_id TEXT,
+             bump_history BOOLEAN
+         )
+         RETURNS VOID
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             INSERT INTO session_recovery_manifest(
+                 session_id,durable_cursor,history_revision,
+                 transcript_messages,transcript_bytes,in_flight_turn,
+                 active_writer_or_attachment,
+                 mission_agent_team_continuation,last_activity_ms,
+                 manifest_revision
+             )
+             SELECT
+                 record.session_id,
+                 COALESCE((
+                     SELECT MAX(sequence)+1 FROM session_messages
+                      WHERE session_id=record.session_id
+                 ),0),
+                 CASE WHEN bump_history THEN 1 ELSE 0 END,
+                 COALESCE((
+                     SELECT COUNT(*) FROM session_messages
+                      WHERE session_id=record.session_id
+                 ),0),
+                 COALESCE((
+                     SELECT SUM(
+                         octet_length(stable_message_id)
+                         + octet_length(session_id)
+                         + octet_length(role)
+                         + octet_length(content_json)
+                         + octet_length(COALESCE(token_usage_json,''))
+                         + octet_length(COALESCE(tool_use_id,''))
+                         + octet_length(COALESCE(tool_name,''))
+                     )
+                     FROM session_messages WHERE session_id=record.session_id
+                 ),0),
+                 EXISTS(
+                     SELECT 1 FROM session_runtime_outbox
+                      WHERE session_id=record.session_id
+                        AND status IN (
+                            'accepted','classified','queued','claimed',
+                            'running','reclassified','blocked'
+                        )
+                 ),
+                 COALESCE((
+                     SELECT jsonb_array_length(
+                         (event_json::jsonb)->'snapshot'->'attachments'
+                     ) > 0
+                       FROM session_events
+                      WHERE session_id=record.session_id
+                        AND event_type='session.lifecycle.v1'
+                      ORDER BY sequence DESC
+                      LIMIT 1
+                 ),FALSE),
+                 EXISTS(
+                     SELECT 1 FROM session_mission_outbox
+                      WHERE session_id=record.session_id
+                        AND operation='start'
+                        AND status IN ('pending','claimed','retry_scheduled')
+                 ),
+                 GREATEST(record.created_at_ms,record.updated_at_ms),
+                 1
+             FROM session_records AS record
+             WHERE record.session_id=target_session_id
+             ON CONFLICT(session_id) DO UPDATE SET
+                 durable_cursor=EXCLUDED.durable_cursor,
+                 history_revision=session_recovery_manifest.history_revision
+                     + CASE WHEN bump_history THEN 1 ELSE 0 END,
+                 transcript_messages=EXCLUDED.transcript_messages,
+                 transcript_bytes=EXCLUDED.transcript_bytes,
+                 in_flight_turn=EXCLUDED.in_flight_turn,
+                 active_writer_or_attachment=
+                     EXCLUDED.active_writer_or_attachment,
+                 mission_agent_team_continuation=
+                     EXCLUDED.mission_agent_team_continuation,
+                 last_activity_ms=GREATEST(
+                     session_recovery_manifest.last_activity_ms,
+                     EXCLUDED.last_activity_ms
+                 ),
+                 manifest_revision=
+                     session_recovery_manifest.manifest_revision+1;
+         END
+         $$",
+        "CREATE OR REPLACE FUNCTION cowd_session_runtime_input_recovery_trigger()
+         RETURNS TRIGGER
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             PERFORM cowd_refresh_session_recovery_manifest(NEW.session_id, FALSE);
+             UPDATE session_recovery_manifest
+                SET in_flight_turn=EXISTS(
+                        SELECT 1 FROM session_runtime_outbox
+                         WHERE session_id=NEW.session_id
+                           AND status IN (
+                               'accepted','classified','queued','claimed',
+                               'running','reclassified','blocked'
+                           )
+                    ),
+                    manifest_revision=manifest_revision + 1
+              WHERE session_id=NEW.session_id;
+             RETURN NEW;
+         END
+         $$",
+        "DROP TRIGGER IF EXISTS session_recovery_runtime_outbox_change
+             ON session_runtime_outbox",
+        "CREATE TRIGGER session_recovery_runtime_outbox_change
+             AFTER INSERT OR UPDATE OF status ON session_runtime_outbox
+              FOR EACH ROW
+              EXECUTE FUNCTION cowd_session_runtime_input_recovery_trigger()",
+        "UPDATE session_recovery_manifest AS manifest
+            SET in_flight_turn=EXISTS(
+                    SELECT 1 FROM session_runtime_outbox
+                     WHERE session_id=manifest.session_id
+                       AND status IN (
+                           'accepted','classified','queued','claimed',
+                           'running','reclassified','blocked'
+                       )
+                ),
+                manifest_revision=manifest_revision + 1",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0009.lifecycle-and-branch-recovery",
+    domain: SESSION_DOMAIN,
+    version: 9,
+    description: "add durable Session lifecycle intents and branch activation receipts",
+    statements: &[
+        "CREATE TABLE IF NOT EXISTS session_lifecycle_intents (
+            operation_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES session_records(session_id) ON DELETE CASCADE,
+            disposition TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            last_stable_phase TEXT NOT NULL,
+            expected_generation BIGINT NOT NULL,
+            created_at_ms BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL,
+            last_error TEXT,
+            revision BIGINT NOT NULL DEFAULT 0
+        )",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_session_lifecycle_active
+             ON session_lifecycle_intents(session_id)
+             WHERE phase != 'unloaded'",
+        "CREATE INDEX IF NOT EXISTS idx_session_lifecycle_recovery
+             ON session_lifecycle_intents(phase, updated_at_ms, operation_id)",
+        "CREATE TABLE IF NOT EXISTS session_branch_activations (
+            operation_id TEXT PRIMARY KEY,
+            source_session_id TEXT NOT NULL
+                REFERENCES session_records(session_id) ON DELETE CASCADE,
+            target_session_id TEXT NOT NULL UNIQUE
+                REFERENCES session_records(session_id) ON DELETE CASCADE,
+            source_message_count BIGINT NOT NULL,
+            phase TEXT NOT NULL,
+            created_at_ms BIGINT NOT NULL,
+            updated_at_ms BIGINT NOT NULL,
+            last_error TEXT,
+            revision BIGINT NOT NULL DEFAULT 0
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_session_branch_activation_recovery
+             ON session_branch_activations(phase, updated_at_ms, operation_id)",
+    ],
+}, PostgresMigrationSpec {
+    id: "session.0010.terminal-claim-fence-epoch",
+    domain: SESSION_DOMAIN,
+    version: 10,
+    description: "separate immutable terminal claim fence epoch from mutable lease revision",
+    statements: &[
+        "ALTER TABLE session_runtime_outbox
+             ADD COLUMN IF NOT EXISTS claim_fence_epoch BIGINT",
+        "UPDATE session_runtime_outbox
+            SET claim_fence_epoch=revision
+          WHERE claim_fence_epoch IS NULL
+            AND claim_token IS NOT NULL
+            AND status IN ('claimed','running')",
+        "ALTER TABLE session_runtime_outbox
+             DROP CONSTRAINT IF EXISTS session_runtime_claim_fence_epoch_positive",
+        "ALTER TABLE session_runtime_outbox
+             ADD CONSTRAINT session_runtime_claim_fence_epoch_positive
+             CHECK (claim_fence_epoch IS NULL OR claim_fence_epoch > 0)",
+    ],
 }];
 
 #[derive(Clone, Debug)]
@@ -775,7 +1119,7 @@ pub struct PostgresSessionStore {
 }
 
 impl PostgresSessionStore {
-    pub fn new(executor: PostgresExecutor) -> memory::store::Result<Self> {
+    pub fn new(executor: PostgresExecutor) -> session::SessionResult<Self> {
         prepare_legacy_session_usage_for_migration(&executor)?;
         executor
             .apply_migrations(SESSION_DOMAIN, SESSION_MIGRATIONS)
@@ -786,7 +1130,7 @@ impl PostgresSessionStore {
     pub fn connect(
         config: PostgresConnectionConfig,
         resolver: &dyn SecretRefResolver,
-    ) -> memory::store::Result<Self> {
+    ) -> session::SessionResult<Self> {
         PostgresExecutor::connect(config, resolver)
             .map_err(storage_error)
             .and_then(Self::new)
@@ -797,7 +1141,7 @@ impl PostgresSessionStore {
         &self.executor
     }
 
-    pub fn create_session(&self, session: &SessionRecord) -> memory::store::Result<()> {
+    pub fn create_session(&self, session: &SessionRecord) -> session::SessionResult<()> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .execute(
@@ -815,7 +1159,7 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    pub fn get_session(&self, session_id: &str) -> memory::store::Result<Option<SessionRecord>> {
+    pub fn get_session(&self, session_id: &str) -> session::SessionResult<Option<SessionRecord>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query_opt(SESSION_SELECT_BY_ID, &[&session_id])
@@ -827,7 +1171,7 @@ impl PostgresSessionStore {
     pub fn get_session_recovery_manifest(
         &self,
         session_id: &str,
-    ) -> memory::store::Result<Option<SessionRecoveryManifest>> {
+    ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query_opt(
@@ -849,7 +1193,7 @@ impl PostgresSessionStore {
         &self,
         offset: usize,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionRecoveryManifest>> {
+    ) -> session::SessionResult<Vec<SessionRecoveryManifest>> {
         let offset = to_i64(offset, "recovery manifest offset")?;
         let limit = to_i64(limit.max(1), "recovery manifest limit")?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
@@ -882,7 +1226,7 @@ impl PostgresSessionStore {
         signal: SessionRecoverySignal,
         active: bool,
         observed_at_ms: u64,
-    ) -> memory::store::Result<SessionRecoveryManifest> {
+    ) -> session::SessionResult<SessionRecoveryManifest> {
         let column = match signal {
             SessionRecoverySignal::PendingApproval => "pending_approval",
             SessionRecoverySignal::ActiveWriterOrAttachment => "active_writer_or_attachment",
@@ -910,13 +1254,13 @@ impl PostgresSessionStore {
             .map(|row| row_to_recovery_manifest(&row))
             .transpose()?
             .ok_or_else(|| {
-                memory::MemoryError::Store(format!(
+                session::SessionError::Store(format!(
                     "session recovery manifest `{session_id}` does not exist"
                 ))
             })
     }
 
-    pub fn update_session(&self, session: &SessionRecord) -> memory::store::Result<()> {
+    pub fn update_session(&self, session: &SessionRecord) -> session::SessionResult<()> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .execute(
@@ -933,7 +1277,7 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    pub fn upsert_session(&self, session: &SessionRecord) -> memory::store::Result<()> {
+    pub fn upsert_session(&self, session: &SessionRecord) -> session::SessionResult<()> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .execute(
@@ -960,7 +1304,7 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    pub fn delete_session(&self, session_id: &str) -> memory::store::Result<()> {
+    pub fn delete_session(&self, session_id: &str) -> session::SessionResult<()> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .execute(
@@ -971,7 +1315,7 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    pub fn mark_session_closed(&self, session_id: &str) -> memory::store::Result<()> {
+    pub fn mark_session_closed(&self, session_id: &str) -> session::SessionResult<()> {
         let now_at = chrono::Utc::now();
         let now = now_at.to_rfc3339();
         let now_ms = now_at.timestamp_millis().max(0);
@@ -988,7 +1332,7 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    pub fn list_sessions(&self) -> memory::store::Result<Vec<SessionRecord>> {
+    pub fn list_sessions(&self) -> session::SessionResult<Vec<SessionRecord>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query(
@@ -1007,7 +1351,7 @@ impl PostgresSessionStore {
     pub fn list_sessions_by_platform(
         &self,
         platform: &str,
-    ) -> memory::store::Result<Vec<SessionRecord>> {
+    ) -> session::SessionResult<Vec<SessionRecord>> {
         self.query_sessions(
             "SELECT session_id, platform, chat_id, user_id, model, created_at,
                     last_activity, message_count, reset_policy, metadata_json,
@@ -1021,7 +1365,7 @@ impl PostgresSessionStore {
     pub fn list_sessions_by_workspace_root(
         &self,
         workspace_root: &str,
-    ) -> memory::store::Result<Vec<SessionRecord>> {
+    ) -> session::SessionResult<Vec<SessionRecord>> {
         self.query_sessions(
             "SELECT session_id, platform, chat_id, user_id, model, created_at,
                     last_activity, message_count, reset_policy, metadata_json,
@@ -1037,7 +1381,7 @@ impl PostgresSessionStore {
     pub fn list_sessions_page(
         &self,
         options: &SessionListOptions<'_>,
-    ) -> memory::store::Result<SessionListPage> {
+    ) -> session::SessionResult<SessionListPage> {
         let sort = match options.sort {
             "created_at" => "created_at",
             "message_count" => "message_count",
@@ -1054,9 +1398,10 @@ impl PostgresSessionStore {
         let status = options.status.filter(|value| !value.trim().is_empty());
         let model = options.model.filter(|value| !value.trim().is_empty());
         let limit = i64::try_from(options.limit.clamp(1, 500))
-            .map_err(|_| memory::MemoryError::Store("session page limit overflow".to_string()))?;
-        let offset = i64::try_from(options.offset)
-            .map_err(|_| memory::MemoryError::Store("session page offset overflow".to_string()))?;
+            .map_err(|_| session::SessionError::Store("session page limit overflow".to_string()))?;
+        let offset = i64::try_from(options.offset).map_err(|_| {
+            session::SessionError::Store("session page offset overflow".to_string())
+        })?;
         let where_clause = "WHERE ($1::text IS NULL OR to_tsvector('simple',
                 coalesce(platform, '') || ' ' || coalesce(chat_id, '') || ' ' ||
                 coalesce(user_id, '') || ' ' || coalesce(metadata_json, ''))
@@ -1088,11 +1433,11 @@ impl PostgresSessionStore {
         let records = rows
             .iter()
             .map(row_to_session)
-            .collect::<memory::store::Result<_>>()?;
+            .collect::<session::SessionResult<_>>()?;
         Ok(SessionListPage {
             records,
             total: usize::try_from(total).map_err(|_| {
-                memory::MemoryError::Store("session page count overflow".to_string())
+                session::SessionError::Store("session page count overflow".to_string())
             })?,
         })
     }
@@ -1102,9 +1447,10 @@ impl PostgresSessionStore {
         query: &str,
         platform: Option<&str>,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionSearchResult>> {
-        let limit = i64::try_from(limit.clamp(1, 500))
-            .map_err(|_| memory::MemoryError::Store("session search limit overflow".to_string()))?;
+    ) -> session::SessionResult<Vec<SessionSearchResult>> {
+        let limit = i64::try_from(limit.clamp(1, 500)).map_err(|_| {
+            session::SessionError::Store("session search limit overflow".to_string())
+        })?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let rows = connection
             .query(
@@ -1123,7 +1469,11 @@ impl PostgresSessionStore {
         rows.iter().map(row_to_session_search).collect()
     }
 
-    pub fn associate_memory(&self, session_id: &str, memory_id: &str) -> memory::store::Result<()> {
+    pub fn associate_memory(
+        &self,
+        session_id: &str,
+        memory_id: &str,
+    ) -> session::SessionResult<()> {
         let created_at = chrono::Utc::now().to_rfc3339();
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
@@ -1136,7 +1486,7 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    pub fn get_session_memories(&self, session_id: &str) -> memory::store::Result<Vec<String>> {
+    pub fn get_session_memories(&self, session_id: &str) -> session::SessionResult<Vec<String>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query(
@@ -1154,7 +1504,7 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
         memory_id: &str,
-    ) -> memory::store::Result<()> {
+    ) -> session::SessionResult<()> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .execute(
@@ -1165,11 +1515,11 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    pub fn insert_message(&self, message: &SessionMessage) -> memory::store::Result<()> {
+    pub fn insert_message(&self, message: &SessionMessage) -> session::SessionResult<()> {
         let sequence = to_i64(message.sequence, "message sequence")?;
         let blocks_count = to_i64(message.blocks_count, "message blocks")?;
         let created_at_ms = i64::try_from(message.created_at_ms)
-            .map_err(|_| memory::MemoryError::Store("message time overflow".to_string()))?;
+            .map_err(|_| session::SessionError::Store("message time overflow".to_string()))?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .execute(
@@ -1204,7 +1554,7 @@ impl PostgresSessionStore {
         session_id: &str,
         offset: usize,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         let limit = to_i64(limit.clamp(1, 500), "message limit")?;
         let offset = to_i64(offset, "message offset")?;
         self.query_messages(
@@ -1221,7 +1571,7 @@ impl PostgresSessionStore {
         session_id: &str,
         from_sequence: usize,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         let from_sequence = to_i64(from_sequence, "message sequence")?;
         let limit = to_i64(limit.clamp(1, 500), "message limit")?;
         self.query_messages(
@@ -1233,7 +1583,7 @@ impl PostgresSessionStore {
         )
     }
 
-    pub fn get_message_count(&self, session_id: &str) -> memory::store::Result<usize> {
+    pub fn get_message_count(&self, session_id: &str) -> session::SessionResult<usize> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let count: i64 = connection
             .query_one(
@@ -1244,14 +1594,14 @@ impl PostgresSessionStore {
             .try_get(0)
             .map_err(postgres_error)?;
         usize::try_from(count)
-            .map_err(|_| memory::MemoryError::Store("message count overflow".to_string()))
+            .map_err(|_| session::SessionError::Store("message count overflow".to_string()))
     }
 
     pub fn delete_messages_from(
         &self,
         session_id: &str,
         from_sequence: usize,
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         let from_sequence = to_i64(from_sequence, "message sequence")?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let deleted = connection
@@ -1263,7 +1613,10 @@ impl PostgresSessionStore {
         Ok(deleted as usize)
     }
 
-    pub fn get_all_messages(&self, session_id: &str) -> memory::store::Result<Vec<SessionMessage>> {
+    pub fn get_all_messages(
+        &self,
+        session_id: &str,
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         self.query_messages(
             "SELECT stable_message_id, session_id, sequence, role, content_json, blocks_count,
                     tool_use_id, tool_name, token_usage_json, created_at_ms
@@ -1272,7 +1625,7 @@ impl PostgresSessionStore {
         )
     }
 
-    pub fn insert_messages_batch(&self, messages: &[SessionMessage]) -> memory::store::Result<()> {
+    pub fn insert_messages_batch(&self, messages: &[SessionMessage]) -> session::SessionResult<()> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         for message in messages {
@@ -1282,231 +1635,575 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    pub fn append_terminal_message_idempotent(
+    pub fn copy_session_messages_at_cutoff(
         &self,
-        message_id: &str,
-        session_id: &str,
-        content_json: &str,
-        token_usage_json: Option<&str>,
-        created_at_ms: u64,
-    ) -> memory::store::Result<(SessionMessage, bool)> {
-        if message_id.trim().is_empty() || session_id.trim().is_empty() {
-            return Err(memory::MemoryError::Store(
-                "terminal message requires stable message and session IDs".to_string(),
+        source_session_id: &str,
+        target_session_id: &str,
+        source_message_count: usize,
+    ) -> session::SessionResult<usize> {
+        if source_session_id.trim().is_empty()
+            || target_session_id.trim().is_empty()
+            || source_session_id == target_session_id
+        {
+            return Err(session::SessionError::Store(
+                "branch copy requires distinct non-empty source and target sessions".to_string(),
             ));
         }
+        let cutoff = to_i64(source_message_count, "branch cutoff")?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
-        transaction
-            .query_one(
-                "SELECT session_id FROM session_records WHERE session_id=$1 FOR UPDATE",
-                &[&session_id],
+        // Lock in stable lexical order so concurrent reciprocal branch requests
+        // cannot deadlock.
+        let (first, second) = if source_session_id < target_session_id {
+            (source_session_id, target_session_id)
+        } else {
+            (target_session_id, source_session_id)
+        };
+        let rows = transaction
+            .query(
+                "SELECT session_id FROM session_records
+                  WHERE session_id IN ($1,$2)
+                  ORDER BY session_id FOR UPDATE",
+                &[&first, &second],
             )
             .map_err(postgres_error)?;
-        if let Some(row) = transaction
-            .query_opt(
-                "SELECT stable_message_id, session_id, sequence, role, content_json, blocks_count,
-                    tool_use_id, tool_name, token_usage_json, created_at_ms
-               FROM session_messages WHERE stable_message_id=$1",
-                &[&message_id],
-            )
-            .map_err(postgres_error)?
-        {
-            let mut existing = row_to_message(&row)?;
-            if existing.session_id != session_id
-                || existing.role != "assistant"
-                || existing.content_json != content_json
-                || matches!(
-                    (existing.token_usage_json.as_deref(), token_usage_json),
-                    (Some(existing), Some(requested)) if existing != requested
-                )
-            {
-                return Err(memory::MemoryError::Store(format!(
-                    "terminal message_id `{message_id}` conflicts with committed content"
-                )));
-            }
-            if existing.token_usage_json.is_none() && token_usage_json.is_some() {
-                transaction
-                    .execute(
-                        "UPDATE session_messages SET token_usage_json=$2
-                          WHERE stable_message_id=$1",
-                        &[&message_id, &token_usage_json],
-                    )
-                    .map_err(postgres_error)?;
-                existing.token_usage_json = token_usage_json.map(ToOwned::to_owned);
-                refresh_session_usage_summary_tx(&mut transaction, session_id)?;
-            }
-            transaction.commit().map_err(postgres_error)?;
-            return Ok((existing, false));
+        if rows.len() != 2 {
+            return Err(session::SessionError::Store(
+                "branch source and target sessions must both exist".to_string(),
+            ));
         }
-        let sequence: i64 = transaction
+        let target_count: i64 = transaction
             .query_one(
-                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM session_messages WHERE session_id=$1",
-                &[&session_id],
+                "SELECT COUNT(*) FROM session_messages WHERE session_id=$1",
+                &[&target_session_id],
             )
             .map_err(postgres_error)?
             .try_get(0)
             .map_err(postgres_error)?;
-        let message = SessionMessage {
-            stable_message_id: message_id.to_string(),
-            session_id: session_id.to_string(),
-            sequence: from_i64(sequence, "message sequence")?,
-            role: "assistant".to_string(),
-            content_json: content_json.to_string(),
-            blocks_count: 1,
-            tool_use_id: None,
-            tool_name: None,
-            token_usage_json: token_usage_json.map(ToOwned::to_owned),
-            created_at_ms,
-        };
-        insert_message_tx(&mut transaction, &message)?;
-        refresh_session_message_summary_tx(&mut transaction, session_id, created_at_ms)?;
-        refresh_session_usage_summary_tx(&mut transaction, session_id)?;
+        if target_count != 0 {
+            return Err(session::SessionError::Store(format!(
+                "branch target `{target_session_id}` already contains messages"
+            )));
+        }
+        let copied = transaction
+            .execute(
+                "INSERT INTO session_messages(
+                     stable_message_id,session_id,sequence,role,content_json,blocks_count,
+                     tool_use_id,tool_name,token_usage_json,created_at_ms
+                 )
+                 SELECT 'branch:' || $2 || ':' || stable_message_id,
+                        $2,sequence,role,content_json,blocks_count,
+                        tool_use_id,tool_name,token_usage_json,created_at_ms
+                   FROM session_messages
+                  WHERE session_id=$1 AND sequence < $3
+                  ORDER BY sequence",
+                &[&source_session_id, &target_session_id, &cutoff],
+            )
+            .map_err(postgres_error)?;
+        let last_created_at: i64 = transaction
+            .query_one(
+                "SELECT COALESCE(MAX(created_at_ms),0)
+                   FROM session_messages WHERE session_id=$1",
+                &[&target_session_id],
+            )
+            .map_err(postgres_error)?
+            .try_get(0)
+            .map_err(postgres_error)?;
+        refresh_session_message_summary_tx(
+            &mut transaction,
+            target_session_id,
+            i64_to_u64(last_created_at.max(0), "branch message time")?,
+        )?;
+        refresh_session_usage_summary_tx(&mut transaction, target_session_id)?;
         transaction.commit().map_err(postgres_error)?;
-        Ok((message, true))
+        Ok(copied as usize)
     }
 
-    pub fn append_terminal_transcript_idempotent(
+    pub fn branch_session_at_cutoff(
         &self,
-        terminal_message_id: &str,
-        ingress_message_id: &str,
-        session_id: &str,
-        messages: &[SessionMessage],
-        created_at_ms: u64,
-    ) -> memory::store::Result<(Vec<SessionMessage>, bool)> {
-        if terminal_message_id.trim().is_empty()
-            || ingress_message_id.trim().is_empty()
-            || session_id.trim().is_empty()
-            || messages.is_empty()
-            || messages
-                .last()
-                .is_none_or(|message| message.stable_message_id != terminal_message_id)
+        request: &SessionBranchRequest,
+    ) -> session::SessionResult<SessionBranchResult> {
+        validate_mission_request(&request.mission_outbox)?;
+        if request.operation_id.trim().is_empty()
+            || request.source_session_id.trim().is_empty()
+            || request.target.session_id.trim().is_empty()
+            || request.source_session_id == request.target.session_id
+            || request.mission_outbox.session_id != request.target.session_id
         {
-            return Err(memory::MemoryError::Store(
-                "terminal transcript requires a non-empty session, terminal ID, and terminal final row"
+            return Err(session::SessionError::Store(
+                "branch requires distinct source/target identities and a target-bound mission intent"
                     .to_string(),
             ));
         }
-        if messages.iter().any(|message| {
-            message.stable_message_id.trim().is_empty()
-                || message.session_id != session_id
-                || message.role.trim().is_empty()
-                || serde_json::from_str::<serde_json::Value>(&message.content_json)
-                    .ok()
-                    .and_then(|value| value.as_array().cloned())
-                    .is_none()
-        }) {
-            return Err(memory::MemoryError::Store(
-                "terminal transcript contains an invalid message row".to_string(),
-            ));
-        }
-        let unique_ids = messages
-            .iter()
-            .map(|message| message.stable_message_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        if unique_ids.len() != messages.len() {
-            return Err(memory::MemoryError::Store(
-                "terminal transcript contains duplicate stable message IDs".to_string(),
-            ));
-        }
 
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
-        transaction
-            .query_one(
+        let source = transaction
+            .query_opt(
                 "SELECT session_id FROM session_records WHERE session_id=$1 FOR UPDATE",
-                &[&session_id],
+                &[&request.source_session_id],
             )
             .map_err(postgres_error)?;
-        let mut loaded = Vec::with_capacity(messages.len());
-        for requested in messages {
-            let existing = transaction
+        if source.is_none() {
+            return Err(session::SessionError::Store(format!(
+                "branch source `{}` does not exist",
+                request.source_session_id
+            )));
+        }
+        if let Some(existing) =
+            query_branch_activation_tx(&mut transaction, &request.operation_id, true)?
+        {
+            if existing.source_session_id != request.source_session_id
+                || existing.target_session_id != request.target.session_id
+                || existing.source_message_count != request.source_message_count
+            {
+                return Err(session::SessionError::Store(format!(
+                    "branch operation `{}` is bound to another source/cutoff/target",
+                    request.operation_id
+                )));
+            }
+            let target = transaction
                 .query_opt(
-                    "SELECT stable_message_id, session_id, sequence, role, content_json,
-                            blocks_count, tool_use_id, tool_name, token_usage_json, created_at_ms
-                       FROM session_messages WHERE stable_message_id=$1",
-                    &[&requested.stable_message_id],
+                    "SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,
+                            message_count,reset_policy,metadata_json,input_tokens,output_tokens,
+                            estimated_cost_usd,status
+                       FROM session_records WHERE session_id=$1",
+                    &[&existing.target_session_id],
                 )
                 .map_err(postgres_error)?
-                .map(|row| row_to_message(&row))
-                .transpose()?;
-            loaded.push(existing);
-        }
-        let terminal_exists = loaded.last().is_some_and(Option::is_some);
-        if terminal_exists {
-            let mut committed = Vec::with_capacity(messages.len());
-            for (requested, existing) in messages.iter().zip(loaded.into_iter()) {
-                let existing = existing.ok_or_else(|| {
-                    memory::MemoryError::Store(format!(
-                        "terminal transcript `{terminal_message_id}` is partially committed"
+                .map(|row| row_to_session(&row))
+                .transpose()?
+                .ok_or_else(|| {
+                    session::SessionError::Store(format!(
+                        "branch operation `{}` lost target `{}`",
+                        existing.operation_id, existing.target_session_id
                     ))
                 })?;
-                if existing.session_id != requested.session_id
-                    || existing.role != requested.role
-                    || existing.content_json != requested.content_json
-                    || existing.blocks_count != requested.blocks_count
-                    || existing.tool_use_id != requested.tool_use_id
-                    || existing.tool_name != requested.tool_name
-                    || existing.token_usage_json != requested.token_usage_json
-                {
-                    return Err(memory::MemoryError::Store(format!(
-                        "terminal transcript message_id `{}` conflicts with committed content",
-                        requested.stable_message_id
-                    )));
-                }
-                committed.push(existing);
-            }
-            committed.sort_by_key(|message| message.sequence);
+            let copied_message_count =
+                usize::try_from(target.message_count.max(0)).map_err(|_| {
+                    session::SessionError::Store(
+                        "branch target message count exceeds usize".to_string(),
+                    )
+                })?;
             transaction.commit().map_err(postgres_error)?;
-            return Ok((committed, false));
+            return Ok(SessionBranchResult {
+                target,
+                copied_message_count,
+                source_message_count: existing.source_message_count,
+                activation: existing,
+            });
         }
-        if loaded.iter().any(Option::is_some) {
-            return Err(memory::MemoryError::Store(format!(
-                "terminal transcript `{terminal_message_id}` collides with existing intermediate rows"
+        let target_exists: bool = transaction
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM session_records WHERE session_id=$1)",
+                &[&request.target.session_id],
+            )
+            .map_err(postgres_error)?
+            .try_get(0)
+            .map_err(postgres_error)?;
+        if target_exists {
+            return Err(session::SessionError::Store(format!(
+                "branch target `{}` already exists",
+                request.target.session_id
             )));
         }
 
-        let _ingress_sequence: i64 = transaction
-            .query_opt(
-                "SELECT sequence FROM session_messages
-                  WHERE stable_message_id=$1 AND session_id=$2 AND role='user'",
-                &[&ingress_message_id, &session_id],
+        let source_count: i64 = transaction
+            .query_one(
+                "SELECT COUNT(*) FROM session_messages WHERE session_id=$1",
+                &[&request.source_session_id],
             )
             .map_err(postgres_error)?
-            .ok_or_else(|| {
-                memory::MemoryError::Store(format!(
-                    "terminal transcript ingress `{ingress_message_id}` is not committed"
-                ))
-            })?
             .try_get(0)
             .map_err(postgres_error)?;
-        // Published sequence values are immutable Surface cursors. Append the
-        // transcript physically and reconstruct turn causality from metadata.
-        let first_sequence = transaction
+        let source_count = from_i64(source_count, "branch source message count")?;
+        let cutoff = request.source_message_count;
+        if cutoff > source_count {
+            return Err(session::SessionError::Store(format!(
+                "branch cutoff {cutoff} exceeds source message count {source_count}"
+            )));
+        }
+        let cutoff_i64 = to_i64(cutoff, "branch cutoff")?;
+
+        transaction
+            .execute(
+                "INSERT INTO session_records(
+                     session_id,platform,chat_id,user_id,model,created_at,last_activity,
+                     message_count,reset_policy,metadata_json,input_tokens,output_tokens,
+                     estimated_cost_usd,status,created_at_ms,updated_at_ms
+                 ) VALUES($1,$2,$3,$4,$5,$6,$7,0,$8,$9,0,0,0,$10,
+                     cowd_safe_session_epoch_ms($6),cowd_safe_session_epoch_ms($7))",
+                &[
+                    &request.target.session_id,
+                    &request.target.platform,
+                    &request.target.chat_id,
+                    &request.target.user_id,
+                    &request.target.model,
+                    &request.target.created_at,
+                    &request.target.last_activity,
+                    &request.target.reset_policy,
+                    &request.target.metadata_json,
+                    &request.target.status,
+                ],
+            )
+            .map_err(postgres_error)?;
+        let copied = transaction
+            .execute(
+                "INSERT INTO session_messages(
+                     stable_message_id,session_id,sequence,role,content_json,blocks_count,
+                     tool_use_id,tool_name,token_usage_json,created_at_ms
+                 )
+                 SELECT 'branch:' || $2 || ':' || stable_message_id,
+                        $2,sequence,role,content_json,blocks_count,
+                        tool_use_id,tool_name,token_usage_json,created_at_ms
+                   FROM session_messages
+                  WHERE session_id=$1 AND sequence < $3
+                  ORDER BY sequence",
+                &[
+                    &request.source_session_id,
+                    &request.target.session_id,
+                    &cutoff_i64,
+                ],
+            )
+            .map_err(postgres_error)?;
+        let copied = usize::try_from(copied).map_err(|_| {
+            session::SessionError::Store("branch copied message count exceeds usize".to_string())
+        })?;
+        let last_created_at: i64 = transaction
             .query_one(
-                "SELECT COALESCE(MAX(sequence), -1) + 1
+                "SELECT COALESCE(MAX(created_at_ms),0)
                    FROM session_messages WHERE session_id=$1",
-                &[&session_id],
+                &[&request.target.session_id],
             )
             .map_err(postgres_error)?
-            .try_get::<_, i64>(0)
-            .map_err(postgres_error)
-            .and_then(|sequence| from_i64(sequence, "message sequence"))?;
-        let mut committed = Vec::with_capacity(messages.len());
-        for (index, requested) in messages.iter().enumerate() {
-            let mut message = requested.clone();
-            message.sequence = first_sequence.saturating_add(index);
-            message.created_at_ms = created_at_ms.saturating_add(index as u64);
-            insert_message_tx(&mut transaction, &message)?;
-            committed.push(message);
+            .try_get(0)
+            .map_err(postgres_error)?;
+        refresh_session_message_summary_tx(
+            &mut transaction,
+            &request.target.session_id,
+            i64_to_u64(last_created_at.max(0), "branch message time")?,
+        )?;
+        refresh_session_usage_summary_tx(&mut transaction, &request.target.session_id)?;
+        insert_mission_outbox_tx(&mut transaction, &request.mission_outbox)?;
+
+        for (session_id, event_type, event_json) in [
+            (
+                request.source_session_id.as_str(),
+                "SessionBranched",
+                request.source_event_json.as_str(),
+            ),
+            (
+                request.target.session_id.as_str(),
+                "BranchCreated",
+                request.target_event_json.as_str(),
+            ),
+        ] {
+            let sequence: i64 = transaction
+                .query_one(
+                    "SELECT COALESCE(MAX(sequence) + 1, 0)
+                       FROM session_events WHERE session_id=$1",
+                    &[&session_id],
+                )
+                .map_err(postgres_error)?
+                .try_get(0)
+                .map_err(postgres_error)?;
+            let stored_sequence = from_i64(sequence, "branch event sequence")?;
+            let event = SessionEvent {
+                session_id: session_id.to_string(),
+                event_type: event_type.to_string(),
+                event_json: event_json.to_string(),
+                sequence: stored_sequence,
+                created_at_ms: request.created_at_ms,
+            };
+            let allocated_json = event_json_with_allocated_sequence(&event, stored_sequence)?;
+            transaction
+                .execute(
+                    "INSERT INTO session_events(
+                         session_id,sequence,event_type,event_json,created_at_ms
+                     ) VALUES($1,$2,$3,$4,$5)",
+                    &[
+                        &session_id,
+                        &sequence,
+                        &event_type,
+                        &allocated_json,
+                        &to_u64_i64(request.created_at_ms, "branch event time")?,
+                    ],
+                )
+                .map_err(postgres_error)?;
         }
-        let last_created_at = committed
-            .last()
-            .map_or(created_at_ms, |message| message.created_at_ms);
-        refresh_session_message_summary_tx(&mut transaction, session_id, last_created_at)?;
-        refresh_session_usage_summary_tx(&mut transaction, session_id)?;
+        transaction
+            .execute(
+                "INSERT INTO session_branch_activations(
+                     operation_id,source_session_id,target_session_id,source_message_count,
+                     phase,created_at_ms,updated_at_ms,last_error,revision
+                 ) VALUES($1,$2,$3,$4,'branch_committed',$5,$5,NULL,0)",
+                &[
+                    &request.operation_id,
+                    &request.source_session_id,
+                    &request.target.session_id,
+                    &cutoff_i64,
+                    &to_u64_i64(request.created_at_ms, "branch activation time")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        let activation =
+            query_branch_activation_tx(&mut transaction, &request.operation_id, false)?
+                .ok_or_else(|| {
+                    session::SessionError::Store(
+                        "branch transaction produced no activation receipt".to_string(),
+                    )
+                })?;
         transaction.commit().map_err(postgres_error)?;
-        Ok((committed, true))
+
+        let mut target = request.target.clone();
+        target.message_count = i64::try_from(copied).map_err(|_| {
+            session::SessionError::Store("branch message count exceeds i64".to_string())
+        })?;
+        Ok(SessionBranchResult {
+            target,
+            copied_message_count: copied,
+            source_message_count: cutoff,
+            activation,
+        })
+    }
+
+    pub fn get_session_branch_activation(
+        &self,
+        operation_id: &str,
+    ) -> session::SessionResult<Option<SessionBranchActivation>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT operation_id,source_session_id,target_session_id,
+                        source_message_count,phase,created_at_ms,updated_at_ms,
+                        last_error,revision
+                   FROM session_branch_activations WHERE operation_id=$1",
+                &[&operation_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_branch_activation(&row))
+            .transpose()
+    }
+
+    pub fn list_recoverable_session_branch_activations(
+        &self,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionBranchActivation>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT operation_id,source_session_id,target_session_id,
+                        source_message_count,phase,created_at_ms,updated_at_ms,
+                        last_error,revision
+                   FROM session_branch_activations
+                  WHERE phase != 'activated'
+                  ORDER BY updated_at_ms ASC,operation_id ASC LIMIT $1",
+                &[&to_i64(limit.max(1), "branch activation recovery limit")?],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_branch_activation)
+            .collect()
+    }
+
+    pub fn transition_session_branch_activation(
+        &self,
+        transition: &SessionBranchActivationTransition,
+    ) -> session::SessionResult<SessionBranchActivation> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current = query_branch_activation_tx(&mut transaction, &transition.operation_id, true)?
+            .ok_or_else(|| {
+                session::SessionError::Store(format!(
+                    "Session branch activation `{}` does not exist",
+                    transition.operation_id
+                ))
+            })?;
+        transition.validate(&current)?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_branch_activations
+                    SET phase=$1,updated_at_ms=$2,last_error=$3,revision=revision+1
+                  WHERE operation_id=$4 AND phase=$5 AND revision=$6",
+                &[
+                    &transition.next_phase.as_str(),
+                    &to_u64_i64(
+                        transition.updated_at_ms,
+                        "branch activation transition time",
+                    )?,
+                    &transition.error,
+                    &transition.operation_id,
+                    &transition.expected_phase.as_str(),
+                    &to_u64_i64(transition.expected_revision, "branch activation revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "Session branch activation `{}` changed during transition",
+                transition.operation_id
+            )));
+        }
+        let activation =
+            query_branch_activation_tx(&mut transaction, &transition.operation_id, false)?
+                .ok_or_else(|| {
+                    session::SessionError::Store(format!(
+                        "Session branch activation `{}` disappeared after transition",
+                        transition.operation_id
+                    ))
+                })?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(activation)
+    }
+
+    pub fn commit_terminal_transcript_if_fenced(
+        &self,
+        request: &SessionTerminalTranscriptCommit,
+    ) -> session::SessionResult<SessionTerminalTranscriptReceipt> {
+        validate_terminal_transcript(
+            &request.terminal_message_id,
+            &request.ingress_message_id,
+            &request.session_id,
+            &request.messages,
+        )?;
+        validate_terminal_commit(request)?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let admission = query_input_admission_tx(&mut transaction, &request.session_id, true)?
+            .ok_or_else(|| {
+                session::SessionError::StaleExecutionFence(format!(
+                    "session `{}` no longer exists",
+                    request.session_id
+                ))
+            })?;
+        let current = runtime_outbox_for_update(&mut transaction, &request.fence.request_id)?;
+        if current.status == SessionRuntimeInputStatus::Completed
+            && current.runtime_commit_cursor == Some(request.runtime_commit_cursor)
+        {
+            if current.session_id != request.session_id
+                || current.message_id != request.ingress_message_id
+                || current.turn_id != request.turn_id
+                || current.sequence != request.fence.input_sequence
+                || current.session_generation != request.fence.session_generation
+                || current.claim_owner.as_deref() != Some(request.fence.claim_owner.as_str())
+                || current.claim_token.as_deref() != Some(request.fence.claim_token.as_str())
+                || current.claim_fence_epoch != Some(request.fence.claim_fence_epoch)
+            {
+                return Err(session::SessionError::StaleExecutionFence(format!(
+                    "completed input `{}` identity does not match terminal replay",
+                    request.fence.request_id
+                )));
+            }
+            let messages = load_committed_terminal_transcript_tx(
+                &mut transaction,
+                &request.terminal_message_id,
+                &request.messages,
+            )?;
+            transaction.commit().map_err(postgres_error)?;
+            return Ok(SessionTerminalTranscriptReceipt {
+                messages,
+                inserted: false,
+                input: current,
+            });
+        }
+        let fence_valid = current.session_id == request.session_id
+            && current.message_id == request.ingress_message_id
+            && current.turn_id == request.turn_id
+            && current.sequence == request.fence.input_sequence
+            && current.status == SessionRuntimeInputStatus::Running
+            && current.session_generation == request.fence.session_generation
+            && admission.generation == request.fence.session_generation
+            && admission.open
+            && current.claim_owner.as_deref() == Some(request.fence.claim_owner.as_str())
+            && current.claim_token.as_deref() == Some(request.fence.claim_token.as_str())
+            && current.claim_fence_epoch == Some(request.fence.claim_fence_epoch)
+            && current
+                .claim_expires_at_ms
+                .is_some_and(|expires| expires > request.created_at_ms);
+        if !fence_valid {
+            return Err(session::SessionError::StaleExecutionFence(format!(
+                "request={} generation={} claim_fence_epoch={} current_status={:?} current_revision={}",
+                request.fence.request_id,
+                request.fence.session_generation,
+                request.fence.claim_fence_epoch,
+                current.status,
+                current.revision
+            )));
+        }
+        let (messages, inserted) = append_terminal_transcript_tx(
+            &mut transaction,
+            &request.terminal_message_id,
+            &request.ingress_message_id,
+            &request.session_id,
+            &request.messages,
+            request.created_at_ms,
+        )?;
+        let terminal_status = SessionRuntimeInputStatus::Completed.as_str();
+        let changed = transaction
+            .execute(
+                "UPDATE session_runtime_outbox
+                    SET status=$1,runtime_commit_cursor=$2,
+                        claim_expires_at_ms=NULL,terminal_at_ms=$3,
+                        failure_class=NULL,last_error=NULL,updated_at_ms=$3,revision=revision+1
+                  WHERE request_id=$4 AND sequence=$5 AND status='running'
+                    AND session_generation=$6
+                    AND claim_owner=$7 AND claim_token=$8
+                    AND claim_fence_epoch=$9 AND revision=$10",
+                &[
+                    &terminal_status,
+                    &to_u64_i64(request.runtime_commit_cursor, "runtime commit cursor")?,
+                    &to_u64_i64(request.created_at_ms, "terminal commit time")?,
+                    &request.fence.request_id,
+                    &to_i64(request.fence.input_sequence, "input sequence")?,
+                    &to_u64_i64(request.fence.session_generation, "session generation")?,
+                    &request.fence.claim_owner,
+                    &request.fence.claim_token,
+                    &to_u64_i64(request.fence.claim_fence_epoch, "claim fence epoch")?,
+                    &to_u64_i64(current.revision, "input revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::StaleExecutionFence(format!(
+                "input `{}` changed during terminal commit",
+                request.fence.request_id
+            )));
+        }
+        let completed = runtime_outbox_tx(&mut transaction, &request.fence.request_id)?
+            .ok_or_else(|| {
+                session::SessionError::Store(format!(
+                    "completed input `{}` disappeared",
+                    request.fence.request_id
+                ))
+            })?;
+        append_runtime_history_tx(
+            &mut transaction,
+            &completed,
+            "terminal_commit",
+            Some(&request.fence.claim_owner),
+            Some(current.revision),
+            SessionRuntimeInputStatus::Running,
+            SessionRuntimeInputStatus::Completed,
+            None,
+            request.created_at_ms,
+        )?;
+        append_input_timeline_event_tx(
+            &mut transaction,
+            &request_from_outbox(&completed),
+            &completed.session_id,
+            completed.sequence,
+            SessionRuntimeInputStatus::Completed.timeline_event_kind(),
+            SessionRuntimeInputStatus::Completed,
+            Some(&request.fence.claim_owner),
+            None,
+            request.created_at_ms,
+        )?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(SessionTerminalTranscriptReceipt {
+            messages,
+            inserted,
+            input: completed,
+        })
     }
 
     pub fn search_messages(
@@ -1514,7 +2211,7 @@ impl PostgresSessionStore {
         query: &str,
         session_id: Option<&str>,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         let limit = to_i64(limit.clamp(1, 500), "message search limit")?;
         self.query_messages(
             "SELECT stable_message_id, session_id, sequence, role, content_json, blocks_count,
@@ -1534,12 +2231,12 @@ impl PostgresSessionStore {
         query: &str,
         session_ids: &[String],
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         if session_ids.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let scope = serde_json::to_string(session_ids).map_err(|error| {
-            memory::MemoryError::Store(format!("encode search session scope: {error}"))
+            session::SessionError::Store(format!("encode search session scope: {error}"))
         })?;
         let limit = to_i64(limit.min(500), "message search limit")?;
         self.query_messages(
@@ -1555,10 +2252,10 @@ impl PostgresSessionStore {
         )
     }
 
-    pub fn append_event(&self, event: &SessionEvent) -> memory::store::Result<()> {
+    pub fn append_event(&self, event: &SessionEvent) -> session::SessionResult<()> {
         let sequence = to_i64(event.sequence, "event sequence")?;
         let created_at_ms = i64::try_from(event.created_at_ms)
-            .map_err(|_| memory::MemoryError::Store("event time overflow".to_string()))?;
+            .map_err(|_| session::SessionError::Store("event time overflow".to_string()))?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .execute(
@@ -1582,14 +2279,14 @@ impl PostgresSessionStore {
     pub fn append_events_allocating_sequence(
         &self,
         events: &[SessionEvent],
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
         let session_id = events[0].session_id.as_str();
         if session_id.trim().is_empty() || events.iter().any(|event| event.session_id != session_id)
         {
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "session event batch must have one non-empty session id".to_string(),
             ));
         }
@@ -1613,11 +2310,13 @@ impl PostgresSessionStore {
         for (index, event) in events.iter().enumerate() {
             let sequence = next
                 .checked_add(i64::try_from(index).map_err(|_| {
-                    memory::MemoryError::Store("event batch index overflow".to_string())
+                    session::SessionError::Store("event batch index overflow".to_string())
                 })?)
-                .ok_or_else(|| memory::MemoryError::Store("event sequence overflow".to_string()))?;
+                .ok_or_else(|| {
+                    session::SessionError::Store("event sequence overflow".to_string())
+                })?;
             let created_at_ms = i64::try_from(event.created_at_ms)
-                .map_err(|_| memory::MemoryError::Store("event time overflow".to_string()))?;
+                .map_err(|_| session::SessionError::Store("event time overflow".to_string()))?;
             let stored_sequence = from_i64(sequence, "event sequence")?;
             let event_json = event_json_with_allocated_sequence(event, stored_sequence)?;
             transaction
@@ -1645,32 +2344,155 @@ impl PostgresSessionStore {
     pub fn append_event_allocating_sequence(
         &self,
         event: &SessionEvent,
-    ) -> memory::store::Result<SessionEvent> {
+    ) -> session::SessionResult<SessionEvent> {
         self.append_events_allocating_sequence(std::slice::from_ref(event))?
             .into_iter()
             .next()
             .ok_or_else(|| {
-                memory::MemoryError::Store("event allocation returned no row".to_string())
+                session::SessionError::Store("event allocation returned no row".to_string())
             })
+    }
+
+    pub fn append_session_domain_event_if_absent_allocating_sequence(
+        &self,
+        event: &SessionEvent,
+        event_id: &str,
+    ) -> session::SessionResult<(SessionEvent, bool)> {
+        if event.event_type != session::SESSION_DOMAIN_EVENT_TYPE || event_id.trim().is_empty() {
+            return Err(session::SessionError::Store(
+                "idempotent domain append requires SessionDomainEvent and a non-empty event_id"
+                    .to_string(),
+            ));
+        }
+        let encoded_event_id = serde_json::from_str::<serde_json::Value>(&event.event_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| {
+                session::SessionError::Store(
+                    "idempotent domain append requires event_json.event_id".to_string(),
+                )
+            })?;
+        if encoded_event_id != event_id {
+            return Err(session::SessionError::Store(
+                "idempotent domain append event_id does not match event_json".to_string(),
+            ));
+        }
+
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        transaction
+            .query_one(
+                "SELECT session_id FROM session_records WHERE session_id=$1 FOR UPDATE",
+                &[&event.session_id],
+            )
+            .map_err(postgres_error)?;
+        if let Some(row) = transaction
+            .query_opt(
+                "SELECT session_id, event_type, event_json, sequence, created_at_ms
+                   FROM session_events
+                  WHERE session_id=$1
+                    AND event_type=$2
+                    AND event_json::jsonb ->> 'event_id'=$3
+                  LIMIT 1",
+                &[
+                    &event.session_id,
+                    &session::SESSION_DOMAIN_EVENT_TYPE,
+                    &event_id,
+                ],
+            )
+            .map_err(postgres_error)?
+        {
+            let existing = row_to_event(&row)?;
+            if !SessionDomainEvent::semantically_equivalent(&existing, event).map_err(|error| {
+                session::SessionError::Store(format!(
+                    "failed to compare idempotent session-domain event content: {error}"
+                ))
+            })? {
+                return Err(session::SessionError::IdempotencyConflict {
+                    namespace: "session_domain_event",
+                    key: event_id.to_string(),
+                });
+            }
+            transaction.commit().map_err(postgres_error)?;
+            return Ok((existing, true));
+        }
+
+        let sequence: i64 = transaction
+            .query_one(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM session_events WHERE session_id=$1",
+                &[&event.session_id],
+            )
+            .map_err(postgres_error)?
+            .try_get(0)
+            .map_err(postgres_error)?;
+        let stored_sequence = from_i64(sequence, "event sequence")?;
+        let event_json = event_json_with_allocated_sequence(event, stored_sequence)?;
+        transaction
+            .execute(
+                "INSERT INTO session_events(session_id, sequence, event_type, event_json, created_at_ms)
+                 VALUES ($1,$2,$3,$4,$5)",
+                &[
+                    &event.session_id,
+                    &sequence,
+                    &event.event_type,
+                    &event_json,
+                    &to_u64_i64(event.created_at_ms, "event time")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        transaction.commit().map_err(postgres_error)?;
+        let mut stored = event.clone();
+        stored.sequence = stored_sequence;
+        stored.event_json = event_json;
+        Ok((stored, false))
+    }
+
+    pub fn get_session_domain_event_by_id(
+        &self,
+        session_id: &str,
+        event_id: &str,
+    ) -> session::SessionResult<Option<SessionEvent>> {
+        if event_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT session_id, event_type, event_json, sequence, created_at_ms
+                   FROM session_events
+                  WHERE session_id=$1
+                    AND event_type=$2
+                    AND event_json::jsonb ->> 'event_id'=$3
+                  LIMIT 1",
+                &[&session_id, &session::SESSION_DOMAIN_EVENT_TYPE, &event_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_event(&row))
+            .transpose()
     }
 
     pub fn append_events_allocating_sequence_if_checkpoint_absent(
         &self,
         events: &[SessionEvent],
         checkpoint_id: &str,
-    ) -> memory::store::Result<Option<Vec<SessionEvent>>> {
+    ) -> session::SessionResult<Option<Vec<SessionEvent>>> {
         if events.is_empty() {
             return Ok(Some(Vec::new()));
         }
         let session_id = events[0].session_id.as_str();
         if session_id.trim().is_empty() || events.iter().any(|event| event.session_id != session_id)
         {
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "atomic session event batch must contain one non-empty session_id".to_string(),
             ));
         }
         if checkpoint_id.trim().is_empty() {
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "checkpoint-aware event batch requires a non-empty checkpoint_id".to_string(),
             ));
         }
@@ -1712,9 +2534,11 @@ impl PostgresSessionStore {
         for (offset, event) in events.iter().enumerate() {
             let sequence = next
                 .checked_add(i64::try_from(offset).map_err(|_| {
-                    memory::MemoryError::Store("event batch offset overflow".to_string())
+                    session::SessionError::Store("event batch offset overflow".to_string())
                 })?)
-                .ok_or_else(|| memory::MemoryError::Store("event sequence overflow".to_string()))?;
+                .ok_or_else(|| {
+                    session::SessionError::Store("event sequence overflow".to_string())
+                })?;
             let stored_sequence = from_i64(sequence, "event sequence")?;
             let event_json = event_json_with_allocated_sequence(event, stored_sequence)?;
             transaction.execute(
@@ -1735,7 +2559,7 @@ impl PostgresSessionStore {
     pub fn append_context_envelope_event_if_absent_allocating_sequence(
         &self,
         event: &SessionEvent,
-    ) -> memory::store::Result<Option<SessionEvent>> {
+    ) -> session::SessionResult<Option<SessionEvent>> {
         if event.event_type != "ContextEnvelope" {
             return self.append_event_allocating_sequence(event).map(Some);
         }
@@ -1780,7 +2604,7 @@ impl PostgresSessionStore {
     pub fn append_context_envelope_event_if_absent(
         &self,
         event: &SessionEvent,
-    ) -> memory::store::Result<bool> {
+    ) -> session::SessionResult<bool> {
         self.append_context_envelope_event_if_absent_allocating_sequence(event)
             .map(|stored| stored.is_some())
     }
@@ -1789,7 +2613,7 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
         from_seq: usize,
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         self.query_events(
             "SELECT session_id, event_type, event_json, sequence, created_at_ms FROM session_events
              WHERE session_id=$1 AND sequence >= $2 ORDER BY sequence ASC",
@@ -1802,7 +2626,7 @@ impl PostgresSessionStore {
         session_id: &str,
         from_seq: usize,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         self.query_events(
             "SELECT session_id, event_type, event_json, sequence, created_at_ms FROM session_events
              WHERE session_id=$1 AND sequence >= $2 ORDER BY sequence ASC LIMIT $3",
@@ -1819,16 +2643,12 @@ impl PostgresSessionStore {
         session_id: &str,
         from_seq: usize,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionEvent>> {
-        self.query_events(
-            "SELECT session_id, event_type, event_json, sequence, created_at_ms FROM session_events
-             WHERE session_id=$1 AND sequence >= $2 AND event_type != 'RuntimeEvent'
-             ORDER BY sequence ASC LIMIT $3",
-            &[
-                &session_id,
-                &to_i64(from_seq, "event sequence")?,
-                &to_i64(limit, "event limit")?,
-            ],
+    ) -> session::SessionResult<Vec<SessionEvent>> {
+        self.get_events_by_type_limited(
+            session_id,
+            session::SESSION_DOMAIN_EVENT_TYPE,
+            from_seq,
+            limit,
         )
     }
 
@@ -1836,8 +2656,55 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
         from_seq: usize,
-    ) -> memory::store::Result<usize> {
-        self.count_events_sql("SELECT COUNT(*) FROM session_events WHERE session_id=$1 AND sequence >= $2 AND event_type != 'RuntimeEvent'", &[&session_id, &to_i64(from_seq, "event sequence")?])
+    ) -> session::SessionResult<usize> {
+        self.count_events_by_type_from(session_id, session::SESSION_DOMAIN_EVENT_TYPE, from_seq)
+    }
+
+    pub fn get_session_domain_events_by_kind_limited(
+        &self,
+        session_id: &str,
+        kind: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionEvent>> {
+        self.query_events(
+            "SELECT session_id, event_type, event_json, sequence, created_at_ms
+               FROM session_events
+              WHERE session_id=$1
+                AND event_type=$2
+                AND event_json::jsonb ->> 'kind'=$3
+                AND sequence >= $4
+              ORDER BY sequence ASC
+              LIMIT $5",
+            &[
+                &session_id,
+                &session::SESSION_DOMAIN_EVENT_TYPE,
+                &kind,
+                &to_i64(from_seq, "event sequence")?,
+                &to_i64(limit, "event limit")?,
+            ],
+        )
+    }
+
+    pub fn count_session_domain_events_by_kind_from(
+        &self,
+        session_id: &str,
+        kind: &str,
+        from_seq: usize,
+    ) -> session::SessionResult<usize> {
+        self.count_events_sql(
+            "SELECT COUNT(*) FROM session_events
+              WHERE session_id=$1
+                AND event_type=$2
+                AND event_json::jsonb ->> 'kind'=$3
+                AND sequence >= $4",
+            &[
+                &session_id,
+                &session::SESSION_DOMAIN_EVENT_TYPE,
+                &kind,
+                &to_i64(from_seq, "event sequence")?,
+            ],
+        )
     }
 
     pub fn get_events_by_type_limited(
@@ -1846,7 +2713,7 @@ impl PostgresSessionStore {
         event_type: &str,
         from_seq: usize,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         self.query_events(
             "SELECT session_id, event_type, event_json, sequence, created_at_ms FROM session_events
              WHERE session_id=$1 AND event_type=$2 AND sequence >= $3 ORDER BY sequence ASC LIMIT $4",
@@ -1858,7 +2725,7 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
         from_seq: usize,
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         self.count_events_sql(
             "SELECT COUNT(*) FROM session_events WHERE session_id=$1 AND sequence >= $2",
             &[&session_id, &to_i64(from_seq, "event sequence")?],
@@ -1870,14 +2737,14 @@ impl PostgresSessionStore {
         session_id: &str,
         event_type: &str,
         from_seq: usize,
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         self.count_events_sql("SELECT COUNT(*) FROM session_events WHERE session_id=$1 AND event_type=$2 AND sequence >= $3", &[&session_id, &event_type, &to_i64(from_seq, "event sequence")?])
     }
 
     pub fn get_context_event_by_envelope_id(
         &self,
         envelope_id: &str,
-    ) -> memory::store::Result<Option<SessionEvent>> {
+    ) -> session::SessionResult<Option<SessionEvent>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection.query_opt(
             "SELECT session_id, event_type, event_json, sequence, created_at_ms FROM session_events
@@ -1887,7 +2754,7 @@ impl PostgresSessionStore {
         ).map_err(postgres_error)?.map(|row| row_to_event(&row)).transpose()
     }
 
-    pub fn next_event_sequence(&self, session_id: &str) -> memory::store::Result<usize> {
+    pub fn next_event_sequence(&self, session_id: &str) -> session::SessionResult<usize> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let value: i64 = connection
             .query_one(
@@ -1904,7 +2771,7 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
         from_sequence: usize,
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         self.delete_events_sql(
             "DELETE FROM session_events WHERE session_id=$1 AND sequence >= $2",
             &[&session_id, &to_i64(from_sequence, "event sequence")?],
@@ -1916,7 +2783,7 @@ impl PostgresSessionStore {
         session_id: &str,
         event_type: &str,
         from_sequence: usize,
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         self.delete_events_sql(
             "DELETE FROM session_events WHERE session_id=$1 AND event_type=$2 AND sequence >= $3",
             &[
@@ -1927,7 +2794,7 @@ impl PostgresSessionStore {
         )
     }
 
-    pub fn save_snapshot(&self, snapshot: &SessionSnapshot) -> memory::store::Result<()> {
+    pub fn save_snapshot(&self, snapshot: &SessionSnapshot) -> session::SessionResult<()> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection.execute(
             "INSERT INTO session_snapshots(session_id,event_idx,messages_json,created_at_ms) VALUES($1,$2,$3,$4)
@@ -1940,7 +2807,7 @@ impl PostgresSessionStore {
     pub fn get_latest_snapshot(
         &self,
         session_id: &str,
-    ) -> memory::store::Result<Option<SessionSnapshot>> {
+    ) -> session::SessionResult<Option<SessionSnapshot>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection.query_opt(
             "SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots WHERE session_id=$1 ORDER BY event_idx DESC LIMIT 1",
@@ -1948,7 +2815,7 @@ impl PostgresSessionStore {
         ).map_err(postgres_error)?.map(|row| row_to_snapshot(&row)).transpose()
     }
 
-    pub fn prune_before(&self, cutoff_iso8601: &str) -> memory::store::Result<usize> {
+    pub fn prune_before(&self, cutoff_iso8601: &str) -> session::SessionResult<usize> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let deleted = connection
             .execute(
@@ -1963,10 +2830,10 @@ impl PostgresSessionStore {
         &self,
         session: &SessionRecord,
         request: &SessionMissionOutboxRequest,
-    ) -> memory::store::Result<SessionMissionOutboxRecord> {
+    ) -> session::SessionResult<SessionMissionOutboxRecord> {
         validate_mission_request(request)?;
         if request.session_id != session.session_id {
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "session/mission outbox session identity does not match record".to_string(),
             ));
         }
@@ -1978,13 +2845,366 @@ impl PostgresSessionStore {
         Ok(record)
     }
 
+    pub fn plan_session_lifecycle(
+        &self,
+        plan: &SessionLifecyclePlan,
+    ) -> session::SessionResult<SessionLifecycleIntent> {
+        if plan.operation_id.trim().is_empty()
+            || plan.session_id.trim().is_empty()
+            || plan.expected_generation == 0
+        {
+            return Err(session::SessionError::Store(
+                "Session lifecycle plan requires non-empty identities and a positive generation"
+                    .to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        // Session is the aggregate lock root for both lifecycle and input rows.
+        let admission = query_input_admission_tx(&mut transaction, &plan.session_id, true)?
+            .ok_or_else(|| {
+                session::SessionError::Store(format!("session `{}` not found", plan.session_id))
+            })?;
+        if let Some(existing) =
+            query_lifecycle_intent_tx(&mut transaction, &plan.operation_id, true)?
+        {
+            if existing.session_id == plan.session_id
+                && existing.disposition == plan.disposition
+                && existing.expected_generation == plan.expected_generation
+            {
+                transaction.commit().map_err(postgres_error)?;
+                return Ok(existing);
+            }
+            return Err(session::SessionError::Store(format!(
+                "Session lifecycle operation `{}` is bound to another identity",
+                plan.operation_id
+            )));
+        }
+        if admission.generation != plan.expected_generation || !admission.open {
+            return Err(session::SessionError::Store(format!(
+                "Session lifecycle plan `{}` expected open generation {}, found generation {} open={}",
+                plan.operation_id,
+                plan.expected_generation,
+                admission.generation,
+                admission.open
+            )));
+        }
+        let created_at_ms = to_u64_i64(plan.created_at_ms, "lifecycle plan time")?;
+        transaction
+            .execute(
+                "INSERT INTO session_lifecycle_intents(
+                     operation_id,session_id,disposition,phase,last_stable_phase,
+                     expected_generation,created_at_ms,updated_at_ms,last_error,revision
+                 ) VALUES($1,$2,$3,'planned','planned',$4,$5,$5,NULL,0)",
+                &[
+                    &plan.operation_id,
+                    &plan.session_id,
+                    &plan.disposition.as_str(),
+                    &to_u64_i64(plan.expected_generation, "lifecycle expected generation")?,
+                    &created_at_ms,
+                ],
+            )
+            .map_err(postgres_error)?;
+        let intent = query_lifecycle_intent_tx(&mut transaction, &plan.operation_id, false)?
+            .ok_or_else(|| {
+                session::SessionError::Store(
+                    "Session lifecycle plan produced no readable row".to_string(),
+                )
+            })?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(intent)
+    }
+
+    pub fn get_session_lifecycle_intent(
+        &self,
+        operation_id: &str,
+    ) -> session::SessionResult<Option<SessionLifecycleIntent>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT operation_id,session_id,disposition,phase,last_stable_phase,
+                        expected_generation,created_at_ms,updated_at_ms,last_error,revision
+                   FROM session_lifecycle_intents WHERE operation_id=$1",
+                &[&operation_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_lifecycle_intent(&row))
+            .transpose()
+    }
+
+    pub fn list_recoverable_session_lifecycle_intents(
+        &self,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionLifecycleIntent>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query(
+                "SELECT operation_id,session_id,disposition,phase,last_stable_phase,
+                        expected_generation,created_at_ms,updated_at_ms,last_error,revision
+                   FROM session_lifecycle_intents
+                  WHERE phase != 'unloaded'
+                  ORDER BY updated_at_ms ASC,operation_id ASC LIMIT $1",
+                &[&to_i64(limit.max(1), "lifecycle recovery limit")?],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_lifecycle_intent)
+            .collect()
+    }
+
+    pub fn fence_session_lifecycle(
+        &self,
+        request: &SessionLifecycleFenceRequest,
+    ) -> session::SessionResult<SessionLifecycleIntent> {
+        if request.actor.trim().is_empty()
+            || request.reason.trim().is_empty()
+            || request.transitional_status.trim().is_empty()
+        {
+            return Err(session::SessionError::Store(
+                "Session lifecycle fence requires actor, reason, and transitional status"
+                    .to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current =
+            query_lifecycle_intent_tx(&mut transaction, &request.transition.operation_id, true)?
+                .ok_or_else(|| {
+                    session::SessionError::Store(format!(
+                        "Session lifecycle intent `{}` does not exist",
+                        request.transition.operation_id
+                    ))
+                })?;
+        request.transition.validate(&current)?;
+        if request.transition.next_phase != SessionLifecyclePhase::AdmissionFenced
+            || request.event.session_id != current.session_id
+        {
+            return Err(session::SessionError::Store(
+                "Session lifecycle fence identity or phase is invalid".to_string(),
+            ));
+        }
+        let admission = query_input_admission_tx(&mut transaction, &current.session_id, true)?
+            .ok_or_else(|| {
+                session::SessionError::Store(format!("session `{}` not found", current.session_id))
+            })?;
+        if admission.generation != current.expected_generation || !admission.open {
+            return Err(session::SessionError::Store(format!(
+                "Session lifecycle fence `{}` lost generation authority",
+                current.operation_id
+            )));
+        }
+        let active = transaction
+            .query(
+                "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                        session_generation,decision,target_turn_id,classification_json,status,
+                        runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                        claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+                   FROM session_runtime_outbox
+                  WHERE session_id=$1 AND session_generation=$2
+                    AND status IN (
+                        'accepted','classified','queued','claimed',
+                        'running','reclassified','blocked'
+                    )
+                  ORDER BY sequence ASC,request_id ASC FOR UPDATE",
+                &[
+                    &current.session_id,
+                    &to_u64_i64(current.expected_generation, "lifecycle generation")?,
+                ],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_runtime_outbox)
+            .collect::<session::SessionResult<Vec<_>>>()?;
+        let next_generation = current.expected_generation.checked_add(1).ok_or_else(|| {
+            session::SessionError::Store("Session generation overflow".to_string())
+        })?;
+        let updated_at_ms = to_u64_i64(request.transition.updated_at_ms, "lifecycle fence time")?;
+        let updated_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(updated_at_ms)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        let changed = transaction
+            .execute(
+                "UPDATE session_records
+                    SET input_generation=$1,input_admission_open=FALSE,status=$2,
+                        last_activity=$3,updated_at_ms=GREATEST(updated_at_ms,$4)
+                  WHERE session_id=$5 AND input_generation=$6
+                    AND input_admission_open=TRUE",
+                &[
+                    &to_u64_i64(next_generation, "next Session generation")?,
+                    &request.transitional_status,
+                    &updated_at,
+                    &updated_at_ms,
+                    &current.session_id,
+                    &to_u64_i64(current.expected_generation, "lifecycle generation")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "Session lifecycle fence `{}` changed during admission close",
+                current.operation_id
+            )));
+        }
+        for before in active {
+            let changed = transaction
+                .execute(
+                    "UPDATE session_runtime_outbox
+                        SET status='expired',claim_owner=NULL,claim_token=NULL,
+                            claim_fence_epoch=NULL,
+                            claim_expires_at_ms=NULL,last_error=$1,terminal_at_ms=$2,
+                            updated_at_ms=$2,revision=revision+1
+                      WHERE request_id=$3 AND session_generation=$4 AND revision=$5",
+                    &[
+                        &request.reason,
+                        &updated_at_ms,
+                        &before.request_id,
+                        &to_u64_i64(current.expected_generation, "lifecycle input generation")?,
+                        &to_u64_i64(before.revision, "lifecycle input revision")?,
+                    ],
+                )
+                .map_err(postgres_error)?;
+            if changed != 1 {
+                return Err(session::SessionError::Store(format!(
+                    "Session lifecycle fence lost input `{}`",
+                    before.request_id
+                )));
+            }
+            let mut expired = before.clone();
+            expired.status = SessionRuntimeInputStatus::Expired;
+            expired.claim_owner = None;
+            expired.claim_token = None;
+            expired.claim_expires_at_ms = None;
+            expired.last_error = Some(request.reason.clone());
+            expired.terminal_at_ms = Some(request.transition.updated_at_ms);
+            expired.updated_at_ms = request.transition.updated_at_ms;
+            expired.revision = before.revision.saturating_add(1);
+            append_runtime_history_tx(
+                &mut transaction,
+                &expired,
+                "lifecycle_fence",
+                Some(&request.actor),
+                Some(before.revision),
+                before.status,
+                SessionRuntimeInputStatus::Expired,
+                Some(&request.reason),
+                request.transition.updated_at_ms,
+            )?;
+        }
+        let closed = SessionInputAdmission {
+            session_id: current.session_id.clone(),
+            generation: next_generation,
+            open: false,
+        };
+        append_admission_timeline_event_tx(
+            &mut transaction,
+            &current.session_id,
+            current.expected_generation,
+            &closed,
+            &request.actor,
+            &request.reason,
+            request.transition.updated_at_ms,
+        )?;
+        append_allocated_event_tx(&mut transaction, &request.event)?;
+        let intent = transition_lifecycle_intent_tx(&mut transaction, &request.transition)?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(intent)
+    }
+
+    pub fn transition_session_lifecycle(
+        &self,
+        transition: &SessionLifecycleTransition,
+    ) -> session::SessionResult<SessionLifecycleIntent> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let intent = transition_lifecycle_intent_tx(&mut transaction, transition)?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(intent)
+    }
+
+    pub fn commit_session_lifecycle_tombstone(
+        &self,
+        request: &SessionLifecycleTombstoneRequest,
+    ) -> session::SessionResult<SessionLifecycleIntent> {
+        validate_mission_request(&request.mission_outbox)?;
+        if request.mission_outbox.operation != SessionMissionOutboxOperation::Close {
+            return Err(session::SessionError::Store(
+                "Session tombstone requires a close Mission outbox intent".to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current =
+            query_lifecycle_intent_tx(&mut transaction, &request.transition.operation_id, true)?
+                .ok_or_else(|| {
+                    session::SessionError::Store(format!(
+                        "Session lifecycle intent `{}` does not exist",
+                        request.transition.operation_id
+                    ))
+                })?;
+        request.transition.validate(&current)?;
+        if request.transition.next_phase != SessionLifecyclePhase::TombstoneCommitted
+            || request.record.session_id != current.session_id
+            || request.mission_outbox.session_id != current.session_id
+            || request.event.session_id != current.session_id
+        {
+            return Err(session::SessionError::Store(
+                "Session lifecycle tombstone identity or phase is invalid".to_string(),
+            ));
+        }
+        query_input_admission_tx(&mut transaction, &current.session_id, true)?.ok_or_else(
+            || session::SessionError::Store(format!("session `{}` not found", current.session_id)),
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_records SET
+                     platform=$2,chat_id=$3,user_id=$4,model=$5,last_activity=$6,
+                     message_count=$7,reset_policy=$8,metadata_json=$9,input_tokens=$10,
+                     output_tokens=$11,estimated_cost_usd=$12,status=$13,updated_at_ms=$14
+                   WHERE session_id=$1 AND input_generation=$15
+                     AND input_admission_open=FALSE",
+                &[
+                    &request.record.session_id,
+                    &request.record.platform,
+                    &request.record.chat_id,
+                    &request.record.user_id,
+                    &request.record.model,
+                    &request.record.last_activity,
+                    &request.record.message_count,
+                    &request.record.reset_policy,
+                    &request.record.metadata_json,
+                    &request.record.input_tokens,
+                    &request.record.output_tokens,
+                    &request.record.estimated_cost_usd,
+                    &request.record.status,
+                    &to_u64_i64(request.transition.updated_at_ms, "lifecycle tombstone time")?,
+                    &to_u64_i64(
+                        current.expected_generation.saturating_add(1),
+                        "fenced Session generation",
+                    )?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "Session lifecycle tombstone `{}` lost fenced Session authority",
+                current.operation_id
+            )));
+        }
+        insert_mission_outbox_tx(&mut transaction, &request.mission_outbox)?;
+        append_allocated_event_tx(&mut transaction, &request.event)?;
+        let intent = transition_lifecycle_intent_tx(&mut transaction, &request.transition)?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(intent)
+    }
+
     pub fn delete_session_with_mission_outbox(
         &self,
         request: &SessionMissionOutboxRequest,
-    ) -> memory::store::Result<bool> {
+    ) -> session::SessionResult<bool> {
         validate_mission_request(request)?;
         if request.operation != SessionMissionOutboxOperation::Close {
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "session deletion requires a close mission outbox operation".to_string(),
             ));
         }
@@ -2019,7 +3239,7 @@ impl PostgresSessionStore {
     pub fn get_session_mission_outbox(
         &self,
         request_id: &str,
-    ) -> memory::store::Result<Option<SessionMissionOutboxRecord>> {
+    ) -> session::SessionResult<Option<SessionMissionOutboxRecord>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query_opt(MISSION_OUTBOX_SELECT, &[&request_id])
@@ -2035,7 +3255,7 @@ impl PostgresSessionStore {
         now_ms: u64,
         lease_ms: u64,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionMissionOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionMissionOutboxRecord>> {
         if workspace_key.trim().is_empty() || worker_id.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -2043,7 +3263,7 @@ impl PostgresSessionStore {
         let lease_expires = now
             .checked_add(to_u64_i64(lease_ms, "mission outbox lease")?)
             .ok_or_else(|| {
-                memory::MemoryError::Store("mission outbox lease overflow".to_string())
+                session::SessionError::Store("mission outbox lease overflow".to_string())
             })?;
         let limit = to_i64(limit.min(500), "mission outbox limit")?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
@@ -2094,7 +3314,7 @@ impl PostgresSessionStore {
         worker_id: &str,
         expected_revision: u64,
         now_ms: u64,
-    ) -> memory::store::Result<SessionMissionOutboxRecord> {
+    ) -> session::SessionResult<SessionMissionOutboxRecord> {
         self.transition_mission_outbox(
             request_id,
             worker_id,
@@ -2107,6 +3327,7 @@ impl PostgresSessionStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn fail_session_mission_outbox(
         &self,
         request_id: &str,
@@ -2117,7 +3338,7 @@ impl PostgresSessionStore {
         retry_at_ms: u64,
         max_attempts: u32,
         now_ms: u64,
-    ) -> memory::store::Result<SessionMissionOutboxRecord> {
+    ) -> session::SessionResult<SessionMissionOutboxRecord> {
         let now = to_u64_i64(now_ms, "mission outbox clock")?;
         let retry_at = to_u64_i64(retry_at_ms, "mission outbox retry")?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
@@ -2156,6 +3377,7 @@ impl PostgresSessionStore {
         Ok(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn transition_mission_outbox(
         &self,
         request_id: &str,
@@ -2166,14 +3388,14 @@ impl PostgresSessionStore {
         failure_class: Option<OutboxFailureClass>,
         error: Option<&str>,
         action: &str,
-    ) -> memory::store::Result<SessionMissionOutboxRecord> {
+    ) -> session::SessionResult<SessionMissionOutboxRecord> {
         let now = to_u64_i64(now_ms, "mission outbox clock")?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = mission_outbox_for_update(&mut transaction, request_id)?;
         assert_mission_lease(&existing, worker_id, expected_revision, now_ms)?;
         let status = OutboxStatus::parse(next_status)
-            .map_err(|error| memory::MemoryError::Store(error.to_string()))?;
+            .map_err(|error| session::SessionError::Store(error.to_string()))?;
         let row = transaction.query_one(
             "UPDATE session_mission_outbox SET status=$1, claim_owner=NULL, claim_expires_at_ms=NULL,
                     failure_class=$2, last_error=$3, revision=revision+1, updated_at_ms=$4
@@ -2202,7 +3424,7 @@ impl PostgresSessionStore {
         &self,
         message: &SessionMessage,
         request: &SessionRuntimeOutboxRequest,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         validate_runtime_request(message, request)?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
@@ -2213,24 +3435,28 @@ impl PostgresSessionStore {
             )
             .map_err(postgres_error)?;
         if let Some(existing) = runtime_outbox_tx(&mut transaction, &request.request_id)? {
-            if existing.turn_id == request.turn_id
+            if existing.input_id == request.input_id
+                && existing.turn_id == request.turn_id
                 && existing.message_id == request.message_id
                 && existing.session_id == message.session_id
                 && existing.sequence == message.sequence
+                && existing.session_generation == request.session_generation
+                && existing.decision == request.decision
+                && existing.target_turn_id == request.target_turn_id
             {
                 transaction.commit().map_err(postgres_error)?;
                 return Ok(existing);
             }
-            return Err(memory::MemoryError::Store(format!(
+            return Err(session::SessionError::Store(format!(
                 "outbox request_id `{}` is already bound to another message",
                 request.request_id
             )));
         }
-        if message.stable_message_id != request.message_id {
-            return Err(memory::MemoryError::Store(
-                "runtime outbox message identity must equal stable message identity".to_string(),
-            ));
-        }
+        require_input_admission_tx(
+            &mut transaction,
+            &message.session_id,
+            request.session_generation,
+        )?;
         insert_message_tx(&mut transaction, message)?;
         refresh_session_message_summary_tx(
             &mut transaction,
@@ -2249,14 +3475,12 @@ impl PostgresSessionStore {
         content_json: Option<&str>,
         created_at_ms: u64,
         request: &SessionRuntimeOutboxRequest,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         if session_id.trim().is_empty()
             || role.trim().is_empty()
-            || request.request_id.trim().is_empty()
-            || request.turn_id.trim().is_empty()
-            || request.message_id.trim().is_empty()
+            || request.input_id.trim().is_empty()
         {
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "ingress outbox requires non-empty session, role and request identities"
                     .to_string(),
             ));
@@ -2270,18 +3494,24 @@ impl PostgresSessionStore {
             )
             .map_err(postgres_error)?;
         if let Some(existing) = runtime_outbox_tx(&mut transaction, &request.request_id)? {
-            if existing.session_id == session_id
+            if existing.input_id == request.input_id
+                && existing.session_id == session_id
                 && existing.message_id == request.message_id
                 && existing.turn_id == request.turn_id
+                && existing.session_generation == request.session_generation
+                && existing.decision == request.decision
+                && existing.target_turn_id == request.target_turn_id
             {
                 transaction.commit().map_err(postgres_error)?;
                 return Ok(existing);
             }
-            return Err(memory::MemoryError::Store(format!(
+            return Err(session::SessionError::Store(format!(
                 "outbox request `{}` conflicts with its committed ingress",
                 request.request_id
             )));
         }
+        validate_runtime_input_request(request)?;
+        require_input_admission_tx(&mut transaction, session_id, request.session_generation)?;
         let sequence: i64 = transaction
             .query_one(
                 "SELECT COALESCE(MAX(sequence), -1) + 1 FROM session_messages WHERE session_id=$1",
@@ -2290,9 +3520,7 @@ impl PostgresSessionStore {
             .map_err(postgres_error)?
             .try_get(0)
             .map_err(postgres_error)?;
-        let content_json = content_json.ok_or_else(|| {
-            memory::MemoryError::Store("ingress message requires content_json".to_string())
-        })?;
+        let content_json = content_json.unwrap_or("[]");
         let message = SessionMessage {
             stable_message_id: request.message_id.clone(),
             session_id: session_id.to_string(),
@@ -2318,9 +3546,9 @@ impl PostgresSessionStore {
         now_ms: u64,
         lease_ms: u64,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         if worker_id.trim().is_empty() || lease_ms == 0 || limit == 0 {
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "outbox claim requires worker_id, positive lease and positive limit".to_string(),
             ));
         }
@@ -2328,39 +3556,82 @@ impl PostgresSessionStore {
         let expires = now
             .checked_add(to_u64_i64(lease_ms, "runtime outbox lease")?)
             .ok_or_else(|| {
-                memory::MemoryError::Store("runtime outbox lease overflow".to_string())
+                session::SessionError::Store("runtime outbox lease overflow".to_string())
             })?;
         let limit = to_i64(limit.min(500), "runtime outbox limit")?;
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let rows = transaction.query(
-            "WITH candidates AS (
-               SELECT request_id,status FROM session_runtime_outbox
-                WHERE ((status IN ('pending','retry_scheduled') AND next_attempt_at_ms <= $1)
-                   OR (status='claimed' AND claim_expires_at_ms <= $1))
-                ORDER BY next_attempt_at_ms ASC, sequence ASC, request_id ASC
-                FOR UPDATE SKIP LOCKED LIMIT $2
-             ) UPDATE session_runtime_outbox o SET status='claimed', attempts=o.attempts+1,
-                    claim_owner=$3, claim_expires_at_ms=$4, updated_at_ms=$1, revision=o.revision+1
-               FROM candidates c WHERE o.request_id=c.request_id
-             RETURNING o.request_id,o.turn_id,o.message_id,o.session_id,o.sequence,o.status,
-                       o.runtime_commit_cursor,o.attempts,o.next_attempt_at_ms,o.claim_owner,
-                       o.claim_expires_at_ms,o.failure_class,o.last_error,o.revision,o.created_at_ms,
-                       o.updated_at_ms,o.runtime_options_json",
+            "WITH ranked AS (
+                 SELECT o.request_id,o.status,o.session_id,o.session_generation,o.sequence,
+                        o.next_attempt_at_ms,o.claim_expires_at_ms,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY o.session_id,o.session_generation
+                            ORDER BY o.sequence ASC,o.request_id ASC
+                        ) AS session_rank
+                   FROM session_runtime_outbox o
+                   JOIN session_records s ON s.session_id=o.session_id
+                  WHERE o.status IN (
+                            'accepted','classified','queued','claimed','running','reclassified'
+                        )
+                    AND o.session_generation=s.input_generation
+                    AND s.input_admission_open=TRUE
+             ), candidates AS (
+                 SELECT o.request_id,o.status AS previous_status
+                   FROM session_runtime_outbox o
+                   JOIN ranked r ON r.request_id=o.request_id
+                  WHERE r.session_rank=1
+                    AND (
+                        (r.status IN ('queued','reclassified') AND r.next_attempt_at_ms <= $1)
+                        OR (r.status IN ('claimed','running') AND r.claim_expires_at_ms <= $1)
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM session_runtime_outbox held
+                         WHERE held.session_id=r.session_id
+                           AND held.session_generation=r.session_generation
+                           AND held.request_id<>r.request_id
+                           AND held.status IN ('claimed','running')
+                           AND held.claim_expires_at_ms > $1
+                    )
+                  ORDER BY r.next_attempt_at_ms ASC,r.sequence ASC,r.request_id ASC
+                  FOR UPDATE OF o SKIP LOCKED LIMIT $2
+             ), updated AS (
+                 UPDATE session_runtime_outbox o
+                    SET status='claimed',attempts=o.attempts+1,claim_owner=$3,
+                        claim_token=o.request_id || ':' || (o.revision+1)::text
+                            || ':' || $1::text || ':' || $3,
+                        claim_fence_epoch=o.revision+1,
+                        claim_expires_at_ms=$4,updated_at_ms=$1,revision=o.revision+1
+                   FROM candidates c WHERE o.request_id=c.request_id
+                 RETURNING o.*,c.previous_status
+             )
+             SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+                    decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                    next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
+                    last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,
+                    runtime_options_json,claim_fence_epoch,previous_status
+               FROM updated
+              ORDER BY next_attempt_at_ms ASC,sequence ASC,request_id ASC",
             &[&now,&limit,&worker_id,&expires],
         ).map_err(postgres_error)?;
         let mut claimed = Vec::with_capacity(rows.len());
         for row in rows {
             let record = row_to_runtime_outbox(&row)?;
+            let previous: String = row.try_get(25).map_err(postgres_error)?;
+            let previous = parse_runtime_status(&previous)?;
             append_runtime_history_tx(
                 &mut transaction,
                 &record,
-                "claim",
+                if previous.holds_claim() {
+                    "reclaim"
+                } else {
+                    "claim"
+                },
                 Some(worker_id),
                 None,
-                OutboxStatus::Pending,
-                OutboxStatus::Claimed,
-                None,
+                previous,
+                SessionRuntimeInputStatus::Claimed,
+                record.claim_token.as_deref(),
                 now_ms,
             )?;
             claimed.push(record);
@@ -2369,67 +3640,59 @@ impl PostgresSessionStore {
         Ok(claimed)
     }
 
-    pub fn ack_session_runtime_outbox(
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_session_runtime_outbox_running(
         &self,
         request_id: &str,
         worker_id: &str,
-        expected_revision: u64,
-        runtime_commit_cursor: u64,
-        now_ms: u64,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-        self.transition_runtime_outbox(
-            request_id,
-            worker_id,
-            expected_revision,
-            now_ms,
-            Some(runtime_commit_cursor),
-            OutboxStatus::Materialized,
-            None,
-            None,
-            None,
-            "ack",
-        )
-    }
-
-    pub fn renew_session_runtime_outbox_lease(
-        &self,
-        request_id: &str,
-        worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
         expected_revision: u64,
         now_ms: u64,
-        lease_ms: u64,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-        if lease_ms == 0 {
-            return Err(memory::MemoryError::Store(
-                "outbox lease renewal requires a positive lease".to_string(),
-            ));
-        }
-        let now = to_u64_i64(now_ms, "runtime outbox clock")?;
-        let expires = now
-            .checked_add(to_u64_i64(lease_ms, "runtime outbox lease")?)
-            .ok_or_else(|| {
-                memory::MemoryError::Store("runtime outbox lease overflow".to_string())
-            })?;
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
-        let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
-        assert_runtime_lease(&existing, worker_id, expected_revision, now_ms)?;
-        let row = transaction.query_one(
-            "UPDATE session_runtime_outbox SET claim_expires_at_ms=$1,updated_at_ms=$2,revision=revision+1
-              WHERE request_id=$3 RETURNING request_id,turn_id,message_id,session_id,sequence,status,
-                runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,
-                failure_class,last_error,revision,created_at_ms,updated_at_ms,runtime_options_json",
-            &[&expires,&now,&request_id],
-        ).map_err(postgres_error)?;
-        let record = row_to_runtime_outbox(&row)?;
+        let current = runtime_outbox_for_update(&mut transaction, request_id)?;
+        assert_runtime_lease(
+            &mut transaction,
+            &current,
+            worker_id,
+            session_generation,
+            claim_token,
+            expected_revision,
+            now_ms,
+            &[SessionRuntimeInputStatus::Claimed],
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_runtime_outbox
+                SET status='running',updated_at_ms=$1,revision=revision+1
+              WHERE request_id=$2 AND status='claimed' AND session_generation=$3
+                AND claim_owner=$4 AND claim_token=$5 AND revision=$6",
+                &[
+                    &to_u64_i64(now_ms, "runtime clock")?,
+                    &request_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &worker_id,
+                    &claim_token,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "outbox `{request_id}` changed during running transition"
+            )));
+        }
+        let record = runtime_outbox_for_update(&mut transaction, request_id)?;
         append_runtime_history_tx(
             &mut transaction,
             &record,
-            "renew_lease",
+            "start",
             Some(worker_id),
             Some(expected_revision),
-            OutboxStatus::Claimed,
-            OutboxStatus::Claimed,
+            current.status,
+            SessionRuntimeInputStatus::Running,
             None,
             now_ms,
         )?;
@@ -2437,27 +3700,212 @@ impl PostgresSessionStore {
         Ok(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn ack_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
+        expected_revision: u64,
+        terminal_status: SessionRuntimeInputStatus,
+        runtime_commit_cursor: u64,
+        now_ms: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        if !matches!(
+            terminal_status,
+            SessionRuntimeInputStatus::Completed
+                | SessionRuntimeInputStatus::Supplemented
+                | SessionRuntimeInputStatus::Cancelled
+        ) {
+            return Err(session::SessionError::Store(
+                "ack terminal status must be completed, supplemented, or cancelled".to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current = runtime_outbox_for_update(&mut transaction, request_id)?;
+        assert_runtime_lease(
+            &mut transaction,
+            &current,
+            worker_id,
+            session_generation,
+            claim_token,
+            expected_revision,
+            now_ms,
+            &[SessionRuntimeInputStatus::Running],
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_runtime_outbox
+                SET status=$1,runtime_commit_cursor=$2,claim_owner=NULL,claim_token=NULL,
+                    claim_fence_epoch=NULL,
+                    claim_expires_at_ms=NULL,terminal_at_ms=$3,failure_class=NULL,last_error=NULL,
+                    updated_at_ms=$3,revision=revision+1
+              WHERE request_id=$4 AND status='running' AND session_generation=$5
+                AND claim_owner=$6 AND claim_token=$7 AND revision=$8",
+                &[
+                    &terminal_status.as_str(),
+                    &to_u64_i64(runtime_commit_cursor, "runtime cursor")?,
+                    &to_u64_i64(now_ms, "runtime clock")?,
+                    &request_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &worker_id,
+                    &claim_token,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "outbox `{request_id}` changed during terminal transition"
+            )));
+        }
+        let record = runtime_outbox_for_update(&mut transaction, request_id)?;
+        append_runtime_history_tx(
+            &mut transaction,
+            &record,
+            "ack",
+            Some(worker_id),
+            Some(expected_revision),
+            current.status,
+            terminal_status,
+            None,
+            now_ms,
+        )?;
+        append_input_timeline_event_tx(
+            &mut transaction,
+            &request_from_outbox(&record),
+            &record.session_id,
+            record.sequence,
+            "session.input.terminal.v1",
+            terminal_status,
+            Some(worker_id),
+            None,
+            now_ms,
+        )?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn renew_session_runtime_outbox_lease(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
+        expected_revision: u64,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        if lease_ms == 0 {
+            return Err(session::SessionError::Store(
+                "outbox lease renewal requires a positive lease".to_string(),
+            ));
+        }
+        let now = to_u64_i64(now_ms, "runtime outbox clock")?;
+        let expires = now
+            .checked_add(to_u64_i64(lease_ms, "runtime outbox lease")?)
+            .ok_or_else(|| {
+                session::SessionError::Store("runtime outbox lease overflow".to_string())
+            })?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
+        assert_runtime_lease(
+            &mut transaction,
+            &existing,
+            worker_id,
+            session_generation,
+            claim_token,
+            expected_revision,
+            now_ms,
+            &[
+                SessionRuntimeInputStatus::Claimed,
+                SessionRuntimeInputStatus::Running,
+            ],
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_runtime_outbox
+                SET claim_expires_at_ms=$1,updated_at_ms=$2,revision=revision+1
+              WHERE request_id=$3 AND status IN ('claimed','running')
+                AND session_generation=$4 AND claim_owner=$5
+                AND claim_token=$6 AND revision=$7",
+                &[
+                    &expires,
+                    &now,
+                    &request_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &worker_id,
+                    &claim_token,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "outbox lease for `{request_id}` changed during renewal"
+            )));
+        }
+        let record = runtime_outbox_for_update(&mut transaction, request_id)?;
+        append_runtime_history_tx(
+            &mut transaction,
+            &record,
+            "renew_lease",
+            Some(worker_id),
+            Some(expected_revision),
+            existing.status,
+            existing.status,
+            None,
+            now_ms,
+        )?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn fail_session_runtime_outbox(
         &self,
         request_id: &str,
         worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
         expected_revision: u64,
         failure_class: OutboxFailureClass,
         error: &str,
         retry_at_ms: u64,
         max_attempts: u32,
         now_ms: u64,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
-        assert_runtime_lease(&existing, worker_id, expected_revision, now_ms)?;
+        assert_runtime_lease(
+            &mut transaction,
+            &existing,
+            worker_id,
+            session_generation,
+            claim_token,
+            expected_revision,
+            now_ms,
+            &[
+                SessionRuntimeInputStatus::Claimed,
+                SessionRuntimeInputStatus::Running,
+            ],
+        )?;
         let retry = failure_class == OutboxFailureClass::Retryable
             && existing.attempts < max_attempts.max(1);
         let next = if retry {
-            OutboxStatus::RetryScheduled
+            SessionRuntimeInputStatus::Queued
+        } else if matches!(
+            failure_class,
+            OutboxFailureClass::AuthorizationBlocked | OutboxFailureClass::CorruptPayload
+        ) {
+            SessionRuntimeInputStatus::Blocked
         } else {
-            OutboxStatus::BlockedMaterialization
+            SessionRuntimeInputStatus::Failed
         };
         let now = to_u64_i64(now_ms, "runtime outbox clock")?;
         let retry_at = if retry {
@@ -2465,20 +3913,51 @@ impl PostgresSessionStore {
         } else {
             now
         };
-        let row = transaction.query_one(
-            "UPDATE session_runtime_outbox SET status=$1,next_attempt_at_ms=$2,claim_owner=NULL,
-                    claim_expires_at_ms=NULL,failure_class=$3,last_error=$4,updated_at_ms=$5,
-                    revision=revision+1 WHERE request_id=$6 RETURNING
-                    request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,
-                    attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,
-                    revision,created_at_ms,updated_at_ms,runtime_options_json",
-            &[&next.as_str(),&retry_at,&failure_class.as_str(),&error,&now,&request_id],
-        ).map_err(postgres_error)?;
+        let row = transaction
+            .query_one(
+                "UPDATE session_runtime_outbox
+                SET status=$1,next_attempt_at_ms=$2,claim_owner=NULL,claim_token=NULL,
+                    claim_fence_epoch=NULL,
+                    claim_expires_at_ms=NULL,terminal_at_ms=$3,failure_class=$4,last_error=$5,
+                    updated_at_ms=$6,revision=revision+1
+              WHERE request_id=$7 AND status IN ('claimed','running')
+                AND session_generation=$8 AND claim_owner=$9
+                AND claim_token=$10 AND revision=$11
+            RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,
+                      session_generation,decision,target_turn_id,classification_json,status,
+                      runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                      claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                      updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                &[
+                    &next.as_str(),
+                    &retry_at,
+                    &if next == SessionRuntimeInputStatus::Failed {
+                        Some(now)
+                    } else {
+                        None
+                    },
+                    &failure_class.as_str(),
+                    &error,
+                    &now,
+                    &request_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &worker_id,
+                    &claim_token,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
         let record = row_to_runtime_outbox(&row)?;
         append_runtime_history_tx(
             &mut transaction,
             &record,
-            if retry { "retry" } else { "block" },
+            if retry {
+                "retry"
+            } else if next == SessionRuntimeInputStatus::Blocked {
+                "block"
+            } else {
+                "fail"
+            },
             Some(worker_id),
             Some(expected_revision),
             existing.status,
@@ -2490,16 +3969,121 @@ impl PostgresSessionStore {
         Ok(record)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn requeue_claimed_session_runtime_outbox(
+        &self,
+        request_id: &str,
+        worker_id: &str,
+        session_generation: u64,
+        claim_token: &str,
+        expected_revision: u64,
+        decision: InputRoutingDecision,
+        target_turn_id: Option<&str>,
+        classification_json: Option<&str>,
+        reason: &str,
+        now_ms: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        let validation = SessionRuntimeOutboxRequest {
+            input_id: "validation".to_string(),
+            request_id: request_id.to_string(),
+            turn_id: "validation".to_string(),
+            message_id: "validation".to_string(),
+            session_generation,
+            decision,
+            target_turn_id: target_turn_id.map(str::to_string),
+            classification_json: classification_json.map(str::to_string),
+            created_at_ms: now_ms,
+            runtime_options_json: None,
+        };
+        validate_runtime_input_request(&validation)?;
+        if worker_id.trim().is_empty() || claim_token.trim().is_empty() || reason.trim().is_empty()
+        {
+            return Err(session::SessionError::Store(
+                "claimed input requeue requires worker, claim token, and reason".to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current = runtime_outbox_for_update(&mut transaction, request_id)?;
+        assert_runtime_lease(
+            &mut transaction,
+            &current,
+            worker_id,
+            session_generation,
+            claim_token,
+            expected_revision,
+            now_ms,
+            &[
+                SessionRuntimeInputStatus::Claimed,
+                SessionRuntimeInputStatus::Running,
+            ],
+        )?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_runtime_outbox
+                SET decision=$1,target_turn_id=$2,classification_json=$3,status='reclassified',
+                    next_attempt_at_ms=$4,claim_owner=NULL,claim_token=NULL,
+                    claim_fence_epoch=NULL,
+                    claim_expires_at_ms=NULL,failure_class=NULL,last_error=NULL,terminal_at_ms=NULL,
+                    updated_at_ms=$4,revision=revision+1
+              WHERE request_id=$5 AND session_generation=$6 AND claim_owner=$7
+                AND claim_token=$8 AND revision=$9 AND status IN ('claimed','running')",
+                &[
+                    &input_decision_as_str(decision),
+                    &target_turn_id,
+                    &classification_json,
+                    &to_u64_i64(now_ms, "runtime clock")?,
+                    &request_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &worker_id,
+                    &claim_token,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "outbox `{request_id}` changed during claimed requeue"
+            )));
+        }
+        let updated = runtime_outbox_for_update(&mut transaction, request_id)?;
+        append_runtime_history_tx(
+            &mut transaction,
+            &updated,
+            "owner_reclassify_requeue",
+            Some(worker_id),
+            Some(expected_revision),
+            current.status,
+            SessionRuntimeInputStatus::Reclassified,
+            Some(reason),
+            now_ms,
+        )?;
+        append_input_timeline_event_tx(
+            &mut transaction,
+            &request_from_outbox(&updated),
+            &updated.session_id,
+            updated.sequence,
+            "session.input.reclassified.v1",
+            updated.status,
+            Some(worker_id),
+            Some(reason),
+            now_ms,
+        )?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(updated)
+    }
+
     pub fn retry_blocked_session_runtime_outbox(
         &self,
         request_id: &str,
+        session_generation: u64,
         expected_revision: u64,
         actor: &str,
         reason: &str,
         now_ms: u64,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         if actor.trim().is_empty() || reason.trim().is_empty() {
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "manual outbox retry requires actor and reason".to_string(),
             ));
         }
@@ -2507,21 +4091,36 @@ impl PostgresSessionStore {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
-        if existing.status != OutboxStatus::BlockedMaterialization
+        require_input_admission_tx(&mut transaction, &existing.session_id, session_generation)?;
+        if existing.status != SessionRuntimeInputStatus::Blocked
+            || existing.session_generation != session_generation
             || existing.revision != expected_revision
         {
-            return Err(memory::MemoryError::Store(format!(
+            return Err(session::SessionError::Store(format!(
                 "outbox `{request_id}` is not blocked at revision {expected_revision}"
             )));
         }
-        let row = transaction.query_one(
-            "UPDATE session_runtime_outbox SET status='pending',next_attempt_at_ms=$1,claim_owner=NULL,
-                    claim_expires_at_ms=NULL,failure_class=NULL,updated_at_ms=$1,revision=revision+1
-              WHERE request_id=$2 RETURNING request_id,turn_id,message_id,session_id,sequence,status,
-                    runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,
-                    failure_class,last_error,revision,created_at_ms,updated_at_ms,runtime_options_json",
-            &[&now,&request_id],
-        ).map_err(postgres_error)?;
+        let row = transaction
+            .query_one(
+                "UPDATE session_runtime_outbox
+                SET status='queued',next_attempt_at_ms=$1,claim_owner=NULL,claim_token=NULL,
+                    claim_fence_epoch=NULL,
+                    claim_expires_at_ms=NULL,failure_class=NULL,last_error=NULL,
+                    terminal_at_ms=NULL,updated_at_ms=$1,revision=revision+1
+              WHERE request_id=$2 AND session_generation=$3 AND revision=$4 AND status='blocked'
+            RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,
+                      session_generation,decision,target_turn_id,classification_json,status,
+                      runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                      claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                      updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                &[
+                    &now,
+                    &request_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
         let record = row_to_runtime_outbox(&row)?;
         append_runtime_history_tx(
             &mut transaction,
@@ -2529,8 +4128,8 @@ impl PostgresSessionStore {
             "manual_retry",
             Some(actor),
             Some(expected_revision),
-            OutboxStatus::BlockedMaterialization,
-            OutboxStatus::Pending,
+            SessionRuntimeInputStatus::Blocked,
+            SessionRuntimeInputStatus::Queued,
             Some(reason),
             now_ms,
         )?;
@@ -2538,13 +4137,376 @@ impl PostgresSessionStore {
         Ok(record)
     }
 
+    pub fn cancel_session_runtime_outbox(
+        &self,
+        input_id: &str,
+        session_generation: u64,
+        expected_revision: u64,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        if actor.trim().is_empty() || reason.trim().is_empty() {
+            return Err(session::SessionError::Store(
+                "session input cancellation requires actor and reason".to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+        if current.session_generation != session_generation
+            || current.revision != expected_revision
+            || current.status.is_terminal()
+        {
+            return Err(session::SessionError::Store(format!(
+                "session input `{input_id}` cannot be cancelled at generation {session_generation} revision {expected_revision}"
+            )));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE session_runtime_outbox
+                SET status='cancelled',claim_owner=NULL,claim_token=NULL,
+                    claim_fence_epoch=NULL,
+                    claim_expires_at_ms=NULL,last_error=$1,terminal_at_ms=$2,
+                    updated_at_ms=$2,revision=revision+1
+              WHERE input_id=$3 AND session_generation=$4 AND revision=$5
+                AND status NOT IN ('completed','supplemented','failed','cancelled','expired')",
+                &[
+                    &reason,
+                    &to_u64_i64(now_ms, "runtime clock")?,
+                    &input_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "session input `{input_id}` changed during cancellation"
+            )));
+        }
+        let updated = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+        append_runtime_history_tx(
+            &mut transaction,
+            &updated,
+            "cancel",
+            Some(actor),
+            Some(expected_revision),
+            current.status,
+            SessionRuntimeInputStatus::Cancelled,
+            Some(reason),
+            now_ms,
+        )?;
+        append_input_timeline_event_tx(
+            &mut transaction,
+            &request_from_outbox(&updated),
+            &updated.session_id,
+            updated.sequence,
+            "session.input.cancelled.v1",
+            updated.status,
+            Some(actor),
+            Some(reason),
+            now_ms,
+        )?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(updated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reclassify_session_runtime_outbox(
+        &self,
+        input_id: &str,
+        session_generation: u64,
+        expected_revision: u64,
+        decision: InputRoutingDecision,
+        target_turn_id: Option<&str>,
+        classification_json: Option<&str>,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        let validation = SessionRuntimeOutboxRequest {
+            input_id: input_id.to_string(),
+            request_id: "validation".to_string(),
+            turn_id: "validation".to_string(),
+            message_id: "validation".to_string(),
+            session_generation,
+            decision,
+            target_turn_id: target_turn_id.map(str::to_string),
+            classification_json: classification_json.map(str::to_string),
+            created_at_ms: now_ms,
+            runtime_options_json: None,
+        };
+        validate_runtime_input_request(&validation)?;
+        if actor.trim().is_empty() || reason.trim().is_empty() {
+            return Err(session::SessionError::Store(
+                "session input reclassification requires actor and reason".to_string(),
+            ));
+        }
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+        require_input_admission_tx(&mut transaction, &current.session_id, session_generation)?;
+        if current.session_generation != session_generation
+            || current.revision != expected_revision
+            || !matches!(
+                current.status,
+                SessionRuntimeInputStatus::Accepted
+                    | SessionRuntimeInputStatus::Classified
+                    | SessionRuntimeInputStatus::Queued
+                    | SessionRuntimeInputStatus::Reclassified
+                    | SessionRuntimeInputStatus::Blocked
+            )
+        {
+            return Err(session::SessionError::Store(format!(
+                "session input `{input_id}` is not reclassifiable at generation {session_generation} revision {expected_revision}"
+            )));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE session_runtime_outbox
+                SET decision=$1,target_turn_id=$2,classification_json=$3,status='reclassified',
+                    next_attempt_at_ms=$4,failure_class=NULL,last_error=NULL,terminal_at_ms=NULL,
+                    claim_owner=NULL,claim_token=NULL,claim_fence_epoch=NULL,
+                    claim_expires_at_ms=NULL,
+                    updated_at_ms=$4,revision=revision+1
+              WHERE input_id=$5 AND session_generation=$6 AND revision=$7
+                AND status IN ('accepted','classified','queued','reclassified','blocked')",
+                &[
+                    &input_decision_as_str(decision),
+                    &target_turn_id,
+                    &classification_json,
+                    &to_u64_i64(now_ms, "runtime clock")?,
+                    &input_id,
+                    &to_u64_i64(session_generation, "session generation")?,
+                    &to_u64_i64(expected_revision, "runtime revision")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "session input `{input_id}` changed during reclassification"
+            )));
+        }
+        let updated = runtime_outbox_by_input_id_for_update(&mut transaction, input_id)?;
+        append_runtime_history_tx(
+            &mut transaction,
+            &updated,
+            "reclassify",
+            Some(actor),
+            Some(expected_revision),
+            current.status,
+            SessionRuntimeInputStatus::Reclassified,
+            Some(reason),
+            now_ms,
+        )?;
+        append_input_timeline_event_tx(
+            &mut transaction,
+            &request_from_outbox(&updated),
+            &updated.session_id,
+            updated.sequence,
+            "session.input.reclassified.v1",
+            updated.status,
+            Some(actor),
+            Some(reason),
+            now_ms,
+        )?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(updated)
+    }
+
+    pub fn get_session_input_admission(
+        &self,
+        session_id: &str,
+    ) -> session::SessionResult<Option<SessionInputAdmission>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT session_id,input_generation,input_admission_open
+                   FROM session_records WHERE session_id=$1",
+                &[&session_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| {
+                Ok(SessionInputAdmission {
+                    session_id: row.try_get(0).map_err(postgres_error)?,
+                    generation: i64_to_u64(
+                        row.try_get(1).map_err(postgres_error)?,
+                        "session input generation",
+                    )?,
+                    open: row.try_get(2).map_err(postgres_error)?,
+                })
+            })
+            .transpose()
+    }
+
+    pub fn close_session_input_admission(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> session::SessionResult<SessionInputAdmission> {
+        self.advance_session_input_generation(
+            session_id,
+            expected_generation,
+            false,
+            actor,
+            reason,
+            now_ms,
+        )
+    }
+
+    pub fn advance_session_input_generation(
+        &self,
+        session_id: &str,
+        expected_generation: u64,
+        open: bool,
+        actor: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> session::SessionResult<SessionInputAdmission> {
+        if actor.trim().is_empty() || reason.trim().is_empty() {
+            return Err(session::SessionError::Store(
+                "session generation advance requires actor and reason".to_string(),
+            ));
+        }
+        let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
+            session::SessionError::Store("session generation overflow".to_string())
+        })?;
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let mut transaction = connection.transaction().map_err(postgres_error)?;
+        let current =
+            query_input_admission_tx(&mut transaction, session_id, true)?.ok_or_else(|| {
+                session::SessionError::Store(format!("session `{session_id}` not found"))
+            })?;
+        if current.generation != expected_generation {
+            return Err(session::SessionError::Store(format!(
+                "session `{session_id}` generation changed from expected {expected_generation}"
+            )));
+        }
+        let rows = transaction
+            .query(
+                "SELECT request_id,status,revision
+               FROM session_runtime_outbox
+              WHERE session_id=$1 AND session_generation=$2
+                AND status IN (
+                    'accepted','classified','queued','claimed','running','reclassified','blocked'
+                )
+              ORDER BY sequence ASC,request_id ASC FOR UPDATE",
+                &[
+                    &session_id,
+                    &to_u64_i64(expected_generation, "session generation")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        let changed = transaction
+            .execute(
+                "UPDATE session_records
+                SET input_generation=$1,input_admission_open=$2,
+                    updated_at_ms=GREATEST(updated_at_ms,$3)
+              WHERE session_id=$4 AND input_generation=$5",
+                &[
+                    &to_u64_i64(next_generation, "session generation")?,
+                    &open,
+                    &to_u64_i64(now_ms, "runtime clock")?,
+                    &session_id,
+                    &to_u64_i64(expected_generation, "session generation")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        if changed != 1 {
+            return Err(session::SessionError::Store(format!(
+                "session `{session_id}` generation changed during advance"
+            )));
+        }
+        for row in rows {
+            let request_id: String = row.try_get(0).map_err(postgres_error)?;
+            let previous =
+                parse_runtime_status(&row.try_get::<_, String>(1).map_err(postgres_error)?)?;
+            let revision = i64_to_u64(row.try_get(2).map_err(postgres_error)?, "runtime revision")?;
+            let expired = transaction
+                .query_one(
+                    "UPDATE session_runtime_outbox
+                    SET status='expired',claim_owner=NULL,claim_token=NULL,
+                        claim_fence_epoch=NULL,
+                        claim_expires_at_ms=NULL,last_error=$1,terminal_at_ms=$2,
+                        updated_at_ms=$2,revision=revision+1
+                  WHERE request_id=$3 AND session_generation=$4 AND revision=$5
+                RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,
+                          session_generation,decision,target_turn_id,classification_json,status,
+                          runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                          claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                          updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+                    &[
+                        &reason,
+                        &to_u64_i64(now_ms, "runtime clock")?,
+                        &request_id,
+                        &to_u64_i64(expected_generation, "session generation")?,
+                        &to_u64_i64(revision, "runtime revision")?,
+                    ],
+                )
+                .map_err(postgres_error)?;
+            let expired = row_to_runtime_outbox(&expired)?;
+            append_runtime_history_tx(
+                &mut transaction,
+                &expired,
+                "generation_expire",
+                Some(actor),
+                Some(revision),
+                previous,
+                SessionRuntimeInputStatus::Expired,
+                Some(reason),
+                now_ms,
+            )?;
+        }
+        let admission =
+            query_input_admission_tx(&mut transaction, session_id, false)?.ok_or_else(|| {
+                session::SessionError::Store(format!(
+                    "session `{session_id}` disappeared after generation advance"
+                ))
+            })?;
+        append_admission_timeline_event_tx(
+            &mut transaction,
+            session_id,
+            expected_generation,
+            &admission,
+            actor,
+            reason,
+            now_ms,
+        )?;
+        transaction.commit().map_err(postgres_error)?;
+        Ok(admission)
+    }
+
     pub fn get_session_runtime_outbox(
         &self,
         request_id: &str,
-    ) -> memory::store::Result<Option<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Option<SessionRuntimeOutboxRecord>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query_opt(RUNTIME_OUTBOX_SELECT, &[&request_id])
+            .map_err(postgres_error)?
+            .map(|row| row_to_runtime_outbox(&row))
+            .transpose()
+    }
+
+    pub fn get_session_runtime_outbox_by_input_id(
+        &self,
+        input_id: &str,
+    ) -> session::SessionResult<Option<SessionRuntimeOutboxRecord>> {
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        connection
+            .query_opt(
+                "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                        session_generation,decision,target_turn_id,classification_json,status,
+                        runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                        claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                        updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+                   FROM session_runtime_outbox WHERE input_id=$1",
+                &[&input_id],
+            )
             .map_err(postgres_error)?
             .map(|row| row_to_runtime_outbox(&row))
             .transpose()
@@ -2554,11 +4516,13 @@ impl PostgresSessionStore {
         &self,
         session_id: &str,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.query_runtime_outbox(
-            "SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,
-                    next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,
-                    created_at_ms,updated_at_ms,runtime_options_json FROM session_runtime_outbox
+            "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                    session_generation,decision,target_turn_id,classification_json,status,
+                    runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                    claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
               WHERE session_id=$1 ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC LIMIT $2",
             &[&session_id,&to_i64(limit.clamp(1,500), "runtime outbox limit")?],
         )
@@ -2567,32 +4531,37 @@ impl PostgresSessionStore {
     pub fn active_session_runtime_outbox(
         &self,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.query_runtime_outbox(
-            "SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,
-                    next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,
-                    created_at_ms,updated_at_ms,runtime_options_json FROM session_runtime_outbox
-              WHERE status != 'materialized' ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC LIMIT $1",
-            &[&to_i64(limit.clamp(1,500), "runtime outbox limit")?],
+            "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                    session_generation,decision,target_turn_id,classification_json,status,
+                    runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                    claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
+              WHERE status NOT IN ('completed','supplemented','failed','cancelled','expired')
+              ORDER BY updated_at_ms DESC,sequence DESC,request_id DESC LIMIT $1",
+            &[&to_i64(limit.clamp(1, 500), "runtime outbox limit")?],
         )
     }
 
     pub fn blocked_session_runtime_outbox(
         &self,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.query_runtime_outbox(
-            "SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,
-                    next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,
-                    created_at_ms,updated_at_ms,runtime_options_json FROM session_runtime_outbox
-              WHERE status='blocked_materialization' ORDER BY updated_at_ms ASC,sequence ASC,request_id ASC LIMIT $1",
+            "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,
+                    session_generation,decision,target_turn_id,classification_json,status,
+                    runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,
+                    claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,
+                    updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox
+              WHERE status='blocked' ORDER BY updated_at_ms ASC,sequence ASC,request_id ASC LIMIT $1",
             &[&to_i64(limit.clamp(1,500), "runtime outbox limit")?],
         )
     }
 
     pub fn session_runtime_outbox_health(
         &self,
-    ) -> memory::store::Result<SessionRuntimeOutboxHealth> {
+    ) -> session::SessionResult<SessionRuntimeOutboxHealth> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let rows = connection
             .query(
@@ -2607,105 +4576,126 @@ impl PostgresSessionStore {
                 row.try_get(1).map_err(postgres_error)?,
                 "runtime outbox count",
             )?;
-            match OutboxStatus::parse(&status)
-                .map_err(|error| memory::MemoryError::Store(error.to_string()))?
-            {
-                OutboxStatus::Pending => health.pending = count,
-                OutboxStatus::Claimed => health.claimed = count,
-                OutboxStatus::RetryScheduled => health.retry_scheduled = count,
-                OutboxStatus::Materialized => health.materialized = count,
-                OutboxStatus::BlockedMaterialization => health.blocked = count,
+            match parse_runtime_status(&status)? {
+                SessionRuntimeInputStatus::Accepted => health.accepted = count,
+                SessionRuntimeInputStatus::Classified => health.classified = count,
+                SessionRuntimeInputStatus::Queued => health.queued = count,
+                SessionRuntimeInputStatus::RejectedDuplicate => {
+                    health.rejected_duplicate = count;
+                }
+                SessionRuntimeInputStatus::RejectedPolicy => {
+                    health.rejected_policy = count;
+                }
+                SessionRuntimeInputStatus::Claimed => health.claimed = count,
+                SessionRuntimeInputStatus::Running => health.running = count,
+                SessionRuntimeInputStatus::Reclassified => health.reclassified = count,
+                SessionRuntimeInputStatus::Completed => health.completed = count,
+                SessionRuntimeInputStatus::Supplemented => health.supplemented = count,
+                SessionRuntimeInputStatus::Failed => health.failed = count,
+                SessionRuntimeInputStatus::Blocked => health.blocked = count,
+                SessionRuntimeInputStatus::Cancelled => health.cancelled = count,
+                SessionRuntimeInputStatus::Expired => health.expired = count,
             }
         }
+        health.runnable_depth = health
+            .accepted
+            .saturating_add(health.classified)
+            .saturating_add(health.queued)
+            .saturating_add(health.claimed)
+            .saturating_add(health.running)
+            .saturating_add(health.reclassified);
+        health.oldest_runnable_created_at_ms = connection
+            .query_one(
+                "SELECT MIN(created_at_ms) FROM session_runtime_outbox
+                  WHERE status IN ('accepted','classified','queued','claimed','running','reclassified')",
+                &[],
+            )
+            .map_err(postgres_error)?
+            .try_get::<_, Option<i64>>(0)
+            .map_err(postgres_error)?
+            .map(|value| value.max(0) as u64);
         Ok(health)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn transition_runtime_outbox(
-        &self,
-        request_id: &str,
-        worker_id: &str,
-        expected_revision: u64,
-        now_ms: u64,
-        runtime_cursor: Option<u64>,
-        next: OutboxStatus,
-        failure_class: Option<OutboxFailureClass>,
-        error: Option<&str>,
-        next_attempt: Option<u64>,
-        action: &str,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-        let now = to_u64_i64(now_ms, "runtime outbox clock")?;
-        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
-        let mut transaction = connection.transaction().map_err(postgres_error)?;
-        let existing = runtime_outbox_for_update(&mut transaction, request_id)?;
-        assert_runtime_lease(&existing, worker_id, expected_revision, now_ms)?;
-        let cursor = runtime_cursor
-            .map(|value| to_u64_i64(value, "runtime cursor"))
-            .transpose()?;
-        let next_attempt = next_attempt
-            .map(|value| to_u64_i64(value, "runtime next attempt"))
-            .transpose()?
-            .unwrap_or(existing.next_attempt_at_ms as i64);
-        let row = transaction.query_one(
-            "UPDATE session_runtime_outbox SET status=$1,runtime_commit_cursor=$2,next_attempt_at_ms=$3,
-                    claim_owner=NULL,claim_expires_at_ms=NULL,failure_class=$4,last_error=$5,
-                    updated_at_ms=$6,revision=revision+1 WHERE request_id=$7 RETURNING
-                    request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,
-                    attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,
-                    revision,created_at_ms,updated_at_ms,runtime_options_json",
-            &[&next.as_str(),&cursor,&next_attempt,&failure_class.map(OutboxFailureClass::as_str),&error,&now,&request_id],
-        ).map_err(postgres_error)?;
-        let record = row_to_runtime_outbox(&row)?;
-        append_runtime_history_tx(
-            &mut transaction,
-            &record,
-            action,
-            Some(worker_id),
-            Some(expected_revision),
-            existing.status,
-            next,
-            error,
-            now_ms,
-        )?;
-        transaction.commit().map_err(postgres_error)?;
-        Ok(record)
     }
 
     /// Export every normalized PG table in canonical SQL order. This is a
     /// cutover-only API; normal request handling stays on the selected owner.
-    pub fn export_migration_snapshot(&self) -> memory::store::Result<SessionMigrationSnapshot> {
+    pub fn export_migration_snapshot(&self) -> session::SessionResult<SessionMigrationSnapshot> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let sessions = connection
             .query("SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status FROM session_records ORDER BY session_id", &[])
             .map_err(postgres_error)?
             .iter()
             .map(row_to_session)
-            .collect::<memory::store::Result<_>>()
+            .collect::<session::SessionResult<_>>()
             .map_err(|error| migration_export_error("session_records", error))?;
-        let associations = connection.query("SELECT session_id,memory_id,created_at FROM session_memory_associations ORDER BY session_id,memory_id",&[]).map_err(postgres_error)?.iter().map(|row| Ok(SessionMemoryAssociation { session_id: row.try_get(0).map_err(postgres_error)?, memory_id: row.try_get(1).map_err(postgres_error)?, created_at: row.try_get(2).map_err(postgres_error)?})).collect::<memory::store::Result<_>>()?;
-        let messages = connection.query("SELECT stable_message_id,session_id,sequence,role,content_json,blocks_count,tool_use_id,tool_name,token_usage_json,created_at_ms FROM session_messages ORDER BY session_id,sequence",&[]).map_err(postgres_error)?.iter().map(row_to_message).collect::<memory::store::Result<_>>()?;
-        let events = connection.query("SELECT session_id,event_type,event_json,sequence,created_at_ms FROM session_events ORDER BY session_id,sequence",&[]).map_err(postgres_error)?.iter().map(row_to_event).collect::<memory::store::Result<_>>()?;
-        let checkpoints = connection.query("SELECT session_id,checkpoint_id FROM session_event_checkpoints ORDER BY session_id,checkpoint_id",&[]).map_err(postgres_error)?.iter().map(|row| Ok(SessionEventCheckpoint {session_id: row.try_get(0).map_err(postgres_error)?,checkpoint_id: row.try_get(1).map_err(postgres_error)?})).collect::<memory::store::Result<_>>()?;
-        let snapshots = connection.query("SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx",&[]).map_err(postgres_error)?.iter().map(row_to_snapshot).collect::<memory::store::Result<_>>()?;
+        let input_admissions = connection
+            .query(
+                "SELECT session_id,input_generation,input_admission_open
+                   FROM session_records ORDER BY session_id",
+                &[],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(|row| {
+                Ok(SessionInputAdmission {
+                    session_id: row.try_get(0).map_err(postgres_error)?,
+                    generation: i64_to_u64(
+                        row.try_get(1).map_err(postgres_error)?,
+                        "session input generation",
+                    )?,
+                    open: row.try_get(2).map_err(postgres_error)?,
+                })
+            })
+            .collect::<session::SessionResult<Vec<_>>>()?;
+        let lifecycle_intents = connection
+            .query(
+                "SELECT operation_id,session_id,disposition,phase,last_stable_phase,
+                        expected_generation,created_at_ms,updated_at_ms,last_error,revision
+                   FROM session_lifecycle_intents ORDER BY operation_id",
+                &[],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_lifecycle_intent)
+            .collect::<session::SessionResult<Vec<_>>>()?;
+        let branch_activations = connection
+            .query(
+                "SELECT operation_id,source_session_id,target_session_id,source_message_count,
+                        phase,created_at_ms,updated_at_ms,last_error,revision
+                   FROM session_branch_activations ORDER BY operation_id",
+                &[],
+            )
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_branch_activation)
+            .collect::<session::SessionResult<Vec<_>>>()?;
+        let associations = connection.query("SELECT session_id,memory_id,created_at FROM session_memory_associations ORDER BY session_id,memory_id",&[]).map_err(postgres_error)?.iter().map(|row| Ok(SessionMemoryAssociation { session_id: row.try_get(0).map_err(postgres_error)?, memory_id: row.try_get(1).map_err(postgres_error)?, created_at: row.try_get(2).map_err(postgres_error)?})).collect::<session::SessionResult<_>>()?;
+        let messages = connection.query("SELECT stable_message_id,session_id,sequence,role,content_json,blocks_count,tool_use_id,tool_name,token_usage_json,created_at_ms FROM session_messages ORDER BY session_id,sequence",&[]).map_err(postgres_error)?.iter().map(row_to_message).collect::<session::SessionResult<_>>()?;
+        let events = connection.query("SELECT session_id,event_type,event_json,sequence,created_at_ms FROM session_events ORDER BY session_id,sequence",&[]).map_err(postgres_error)?.iter().map(row_to_event).collect::<session::SessionResult<_>>()?;
+        let checkpoints = connection.query("SELECT session_id,checkpoint_id FROM session_event_checkpoints ORDER BY session_id,checkpoint_id",&[]).map_err(postgres_error)?.iter().map(|row| Ok(SessionEventCheckpoint {session_id: row.try_get(0).map_err(postgres_error)?,checkpoint_id: row.try_get(1).map_err(postgres_error)?})).collect::<session::SessionResult<_>>()?;
+        let snapshots = connection.query("SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx",&[]).map_err(postgres_error)?.iter().map(row_to_snapshot).collect::<session::SessionResult<_>>()?;
         let runtime_outbox = connection
-            .query("SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,runtime_options_json FROM session_runtime_outbox ORDER BY request_id",&[])
+            .query("SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch FROM session_runtime_outbox ORDER BY request_id",&[])
             .map_err(postgres_error)?
             .iter()
             .map(row_to_runtime_outbox)
-            .collect::<memory::store::Result<_>>()
+            .collect::<session::SessionResult<_>>()
             .map_err(|error| migration_export_error("session_runtime_outbox", error))?;
         let mission_outbox = connection
             .query("SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms FROM session_mission_outbox ORDER BY request_id",&[])
             .map_err(postgres_error)?
             .iter()
             .map(row_to_mission_outbox)
-            .collect::<memory::store::Result<_>>()
+            .collect::<session::SessionResult<_>>()
             .map_err(|error| migration_export_error("session_mission_outbox", error))?;
         let runtime_history = pg_history_rows(&mut connection, "session_runtime_outbox_history")?;
         let mission_history = pg_history_rows(&mut connection, "session_mission_outbox_history")?;
         Ok(SessionMigrationSnapshot {
-            schema_version: 2,
+            schema_version: 5,
             sessions,
+            input_admissions,
+            lifecycle_intents,
+            branch_activations,
             associations,
             messages,
             events,
@@ -2724,9 +4714,9 @@ impl PostgresSessionStore {
     pub fn import_migration_snapshot(
         &self,
         snapshot: &SessionMigrationSnapshot,
-    ) -> memory::store::Result<()> {
-        if snapshot.schema_version != 2 {
-            return Err(memory::MemoryError::Store(format!(
+    ) -> session::SessionResult<()> {
+        if snapshot.schema_version != 5 {
+            return Err(session::SessionError::Store(format!(
                 "unsupported session migration schema {}",
                 snapshot.schema_version
             )));
@@ -2736,7 +4726,7 @@ impl PostgresSessionStore {
             if existing.canonical_digest()? == snapshot.canonical_digest()? {
                 return Ok(());
             }
-            return Err(memory::MemoryError::Store(
+            return Err(session::SessionError::Store(
                 "refusing divergent non-empty PostgreSQL session target".to_string(),
             ));
         }
@@ -2744,6 +4734,32 @@ impl PostgresSessionStore {
         let mut transaction = connection.transaction().map_err(postgres_error)?;
         for session in &snapshot.sessions {
             upsert_session_tx(&mut transaction, session)?;
+        }
+        for admission in &snapshot.input_admissions {
+            let changed = transaction
+                .execute(
+                    "UPDATE session_records
+                        SET input_generation=$1,input_admission_open=$2
+                      WHERE session_id=$3",
+                    &[
+                        &to_u64_i64(admission.generation, "session input generation")?,
+                        &admission.open,
+                        &admission.session_id,
+                    ],
+                )
+                .map_err(postgres_error)?;
+            if changed != 1 {
+                return Err(session::SessionError::Store(format!(
+                    "session admission `{}` has no imported owner",
+                    admission.session_id
+                )));
+            }
+        }
+        for intent in &snapshot.lifecycle_intents {
+            import_lifecycle_intent_tx(&mut transaction, intent)?;
+        }
+        for activation in &snapshot.branch_activations {
+            import_branch_activation_tx(&mut transaction, activation)?;
         }
         for association in &snapshot.associations {
             transaction.execute("INSERT INTO session_memory_associations(session_id,memory_id,created_at) VALUES($1,$2,$3)", &[&association.session_id,&association.memory_id,&association.created_at]).map_err(postgres_error)?;
@@ -2785,7 +4801,7 @@ impl PostgresSessionStore {
         &self,
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> memory::store::Result<Vec<SessionRecord>> {
+    ) -> session::SessionResult<Vec<SessionRecord>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query(statement, params)
@@ -2799,7 +4815,7 @@ impl PostgresSessionStore {
         &self,
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query(statement, params)
@@ -2813,7 +4829,7 @@ impl PostgresSessionStore {
         &self,
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query(statement, params)
@@ -2827,7 +4843,7 @@ impl PostgresSessionStore {
         &self,
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         connection
             .query(statement, params)
@@ -2841,7 +4857,7 @@ impl PostgresSessionStore {
         &self,
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let count: i64 = connection
             .query_one(statement, params)
@@ -2855,7 +4871,7 @@ impl PostgresSessionStore {
         &self,
         statement: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
         let deleted = connection
             .execute(statement, params)
@@ -2870,7 +4886,7 @@ impl PostgresSessionStore {
 /// Valid JSON with bounded numeric token fields is preserved byte-for-byte.
 fn prepare_legacy_session_usage_for_migration(
     executor: &PostgresExecutor,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     let mut connection = executor.checkout_runtime().map_err(storage_error)?;
     let mut transaction = connection.transaction().map_err(postgres_error)?;
     // This compatibility preflight creates helper functions before the
@@ -2989,9 +5005,10 @@ const MISSION_OUTBOX_SELECT: &str =
        FROM session_mission_outbox WHERE request_id=$1";
 
 const RUNTIME_OUTBOX_SELECT: &str =
-    "SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,
-            next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,
-            created_at_ms,updated_at_ms,runtime_options_json
+    "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+            decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+            next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,
+            revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
        FROM session_runtime_outbox WHERE request_id=$1";
 
 fn session_params(session: &SessionRecord) -> [&(dyn ToSql + Sync); 14] {
@@ -3016,7 +5033,7 @@ fn session_params(session: &SessionRecord) -> [&(dyn ToSql + Sync); 14] {
 fn upsert_session_tx(
     transaction: &mut PostgresTransaction<'_>,
     session: &SessionRecord,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     transaction.execute(
         "INSERT INTO session_records(
             session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,
@@ -3037,13 +5054,13 @@ fn upsert_session_tx(
     Ok(())
 }
 
-fn validate_mission_request(request: &SessionMissionOutboxRequest) -> memory::store::Result<()> {
+fn validate_mission_request(request: &SessionMissionOutboxRequest) -> session::SessionResult<()> {
     if request.request_id.trim().is_empty()
         || request.session_id.trim().is_empty()
         || request.title.trim().is_empty()
         || request.workspace_key.trim().is_empty()
     {
-        return Err(memory::MemoryError::Store(
+        return Err(session::SessionError::Store(
             "mission outbox requires non-empty request, session, title and workspace identities"
                 .to_string(),
         ));
@@ -3054,7 +5071,7 @@ fn validate_mission_request(request: &SessionMissionOutboxRequest) -> memory::st
 fn insert_mission_outbox_tx(
     transaction: &mut PostgresTransaction<'_>,
     request: &SessionMissionOutboxRequest,
-) -> memory::store::Result<SessionMissionOutboxRecord> {
+) -> session::SessionResult<SessionMissionOutboxRecord> {
     if let Some(row) = transaction
         .query_opt(MISSION_OUTBOX_SELECT, &[&request.request_id])
         .map_err(postgres_error)?
@@ -3067,7 +5084,7 @@ fn insert_mission_outbox_tx(
         {
             return Ok(existing);
         }
-        return Err(memory::MemoryError::Store(format!(
+        return Err(session::SessionError::Store(format!(
             "mission outbox request_id `{}` is already bound to another intent",
             request.request_id
         )));
@@ -3098,7 +5115,7 @@ fn insert_mission_outbox_tx(
     Ok(record)
 }
 
-fn row_to_mission_outbox(row: &Row) -> memory::store::Result<SessionMissionOutboxRecord> {
+fn row_to_mission_outbox(row: &Row) -> session::SessionResult<SessionMissionOutboxRecord> {
     let operation: String = row.try_get(4).map_err(postgres_error)?;
     let status: String = row.try_get(5).map_err(postgres_error)?;
     let failure: Option<String> = row.try_get(10).map_err(postgres_error)?;
@@ -3108,9 +5125,9 @@ fn row_to_mission_outbox(row: &Row) -> memory::store::Result<SessionMissionOutbo
         title: row.try_get(2).map_err(postgres_error)?,
         workspace_key: row.try_get(3).map_err(postgres_error)?,
         operation: SessionMissionOutboxOperation::parse(&operation)
-            .map_err(|error| memory::MemoryError::Store(error.to_string()))?,
+            .map_err(|error| session::SessionError::Store(error.to_string()))?,
         status: OutboxStatus::parse(&status)
-            .map_err(|error| memory::MemoryError::Store(error.to_string()))?,
+            .map_err(|error| session::SessionError::Store(error.to_string()))?,
         attempts: i64_to_u32(row.try_get(6).map_err(postgres_error)?, "mission attempts")?,
         next_attempt_at_ms: i64_to_u64(
             row.try_get(7).map_err(postgres_error)?,
@@ -3125,7 +5142,7 @@ fn row_to_mission_outbox(row: &Row) -> memory::store::Result<SessionMissionOutbo
         failure_class: failure
             .map(|value| {
                 OutboxFailureClass::parse(&value)
-                    .map_err(|error| memory::MemoryError::Store(error.to_string()))
+                    .map_err(|error| session::SessionError::Store(error.to_string()))
             })
             .transpose()?,
         last_error: row.try_get(11).map_err(postgres_error)?,
@@ -3141,19 +5158,520 @@ fn row_to_mission_outbox(row: &Row) -> memory::store::Result<SessionMissionOutbo
     })
 }
 
+fn input_decision_as_str(decision: InputRoutingDecision) -> &'static str {
+    match decision {
+        InputRoutingDecision::StartNewTurn => "start_new_turn",
+        InputRoutingDecision::SupplementCurrentTurn => "supplement_current_turn",
+        InputRoutingDecision::InterruptAndReplan => "interrupt_and_replan",
+        InputRoutingDecision::EnqueueNextStep => "enqueue_next_step",
+        InputRoutingDecision::SpawnSubtask => "spawn_subtask",
+        InputRoutingDecision::RouteCrossSession => "route_cross_session",
+        InputRoutingDecision::CreateNewSession => "create_new_session",
+        InputRoutingDecision::ControlOrApproval => "control_or_approval",
+        InputRoutingDecision::RejectDuplicate => "reject_duplicate",
+        InputRoutingDecision::RejectPolicy => "reject_policy",
+    }
+}
+
+fn parse_input_decision(value: &str) -> session::SessionResult<InputRoutingDecision> {
+    match value {
+        "start_new_turn" => Ok(InputRoutingDecision::StartNewTurn),
+        "supplement_current_turn" => Ok(InputRoutingDecision::SupplementCurrentTurn),
+        "interrupt_and_replan" => Ok(InputRoutingDecision::InterruptAndReplan),
+        "enqueue_next_step" => Ok(InputRoutingDecision::EnqueueNextStep),
+        "spawn_subtask" => Ok(InputRoutingDecision::SpawnSubtask),
+        "route_cross_session" => Ok(InputRoutingDecision::RouteCrossSession),
+        "create_new_session" => Ok(InputRoutingDecision::CreateNewSession),
+        "control_or_approval" => Ok(InputRoutingDecision::ControlOrApproval),
+        "reject_duplicate" => Ok(InputRoutingDecision::RejectDuplicate),
+        "reject_policy" => Ok(InputRoutingDecision::RejectPolicy),
+        other => Err(session::SessionError::Store(format!(
+            "unknown session input decision `{other}`"
+        ))),
+    }
+}
+
+fn decision_requires_target_turn(decision: InputRoutingDecision) -> bool {
+    matches!(
+        decision,
+        InputRoutingDecision::SupplementCurrentTurn
+            | InputRoutingDecision::InterruptAndReplan
+            | InputRoutingDecision::ControlOrApproval
+    )
+}
+
+fn parse_runtime_status(value: &str) -> session::SessionResult<SessionRuntimeInputStatus> {
+    match value {
+        "accepted" => Ok(SessionRuntimeInputStatus::Accepted),
+        "classified" => Ok(SessionRuntimeInputStatus::Classified),
+        "queued" | "pending" | "retry_scheduled" => Ok(SessionRuntimeInputStatus::Queued),
+        "rejected_duplicate" => Ok(SessionRuntimeInputStatus::RejectedDuplicate),
+        "rejected_policy" => Ok(SessionRuntimeInputStatus::RejectedPolicy),
+        "claimed" => Ok(SessionRuntimeInputStatus::Claimed),
+        "running" => Ok(SessionRuntimeInputStatus::Running),
+        "reclassified" => Ok(SessionRuntimeInputStatus::Reclassified),
+        "completed" | "materialized" => Ok(SessionRuntimeInputStatus::Completed),
+        "supplemented" => Ok(SessionRuntimeInputStatus::Supplemented),
+        "failed" => Ok(SessionRuntimeInputStatus::Failed),
+        "blocked" | "blocked_materialization" => Ok(SessionRuntimeInputStatus::Blocked),
+        "cancelled" => Ok(SessionRuntimeInputStatus::Cancelled),
+        "expired" => Ok(SessionRuntimeInputStatus::Expired),
+        other => Err(session::SessionError::Store(format!(
+            "unknown session runtime input status `{other}`"
+        ))),
+    }
+}
+
+fn row_to_lifecycle_intent(row: &Row) -> session::SessionResult<SessionLifecycleIntent> {
+    Ok(SessionLifecycleIntent {
+        operation_id: row.try_get(0).map_err(postgres_error)?,
+        session_id: row.try_get(1).map_err(postgres_error)?,
+        disposition: session::SessionCloseDisposition::parse(
+            &row.try_get::<_, String>(2).map_err(postgres_error)?,
+        )?,
+        phase: SessionLifecyclePhase::parse(&row.try_get::<_, String>(3).map_err(postgres_error)?)?,
+        last_stable_phase: SessionLifecyclePhase::parse(
+            &row.try_get::<_, String>(4).map_err(postgres_error)?,
+        )?,
+        expected_generation: i64_to_u64(
+            row.try_get(5).map_err(postgres_error)?,
+            "lifecycle expected generation",
+        )?,
+        created_at_ms: i64_to_u64(
+            row.try_get(6).map_err(postgres_error)?,
+            "lifecycle created time",
+        )?,
+        updated_at_ms: i64_to_u64(
+            row.try_get(7).map_err(postgres_error)?,
+            "lifecycle updated time",
+        )?,
+        last_error: row.try_get(8).map_err(postgres_error)?,
+        revision: i64_to_u64(
+            row.try_get(9).map_err(postgres_error)?,
+            "lifecycle revision",
+        )?,
+    })
+}
+
+fn query_lifecycle_intent_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    operation_id: &str,
+    lock: bool,
+) -> session::SessionResult<Option<SessionLifecycleIntent>> {
+    let suffix = if lock { " FOR UPDATE" } else { "" };
+    transaction
+        .query_opt(
+            &format!(
+                "SELECT operation_id,session_id,disposition,phase,last_stable_phase,
+                        expected_generation,created_at_ms,updated_at_ms,last_error,revision
+                   FROM session_lifecycle_intents WHERE operation_id=$1{suffix}"
+            ),
+            &[&operation_id],
+        )
+        .map_err(postgres_error)?
+        .map(|row| row_to_lifecycle_intent(&row))
+        .transpose()
+}
+
+fn transition_lifecycle_intent_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    transition: &SessionLifecycleTransition,
+) -> session::SessionResult<SessionLifecycleIntent> {
+    let current = query_lifecycle_intent_tx(transaction, &transition.operation_id, true)?
+        .ok_or_else(|| {
+            session::SessionError::Store(format!(
+                "Session lifecycle intent `{}` does not exist",
+                transition.operation_id
+            ))
+        })?;
+    transition.validate(&current)?;
+    let last_stable_phase = if transition.next_phase == SessionLifecyclePhase::Failed {
+        current.last_stable_phase
+    } else {
+        transition.next_phase
+    };
+    let changed = transaction
+        .execute(
+            "UPDATE session_lifecycle_intents
+                SET phase=$1,last_stable_phase=$2,updated_at_ms=$3,last_error=$4,
+                    revision=revision+1
+              WHERE operation_id=$5 AND phase=$6 AND revision=$7",
+            &[
+                &transition.next_phase.as_str(),
+                &last_stable_phase.as_str(),
+                &to_u64_i64(transition.updated_at_ms, "lifecycle transition time")?,
+                &transition.error,
+                &transition.operation_id,
+                &transition.expected_phase.as_str(),
+                &to_u64_i64(transition.expected_revision, "lifecycle revision")?,
+            ],
+        )
+        .map_err(postgres_error)?;
+    if changed != 1 {
+        return Err(session::SessionError::Store(format!(
+            "Session lifecycle intent `{}` changed during transition",
+            transition.operation_id
+        )));
+    }
+    query_lifecycle_intent_tx(transaction, &transition.operation_id, false)?.ok_or_else(|| {
+        session::SessionError::Store(format!(
+            "Session lifecycle intent `{}` disappeared after transition",
+            transition.operation_id
+        ))
+    })
+}
+
+fn row_to_branch_activation(row: &Row) -> session::SessionResult<SessionBranchActivation> {
+    Ok(SessionBranchActivation {
+        operation_id: row.try_get(0).map_err(postgres_error)?,
+        source_session_id: row.try_get(1).map_err(postgres_error)?,
+        target_session_id: row.try_get(2).map_err(postgres_error)?,
+        source_message_count: from_i64(
+            row.try_get(3).map_err(postgres_error)?,
+            "branch source cutoff",
+        )?,
+        phase: SessionBranchActivationPhase::parse(
+            &row.try_get::<_, String>(4).map_err(postgres_error)?,
+        )?,
+        created_at_ms: i64_to_u64(
+            row.try_get(5).map_err(postgres_error)?,
+            "branch activation created time",
+        )?,
+        updated_at_ms: i64_to_u64(
+            row.try_get(6).map_err(postgres_error)?,
+            "branch activation updated time",
+        )?,
+        last_error: row.try_get(7).map_err(postgres_error)?,
+        revision: i64_to_u64(
+            row.try_get(8).map_err(postgres_error)?,
+            "branch activation revision",
+        )?,
+    })
+}
+
+fn query_branch_activation_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    operation_id: &str,
+    lock: bool,
+) -> session::SessionResult<Option<SessionBranchActivation>> {
+    let suffix = if lock { " FOR UPDATE" } else { "" };
+    transaction
+        .query_opt(
+            &format!(
+                "SELECT operation_id,source_session_id,target_session_id,
+                        source_message_count,phase,created_at_ms,updated_at_ms,
+                        last_error,revision
+                   FROM session_branch_activations WHERE operation_id=$1{suffix}"
+            ),
+            &[&operation_id],
+        )
+        .map_err(postgres_error)?
+        .map(|row| row_to_branch_activation(&row))
+        .transpose()
+}
+
+fn append_allocated_event_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    event: &SessionEvent,
+) -> session::SessionResult<SessionEvent> {
+    let sequence: i64 = transaction
+        .query_one(
+            "SELECT COALESCE(MAX(sequence),-1)+1
+               FROM session_events WHERE session_id=$1",
+            &[&event.session_id],
+        )
+        .map_err(postgres_error)?
+        .try_get(0)
+        .map_err(postgres_error)?;
+    let sequence_usize = from_i64(sequence, "Session event sequence")?;
+    let event_json = event_json_with_allocated_sequence(event, sequence_usize)?;
+    transaction
+        .execute(
+            "INSERT INTO session_events(
+                 session_id,sequence,event_type,event_json,created_at_ms
+             ) VALUES($1,$2,$3,$4,$5)",
+            &[
+                &event.session_id,
+                &sequence,
+                &event.event_type,
+                &event_json,
+                &to_u64_i64(event.created_at_ms, "Session event time")?,
+            ],
+        )
+        .map_err(postgres_error)?;
+    let mut stored = event.clone();
+    stored.sequence = sequence_usize;
+    stored.event_json = event_json;
+    Ok(stored)
+}
+
+fn query_input_admission_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+    lock: bool,
+) -> session::SessionResult<Option<SessionInputAdmission>> {
+    let suffix = if lock { " FOR UPDATE" } else { "" };
+    transaction
+        .query_opt(
+            &format!(
+                "SELECT session_id,input_generation,input_admission_open
+                   FROM session_records WHERE session_id=$1{suffix}"
+            ),
+            &[&session_id],
+        )
+        .map_err(postgres_error)?
+        .map(|row| {
+            Ok(SessionInputAdmission {
+                session_id: row.try_get(0).map_err(postgres_error)?,
+                generation: i64_to_u64(
+                    row.try_get(1).map_err(postgres_error)?,
+                    "session input generation",
+                )?,
+                open: row.try_get(2).map_err(postgres_error)?,
+            })
+        })
+        .transpose()
+}
+
+fn require_input_admission_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+    generation: u64,
+) -> session::SessionResult<()> {
+    // Callers that allocate transcript sequence lock the Session owner first.
+    // Worker transitions already hold the outbox row, so taking the Session
+    // row lock here would invert the generation-advance lock order.
+    let admission = query_input_admission_tx(transaction, session_id, false)?
+        .ok_or_else(|| session::SessionError::Store(format!("session `{session_id}` not found")))?;
+    if !admission.open {
+        return Err(session::SessionError::Store(format!(
+            "session `{session_id}` input admission is closed"
+        )));
+    }
+    if admission.generation != generation {
+        return Err(session::SessionError::Store(format!(
+            "session `{session_id}` generation mismatch: expected {generation}, current {}",
+            admission.generation
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_input_timeline_event_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    request: &SessionRuntimeOutboxRequest,
+    session_id: &str,
+    input_sequence: usize,
+    kind: &str,
+    status: SessionRuntimeInputStatus,
+    actor: Option<&str>,
+    reason: Option<&str>,
+    created_at_ms: u64,
+) -> session::SessionResult<()> {
+    let sequence: i64 = transaction
+        .query_one(
+            "SELECT COALESCE(MAX(sequence),-1)+1
+               FROM session_events WHERE session_id=$1",
+            &[&session_id],
+        )
+        .map_err(postgres_error)?
+        .try_get(0)
+        .map_err(postgres_error)?;
+    let mut refs = vec![
+        SessionDomainRef {
+            ref_type: "session_input".to_string(),
+            id: request.input_id.clone(),
+            label: None,
+        },
+        SessionDomainRef {
+            ref_type: "message".to_string(),
+            id: request.message_id.clone(),
+            label: None,
+        },
+        SessionDomainRef {
+            ref_type: "turn".to_string(),
+            id: request.turn_id.clone(),
+            label: None,
+        },
+    ];
+    if let Some(target_turn_id) = request.target_turn_id.as_ref() {
+        refs.push(SessionDomainRef {
+            ref_type: "target_turn".to_string(),
+            id: target_turn_id.clone(),
+            label: None,
+        });
+    }
+    let mut event = SessionDomainEvent::new(
+        session_id,
+        from_i64(sequence, "session input event sequence")?,
+        SessionDomainScope::Message,
+        kind,
+        serde_json::json!({
+            "input_id": request.input_id,
+            "request_id": request.request_id,
+            "message_id": request.message_id,
+            "turn_id": request.turn_id,
+            "input_sequence": input_sequence,
+            "session_generation": request.session_generation,
+            "decision": input_decision_as_str(request.decision),
+            "target_turn_id": request.target_turn_id,
+            "classification": request.classification_json,
+            "actor": actor,
+            "reason": reason,
+        }),
+        created_at_ms,
+    );
+    event.event_id = format!(
+        "session-input:{}:{}:{kind}",
+        request.request_id, request.session_generation
+    );
+    event.correlation_id = Some(request.request_id.clone());
+    event.status = Some(status.as_str().to_string());
+    event.refs = refs;
+    let stored = event.to_session_event().map_err(|error| {
+        session::SessionError::Store(format!("session input event encode failed: {error}"))
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO session_events(
+                 session_id,event_type,event_json,sequence,created_at_ms
+             ) VALUES($1,$2,$3,$4,$5)",
+            &[
+                &stored.session_id,
+                &stored.event_type,
+                &stored.event_json,
+                &to_i64(stored.sequence, "session input event sequence")?,
+                &to_u64_i64(stored.created_at_ms, "session input event time")?,
+            ],
+        )
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
+fn append_admission_timeline_event_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    session_id: &str,
+    previous_generation: u64,
+    admission: &SessionInputAdmission,
+    actor: &str,
+    reason: &str,
+    created_at_ms: u64,
+) -> session::SessionResult<()> {
+    let sequence: i64 = transaction
+        .query_one(
+            "SELECT COALESCE(MAX(sequence),-1)+1
+               FROM session_events WHERE session_id=$1",
+            &[&session_id],
+        )
+        .map_err(postgres_error)?
+        .try_get(0)
+        .map_err(postgres_error)?;
+    let kind = if admission.open {
+        "session.input.generation.advanced.v1"
+    } else {
+        "session.input.admission.closed.v1"
+    };
+    let mut event = SessionDomainEvent::new(
+        session_id,
+        from_i64(sequence, "session admission event sequence")?,
+        SessionDomainScope::Session,
+        kind,
+        serde_json::json!({
+            "previous_generation": previous_generation,
+            "generation": admission.generation,
+            "admission_open": admission.open,
+            "actor": actor,
+            "reason": reason,
+        }),
+        created_at_ms,
+    );
+    event.event_id = format!(
+        "session-input-admission:{session_id}:{}",
+        admission.generation
+    );
+    event.status = Some(if admission.open { "open" } else { "closed" }.to_string());
+    let stored = event.to_session_event().map_err(|error| {
+        session::SessionError::Store(format!("session admission event encode failed: {error}"))
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO session_events(
+                 session_id,event_type,event_json,sequence,created_at_ms
+             ) VALUES($1,$2,$3,$4,$5)",
+            &[
+                &stored.session_id,
+                &stored.event_type,
+                &stored.event_json,
+                &to_i64(stored.sequence, "session admission event sequence")?,
+                &to_u64_i64(stored.created_at_ms, "session admission event time")?,
+            ],
+        )
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
+fn request_from_outbox(record: &SessionRuntimeOutboxRecord) -> SessionRuntimeOutboxRequest {
+    SessionRuntimeOutboxRequest {
+        input_id: record.input_id.clone(),
+        request_id: record.request_id.clone(),
+        turn_id: record.turn_id.clone(),
+        message_id: record.message_id.clone(),
+        session_generation: record.session_generation,
+        decision: record.decision,
+        target_turn_id: record.target_turn_id.clone(),
+        classification_json: record.classification_json.clone(),
+        created_at_ms: record.created_at_ms,
+        runtime_options_json: record.runtime_options_json.clone(),
+    }
+}
+
 fn validate_runtime_request(
     message: &SessionMessage,
     request: &SessionRuntimeOutboxRequest,
-) -> memory::store::Result<()> {
-    if request.request_id.trim().is_empty()
+) -> session::SessionResult<()> {
+    if request.input_id.trim().is_empty()
+        || request.request_id.trim().is_empty()
         || request.turn_id.trim().is_empty()
         || request.message_id.trim().is_empty()
         || message.session_id.trim().is_empty()
+        || request.session_generation == 0
     {
-        return Err(memory::MemoryError::Store(
-            "runtime outbox requires non-empty request, turn, message and session identities"
+        return Err(session::SessionError::Store(
+            "durable session input requires non-empty identities and a positive generation"
                 .to_string(),
         ));
+    }
+    if request.message_id != message.stable_message_id {
+        return Err(session::SessionError::Store(
+            "runtime outbox message_id must equal the durable message identity".to_string(),
+        ));
+    }
+    validate_runtime_input_request(request)?;
+    Ok(())
+}
+
+fn validate_runtime_input_request(
+    request: &SessionRuntimeOutboxRequest,
+) -> session::SessionResult<()> {
+    if request.input_id.trim().is_empty()
+        || request.request_id.trim().is_empty()
+        || request.turn_id.trim().is_empty()
+        || request.message_id.trim().is_empty()
+        || request.session_generation == 0
+    {
+        return Err(session::SessionError::Store(
+            "durable session input requires non-empty identities and a positive generation"
+                .to_string(),
+        ));
+    }
+    if decision_requires_target_turn(request.decision)
+        && request.target_turn_id.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(session::SessionError::Store(format!(
+            "decision `{}` requires target_turn_id",
+            input_decision_as_str(request.decision)
+        )));
     }
     Ok(())
 }
@@ -3162,88 +5680,204 @@ fn insert_runtime_outbox_tx(
     transaction: &mut PostgresTransaction<'_>,
     message: &SessionMessage,
     request: &SessionRuntimeOutboxRequest,
-) -> memory::store::Result<SessionRuntimeOutboxRecord> {
+) -> session::SessionResult<SessionRuntimeOutboxRecord> {
     let now = to_u64_i64(request.created_at_ms, "runtime outbox time")?;
     let row = transaction.query_one(
         "INSERT INTO session_runtime_outbox(
-             request_id,turn_id,message_id,session_id,sequence,status,attempts,next_attempt_at_ms,
+             input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+             decision,target_turn_id,classification_json,status,attempts,next_attempt_at_ms,
              revision,created_at_ms,updated_at_ms,runtime_options_json
-         ) VALUES($1,$2,$3,$4,$5,'pending',0,$6,0,$6,$6,$7)
-         RETURNING request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,
-                   attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,
-                   revision,created_at_ms,updated_at_ms,runtime_options_json",
-        &[&request.request_id,&request.turn_id,&request.message_id,&message.session_id,
-          &to_i64(message.sequence, "message sequence")?,&now,&request.runtime_options_json],
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'accepted',0,$11,0,$11,$11,$12)
+         RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+                   decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                   next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
+                   last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+        &[&request.input_id,&request.request_id,&request.turn_id,&request.message_id,
+          &message.session_id,&to_i64(message.sequence, "message sequence")?,
+          &to_u64_i64(request.session_generation, "session generation")?,
+          &input_decision_as_str(request.decision),&request.target_turn_id,
+          &request.classification_json,&now,&request.runtime_options_json],
     ).map_err(postgres_error)?;
-    let record = row_to_runtime_outbox(&row)?;
+    let accepted = row_to_runtime_outbox(&row)?;
     append_runtime_history_tx(
         transaction,
-        &record,
-        "enqueue",
+        &accepted,
+        "accepted",
         None,
         None,
-        OutboxStatus::Pending,
-        OutboxStatus::Pending,
+        SessionRuntimeInputStatus::Accepted,
+        SessionRuntimeInputStatus::Accepted,
         None,
         request.created_at_ms,
     )?;
-    Ok(record)
+    append_input_timeline_event_tx(
+        transaction,
+        request,
+        &message.session_id,
+        message.sequence,
+        "session.input.accepted.v1",
+        SessionRuntimeInputStatus::Accepted,
+        None,
+        None,
+        request.created_at_ms,
+    )?;
+    let row = transaction.query_one(
+        "UPDATE session_runtime_outbox
+            SET status='classified',revision=revision+1
+          WHERE request_id=$1 AND revision=0
+        RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+                  decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                  next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
+                  last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+        &[&request.request_id],
+    ).map_err(postgres_error)?;
+    let classified = row_to_runtime_outbox(&row)?;
+    append_runtime_history_tx(
+        transaction,
+        &classified,
+        "classified",
+        None,
+        Some(accepted.revision),
+        SessionRuntimeInputStatus::Accepted,
+        SessionRuntimeInputStatus::Classified,
+        request.classification_json.as_deref(),
+        request.created_at_ms,
+    )?;
+    append_input_timeline_event_tx(
+        transaction,
+        request,
+        &message.session_id,
+        message.sequence,
+        "session.input.classified.v1",
+        SessionRuntimeInputStatus::Classified,
+        None,
+        None,
+        request.created_at_ms,
+    )?;
+    let final_status = SessionRuntimeInputStatus::for_rejection(request.decision)
+        .unwrap_or(SessionRuntimeInputStatus::Queued);
+    let final_status_name = final_status.as_str();
+    let terminal_at_ms = final_status
+        .is_terminal()
+        .then_some(to_u64_i64(request.created_at_ms, "runtime terminal time")?);
+    let row = transaction.query_one(
+        "UPDATE session_runtime_outbox
+            SET status=$1,terminal_at_ms=$2,revision=revision+1
+          WHERE request_id=$3 AND revision=$4
+        RETURNING input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+                  decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                  next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
+                  last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch",
+        &[
+            &final_status_name,
+            &terminal_at_ms,
+            &request.request_id,
+            &to_u64_i64(classified.revision, "classified revision")?,
+        ],
+    ).map_err(postgres_error)?;
+    let finalized = row_to_runtime_outbox(&row)?;
+    append_runtime_history_tx(
+        transaction,
+        &finalized,
+        if final_status.is_terminal() {
+            "rejected"
+        } else {
+            "queued"
+        },
+        None,
+        Some(classified.revision),
+        SessionRuntimeInputStatus::Classified,
+        final_status,
+        request.classification_json.as_deref(),
+        request.created_at_ms,
+    )?;
+    append_input_timeline_event_tx(
+        transaction,
+        request,
+        &message.session_id,
+        message.sequence,
+        final_status.timeline_event_kind(),
+        final_status,
+        None,
+        request.classification_json.as_deref(),
+        request.created_at_ms,
+    )?;
+    Ok(finalized)
 }
 
-fn row_to_runtime_outbox(row: &Row) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-    let status: String = row.try_get(5).map_err(postgres_error)?;
-    let failure: Option<String> = row.try_get(11).map_err(postgres_error)?;
+fn row_to_runtime_outbox(row: &Row) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+    let decision: String = row.try_get(7).map_err(postgres_error)?;
+    let status: String = row.try_get(10).map_err(postgres_error)?;
+    let failure: Option<String> = row.try_get(17).map_err(postgres_error)?;
     Ok(SessionRuntimeOutboxRecord {
-        request_id: row.try_get(0).map_err(postgres_error)?,
-        turn_id: row.try_get(1).map_err(postgres_error)?,
-        message_id: row.try_get(2).map_err(postgres_error)?,
-        session_id: row.try_get(3).map_err(postgres_error)?,
+        input_id: row.try_get(0).map_err(postgres_error)?,
+        request_id: row.try_get(1).map_err(postgres_error)?,
+        turn_id: row.try_get(2).map_err(postgres_error)?,
+        message_id: row.try_get(3).map_err(postgres_error)?,
+        session_id: row.try_get(4).map_err(postgres_error)?,
         sequence: from_i64(
-            row.try_get(4).map_err(postgres_error)?,
+            row.try_get(5).map_err(postgres_error)?,
             "runtime message sequence",
         )?,
-        status: OutboxStatus::parse(&status)
-            .map_err(|error| memory::MemoryError::Store(error.to_string()))?,
+        session_generation: i64_to_u64(
+            row.try_get(6).map_err(postgres_error)?,
+            "session generation",
+        )?,
+        decision: parse_input_decision(&decision)?,
+        target_turn_id: row.try_get(8).map_err(postgres_error)?,
+        classification_json: row.try_get(9).map_err(postgres_error)?,
+        status: parse_runtime_status(&status)?,
         runtime_commit_cursor: row
-            .try_get::<_, Option<i64>>(6)
+            .try_get::<_, Option<i64>>(11)
             .map_err(postgres_error)?
             .map(|value| i64_to_u64(value, "runtime cursor"))
             .transpose()?,
-        attempts: i64_to_u32(row.try_get(7).map_err(postgres_error)?, "runtime attempts")?,
+        attempts: i64_to_u32(row.try_get(12).map_err(postgres_error)?, "runtime attempts")?,
         next_attempt_at_ms: i64_to_u64(
-            row.try_get(8).map_err(postgres_error)?,
+            row.try_get(13).map_err(postgres_error)?,
             "runtime next attempt",
         )?,
-        claim_owner: row.try_get(9).map_err(postgres_error)?,
+        claim_owner: row.try_get(14).map_err(postgres_error)?,
+        claim_token: row.try_get(15).map_err(postgres_error)?,
         claim_expires_at_ms: row
-            .try_get::<_, Option<i64>>(10)
+            .try_get::<_, Option<i64>>(16)
             .map_err(postgres_error)?
             .map(|value| i64_to_u64(value, "runtime lease"))
             .transpose()?,
         failure_class: failure
             .map(|value| {
                 OutboxFailureClass::parse(&value)
-                    .map_err(|error| memory::MemoryError::Store(error.to_string()))
+                    .map_err(|error| session::SessionError::Store(error.to_string()))
             })
             .transpose()?,
-        last_error: row.try_get(12).map_err(postgres_error)?,
-        revision: i64_to_u64(row.try_get(13).map_err(postgres_error)?, "runtime revision")?,
+        last_error: row.try_get(18).map_err(postgres_error)?,
+        revision: i64_to_u64(row.try_get(19).map_err(postgres_error)?, "runtime revision")?,
         created_at_ms: i64_to_u64(
-            row.try_get(14).map_err(postgres_error)?,
+            row.try_get(20).map_err(postgres_error)?,
             "runtime created time",
         )?,
         updated_at_ms: i64_to_u64(
-            row.try_get(15).map_err(postgres_error)?,
+            row.try_get(21).map_err(postgres_error)?,
             "runtime updated time",
         )?,
-        runtime_options_json: row.try_get(16).map_err(postgres_error)?,
+        terminal_at_ms: row
+            .try_get::<_, Option<i64>>(22)
+            .map_err(postgres_error)?
+            .map(|value| i64_to_u64(value, "runtime terminal time"))
+            .transpose()?,
+        runtime_options_json: row.try_get(23).map_err(postgres_error)?,
+        claim_fence_epoch: row
+            .try_get::<_, Option<i64>>(24)
+            .map_err(postgres_error)?
+            .map(|value| i64_to_u64(value, "runtime claim fence epoch"))
+            .transpose()?,
     })
 }
 
 fn pg_history_rows(
     connection: &mut PostgresConnection,
     table: &str,
-) -> memory::store::Result<Vec<SessionOutboxHistory>> {
+) -> session::SessionResult<Vec<SessionOutboxHistory>> {
     debug_assert!(matches!(
         table,
         "session_runtime_outbox_history" | "session_mission_outbox_history"
@@ -3262,6 +5896,9 @@ fn pg_history_rows(
 
 fn snapshot_is_empty(snapshot: &SessionMigrationSnapshot) -> bool {
     snapshot.sessions.is_empty()
+        && snapshot.input_admissions.is_empty()
+        && snapshot.lifecycle_intents.is_empty()
+        && snapshot.branch_activations.is_empty()
         && snapshot.associations.is_empty()
         && snapshot.messages.is_empty()
         && snapshot.events.is_empty()
@@ -3273,15 +5910,89 @@ fn snapshot_is_empty(snapshot: &SessionMigrationSnapshot) -> bool {
         && snapshot.mission_history.is_empty()
 }
 
+fn import_lifecycle_intent_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    intent: &SessionLifecycleIntent,
+) -> session::SessionResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO session_lifecycle_intents(
+                 operation_id,session_id,disposition,phase,last_stable_phase,
+                 expected_generation,created_at_ms,updated_at_ms,last_error,revision
+             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            &[
+                &intent.operation_id,
+                &intent.session_id,
+                &intent.disposition.as_str(),
+                &intent.phase.as_str(),
+                &intent.last_stable_phase.as_str(),
+                &to_u64_i64(intent.expected_generation, "lifecycle expected generation")?,
+                &to_u64_i64(intent.created_at_ms, "lifecycle created time")?,
+                &to_u64_i64(intent.updated_at_ms, "lifecycle updated time")?,
+                &intent.last_error,
+                &to_u64_i64(intent.revision, "lifecycle revision")?,
+            ],
+        )
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
+fn import_branch_activation_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    activation: &SessionBranchActivation,
+) -> session::SessionResult<()> {
+    transaction
+        .execute(
+            "INSERT INTO session_branch_activations(
+                 operation_id,source_session_id,target_session_id,source_message_count,
+                 phase,created_at_ms,updated_at_ms,last_error,revision
+             ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            &[
+                &activation.operation_id,
+                &activation.source_session_id,
+                &activation.target_session_id,
+                &to_i64(
+                    activation.source_message_count,
+                    "branch activation source cutoff",
+                )?,
+                &activation.phase.as_str(),
+                &to_u64_i64(activation.created_at_ms, "branch activation created time")?,
+                &to_u64_i64(activation.updated_at_ms, "branch activation updated time")?,
+                &activation.last_error,
+                &to_u64_i64(activation.revision, "branch activation revision")?,
+            ],
+        )
+        .map_err(postgres_error)?;
+    Ok(())
+}
+
 fn import_runtime_outbox_tx(
     transaction: &mut PostgresTransaction<'_>,
     item: &SessionRuntimeOutboxRecord,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     transaction.execute(
-        "INSERT INTO session_runtime_outbox(request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,runtime_options_json)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
-        &[&item.request_id,&item.turn_id,&item.message_id,&item.session_id,&to_i64(item.sequence,"runtime sequence")?,&item.status.as_str(),
-          &item.runtime_commit_cursor.map(|value| to_u64_i64(value,"runtime cursor")).transpose()?,&to_i64(item.attempts as usize,"runtime attempts")?,&to_u64_i64(item.next_attempt_at_ms,"runtime next")?,&item.claim_owner,&item.claim_expires_at_ms.map(|value|to_u64_i64(value,"runtime lease")).transpose()?,&item.failure_class.map(OutboxFailureClass::as_str),&item.last_error,&to_u64_i64(item.revision,"runtime revision")?,&to_u64_i64(item.created_at_ms,"runtime created")?,&to_u64_i64(item.updated_at_ms,"runtime updated")?,&item.runtime_options_json],
+        "INSERT INTO session_runtime_outbox(
+             input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+             decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+             next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,last_error,
+             revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)",
+        &[&item.input_id,&item.request_id,&item.turn_id,&item.message_id,&item.session_id,
+          &to_i64(item.sequence,"runtime sequence")?,
+          &to_u64_i64(item.session_generation,"session generation")?,
+          &input_decision_as_str(item.decision),&item.target_turn_id,&item.classification_json,
+          &item.status.as_str(),
+          &item.runtime_commit_cursor.map(|value| to_u64_i64(value,"runtime cursor")).transpose()?,
+          &to_i64(item.attempts as usize,"runtime attempts")?,
+          &to_u64_i64(item.next_attempt_at_ms,"runtime next")?,&item.claim_owner,&item.claim_token,
+          &item.claim_expires_at_ms.map(|value|to_u64_i64(value,"runtime lease")).transpose()?,
+          &item.failure_class.map(OutboxFailureClass::as_str),&item.last_error,
+          &to_u64_i64(item.revision,"runtime revision")?,
+          &to_u64_i64(item.created_at_ms,"runtime created")?,
+          &to_u64_i64(item.updated_at_ms,"runtime updated")?,
+          &item.terminal_at_ms.map(|value|to_u64_i64(value,"runtime terminal")).transpose()?,
+          &item.runtime_options_json,
+          &item.claim_fence_epoch.map(|value|to_u64_i64(value,"runtime claim fence epoch")).transpose()?],
     ).map_err(postgres_error)?;
     Ok(())
 }
@@ -3289,7 +6000,7 @@ fn import_runtime_outbox_tx(
 fn import_mission_outbox_tx(
     transaction: &mut PostgresTransaction<'_>,
     item: &SessionMissionOutboxRecord,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     transaction.execute(
         "INSERT INTO session_mission_outbox(request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms)
          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
@@ -3302,7 +6013,7 @@ fn import_history_tx(
     transaction: &mut PostgresTransaction<'_>,
     table: &str,
     item: &SessionOutboxHistory,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     debug_assert!(matches!(
         table,
         "session_runtime_outbox_history" | "session_mission_outbox_history"
@@ -3320,18 +6031,18 @@ pub fn copy_quiesced_session_store(
     source: &SqliteSessionStore,
     target: &PostgresSessionStore,
     manifest_path: impl AsRef<Path>,
-) -> memory::store::Result<SessionMigrationManifest> {
+) -> session::SessionResult<SessionMigrationManifest> {
     let snapshot = export_sqlite_session_snapshot(source)?;
     let source_digest = snapshot.canonical_digest()?;
     target.import_migration_snapshot(&snapshot)?;
     if export_sqlite_session_snapshot(source)?.canonical_digest()? != source_digest {
-        return Err(memory::MemoryError::Store(
+        return Err(session::SessionError::Store(
             "session SQLite source changed during quiesced copy".to_string(),
         ));
     }
     let target_digest = target.export_migration_snapshot()?.canonical_digest()?;
     if target_digest != source_digest {
-        return Err(memory::MemoryError::Store(
+        return Err(session::SessionError::Store(
             "session PostgreSQL target digest differs from source".to_string(),
         ));
     }
@@ -3347,23 +6058,24 @@ pub fn copy_quiesced_session_store(
     let path = manifest_path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|error| memory::MemoryError::Store(error.to_string()))?;
+            .map_err(|error| session::SessionError::Store(error.to_string()))?;
     }
     let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
     fs::write(
         &temporary,
         serde_json::to_vec_pretty(&manifest)
-            .map_err(|error| memory::MemoryError::Store(error.to_string()))?,
+            .map_err(|error| session::SessionError::Store(error.to_string()))?,
     )
-    .map_err(|error| memory::MemoryError::Store(error.to_string()))?;
-    fs::rename(&temporary, path).map_err(|error| memory::MemoryError::Store(error.to_string()))?;
+    .map_err(|error| session::SessionError::Store(error.to_string()))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| session::SessionError::Store(error.to_string()))?;
     Ok(manifest)
 }
 
 fn runtime_outbox_tx(
     transaction: &mut PostgresTransaction<'_>,
     request_id: &str,
-) -> memory::store::Result<Option<SessionRuntimeOutboxRecord>> {
+) -> session::SessionResult<Option<SessionRuntimeOutboxRecord>> {
     transaction
         .query_opt(RUNTIME_OUTBOX_SELECT, &[&request_id])
         .map_err(postgres_error)?
@@ -3374,47 +6086,93 @@ fn runtime_outbox_tx(
 fn runtime_outbox_for_update(
     transaction: &mut PostgresTransaction<'_>,
     request_id: &str,
-) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-    transaction.query_opt(
-        "SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,
-                next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,
-                created_at_ms,updated_at_ms,runtime_options_json FROM session_runtime_outbox
-          WHERE request_id=$1 FOR UPDATE", &[&request_id],
-    ).map_err(postgres_error)?.map(|row| row_to_runtime_outbox(&row)).transpose()?
-        .ok_or_else(|| memory::MemoryError::Store(format!("session runtime outbox `{request_id}` not found")))
+) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+    transaction
+        .query_opt(
+            "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+                decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
+                last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+           FROM session_runtime_outbox
+          WHERE request_id=$1 FOR UPDATE",
+            &[&request_id],
+        )
+        .map_err(postgres_error)?
+        .map(|row| row_to_runtime_outbox(&row))
+        .transpose()?
+        .ok_or_else(|| {
+            session::SessionError::Store(format!("session runtime outbox `{request_id}` not found"))
+        })
 }
 
+fn runtime_outbox_by_input_id_for_update(
+    transaction: &mut PostgresTransaction<'_>,
+    input_id: &str,
+) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+    transaction
+        .query_opt(
+            "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
+                decision,target_turn_id,classification_json,status,runtime_commit_cursor,attempts,
+                next_attempt_at_ms,claim_owner,claim_token,claim_expires_at_ms,failure_class,
+                last_error,revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch
+           FROM session_runtime_outbox
+          WHERE input_id=$1 FOR UPDATE",
+            &[&input_id],
+        )
+        .map_err(postgres_error)?
+        .map(|row| row_to_runtime_outbox(&row))
+        .transpose()?
+        .ok_or_else(|| {
+            session::SessionError::Store(format!("session input `{input_id}` not found"))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn assert_runtime_lease(
+    transaction: &mut PostgresTransaction<'_>,
     record: &SessionRuntimeOutboxRecord,
     worker_id: &str,
+    session_generation: u64,
+    claim_token: &str,
     expected_revision: u64,
     now_ms: u64,
-) -> memory::store::Result<()> {
-    if record.status != OutboxStatus::Claimed
+    allowed: &[SessionRuntimeInputStatus],
+) -> session::SessionResult<()> {
+    let admission =
+        query_input_admission_tx(transaction, &record.session_id, false)?.ok_or_else(|| {
+            session::SessionError::Store(format!("session `{}` not found", record.session_id))
+        })?;
+    if !allowed.contains(&record.status)
+        || record.session_generation != session_generation
+        || admission.generation != session_generation
+        || !admission.open
         || record.claim_owner.as_deref() != Some(worker_id)
+        || record.claim_token.as_deref() != Some(claim_token)
         || record.revision != expected_revision
         || record
             .claim_expires_at_ms
-            .is_none_or(|expires| expires < now_ms)
+            .is_none_or(|expires| expires <= now_ms)
     {
-        return Err(memory::MemoryError::Store(
-            "runtime outbox transition rejected by lease/revision fencing".to_string(),
+        return Err(session::SessionError::Store(
+            "runtime outbox transition rejected by generation/token/lease/revision fencing"
+                .to_string(),
         ));
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_runtime_history_tx(
     transaction: &mut PostgresTransaction<'_>,
     record: &SessionRuntimeOutboxRecord,
     action: &str,
     actor: Option<&str>,
     expected_revision: Option<u64>,
-    previous_status: OutboxStatus,
-    next_status: OutboxStatus,
+    previous_status: SessionRuntimeInputStatus,
+    next_status: SessionRuntimeInputStatus,
     detail: Option<&str>,
     created_at_ms: u64,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     transaction
         .execute(
             "INSERT INTO session_runtime_outbox_history(
@@ -3442,14 +6200,14 @@ fn append_runtime_history_tx(
 fn mission_outbox_for_update(
     transaction: &mut PostgresTransaction<'_>,
     request_id: &str,
-) -> memory::store::Result<SessionMissionOutboxRecord> {
+) -> session::SessionResult<SessionMissionOutboxRecord> {
     transaction.query_opt(
         "SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,
                 claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms
            FROM session_mission_outbox WHERE request_id=$1 FOR UPDATE",
         &[&request_id],
     ).map_err(postgres_error)?.map(|row| row_to_mission_outbox(&row)).transpose()?
-        .ok_or_else(|| memory::MemoryError::Store(format!("mission outbox `{request_id}` was not found")))
+        .ok_or_else(|| session::SessionError::Store(format!("mission outbox `{request_id}` was not found")))
 }
 
 fn assert_mission_lease(
@@ -3457,7 +6215,7 @@ fn assert_mission_lease(
     worker_id: &str,
     expected_revision: u64,
     now_ms: u64,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     if record.status != OutboxStatus::Claimed
         || record.claim_owner.as_deref() != Some(worker_id)
         || record.revision != expected_revision
@@ -3465,13 +6223,14 @@ fn assert_mission_lease(
             .claim_expires_at_ms
             .is_none_or(|expires| expires < now_ms)
     {
-        return Err(memory::MemoryError::Store(
+        return Err(session::SessionError::Store(
             "mission outbox transition rejected by lease/revision fencing".to_string(),
         ));
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_mission_history_tx(
     transaction: &mut PostgresTransaction<'_>,
     record: &SessionMissionOutboxRecord,
@@ -3482,7 +6241,7 @@ fn append_mission_history_tx(
     next_status: OutboxStatus,
     detail: Option<&str>,
     created_at_ms: u64,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     transaction
         .execute(
             "INSERT INTO session_mission_outbox_history(
@@ -3507,7 +6266,7 @@ fn append_mission_history_tx(
     Ok(())
 }
 
-fn row_to_session(row: &Row) -> memory::store::Result<SessionRecord> {
+fn row_to_session(row: &Row) -> session::SessionResult<SessionRecord> {
     Ok(SessionRecord {
         session_id: row.try_get(0).map_err(postgres_error)?,
         platform: row.try_get(1).map_err(postgres_error)?,
@@ -3526,7 +6285,7 @@ fn row_to_session(row: &Row) -> memory::store::Result<SessionRecord> {
     })
 }
 
-fn row_to_recovery_manifest(row: &Row) -> memory::store::Result<SessionRecoveryManifest> {
+fn row_to_recovery_manifest(row: &Row) -> session::SessionResult<SessionRecoveryManifest> {
     Ok(SessionRecoveryManifest {
         session_id: row.try_get(0).map_err(postgres_error)?,
         durable_cursor: i64_to_u64(
@@ -3560,11 +6319,227 @@ fn row_to_recovery_manifest(row: &Row) -> memory::store::Result<SessionRecoveryM
     })
 }
 
+fn validate_terminal_transcript(
+    terminal_message_id: &str,
+    ingress_message_id: &str,
+    session_id: &str,
+    messages: &[SessionMessage],
+) -> session::SessionResult<()> {
+    if terminal_message_id.trim().is_empty()
+        || ingress_message_id.trim().is_empty()
+        || session_id.trim().is_empty()
+        || messages.is_empty()
+        || messages
+            .last()
+            .is_none_or(|message| message.stable_message_id != terminal_message_id)
+    {
+        return Err(session::SessionError::InvalidArgument(
+            "terminal transcript requires a non-empty session, ingress, terminal ID, and final row"
+                .to_string(),
+        ));
+    }
+    if messages.iter().any(|message| {
+        message.stable_message_id.trim().is_empty()
+            || message.session_id != session_id
+            || message.role.trim().is_empty()
+            || serde_json::from_str::<serde_json::Value>(&message.content_json)
+                .ok()
+                .and_then(|value| value.as_array().cloned())
+                .is_none()
+    }) {
+        return Err(session::SessionError::InvalidArgument(
+            "terminal transcript contains an invalid message row".to_string(),
+        ));
+    }
+    let unique_ids = messages
+        .iter()
+        .map(|message| message.stable_message_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_ids.len() != messages.len() {
+        return Err(session::SessionError::InvalidArgument(
+            "terminal transcript contains duplicate stable message IDs".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_terminal_commit(
+    request: &SessionTerminalTranscriptCommit,
+) -> session::SessionResult<()> {
+    if request.turn_id.trim().is_empty()
+        || request.runtime_commit_cursor == 0
+        || request.fence.request_id.trim().is_empty()
+        || request.fence.session_generation == 0
+        || request.fence.claim_owner.trim().is_empty()
+        || request.fence.claim_token.trim().is_empty()
+        || request.fence.claim_fence_epoch == 0
+    {
+        return Err(session::SessionError::InvalidArgument(
+            "terminal commit requires complete turn, cursor and live execution fence identity"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn append_terminal_transcript_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    terminal_message_id: &str,
+    ingress_message_id: &str,
+    session_id: &str,
+    messages: &[SessionMessage],
+    created_at_ms: u64,
+) -> session::SessionResult<(Vec<SessionMessage>, bool)> {
+    transaction
+        .query_one(
+            "SELECT session_id FROM session_records WHERE session_id=$1 FOR UPDATE",
+            &[&session_id],
+        )
+        .map_err(postgres_error)?;
+    let mut loaded = Vec::with_capacity(messages.len());
+    for requested in messages {
+        let existing = transaction
+            .query_opt(
+                "SELECT stable_message_id, session_id, sequence, role, content_json,
+                        blocks_count, tool_use_id, tool_name, token_usage_json, created_at_ms
+                   FROM session_messages WHERE stable_message_id=$1",
+                &[&requested.stable_message_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_message(&row))
+            .transpose()?;
+        loaded.push(existing);
+    }
+    let terminal_exists = loaded.last().is_some_and(Option::is_some);
+    if terminal_exists {
+        let mut committed = Vec::with_capacity(messages.len());
+        for (requested, existing) in messages.iter().zip(loaded.into_iter()) {
+            let existing = existing.ok_or_else(|| {
+                session::SessionError::Store(format!(
+                    "terminal transcript `{terminal_message_id}` is partially committed"
+                ))
+            })?;
+            if existing.session_id != requested.session_id
+                || existing.role != requested.role
+                || existing.content_json != requested.content_json
+                || existing.blocks_count != requested.blocks_count
+                || existing.tool_use_id != requested.tool_use_id
+                || existing.tool_name != requested.tool_name
+                || existing.token_usage_json != requested.token_usage_json
+            {
+                return Err(session::SessionError::Store(format!(
+                    "terminal transcript message_id `{}` conflicts with committed content",
+                    requested.stable_message_id
+                )));
+            }
+            committed.push(existing);
+        }
+        committed.sort_by_key(|message| message.sequence);
+        return Ok((committed, false));
+    }
+    if loaded.iter().any(Option::is_some) {
+        return Err(session::SessionError::Store(format!(
+            "terminal transcript `{terminal_message_id}` collides with existing intermediate rows"
+        )));
+    }
+    transaction
+        .query_opt(
+            "SELECT sequence FROM session_messages
+              WHERE stable_message_id=$1 AND session_id=$2 AND role='user'",
+            &[&ingress_message_id, &session_id],
+        )
+        .map_err(postgres_error)?
+        .ok_or_else(|| {
+            session::SessionError::Store(format!(
+                "terminal transcript ingress `{ingress_message_id}` is not committed"
+            ))
+        })?;
+    let first_sequence = transaction
+        .query_one(
+            "SELECT COALESCE(MAX(sequence), -1) + 1
+               FROM session_messages WHERE session_id=$1",
+            &[&session_id],
+        )
+        .map_err(postgres_error)?
+        .try_get::<_, i64>(0)
+        .map_err(postgres_error)
+        .and_then(|sequence| from_i64(sequence, "message sequence"))?;
+    let mut committed = Vec::with_capacity(messages.len());
+    for (index, requested) in messages.iter().enumerate() {
+        let mut message = requested.clone();
+        message.sequence = first_sequence.saturating_add(index);
+        message.created_at_ms = created_at_ms.saturating_add(index as u64);
+        insert_message_tx(transaction, &message)?;
+        committed.push(message);
+    }
+    let last_created_at = committed
+        .last()
+        .map_or(created_at_ms, |message| message.created_at_ms);
+    refresh_session_message_summary_tx(transaction, session_id, last_created_at)?;
+    refresh_session_usage_summary_tx(transaction, session_id)?;
+    Ok((committed, true))
+}
+
+fn load_committed_terminal_transcript_tx(
+    transaction: &mut PostgresTransaction<'_>,
+    terminal_message_id: &str,
+    messages: &[SessionMessage],
+) -> session::SessionResult<Vec<SessionMessage>> {
+    let mut committed = Vec::with_capacity(messages.len());
+    for requested in messages {
+        let existing = transaction
+            .query_opt(
+                "SELECT stable_message_id, session_id, sequence, role, content_json,
+                        blocks_count, tool_use_id, tool_name, token_usage_json, created_at_ms
+                   FROM session_messages WHERE stable_message_id=$1",
+                &[&requested.stable_message_id],
+            )
+            .map_err(postgres_error)?
+            .map(|row| row_to_message(&row))
+            .transpose()?
+            .ok_or_else(|| {
+                session::SessionError::StaleExecutionFence(format!(
+                    "completed terminal transcript `{terminal_message_id}` does not match replay"
+                ))
+            })?;
+        if existing.session_id != requested.session_id
+            || existing.role != requested.role
+            || existing.content_json != requested.content_json
+            || existing.blocks_count != requested.blocks_count
+            || existing.tool_use_id != requested.tool_use_id
+            || existing.tool_name != requested.tool_name
+            || existing.token_usage_json != requested.token_usage_json
+        {
+            return Err(session::SessionError::StaleExecutionFence(format!(
+                "completed terminal transcript `{terminal_message_id}` content does not match replay"
+            )));
+        }
+        committed.push(existing);
+    }
+    if committed
+        .windows(2)
+        .any(|pair| pair[0].sequence >= pair[1].sequence)
+    {
+        return Err(session::SessionError::StaleExecutionFence(format!(
+            "completed terminal transcript `{terminal_message_id}` order does not match replay"
+        )));
+    }
+    if committed
+        .last()
+        .is_none_or(|message| message.stable_message_id != terminal_message_id)
+    {
+        return Err(session::SessionError::StaleExecutionFence(format!(
+            "completed terminal transcript `{terminal_message_id}` identity does not match replay"
+        )));
+    }
+    Ok(committed)
+}
+
 fn refresh_session_message_summary_tx(
     transaction: &mut PostgresTransaction<'_>,
     session_id: &str,
     activity_ms: u64,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     let activity = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(to_u64_i64(
         activity_ms,
         "session activity time",
@@ -3593,7 +6568,7 @@ fn refresh_session_message_summary_tx(
 fn refresh_session_usage_summary_tx(
     transaction: &mut PostgresTransaction<'_>,
     session_id: &str,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     transaction
         .execute(
             "UPDATE session_records
@@ -3619,7 +6594,7 @@ fn refresh_session_usage_summary_tx(
 fn insert_message_tx(
     transaction: &mut PostgresTransaction<'_>,
     message: &SessionMessage,
-) -> memory::store::Result<()> {
+) -> session::SessionResult<()> {
     let stable_message_id = if message.stable_message_id.trim().is_empty() {
         format!("legacy:{}:{}", message.session_id, message.sequence)
     } else {
@@ -3653,7 +6628,7 @@ fn insert_message_tx(
     Ok(())
 }
 
-fn row_to_session_search(row: &Row) -> memory::store::Result<SessionSearchResult> {
+fn row_to_session_search(row: &Row) -> session::SessionResult<SessionSearchResult> {
     Ok(SessionSearchResult {
         session_id: row.try_get(0).map_err(postgres_error)?,
         platform: row.try_get(1).map_err(postgres_error)?,
@@ -3666,7 +6641,7 @@ fn row_to_session_search(row: &Row) -> memory::store::Result<SessionSearchResult
     })
 }
 
-fn row_to_message(row: &Row) -> memory::store::Result<SessionMessage> {
+fn row_to_message(row: &Row) -> session::SessionResult<SessionMessage> {
     Ok(SessionMessage {
         stable_message_id: row.try_get(0).map_err(postgres_error)?,
         session_id: row.try_get(1).map_err(postgres_error)?,
@@ -3678,11 +6653,11 @@ fn row_to_message(row: &Row) -> memory::store::Result<SessionMessage> {
         tool_name: row.try_get(7).map_err(postgres_error)?,
         token_usage_json: row.try_get(8).map_err(postgres_error)?,
         created_at_ms: u64::try_from(row.try_get::<_, i64>(9).map_err(postgres_error)?)
-            .map_err(|_| memory::MemoryError::Store("message time overflow".to_string()))?,
+            .map_err(|_| session::SessionError::Store("message time overflow".to_string()))?,
     })
 }
 
-fn row_to_event(row: &Row) -> memory::store::Result<SessionEvent> {
+fn row_to_event(row: &Row) -> session::SessionResult<SessionEvent> {
     Ok(SessionEvent {
         session_id: row.try_get(0).map_err(postgres_error)?,
         event_type: row.try_get(1).map_err(postgres_error)?,
@@ -3692,7 +6667,7 @@ fn row_to_event(row: &Row) -> memory::store::Result<SessionEvent> {
     })
 }
 
-fn row_to_snapshot(row: &Row) -> memory::store::Result<SessionSnapshot> {
+fn row_to_snapshot(row: &Row) -> session::SessionResult<SessionSnapshot> {
     Ok(SessionSnapshot {
         session_id: row.try_get(0).map_err(postgres_error)?,
         event_idx: from_i64(row.try_get(1).map_err(postgres_error)?, "snapshot index")?,
@@ -3704,20 +6679,20 @@ fn row_to_snapshot(row: &Row) -> memory::store::Result<SessionSnapshot> {
 fn event_json_with_allocated_sequence(
     event: &SessionEvent,
     sequence: usize,
-) -> memory::store::Result<String> {
+) -> session::SessionResult<String> {
     let mut value: serde_json::Value =
         serde_json::from_str(&event.event_json).map_err(|error| {
-            memory::MemoryError::Store(format!("decode allocated session event JSON: {error}"))
+            session::SessionError::Store(format!("decode allocated session event JSON: {error}"))
         })?;
     if let Some(object) = value.as_object_mut() {
         object.insert("sequence".to_string(), serde_json::Value::from(sequence));
     }
     serde_json::to_string(&value).map_err(|error| {
-        memory::MemoryError::Store(format!("encode allocated session event JSON: {error}"))
+        session::SessionError::Store(format!("encode allocated session event JSON: {error}"))
     })
 }
 
-fn context_envelope_id(event_json: &str) -> memory::store::Result<String> {
+fn context_envelope_id(event_json: &str) -> session::SessionResult<String> {
     serde_json::from_str::<serde_json::Value>(event_json)
         .ok()
         .and_then(|payload| {
@@ -3728,14 +6703,14 @@ fn context_envelope_id(event_json: &str) -> memory::store::Result<String> {
                 .map(str::to_owned)
         })
         .ok_or_else(|| {
-            memory::MemoryError::Store(
+            session::SessionError::Store(
                 "ContextEnvelope append requires envelope.id or envelope_id".to_string(),
             )
         })
 }
 
 fn checkpoint_from_event(event: &SessionEvent) -> Option<String> {
-    if event.event_type != memory::SESSION_DOMAIN_EVENT_TYPE {
+    if event.event_type != session::SESSION_DOMAIN_EVENT_TYPE {
         return None;
     }
     let payload = serde_json::from_str::<serde_json::Value>(&event.event_json).ok()?;
@@ -3748,14 +6723,14 @@ fn checkpoint_from_event(event: &SessionEvent) -> Option<String> {
         .map(str::to_string)
 }
 
-fn storage_error(error: storage::StorageError) -> memory::MemoryError {
+fn storage_error(error: storage::StorageError) -> session::SessionError {
     match error {
         storage::StorageError::Postgres(error) => postgres_error(error),
-        other => memory::MemoryError::Store(other.to_string()),
+        other => session::SessionError::Store(other.to_string()),
     }
 }
 
-fn postgres_error(error: postgres::Error) -> memory::MemoryError {
+fn postgres_error(error: postgres::Error) -> session::SessionError {
     let detail = error.as_db_error().map_or_else(
         || error.to_string(),
         |database_error| {
@@ -3766,54 +6741,54 @@ fn postgres_error(error: postgres::Error) -> memory::MemoryError {
             )
         },
     );
-    memory::MemoryError::Store(detail)
+    session::SessionError::Store(detail)
 }
 
-fn migration_export_error(table: &str, error: memory::MemoryError) -> memory::MemoryError {
-    memory::MemoryError::Store(format!("export PostgreSQL `{table}` snapshot: {error}"))
+fn migration_export_error(table: &str, error: session::SessionError) -> session::SessionError {
+    session::SessionError::Store(format!("export PostgreSQL `{table}` snapshot: {error}"))
 }
 
-fn to_i64(value: usize, label: &str) -> memory::store::Result<i64> {
-    i64::try_from(value).map_err(|_| memory::MemoryError::Store(format!("{label} overflow")))
+fn to_i64(value: usize, label: &str) -> session::SessionResult<i64> {
+    i64::try_from(value).map_err(|_| session::SessionError::Store(format!("{label} overflow")))
 }
 
-fn from_i64(value: i64, label: &str) -> memory::store::Result<usize> {
-    usize::try_from(value).map_err(|_| memory::MemoryError::Store(format!("{label} overflow")))
+fn from_i64(value: i64, label: &str) -> session::SessionResult<usize> {
+    usize::try_from(value).map_err(|_| session::SessionError::Store(format!("{label} overflow")))
 }
 
-fn to_u64_i64(value: u64, label: &str) -> memory::store::Result<i64> {
-    i64::try_from(value).map_err(|_| memory::MemoryError::Store(format!("{label} overflow")))
+fn to_u64_i64(value: u64, label: &str) -> session::SessionResult<i64> {
+    i64::try_from(value).map_err(|_| session::SessionError::Store(format!("{label} overflow")))
 }
 
-fn i64_to_u64(value: i64, label: &str) -> memory::store::Result<u64> {
-    u64::try_from(value).map_err(|_| memory::MemoryError::Store(format!("{label} overflow")))
+fn i64_to_u64(value: i64, label: &str) -> session::SessionResult<u64> {
+    u64::try_from(value).map_err(|_| session::SessionError::Store(format!("{label} overflow")))
 }
 
-fn i64_to_u32(value: i64, label: &str) -> memory::store::Result<u32> {
-    u32::try_from(value).map_err(|_| memory::MemoryError::Store(format!("{label} overflow")))
+fn i64_to_u32(value: i64, label: &str) -> session::SessionResult<u32> {
+    u32::try_from(value).map_err(|_| session::SessionError::Store(format!("{label} overflow")))
 }
 
 // Keep this explicit rather than using partial/default methods: adding a new
 // Session operation fails compilation until PostgreSQL has a real owner.
 #[allow(clippy::too_many_arguments)]
-impl memory::SessionStoreBackend for PostgresSessionStore {
-    fn create_session(&self, v: &SessionRecord) -> memory::store::Result<()> {
+impl session::SessionStoreBackend for PostgresSessionStore {
+    fn create_session(&self, v: &SessionRecord) -> session::SessionResult<()> {
         self.create_session(v)
     }
-    fn get_session(&self, v: &str) -> memory::store::Result<Option<SessionRecord>> {
+    fn get_session(&self, v: &str) -> session::SessionResult<Option<SessionRecord>> {
         self.get_session(v)
     }
     fn get_session_recovery_manifest(
         &self,
         v: &str,
-    ) -> memory::store::Result<Option<SessionRecoveryManifest>> {
+    ) -> session::SessionResult<Option<SessionRecoveryManifest>> {
         self.get_session_recovery_manifest(v)
     }
     fn list_active_session_recovery_manifests(
         &self,
         offset: usize,
         limit: usize,
-    ) -> memory::store::Result<Vec<SessionRecoveryManifest>> {
+    ) -> session::SessionResult<Vec<SessionRecoveryManifest>> {
         self.list_active_session_recovery_manifests(offset, limit)
     }
     fn set_session_recovery_signal(
@@ -3822,57 +6797,93 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         signal: SessionRecoverySignal,
         active: bool,
         observed_at_ms: u64,
-    ) -> memory::store::Result<SessionRecoveryManifest> {
+    ) -> session::SessionResult<SessionRecoveryManifest> {
         self.set_session_recovery_signal(session_id, signal, active, observed_at_ms)
     }
-    fn update_session(&self, v: &SessionRecord) -> memory::store::Result<()> {
+    fn update_session(&self, v: &SessionRecord) -> session::SessionResult<()> {
         self.update_session(v)
     }
-    fn upsert_session(&self, v: &SessionRecord) -> memory::store::Result<()> {
+    fn upsert_session(&self, v: &SessionRecord) -> session::SessionResult<()> {
         self.upsert_session(v)
     }
     fn upsert_session_with_mission_outbox(
         &self,
         v: &SessionRecord,
         r: &SessionMissionOutboxRequest,
-    ) -> memory::store::Result<SessionMissionOutboxRecord> {
+    ) -> session::SessionResult<SessionMissionOutboxRecord> {
         self.upsert_session_with_mission_outbox(v, r)
     }
-    fn delete_session(&self, v: &str) -> memory::store::Result<()> {
+    fn plan_session_lifecycle(
+        &self,
+        plan: &SessionLifecyclePlan,
+    ) -> session::SessionResult<SessionLifecycleIntent> {
+        self.plan_session_lifecycle(plan)
+    }
+    fn get_session_lifecycle_intent(
+        &self,
+        operation_id: &str,
+    ) -> session::SessionResult<Option<SessionLifecycleIntent>> {
+        self.get_session_lifecycle_intent(operation_id)
+    }
+    fn list_recoverable_session_lifecycle_intents(
+        &self,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionLifecycleIntent>> {
+        self.list_recoverable_session_lifecycle_intents(limit)
+    }
+    fn fence_session_lifecycle(
+        &self,
+        request: &SessionLifecycleFenceRequest,
+    ) -> session::SessionResult<SessionLifecycleIntent> {
+        self.fence_session_lifecycle(request)
+    }
+    fn transition_session_lifecycle(
+        &self,
+        transition: &SessionLifecycleTransition,
+    ) -> session::SessionResult<SessionLifecycleIntent> {
+        self.transition_session_lifecycle(transition)
+    }
+    fn commit_session_lifecycle_tombstone(
+        &self,
+        request: &SessionLifecycleTombstoneRequest,
+    ) -> session::SessionResult<SessionLifecycleIntent> {
+        self.commit_session_lifecycle_tombstone(request)
+    }
+    fn delete_session(&self, v: &str) -> session::SessionResult<()> {
         self.delete_session(v)
     }
     fn delete_session_with_mission_outbox(
         &self,
         r: &SessionMissionOutboxRequest,
-    ) -> memory::store::Result<bool> {
+    ) -> session::SessionResult<bool> {
         self.delete_session_with_mission_outbox(r)
     }
-    fn mark_session_closed(&self, v: &str) -> memory::store::Result<()> {
+    fn mark_session_closed(&self, v: &str) -> session::SessionResult<()> {
         self.mark_session_closed(v)
     }
-    fn list_sessions(&self) -> memory::store::Result<Vec<SessionRecord>> {
+    fn list_sessions(&self) -> session::SessionResult<Vec<SessionRecord>> {
         self.list_sessions()
     }
     fn list_sessions_page(
         &self,
         v: &SessionListOptions<'_>,
-    ) -> memory::store::Result<SessionListPage> {
+    ) -> session::SessionResult<SessionListPage> {
         self.list_sessions_page(v)
     }
-    fn list_sessions_by_platform(&self, v: &str) -> memory::store::Result<Vec<SessionRecord>> {
+    fn list_sessions_by_platform(&self, v: &str) -> session::SessionResult<Vec<SessionRecord>> {
         self.list_sessions_by_platform(v)
     }
     fn list_sessions_by_workspace_root(
         &self,
         v: &str,
-    ) -> memory::store::Result<Vec<SessionRecord>> {
+    ) -> session::SessionResult<Vec<SessionRecord>> {
         self.list_sessions_by_workspace_root(v)
     }
     fn search_sessions(
         &self,
         q: &str,
         l: usize,
-    ) -> memory::store::Result<Vec<SessionSearchResult>> {
+    ) -> session::SessionResult<Vec<SessionSearchResult>> {
         self.search_sessions(q, None, l)
     }
     fn search_sessions_by_platform(
@@ -3880,53 +6891,67 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         q: &str,
         p: &str,
         l: usize,
-    ) -> memory::store::Result<Vec<SessionSearchResult>> {
+    ) -> session::SessionResult<Vec<SessionSearchResult>> {
         self.search_sessions(q, Some(p), l)
     }
-    fn associate_memory(&self, a: &str, b: &str) -> memory::store::Result<()> {
+    fn associate_memory(&self, a: &str, b: &str) -> session::SessionResult<()> {
         self.associate_memory(a, b)
     }
-    fn get_session_memories(&self, a: &str) -> memory::store::Result<Vec<String>> {
+    fn get_session_memories(&self, a: &str) -> session::SessionResult<Vec<String>> {
         self.get_session_memories(a)
     }
-    fn disassociate_memory(&self, a: &str, b: &str) -> memory::store::Result<()> {
+    fn disassociate_memory(&self, a: &str, b: &str) -> session::SessionResult<()> {
         self.disassociate_memory(a, b)
     }
-    fn append_event(&self, v: &SessionEvent) -> memory::store::Result<()> {
+    fn append_event(&self, v: &SessionEvent) -> session::SessionResult<()> {
         self.append_event(v)
     }
     fn append_event_allocating_sequence(
         &self,
         v: &SessionEvent,
-    ) -> memory::store::Result<SessionEvent> {
+    ) -> session::SessionResult<SessionEvent> {
         self.append_event_allocating_sequence(v)
+    }
+    fn append_session_domain_event_if_absent_allocating_sequence(
+        &self,
+        event: &SessionEvent,
+        event_id: &str,
+    ) -> session::SessionResult<(SessionEvent, bool)> {
+        self.append_session_domain_event_if_absent_allocating_sequence(event, event_id)
+    }
+    fn get_session_domain_event_by_id(
+        &self,
+        session_id: &str,
+        event_id: &str,
+    ) -> session::SessionResult<Option<SessionEvent>> {
+        self.get_session_domain_event_by_id(session_id, event_id)
     }
     fn append_events_allocating_sequence(
         &self,
         v: &[SessionEvent],
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         self.append_events_allocating_sequence(v)
     }
     fn append_events_allocating_sequence_if_checkpoint_absent(
         &self,
         v: &[SessionEvent],
         c: &str,
-    ) -> memory::store::Result<Option<Vec<SessionEvent>>> {
+    ) -> session::SessionResult<Option<Vec<SessionEvent>>> {
         self.append_events_allocating_sequence_if_checkpoint_absent(v, c)
     }
     fn append_context_envelope_event_if_absent(
         &self,
         v: &SessionEvent,
-    ) -> memory::store::Result<bool> {
+    ) -> session::SessionResult<bool> {
         self.append_context_envelope_event_if_absent(v)
     }
     fn append_context_envelope_event_if_absent_allocating_sequence(
         &self,
         v: &SessionEvent,
-    ) -> memory::store::Result<Option<SessionEvent>> {
+    ) -> session::SessionResult<Option<SessionEvent>> {
         self.append_context_envelope_event_if_absent_allocating_sequence(v)
     }
-    fn get_events(&self, a: &str, b: usize) -> memory::store::Result<Vec<SessionEvent>> {
+    fn get_events(&self, a: &str, b: usize) -> session::SessionResult<Vec<SessionEvent>> {
         self.get_events(a, b)
     }
     fn get_events_limited(
@@ -3934,7 +6959,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: usize,
         c: usize,
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         self.get_events_limited(a, b, c)
     }
     fn get_session_domain_timeline_limited(
@@ -3942,15 +6967,32 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: usize,
         c: usize,
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         self.get_session_domain_timeline_limited(a, b, c)
     }
     fn count_session_domain_timeline_from(
         &self,
         a: &str,
         b: usize,
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         self.count_session_domain_timeline_from(a, b)
+    }
+    fn get_session_domain_events_by_kind_limited(
+        &self,
+        session_id: &str,
+        kind: &str,
+        from_seq: usize,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionEvent>> {
+        self.get_session_domain_events_by_kind_limited(session_id, kind, from_seq, limit)
+    }
+    fn count_session_domain_events_by_kind_from(
+        &self,
+        session_id: &str,
+        kind: &str,
+        from_seq: usize,
+    ) -> session::SessionResult<usize> {
+        self.count_session_domain_events_by_kind_from(session_id, kind, from_seq)
     }
     fn get_events_by_type_limited(
         &self,
@@ -3958,10 +7000,10 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         b: &str,
         c: usize,
         d: usize,
-    ) -> memory::store::Result<Vec<SessionEvent>> {
+    ) -> session::SessionResult<Vec<SessionEvent>> {
         self.get_events_by_type_limited(a, b, c, d)
     }
-    fn count_events_from(&self, a: &str, b: usize) -> memory::store::Result<usize> {
+    fn count_events_from(&self, a: &str, b: usize) -> session::SessionResult<usize> {
         self.count_events_from(a, b)
     }
     fn count_events_by_type_from(
@@ -3969,19 +7011,19 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: &str,
         c: usize,
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         self.count_events_by_type_from(a, b, c)
     }
     fn get_context_event_by_envelope_id(
         &self,
         a: &str,
-    ) -> memory::store::Result<Option<SessionEvent>> {
+    ) -> session::SessionResult<Option<SessionEvent>> {
         self.get_context_event_by_envelope_id(a)
     }
-    fn next_event_sequence(&self, a: &str) -> memory::store::Result<usize> {
+    fn next_event_sequence(&self, a: &str) -> session::SessionResult<usize> {
         self.next_event_sequence(a)
     }
-    fn delete_events_from(&self, a: &str, b: usize) -> memory::store::Result<usize> {
+    fn delete_events_from(&self, a: &str, b: usize) -> session::SessionResult<usize> {
         self.delete_events_from(a, b)
     }
     fn delete_events_by_type_from(
@@ -3989,49 +7031,67 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: &str,
         c: usize,
-    ) -> memory::store::Result<usize> {
+    ) -> session::SessionResult<usize> {
         self.delete_events_by_type_from(a, b, c)
     }
-    fn save_snapshot(&self, v: &SessionSnapshot) -> memory::store::Result<()> {
+    fn save_snapshot(&self, v: &SessionSnapshot) -> session::SessionResult<()> {
         self.save_snapshot(v)
     }
-    fn get_latest_snapshot(&self, a: &str) -> memory::store::Result<Option<SessionSnapshot>> {
+    fn get_latest_snapshot(&self, a: &str) -> session::SessionResult<Option<SessionSnapshot>> {
         self.get_latest_snapshot(a)
     }
-    fn prune_before(&self, a: &str) -> memory::store::Result<usize> {
+    fn prune_before(&self, a: &str) -> session::SessionResult<usize> {
         self.prune_before(a)
     }
-    fn insert_message(&self, v: &SessionMessage) -> memory::store::Result<()> {
+    fn insert_message(&self, v: &SessionMessage) -> session::SessionResult<()> {
         self.insert_message(v)
     }
-    fn append_terminal_message_idempotent(
+    fn commit_terminal_transcript_if_fenced(
         &self,
-        a: &str,
-        b: &str,
-        c: &str,
-        d: Option<&str>,
-        e: u64,
-    ) -> memory::store::Result<(SessionMessage, bool)> {
-        self.append_terminal_message_idempotent(a, b, c, d, e)
+        request: &SessionTerminalTranscriptCommit,
+    ) -> session::SessionResult<SessionTerminalTranscriptReceipt> {
+        self.commit_terminal_transcript_if_fenced(request)
     }
-    fn append_terminal_transcript_idempotent(
-        &self,
-        a: &str,
-        b: &str,
-        c: &str,
-        d: &[SessionMessage],
-        e: u64,
-    ) -> memory::store::Result<(Vec<SessionMessage>, bool)> {
-        self.append_terminal_transcript_idempotent(a, b, c, d, e)
-    }
-    fn insert_messages_batch(&self, a: &[SessionMessage]) -> memory::store::Result<()> {
+    fn insert_messages_batch(&self, a: &[SessionMessage]) -> session::SessionResult<()> {
         self.insert_messages_batch(a)
+    }
+    fn copy_session_messages_at_cutoff(
+        &self,
+        a: &str,
+        b: &str,
+        c: usize,
+    ) -> session::SessionResult<usize> {
+        self.copy_session_messages_at_cutoff(a, b, c)
+    }
+    fn branch_session_at_cutoff(
+        &self,
+        request: &SessionBranchRequest,
+    ) -> session::SessionResult<SessionBranchResult> {
+        self.branch_session_at_cutoff(request)
+    }
+    fn get_session_branch_activation(
+        &self,
+        operation_id: &str,
+    ) -> session::SessionResult<Option<SessionBranchActivation>> {
+        self.get_session_branch_activation(operation_id)
+    }
+    fn list_recoverable_session_branch_activations(
+        &self,
+        limit: usize,
+    ) -> session::SessionResult<Vec<SessionBranchActivation>> {
+        self.list_recoverable_session_branch_activations(limit)
+    }
+    fn transition_session_branch_activation(
+        &self,
+        transition: &SessionBranchActivationTransition,
+    ) -> session::SessionResult<SessionBranchActivation> {
+        self.transition_session_branch_activation(transition)
     }
     fn append_message_with_runtime_outbox(
         &self,
         a: &SessionMessage,
         b: &SessionRuntimeOutboxRequest,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         self.append_message_with_runtime_outbox(a, b)
     }
     fn append_ingress_with_runtime_outbox(
@@ -4041,7 +7101,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         c: Option<&str>,
         d: u64,
         e: &SessionRuntimeOutboxRequest,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
         self.append_ingress_with_runtime_outbox(a, b, c, d, e)
     }
     fn claim_session_runtime_outbox(
@@ -4050,7 +7110,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         b: u64,
         c: u64,
         d: usize,
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.claim_session_runtime_outbox(a, b, c, d)
     }
     fn ack_session_runtime_outbox(
@@ -4058,70 +7118,162 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: &str,
         c: u64,
-        d: u64,
+        d: &str,
         e: u64,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-        self.ack_session_runtime_outbox(a, b, c, d, e)
+        f: SessionRuntimeInputStatus,
+        g: u64,
+        h: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.ack_session_runtime_outbox(a, b, c, d, e, f, g, h)
+    }
+    fn mark_session_runtime_outbox_running(
+        &self,
+        a: &str,
+        b: &str,
+        c: u64,
+        d: &str,
+        e: u64,
+        f: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.mark_session_runtime_outbox_running(a, b, c, d, e, f)
     }
     fn renew_session_runtime_outbox_lease(
         &self,
         a: &str,
         b: &str,
         c: u64,
-        d: u64,
+        d: &str,
         e: u64,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-        self.renew_session_runtime_outbox_lease(a, b, c, d, e)
+        f: u64,
+        g: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.renew_session_runtime_outbox_lease(a, b, c, d, e, f, g)
     }
     fn fail_session_runtime_outbox(
         &self,
         a: &str,
         b: &str,
         c: u64,
-        d: OutboxFailureClass,
-        e: &str,
-        f: u64,
-        g: u32,
+        d: &str,
+        e: u64,
+        f: OutboxFailureClass,
+        g: &str,
         h: u64,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-        self.fail_session_runtime_outbox(a, b, c, d, e, f, g, h)
+        i: u32,
+        j: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.fail_session_runtime_outbox(a, b, c, d, e, f, g, h, i, j)
+    }
+    fn requeue_claimed_session_runtime_outbox(
+        &self,
+        a: &str,
+        b: &str,
+        c: u64,
+        d: &str,
+        e: u64,
+        f: InputRoutingDecision,
+        g: Option<&str>,
+        h: Option<&str>,
+        i: &str,
+        j: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.requeue_claimed_session_runtime_outbox(a, b, c, d, e, f, g, h, i, j)
     }
     fn retry_blocked_session_runtime_outbox(
+        &self,
+        a: &str,
+        b: u64,
+        c: u64,
+        d: &str,
+        e: &str,
+        f: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.retry_blocked_session_runtime_outbox(a, b, c, d, e, f)
+    }
+    fn cancel_session_runtime_outbox(
+        &self,
+        a: &str,
+        b: u64,
+        c: u64,
+        d: &str,
+        e: &str,
+        f: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.cancel_session_runtime_outbox(a, b, c, d, e, f)
+    }
+    fn reclassify_session_runtime_outbox(
+        &self,
+        a: &str,
+        b: u64,
+        c: u64,
+        d: InputRoutingDecision,
+        e: Option<&str>,
+        f: Option<&str>,
+        g: &str,
+        h: &str,
+        i: u64,
+    ) -> session::SessionResult<SessionRuntimeOutboxRecord> {
+        self.reclassify_session_runtime_outbox(a, b, c, d, e, f, g, h, i)
+    }
+    fn get_session_input_admission(
+        &self,
+        a: &str,
+    ) -> session::SessionResult<Option<SessionInputAdmission>> {
+        self.get_session_input_admission(a)
+    }
+    fn close_session_input_admission(
         &self,
         a: &str,
         b: u64,
         c: &str,
         d: &str,
         e: u64,
-    ) -> memory::store::Result<SessionRuntimeOutboxRecord> {
-        self.retry_blocked_session_runtime_outbox(a, b, c, d, e)
+    ) -> session::SessionResult<SessionInputAdmission> {
+        self.close_session_input_admission(a, b, c, d, e)
+    }
+    fn advance_session_input_generation(
+        &self,
+        a: &str,
+        b: u64,
+        c: bool,
+        d: &str,
+        e: &str,
+        f: u64,
+    ) -> session::SessionResult<SessionInputAdmission> {
+        self.advance_session_input_generation(a, b, c, d, e, f)
     }
     fn get_session_runtime_outbox(
         &self,
         a: &str,
-    ) -> memory::store::Result<Option<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Option<SessionRuntimeOutboxRecord>> {
         self.get_session_runtime_outbox(a)
+    }
+    fn get_session_runtime_outbox_by_input_id(
+        &self,
+        a: &str,
+    ) -> session::SessionResult<Option<SessionRuntimeOutboxRecord>> {
+        self.get_session_runtime_outbox_by_input_id(a)
     }
     fn session_runtime_outbox_for_session(
         &self,
         a: &str,
         b: usize,
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.session_runtime_outbox_for_session(a, b)
     }
     fn active_session_runtime_outbox(
         &self,
         a: usize,
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.active_session_runtime_outbox(a)
     }
-    fn session_runtime_outbox_health(&self) -> memory::store::Result<SessionRuntimeOutboxHealth> {
+    fn session_runtime_outbox_health(&self) -> session::SessionResult<SessionRuntimeOutboxHealth> {
         self.session_runtime_outbox_health()
     }
     fn blocked_session_runtime_outbox(
         &self,
         a: usize,
-    ) -> memory::store::Result<Vec<SessionRuntimeOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionRuntimeOutboxRecord>> {
         self.blocked_session_runtime_outbox(a)
     }
     fn claim_session_mission_outbox(
@@ -4131,7 +7283,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         c: u64,
         d: u64,
         e: usize,
-    ) -> memory::store::Result<Vec<SessionMissionOutboxRecord>> {
+    ) -> session::SessionResult<Vec<SessionMissionOutboxRecord>> {
         self.claim_session_mission_outbox(a, b, c, d, e)
     }
     fn ack_session_mission_outbox(
@@ -4140,7 +7292,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         b: &str,
         c: u64,
         d: u64,
-    ) -> memory::store::Result<SessionMissionOutboxRecord> {
+    ) -> session::SessionResult<SessionMissionOutboxRecord> {
         self.ack_session_mission_outbox(a, b, c, d)
     }
     fn fail_session_mission_outbox(
@@ -4153,13 +7305,13 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         f: u64,
         g: u32,
         h: u64,
-    ) -> memory::store::Result<SessionMissionOutboxRecord> {
+    ) -> session::SessionResult<SessionMissionOutboxRecord> {
         self.fail_session_mission_outbox(a, b, c, d, e, f, g, h)
     }
     fn get_session_mission_outbox(
         &self,
         a: &str,
-    ) -> memory::store::Result<Option<SessionMissionOutboxRecord>> {
+    ) -> session::SessionResult<Option<SessionMissionOutboxRecord>> {
         self.get_session_mission_outbox(a)
     }
     fn get_messages(
@@ -4167,7 +7319,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: usize,
         c: usize,
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         self.get_messages(a, b, c)
     }
     fn get_messages_from_sequence(
@@ -4175,16 +7327,16 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: usize,
         c: usize,
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         self.get_messages_from_sequence(a, b, c)
     }
-    fn get_all_messages(&self, a: &str) -> memory::store::Result<Vec<SessionMessage>> {
+    fn get_all_messages(&self, a: &str) -> session::SessionResult<Vec<SessionMessage>> {
         self.get_all_messages(a)
     }
-    fn get_message_count(&self, a: &str) -> memory::store::Result<usize> {
+    fn get_message_count(&self, a: &str) -> session::SessionResult<usize> {
         self.get_message_count(a)
     }
-    fn delete_messages_from(&self, a: &str, b: usize) -> memory::store::Result<usize> {
+    fn delete_messages_from(&self, a: &str, b: usize) -> session::SessionResult<usize> {
         self.delete_messages_from(a, b)
     }
     fn search_messages(
@@ -4192,7 +7344,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: Option<&str>,
         c: usize,
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         self.search_messages(a, b, c)
     }
     fn search_messages_in_sessions(
@@ -4200,7 +7352,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
         a: &str,
         b: &[String],
         c: usize,
-    ) -> memory::store::Result<Vec<SessionMessage>> {
+    ) -> session::SessionResult<Vec<SessionMessage>> {
         self.search_messages_in_sessions(a, b, c)
     }
 }
@@ -4209,7 +7361,7 @@ impl memory::SessionStoreBackend for PostgresSessionStore {
 mod tests {
     use std::sync::{Arc, Barrier, Mutex, MutexGuard, OnceLock};
 
-    use memory::{SessionStoreBackend, UnifiedSessionStore};
+    use session::{SessionStoreBackend, UnifiedSessionStore};
     use storage::StaticSecretRefResolver;
 
     use super::*;
@@ -4258,6 +7410,140 @@ mod tests {
         .expect("isolated PostgreSQL session store opens")
     }
 
+    fn clear_isolated_store(store: &PostgresSessionStore) {
+        let mut connection = store
+            .executor
+            .checkout_runtime()
+            .expect("isolated PostgreSQL test connection");
+        connection
+            .batch_execute(
+                "TRUNCATE TABLE
+                    session_branch_activations,
+                    session_lifecycle_intents,
+                    session_runtime_outbox_history,
+                    session_mission_outbox_history,
+                    session_runtime_outbox,
+                    session_mission_outbox,
+                    session_event_checkpoints,
+                    session_snapshots,
+                    session_events,
+                    session_messages,
+                    session_memory_associations,
+                    session_recovery_manifest,
+                    session_records
+                 CASCADE",
+            )
+            .expect("clear isolated PostgreSQL Session store");
+    }
+
+    fn unique_id(prefix: &str) -> String {
+        format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        )
+    }
+
+    fn runtime_request(
+        id: &str,
+        generation: u64,
+        decision: InputRoutingDecision,
+        target_turn_id: Option<&str>,
+        created_at_ms: u64,
+    ) -> SessionRuntimeOutboxRequest {
+        SessionRuntimeOutboxRequest {
+            input_id: format!("input-{id}"),
+            request_id: format!("request-{id}"),
+            turn_id: format!("turn-{id}"),
+            message_id: format!("message-{id}"),
+            session_generation: generation,
+            decision,
+            target_turn_id: target_turn_id.map(str::to_string),
+            classification_json: Some(
+                serde_json::json!({"classifier":"test.v1","reason":"contract"}).to_string(),
+            ),
+            created_at_ms,
+            runtime_options_json: Some(r#"{"profile":"test"}"#.to_string()),
+        }
+    }
+
+    fn append_runtime_input(
+        store: &PostgresSessionStore,
+        session_id: &str,
+        request: &SessionRuntimeOutboxRequest,
+    ) -> SessionRuntimeOutboxRecord {
+        store
+            .append_ingress_with_runtime_outbox(
+                session_id,
+                "user",
+                Some(r#"[{"type":"text","text":"test input"}]"#),
+                request.created_at_ms,
+                request,
+            )
+            .expect("append durable runtime input")
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place() {
+        let _guard = postgres_test_guard();
+        let store = real_store();
+        clear_isolated_store(&store);
+        store
+            .create_session(&session("claim-fence-migration"))
+            .expect("create migration Session");
+        let request = runtime_request(
+            "claim-fence-migration",
+            1,
+            InputRoutingDecision::StartNewTurn,
+            None,
+            100,
+        );
+        append_runtime_input(&store, "claim-fence-migration", &request);
+        let claimed = store
+            .claim_session_runtime_outbox("migration-worker", 101, 1_000, 1)
+            .expect("claim pre-migration input")
+            .remove(0);
+        let token = claimed.claim_token.clone().expect("pre-migration token");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &request.request_id,
+                "migration-worker",
+                1,
+                &token,
+                claimed.revision,
+                102,
+            )
+            .expect("mark pre-migration input running");
+        let expected_epoch = running.revision;
+
+        let mut connection = store
+            .executor()
+            .checkout_runtime()
+            .expect("checkout migration database");
+        connection
+            .batch_execute(
+                "ALTER TABLE session_runtime_outbox
+                     DROP CONSTRAINT IF EXISTS session_runtime_claim_fence_epoch_positive;
+                 ALTER TABLE session_runtime_outbox DROP COLUMN claim_fence_epoch;
+                 DELETE FROM cowd_schema_migrations
+                  WHERE id='session.0010.terminal-claim-fence-epoch';",
+            )
+            .expect("restore the version-9 outbox schema");
+        drop(connection);
+        drop(store);
+
+        let migrated = real_store()
+            .get_session_runtime_outbox(&request.request_id)
+            .expect("read migrated input")
+            .expect("migrated input remains");
+        assert_eq!(migrated.status, SessionRuntimeInputStatus::Running);
+        assert_eq!(migrated.claim_fence_epoch, Some(expected_epoch));
+    }
+
     #[test]
     fn sqlite_snapshot_contains_full_session_truth_and_is_stable() {
         let source = SqliteSessionStore::open_in_memory().expect("SQLite source opens");
@@ -4303,7 +7589,7 @@ mod tests {
         source
             .append_event(&SessionEvent {
                 session_id: "migration-session".to_string(),
-                event_type: memory::SESSION_DOMAIN_EVENT_TYPE.to_string(),
+                event_type: session::SESSION_DOMAIN_EVENT_TYPE.to_string(),
                 event_json: r#"{"kind":"memory.semantic_checkpoint.created","payload":{"checkpoint":{"checkpoint_id":"checkpoint-1"}}}"#.to_string(),
                 sequence: 1,
                 created_at_ms: 3,
@@ -4317,18 +7603,49 @@ mod tests {
                 created_at_ms: 4,
             })
             .expect("snapshot");
+        source
+            .plan_session_lifecycle(&SessionLifecyclePlan {
+                operation_id: "lifecycle-copy".to_string(),
+                session_id: "migration-session".to_string(),
+                disposition: SessionCloseDisposition::Archive,
+                expected_generation: 1,
+                created_at_ms: 5,
+            })
+            .expect("lifecycle intent");
+        source
+            .branch_session_at_cutoff(&SessionBranchRequest {
+                operation_id: "branch-copy".to_string(),
+                source_session_id: "migration-session".to_string(),
+                source_message_count: 1,
+                target: session("migration-branch"),
+                mission_outbox: SessionMissionOutboxRequest {
+                    request_id: "mission-branch-copy".to_string(),
+                    session_id: "migration-branch".to_string(),
+                    title: "Migrate branch activation".to_string(),
+                    workspace_key: "workspace-copy".to_string(),
+                    operation: SessionMissionOutboxOperation::Register,
+                    created_at_ms: 6,
+                },
+                source_event_json: r#"{"kind":"session.branch.source"}"#.to_string(),
+                target_event_json: r#"{"kind":"session.branch.target"}"#.to_string(),
+                created_at_ms: 6,
+            })
+            .expect("branch activation");
         let first = export_sqlite_session_snapshot(&source).expect("first snapshot");
         let second = export_sqlite_session_snapshot(&source).expect("second snapshot");
         assert_eq!(
             first.canonical_digest().unwrap(),
             second.canonical_digest().unwrap()
         );
-        assert_eq!(first.sessions.len(), 1);
-        assert_eq!(first.messages.len(), 1);
-        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.schema_version, 5);
+        assert_eq!(first.sessions.len(), 2);
+        assert_eq!(first.messages.len(), 2);
+        assert_eq!(first.events.len(), 4);
         assert_eq!(first.checkpoints.len(), 1);
         assert_eq!(first.snapshots.len(), 1);
-        assert_eq!(first.mission_outbox.len(), 1);
+        assert_eq!(first.mission_outbox.len(), 2);
+        assert_eq!(first.lifecycle_intents.len(), 1);
+        assert_eq!(first.branch_activations.len(), 1);
     }
 
     #[tokio::test]
@@ -4336,6 +7653,7 @@ mod tests {
     async fn postgres_adapter_real_copy_fences_and_injected_facade() {
         let _guard = postgres_test_guard();
         let target = real_store();
+        clear_isolated_store(&target);
         let source = SqliteSessionStore::open_in_memory().expect("SQLite source opens");
         source
             .create_session(&session("migration-session"))
@@ -4367,6 +7685,34 @@ mod tests {
                 created_at_ms: 1,
             })
             .expect("message");
+        source
+            .plan_session_lifecycle(&SessionLifecyclePlan {
+                operation_id: "lifecycle-copy".to_string(),
+                session_id: "migration-session".to_string(),
+                disposition: SessionCloseDisposition::Archive,
+                expected_generation: 1,
+                created_at_ms: 2,
+            })
+            .expect("lifecycle intent");
+        source
+            .branch_session_at_cutoff(&SessionBranchRequest {
+                operation_id: "branch-copy".to_string(),
+                source_session_id: "migration-session".to_string(),
+                source_message_count: 1,
+                target: session("migration-branch"),
+                mission_outbox: SessionMissionOutboxRequest {
+                    request_id: "mission-branch-copy".to_string(),
+                    session_id: "migration-branch".to_string(),
+                    title: "Migrate branch activation".to_string(),
+                    workspace_key: "workspace-copy".to_string(),
+                    operation: SessionMissionOutboxOperation::Register,
+                    created_at_ms: 3,
+                },
+                source_event_json: r#"{"kind":"session.branch.source"}"#.to_string(),
+                target_event_json: r#"{"kind":"session.branch.target"}"#.to_string(),
+                created_at_ms: 3,
+            })
+            .expect("branch activation");
         let root = tempfile::tempdir().expect("manifest root");
         let manifest =
             copy_quiesced_session_store(&source, &target, root.path().join("session.json"))
@@ -4375,9 +7721,18 @@ mod tests {
         let copied = target
             .export_migration_snapshot()
             .expect("export copied PostgreSQL snapshot");
-        assert_eq!(copied.mission_outbox.len(), 1);
-        assert_eq!(copied.mission_outbox[0].request_id, "mission-copy");
-        assert_eq!(copied.mission_outbox[0].revision, 0);
+        assert_eq!(copied.mission_outbox.len(), 2);
+        assert!(copied
+            .mission_outbox
+            .iter()
+            .any(|item| item.request_id == "mission-copy" && item.revision == 0));
+        assert_eq!(copied.lifecycle_intents.len(), 1);
+        assert_eq!(copied.branch_activations.len(), 1);
+        let initial_source_events = copied
+            .events
+            .iter()
+            .filter(|event| event.session_id == "migration-session")
+            .count();
         let injected = UnifiedSessionStore::from_backend(Arc::new(target.clone()));
         assert_eq!(
             injected
@@ -4414,119 +7769,1417 @@ mod tests {
             .map(|worker| worker.join().expect("worker").sequence)
             .collect::<Vec<_>>();
         sequences.sort_unstable();
-        assert_eq!(sequences, vec![0, 1]);
+        assert_eq!(
+            sequences,
+            vec![initial_source_events, initial_source_events + 1]
+        );
         target
             .delete_session("migration-session")
             .expect("delete isolated migration session");
+        target
+            .delete_session("migration-branch")
+            .expect("delete isolated migration branch");
     }
 
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
-    fn postgres_terminal_transcript_preserves_published_cursor_and_is_idempotent() {
+    fn postgres_fenced_terminal_commit_matches_sqlite_atomic_identity_contract() {
         let _guard = postgres_test_guard();
         let store = real_store();
-        let session_id = format!(
-            "causal-terminal-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock after epoch")
-                .as_millis()
-        );
+        let session_id = unique_id("terminal-fence");
+        let id = unique_id("terminal-input");
         store
             .create_session(&session(&session_id))
-            .expect("create isolated session");
-        for (sequence, id, text, turn_id) in [
-            (0, "user-1", "first", "turn-1"),
-            (1, "user-2", "second", "turn-2"),
-        ] {
+            .expect("create fenced terminal session");
+        let request = runtime_request(&id, 1, InputRoutingDecision::StartNewTurn, None, 100);
+        append_runtime_input(&store, &session_id, &request);
+        let claimed = store
+            .claim_session_runtime_outbox("runtime-worker", 101, 1_000, 1)
+            .expect("claim input")
+            .remove(0);
+        let token = claimed.claim_token.clone().expect("claim token");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &request.request_id,
+                "runtime-worker",
+                1,
+                &token,
+                claimed.revision,
+                102,
+            )
+            .expect("mark running");
+        let renewed = store
+            .renew_session_runtime_outbox_lease(
+                &request.request_id,
+                "runtime-worker",
+                1,
+                &token,
+                running.revision,
+                103,
+                1_000,
+            )
+            .expect("renew running lease");
+        assert!(renewed.revision > running.revision);
+        let messages = vec![
+            SessionMessage {
+                stable_message_id: format!("tool-{id}"),
+                session_id: session_id.clone(),
+                sequence: 0,
+                role: "tool".to_string(),
+                content_json: r#"[{"type":"text","text":"evidence"}]"#.to_string(),
+                blocks_count: 1,
+                tool_use_id: Some(format!("tool-use-{id}")),
+                tool_name: Some("read".to_string()),
+                token_usage_json: None,
+                created_at_ms: 0,
+            },
+            SessionMessage {
+                stable_message_id: format!("tool-secondary-{id}"),
+                session_id: session_id.clone(),
+                sequence: 0,
+                role: "tool".to_string(),
+                content_json: r#"[{"type":"text","text":"secondary evidence"}]"#.to_string(),
+                blocks_count: 1,
+                tool_use_id: Some(format!("tool-use-secondary-{id}")),
+                tool_name: Some("read".to_string()),
+                token_usage_json: None,
+                created_at_ms: 0,
+            },
+            SessionMessage {
+                stable_message_id: format!("assistant-{id}"),
+                session_id: session_id.clone(),
+                sequence: 0,
+                role: "assistant".to_string(),
+                content_json: r#"[{"type":"text","text":"done"}]"#.to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: Some(r#"{"output_tokens":1}"#.to_string()),
+                created_at_ms: 0,
+            },
+        ];
+        let commit = SessionTerminalTranscriptCommit {
+            terminal_message_id: format!("assistant-{id}"),
+            ingress_message_id: request.message_id.clone(),
+            session_id: session_id.clone(),
+            turn_id: request.turn_id.clone(),
+            messages,
+            runtime_commit_cursor: 42,
+            created_at_ms: 104,
+            fence: session::SessionTerminalExecutionFence {
+                request_id: request.request_id.clone(),
+                input_sequence: running.sequence,
+                session_generation: 1,
+                claim_owner: "runtime-worker".to_string(),
+                claim_token: token,
+                claim_fence_epoch: running
+                    .claim_fence_epoch
+                    .expect("running input owns an immutable claim fence"),
+            },
+        };
+        let mut wrong_sequence = commit.clone();
+        wrong_sequence.fence.input_sequence = wrong_sequence.fence.input_sequence.saturating_add(1);
+        assert!(matches!(
+            store.commit_terminal_transcript_if_fenced(&wrong_sequence),
+            Err(session::SessionError::StaleExecutionFence(_))
+        ));
+        let receipt = store
+            .commit_terminal_transcript_if_fenced(&commit)
+            .expect("commit with renewed live fence");
+        assert!(receipt.inserted);
+        assert_eq!(receipt.input.status, SessionRuntimeInputStatus::Completed);
+        assert_eq!(receipt.input.revision, renewed.revision + 1);
+        assert_eq!(store.get_message_count(&session_id).unwrap(), 4);
+        let replay = store
+            .commit_terminal_transcript_if_fenced(&commit)
+            .expect("exact replay");
+        assert!(!replay.inserted);
+        assert_eq!(replay.messages, receipt.messages);
+
+        let mut reordered_intermediate = commit.clone();
+        reordered_intermediate.messages.swap(0, 1);
+        assert!(matches!(
+            store.commit_terminal_transcript_if_fenced(&reordered_intermediate),
+            Err(session::SessionError::StaleExecutionFence(_))
+        ));
+        assert_eq!(store.get_message_count(&session_id).unwrap(), 4);
+
+        let mut conflicting = commit.clone();
+        conflicting.terminal_message_id = format!("assistant-conflict-{id}");
+        conflicting
+            .messages
+            .last_mut()
+            .expect("terminal row")
+            .stable_message_id = conflicting.terminal_message_id.clone();
+        assert!(matches!(
+            store.commit_terminal_transcript_if_fenced(&conflicting),
+            Err(session::SessionError::StaleExecutionFence(_))
+        ));
+        assert_eq!(store.get_message_count(&session_id).unwrap(), 4);
+        store
+            .delete_session(&session_id)
+            .expect("delete fenced terminal session");
+
+        let stale_session = unique_id("terminal-stale");
+        let stale_id = unique_id("terminal-stale-input");
+        store
+            .create_session(&session(&stale_session))
+            .expect("create stale terminal session");
+        let stale_request =
+            runtime_request(&stale_id, 1, InputRoutingDecision::StartNewTurn, None, 200);
+        append_runtime_input(&store, &stale_session, &stale_request);
+        let stale_claim = store
+            .claim_session_runtime_outbox("runtime-worker-old", 201, 50, 1)
+            .expect("claim stale input")
+            .remove(0);
+        let stale_token = stale_claim.claim_token.clone().expect("stale token");
+        let stale_running = store
+            .mark_session_runtime_outbox_running(
+                &stale_request.request_id,
+                "runtime-worker-old",
+                1,
+                &stale_token,
+                stale_claim.revision,
+                202,
+            )
+            .expect("mark stale input running");
+        let stale_commit = SessionTerminalTranscriptCommit {
+            terminal_message_id: format!("assistant-{stale_id}"),
+            ingress_message_id: stale_request.message_id.clone(),
+            session_id: stale_session.clone(),
+            turn_id: stale_request.turn_id.clone(),
+            messages: vec![SessionMessage {
+                stable_message_id: format!("assistant-{stale_id}"),
+                session_id: stale_session.clone(),
+                sequence: 0,
+                role: "assistant".to_string(),
+                content_json: r#"[{"type":"text","text":"must not commit"}]"#.to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: 0,
+            }],
+            runtime_commit_cursor: 43,
+            created_at_ms: 250,
+            fence: session::SessionTerminalExecutionFence {
+                request_id: stale_request.request_id.clone(),
+                input_sequence: stale_running.sequence,
+                session_generation: 1,
+                claim_owner: "runtime-worker-old".to_string(),
+                claim_token: stale_token.clone(),
+                claim_fence_epoch: stale_running
+                    .claim_fence_epoch
+                    .expect("running input owns an immutable claim fence"),
+            },
+        };
+        let reclaimed = store
+            .claim_session_runtime_outbox("runtime-worker-new", 251, 1_000, 1)
+            .expect("reclaim expired input")
+            .remove(0);
+        assert_ne!(reclaimed.claim_token.as_deref(), Some(stale_token.as_str()));
+        assert!(matches!(
+            store.commit_terminal_transcript_if_fenced(&stale_commit),
+            Err(session::SessionError::StaleExecutionFence(_))
+        ));
+        assert_eq!(store.get_message_count(&stale_session).unwrap(), 1);
+        store
+            .advance_session_input_generation(
+                &stale_session,
+                1,
+                true,
+                "test",
+                "replace stale generation",
+                252,
+            )
+            .expect("advance stale generation");
+        assert!(matches!(
+            store.commit_terminal_transcript_if_fenced(&stale_commit),
+            Err(session::SessionError::StaleExecutionFence(_))
+        ));
+        assert_eq!(store.get_message_count(&stale_session).unwrap(), 1);
+        store
+            .delete_session(&stale_session)
+            .expect("delete stale terminal session");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_terminal_commit_and_generation_advance_share_one_lock_order() {
+        let _guard = postgres_test_guard();
+        let store = real_store();
+        let session_id = unique_id("terminal-lock-order");
+        let id = unique_id("terminal-lock-input");
+        store
+            .create_session(&session(&session_id))
+            .expect("create lock-order session");
+        let request = runtime_request(&id, 1, InputRoutingDecision::StartNewTurn, None, 100);
+        append_runtime_input(&store, &session_id, &request);
+        let claimed = store
+            .claim_session_runtime_outbox("runtime-worker", 101, 1_000, 1)
+            .expect("claim lock-order input")
+            .remove(0);
+        let token = claimed.claim_token.clone().expect("claim token");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &request.request_id,
+                "runtime-worker",
+                1,
+                &token,
+                claimed.revision,
+                102,
+            )
+            .expect("mark lock-order input running");
+        let commit = SessionTerminalTranscriptCommit {
+            terminal_message_id: format!("assistant-{id}"),
+            ingress_message_id: request.message_id.clone(),
+            session_id: session_id.clone(),
+            turn_id: request.turn_id.clone(),
+            messages: vec![SessionMessage {
+                stable_message_id: format!("assistant-{id}"),
+                session_id: session_id.clone(),
+                sequence: 0,
+                role: "assistant".to_string(),
+                content_json: r#"[{"type":"text","text":"lock order"}]"#.to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: 0,
+            }],
+            runtime_commit_cursor: 44,
+            created_at_ms: 103,
+            fence: session::SessionTerminalExecutionFence {
+                request_id: request.request_id,
+                input_sequence: running.sequence,
+                session_generation: 1,
+                claim_owner: "runtime-worker".to_string(),
+                claim_token: token,
+                claim_fence_epoch: running
+                    .claim_fence_epoch
+                    .expect("running input owns an immutable claim fence"),
+            },
+        };
+        let barrier = Arc::new(Barrier::new(2));
+        let commit_worker = {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.commit_terminal_transcript_if_fenced(&commit)
+            })
+        };
+        let generation_worker = {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            let session_id = session_id.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.advance_session_input_generation(
+                    &session_id,
+                    1,
+                    true,
+                    "lock-order-test",
+                    "race terminal commit",
+                    104,
+                )
+            })
+        };
+        let commit_result = commit_worker.join().expect("commit worker");
+        let generation = generation_worker
+            .join()
+            .expect("generation worker")
+            .expect("generation advance cannot deadlock");
+        assert_eq!(generation.generation, 2);
+        let messages = store
+            .get_message_count(&session_id)
+            .expect("count lock-order transcript");
+        match commit_result {
+            Ok(receipt) => {
+                assert!(receipt.inserted);
+                assert_eq!(messages, 2);
+            }
+            Err(session::SessionError::StaleExecutionFence(_)) => {
+                assert_eq!(messages, 1);
+            }
+            Err(error) => panic!("unexpected terminal commit result: {error}"),
+        }
+        store
+            .delete_session(&session_id)
+            .expect("delete lock-order session");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_branch_command_commits_every_artifact_or_nothing() {
+        let _guard = postgres_test_guard();
+        let store = real_store();
+        let source = unique_id("branch-command-source");
+        let target = unique_id("branch-command-target");
+        let rollback_target = unique_id("branch-command-rollback");
+        store
+            .create_session(&session(&source))
+            .expect("create branch source");
+        for sequence in 0..2 {
             store
                 .insert_message(&SessionMessage {
-                    stable_message_id: format!("{session_id}:{id}"),
-                    session_id: session_id.clone(),
+                    stable_message_id: format!("{source}-message-{sequence}"),
+                    session_id: source.clone(),
                     sequence,
                     role: "user".to_string(),
-                    content_json: serde_json::json!([{
-                        "type": "text",
-                        "text": text,
-                        "cowd_turn_id": turn_id,
-                        "cowd_turn_ingress_message_id": format!("{session_id}:{id}"),
-                    }])
-                    .to_string(),
+                    content_json: format!(
+                        r#"[{{"type":"text","text":"source message {sequence}"}}]"#
+                    ),
                     blocks_count: 1,
                     tool_use_id: None,
                     tool_name: None,
-                    token_usage_json: None,
-                    created_at_ms: sequence as u64 + 1,
+                    token_usage_json: Some(r#"{"input_tokens":3,"output_tokens":2}"#.to_string()),
+                    created_at_ms: 100 + sequence as u64,
                 })
-                .expect("insert ingress");
+                .expect("append source message");
         }
-        let terminal_id = format!("{session_id}:assistant-1");
-        let ingress_id = format!("{session_id}:user-1");
-        let transcript = vec![SessionMessage {
-            stable_message_id: terminal_id.clone(),
-            session_id: session_id.clone(),
-            sequence: usize::MAX,
-            role: "assistant".to_string(),
-            content_json: serde_json::json!([{
-                "type": "text",
-                "text": "first answer",
-                "cowd_turn_id": "turn-1",
-                "cowd_turn_ingress_message_id": ingress_id,
-            }])
+        let source_generation = store
+            .get_session_input_admission(&source)
+            .expect("read source admission")
+            .expect("source admission exists")
+            .generation;
+        let request = SessionBranchRequest {
+            operation_id: format!("branch-{source}-{target}-1"),
+            source_session_id: source.clone(),
+            source_message_count: 1,
+            target: session(&target),
+            mission_outbox: SessionMissionOutboxRequest {
+                request_id: format!("mission-{target}"),
+                session_id: target.clone(),
+                title: "Create durable branch".to_string(),
+                workspace_key: "branch-workspace".to_string(),
+                operation: SessionMissionOutboxOperation::Register,
+                created_at_ms: 200,
+            },
+            source_event_json: serde_json::json!({
+                "kind": "session.branched",
+                "target_session_id": target.clone(),
+                "source_message_count": 1
+            })
             .to_string(),
-            blocks_count: 1,
-            tool_use_id: None,
-            tool_name: None,
-            token_usage_json: Some(
-                serde_json::json!({"input_tokens": 3, "output_tokens": 2}).to_string(),
-            ),
-            created_at_ms: 3,
-        }];
-
-        let (committed, inserted) = store
-            .append_terminal_transcript_idempotent(
-                &terminal_id,
-                &ingress_id,
-                &session_id,
-                &transcript,
-                3,
-            )
-            .expect("commit terminal transcript");
-        assert!(inserted);
-        assert_eq!(committed[0].sequence, 2);
-        let physical = store
-            .get_all_messages(&session_id)
-            .expect("load physical order");
+            target_event_json: serde_json::json!({
+                "kind": "session.branch_created",
+                "source_session_id": source.clone(),
+                "source_message_count": 1
+            })
+            .to_string(),
+            created_at_ms: 200,
+        };
+        let result = store
+            .branch_session_at_cutoff(&request)
+            .expect("branch command commits");
+        assert_eq!(result.copied_message_count, 1);
+        assert_eq!(result.source_message_count, 1);
+        assert_eq!(result.target.message_count, 1);
         assert_eq!(
-            physical
-                .iter()
-                .map(|message| message.sequence)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2],
-            "published ingress cursors must stay immutable in PostgreSQL"
+            result.activation.phase,
+            SessionBranchActivationPhase::BranchCommitted
         );
-
-        let (replayed, inserted) = store
-            .append_terminal_transcript_idempotent(
-                &terminal_id,
-                &ingress_id,
-                &session_id,
-                &transcript,
-                99,
-            )
-            .expect("replay terminal transcript");
-        assert!(!inserted);
-        assert_eq!(replayed, committed);
+        let replay = store
+            .branch_session_at_cutoff(&request)
+            .expect("committed branch retry resumes activation receipt");
+        assert_eq!(replay.target.session_id, target);
+        assert_eq!(replay.copied_message_count, 1);
+        let persisted_target = store
+            .get_session(&target)
+            .expect("read target")
+            .expect("target exists");
+        assert_eq!(persisted_target.message_count, 1);
+        assert_eq!(persisted_target.input_tokens, 3);
+        assert_eq!(persisted_target.output_tokens, 2);
+        let copied = store
+            .get_all_messages(&target)
+            .expect("read branch messages");
+        assert_eq!(copied.len(), 1);
+        assert_eq!(copied[0].sequence, 0);
+        assert!(copied[0]
+            .stable_message_id
+            .starts_with(&format!("branch:{target}:")));
+        assert!(store
+            .get_session_mission_outbox(&request.mission_outbox.request_id)
+            .expect("read branch mission")
+            .is_some());
+        let source_events = store
+            .get_events_limited(&source, 0, 10)
+            .expect("read source branch event");
+        assert_eq!(
+            source_events
+                .iter()
+                .filter(|event| event.event_type == "SessionBranched")
+                .count(),
+            1
+        );
+        let target_events = store
+            .get_events_limited(&target, 0, 10)
+            .expect("read target branch event");
+        assert_eq!(
+            target_events
+                .iter()
+                .filter(|event| event.event_type == "BranchCreated")
+                .count(),
+            1
+        );
         assert_eq!(
             store
-                .get_all_messages(&session_id)
-                .expect("reload physical order"),
-            physical
+                .get_session_input_admission(&source)
+                .expect("read source admission after branch")
+                .expect("source admission remains")
+                .generation,
+            source_generation,
+            "branch command must not advance source generation"
+        );
+        let activation_pending = store
+            .transition_session_branch_activation(&SessionBranchActivationTransition {
+                operation_id: request.operation_id.clone(),
+                expected_revision: result.activation.revision,
+                expected_phase: SessionBranchActivationPhase::BranchCommitted,
+                next_phase: SessionBranchActivationPhase::ActivationPending,
+                updated_at_ms: 204,
+                error: None,
+            })
+            .expect("fence Gateway activation after branch commit");
+        let failed = store
+            .transition_session_branch_activation(&SessionBranchActivationTransition {
+                operation_id: request.operation_id.clone(),
+                expected_revision: activation_pending.revision,
+                expected_phase: SessionBranchActivationPhase::ActivationPending,
+                next_phase: SessionBranchActivationPhase::Failed,
+                updated_at_ms: 205,
+                error: Some("simulated activation failure".to_string()),
+            })
+            .expect("persist branch activation failure");
+        assert!(store
+            .list_recoverable_session_branch_activations(10)
+            .expect("list recoverable branch activations")
+            .iter()
+            .any(|activation| activation.operation_id == request.operation_id));
+        let pending = store
+            .transition_session_branch_activation(&SessionBranchActivationTransition {
+                operation_id: request.operation_id.clone(),
+                expected_revision: failed.revision,
+                expected_phase: SessionBranchActivationPhase::Failed,
+                next_phase: SessionBranchActivationPhase::ActivationPending,
+                updated_at_ms: 206,
+                error: None,
+            })
+            .expect("resume branch activation");
+        let activated = store
+            .transition_session_branch_activation(&SessionBranchActivationTransition {
+                operation_id: request.operation_id.clone(),
+                expected_revision: pending.revision,
+                expected_phase: SessionBranchActivationPhase::ActivationPending,
+                next_phase: SessionBranchActivationPhase::Activated,
+                updated_at_ms: 207,
+                error: None,
+            })
+            .expect("complete branch activation");
+        assert_eq!(activated.phase, SessionBranchActivationPhase::Activated);
+
+        let source_event_count = source_events.len();
+        let rollback_request = SessionBranchRequest {
+            operation_id: format!("branch-{source}-{rollback_target}-2"),
+            source_session_id: source.clone(),
+            source_message_count: 2,
+            target: session(&rollback_target),
+            mission_outbox: SessionMissionOutboxRequest {
+                request_id: format!("mission-{rollback_target}"),
+                session_id: rollback_target.clone(),
+                title: "Rollback invalid branch".to_string(),
+                workspace_key: "branch-workspace".to_string(),
+                operation: SessionMissionOutboxOperation::Register,
+                created_at_ms: 201,
+            },
+            source_event_json: r#"{"kind":"session.branched"}"#.to_string(),
+            target_event_json: "{invalid-json".to_string(),
+            created_at_ms: 201,
+        };
+        assert!(store.branch_session_at_cutoff(&rollback_request).is_err());
+        assert!(store
+            .get_session(&rollback_target)
+            .expect("read rolled back target")
+            .is_none());
+        assert!(store
+            .get_session_mission_outbox(&rollback_request.mission_outbox.request_id)
+            .expect("read rolled back mission")
+            .is_none());
+        assert_eq!(
+            store
+                .get_events_limited(&source, 0, 10)
+                .expect("read source events after rollback")
+                .len(),
+            source_event_count
+        );
+
+        store.delete_session(&target).expect("delete branch target");
+        store.delete_session(&source).expect("delete branch source");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_lifecycle_intent_recovers_each_phase_and_commits_one_tombstone() {
+        let _guard = postgres_test_guard();
+        let session_id = unique_id("lifecycle-recovery");
+        let operation_id = format!("session-lifecycle:archive:{session_id}");
+        let mission_id = format!("mission:lifecycle-close:{session_id}");
+        let store = real_store();
+        store
+            .create_session(&session(&session_id))
+            .expect("create lifecycle session");
+        let input = runtime_request(
+            &format!("{session_id}-input"),
+            1,
+            InputRoutingDecision::StartNewTurn,
+            None,
+            100,
+        );
+        append_runtime_input(&store, &session_id, &input);
+        let planned = store
+            .plan_session_lifecycle(&SessionLifecyclePlan {
+                operation_id: operation_id.clone(),
+                session_id: session_id.clone(),
+                disposition: session::SessionCloseDisposition::Archive,
+                expected_generation: 1,
+                created_at_ms: 110,
+            })
+            .expect("plan lifecycle");
+        assert_eq!(planned.phase, SessionLifecyclePhase::Planned);
+        drop(store);
+
+        let store = real_store();
+        let fenced = store
+            .fence_session_lifecycle(&SessionLifecycleFenceRequest {
+                transition: SessionLifecycleTransition {
+                    operation_id: operation_id.clone(),
+                    expected_revision: planned.revision,
+                    expected_phase: SessionLifecyclePhase::Planned,
+                    next_phase: SessionLifecyclePhase::AdmissionFenced,
+                    updated_at_ms: 120,
+                    error: None,
+                },
+                actor: "postgres-contract".to_string(),
+                reason: "archive".to_string(),
+                transitional_status: "archiving".to_string(),
+                event: SessionEvent {
+                    session_id: session_id.clone(),
+                    event_type: "session.archive_started".to_string(),
+                    event_json: r#"{"kind":"session.archive_started"}"#.to_string(),
+                    sequence: 0,
+                    created_at_ms: 120,
+                },
+            })
+            .expect("fence lifecycle");
+        assert_eq!(fenced.phase, SessionLifecyclePhase::AdmissionFenced);
+        assert!(store
+            .session_runtime_outbox_for_session(&session_id, 10)
+            .unwrap()
+            .iter()
+            .all(|input| input.status == SessionRuntimeInputStatus::Expired));
+        let failed = store
+            .transition_session_lifecycle(&SessionLifecycleTransition {
+                operation_id: operation_id.clone(),
+                expected_revision: fenced.revision,
+                expected_phase: SessionLifecyclePhase::AdmissionFenced,
+                next_phase: SessionLifecyclePhase::Failed,
+                updated_at_ms: 121,
+                error: Some("simulated worker crash".to_string()),
+            })
+            .expect("persist lifecycle failure");
+        drop(store);
+
+        let store = real_store();
+        assert!(store
+            .list_recoverable_session_lifecycle_intents(10)
+            .unwrap()
+            .iter()
+            .any(|intent| intent.operation_id == operation_id));
+        let resumed = store
+            .transition_session_lifecycle(&SessionLifecycleTransition {
+                operation_id: operation_id.clone(),
+                expected_revision: failed.revision,
+                expected_phase: SessionLifecyclePhase::Failed,
+                next_phase: SessionLifecyclePhase::AdmissionFenced,
+                updated_at_ms: 130,
+                error: None,
+            })
+            .expect("resume lifecycle");
+        let drained = store
+            .transition_session_lifecycle(&SessionLifecycleTransition {
+                operation_id: operation_id.clone(),
+                expected_revision: resumed.revision,
+                expected_phase: SessionLifecyclePhase::AdmissionFenced,
+                next_phase: SessionLifecyclePhase::RuntimeDrained,
+                updated_at_ms: 140,
+                error: None,
+            })
+            .expect("mark Runtime drained");
+        drop(store);
+
+        let store = real_store();
+        let mut record = store
+            .get_session(&session_id)
+            .unwrap()
+            .expect("lifecycle Session");
+        record.status = "archived".to_string();
+        record.last_activity = "2026-07-26T00:00:01Z".to_string();
+        record.metadata_json = Some(r#"{"tombstone":{"kind":"archived"}}"#.to_string());
+        let tombstone = SessionLifecycleTombstoneRequest {
+            transition: SessionLifecycleTransition {
+                operation_id: operation_id.clone(),
+                expected_revision: drained.revision,
+                expected_phase: SessionLifecyclePhase::RuntimeDrained,
+                next_phase: SessionLifecyclePhase::TombstoneCommitted,
+                updated_at_ms: 150,
+                error: None,
+            },
+            record,
+            mission_outbox: SessionMissionOutboxRequest {
+                request_id: mission_id.clone(),
+                session_id: session_id.clone(),
+                title: "Lifecycle recovery".to_string(),
+                workspace_key: "postgres-contract".to_string(),
+                operation: SessionMissionOutboxOperation::Close,
+                created_at_ms: 150,
+            },
+            event: SessionEvent {
+                session_id: session_id.clone(),
+                event_type: "session.archived".to_string(),
+                event_json: r#"{"kind":"session.archived"}"#.to_string(),
+                sequence: 0,
+                created_at_ms: 150,
+            },
+        };
+        let committed = store
+            .commit_session_lifecycle_tombstone(&tombstone)
+            .expect("commit lifecycle tombstone");
+        assert_eq!(committed.phase, SessionLifecyclePhase::TombstoneCommitted);
+        assert!(store
+            .get_session_mission_outbox(&mission_id)
+            .unwrap()
+            .is_some());
+        drop(store);
+
+        let store = real_store();
+        assert_eq!(
+            store
+                .get_events_limited(&session_id, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "session.archived")
+                .count(),
+            1
+        );
+        let unloaded = store
+            .transition_session_lifecycle(&SessionLifecycleTransition {
+                operation_id: operation_id.clone(),
+                expected_revision: committed.revision,
+                expected_phase: SessionLifecyclePhase::TombstoneCommitted,
+                next_phase: SessionLifecyclePhase::Unloaded,
+                updated_at_ms: 160,
+                error: None,
+            })
+            .expect("mark lifecycle unloaded");
+        assert_eq!(unloaded.phase, SessionLifecyclePhase::Unloaded);
+        assert!(store
+            .commit_session_lifecycle_tombstone(&tombstone)
+            .is_err());
+        assert_eq!(
+            store
+                .get_events_limited(&session_id, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "session.archived")
+                .count(),
+            1
         );
         store
             .delete_session(&session_id)
+            .expect("cleanup lifecycle Session");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_delete_lifecycle_recovers_stable_phases_and_commits_one_tombstone() {
+        let _guard = postgres_test_guard();
+        let session_id = unique_id("delete-lifecycle-recovery");
+        let operation_id = format!("session-lifecycle:delete:{session_id}");
+        let mission_id = format!("mission:delete-lifecycle:{session_id}");
+        let store = real_store();
+        store
+            .create_session(&session(&session_id))
+            .expect("create delete lifecycle Session");
+        let planned = store
+            .plan_session_lifecycle(&SessionLifecyclePlan {
+                operation_id: operation_id.clone(),
+                session_id: session_id.clone(),
+                disposition: session::SessionCloseDisposition::Delete,
+                expected_generation: 1,
+                created_at_ms: 100,
+            })
+            .expect("plan delete lifecycle");
+        drop(store);
+
+        let store = real_store();
+        let fenced = store
+            .fence_session_lifecycle(&SessionLifecycleFenceRequest {
+                transition: SessionLifecycleTransition {
+                    operation_id: operation_id.clone(),
+                    expected_revision: planned.revision,
+                    expected_phase: SessionLifecyclePhase::Planned,
+                    next_phase: SessionLifecyclePhase::AdmissionFenced,
+                    updated_at_ms: 110,
+                    error: None,
+                },
+                actor: "postgres-contract".to_string(),
+                reason: "delete".to_string(),
+                transitional_status: "deleting".to_string(),
+                event: SessionEvent {
+                    session_id: session_id.clone(),
+                    event_type: "session.delete_started".to_string(),
+                    event_json: r#"{"kind":"session.delete_started"}"#.to_string(),
+                    sequence: 0,
+                    created_at_ms: 110,
+                },
+            })
+            .expect("fence delete lifecycle");
+        drop(store);
+
+        let store = real_store();
+        let drained = store
+            .transition_session_lifecycle(&SessionLifecycleTransition {
+                operation_id: operation_id.clone(),
+                expected_revision: fenced.revision,
+                expected_phase: SessionLifecyclePhase::AdmissionFenced,
+                next_phase: SessionLifecyclePhase::RuntimeDrained,
+                updated_at_ms: 120,
+                error: None,
+            })
+            .expect("mark delete Runtime drained");
+        drop(store);
+
+        let store = real_store();
+        let mut record = store
+            .get_session(&session_id)
+            .unwrap()
+            .expect("delete lifecycle Session");
+        record.status = "deleted".to_string();
+        record.last_activity = "2026-07-26T00:00:01Z".to_string();
+        record.metadata_json = Some(r#"{"tombstone":{"kind":"deleted"}}"#.to_string());
+        let request = SessionLifecycleTombstoneRequest {
+            transition: SessionLifecycleTransition {
+                operation_id: operation_id.clone(),
+                expected_revision: drained.revision,
+                expected_phase: SessionLifecyclePhase::RuntimeDrained,
+                next_phase: SessionLifecyclePhase::TombstoneCommitted,
+                updated_at_ms: 130,
+                error: None,
+            },
+            record,
+            mission_outbox: SessionMissionOutboxRequest {
+                request_id: mission_id,
+                session_id: session_id.clone(),
+                title: "Delete lifecycle recovery".to_string(),
+                workspace_key: "postgres-contract".to_string(),
+                operation: SessionMissionOutboxOperation::Close,
+                created_at_ms: 130,
+            },
+            event: SessionEvent {
+                session_id: session_id.clone(),
+                event_type: "session.deleted".to_string(),
+                event_json: r#"{"kind":"session.deleted"}"#.to_string(),
+                sequence: 0,
+                created_at_ms: 130,
+            },
+        };
+        let committed = store
+            .commit_session_lifecycle_tombstone(&request)
+            .expect("commit delete lifecycle tombstone");
+        drop(store);
+
+        let store = real_store();
+        assert_eq!(
+            store
+                .get_events_limited(&session_id, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "session.deleted")
+                .count(),
+            1
+        );
+        let unloaded = store
+            .transition_session_lifecycle(&SessionLifecycleTransition {
+                operation_id: operation_id,
+                expected_revision: committed.revision,
+                expected_phase: SessionLifecyclePhase::TombstoneCommitted,
+                next_phase: SessionLifecyclePhase::Unloaded,
+                updated_at_ms: 140,
+                error: None,
+            })
+            .expect("unload deleted Session");
+        assert_eq!(unloaded.phase, SessionLifecyclePhase::Unloaded);
+        assert!(store.commit_session_lifecycle_tombstone(&request).is_err());
+        assert_eq!(
+            store
+                .get_events_limited(&session_id, 0, 100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "session.deleted")
+                .count(),
+            1
+        );
+        store
+            .delete_session(&session_id)
+            .expect("cleanup deleted Session");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_durable_input_contract_is_fenced_ordered_and_auditable() {
+        let _guard = postgres_test_guard();
+        let store = real_store();
+        let source = unique_id("durable-source");
+        let peer = unique_id("durable-peer");
+        let branch = unique_id("durable-branch");
+        let rejected = unique_id("durable-rejected");
+        for id in [&source, &peer, &branch, &rejected] {
+            store
+                .create_session(&session(id))
+                .expect("create isolated session");
+        }
+
+        let source_first = runtime_request(
+            &format!("{source}-1"),
+            1,
+            InputRoutingDecision::StartNewTurn,
+            None,
+            100,
+        );
+        let source_second = runtime_request(
+            &format!("{source}-2"),
+            1,
+            InputRoutingDecision::EnqueueNextStep,
+            None,
+            101,
+        );
+        let peer_first = runtime_request(
+            &format!("{peer}-1"),
+            1,
+            InputRoutingDecision::StartNewTurn,
+            None,
+            102,
+        );
+        let wrong_generation = runtime_request(
+            &format!("{source}-wrong-generation"),
+            2,
+            InputRoutingDecision::StartNewTurn,
+            None,
+            99,
+        );
+        assert!(store
+            .append_ingress_with_runtime_outbox(
+                &source,
+                "user",
+                Some(r#"[{"type":"text","text":"must roll back"}]"#),
+                99,
+                &wrong_generation,
+            )
+            .is_err());
+        assert_eq!(
+            store.get_message_count(&source).expect("message count"),
+            0,
+            "rejected generation must not leave a transcript row"
+        );
+        let first = append_runtime_input(&store, &source, &source_first);
+        let second = append_runtime_input(&store, &source, &source_second);
+        let peer_record = append_runtime_input(&store, &peer, &peer_first);
+        let rejected_duplicate = append_runtime_input(
+            &store,
+            &rejected,
+            &runtime_request(
+                &format!("{rejected}-duplicate"),
+                1,
+                InputRoutingDecision::RejectDuplicate,
+                None,
+                103,
+            ),
+        );
+        let rejected_policy = append_runtime_input(
+            &store,
+            &rejected,
+            &runtime_request(
+                &format!("{rejected}-policy"),
+                1,
+                InputRoutingDecision::RejectPolicy,
+                None,
+                104,
+            ),
+        );
+        assert_eq!(
+            rejected_duplicate.status,
+            SessionRuntimeInputStatus::RejectedDuplicate
+        );
+        assert_eq!(
+            rejected_policy.status,
+            SessionRuntimeInputStatus::RejectedPolicy
+        );
+        assert_eq!(rejected_duplicate.terminal_at_ms, Some(103));
+        assert_eq!(rejected_policy.terminal_at_ms, Some(104));
+        assert_eq!(first.status, SessionRuntimeInputStatus::Queued);
+        assert_eq!(first.revision, 2);
+        assert_eq!(second.sequence, 1);
+        assert_eq!(
+            store
+                .get_session_runtime_outbox_by_input_id(&source_first.input_id)
+                .expect("lookup input")
+                .expect("input exists"),
+            first
+        );
+        assert_eq!(
+            store
+                .get_session_domain_timeline_limited(&source, 0, 20)
+                .expect("input timeline")
+                .iter()
+                .filter(|event| event.event_json.contains("session.input."))
+                .count(),
+            6,
+            "accepted, classified and queued must be atomic timeline evidence"
+        );
+
+        let claimed = store
+            .claim_session_runtime_outbox("worker-a", 200, 1_000, 10)
+            .expect("claim session heads");
+        assert_eq!(claimed.len(), 2, "one head per Session may be claimed");
+        assert!(
+            claimed.iter().all(|item| item.session_id != rejected),
+            "terminal policy decisions must never enter the runnable claim set"
+        );
+        assert!(claimed.iter().any(|item| item.input_id == first.input_id));
+        assert!(claimed
+            .iter()
+            .any(|item| item.input_id == peer_record.input_id));
+        assert!(
+            !claimed.iter().any(|item| item.input_id == second.input_id),
+            "same-Session second input must remain behind the active head"
+        );
+
+        let first_claim = claimed
+            .iter()
+            .find(|item| item.input_id == first.input_id)
+            .expect("source head claimed");
+        let token = first_claim
+            .claim_token
+            .as_deref()
+            .expect("claim token issued");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &first_claim.request_id,
+                "worker-a",
+                1,
+                token,
+                first_claim.revision,
+                201,
+            )
+            .expect("mark running");
+        assert!(store
+            .ack_session_runtime_outbox(
+                &running.request_id,
+                "worker-a",
+                1,
+                "stale-token",
+                running.revision,
+                SessionRuntimeInputStatus::Completed,
+                1,
+                202,
+            )
+            .is_err());
+        let renewed = store
+            .renew_session_runtime_outbox_lease(
+                &running.request_id,
+                "worker-a",
+                1,
+                token,
+                running.revision,
+                202,
+                1_000,
+            )
+            .expect("renew running lease");
+        let completed = store
+            .ack_session_runtime_outbox(
+                &renewed.request_id,
+                "worker-a",
+                1,
+                token,
+                renewed.revision,
+                SessionRuntimeInputStatus::Completed,
+                7,
+                203,
+            )
+            .expect("ack completed input");
+        assert_eq!(completed.status, SessionRuntimeInputStatus::Completed);
+        assert_eq!(completed.runtime_commit_cursor, Some(7));
+        assert_eq!(completed.terminal_at_ms, Some(203));
+
+        let next = store
+            .claim_session_runtime_outbox("worker-b", 204, 1_000, 10)
+            .expect("claim released Session head");
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].input_id, second.input_id);
+        let requeued = store
+            .requeue_claimed_session_runtime_outbox(
+                &next[0].request_id,
+                "worker-b",
+                1,
+                next[0].claim_token.as_deref().expect("claim token"),
+                next[0].revision,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                Some(r#"{"classifier":"target-lost.v1"}"#),
+                "target turn is no longer active",
+                205,
+            )
+            .expect("owner-fenced requeue");
+        assert_eq!(requeued.status, SessionRuntimeInputStatus::Reclassified);
+        assert_eq!(requeued.decision, InputRoutingDecision::StartNewTurn);
+        let reclaimed = store
+            .claim_session_runtime_outbox("worker-c", 206, 1_000, 10)
+            .expect("reclaim reclassified input");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].input_id, second.input_id);
+
+        let peer_claim = claimed
+            .iter()
+            .find(|item| item.input_id == peer_record.input_id)
+            .expect("peer head claimed");
+        let cancelled = store
+            .cancel_session_runtime_outbox(
+                &peer_claim.input_id,
+                1,
+                peer_claim.revision,
+                "operator",
+                "cancel peer test input",
+                207,
+            )
+            .expect("cancel by input id");
+        assert_eq!(cancelled.status, SessionRuntimeInputStatus::Cancelled);
+        let peer_second = runtime_request(
+            &format!("{peer}-2"),
+            1,
+            InputRoutingDecision::EnqueueNextStep,
+            None,
+            208,
+        );
+        let peer_second = append_runtime_input(&store, &peer, &peer_second);
+        let peer_second = store
+            .reclassify_session_runtime_outbox(
+                &peer_second.input_id,
+                1,
+                peer_second.revision,
+                InputRoutingDecision::StartNewTurn,
+                None,
+                Some(r#"{"classifier":"operator.v1"}"#),
+                "operator",
+                "explicit reroute",
+                209,
+            )
+            .expect("reclassify queued input");
+        assert_eq!(peer_second.status, SessionRuntimeInputStatus::Reclassified);
+
+        let generation_before_branch = store
+            .get_session_input_admission(&source)
+            .expect("source admission")
+            .expect("source exists")
+            .generation;
+        assert_eq!(
+            store
+                .copy_session_messages_at_cutoff(&source, &branch, 1)
+                .expect("copy immutable branch cutoff"),
+            1
+        );
+        let branch_messages = store.get_all_messages(&branch).expect("branch messages");
+        assert_eq!(branch_messages.len(), 1);
+        assert_eq!(branch_messages[0].sequence, 0);
+        assert!(branch_messages[0]
+            .stable_message_id
+            .starts_with(&format!("branch:{branch}:")));
+        assert!(store
+            .copy_session_messages_at_cutoff(&source, &branch, 1)
+            .is_err());
+        assert_eq!(
+            store
+                .get_session_input_admission(&source)
+                .expect("source admission")
+                .expect("source exists")
+                .generation,
+            generation_before_branch,
+            "branch copy must never advance source generation"
+        );
+
+        let closed = store
+            .close_session_input_admission(
+                &source,
+                generation_before_branch,
+                "operator",
+                "close test source",
+                210,
+            )
+            .expect("close admission and expire owned work");
+        assert!(!closed.open);
+        assert_eq!(closed.generation, generation_before_branch + 1);
+        let expired = store
+            .get_session_runtime_outbox(&reclaimed[0].request_id)
+            .expect("expired lookup")
+            .expect("expired input exists");
+        assert_eq!(expired.status, SessionRuntimeInputStatus::Expired);
+        assert!(store
+            .mark_session_runtime_outbox_running(
+                &reclaimed[0].request_id,
+                "worker-c",
+                generation_before_branch,
+                reclaimed[0].claim_token.as_deref().expect("claim token"),
+                reclaimed[0].revision,
+                211,
+            )
+            .is_err());
+        let health = store
+            .session_runtime_outbox_health()
+            .expect("runtime input health");
+        assert!(health.completed >= 1);
+        assert!(health.rejected_duplicate >= 1);
+        assert!(health.rejected_policy >= 1);
+        assert!(health.cancelled >= 1);
+        assert!(health.expired >= 1);
+        assert!(health.reclassified >= 1);
+
+        for id in [&source, &peer, &branch, &rejected] {
+            store.delete_session(id).expect("delete isolated session");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_runtime_failure_retry_and_terminal_statuses_are_real() {
+        let _guard = postgres_test_guard();
+        let store = real_store();
+        let session_id = unique_id("durable-failure");
+        store
+            .create_session(&session(&session_id))
+            .expect("create isolated session");
+        let request = runtime_request(&session_id, 1, InputRoutingDecision::StartNewTurn, None, 10);
+        let explicit_message = SessionMessage {
+            stable_message_id: request.message_id.clone(),
+            session_id: session_id.clone(),
+            sequence: 0,
+            role: "user".to_string(),
+            content_json: r#"[{"type":"text","text":"failure path"}]"#.to_string(),
+            blocks_count: 1,
+            tool_use_id: None,
+            tool_name: None,
+            token_usage_json: None,
+            created_at_ms: 10,
+        };
+        let queued = store
+            .append_message_with_runtime_outbox(&explicit_message, &request)
+            .expect("append explicit message and durable input atomically");
+        assert_eq!(queued.status, SessionRuntimeInputStatus::Queued);
+        let claimed = store
+            .claim_session_runtime_outbox("failure-worker", 20, 100, 1)
+            .expect("claim failure input")
+            .pop()
+            .expect("failure input claimed");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &claimed.request_id,
+                "failure-worker",
+                1,
+                claimed.claim_token.as_deref().expect("claim token"),
+                claimed.revision,
+                21,
+            )
+            .expect("mark failure input running");
+        let queued = store
+            .fail_session_runtime_outbox(
+                &running.request_id,
+                "failure-worker",
+                1,
+                running.claim_token.as_deref().expect("claim token"),
+                running.revision,
+                OutboxFailureClass::Retryable,
+                "temporary dependency failure",
+                30,
+                3,
+                22,
+            )
+            .expect("schedule retry");
+        assert_eq!(queued.status, SessionRuntimeInputStatus::Queued);
+        assert!(queued.claim_token.is_none());
+        assert!(store
+            .claim_session_runtime_outbox("early-worker", 29, 100, 1)
+            .expect("early claim")
+            .is_empty());
+        let claimed = store
+            .claim_session_runtime_outbox("blocked-worker", 30, 100, 1)
+            .expect("claim retry")
+            .pop()
+            .expect("retry claimed");
+        let blocked = store
+            .fail_session_runtime_outbox(
+                &claimed.request_id,
+                "blocked-worker",
+                1,
+                claimed.claim_token.as_deref().expect("claim token"),
+                claimed.revision,
+                OutboxFailureClass::AuthorizationBlocked,
+                "approval required",
+                31,
+                3,
+                31,
+            )
+            .expect("block authorization failure");
+        assert_eq!(blocked.status, SessionRuntimeInputStatus::Blocked);
+        assert!(blocked.terminal_at_ms.is_none());
+        let queued = store
+            .retry_blocked_session_runtime_outbox(
+                &blocked.request_id,
+                1,
+                blocked.revision,
+                "operator",
+                "approval granted",
+                32,
+            )
+            .expect("release blocked input");
+        let claimed = store
+            .claim_session_runtime_outbox("permanent-worker", 33, 100, 1)
+            .expect("claim released input")
+            .pop()
+            .expect("released input claimed");
+        assert_eq!(claimed.request_id, queued.request_id);
+        let failed = store
+            .fail_session_runtime_outbox(
+                &claimed.request_id,
+                "permanent-worker",
+                1,
+                claimed.claim_token.as_deref().expect("claim token"),
+                claimed.revision,
+                OutboxFailureClass::Permanent,
+                "permanent runtime failure",
+                34,
+                3,
+                34,
+            )
+            .expect("record permanent failure");
+        assert_eq!(failed.status, SessionRuntimeInputStatus::Failed);
+        assert_eq!(failed.terminal_at_ms, Some(34));
+        assert!(store
+            .retry_blocked_session_runtime_outbox(
+                &failed.request_id,
+                1,
+                failed.revision,
+                "operator",
+                "must not retry terminal failure",
+                35,
+            )
+            .is_err());
+        store
+            .delete_session(&session_id)
             .expect("delete isolated session");
+    }
+
+    #[test]
+    #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+    fn postgres_v8_migrates_legacy_runtime_rows_in_place() {
+        let _guard = postgres_test_guard();
+        let url =
+            std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
+        let mut client =
+            postgres::Client::connect(&url, postgres::NoTls).expect("connect isolated PostgreSQL");
+        let schema = unique_id("legacy_v8").replace('-', "_");
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema}; SET search_path TO {schema};"
+            ))
+            .expect("create isolated migration schema");
+        client
+            .batch_execute(
+                "CREATE TABLE session_records(
+                     session_id TEXT PRIMARY KEY,
+                     updated_at_ms BIGINT NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE session_runtime_outbox(
+                     request_id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL REFERENCES session_records(session_id),
+                     sequence BIGINT NOT NULL,
+                     status TEXT NOT NULL,
+                     next_attempt_at_ms BIGINT NOT NULL,
+                     claim_expires_at_ms BIGINT,
+                     updated_at_ms BIGINT NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE session_recovery_manifest(
+                     session_id TEXT PRIMARY KEY,
+                     in_flight_turn BOOLEAN NOT NULL DEFAULT FALSE,
+                     manifest_revision BIGINT NOT NULL DEFAULT 0
+                 );
+                 CREATE OR REPLACE FUNCTION cowd_refresh_session_recovery_manifest(
+                     target_session_id TEXT,bump_history BOOLEAN
+                 ) RETURNS VOID LANGUAGE plpgsql AS $$ BEGIN RETURN; END $$;
+                 INSERT INTO session_records(session_id) VALUES('legacy');
+                 INSERT INTO session_recovery_manifest(session_id) VALUES('legacy');
+                 INSERT INTO session_runtime_outbox(
+                     request_id,session_id,sequence,status,next_attempt_at_ms
+                 ) VALUES
+                     ('pending','legacy',0,'pending',0),
+                     ('retry','legacy',1,'retry_scheduled',0),
+                     ('done','legacy',2,'materialized',0),
+                     ('blocked','legacy',3,'blocked_materialization',0);",
+            )
+            .expect("seed legacy schema");
+        let migration = SESSION_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 8)
+            .expect("v8 migration exists");
+        assert_eq!(migration.version, 8);
+        for statement in migration.statements {
+            client
+                .batch_execute(statement)
+                .unwrap_or_else(|error| panic!("v8 statement failed: {statement}: {error}"));
+        }
+        let admission = client
+            .query_one(
+                "SELECT input_generation,input_admission_open
+                   FROM session_records WHERE session_id='legacy'",
+                &[],
+            )
+            .expect("load migrated admission");
+        assert_eq!(admission.get::<_, i64>(0), 1);
+        assert!(admission.get::<_, bool>(1));
+        let rows = client
+            .query(
+                "SELECT request_id,input_id,status,session_generation,decision
+                   FROM session_runtime_outbox ORDER BY sequence",
+                &[],
+            )
+            .expect("load migrated rows");
+        let expected = [
+            ("pending", "queued"),
+            ("retry", "queued"),
+            ("done", "completed"),
+            ("blocked", "blocked"),
+        ];
+        for (row, (request_id, status)) in rows.iter().zip(expected) {
+            assert_eq!(row.get::<_, String>(0), request_id);
+            assert_eq!(row.get::<_, String>(1), request_id);
+            assert_eq!(row.get::<_, String>(2), status);
+            assert_eq!(row.get::<_, i64>(3), 1);
+            assert_eq!(row.get::<_, String>(4), "start_new_turn");
+        }
+        client
+            .batch_execute(&format!(
+                "SET search_path TO public; DROP SCHEMA {schema} CASCADE;"
+            ))
+            .expect("drop isolated migration schema");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use harness_contract::context::{ArtifactRef, ArtifactWriteDescriptor};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{cowd_dirs, ArtifactStore};
@@ -362,7 +363,53 @@ impl ResourceStore {
         session_id: Option<String>,
         declared_mime: Option<String>,
     ) -> Result<(ResourceProjection, ResourceHint), String> {
-        let path = path.as_ref();
+        self.register_resource_from_path_inner(
+            path.as_ref(),
+            None,
+            source.into(),
+            source_message_id,
+            session_id,
+            declared_mime,
+        )
+    }
+
+    /// Registers a resource under a caller-owned stable identity.
+    ///
+    /// Durable ingress paths use this variant so replay after a process crash
+    /// returns the original resource instead of creating another metadata
+    /// record for the same logical attachment.
+    pub fn register_resource_from_path_idempotent(
+        &self,
+        path: impl AsRef<Path>,
+        idempotency_key: &str,
+        source: impl Into<String>,
+        source_message_id: Option<String>,
+        session_id: Option<String>,
+        declared_mime: Option<String>,
+    ) -> Result<(ResourceProjection, ResourceHint), String> {
+        let idempotency_key = idempotency_key.trim();
+        if idempotency_key.is_empty() {
+            return Err("resource idempotency key must not be empty".to_string());
+        }
+        self.register_resource_from_path_inner(
+            path.as_ref(),
+            Some(stable_resource_id(idempotency_key)),
+            source.into(),
+            source_message_id,
+            session_id,
+            declared_mime,
+        )
+    }
+
+    fn register_resource_from_path_inner(
+        &self,
+        path: &Path,
+        stable_id: Option<String>,
+        source: String,
+        source_message_id: Option<String>,
+        session_id: Option<String>,
+        declared_mime: Option<String>,
+    ) -> Result<(ResourceProjection, ResourceHint), String> {
         if !path.is_file() {
             return Err(format!("resource path is not a file: {}", path.display()));
         }
@@ -387,6 +434,25 @@ impl ResourceStore {
             .map(|ext| ext.to_ascii_lowercase());
         let detected_mime = detect_mime(path, declared_mime.as_deref(), extension.as_deref());
         let kind = detect_kind(&original_name, detected_mime.as_deref());
+        if let Some(id) = stable_id.as_deref() {
+            if self.metadata_path(id).exists() {
+                let existing = self.get(id)?;
+                let (sha256, bytes) = sha256_file(path)?;
+                validate_idempotent_resource(
+                    &existing,
+                    &source,
+                    source_message_id.as_deref(),
+                    session_id.as_deref(),
+                    declared_mime.as_deref(),
+                    &sha256,
+                    bytes,
+                )?;
+                return Ok((
+                    existing.clone(),
+                    resource_hint(&existing, &self.capabilities.snapshot()),
+                ));
+            }
+        }
         let visibility_scope = session_id
             .as_ref()
             .map_or_else(|| "public".to_string(), |id| format!("session:{id}"));
@@ -405,7 +471,8 @@ impl ResourceStore {
                 path,
             )
             .map_err(|error| error.to_string())?;
-        self.register_resource_from_artifact(
+        self.register_resource_from_artifact_inner(
+            stable_id,
             artifact,
             source,
             source_message_id,
@@ -433,11 +500,55 @@ impl ResourceStore {
         kind: ResourceKind,
         metadata: serde_json::Value,
     ) -> Result<(ResourceProjection, ResourceHint), String> {
-        let id = format!("res_{}", Uuid::new_v4().simple());
+        self.register_resource_from_artifact_inner(
+            None,
+            artifact,
+            source.into(),
+            source_message_id,
+            session_id,
+            original_name,
+            declared_mime,
+            detected_mime,
+            kind,
+            metadata,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_resource_from_artifact_inner(
+        &self,
+        stable_id: Option<String>,
+        artifact: ArtifactRef,
+        source: String,
+        source_message_id: Option<String>,
+        session_id: Option<String>,
+        original_name: String,
+        declared_mime: Option<String>,
+        detected_mime: Option<String>,
+        kind: ResourceKind,
+        metadata: serde_json::Value,
+    ) -> Result<(ResourceProjection, ResourceHint), String> {
+        let id = stable_id.unwrap_or_else(|| format!("res_{}", Uuid::new_v4().simple()));
+        if self.metadata_path(&id).exists() {
+            let existing = self.get(&id)?;
+            validate_idempotent_resource(
+                &existing,
+                &source,
+                source_message_id.as_deref(),
+                session_id.as_deref(),
+                declared_mime.as_deref(),
+                &artifact.sha256,
+                artifact.bytes,
+            )?;
+            return Ok((
+                existing.clone(),
+                resource_hint(&existing, &self.capabilities.snapshot()),
+            ));
+        }
         let envelope = ResourceProjection {
             id: id.clone(),
             uri: format!("resource://{id}"),
-            source: source.into(),
+            source,
             source_message_id,
             session_id,
             original_name,
@@ -1152,8 +1263,6 @@ const fn default_resource_migration_limit() -> usize {
 }
 
 fn sha256_file(path: &Path) -> Result<(String, u64), String> {
-    use sha2::{Digest, Sha256};
-
     let mut input =
         fs::File::open(path).map_err(|error| format!("open legacy resource object: {error}"))?;
     let mut hasher = Sha256::new();
@@ -1170,6 +1279,39 @@ fn sha256_file(path: &Path) -> Result<(String, u64), String> {
         bytes = bytes.saturating_add(read as u64);
     }
     Ok((format!("sha256:{:x}", hasher.finalize()), bytes))
+}
+
+fn stable_resource_id(idempotency_key: &str) -> String {
+    format!(
+        "res_{:x}",
+        Sha256::digest(format!("cowd-resource:{idempotency_key}").as_bytes())
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_idempotent_resource(
+    existing: &ResourceProjection,
+    source: &str,
+    source_message_id: Option<&str>,
+    session_id: Option<&str>,
+    declared_mime: Option<&str>,
+    sha256: &str,
+    bytes: u64,
+) -> Result<(), String> {
+    let matches = existing.source == source
+        && existing.source_message_id.as_deref() == source_message_id
+        && existing.session_id.as_deref() == session_id
+        && existing.declared_mime.as_deref() == declared_mime
+        && existing.artifact.sha256 == sha256
+        && existing.artifact.bytes == bytes;
+    if matches {
+        Ok(())
+    } else {
+        Err(format!(
+            "resource idempotency conflict for `{}`: existing registration does not match replayed attachment",
+            existing.id
+        ))
+    }
 }
 
 fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<(), String> {

@@ -30,24 +30,24 @@ use runtime::ProfileManager;
 use sha2::Digest;
 use tools::ToolCatalog;
 
-use crate::event_bus::SessionEventBus;
+use crate::event_bus::SessionProjectionHub;
 #[cfg(test)]
-use crate::gateway::ActiveSessions;
+use crate::gateway::HotSessionPool;
+#[cfg(test)]
+use crate::services::session_service::repository::SessionRepository;
 use crate::services::GatewayServices;
-#[cfg(test)]
-use crate::session_kernel::SessionKernel;
 #[cfg(test)]
 use crate::task_kernel::TaskKernel;
 #[cfg(test)]
 use memory::cognitive::CognitiveContextManager;
-use memory::session_store::UnifiedSessionStore;
-use memory::store::session::SessionRecord;
 #[cfg(test)]
 use memory::types::{
     AgentVisibility, MemoryCategory, MemoryEntry, MemoryId, MemoryLayer, MemorySource, Priority,
 };
 #[cfg(test)]
 use memory::MemoryScope;
+#[cfg(test)]
+use session::{SessionRecord, UnifiedSessionStore};
 
 mod agent_routes;
 mod app_routes;
@@ -62,7 +62,7 @@ mod edge_routes;
 mod evolution_routes;
 mod growth_routes;
 mod harness_eval_routes;
-mod live_routes;
+pub(crate) mod live_routes;
 mod managed_agent_routes;
 mod matrix_outcomes;
 mod matrix_routes;
@@ -90,7 +90,6 @@ mod workspace_routes;
 pub struct AppState {
     pub tool_registry: Arc<ToolCatalog>,
     pub config: Option<serde_json::Value>,
-    pub event_bus: Arc<SessionEventBus>,
     pub static_webui: crate::gateway_static::StaticWebUiSource,
     pub approval_gate: Option<Arc<SmartApprovalGate>>,
     pub auth_token: Option<String>,
@@ -100,6 +99,7 @@ pub struct AppState {
     pub profile_manager: Arc<ProfileManager>,
     pub services: Arc<GatewayServices>,
     pub session_lease_registry: Option<Arc<session::SessionLeaseRegistry>>,
+    pub(crate) live_registry: Arc<live_routes::LiveRegistry>,
 }
 
 fn validated_session_observer_id(observer_id: Option<&str>) -> Option<&str> {
@@ -306,11 +306,8 @@ impl AppState {
         self.services.session.has_unified_store()
     }
 
-    fn event_bus(&self) -> Arc<SessionEventBus> {
-        self.services
-            .session
-            .event_bus()
-            .unwrap_or_else(|| Arc::clone(&self.event_bus))
+    fn event_bus(&self) -> Arc<SessionProjectionHub> {
+        self.services.session.event_bus()
     }
 
     pub(crate) fn list_active_session_ids(&self) -> Vec<String> {
@@ -385,9 +382,19 @@ async fn auth_middleware(
         ));
     };
     let app_request_context = generic_app_request_context(&state, &claims, request.headers());
-    state
+    let producer_id = state
         .services
-        .bind_app_request_principal(&claims, &app_request_context.invocation);
+        .app_registry
+        .active_app_id_for_route(request.method().as_str(), &request_path)
+        .map_or_else(
+            || gateway_http_producer_namespace(&request_path),
+            |app_id| format!("app:{app_id}"),
+        );
+    state.services.bind_app_request_principal(
+        &claims,
+        &app_request_context.invocation,
+        producer_id,
+    );
     request
         .extensions_mut()
         .insert(AuthenticatedPrincipal(claims));
@@ -395,8 +402,18 @@ async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
+fn gateway_http_producer_namespace(path: &str) -> String {
+    let mut segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty());
+    let first = segments.next().unwrap_or("root");
+    let second = segments.next().unwrap_or("root");
+    format!("gateway:http:{first}.{second}")
+}
+
 /// Project a verified Gateway principal into the stable APP request ABI.
-/// The APP receives a hashed workspace scope and a request correlation id,
+/// The APP receives a hashed workspace scope and a Gateway-issued request id,
 /// never an absolute path, bearer credential, signed envelope or `AppState`.
 fn generic_app_request_context(
     state: &AppState,
@@ -410,12 +427,8 @@ fn generic_app_request_context(
         .unwrap_or("gateway")
         .trim()
         .to_string();
-    let request_id = headers
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Host-effect identity bindings must never use a caller-controlled key.
+    let request_id = uuid::Uuid::new_v4().to_string();
     let workspace_id = format!(
         "sha256:{:x}",
         sha2::Sha256::digest(state.workspace_root.to_string_lossy().as_bytes())
@@ -945,9 +958,14 @@ fn test_human_principal() -> runtime::VerifiedPrincipal {
 /// `test-support` feature.
 #[cfg(feature = "test-support")]
 pub mod test_support {
-    use std::{path::PathBuf, sync::Arc, time::Instant};
+    use std::{
+        path::PathBuf,
+        sync::{mpsc, Arc},
+        thread::JoinHandle,
+        time::Instant,
+    };
 
-    use approval::{SharedApprovalHistoryLedger, SqliteApprovalHistoryLedger};
+    use approval::SharedApprovalHistoryLedger;
     use axum::Router;
     use runtime::{
         approval_gate::SmartApprovalGate, permission_enforcer::DestructivePatternDetector,
@@ -957,12 +975,104 @@ pub mod test_support {
 
     use super::{api_router, AppState};
     use crate::{
-        event_bus::SessionEventBus, gateway::ActiveSessions, runtime_service::RuntimeService,
-        services::GatewayServices, session_kernel::SessionKernel, task_kernel::TaskKernel,
+        event_bus::SessionProjectionHub,
+        gateway::HotSessionPool,
+        runtime_service::RuntimeService,
+        services::session_service::{
+            activation::SessionActivationCoordinator, presence::SessionPresenceLedger,
+            repository::SessionRepository,
+        },
+        services::{GatewayServices, SessionService},
     };
 
     pub struct GatewayTestHarness {
         state: Arc<AppState>,
+        session_workers: Arc<TestSessionWorkerDriver>,
+    }
+
+    /// Owns the Tokio runtime that drives the production Session workers used
+    /// by the synchronous black-box harness API.
+    ///
+    /// Integration tests call `GatewayTestHarness::in_memory()` from inside a
+    /// Tokio test, so attempting to synchronously block that test runtime would
+    /// panic. A dedicated thread preserves the existing synchronous fixture
+    /// API while still exercising the production supervisor and shutdown path.
+    struct TestSessionWorkerDriver {
+        stop: Option<mpsc::Sender<()>>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl TestSessionWorkerDriver {
+        fn start(
+            runtime: Arc<RuntimeService>,
+            session: Arc<SessionService>,
+            event_bus: Arc<SessionProjectionHub>,
+        ) -> Result<
+            (
+                Self,
+                Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
+            ),
+            String,
+        > {
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let thread = std::thread::Builder::new()
+                .name("cowd-gateway-test-session-workers".to_string())
+                .spawn(move || {
+                    let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "failed to create Gateway test worker runtime: {error}"
+                            )));
+                            return;
+                        }
+                    };
+                    match tokio_runtime.block_on(
+                        crate::session_runtime_bridge::SessionWorkerSupervisor::start(
+                            runtime, session, event_bus,
+                        ),
+                    ) {
+                        Ok(supervisor) => {
+                            if ready_tx.send(Ok(Arc::clone(&supervisor))).is_err() {
+                                tokio_runtime.block_on(supervisor.shutdown());
+                                return;
+                            }
+                            let _ = stop_rx.recv();
+                            tokio_runtime.block_on(supervisor.shutdown());
+                        }
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(error));
+                        }
+                    }
+                })
+                .map_err(|error| format!("failed to spawn Gateway test worker thread: {error}"))?;
+            let supervisor = ready_rx
+                .recv()
+                .map_err(|error| format!("Gateway test worker startup disconnected: {error}"))??;
+            Ok((
+                Self {
+                    stop: Some(stop_tx),
+                    thread: Some(thread),
+                },
+                supervisor,
+            ))
+        }
+    }
+
+    impl Drop for TestSessionWorkerDriver {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     impl GatewayTestHarness {
@@ -989,38 +1099,46 @@ pub mod test_support {
             std::fs::create_dir_all(&config_home).map_err(|error| error.to_string())?;
             std::fs::create_dir_all(&workspace_root).map_err(|error| error.to_string())?;
 
-            let sessions = Arc::new(ActiveSessions::new());
-            let event_bus = SessionEventBus::new();
-            let session_store = Arc::new(
-                memory::session_store::UnifiedSessionStore::open_in_memory()
-                    .map_err(|error| error.to_string())?,
+            let selected_storage = Arc::new(
+                crate::selected_storage::SelectedStorageTopology::compose_for_runtime(
+                    &runtime::StorageTopologyConfig::default(),
+                    &runtime::AppsConfig::default().with_app_enabled("mfg", false),
+                    &config_home,
+                    &workspace_root,
+                )?,
             );
-            let session_kernel = Arc::new(SessionKernel::new(
+            let sessions = Arc::new(HotSessionPool::new());
+            let event_bus = SessionProjectionHub::new();
+            let session_store = Arc::clone(&selected_storage.session_store);
+            let session_repository = Arc::new(SessionRepository::new(
                 Arc::clone(&sessions),
                 Some(Arc::clone(&session_store)),
                 Arc::clone(&event_bus),
             ));
-            let lifecycle_kernel = Arc::new(
-                crate::session_lifecycle_kernel::SessionLifecycleKernel::with_store(Arc::clone(
-                    &session_store,
-                )),
-            );
-            let task_kernel = Arc::new(
-                TaskKernel::open(root.join("tasks.json")).map_err(|error| error.to_string())?,
-            );
-            let runtime_services =
-                runtime::RuntimeServices::in_memory().map_err(|error| error.to_string())?;
-            runtime_services
-                .install_session_store(session_store)
+            let presence_ledger = Arc::new(SessionPresenceLedger::with_store(Arc::clone(
+                &session_store,
+            )));
+            let task_kernel = Arc::clone(&selected_storage.task_kernel);
+            let session_runtime_port =
+                crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
+            let provider_registry = Arc::new(runtime::ProviderRegistry::empty());
+            let runtime_services = runtime::RuntimeServices::builder(&config_home, &workspace_root)
+                .provider_registry(Arc::clone(&provider_registry))
+                .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
+                .artifact_store(Arc::clone(&selected_storage.artifact_store))
+                .session_query_port(session_runtime_port.clone())
+                .session_ingress_port(session_runtime_port.clone())
+                .session_journal_port(session_runtime_port.clone())
+                .build()
                 .map_err(|error| error.to_string())?;
             let runtime = Arc::new(
                 RuntimeService::new(
-                    sessions,
+                    Arc::clone(&sessions),
                     Arc::new(session::SessionLeaseRegistry::default()),
-                    session_kernel,
-                    lifecycle_kernel,
+                    session_runtime_port.clone(),
+                    Arc::clone(&event_bus),
                     Instant::now(),
-                    Arc::new(runtime::ProviderRegistry::empty()),
+                    provider_registry,
                     Arc::new(runtime::UpgradeCoordinator::new()),
                     runtime_services,
                 )
@@ -1030,25 +1148,47 @@ pub mod test_support {
                     workspace_root.clone(),
                 ))),
             );
-            let approval_ledger: SharedApprovalHistoryLedger = Arc::new(
-                SqliteApprovalHistoryLedger::in_memory().map_err(|error| error.to_string())?,
-            );
+            let session_activation = Arc::new(SessionActivationCoordinator::new(
+                Arc::clone(&runtime),
+                Arc::clone(&session_repository),
+                Arc::clone(&presence_ledger),
+                Arc::new(runtime::session_lifecycle::SessionWorkingSetManager::new(
+                    runtime::session_lifecycle::SessionLifecycleConfig::default(),
+                )),
+                100,
+                runtime::SessionRecoveryConfig::default(),
+            ));
+            let session_service = Arc::new(SessionService::new_unbound(
+                Arc::clone(&runtime),
+                Arc::clone(&session_activation),
+            ));
+            session_runtime_port.bind(&session_service)?;
+            let (session_workers, session_supervisor) = TestSessionWorkerDriver::start(
+                Arc::clone(&runtime),
+                Arc::clone(&session_service),
+                Arc::clone(&event_bus),
+            )?;
+            session_service.install_supervisor(Arc::clone(&session_supervisor))?;
+            let approval_ledger: SharedApprovalHistoryLedger =
+                Arc::clone(&selected_storage.approval_ledger);
             let approval_gate = Arc::new(SmartApprovalGate::new(
                 Arc::new(DestructivePatternDetector::new(workspace_root.clone())),
                 ApprovalConfig::default(),
                 Arc::clone(&approval_ledger),
             ));
-            let services = Arc::new(GatewayServices::new_with_config_home(
+            let services = Arc::new(GatewayServices::new_with_bound_session_and_storage(
                 runtime,
+                session_service,
                 task_kernel,
                 Arc::new(crate::surface_host::SurfaceHost::baseline()?),
                 None,
                 approval_gate,
                 approval_ledger,
-                Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
-                    runtime::session_lifecycle::SessionLifecycleConfig::default(),
-                )),
+                session_activation,
+                session_supervisor,
                 &config_home,
+                runtime::GatewayCapacityConfig::default(),
+                selected_storage,
             ));
             let profiles = Arc::new(ProfileManager::new_with_profiles_dir(
                 config_home.join("profiles"),
@@ -1059,7 +1199,6 @@ pub mod test_support {
                 state: Arc::new(AppState {
                     tool_registry: Arc::new(ToolCatalog::builtin()),
                     config: None,
-                    event_bus,
                     static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
                     approval_gate: None,
                     auth_token,
@@ -1071,12 +1210,15 @@ pub mod test_support {
                     session_lease_registry: Some(
                         Arc::new(session::SessionLeaseRegistry::default()),
                     ),
+                    live_registry: Arc::new(live_routes::LiveRegistry::new()),
                 }),
+                session_workers: Arc::new(session_workers),
             })
         }
 
         pub fn router(&self) -> Router {
             api_router(Arc::clone(&self.state))
+                .layer(axum::Extension(Arc::clone(&self.session_workers)))
         }
 
         /// Seed one terminal Surface-to-Runtime handoff through the production
@@ -1336,6 +1478,7 @@ fn default_config_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".cowd"))
 }
 
+#[cfg(test)]
 pub(crate) fn new_api_session_record(session_id: &str, model: Option<String>) -> SessionRecord {
     let now = chrono::Utc::now().to_rfc3339();
     let title = format!("Session {}", session_id.chars().take(8).collect::<String>());
@@ -1355,86 +1498,6 @@ pub(crate) fn new_api_session_record(session_id: &str, model: Option<String>) ->
         estimated_cost_usd: 0.0,
         status: "active".to_string(),
     }
-}
-
-pub(crate) async fn sync_runtime_session_metadata_to_store(
-    store: &UnifiedSessionStore,
-    session_id: &str,
-    session: &runtime::Session,
-) -> Result<(), String> {
-    let now = chrono::Utc::now().to_rfc3339();
-    let existing_record = store
-        .get_session(session_id)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut record = existing_record
-        .clone()
-        .unwrap_or_else(|| new_api_session_record(session_id, session.model.clone()));
-
-    record.model = session.model.clone().or(record.model);
-    record.last_activity = now;
-    record.message_count = session.message_count() as i64;
-    record.input_tokens = session
-        .messages()
-        .filter_map(|m| m.usage.as_ref())
-        .map(|u| i64::from(u.input_tokens))
-        .sum();
-    record.output_tokens = session
-        .messages()
-        .filter_map(|m| m.usage.as_ref())
-        .map(|u| i64::from(u.output_tokens))
-        .sum();
-
-    if existing_record.is_some() {
-        store
-            .update_session(&record)
-            .await
-            .map_err(|e| e.to_string())?;
-    } else {
-        store
-            .create_session(&record)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    store
-        .delete_messages_from(session_id, 0)
-        .await
-        .map_err(|e| e.to_string())?;
-    store
-        .delete_events_by_type_from(session_id, "message_appended", 0)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let mut message_events = Vec::with_capacity(session.message_count());
-    for (sequence, message) in session.messages().enumerate() {
-        let message_record = message.to_session_message(session_id, sequence);
-        store
-            .insert_message(&message_record)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let message_json = serde_json::from_str::<serde_json::Value>(&message.to_json().render())
-            .unwrap_or(serde_json::Value::Null);
-        message_events.push(memory::SessionEvent {
-            session_id: session_id.to_string(),
-            event_type: "message_appended".to_string(),
-            event_json: serde_json::json!({
-                "type": "message_appended",
-                "sequence": sequence,
-                "role": message.role.role_str(),
-                "message": message_json,
-            })
-            .to_string(),
-            sequence,
-            created_at_ms: message_record.created_at_ms,
-        });
-    }
-    store
-        .append_events_allocating_sequence(&message_events)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 fn current_time_ms() -> u64 {
@@ -1544,7 +1607,8 @@ pub(crate) mod tests {
         let context = generic_app_request_context(&state, &principal, &headers);
 
         assert_eq!(context.invocation.surface, "tui");
-        assert_eq!(context.invocation.request_id, "request-123");
+        assert_ne!(context.invocation.request_id, "request-123");
+        assert!(uuid::Uuid::parse_str(&context.invocation.request_id).is_ok());
         assert!(context.invocation.workspace_id.starts_with("sha256:"));
         assert!(!context
             .invocation
@@ -1726,12 +1790,12 @@ pub(crate) mod tests {
         manager
     }
 
-    fn test_session_kernel(
-        sessions: Arc<ActiveSessions>,
+    fn test_session_repository(
+        sessions: Arc<HotSessionPool>,
         store: Option<Arc<UnifiedSessionStore>>,
-        event_bus: Arc<SessionEventBus>,
-    ) -> Arc<SessionKernel> {
-        Arc::new(SessionKernel::new(sessions, store, event_bus))
+        event_bus: Arc<SessionProjectionHub>,
+    ) -> Arc<SessionRepository> {
+        Arc::new(SessionRepository::new(sessions, store, event_bus))
     }
 
     fn test_provider_registry() -> Arc<runtime::ProviderRegistry> {
@@ -1761,12 +1825,12 @@ pub(crate) mod tests {
     }
 
     fn test_services(
-        session_kernel: Arc<SessionKernel>,
+        session_repository: Arc<SessionRepository>,
         task_kernel: Arc<TaskKernel>,
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
     ) -> Arc<crate::services::GatewayServices> {
         test_services_for_workspace(
-            session_kernel,
+            session_repository,
             task_kernel,
             surface_host,
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1774,13 +1838,13 @@ pub(crate) mod tests {
     }
 
     fn test_services_for_workspace(
-        session_kernel: Arc<SessionKernel>,
+        session_repository: Arc<SessionRepository>,
         task_kernel: Arc<TaskKernel>,
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
         tool_workspace_root: PathBuf,
     ) -> Arc<crate::services::GatewayServices> {
         test_services_for_workspace_with_config_home(
-            session_kernel,
+            session_repository,
             task_kernel,
             surface_host,
             tool_workspace_root,
@@ -1789,32 +1853,38 @@ pub(crate) mod tests {
     }
 
     fn test_services_for_workspace_with_config_home(
-        session_kernel: Arc<SessionKernel>,
+        session_repository: Arc<SessionRepository>,
         task_kernel: Arc<TaskKernel>,
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
         tool_workspace_root: PathBuf,
         config_home: PathBuf,
     ) -> Arc<crate::services::GatewayServices> {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let runtime_services =
             runtime::RuntimeServices::in_memory().expect("test runtime services");
-        let runtime_store = session_kernel.unified_store().unwrap_or_else(|| {
+        let runtime_store = session_repository.test_unified_store().unwrap_or_else(|| {
             Arc::new(UnifiedSessionStore::open_in_memory().expect("test session store"))
         });
-        let lifecycle_kernel = Arc::new(
-            crate::session_lifecycle_kernel::SessionLifecycleKernel::with_store(Arc::clone(
-                &runtime_store,
-            )),
+        let presence_ledger = Arc::new(
+            crate::services::session_service::presence::SessionPresenceLedger::with_store(
+                Arc::clone(&runtime_store),
+            ),
         );
+        let session_runtime_port =
+            crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
         runtime_services
-            .install_session_store(runtime_store)
+            .install_session_ports(
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+                session_runtime_port.clone(),
+            )
             .expect("test session router");
         let runtime = Arc::new(
             crate::runtime_service::RuntimeService::new(
-                sessions,
+                Arc::clone(&sessions),
                 Arc::new(session::SessionLeaseRegistry::default()),
-                session_kernel,
-                lifecycle_kernel,
+                session_runtime_port.clone(),
+                session_repository.test_event_bus(),
                 Instant::now(),
                 test_provider_registry(),
                 Arc::new(runtime::UpgradeCoordinator::new()),
@@ -1826,12 +1896,26 @@ pub(crate) mod tests {
                 tool_workspace_root,
             ))),
         );
+        let session_activation = Arc::new(
+            crate::services::session_service::activation::SessionActivationCoordinator::new(
+                Arc::clone(&runtime),
+                session_repository,
+                presence_ledger,
+                Arc::new(runtime::session_lifecycle::SessionWorkingSetManager::new(
+                    runtime::session_lifecycle::SessionLifecycleConfig::default(),
+                )),
+                100,
+                runtime::SessionRecoveryConfig::default(),
+            ),
+        );
         let approval_ledger: approval::SharedApprovalHistoryLedger = Arc::new(
             approval::SqliteApprovalHistoryLedger::in_memory()
                 .expect("in-memory approval history ledger"),
         );
-        Arc::new(crate::services::GatewayServices::new_with_config_home(
+        let services = Arc::new(crate::services::GatewayServices::new_with_config_home(
             runtime,
+            session_activation,
+            crate::session_runtime_bridge::SessionWorkerSupervisor::for_tests(),
             task_kernel,
             surface_host.unwrap_or_else(|| {
                 Arc::new(
@@ -1842,27 +1926,27 @@ pub(crate) mod tests {
             None,
             test_approval_gate(Arc::clone(&approval_ledger)),
             approval_ledger,
-            Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
-                runtime::session_lifecycle::SessionLifecycleConfig::default(),
-            )),
             config_home,
-        ))
+        ));
+        session_runtime_port
+            .bind(&services.session)
+            .expect("test Runtime port binds the routed SessionService");
+        services
     }
 
     pub(crate) fn test_state() -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new(); // returns Arc<Self>
+        let event_bus = SessionProjectionHub::new(); // returns Arc<Self>
         let session_store = Arc::new(
             UnifiedSessionStore::open_in_memory().expect("test session store should open"),
         );
-        let session_kernel =
-            test_session_kernel(sessions.clone(), Some(session_store), event_bus.clone());
+        let session_repository =
+            test_session_repository(sessions.clone(), Some(session_store), event_bus.clone());
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
@@ -1870,8 +1954,9 @@ pub(crate) mod tests {
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services(session_repository, task_kernel, None),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
     }
 
@@ -1895,16 +1980,15 @@ pub(crate) mod tests {
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         let config_home = isolated_test_config_home_with_config(&config);
         Arc::new(AppState {
             tool_registry: tools,
             config: Some(config),
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
@@ -1913,12 +1997,13 @@ pub(crate) mod tests {
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services_for_workspace(
-                session_kernel,
+                session_repository,
                 task_kernel,
                 surface_host,
                 workspace_root,
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
     }
 
@@ -1940,16 +2025,15 @@ pub(crate) mod tests {
     }
 
     fn test_state_with_store(store: Arc<UnifiedSessionStore>) -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel =
-            test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository =
+            test_session_repository(sessions.clone(), Some(store.clone()), event_bus.clone());
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
@@ -1957,8 +2041,9 @@ pub(crate) mod tests {
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services(session_repository, task_kernel, None),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
     }
 
@@ -1967,16 +2052,15 @@ pub(crate) mod tests {
         workspace_root: PathBuf,
         config_home: PathBuf,
     ) -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel =
-            test_session_kernel(sessions.clone(), Some(store.clone()), event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository =
+            test_session_repository(sessions.clone(), Some(store.clone()), event_bus.clone());
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
@@ -1985,13 +2069,14 @@ pub(crate) mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services_for_workspace_with_config_home(
-                session_kernel,
+                session_repository,
                 task_kernel,
                 None,
                 workspace_root,
                 config_home.clone(),
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
     }
 
@@ -2014,12 +2099,10 @@ pub(crate) mod tests {
 
     fn test_state_with_memory(memory_manager: Arc<CognitiveContextManager>) -> Arc<AppState> {
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
@@ -2032,6 +2115,7 @@ pub(crate) mod tests {
                     .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
     }
 
@@ -2040,12 +2124,10 @@ pub(crate) mod tests {
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
@@ -2058,6 +2140,7 @@ pub(crate) mod tests {
                     .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
     }
 
@@ -2071,12 +2154,10 @@ pub(crate) mod tests {
 
     fn test_state_with_approval_gate(gate: Arc<SmartApprovalGate>) -> Arc<AppState> {
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: Some(gate.clone()),
             auth_token: None,
@@ -2089,19 +2170,24 @@ pub(crate) mod tests {
                     .with_task_kernel_for_tests(task_kernel),
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
     }
 
     fn test_state_with_workspace(workspace_root: PathBuf, config_home: PathBuf) -> Arc<AppState> {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let store = Arc::new(
+            UnifiedSessionStore::open_in_memory()
+                .expect("workspace-backed API tests require the production Session contract"),
+        );
+        let session_repository =
+            test_session_repository(sessions.clone(), Some(store), event_bus.clone());
         let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: None,
@@ -2110,13 +2196,14 @@ pub(crate) mod tests {
             profile_id: "enterprise".to_string(),
             profile_manager: test_profile_manager(),
             services: test_services_for_workspace_with_config_home(
-                session_kernel,
+                session_repository,
                 task_kernel,
                 None,
                 workspace_root,
                 config_home,
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
     }
 
@@ -2136,30 +2223,38 @@ pub(crate) mod tests {
             .expect("activate test provider config");
     }
 
-    #[test]
-    fn session_service_shares_session_kernel_handles() {
+    #[tokio::test]
+    async fn session_service_exposes_session_queries_without_repository_handles() {
         let state = test_state_with_store(Arc::new(UnifiedSessionStore::open_in_memory().unwrap()));
 
-        assert!(Arc::ptr_eq(
-            &state
+        let _projection_hub = state.services.session.event_bus();
+        assert!(state.services.session.has_unified_store());
+        assert_eq!(
+            state
                 .services
                 .session
-                .event_bus()
-                .expect("service event bus should exist"),
-            &state.event_bus
-        ));
-        assert!(Arc::ptr_eq(
-            &state
-                .services
-                .session
-                .unified_store()
-                .expect("service store should exist"),
-            &state
-                .services
-                .session
-                .unified_store()
-                .expect("service store should exist")
-        ));
+                .list_stored_sessions()
+                .await
+                .expect("session query")
+                .expect("durable store")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn producer_namespace_comes_from_active_app_routes_or_gateway_route_family() {
+        let state = test_state();
+        let app_id = state
+            .services
+            .app_registry
+            .active_app_id_for_route("GET", "/api/apps/mfg/contract")
+            .expect("active MFG route must resolve through registered metadata");
+        assert_eq!(format!("app:{app_id}"), "app:mfg");
+        assert_eq!(
+            gateway_http_producer_namespace("/api/sessions/session-1"),
+            "gateway:http:api.sessions"
+        );
     }
 
     #[tokio::test]
@@ -2223,16 +2318,27 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
+        let session_generation = store
+            .get_session_input_admission(session_id)
+            .await
+            .unwrap()
+            .expect("created Session has durable input admission")
+            .generation;
         store
             .append_ingress_with_runtime_outbox(
                 session_id,
                 "user",
                 Some("[{\"type\":\"text\",\"text\":\"durable route check\"}]"),
                 42,
-                &memory::SessionRuntimeOutboxRequest {
+                &session::SessionRuntimeOutboxRequest {
+                    input_id: "durable-execution-route-input".to_string(),
                     request_id: request_id.to_string(),
                     turn_id: turn_id.to_string(),
                     message_id: "durable-execution-route-message".to_string(),
+                    session_generation,
+                    decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                    target_turn_id: None,
+                    classification_json: None,
                     created_at_ms: 42,
                     runtime_options_json: Some("{\"profile\":\"main_turn\"}".to_string()),
                 },
@@ -2307,11 +2413,22 @@ pub(crate) mod tests {
             .create_session(&new_api_session_record("outbox-session", None))
             .await
             .unwrap();
+        let session_generation = store
+            .get_session_input_admission("outbox-session")
+            .await
+            .unwrap()
+            .expect("created Session has durable input admission")
+            .generation;
         let state = test_state_with_store(Arc::clone(&store));
-        let request = memory::SessionRuntimeOutboxRequest {
+        let request = session::SessionRuntimeOutboxRequest {
+            input_id: "ingress-poison-input".to_string(),
             request_id: "ingress-poison".to_string(),
             turn_id: "turn-1".to_string(),
             message_id: "user-1".to_string(),
+            session_generation,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
             created_at_ms: 1,
             runtime_options_json: None,
         };
@@ -2335,8 +2452,10 @@ pub(crate) mod tests {
             .fail_session_runtime_outbox(
                 "ingress-poison",
                 "test-worker",
+                ingress_claim.session_generation,
+                ingress_claim.claim_token.as_deref().expect("claim token"),
                 ingress_claim.revision,
-                memory::OutboxFailureClass::CorruptPayload,
+                session::OutboxFailureClass::CorruptPayload,
                 "bad payload",
                 2,
                 1,
@@ -2674,7 +2793,7 @@ pub(crate) mod tests {
         store.create_session(&source).await.unwrap();
         store
             .insert_messages_batch(&[
-                memory::store::session::SessionMessage {
+                session::SessionMessage {
                     stable_message_id: format!("branch:{source_id}:0"),
                     session_id: source_id.to_string(),
                     sequence: 0,
@@ -2686,7 +2805,7 @@ pub(crate) mod tests {
                     token_usage_json: None,
                     created_at_ms: 10,
                 },
-                memory::store::session::SessionMessage {
+                session::SessionMessage {
                     stable_message_id: format!("branch:{source_id}:1"),
                     session_id: source_id.to_string(),
                     sequence: 1,
@@ -2704,11 +2823,15 @@ pub(crate) mod tests {
 
         let app = api_router(test_state_with_store(store.clone()));
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/sessions/{source_id}/branch"))
-                    .body(Body::empty())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"idempotency_key":"branch-copy-once"}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -2718,13 +2841,19 @@ pub(crate) mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(
             status,
-            StatusCode::CREATED,
+            StatusCode::OK,
             "branch response: {}",
             String::from_utf8_lossy(&body)
         );
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let branch_id = json["id"].as_str().expect("branch id should be returned");
-        let copied = store.get_messages(branch_id, 0, 10).await.unwrap();
+        assert_eq!(json["replayed"], false);
+        assert_eq!(json["source_message_count"], 2);
+        assert_eq!(json["copied_message_count"], 2);
+        let branch_id = json["id"]
+            .as_str()
+            .expect("branch id should be returned")
+            .to_string();
+        let copied = store.get_messages(&branch_id, 0, 10).await.unwrap();
         assert_eq!(copied.len(), 2);
         assert_eq!(copied[0].session_id, branch_id);
         assert_ne!(copied[0].stable_message_id, format!("branch:{source_id}:0"));
@@ -2734,7 +2863,7 @@ pub(crate) mod tests {
         assert_eq!(copied[0].sequence, 0);
         assert!(copied[0].content_json.contains("hello"));
         let branch_record = store
-            .get_session(branch_id)
+            .get_session(&branch_id)
             .await
             .unwrap()
             .expect("branch record should exist");
@@ -2747,15 +2876,71 @@ pub(crate) mod tests {
         let source_events = store.get_events(source_id, 0).await.unwrap();
         assert!(source_events.iter().any(|event| {
             event.event_type == "SessionBranched"
-                && event.event_json.contains(branch_id)
+                && event.event_json.contains(&branch_id)
                 && event.event_json.contains("\"copied_message_count\":2")
         }));
-        let branch_events = store.get_events(branch_id, 0).await.unwrap();
+        let branch_events = store.get_events(&branch_id, 0).await.unwrap();
         assert!(branch_events.iter().any(|event| {
             event.event_type == "BranchCreated"
                 && event.event_json.contains(source_id)
                 && event.event_json.contains("\"copied_message_count\":2")
         }));
+
+        store
+            .insert_message(&session::SessionMessage {
+                stable_message_id: format!("branch:{source_id}:2"),
+                session_id: source_id.to_string(),
+                sequence: 2,
+                role: "user".to_string(),
+                content_json: serde_json::json!([{"type":"text","text":"after first branch"}])
+                    .to_string(),
+                blocks_count: 1,
+                tool_use_id: None,
+                tool_name: None,
+                token_usage_json: None,
+                created_at_ms: 12,
+            })
+            .await
+            .unwrap();
+        let replay = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{source_id}/branch"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"idempotency_key":"branch-copy-once"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body = to_bytes(replay.into_body(), usize::MAX).await.unwrap();
+        let replay_json: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+        assert_eq!(replay_json["id"], branch_id);
+        assert_eq!(replay_json["replayed"], true);
+        assert_eq!(replay_json["source_message_count"], 2);
+        assert_eq!(replay_json["copied_message_count"], 2);
+        assert_eq!(
+            store.get_messages(&branch_id, 0, 10).await.unwrap().len(),
+            2,
+            "a response retry must retain the original durable cutoff"
+        );
+        let branch_sessions = store
+            .list_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record
+                    .metadata_json
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("\"branched_from\":\"branch-source\"")
+            })
+            .count();
+        assert_eq!(branch_sessions, 1);
     }
 
     #[tokio::test]
@@ -3044,8 +3229,11 @@ pub(crate) mod tests {
         assert_eq!(json["static_webui"]["config_key"], "gateway.webui_dir");
         assert_eq!(json["static_webui"]["required"], false);
         assert_eq!(json["static_webui"]["status"], "missing_config");
-        assert_eq!(json["runtime"]["session_kernel"], true);
-        assert_eq!(json["runtime"]["event_bus"], true);
+        assert_eq!(json["runtime"]["session_repository"], true);
+        assert_eq!(
+            json["runtime"]["session_projection"]["active_subscribers"],
+            0
+        );
         assert!(
             json["storage"]["registry"]["endpoint_count"]
                 .as_u64()
@@ -3204,7 +3392,11 @@ pub(crate) mod tests {
         let required = json["required"].as_array().unwrap();
         assert!(required.iter().any(|item| item == "gateway-runtime-host"));
         assert!(required.iter().any(|item| item == "gateway-api-router"));
-        assert!(required.iter().any(|item| item == "session-kernel"));
+        assert!(required.iter().any(|item| item == "session-service"));
+        assert!(required.iter().any(|item| item == "session-projection"));
+        assert!(required
+            .iter()
+            .any(|item| item == "session-worker-supervisor"));
         assert!(required.iter().any(|item| item == "storage-registry"));
         let old_required_webui = ["static", "webui", "index"].join("-");
         assert!(!required.iter().any(|item| item == &old_required_webui));
@@ -3714,14 +3906,18 @@ pub(crate) mod tests {
             "mission_control.session_dispatch_submission"
         );
         assert_eq!(dispatch["ok"], true);
-        let dispatch_report = dispatch["result"].get("Ok").unwrap_or(&dispatch["result"]);
-        assert!(dispatch_report["claimed"].as_u64().is_some());
-        assert!(dispatch_report["receipts"]
-            .as_array()
-            .expect("execution graph submission receipts")
-            .iter()
-            .all(|receipt| receipt["graph_id"].as_str().is_some()
-                && receipt["commit_cursor"].as_u64().is_some()));
+        assert_eq!(dispatch["result"]["status"], "scheduler_owned");
+        assert!(dispatch["result"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Gateway scheduler")));
+        assert!(
+            dispatch["result"].get("claimed").is_none(),
+            "HTTP Mission Control must not become a second Session input claimant"
+        );
+        assert!(
+            dispatch["result"].get("receipts").is_none(),
+            "scheduler wake responses must not fabricate execution receipts"
+        );
 
         let control = app
             .oneshot(
@@ -5172,20 +5368,20 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_session_domain_event(&memory::SessionDomainEvent::new(
+            .append_session_domain_event(&session::SessionDomainEvent::new(
                 session_id,
                 0,
-                memory::SessionDomainScope::Turn,
-                "execution.outcome",
+                session::SessionDomainScope::Turn,
+                "application.execution_outcome",
                 serde_json::json!({"status": "ok", "title": "full loop outcome"}),
                 current_time_ms(),
             ))
             .await
             .unwrap();
-        let mut skill_activation_event = memory::SessionDomainEvent::new(
+        let mut skill_activation_event = session::SessionDomainEvent::new(
             session_id,
             1,
-            memory::SessionDomainScope::Context,
+            session::SessionDomainScope::Context,
             "skill_candidates",
             serde_json::json!({
                 "source": "conversation_runtime.skill_activation",
@@ -5210,12 +5406,12 @@ pub(crate) mod tests {
             }),
             current_time_ms(),
         );
-        skill_activation_event.refs.push(memory::SessionDomainRef {
+        skill_activation_event.refs.push(session::SessionDomainRef {
             ref_type: "skill".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("selected".to_string()),
         });
-        skill_activation_event.refs.push(memory::SessionDomainRef {
+        skill_activation_event.refs.push(session::SessionDomainRef {
             ref_type: "skill_invocation".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("selected_for_runtime".to_string()),
@@ -5224,10 +5420,10 @@ pub(crate) mod tests {
             .append_session_domain_event(&skill_activation_event)
             .await
             .unwrap();
-        let mut skill_memory_event = memory::SessionDomainEvent::new(
+        let mut skill_memory_event = session::SessionDomainEvent::new(
             session_id,
             2,
-            memory::SessionDomainScope::Context,
+            session::SessionDomainScope::Context,
             "skill_memory_candidate",
             serde_json::json!({
                 "source": "conversation_runtime.skill_memory_candidate",
@@ -5242,7 +5438,7 @@ pub(crate) mod tests {
             }),
             current_time_ms(),
         );
-        skill_memory_event.refs.push(memory::SessionDomainRef {
+        skill_memory_event.refs.push(session::SessionDomainRef {
             ref_type: "skill".to_string(),
             id: "supply-risk-analyst".to_string(),
             label: Some("memory_candidate_source".to_string()),
@@ -5923,7 +6119,7 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                        "/api/runtime/timeline?session_id={session_id}&limit=10"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -5937,7 +6133,7 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|event| event["kind"] == "execution.outcome")
+            .filter(|event| event["kind"] == "application.execution_outcome")
             .collect::<Vec<_>>();
         assert_eq!(outcome_events.len(), 2);
         assert!(outcome_events.iter().any(|event| {
@@ -9591,81 +9787,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn sync_runtime_session_persists_messages_and_events_idempotently() {
-        let store = UnifiedSessionStore::open_in_memory().unwrap();
-        let session_id = "sync-session";
-        let mut session = runtime::Session::new();
-        session.session_id = session_id.to_string();
-        session.model = Some("test-model".to_string());
-        session.push_user_text("hello store").unwrap();
-        session
-            .push_message(runtime::ConversationMessage::assistant(vec![
-                runtime::ContentBlock::Text {
-                    text: "hello user".to_string(),
-                },
-            ]))
-            .unwrap();
-
-        sync_runtime_session_metadata_to_store(&store, session_id, &session)
-            .await
-            .unwrap();
-        sync_runtime_session_metadata_to_store(&store, session_id, &session)
-            .await
-            .unwrap();
-
-        let record = store.get_session(session_id).await.unwrap().unwrap();
-        let messages = store.get_messages(session_id, 0, 10).await.unwrap();
-        let events = store.get_events(session_id, 0).await.unwrap();
-
-        assert_eq!(record.message_count, 2);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(messages[1].role, "assistant");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "message_appended");
-        assert_eq!(events[0].sequence, 0);
-        assert_eq!(events[1].sequence, 1);
-
-        store
-            .append_event(&memory::SessionEvent {
-                session_id: session_id.to_string(),
-                event_type: "TextDelta".to_string(),
-                event_json: serde_json::json!({
-                    "type": "TextDelta",
-                    "content": "streamed",
-                })
-                .to_string(),
-                sequence: 99,
-                created_at_ms: 99,
-            })
-            .await
-            .unwrap();
-
-        session.truncate_messages(1);
-        sync_runtime_session_metadata_to_store(&store, session_id, &session)
-            .await
-            .unwrap();
-        let record = store.get_session(session_id).await.unwrap().unwrap();
-        let messages = store.get_messages(session_id, 0, 10).await.unwrap();
-        let events = store.get_events(session_id, 0).await.unwrap();
-
-        assert_eq!(record.message_count, 1);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "user");
-        assert_eq!(events.len(), 2);
-        let text_delta = events
-            .iter()
-            .find(|event| event.event_type == "TextDelta")
-            .expect("non-message timeline events must survive transcript sync");
-        assert_eq!(text_delta.sequence, 99);
-        let message_event = events
-            .iter()
-            .find(|event| event.event_type == "message_appended")
-            .expect("current transcript must have one message projection");
-        assert!(message_event.sequence > text_delta.sequence);
-    }
-
-    #[tokio::test]
     async fn session_messages_support_sequence_paging_and_limit_cap() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let session_id = "message-page-session";
@@ -9676,8 +9797,8 @@ pub(crate) mod tests {
             ))
             .await
             .unwrap();
-        let messages: Vec<memory::store::session::SessionMessage> = (0..1000)
-            .map(|i| memory::store::session::SessionMessage {
+        let messages: Vec<session::SessionMessage> = (0..1000)
+            .map(|i| session::SessionMessage {
                 stable_message_id: format!("page:{session_id}:{i}"),
                 session_id: session_id.to_string(),
                 sequence: i,
@@ -9723,7 +9844,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn delete_session_removes_cold_store_record() {
+    async fn delete_session_commits_tombstone_closes_admission_and_rejects_execution() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let session_id = "cold-session";
         store
@@ -9734,6 +9855,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let state = test_state_with_store(store.clone());
+        let session_service = Arc::clone(&state.services.session);
         let app = api_router(state);
 
         let response = app
@@ -9748,7 +9870,36 @@ pub(crate) mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert!(store.get_session(session_id).await.unwrap().is_none());
+        let tombstone = store
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .expect("logical deletion retains the durable Session tombstone");
+        assert_eq!(tombstone.status, "deleted");
+        let metadata: serde_json::Value =
+            serde_json::from_str(tombstone.metadata_json.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(metadata["tombstone"]["kind"], "deleted");
+        assert_eq!(metadata["tombstone"]["physical_delete"], false);
+
+        let admission = store
+            .get_session_input_admission(session_id)
+            .await
+            .unwrap()
+            .expect("deleted Session retains its fenced admission generation");
+        assert!(!admission.open);
+
+        let execution_error = session_service
+            .admit_input(harness_contract::turn::SessionInputEnvelope::text(
+                session_id,
+                harness_contract::turn::InputSourceKind::Webui,
+                "must not execute after logical deletion",
+            ))
+            .await
+            .expect_err("deleted Session must reject new execution input");
+        assert!(
+            execution_error.contains("no longer accepts input"),
+            "unexpected admission rejection: {execution_error}"
+        );
     }
 
     #[tokio::test]
@@ -9763,7 +9914,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "message_appended".to_string(),
                 event_json: serde_json::json!({
@@ -9859,20 +10010,21 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
-                session_id: session_id.to_string(),
-                event_type: "ToolStart".to_string(),
-                event_json: serde_json::json!({"tool": "bash"}).to_string(),
-                sequence: 0,
-                created_at_ms: 10,
-            })
+            .append_session_domain_event(&session::SessionDomainEvent::new(
+                session_id,
+                0,
+                session::SessionDomainScope::Tool,
+                "tool.started",
+                serde_json::json!({"tool": "bash"}),
+                10,
+            ))
             .await
             .unwrap();
         store
-            .append_session_domain_event(&memory::SessionDomainEvent::new(
+            .append_session_domain_event(&session::SessionDomainEvent::new(
                 session_id,
                 1,
-                memory::SessionDomainScope::Memory,
+                session::SessionDomainScope::Memory,
                 "memory.pulse.created",
                 serde_json::json!({"candidates": 2}),
                 11,
@@ -9886,7 +10038,7 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=1"
+                        "/api/runtime/timeline?session_id={session_id}&limit=1"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -9900,11 +10052,97 @@ pub(crate) mod tests {
         assert_eq!(json["session_id"], session_id);
         assert_eq!(json["total"], 2);
         assert_eq!(json["events"].as_array().unwrap().len(), 1);
-        assert_eq!(json["events"][0]["kind"], "ToolStart");
+        assert_eq!(json["events"][0]["kind"], "tool.started");
         assert_eq!(json["events"][0]["scope"], "tool");
-        assert_eq!(json["next_seq"], 1);
+        assert_eq!(json["next_cursor"], "v2:1:-:-");
         assert_eq!(json["has_more"], true);
         assert_eq!(json["degraded"], false);
+    }
+
+    #[tokio::test]
+    async fn runtime_timeline_composite_cursor_does_not_skip_interleaved_sources() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "runtime-composite-cursor-session";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        let future_ms = chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_add(60_000)
+            .max(0) as u64;
+        for (sequence, created_at_ms) in [(0, 1), (1, future_ms)] {
+            store
+                .append_session_domain_event(&session::SessionDomainEvent::new(
+                    session_id,
+                    sequence,
+                    session::SessionDomainScope::ApplicationTask,
+                    format!("task.phase.{sequence}"),
+                    serde_json::json!({"phase": sequence}),
+                    created_at_ms,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let state = test_state_with_store(store);
+        state
+            .services
+            .runtime_events
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: session_id.to_string(),
+                scope: runtime::RuntimeEventScope::SessionInput,
+                kind: "runtime.session.observed".to_string(),
+                status: Some("completed".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"session_id": session_id}),
+            })
+            .unwrap();
+        let app = api_router(state);
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&limit=2"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first: serde_json::Value =
+            serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(first["events"].as_array().unwrap().len(), 2);
+        assert_eq!(first["events"][0]["kind"], "task.phase.0");
+        assert_eq!(first["events"][1]["kind"], "runtime.session.observed");
+        let cursor = first["next_cursor"].as_str().unwrap();
+
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/runtime/timeline?session_id={session_id}&limit=2&cursor={cursor}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second: serde_json::Value =
+            serde_json::from_slice(&to_bytes(second.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let events = second["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "task.phase.1");
     }
 
     #[tokio::test]
@@ -9967,7 +10205,7 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                        "/api/runtime/timeline?session_id={session_id}&limit=10"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -10092,7 +10330,7 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                        "/api/runtime/timeline?session_id={session_id}&limit=10"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -10132,10 +10370,10 @@ pub(crate) mod tests {
             .unwrap();
         let state = test_state_with_store(store.clone());
         store
-            .append_session_domain_event(&memory::SessionDomainEvent::new(
+            .append_session_domain_event(&session::SessionDomainEvent::new(
                 session_id,
                 0,
-                memory::SessionDomainScope::ApplicationTask,
+                session::SessionDomainScope::ApplicationTask,
                 "task.started",
                 serde_json::json!({"task_id": "task-health"}),
                 10,
@@ -10143,10 +10381,10 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .append_session_domain_event(&memory::SessionDomainEvent::new(
+            .append_session_domain_event(&session::SessionDomainEvent::new(
                 session_id,
                 1,
-                memory::SessionDomainScope::Policy,
+                session::SessionDomainScope::Policy,
                 "runtime.policy.decided",
                 serde_json::json!({
                     "agent_mode": "Parallel",
@@ -10182,10 +10420,10 @@ pub(crate) mod tests {
             })
             .unwrap();
         store
-            .append_session_domain_event(&memory::SessionDomainEvent::new(
+            .append_session_domain_event(&session::SessionDomainEvent::new(
                 session_id,
                 3,
-                memory::SessionDomainScope::ApplicationTask,
+                session::SessionDomainScope::ApplicationTask,
                 "task.completed",
                 serde_json::json!({"task_id": "task-health"}),
                 13,
@@ -10198,7 +10436,7 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                        "/api/runtime/timeline?session_id={session_id}&limit=10"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -10358,10 +10596,12 @@ runtime:
     async fn runtime_control_plane_reports_degraded_kernel_without_store() {
         let root = test_temp_dir("runtime-control-plane-degraded");
         let workspace = root.join("workspace");
-        let config_home = root.join("home");
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&config_home).unwrap();
-        let app = api_router(test_state_with_workspace(workspace, config_home));
+        let app = api_router(test_state_with_config_runtime_and_workspace(
+            serde_json::json!({}),
+            None,
+            workspace,
+        ));
         let response = app
             .oneshot(
                 Request::builder()
@@ -11661,7 +11901,7 @@ providers:
             ),
         ] {
             store
-                .append_event(&memory::SessionEvent {
+                .append_event(&session::SessionEvent {
                     session_id: session_id.to_string(),
                     event_type: event_type.to_string(),
                     event_json: payload.to_string(),
@@ -11716,7 +11956,7 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "ContextEnvelope".to_string(),
                 event_json: test_context_envelope(session_id, "env-summary", "summary").to_string(),
@@ -11767,7 +12007,7 @@ providers:
             (5, "env-page-5", "third"),
         ] {
             store
-                .append_event(&memory::SessionEvent {
+                .append_event(&session::SessionEvent {
                     session_id: session_id.to_string(),
                     event_type: "ContextEnvelope".to_string(),
                     event_json: test_context_envelope(session_id, envelope_id, intent).to_string(),
@@ -11840,7 +12080,7 @@ providers:
             ),
         ] {
             store
-                .append_event(&memory::SessionEvent {
+                .append_event(&session::SessionEvent {
                     session_id: session_id.to_string(),
                     event_type: event_type.to_string(),
                     event_json: payload.to_string(),
@@ -11934,7 +12174,7 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "ContextEnvelope".to_string(),
                 event_json: test_context_envelope(session_id, "env-log-1", "logged").to_string(),
@@ -12024,7 +12264,7 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "ContextEnvelope".to_string(),
                 event_json: test_context_envelope(session_id, "env-target", "inspect").to_string(),
@@ -12095,8 +12335,10 @@ providers:
         assert_eq!(response.status(), StatusCode::OK);
         let events = store.get_events(session_id, 0).await.unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_type, "ContextRecommendationAction");
-        let payload: serde_json::Value = serde_json::from_str(&events[0].event_json).unwrap();
+        assert_eq!(events[0].event_type, session::SESSION_DOMAIN_EVENT_TYPE);
+        let event = session::SessionDomainEvent::from_session_event(&events[0]).unwrap();
+        assert_eq!(event.kind, "context.recommendation_action");
+        let payload = event.payload;
         assert_eq!(payload["envelope_id"], "env-1");
         assert_eq!(payload["recommendation"], "Start a handoff");
         assert_eq!(payload["note"], "handled");
@@ -12114,23 +12356,21 @@ providers:
             .await
             .unwrap();
         for (sequence, action) in [(0, "acknowledged"), (1, "applied")] {
-            store
-                .append_event(&memory::SessionEvent {
-                    session_id: session_id.to_string(),
-                    event_type: "ContextRecommendationAction".to_string(),
-                    event_json: serde_json::json!({
-                        "type": "ContextRecommendationAction",
-                        "session_id": session_id,
-                        "envelope_id": format!("env-{sequence}"),
-                        "recommendation": "Start a handoff",
-                        "action": action,
-                    })
-                    .to_string(),
-                    sequence: sequence as usize,
-                    created_at_ms: sequence as u64,
-                })
-                .await
-                .unwrap();
+            let event = session::SessionDomainEvent::new(
+                session_id,
+                sequence,
+                session::SessionDomainScope::Context,
+                "context.recommendation_action",
+                serde_json::json!({
+                    "type": "ContextRecommendationAction",
+                    "session_id": session_id,
+                    "envelope_id": format!("env-{sequence}"),
+                    "recommendation": "Start a handoff",
+                    "action": action,
+                }),
+                sequence as u64,
+            );
+            store.append_session_domain_event(&event).await.unwrap();
         }
 
         let state = test_state_with_store(store);
@@ -15131,7 +15371,7 @@ providers:
             ),
         ] {
             store
-                .append_event(&memory::SessionEvent {
+                .append_event(&session::SessionEvent {
                     session_id: session_id.to_string(),
                     event_type: event_type.to_string(),
                     event_json: payload.to_string(),
@@ -15190,7 +15430,7 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "ContextEnvelope".to_string(),
                 event_json: test_context_envelope(
@@ -15205,7 +15445,7 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "RuntimeRun".to_string(),
                 event_json: message_routes::runtime_run_completed_payload(
@@ -15291,7 +15531,7 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "message_appended".to_string(),
                 event_json: serde_json::json!({
@@ -15306,7 +15546,7 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "ContextEnvelope".to_string(),
                 event_json: test_context_envelope(
@@ -15321,7 +15561,7 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&memory::SessionEvent {
+            .append_event(&session::SessionEvent {
                 session_id: session_id.to_string(),
                 event_type: "RuntimeRun".to_string(),
                 event_json: message_routes::runtime_run_completed_payload(
@@ -15343,10 +15583,10 @@ providers:
             .await
             .unwrap();
         store
-            .append_session_domain_event(&memory::SessionDomainEvent::new(
+            .append_session_domain_event(&session::SessionDomainEvent::new(
                 session_id,
                 3,
-                memory::SessionDomainScope::Policy,
+                session::SessionDomainScope::Policy,
                 "runtime.policy.decided",
                 serde_json::json!({
                     "agent_mode": "Solo",
@@ -15365,7 +15605,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/runtime/timeline?session_id={session_id}&from_seq=0&limit=10"
+                        "/api/runtime/timeline?session_id={session_id}&limit=10"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -15433,7 +15673,7 @@ providers:
         for sequence in 0..120u64 {
             let run_id = format!("run-{sequence}");
             store
-                .append_event(&memory::SessionEvent {
+                .append_event(&session::SessionEvent {
                     session_id: session_id.to_string(),
                     event_type: "RuntimeRun".to_string(),
                     event_json: message_routes::runtime_run_completed_payload(
@@ -15507,10 +15747,10 @@ providers:
             .await
             .expect("persist test artifact");
         store
-            .append_session_domain_event_allocating_sequence(&memory::SessionDomainEvent::new(
+            .append_session_domain_event_allocating_sequence(&session::SessionDomainEvent::new(
                 session_id,
                 0,
-                memory::SessionDomainScope::Tool,
+                session::SessionDomainScope::Tool,
                 "evidence.raw.persisted",
                 serde_json::json!({
                     "type": "RawEvidence",
@@ -15544,10 +15784,10 @@ providers:
             )),
         };
         store
-            .append_session_domain_event_allocating_sequence(&memory::SessionDomainEvent::new(
+            .append_session_domain_event_allocating_sequence(&session::SessionDomainEvent::new(
                 session_id,
                 0,
-                memory::SessionDomainScope::Context,
+                session::SessionDomainScope::Context,
                 "context.turn_report",
                 serde_json::json!({
                     "type": "ContextTurnReport",
@@ -15787,7 +16027,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/runtime/timeline?session_id={task_id}&from_seq=0&limit=10"
+                        "/api/runtime/timeline?session_id={task_id}&limit=10"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -16004,8 +16244,8 @@ providers:
             .create_entry(
                 MemoryLayer::L3,
                 MemoryCategory::ProjectKnowledge,
-                "SessionKernel migration",
-                "SessionKernel owns durable sessions and task phase review evidence.",
+                "SessionRepository migration",
+                "SessionRepository owns durable sessions and task phase review evidence.",
                 Priority::High,
                 vec!["session".into(), "task".into()],
                 MemoryScope::Project("api-test".to_string()),
@@ -16017,7 +16257,7 @@ providers:
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/memory/recall/explain?q=SessionKernel&limit=5")
+                    .uri("/api/memory/recall/explain?q=SessionRepository&limit=5")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -16027,7 +16267,7 @@ providers:
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["enabled"], true);
-        assert_eq!(json["query"], "SessionKernel");
+        assert_eq!(json["query"], "SessionRepository");
         assert_eq!(json["degraded"], false);
         assert_eq!(json["results"][0]["source_layer"], "L3");
         assert_eq!(json["results"][0]["category"], "ProjectKnowledge");
@@ -16036,7 +16276,7 @@ providers:
         assert!(json["results"][0]["snippet"]
             .as_str()
             .unwrap_or_default()
-            .contains("SessionKernel"));
+            .contains("SessionRepository"));
 
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -16178,7 +16418,7 @@ providers:
                 MemoryLayer::L3,
                 MemoryCategory::Shared,
                 "Durable Decision Candidate",
-                "Use SessionKernel as the source of truth for v0.8.10.",
+                "Use SessionRepository as the source of truth for v0.8.10.",
                 Priority::High,
                 vec!["team_relevant".into()],
                 MemoryScope::Global,
@@ -16505,15 +16745,14 @@ providers:
 
     #[tokio::test]
     async fn auth_required_when_token_set() {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -16521,8 +16760,9 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services(session_repository, task_kernel, None),
             session_lease_registry: None,
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
         let app = api_router(state);
 
@@ -16540,15 +16780,14 @@ providers:
 
     #[tokio::test]
     async fn system_routes_stay_protected_when_auth_token_set() {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -16556,8 +16795,9 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services(session_repository, task_kernel, None),
             session_lease_registry: None,
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
         let app = api_router(state);
 
@@ -16575,15 +16815,14 @@ providers:
 
     #[tokio::test]
     async fn same_origin_headers_do_not_bypass_bearer_authentication() {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -16591,8 +16830,9 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services(session_repository, task_kernel, None),
             session_lease_registry: None,
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
         let app = api_router(state);
 
@@ -16612,15 +16852,14 @@ providers:
 
     #[tokio::test]
     async fn cross_site_requests_still_require_bearer_auth() {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -16628,8 +16867,9 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services(session_repository, task_kernel, None),
             session_lease_registry: None,
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
         let app = api_router(state);
 
@@ -16649,15 +16889,14 @@ providers:
 
     #[tokio::test]
     async fn profile_and_workspace_routes_stay_protected_when_auth_token_set() {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -16665,8 +16904,9 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services(session_repository, task_kernel, None),
             session_lease_registry: None,
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
         let app = api_router(state);
 
@@ -16693,15 +16933,14 @@ providers:
 
     #[tokio::test]
     async fn auth_passes_with_valid_token() {
-        let sessions = Arc::new(ActiveSessions::new());
+        let sessions = Arc::new(HotSessionPool::new());
         let tools = Arc::new(ToolCatalog::builtin());
-        let event_bus = SessionEventBus::new();
-        let session_kernel = test_session_kernel(sessions.clone(), None, event_bus.clone());
+        let event_bus = SessionProjectionHub::new();
+        let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
         let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
-            event_bus,
             static_webui: crate::gateway_static::StaticWebUiSource::missing_config(),
             approval_gate: None,
             auth_token: Some("test-token".into()),
@@ -16709,8 +16948,9 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_kernel, task_kernel, None),
+            services: test_services(session_repository, task_kernel, None),
             session_lease_registry: None,
+            live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
         let app = api_router(state);
 

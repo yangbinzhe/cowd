@@ -61,7 +61,7 @@ impl Display for SessionStatus {
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
-/// Top-level configuration for the [`SessionLifecycleManager`].
+/// Top-level configuration for the [`SessionWorkingSetManager`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionLifecycleConfig {
     /// If set, a session that has not been marked active for this duration
@@ -124,12 +124,12 @@ impl SessionEntry {
 ///
 /// All mutable state is protected by an internal [`tokio::sync::RwLock`].
 #[derive(Debug, Clone)]
-pub struct SessionLifecycleManager {
+pub struct SessionWorkingSetManager {
     sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
     config: SessionLifecycleConfig,
 }
 
-impl SessionLifecycleManager {
+impl SessionWorkingSetManager {
     /// Create a new manager with the given configuration.
     #[must_use]
     pub fn new(config: SessionLifecycleConfig) -> Self {
@@ -343,7 +343,7 @@ impl SessionLifecycleManager {
     }
 }
 
-impl Default for SessionLifecycleManager {
+impl Default for SessionWorkingSetManager {
     fn default() -> Self {
         Self::new(SessionLifecycleConfig::default())
     }
@@ -377,7 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_and_check_session() {
-        let mgr = SessionLifecycleManager::new(config_for_tests());
+        let mgr = SessionWorkingSetManager::new(config_for_tests());
         assert!(mgr.register("s1").await);
         assert!(!mgr.register("s1").await); // duplicate
         assert_eq!(mgr.check_session("s1").await, Some(SessionStatus::Active));
@@ -388,7 +388,7 @@ mod tests {
     async fn mark_active_resets_idle() {
         let mut cfg = config_for_tests();
         cfg.idle_timeout = Some(Duration::from_millis(10));
-        let mgr = SessionLifecycleManager::new(cfg);
+        let mgr = SessionWorkingSetManager::new(cfg);
         mgr.register("s1").await;
 
         // Let idle timeout expire.
@@ -406,7 +406,7 @@ mod tests {
         let mut cfg = config_for_tests();
         cfg.idle_timeout = None;
         cfg.max_ttl = Some(Duration::from_millis(10));
-        let mgr = SessionLifecycleManager::new(cfg);
+        let mgr = SessionWorkingSetManager::new(cfg);
         mgr.register("s1").await;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -420,7 +420,7 @@ mod tests {
         cfg.max_active_sessions = 2;
         cfg.idle_timeout = None;
         cfg.max_ttl = None;
-        let mgr = SessionLifecycleManager::new(cfg);
+        let mgr = SessionWorkingSetManager::new(cfg);
 
         mgr.register("s1").await;
         mgr.register("s2").await;
@@ -437,7 +437,7 @@ mod tests {
         cfg.max_active_sessions = 2;
         cfg.max_ttl = Some(Duration::from_millis(10));
         cfg.idle_timeout = None;
-        let mgr = SessionLifecycleManager::new(cfg);
+        let mgr = SessionWorkingSetManager::new(cfg);
 
         mgr.register("s1").await;
         mgr.register("s2").await;
@@ -451,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_removes_session() {
-        let mgr = SessionLifecycleManager::new(config_for_tests());
+        let mgr = SessionWorkingSetManager::new(config_for_tests());
         mgr.register("s1").await;
         assert!(mgr.close("s1").await);
         assert!(!mgr.close("s1").await); // already removed
@@ -460,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn unregister_removes_session() {
-        let mgr = SessionLifecycleManager::new(config_for_tests());
+        let mgr = SessionWorkingSetManager::new(config_for_tests());
         mgr.register("s1").await;
         assert!(mgr.unregister("s1").await);
         assert!(!mgr.unregister("s1").await);
@@ -468,7 +468,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_message_count_and_status_snapshot() {
-        let mgr = SessionLifecycleManager::new(config_for_tests());
+        let mgr = SessionWorkingSetManager::new(config_for_tests());
         mgr.register("s1").await;
         mgr.register("s2").await;
         mgr.update_message_count("s1", 42).await;
@@ -483,7 +483,7 @@ mod tests {
     async fn idle_does_not_transition_already_closed() {
         let mut cfg = config_for_tests();
         cfg.idle_timeout = Some(Duration::from_millis(10));
-        let mgr = SessionLifecycleManager::new(cfg);
+        let mgr = SessionWorkingSetManager::new(cfg);
         mgr.register("s1").await;
         mgr.close("s1").await;
 

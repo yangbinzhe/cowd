@@ -24,8 +24,9 @@ pub mod message_ledger;
 pub use message_ledger::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
     SurfaceIngressFrameRecord, SurfaceMessageLedger, SurfaceMessageLedgerMigrationSnapshot,
-    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
-    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
+    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceSessionProjectionDraft,
+    SurfaceSessionProjectionRecord, SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord,
+    SurfaceTurnCorrelation,
 };
 
 include!("edge_v2_generated.rs");

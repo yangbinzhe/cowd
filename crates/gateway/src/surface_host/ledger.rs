@@ -9,8 +9,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use super::{managed_actions, SurfaceHost};
 use super::{
     SurfaceDeliveryEvent, SurfaceInboxReceipt, SurfaceInboxRecord, SurfaceIngressClaim,
-    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceTriggerEventReceipt,
-    SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
+    SurfaceMessageSnapshot, SurfaceOutboxRecord, SurfaceSessionProjectionDraft,
+    SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 use harness_contract::managed_agent::ManagedAgentTriggerEvent;
 
@@ -42,6 +42,7 @@ impl SurfaceHost {
         runtime_session_id: &str,
         thread_id: Option<String>,
         sender_id: Option<String>,
+        projections: &[SurfaceSessionProjectionDraft],
     ) -> Result<SurfaceInboxReceipt, String> {
         self.messages.record_inbox_received(
             surface,
@@ -50,11 +51,17 @@ impl SurfaceHost {
             runtime_session_id,
             thread_id,
             sender_id,
+            projections,
         )
     }
 
-    pub(crate) fn mark_inbox_processing(&self, idempotency_key: &str) -> Result<(), String> {
-        self.messages.mark_inbox_processing(idempotency_key)
+    pub(crate) fn mark_inbox_processing(
+        &self,
+        idempotency_key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.messages
+            .mark_inbox_processing(idempotency_key, projections)
     }
 
     pub(crate) fn mark_inbox_processed(
@@ -70,9 +77,10 @@ impl SurfaceHost {
         &self,
         idempotency_key: &str,
         correlation: SurfaceTurnCorrelation,
+        projections: &[SurfaceSessionProjectionDraft],
     ) -> Result<(), String> {
         self.messages
-            .mark_inbox_admitted(idempotency_key, correlation)
+            .mark_inbox_admitted(idempotency_key, correlation, projections)
     }
 
     pub(crate) fn record_inbox_terminal_delivery(
@@ -84,8 +92,42 @@ impl SurfaceHost {
             .record_inbox_terminal_delivery(idempotency_key, terminal_id)
     }
 
-    pub(crate) fn mark_inbox_replied(&self, idempotency_key: &str) -> Result<(), String> {
-        self.messages.mark_inbox_replied(idempotency_key)
+    pub(crate) fn mark_inbox_replied(
+        &self,
+        idempotency_key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.messages
+            .mark_inbox_replied(idempotency_key, projections)
+    }
+
+    pub(crate) fn mark_inbox_projection_applied(
+        &self,
+        idempotency_key: &str,
+        event_id: &str,
+        projected_at_ms: i64,
+    ) -> Result<(), String> {
+        self.messages
+            .mark_inbox_projection_applied(idempotency_key, event_id, projected_at_ms)
+    }
+
+    pub(crate) fn stage_inbox_projections(
+        &self,
+        idempotency_key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.messages
+            .stage_inbox_projections(idempotency_key, projections)
+    }
+
+    pub(crate) fn mark_inbox_projection_failed(
+        &self,
+        idempotency_key: &str,
+        event_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        self.messages
+            .mark_inbox_projection_failed(idempotency_key, event_id, error)
     }
 
     pub(crate) fn mark_inbox_reply_failed(

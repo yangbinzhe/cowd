@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
     },
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
@@ -29,7 +29,10 @@ use harness_contract::live::{
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
+use tokio::{
+    sync::{mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock},
+    task::JoinSet,
+};
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
@@ -113,13 +116,13 @@ impl SubscriptionEntry {
     }
 }
 
-struct LiveRegistry {
+pub(crate) struct LiveRegistry {
     subscriptions: RwLock<HashMap<String, Arc<SubscriptionEntry>>>,
     checkpoint_secret: [u8; 32],
 }
 
 impl LiveRegistry {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let mut hasher = Sha256::new();
         hasher.update(uuid::Uuid::new_v4().as_bytes());
         hasher.update(uuid::Uuid::new_v4().as_bytes());
@@ -129,11 +132,6 @@ impl LiveRegistry {
             checkpoint_secret: hasher.finalize().into(),
         }
     }
-}
-
-fn live_registry() -> &'static LiveRegistry {
-    static REGISTRY: OnceLock<LiveRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(LiveRegistry::new)
 }
 
 async fn create_live_subscription(
@@ -156,7 +154,7 @@ async fn create_live_subscription(
         request.ttl_seconds.unwrap_or(limits.default_ttl_seconds),
     );
 
-    let registry = live_registry();
+    let registry = &state.live_registry;
     let mut subscriptions = registry.subscriptions.write().await;
     subscriptions.retain(|_, entry| {
         let snapshot = entry.snapshot();
@@ -230,6 +228,7 @@ async fn patch_live_subscription(
 ) -> Result<Json<LiveSubscription>, (StatusCode, Json<ErrorResponse>)> {
     let idempotency_key = validate_required_idempotency_key(&request.idempotency_key)?;
     let entry = find_owned_subscription(
+        &state.live_registry,
         &principal,
         &id,
         require_surface_instance(&headers, None)?.as_str(),
@@ -319,11 +318,13 @@ async fn patch_live_subscription_entry(
 }
 
 async fn delete_live_subscription(
+    AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
     let entry = find_owned_subscription(
+        &state.live_registry,
         &principal,
         &id,
         require_surface_instance(&headers, None)?.as_str(),
@@ -342,7 +343,16 @@ async fn delete_live_subscription(
         expires_at_ms: now_ms(),
         deleted: true,
     }));
-    live_registry().subscriptions.write().await.remove(&id);
+    state.live_registry.subscriptions.write().await.remove(&id);
+    if let Some(runtime) = state.services.runtime.as_ref() {
+        runtime
+            .gateway_tasks()
+            .close_owner_and_drain(
+                crate::runtime_host::task_set::GatewayTaskOwner::LiveSubscription(id),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -355,7 +365,8 @@ async fn get_live_stream(
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
     let surface_instance =
         require_surface_instance(&headers, query.get("surface_instance").map(String::as_str))?;
-    let entry = find_owned_subscription(&principal, &id, &surface_instance).await?;
+    let entry =
+        find_owned_subscription(&state.live_registry, &principal, &id, &surface_instance).await?;
     let snapshot = entry.snapshot();
     if snapshot.deleted || snapshot.expires_at_ms <= now_ms() {
         return Err(api_error(StatusCode::GONE, "live subscription expired"));
@@ -376,7 +387,12 @@ async fn get_live_stream(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
     {
-        Some(token) => match verify_checkpoint(token, &entry, &snapshot) {
+        Some(token) => match verify_checkpoint(
+            token,
+            &entry,
+            &snapshot,
+            &state.live_registry.checkpoint_secret,
+        ) {
             Ok(checkpoint) => checkpoint.source_cursors,
             Err(error) => {
                 entry.active_connection.store(false, Ordering::Release);
@@ -394,20 +410,24 @@ async fn get_live_stream(
     let (tx, rx) = mpsc::channel(entry.limits.queue_capacity);
     let terminal = Arc::new(Mutex::new(None));
     let delivered_cursors = Arc::new(Mutex::new(initial_cursors.clone()));
-    spawn_subscription_coordinator(
-        state,
+    let checkpoint_secret = state.live_registry.checkpoint_secret;
+    if let Err(error) = spawn_subscription_coordinator(
+        Arc::clone(&state),
         principal,
         Arc::clone(&entry),
         tx,
         Arc::clone(&terminal),
         initial_cursors,
-    );
+    ) {
+        entry.active_connection.store(false, Ordering::Release);
+        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, error));
+    }
     let stream = PhysicalLiveStream {
         rx: ReceiverStream::new(rx),
         entry,
         terminal,
         delivered_cursors,
-        checkpoint_secret: live_registry().checkpoint_secret,
+        checkpoint_secret,
         ended: false,
     };
     Ok(Sse::new(stream)
@@ -420,11 +440,12 @@ async fn get_live_stream(
 }
 
 async fn find_owned_subscription(
+    registry: &LiveRegistry,
     principal: &AuthenticatedPrincipal,
     id: &str,
     surface_instance: &str,
 ) -> Result<Arc<SubscriptionEntry>, (StatusCode, Json<ErrorResponse>)> {
-    let entry = live_registry()
+    let entry = registry
         .subscriptions
         .read()
         .await
@@ -453,200 +474,250 @@ fn spawn_subscription_coordinator(
     tx: mpsc::Sender<QueuedEnvelope>,
     terminal: Arc<Mutex<Option<TerminalSignal>>>,
     initial_cursors: BTreeMap<String, u64>,
+) -> Result<(), String> {
+    let tasks = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.gateway_tasks())
+        .ok_or_else(|| "Runtime task owner is unavailable".to_string())?;
+    let subscription_id = entry.id.clone();
+    tasks
+        .spawn_owned(
+            crate::runtime_host::task_set::GatewayTaskKind::LiveSubscription,
+            crate::runtime_host::task_set::GatewayTaskOwner::LiveSubscription(
+                subscription_id.clone(),
+            ),
+            move |cancellation| async move {
+                run_subscription_coordinator(
+                    state,
+                    principal,
+                    entry,
+                    tx,
+                    terminal,
+                    initial_cursors,
+                    cancellation,
+                )
+                .await;
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            format!("live subscription `{subscription_id}` task admission failed: {error}")
+        })
+}
+
+async fn run_subscription_coordinator(
+    state: Arc<AppState>,
+    principal: AuthenticatedPrincipal,
+    entry: Arc<SubscriptionEntry>,
+    tx: mpsc::Sender<QueuedEnvelope>,
+    terminal: Arc<Mutex<Option<TerminalSignal>>>,
+    initial_cursors: BTreeMap<String, u64>,
+    cancellation: runtime::CancellationToken,
 ) {
-    tokio::spawn(async move {
-        let mut revision_rx = entry.revisions.subscribe();
-        let mut previous_sources = BTreeSet::new();
-        let mut first_revision = true;
-        loop {
-            let revision = revision_rx.borrow().clone();
-            if revision.deleted || revision.expires_at_ms <= now_ms() {
-                signal_terminal(
-                    &tx,
-                    &terminal,
-                    "subscription.closed",
-                    "live subscription was deleted or expired",
-                );
-                return;
-            }
-            let current_sources = revision
-                .selector
-                .sources
-                .iter()
-                .map(LiveSourceSelector::key)
-                .collect::<BTreeSet<_>>();
-            if !first_revision {
-                for removed in previous_sources.difference(&current_sources) {
-                    let (source_kind, source_id) = split_source_key(removed);
-                    let revoked = envelope(
-                        &entry,
-                        revision.revision,
-                        source_kind,
-                        source_id,
-                        harness_contract::projection::ProjectionDetailScope::Summary,
-                        None,
-                        DeliveryClass::SnapshotReconstructable,
-                        SourceHealth::Revoked,
-                        "source.revoked",
-                        serde_json::json!({"reason": "selector_removed"}),
-                    );
-                    queue_envelope(&tx, &terminal, &entry, revoked, None);
-                }
-            }
-            let mut tasks = Vec::new();
-            let mut baseline_receivers = Vec::new();
-            let (release_tx, release_rx) = watch::channel(false);
-            for source in revision.selector.sources.clone() {
-                let (baseline_tx, baseline_rx) = oneshot::channel();
-                baseline_receivers.push(baseline_rx);
-                let source_cursor = if first_revision {
-                    initial_cursors
-                        .get(&source.key())
-                        .copied()
-                        .unwrap_or(source.cursor)
-                } else {
-                    source.cursor
-                };
-                let source_state = Arc::clone(&state);
-                let source_principal = principal.clone();
-                let source_entry = Arc::clone(&entry);
-                let source_tx = tx.clone();
-                let source_terminal = Arc::clone(&terminal);
-                let source_revision = revision.revision;
-                let source_release = release_rx.clone();
-                tasks.push(tokio::spawn(async move {
-                    match source.kind {
-                        LiveSourceKind::Session => {
-                            run_session_source(
-                                source_state,
-                                source_principal,
-                                source_entry,
-                                source_tx,
-                                source_terminal,
-                                source,
-                                source_revision,
-                                source_cursor,
-                                baseline_tx,
-                                source_release,
-                            )
-                            .await;
-                        }
-                        LiveSourceKind::Execution => {
-                            run_execution_source(
-                                source_state,
-                                source_principal,
-                                source_entry,
-                                source_tx,
-                                source_terminal,
-                                source,
-                                source_revision,
-                                source_cursor,
-                                baseline_tx,
-                                source_release,
-                            )
-                            .await;
-                        }
-                        LiveSourceKind::Mission => {
-                            run_mission_source(
-                                source_state,
-                                source_principal,
-                                source_entry,
-                                source_tx,
-                                source_terminal,
-                                source,
-                                source_revision,
-                                source_cursor,
-                                baseline_tx,
-                                source_release,
-                            )
-                            .await;
-                        }
-                    }
-                }));
-            }
-
-            let baselines_ready = tokio::time::timeout(
-                std::time::Duration::from_millis(entry.limits.baseline_timeout_ms),
-                futures::future::join_all(baseline_receivers),
-            )
-            .await;
-            if !matches!(
-                baselines_ready,
-                Ok(ref results) if results.iter().all(|result| result.is_ok())
-            ) {
-                signal_terminal(
-                    &tx,
-                    &terminal,
-                    "subscription.baseline_timeout",
-                    "live subscription source baselines did not materialize in time",
-                );
-                for task in tasks {
-                    task.abort();
-                }
-                return;
-            }
-            let barrier_event = if first_revision {
-                "subscription.ready"
-            } else {
-                "subscription.revision.changed"
-            };
-            let barrier = envelope(
-                &entry,
-                revision.revision,
-                "subscription",
-                &entry.id,
-                harness_contract::projection::ProjectionDetailScope::Summary,
-                None,
-                DeliveryClass::SnapshotReconstructable,
-                SourceHealth::Baseline,
-                barrier_event,
-                serde_json::json!({
-                    "revision": revision.revision,
-                    "selector_hash": revision.selector_hash,
-                    "source_count": revision.selector.sources.len(),
-                }),
+    let mut revision_rx = entry.revisions.subscribe();
+    let mut previous_sources = BTreeSet::new();
+    let mut first_revision = true;
+    loop {
+        let revision = revision_rx.borrow().clone();
+        if revision.deleted || revision.expires_at_ms <= now_ms() {
+            signal_terminal(
+                &tx,
+                &terminal,
+                "subscription.closed",
+                "live subscription was deleted or expired",
             );
-            queue_envelope(&tx, &terminal, &entry, barrier, None);
-            release_tx.send_replace(true);
-
-            previous_sources = current_sources;
-            first_revision = false;
-            let mut auth_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            auth_interval.tick().await;
-            let transition = loop {
-                tokio::select! {
-                    changed = revision_rx.changed() => break changed.is_ok(),
-                    _ = tx.closed() => break false,
-                    _ = auth_interval.tick() => {
-                        if revision.expires_at_ms <= now_ms() {
-                            signal_terminal(&tx, &terminal, "subscription.expired", "live subscription TTL expired");
-                            break false;
-                        }
-                        let config_home = state.config_home.clone();
-                        let principal = principal.clone();
-                        let current = tokio::task::spawn_blocking(move || {
-                            super::projection_stream_principal_current(&config_home, &principal)
-                        }).await;
-                        if !matches!(current, Ok(Ok(()))) {
-                            signal_terminal(
-                                &tx,
-                                &terminal,
-                                "subscription.authorization_revoked",
-                                "authenticated principal is no longer current",
-                            );
-                            break false;
-                        }
-                    }
-                }
-            };
-            for task in tasks {
-                task.abort();
-            }
-            if !transition {
-                return;
+            return;
+        }
+        let current_sources = revision
+            .selector
+            .sources
+            .iter()
+            .map(LiveSourceSelector::key)
+            .collect::<BTreeSet<_>>();
+        if !first_revision {
+            for removed in previous_sources.difference(&current_sources) {
+                let (source_kind, source_id) = split_source_key(removed);
+                let revoked = envelope(
+                    &entry,
+                    revision.revision,
+                    source_kind,
+                    source_id,
+                    harness_contract::projection::ProjectionDetailScope::Summary,
+                    None,
+                    DeliveryClass::SnapshotReconstructable,
+                    SourceHealth::Revoked,
+                    "source.revoked",
+                    serde_json::json!({"reason": "selector_removed"}),
+                );
+                queue_envelope(&tx, &terminal, &entry, revoked, None);
             }
         }
-    });
+        let mut source_tasks = JoinSet::new();
+        let mut baseline_receivers = Vec::new();
+        let (release_tx, release_rx) = watch::channel(false);
+        for source in revision.selector.sources.clone() {
+            let (baseline_tx, baseline_rx) = oneshot::channel();
+            baseline_receivers.push(baseline_rx);
+            let source_cursor = if first_revision {
+                initial_cursors
+                    .get(&source.key())
+                    .copied()
+                    .unwrap_or(source.cursor)
+            } else {
+                source.cursor
+            };
+            let source_state = Arc::clone(&state);
+            let source_principal = principal.clone();
+            let source_entry = Arc::clone(&entry);
+            let source_tx = tx.clone();
+            let source_terminal = Arc::clone(&terminal);
+            let source_revision = revision.revision;
+            let source_release = release_rx.clone();
+            source_tasks.spawn(async move {
+                match source.kind {
+                    LiveSourceKind::Session => {
+                        run_session_source(
+                            source_state,
+                            source_principal,
+                            source_entry,
+                            source_tx,
+                            source_terminal,
+                            source,
+                            source_revision,
+                            source_cursor,
+                            baseline_tx,
+                            source_release,
+                        )
+                        .await;
+                    }
+                    LiveSourceKind::Execution => {
+                        run_execution_source(
+                            source_state,
+                            source_principal,
+                            source_entry,
+                            source_tx,
+                            source_terminal,
+                            source,
+                            source_revision,
+                            source_cursor,
+                            baseline_tx,
+                            source_release,
+                        )
+                        .await;
+                    }
+                    LiveSourceKind::Mission => {
+                        run_mission_source(
+                            source_state,
+                            source_principal,
+                            source_entry,
+                            source_tx,
+                            source_terminal,
+                            source,
+                            source_revision,
+                            source_cursor,
+                            baseline_tx,
+                            source_release,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+
+        let baselines_ready = tokio::select! {
+            _ = cancellation.cancelled() => {
+                abort_and_join_live_sources(&mut source_tasks).await;
+                return;
+            }
+            ready = tokio::time::timeout(
+                std::time::Duration::from_millis(entry.limits.baseline_timeout_ms),
+                futures::future::join_all(baseline_receivers),
+            ) => ready,
+        };
+        if !matches!(
+            baselines_ready,
+            Ok(ref results) if results.iter().all(|result| result.is_ok())
+        ) {
+            signal_terminal(
+                &tx,
+                &terminal,
+                "subscription.baseline_timeout",
+                "live subscription source baselines did not materialize in time",
+            );
+            abort_and_join_live_sources(&mut source_tasks).await;
+            return;
+        }
+        let barrier_event = if first_revision {
+            "subscription.ready"
+        } else {
+            "subscription.revision.changed"
+        };
+        let barrier = envelope(
+            &entry,
+            revision.revision,
+            "subscription",
+            &entry.id,
+            harness_contract::projection::ProjectionDetailScope::Summary,
+            None,
+            DeliveryClass::SnapshotReconstructable,
+            SourceHealth::Baseline,
+            barrier_event,
+            serde_json::json!({
+                "revision": revision.revision,
+                "selector_hash": revision.selector_hash,
+                "source_count": revision.selector.sources.len(),
+            }),
+        );
+        queue_envelope(&tx, &terminal, &entry, barrier, None);
+        release_tx.send_replace(true);
+
+        previous_sources = current_sources;
+        first_revision = false;
+        let mut auth_interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        auth_interval.tick().await;
+        let transition = loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => break false,
+                changed = revision_rx.changed() => break changed.is_ok(),
+                _ = tx.closed() => break false,
+                _ = auth_interval.tick() => {
+                    if revision.expires_at_ms <= now_ms() {
+                        signal_terminal(&tx, &terminal, "subscription.expired", "live subscription TTL expired");
+                        break false;
+                    }
+                    let config_home = state.config_home.clone();
+                    let principal = principal.clone();
+                    let current = tokio::task::spawn_blocking(move || {
+                        super::projection_stream_principal_current(&config_home, &principal)
+                    }).await;
+                    if !matches!(current, Ok(Ok(()))) {
+                        signal_terminal(
+                            &tx,
+                            &terminal,
+                            "subscription.authorization_revoked",
+                            "authenticated principal is no longer current",
+                        );
+                        break false;
+                    }
+                }
+            }
+        };
+        abort_and_join_live_sources(&mut source_tasks).await;
+        if !transition {
+            return;
+        }
+    }
+}
+
+async fn abort_and_join_live_sources(tasks: &mut JoinSet<()>) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::debug!(%error, "live source task joined after cancellation");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,8 +750,8 @@ async fn run_session_source(
     }
 
     let event_bus = state.event_bus();
-    let (bus_tx, mut bus_rx) = mpsc::channel(256);
-    let subscription_id = event_bus.subscribe(&source.id, bus_tx).await;
+    let mut subscription = event_bus.subscribe(&source.id, 256).await;
+    let subscription_id = subscription.id();
 
     const PAGE_SIZE: usize = 500;
     const MAX_PAGES: usize = 100;
@@ -751,8 +822,9 @@ async fn run_session_source(
     loop {
         tokio::select! {
             _ = tx.closed() => break,
-            raw = bus_rx.recv() => {
-                let Some(raw) = raw else { break; };
+            payload = subscription.recv() => {
+                let Some(event) = payload else { break; };
+                let payload = event.to_transport_value();
                 if authorize_session_access(&state, &principal, &source.id, SessionAccess::Read).await.is_err() {
                     let attachment_actor =
                         super::surface_actor_id(&principal, &entry.surface_instance);
@@ -775,28 +847,13 @@ async fn run_session_source(
                     );
                     break;
                 }
-                let event_cursor = message_routes::stream_durable_cursor(&raw);
+                let event_cursor = message_routes::stream_durable_cursor_value(&payload);
                 if event_cursor.is_some_and(|value| value <= cursor) {
                     continue;
                 }
                 if let Some(value) = event_cursor {
                     cursor = value;
                 }
-                let payload = match serde_json::from_str::<serde_json::Value>(&raw) {
-                    Ok(payload) => payload,
-                    Err(_) => {
-                        queue_source_resync(
-                            &tx,
-                            &terminal,
-                            &entry,
-                            revision,
-                            &source,
-                            cursor,
-                            "session event was not valid JSON",
-                        );
-                        break;
-                    }
-                };
                 queue_session_payload(
                     &tx,
                     &terminal,
@@ -1820,6 +1877,7 @@ fn verify_checkpoint(
     token: &str,
     entry: &SubscriptionEntry,
     revision: &SubscriptionRevision,
+    checkpoint_secret: &[u8; 32],
 ) -> Result<CompositeCheckpoint, String> {
     if token.len() > entry.limits.checkpoint_max_bytes {
         return Err("composite checkpoint exceeds the transport header limit".to_string());
@@ -1842,7 +1900,7 @@ fn verify_checkpoint(
     let signature = URL_SAFE_NO_PAD
         .decode(signature)
         .map_err(|_| "composite checkpoint signature is malformed".to_string())?;
-    let key = derive_checkpoint_key(&live_registry().checkpoint_secret, checkpoint.key_revision)?;
+    let key = derive_checkpoint_key(checkpoint_secret, checkpoint.key_revision)?;
     let mut mac =
         HmacSha256::new_from_slice(&key).map_err(|_| "checkpoint key is invalid".to_string())?;
     mac.update(encoded.as_bytes());
@@ -2027,9 +2085,7 @@ mod tests {
             source_cursors: BTreeMap::from([("session:a".to_string(), 9)]),
         };
         mutate(&mut checkpoint);
-        let key =
-            derive_checkpoint_key(&live_registry().checkpoint_secret, checkpoint.key_revision)
-                .unwrap();
+        let key = derive_checkpoint_key(&TEST_CHECKPOINT_SECRET, checkpoint.key_revision).unwrap();
         sign_checkpoint(&checkpoint, &key, entry.limits.checkpoint_max_bytes).unwrap()
     }
 
@@ -2119,62 +2175,91 @@ mod tests {
             sources: vec![test_source("a")],
         });
         let valid = signed_test_checkpoint(&entry, |_| {});
-        assert!(verify_checkpoint(&valid, &entry, &entry.snapshot()).is_ok());
+        assert!(
+            verify_checkpoint(&valid, &entry, &entry.snapshot(), &TEST_CHECKPOINT_SECRET).is_ok()
+        );
         let retained_rotated_key = signed_test_checkpoint(&entry, |checkpoint| {
             checkpoint.key_revision = checkpoint.key_revision.saturating_sub(1);
         });
-        assert!(verify_checkpoint(&retained_rotated_key, &entry, &entry.snapshot()).is_ok());
+        assert!(verify_checkpoint(
+            &retained_rotated_key,
+            &entry,
+            &entry.snapshot(),
+            &TEST_CHECKPOINT_SECRET
+        )
+        .is_ok());
 
         let mismatched_principal =
             signed_test_checkpoint(&entry, |checkpoint| checkpoint.principal_hash.push('x'));
-        assert!(
-            verify_checkpoint(&mismatched_principal, &entry, &entry.snapshot())
-                .unwrap_err()
-                .contains("mismatched")
-        );
+        assert!(verify_checkpoint(
+            &mismatched_principal,
+            &entry,
+            &entry.snapshot(),
+            &TEST_CHECKPOINT_SECRET,
+        )
+        .unwrap_err()
+        .contains("mismatched"));
 
         let expired = signed_test_checkpoint(&entry, |checkpoint| {
             checkpoint.expires_at_ms = now_ms().saturating_sub(1);
         });
-        assert!(verify_checkpoint(&expired, &entry, &entry.snapshot())
-            .unwrap_err()
-            .contains("mismatched"));
+        assert!(
+            verify_checkpoint(&expired, &entry, &entry.snapshot(), &TEST_CHECKPOINT_SECRET)
+                .unwrap_err()
+                .contains("mismatched")
+        );
 
         let issued_in_the_future = signed_test_checkpoint(&entry, |checkpoint| {
             checkpoint.issued_at_ms = now_ms().saturating_add(60_000);
         });
-        assert!(
-            verify_checkpoint(&issued_in_the_future, &entry, &entry.snapshot())
-                .unwrap_err()
-                .contains("mismatched")
-        );
+        assert!(verify_checkpoint(
+            &issued_in_the_future,
+            &entry,
+            &entry.snapshot(),
+            &TEST_CHECKPOINT_SECRET,
+        )
+        .unwrap_err()
+        .contains("mismatched"));
 
         let foreign_source = signed_test_checkpoint(&entry, |checkpoint| {
             checkpoint
                 .source_cursors
                 .insert("session:foreign".to_string(), 1);
         });
-        assert!(
-            verify_checkpoint(&foreign_source, &entry, &entry.snapshot())
-                .unwrap_err()
-                .contains("unselected")
-        );
+        assert!(verify_checkpoint(
+            &foreign_source,
+            &entry,
+            &entry.snapshot(),
+            &TEST_CHECKPOINT_SECRET,
+        )
+        .unwrap_err()
+        .contains("unselected"));
 
         let future_key = signed_test_checkpoint(&entry, |checkpoint| {
             checkpoint.key_revision = checkpoint.key_revision.saturating_add(1);
         });
-        assert!(verify_checkpoint(&future_key, &entry, &entry.snapshot())
-            .unwrap_err()
-            .contains("no longer valid"));
+        assert!(verify_checkpoint(
+            &future_key,
+            &entry,
+            &entry.snapshot(),
+            &TEST_CHECKPOINT_SECRET
+        )
+        .unwrap_err()
+        .contains("no longer valid"));
 
         let retired_key = signed_test_checkpoint(&entry, |checkpoint| {
             checkpoint.key_revision = checkpoint.key_revision.saturating_sub(
                 checkpoint_key_retention_revisions(entry.limits.max_ttl_seconds).saturating_add(1),
             );
         });
-        assert!(verify_checkpoint(&retired_key, &entry, &entry.snapshot())
-            .unwrap_err()
-            .contains("no longer valid"));
+        assert!(verify_checkpoint(
+            &retired_key,
+            &entry,
+            &entry.snapshot(),
+            &TEST_CHECKPOINT_SECRET
+        )
+        .unwrap_err()
+        .contains("no longer valid"));
     }
 
     #[test]
@@ -2251,7 +2336,7 @@ mod tests {
             entry,
             terminal: Arc::new(Mutex::new(None)),
             delivered_cursors: Arc::new(Mutex::new(BTreeMap::new())),
-            checkpoint_secret: live_registry().checkpoint_secret,
+            checkpoint_secret: TEST_CHECKPOINT_SECRET,
             ended: false,
         };
         let event = stream.next().await.unwrap().unwrap();
@@ -2342,3 +2427,4 @@ mod tests {
         assert_eq!(replay, accepted);
     }
 }
+const TEST_CHECKPOINT_SECRET: [u8; 32] = [37; 32];

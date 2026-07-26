@@ -51,11 +51,11 @@ impl RuntimeEventService {
     pub(crate) fn session_timeline_events(
         &self,
         session_id: &str,
-        from_sequence: u64,
+        after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<runtime::DurableRuntimeEvent>, String> {
         self.reader
-            .session_timeline_events(session_id, from_sequence, limit)
+            .session_timeline_events(session_id, after_position, limit)
     }
 
     #[cfg(test)]

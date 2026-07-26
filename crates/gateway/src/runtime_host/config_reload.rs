@@ -137,16 +137,25 @@ pub(crate) fn spawn_config_reload_watcher(
     reload: Arc<ConfigReloadState>,
     state: Arc<AppState>,
     interval: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        poll_config_reload_once(&reload, state.clone(), "initial").await;
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            poll_config_reload_once(&reload, state.clone(), "auto").await;
-        }
-    })
+    tasks: Arc<super::task_set::GatewayRuntimeTaskSet>,
+) -> Result<u64, super::task_set::GatewayTaskSpawnError> {
+    tasks.spawn(
+        super::task_set::GatewayTaskKind::ConfigReload,
+        None,
+        move |cancellation| async move {
+            poll_config_reload_once(&reload, state.clone(), "initial").await;
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    _ = ticker.tick() => {
+                        poll_config_reload_once(&reload, state.clone(), "auto").await;
+                    }
+                }
+            }
+        },
+    )
 }
 
 pub(crate) fn status_value(reload: &ConfigReloadState) -> Value {

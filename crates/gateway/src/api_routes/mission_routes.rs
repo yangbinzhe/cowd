@@ -14,7 +14,7 @@ use crate::services::{
     StartMissionSessionHttpRequest, SubmitMissionApprovalHttpRequest,
     UpdateMissionScheduleHttpRequest, UpsertMissionProxyHttpRequest,
 };
-use memory::SessionMissionOutboxOperation;
+use session::SessionMissionOutboxOperation;
 
 use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 
@@ -223,24 +223,15 @@ async fn dispatch_mission_sessions_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<runtime::SessionExecutionPolicy>,
 ) -> impl IntoResponse {
-    let Some(runtime_service) = state.services.runtime.as_ref().cloned() else {
-        return Json(serde_json::json!({
-            "envelope": state.services.mission.session_control_contract(),
-            "kind": "mission_control.session_dispatch_submission",
-            "ok": false,
-            "error": "runtime service unavailable"
-        }));
-    };
-    let result = runtime_service
-        .route_pending_session_inputs(body.max_commands)
-        .await
-        .map_err(|error| error.message());
     Json(serde_json::json!({
         "envelope": state.services.mission.session_control_contract(),
         "kind": "mission_control.session_dispatch_submission",
-        "ok": result.is_ok(),
+        "ok": true,
         "policy": body,
-        "result": result
+        "result": {
+            "status": "scheduler_owned",
+            "message": "durable Session input is dispatched automatically by the Gateway scheduler"
+        }
     }))
 }
 
@@ -449,10 +440,10 @@ async fn start_mission_session_handler(
         .and_then(|config| config.model().map(str::to_string))
         .filter(|model| !model.trim().is_empty())
         .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
-    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+    let mut request = crate::services::EnsureSessionRequest::new(
         &session_id,
         Some(model),
-        crate::unified_session_manager::SessionSource::MissionControl,
+        crate::services::SessionSource::MissionControl,
     );
     request.title = Some(body.title.clone());
     request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
@@ -460,15 +451,8 @@ async fn start_mission_session_handler(
     request.mission_operation = SessionMissionOutboxOperation::Start;
     state
         .services
-        .session_manager
-        .as_ref()
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unified session manager is not configured".to_string(),
-            )
-        })?
-        .ensure_session(request)
+        .session
+        .ensure_surface_session(request)
         .await
         .map_err(|error| {
             api_error(

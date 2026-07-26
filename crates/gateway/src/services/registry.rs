@@ -6,7 +6,7 @@ use runtime::approval_gate::SmartApprovalGate;
 use super::*;
 use crate::runtime_service::RuntimeService;
 #[cfg(test)]
-use crate::session_kernel::SessionKernel;
+use crate::services::session_service::repository::SessionRepository;
 use crate::task_kernel::TaskKernel;
 
 pub(crate) type ServiceRegistry = GatewayServices;
@@ -14,107 +14,149 @@ pub(crate) type ServiceRegistry = GatewayServices;
 impl GatewayServices {
     pub(crate) fn new(
         runtime: Arc<RuntimeService>,
+        session_activation: Arc<
+            crate::services::session_service::activation::SessionActivationCoordinator,
+        >,
+        session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
         task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_ledger: SharedApprovalHistoryLedger,
     ) -> Self {
-        let resource_lifecycle =
-            Arc::new(runtime::session_lifecycle::SessionLifecycleManager::new(
-                runtime::session_lifecycle::SessionLifecycleConfig::default(),
-            ));
         Self::new_with_config_home(
             runtime,
+            session_activation,
+            session_supervisor,
             task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
             approval_ledger,
-            resource_lifecycle,
             ::runtime::cowd_dirs::config_home_dir(),
         )
     }
 
     pub(crate) fn new_with_config_home(
         runtime: Arc<RuntimeService>,
+        session_activation: Arc<
+            crate::services::session_service::activation::SessionActivationCoordinator,
+        >,
+        session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
         task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_ledger: SharedApprovalHistoryLedger,
-        resource_lifecycle: Arc<runtime::session_lifecycle::SessionLifecycleManager>,
         config_home: impl AsRef<std::path::Path>,
     ) -> Self {
-        let session_manager = Arc::new(crate::unified_session_manager::UnifiedSessionManager::new(
-            Arc::clone(&runtime),
-            resource_lifecycle,
-            100,
-            runtime::SessionRecoveryConfig::default(),
-        ));
-        Self::new_with_session_manager(
+        Self::new_with_session_activation(
             runtime,
             task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
             approval_ledger,
-            session_manager,
+            session_activation,
+            session_supervisor,
             config_home,
             runtime::GatewayCapacityConfig::default(),
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_session_manager(
+    pub(crate) fn new_with_session_activation(
         runtime: Arc<RuntimeService>,
         task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_ledger: SharedApprovalHistoryLedger,
-        session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
+        session_activation: Arc<
+            crate::services::session_service::activation::SessionActivationCoordinator,
+        >,
+        session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
         config_home: impl AsRef<std::path::Path>,
         capacity_config: runtime::GatewayCapacityConfig,
     ) -> Self {
-        Self::new_with_session_manager_inner(
+        Self::new_with_session_activation_inner(
             runtime,
             task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
             approval_ledger,
-            session_manager,
+            session_activation,
+            session_supervisor,
             config_home,
             capacity_config,
+            None,
             None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_session_manager_and_storage(
+    pub(crate) fn new_with_session_activation_and_storage(
         runtime: Arc<RuntimeService>,
         task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_ledger: SharedApprovalHistoryLedger,
-        session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
+        session_activation: Arc<
+            crate::services::session_service::activation::SessionActivationCoordinator,
+        >,
+        session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
         config_home: impl AsRef<std::path::Path>,
         capacity_config: runtime::GatewayCapacityConfig,
         selected_storage: Arc<crate::selected_storage::SelectedStorageTopology>,
     ) -> Self {
-        Self::new_with_session_manager_inner(
+        Self::new_with_session_activation_inner(
             runtime,
             task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
             approval_ledger,
-            session_manager,
+            session_activation,
+            session_supervisor,
             config_home,
             capacity_config,
             Some(selected_storage),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_bound_session_and_storage(
+        runtime: Arc<RuntimeService>,
+        session: Arc<SessionService>,
+        task_kernel: Arc<TaskKernel>,
+        surface_host: Arc<crate::surface_host::SurfaceHost>,
+        memory_manager: Option<Arc<GatewayMemoryManager>>,
+        approval_gate: Arc<SmartApprovalGate>,
+        approval_ledger: SharedApprovalHistoryLedger,
+        session_activation: Arc<
+            crate::services::session_service::activation::SessionActivationCoordinator,
+        >,
+        session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
+        config_home: impl AsRef<std::path::Path>,
+        capacity_config: runtime::GatewayCapacityConfig,
+        selected_storage: Arc<crate::selected_storage::SelectedStorageTopology>,
+    ) -> Self {
+        Self::new_with_session_activation_inner(
+            runtime,
+            task_kernel,
+            surface_host,
+            memory_manager,
+            approval_gate,
+            approval_ledger,
+            session_activation,
+            session_supervisor,
+            config_home,
+            capacity_config,
+            Some(selected_storage),
+            Some(session),
         )
     }
 
@@ -123,25 +165,27 @@ impl GatewayServices {
         clippy::expect_used,
         reason = "SelectedStorageTopology is constructed only after the Matrix endpoint inventory has been validated"
     )]
-    fn new_with_session_manager_inner(
+    fn new_with_session_activation_inner(
         runtime: Arc<RuntimeService>,
         task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
         approval_ledger: SharedApprovalHistoryLedger,
-        session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
+        session_activation: Arc<
+            crate::services::session_service::activation::SessionActivationCoordinator,
+        >,
+        session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
         config_home: impl AsRef<std::path::Path>,
         capacity_config: runtime::GatewayCapacityConfig,
         selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
+        session_service: Option<Arc<SessionService>>,
     ) -> Self {
         let config_home = config_home.as_ref().to_path_buf();
         let app_host_binding = GatewayAppHostBinding::new();
         let command_host_runtime = Arc::clone(&runtime);
         let runtime_services = runtime.runtime_services();
         let runtime_events = RuntimeEventService::from_runtime_services(runtime_services.as_ref());
-        let session_kernel = runtime.session_kernel();
-        let lifecycle_kernel = runtime.lifecycle_kernel();
         let task = TaskService::with_kernel_and_runtime(task_kernel, Arc::clone(&runtime_services));
         let capacity = crate::gateway_capacity::GatewayCapacityController::new(
             crate::gateway_capacity::GatewayCapacityConfig::resolve(&capacity_config),
@@ -183,12 +227,17 @@ impl GatewayServices {
             selected_storage,
             app_registry,
             app_host_binding,
-            runtime: Some(runtime),
-            session_manager: Some(session_manager),
+            runtime: Some(Arc::clone(&runtime)),
             runtime_events,
             surface: SurfaceService::with_host(surface_host),
             slash: SlashController::new(Some(command_host_runtime), task.clone()),
-            session: SessionService::with_runtime_boundaries(session_kernel, lifecycle_kernel),
+            session: session_service.unwrap_or_else(|| {
+                Arc::new(SessionService::new(
+                    Arc::clone(&runtime),
+                    session_activation,
+                    session_supervisor,
+                ))
+            }),
             task,
             memory,
             approval: ApprovalService::with_gate_and_ledger(approval_gate, approval_ledger)
@@ -200,7 +249,7 @@ impl GatewayServices {
             tool: ToolService::new(),
             system: SystemService::new(),
             audit: AuditService::new(),
-            harness_eval: HarnessEvalService::new(),
+            harness_eval: HarnessEvalService::with_gateway_tasks(runtime.gateway_tasks()),
             evolution: EvolutionService::new(),
             provider: ProviderService::new(),
             reality: RealityService::new(),
@@ -217,10 +266,12 @@ impl GatewayServices {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn baseline() -> Self {
         Self::baseline_with_config_home(::runtime::cowd_dirs::config_home_dir())
     }
 
+    #[cfg(test)]
     #[allow(
         clippy::expect_used,
         reason = "the in-memory cross-plane baseline is a deterministic local dependency for static command projections"
@@ -234,6 +285,14 @@ impl GatewayServices {
             baseline_runtime.resource_manager(),
         ));
         let task = TaskService::new();
+        let sessions = Arc::new(crate::gateway::HotSessionPool::default());
+        let session_repository = Arc::new(SessionRepository::new(
+            Arc::clone(&sessions),
+            None,
+            crate::event_bus::SessionProjectionHub::new(),
+        ));
+        let presence_ledger =
+            Arc::new(crate::services::session_service::presence::SessionPresenceLedger::new());
         Self {
             selected_storage: None,
             app_registry: Arc::new(embedded_app_registry(
@@ -242,11 +301,13 @@ impl GatewayServices {
             )),
             app_host_binding,
             runtime: None,
-            session_manager: None,
             runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
             surface: SurfaceService::new(),
             slash: SlashController::new(None, task.clone()),
-            session: SessionService::new(),
+            session: Arc::new(SessionService::for_tests(
+                session_repository,
+                presence_ledger,
+            )),
             task,
             approval: ApprovalService::new(),
             memory: MemoryService::new(),
@@ -300,9 +361,10 @@ impl GatewayServices {
         &self,
         principal: &runtime::VerifiedPrincipal,
         context: &cowd_app_sdk::InvocationContext,
+        producer_id: String,
     ) {
         self.app_host_binding
-            .bind_request_principal(principal, context);
+            .bind_request_principal(principal, context, producer_id);
     }
 
     /// Gateway only projects the Runtime-owned capability snapshot. Baseline
@@ -342,20 +404,32 @@ impl GatewayServices {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_session_kernel_for_tests(session_kernel: Arc<SessionKernel>) -> Self {
+    pub(crate) fn with_session_repository_for_tests(
+        session_repository: Arc<SessionRepository>,
+    ) -> Self {
+        let presence_ledger =
+            Arc::new(crate::services::session_service::presence::SessionPresenceLedger::new());
         Self {
-            session: SessionService::with_kernel(session_kernel),
+            session: Arc::new(SessionService::for_tests(
+                session_repository,
+                presence_ledger,
+            )),
             ..Self::baseline()
         }
     }
 
     #[cfg(test)]
     pub(crate) fn with_kernels_for_tests(
-        session_kernel: Arc<SessionKernel>,
+        session_repository: Arc<SessionRepository>,
         task_kernel: Arc<TaskKernel>,
     ) -> Self {
+        let presence_ledger =
+            Arc::new(crate::services::session_service::presence::SessionPresenceLedger::new());
         Self {
-            session: SessionService::with_kernel(session_kernel),
+            session: Arc::new(SessionService::for_tests(
+                session_repository,
+                presence_ledger,
+            )),
             task: TaskService::with_kernel(task_kernel),
             ..Self::baseline()
         }
@@ -514,7 +588,7 @@ impl GatewayServices {
 /// registry using broker-backed live credential revalidation before accepting
 /// traffic.  The APP source itself remains external; this helper owns only
 /// product assembly policy.
-fn embedded_app_registry(
+pub(crate) fn embedded_app_registry(
     config_home: &std::path::Path,
     host_context: cowd_app_sdk::CowdAppContext,
 ) -> cowd_app_host::AppRegistry {

@@ -227,6 +227,89 @@ impl SessionInputStream {
         receipt
     }
 
+    /// Materialize a durable Session admission into the process-local turn
+    /// view. The supplied receipt is authoritative; this method never
+    /// reclassifies input or creates lifecycle state of its own.
+    pub fn project_durable(
+        &self,
+        envelope: SessionInputEnvelope,
+        receipt: SessionInputReceipt,
+    ) -> SessionInputReceipt {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = inner
+            .records
+            .iter_mut()
+            .find(|record| record.envelope.input_id == envelope.input_id)
+        {
+            record.status = receipt.status;
+            record.decision = receipt.decision;
+            record.reason = receipt.reason.clone().unwrap_or_else(|| {
+                InputRoutingReason::new(
+                    "durable_projection",
+                    "classification restored from durable Session input",
+                    10_000,
+                )
+            });
+            record.relation_proposal = receipt.relation_proposal.clone();
+            record.active_turn_id = receipt.active_turn_id.clone();
+            record.evidence_refs = receipt.evidence_refs.clone();
+            return receipt;
+        }
+
+        inner
+            .idempotency
+            .insert(envelope.idempotency_key.clone(), envelope.input_id.clone());
+        inner.records.push(SessionInputRecord {
+            envelope,
+            status: receipt.status,
+            decision: receipt.decision,
+            reason: receipt.reason.clone().unwrap_or_else(|| {
+                InputRoutingReason::new(
+                    "durable_projection",
+                    "classification restored from durable Session input",
+                    10_000,
+                )
+            }),
+            relation_proposal: receipt.relation_proposal.clone(),
+            active_turn_id: receipt.active_turn_id.clone(),
+            evidence_refs: receipt.evidence_refs.clone(),
+            checkpoint: None,
+            consumed_at: None,
+            primary_ingress: false,
+        });
+        receipt
+    }
+
+    /// Apply a later durable transition to an already materialized execution
+    /// view. Missing records are expected after restart and remain harmless:
+    /// callers rebuild them from the durable envelope before a turn consumes
+    /// their content.
+    pub fn project_durable_receipt(&self, receipt: &SessionInputReceipt) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(record) = inner
+            .records
+            .iter_mut()
+            .find(|record| record.envelope.input_id == receipt.input_id)
+        else {
+            return false;
+        };
+        record.status = receipt.status;
+        record.decision = receipt.decision;
+        if let Some(reason) = &receipt.reason {
+            record.reason = reason.clone();
+        }
+        record.relation_proposal = receipt.relation_proposal.clone();
+        record.active_turn_id = receipt.active_turn_id.clone();
+        record.evidence_refs = receipt.evidence_refs.clone();
+        true
+    }
+
     /// Bind the exactly accepted primary ingress to the Runtime turn that is
     /// now taking ownership of it. Missing records are normal after a process
     /// restart because the UI projection is intentionally in-memory; they do

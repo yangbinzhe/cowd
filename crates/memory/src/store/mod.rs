@@ -17,7 +17,6 @@ use crate::{
 pub use verbatim::VerbatimEntry;
 
 pub mod blob;
-pub mod session;
 pub mod sqlite;
 pub mod vector;
 pub mod verbatim;

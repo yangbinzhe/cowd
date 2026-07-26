@@ -131,6 +131,7 @@ impl SurfaceService {
         runtime_session_id: &str,
         thread_id: Option<String>,
         sender_id: Option<String>,
+        projections: &[crate::surface_host::SurfaceSessionProjectionDraft],
     ) -> Result<SurfaceInboxReceipt, String> {
         self.host.record_inbox_received(
             surface,
@@ -139,11 +140,17 @@ impl SurfaceService {
             runtime_session_id,
             thread_id,
             sender_id,
+            projections,
         )
     }
 
-    pub(crate) fn mark_inbox_processing(&self, idempotency_key: &str) -> Result<(), String> {
-        self.host.mark_inbox_processing(idempotency_key)
+    pub(crate) fn mark_inbox_processing(
+        &self,
+        idempotency_key: &str,
+        projections: &[crate::surface_host::SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.host
+            .mark_inbox_processing(idempotency_key, projections)
     }
 
     pub(crate) fn mark_inbox_processed(
@@ -159,8 +166,10 @@ impl SurfaceService {
         &self,
         idempotency_key: &str,
         correlation: crate::surface_host::SurfaceTurnCorrelation,
+        projections: &[crate::surface_host::SurfaceSessionProjectionDraft],
     ) -> Result<(), String> {
-        self.host.mark_inbox_admitted(idempotency_key, correlation)
+        self.host
+            .mark_inbox_admitted(idempotency_key, correlation, projections)
     }
 
     pub(crate) fn record_inbox_terminal_delivery(
@@ -172,8 +181,41 @@ impl SurfaceService {
             .record_inbox_terminal_delivery(idempotency_key, terminal_id)
     }
 
-    pub(crate) fn mark_inbox_replied(&self, idempotency_key: &str) -> Result<(), String> {
-        self.host.mark_inbox_replied(idempotency_key)
+    pub(crate) fn mark_inbox_replied(
+        &self,
+        idempotency_key: &str,
+        projections: &[crate::surface_host::SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.host.mark_inbox_replied(idempotency_key, projections)
+    }
+
+    pub(crate) fn mark_inbox_projection_applied(
+        &self,
+        idempotency_key: &str,
+        event_id: &str,
+        projected_at_ms: i64,
+    ) -> Result<(), String> {
+        self.host
+            .mark_inbox_projection_applied(idempotency_key, event_id, projected_at_ms)
+    }
+
+    pub(crate) fn stage_inbox_projections(
+        &self,
+        idempotency_key: &str,
+        projections: &[crate::surface_host::SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.host
+            .stage_inbox_projections(idempotency_key, projections)
+    }
+
+    pub(crate) fn mark_inbox_projection_failed(
+        &self,
+        idempotency_key: &str,
+        event_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        self.host
+            .mark_inbox_projection_failed(idempotency_key, event_id, error)
     }
 
     pub(crate) fn mark_inbox_reply_failed(
@@ -425,8 +467,21 @@ impl SurfaceService {
             .await
             .map_err(|error| error.to_string())?;
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(async move {
-            while let Some(operation) = operations.recv().await {
+        let task_surface = surface.clone();
+        self.host
+            .gateway_tasks()
+            .spawn_owned(
+                crate::runtime_host::task_set::GatewayTaskKind::SurfaceStream,
+                crate::runtime_host::task_set::GatewayTaskOwner::Surface(surface.clone()),
+                move |cancellation| async move {
+            loop {
+                let operation = tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    operation = operations.recv() => operation,
+                };
+                let Some(operation) = operation else {
+                    break;
+                };
                 let decoded = operation
                     .map_err(|error| error.to_string())
                     .and_then(|result| {
@@ -451,7 +506,11 @@ impl SurfaceService {
                     return;
                 }
             }
-        });
+                },
+            )
+            .map_err(|error| {
+                format!("source connector `{task_surface}` stream admission failed: {error}")
+            })?;
         Ok(rx)
     }
 

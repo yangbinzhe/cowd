@@ -235,7 +235,35 @@ pub struct SessionTerminalInput {
     pub execution_id: Option<String>,
     #[serde(default)]
     pub turn_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub session_generation: Option<u64>,
+    #[serde(default)]
+    pub input_sequence: Option<u64>,
+    #[serde(default)]
+    pub input_claim_owner: Option<String>,
+    #[serde(default)]
+    pub input_claim_token: Option<String>,
+    #[serde(default)]
+    pub input_claim_revision: Option<u64>,
     pub payload_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSessionTerminalFenceAdoption {
+    pub terminal_id: String,
+    pub expected_terminal_revision: u64,
+    pub request_id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub session_generation: u64,
+    pub input_sequence: u64,
+    pub claim_owner: String,
+    pub claim_token: String,
+    pub claim_revision: u64,
+    pub claim_expires_at_ms: u64,
+    pub adopted_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -293,6 +321,18 @@ pub struct RuntimeSessionOutboxRecord {
     pub execution_id: Option<String>,
     #[serde(default)]
     pub turn_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub session_generation: Option<u64>,
+    #[serde(default)]
+    pub input_sequence: Option<u64>,
+    #[serde(default)]
+    pub input_claim_owner: Option<String>,
+    #[serde(default)]
+    pub input_claim_token: Option<String>,
+    #[serde(default)]
+    pub input_claim_revision: Option<u64>,
     pub status: String,
     pub attempts: u32,
     pub next_attempt_at_ms: Option<u64>,
@@ -468,7 +508,7 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
     fn execution_events_for_session(
         &self,
         session_id: &str,
-        after_commit_cursor: u64,
+        after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String>;
     fn list_scope(
@@ -501,6 +541,9 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         &self,
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>>;
+    /// True while this Session still owns a Runtime terminal that has not
+    /// reached the durable `materialized` state.
+    fn has_unsettled_session_terminals(&self, session_id: &str) -> RuntimeEventStoreResult<bool>;
     fn materialized_session_terminals_after(
         &self,
         session_id: &str,
@@ -518,6 +561,10 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         actor: &str,
         reason: &str,
         now_ms: u64,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
+    fn adopt_session_terminal_fence(
+        &self,
+        request: &RuntimeSessionTerminalFenceAdoption,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord>;
     fn ack_session_terminal(
         &self,
@@ -685,11 +732,11 @@ impl RuntimeEventStore {
     pub fn execution_events_for_session(
         &self,
         session_id: &str,
-        after_commit_cursor: u64,
+        after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         self.backend
-            .execution_events_for_session(session_id, after_commit_cursor, limit)
+            .execution_events_for_session(session_id, after_position, limit)
     }
 
     pub fn list_scope(
@@ -726,13 +773,30 @@ impl RuntimeEventStore {
         commit_cursor: u64,
         payload_ref: &str,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        self.backend.enqueue_session_terminal(
-            terminal_id,
-            message_id,
-            session_id,
-            commit_cursor,
-            payload_ref,
-        )
+        #[cfg(any(test, feature = "test-fixtures"))]
+        {
+            self.backend.enqueue_session_terminal(
+                terminal_id,
+                message_id,
+                session_id,
+                commit_cursor,
+                payload_ref,
+            )
+        }
+        #[cfg(not(any(test, feature = "test-fixtures")))]
+        {
+            let _ = (
+                terminal_id,
+                message_id,
+                session_id,
+                commit_cursor,
+                payload_ref,
+            );
+            Err(RuntimeEventStoreError::InvalidTransaction(
+                "unfenced terminal enqueue is test-only; use append_transaction_with_terminal"
+                    .to_string(),
+            ))
+        }
     }
 
     pub fn claim_session_terminals(
@@ -751,6 +815,13 @@ impl RuntimeEventStore {
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
         self.backend.session_terminal(terminal_id)
+    }
+
+    pub fn has_unsettled_session_terminals(
+        &self,
+        session_id: &str,
+    ) -> RuntimeEventStoreResult<bool> {
+        self.backend.has_unsettled_session_terminals(session_id)
     }
 
     pub fn materialized_session_terminals_after(
@@ -783,6 +854,13 @@ impl RuntimeEventStore {
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
         self.backend
             .retry_session_terminal(terminal_id, actor, reason, now_ms)
+    }
+
+    pub fn adopt_session_terminal_fence(
+        &self,
+        request: &RuntimeSessionTerminalFenceAdoption,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        self.backend.adopt_session_terminal_fence(request)
     }
 
     pub fn ack_session_terminal(
@@ -1176,7 +1254,7 @@ impl SqliteRuntimeEventStore {
     pub fn execution_events_for_session(
         &self,
         session_id: &str,
-        after_commit_cursor: u64,
+        after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
         if session_id.trim().is_empty() || limit == 0 {
@@ -1234,7 +1312,11 @@ impl SqliteRuntimeEventStore {
         related.dedup_by(|left, right| left.event_id == right.event_id);
         Ok(related
             .into_iter()
-            .filter(|event| event.commit_cursor > after_commit_cursor)
+            .filter(|event| {
+                after_position.is_none_or(|position| {
+                    (event.commit_cursor, event.transaction_index) > position
+                })
+            })
             .take(limit)
             .collect())
     }
@@ -1321,7 +1403,8 @@ impl SqliteRuntimeEventStore {
 
     /// Insert one terminal delivery exactly once. A duplicate terminal ID is
     /// accepted only when every immutable field matches the committed row.
-    pub fn enqueue_session_terminal(
+    #[cfg(any(test, feature = "test-fixtures"))]
+    fn enqueue_unfenced_session_terminal_for_test(
         &self,
         terminal_id: &str,
         message_id: &str,
@@ -1332,8 +1415,10 @@ impl SqliteRuntimeEventStore {
         let conn = self.executor.checkout()?;
         conn.execute(
             "INSERT INTO runtime_session_outbox
-             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 'pending', 0)
+             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+              request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+              input_claim_revision, status, revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'pending', 0)
              ON CONFLICT(terminal_id) DO NOTHING",
             params![
                 terminal_id,
@@ -1416,6 +1501,23 @@ impl SqliteRuntimeEventStore {
         query_runtime_session_outbox(&connection, terminal_id)
     }
 
+    pub fn has_unsettled_session_terminals(
+        &self,
+        session_id: &str,
+    ) -> RuntimeEventStoreResult<bool> {
+        let connection = self.executor.checkout()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM runtime_session_outbox
+                      WHERE session_id=?1 AND status!='materialized'
+                 )",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(RuntimeEventStoreError::from)
+    }
+
     /// Return already materialized terminal commits after a durable runtime
     /// cursor. Gateway uses this for resumable surface streams; the transient
     /// session bus is deliberately not the source of truth for final replies.
@@ -1427,7 +1529,9 @@ impl SqliteRuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
         let conn = self.executor.checkout()?;
         let mut statement = conn.prepare(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                    request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                    input_claim_revision, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox
@@ -1479,7 +1583,9 @@ impl SqliteRuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<RuntimeSessionOutboxRecord>> {
         let conn = self.executor.checkout()?;
         let mut statement = conn.prepare(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                    request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                    input_claim_revision, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox WHERE status='blocked'
@@ -1526,6 +1632,128 @@ impl SqliteRuntimeEventStore {
         query_runtime_session_outbox(&conn, terminal_id)?.ok_or_else(|| {
             RuntimeEventStoreError::Corrupt(format!("terminal `{terminal_id}` vanished"))
         })
+    }
+
+    pub fn adopt_session_terminal_fence(
+        &self,
+        request: &RuntimeSessionTerminalFenceAdoption,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        if request.terminal_id.trim().is_empty()
+            || request.request_id.trim().is_empty()
+            || request.session_id.trim().is_empty()
+            || request.turn_id.trim().is_empty()
+            || request.claim_owner.trim().is_empty()
+            || request.claim_token.trim().is_empty()
+            || request.session_generation == 0
+            || request.claim_revision == 0
+            || request.claim_expires_at_ms <= request.adopted_at_ms
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(
+                "terminal fence adoption requires live terminal, request, session, turn and claim identities"
+                    .to_string(),
+            ));
+        }
+        let mut conn = self.executor.checkout()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current =
+            query_runtime_session_outbox(&tx, &request.terminal_id)?.ok_or_else(|| {
+                RuntimeEventStoreError::Corrupt(format!(
+                    "terminal `{}` is missing",
+                    request.terminal_id
+                ))
+            })?;
+        if current.request_id.as_deref() != Some(request.request_id.as_str())
+            || current.session_id != request.session_id
+            || current.turn_id.as_deref() != Some(request.turn_id.as_str())
+            || current.session_generation != Some(request.session_generation)
+            || current.input_sequence != Some(request.input_sequence)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "terminal `{}` identity does not match the current Session claim",
+                request.terminal_id
+            )));
+        }
+        let already_adopted = current.input_claim_owner.as_deref()
+            == Some(request.claim_owner.as_str())
+            && current.input_claim_token.as_deref() == Some(request.claim_token.as_str())
+            && current.input_claim_revision == Some(request.claim_revision)
+            && current.input_sequence == Some(request.input_sequence);
+        if already_adopted {
+            return Ok(current);
+        }
+        if current.revision != request.expected_terminal_revision {
+            return Err(RuntimeEventStoreError::StaleRevision {
+                stream_id: format!("session-terminal:{}", request.terminal_id),
+                expected: request.expected_terminal_revision,
+                actual: current.revision,
+            });
+        }
+        if current.status == "materialized" {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "materialized terminal `{}` cannot adopt a different Session claim",
+                request.terminal_id
+            )));
+        }
+        if !matches!(
+            current.status.as_str(),
+            "pending" | "retry_scheduled" | "blocked" | "claimed"
+        ) {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "terminal `{}` in state `{}` cannot adopt a Session claim",
+                request.terminal_id, current.status
+            )));
+        }
+        if current
+            .input_claim_revision
+            .is_some_and(|revision| request.claim_revision <= revision)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "terminal `{}` cannot regress Session claim revision",
+                request.terminal_id
+            )));
+        }
+        if current.status == "claimed"
+            && !current
+                .claim_expires_at_ms
+                .is_some_and(|expires| expires <= request.adopted_at_ms)
+        {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "terminal `{}` has an active delivery claim",
+                request.terminal_id
+            )));
+        }
+        let changed = tx.execute(
+            "UPDATE runtime_session_outbox
+                SET input_sequence=?1, input_claim_owner=?2, input_claim_token=?3, input_claim_revision=?4,
+                    status='pending', next_attempt_at=0, claim_owner=NULL,
+                    claim_expires_at=NULL, failure_class=NULL, last_error=NULL,
+                    materialized_at=NULL, revision=revision+1
+              WHERE terminal_id=?5 AND revision=?6",
+            params![
+                request.input_sequence as i64,
+                request.claim_owner,
+                request.claim_token,
+                request.claim_revision as i64,
+                request.terminal_id,
+                request.expected_terminal_revision as i64,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(RuntimeEventStoreError::StaleRevision {
+                stream_id: format!("session-terminal:{}", request.terminal_id),
+                expected: request.expected_terminal_revision,
+                actual: current.revision,
+            });
+        }
+        let adopted =
+            query_runtime_session_outbox(&tx, &request.terminal_id)?.ok_or_else(|| {
+                RuntimeEventStoreError::Corrupt(format!(
+                    "terminal `{}` vanished after fence adoption",
+                    request.terminal_id
+                ))
+            })?;
+        tx.commit()?;
+        Ok(adopted)
     }
 
     pub fn ack_session_terminal(
@@ -1724,10 +1952,10 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
     fn execution_events_for_session(
         &self,
         session_id: &str,
-        after_commit_cursor: u64,
+        after_position: Option<(u64, u32)>,
         limit: usize,
     ) -> Result<Vec<DurableRuntimeEvent>, String> {
-        Self::execution_events_for_session(self, session_id, after_commit_cursor, limit)
+        Self::execution_events_for_session(self, session_id, after_position, limit)
     }
 
     fn list_scope(
@@ -1761,14 +1989,31 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         commit_cursor: u64,
         payload_ref: &str,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
-        Self::enqueue_session_terminal(
-            self,
-            terminal_id,
-            message_id,
-            session_id,
-            commit_cursor,
-            payload_ref,
-        )
+        #[cfg(any(test, feature = "test-fixtures"))]
+        {
+            Self::enqueue_unfenced_session_terminal_for_test(
+                self,
+                terminal_id,
+                message_id,
+                session_id,
+                commit_cursor,
+                payload_ref,
+            )
+        }
+        #[cfg(not(any(test, feature = "test-fixtures")))]
+        {
+            let _ = (
+                terminal_id,
+                message_id,
+                session_id,
+                commit_cursor,
+                payload_ref,
+            );
+            Err(RuntimeEventStoreError::InvalidTransaction(
+                "unfenced terminal enqueue is test-only; use append_transaction_with_terminal"
+                    .to_string(),
+            ))
+        }
     }
 
     fn claim_session_terminals(
@@ -1786,6 +2031,10 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         terminal_id: &str,
     ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
         Self::session_terminal(self, terminal_id)
+    }
+
+    fn has_unsettled_session_terminals(&self, session_id: &str) -> RuntimeEventStoreResult<bool> {
+        Self::has_unsettled_session_terminals(self, session_id)
     }
 
     fn materialized_session_terminals_after(
@@ -1816,6 +2065,13 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         now_ms: u64,
     ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
         Self::retry_session_terminal(self, terminal_id, actor, reason, now_ms)
+    }
+
+    fn adopt_session_terminal_fence(
+        &self,
+        request: &RuntimeSessionTerminalFenceAdoption,
+    ) -> RuntimeEventStoreResult<RuntimeSessionOutboxRecord> {
+        Self::adopt_session_terminal_fence(self, request)
     }
 
     fn ack_session_terminal(
@@ -1915,7 +2171,9 @@ fn export_sqlite_migration_snapshot(
         .collect::<Result<Vec<_>, _>>()?;
     let session_outbox = conn
         .prepare(
-            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
+            "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                    request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                    input_claim_revision, status,
                     attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                     last_error, materialized_at, revision
                FROM runtime_session_outbox ORDER BY terminal_id ASC",
@@ -2037,10 +2295,13 @@ fn import_sqlite_migration_snapshot(
     for terminal in &snapshot.session_outbox {
         tx.execute(
             "INSERT INTO runtime_session_outbox
-             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, attempts,
+             (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+              request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+              input_claim_revision, status, attempts,
               next_attempt_at, claim_owner, claim_expires_at, failure_class, last_error,
               materialized_at, revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 terminal.terminal_id,
                 terminal.message_id,
@@ -2049,6 +2310,21 @@ fn import_sqlite_migration_snapshot(
                 terminal.payload_ref,
                 terminal.execution_id,
                 terminal.turn_id,
+                terminal.request_id,
+                terminal
+                    .session_generation
+                    .map(|value| snapshot_i64(value, "session_generation"))
+                    .transpose()?,
+                terminal
+                    .input_sequence
+                    .map(|value| snapshot_i64(value, "input_sequence"))
+                    .transpose()?,
+                terminal.input_claim_owner,
+                terminal.input_claim_token,
+                terminal
+                    .input_claim_revision
+                    .map(|value| snapshot_i64(value, "input_claim_revision"))
+                    .transpose()?,
                 terminal.status,
                 i64::from(terminal.attempts),
                 terminal
@@ -2319,6 +2595,12 @@ fn create_current_tables(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
             payload_ref TEXT NOT NULL,
             execution_id TEXT,
             turn_id TEXT,
+            request_id TEXT,
+            session_generation INTEGER,
+            input_sequence INTEGER,
+            input_claim_owner TEXT,
+            input_claim_token TEXT,
+            input_claim_revision INTEGER,
             status TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt_at INTEGER,
@@ -2355,7 +2637,16 @@ fn create_current_tables(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
             )?;
         }
     }
-    for (column, definition) in [("execution_id", "TEXT"), ("turn_id", "TEXT")] {
+    for (column, definition) in [
+        ("execution_id", "TEXT"),
+        ("turn_id", "TEXT"),
+        ("request_id", "TEXT"),
+        ("session_generation", "INTEGER"),
+        ("input_sequence", "INTEGER"),
+        ("input_claim_owner", "TEXT"),
+        ("input_claim_token", "TEXT"),
+        ("input_claim_revision", "INTEGER"),
+    ] {
         if !table_has_column(tx, "runtime_session_outbox", column)? {
             tx.execute(
                 &format!("ALTER TABLE runtime_session_outbox ADD COLUMN {column} {definition}"),
@@ -2371,7 +2662,9 @@ fn query_runtime_session_outbox(
     terminal_id: &str,
 ) -> RuntimeEventStoreResult<Option<RuntimeSessionOutboxRecord>> {
     conn.query_row(
-        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status,
+        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                input_claim_revision, status,
                 attempts, next_attempt_at, claim_owner, claim_expires_at, failure_class,
                 last_error, materialized_at, revision
          FROM runtime_session_outbox WHERE terminal_id=?1",
@@ -2393,15 +2686,21 @@ fn row_to_runtime_session_outbox(
         payload_ref: row.get(4)?,
         execution_id: row.get(5)?,
         turn_id: row.get(6)?,
-        status: row.get(7)?,
-        attempts: row.get::<_, i64>(8)? as u32,
-        next_attempt_at_ms: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
-        claim_owner: row.get(10)?,
-        claim_expires_at_ms: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
-        failure_class: row.get(12)?,
-        last_error: row.get(13)?,
-        materialized_at_ms: row.get::<_, Option<i64>>(14)?.map(|value| value as u64),
-        revision: row.get::<_, i64>(15)? as u64,
+        request_id: row.get(7)?,
+        session_generation: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+        input_sequence: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+        input_claim_owner: row.get(10)?,
+        input_claim_token: row.get(11)?,
+        input_claim_revision: row.get::<_, Option<i64>>(12)?.map(|value| value as u64),
+        status: row.get(13)?,
+        attempts: row.get::<_, i64>(14)? as u32,
+        next_attempt_at_ms: row.get::<_, Option<i64>>(15)?.map(|value| value as u64),
+        claim_owner: row.get(16)?,
+        claim_expires_at_ms: row.get::<_, Option<i64>>(17)?.map(|value| value as u64),
+        failure_class: row.get(18)?,
+        last_error: row.get(19)?,
+        materialized_at_ms: row.get::<_, Option<i64>>(20)?.map(|value| value as u64),
+        revision: row.get::<_, i64>(21)? as u64,
     })
 }
 
@@ -2501,7 +2800,15 @@ fn append_transaction_in_tx(
     terminal: Option<&SessionTerminalInput>,
 ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
     validate_transaction(request)?;
-    let request_hash = request_hash(request)?;
+    if let Some(terminal) = terminal {
+        validate_fenced_terminal(terminal)?;
+        if serde_json::to_vec(&(request, terminal))?.len() > MAX_TRANSACTION_BYTES {
+            return Err(RuntimeEventStoreError::InvalidTransaction(format!(
+                "serialized terminal transaction exceeds hard limit {MAX_TRANSACTION_BYTES} bytes"
+            )));
+        }
+    }
+    let request_hash = request_hash_with_terminal(request, terminal)?;
     if let Some(committed_hash) = tx
         .query_row(
             "SELECT request_hash FROM runtime_commits WHERE transaction_id = ?1",
@@ -2517,7 +2824,7 @@ fn append_transaction_in_tx(
         }
         let receipt = load_receipt(tx, &request.transaction_id, true)?;
         if let Some(terminal) = terminal {
-            insert_terminal_in_tx(tx, terminal, receipt.commit_cursor)?;
+            verify_terminal_for_commit(tx, terminal, receipt.commit_cursor)?;
         }
         return Ok(receipt);
     }
@@ -2648,8 +2955,10 @@ fn insert_terminal_in_tx(
 ) -> RuntimeEventStoreResult<()> {
     tx.execute(
         "INSERT INTO runtime_session_outbox
-         (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id, status, revision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 0)
+         (terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+          request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+          input_claim_revision, status, revision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', 0)
          ON CONFLICT(terminal_id) DO NOTHING",
         params![
             terminal.terminal_id,
@@ -2659,6 +2968,12 @@ fn insert_terminal_in_tx(
             terminal.payload_ref,
             terminal.execution_id,
             terminal.turn_id,
+            terminal.request_id,
+            terminal.session_generation.map(|value| value as i64),
+            terminal.input_sequence.map(|value| value as i64),
+            terminal.input_claim_owner,
+            terminal.input_claim_token,
+            terminal.input_claim_revision.map(|value| value as i64),
         ],
     )?;
     let stored = query_runtime_session_outbox(tx, &terminal.terminal_id)?.ok_or_else(|| {
@@ -2673,10 +2988,84 @@ fn insert_terminal_in_tx(
         || stored.payload_ref != terminal.payload_ref
         || stored.execution_id != terminal.execution_id
         || stored.turn_id != terminal.turn_id
+        || stored.request_id != terminal.request_id
+        || stored.session_generation != terminal.session_generation
+        || stored.input_sequence != terminal.input_sequence
+        || stored.input_claim_owner != terminal.input_claim_owner
+        || stored.input_claim_token != terminal.input_claim_token
+        || stored.input_claim_revision != terminal.input_claim_revision
     {
         return Err(RuntimeEventStoreError::TransactionConflict {
             transaction_id: terminal.terminal_id.clone(),
         });
+    }
+    Ok(())
+}
+
+fn verify_terminal_for_commit(
+    conn: &Connection,
+    terminal: &SessionTerminalInput,
+    commit_cursor: u64,
+) -> RuntimeEventStoreResult<()> {
+    let mut statement = conn.prepare(
+        "SELECT terminal_id, message_id, session_id, commit_cursor, payload_ref, execution_id, turn_id,
+                request_id, session_generation, input_sequence, input_claim_owner, input_claim_token,
+                input_claim_revision, status, attempts, next_attempt_at, claim_owner,
+                claim_expires_at, failure_class, last_error, materialized_at, revision
+           FROM runtime_session_outbox WHERE commit_cursor=?1
+           ORDER BY terminal_id LIMIT 2",
+    )?;
+    let records = statement
+        .query_map(params![commit_cursor as i64], row_to_runtime_session_outbox)?
+        .collect::<Result<Vec<_>, _>>()?;
+    if records.len() != 1 {
+        return Err(RuntimeEventStoreError::TransactionConflict {
+            transaction_id: terminal.terminal_id.clone(),
+        });
+    }
+    let stored = &records[0];
+    if stored.terminal_id != terminal.terminal_id
+        || stored.message_id != terminal.message_id
+        || stored.session_id != terminal.session_id
+        || stored.payload_ref != terminal.payload_ref
+        || stored.execution_id != terminal.execution_id
+        || stored.turn_id != terminal.turn_id
+        || stored.request_id != terminal.request_id
+        || stored.session_generation != terminal.session_generation
+        || stored.input_sequence != terminal.input_sequence
+    {
+        return Err(RuntimeEventStoreError::TransactionConflict {
+            transaction_id: terminal.terminal_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_fenced_terminal(terminal: &SessionTerminalInput) -> RuntimeEventStoreResult<()> {
+    let required = [
+        terminal.terminal_id.as_str(),
+        terminal.message_id.as_str(),
+        terminal.session_id.as_str(),
+        terminal.payload_ref.as_str(),
+        terminal.execution_id.as_deref().unwrap_or_default(),
+        terminal.turn_id.as_deref().unwrap_or_default(),
+        terminal.request_id.as_deref().unwrap_or_default(),
+        terminal.input_claim_owner.as_deref().unwrap_or_default(),
+        terminal.input_claim_token.as_deref().unwrap_or_default(),
+    ];
+    if required.iter().any(|value| value.trim().is_empty())
+        || terminal
+            .session_generation
+            .is_none_or(|generation| generation == 0)
+        || terminal.input_sequence.is_none()
+        || terminal
+            .input_claim_revision
+            .is_none_or(|revision| revision == 0)
+    {
+        return Err(RuntimeEventStoreError::InvalidTransaction(
+            "terminal transaction requires complete execution, turn and Session claim fences"
+                .to_string(),
+        ));
     }
     Ok(())
 }
@@ -2744,6 +3133,16 @@ fn validate_event(input: &RuntimeEventInput) -> RuntimeEventStoreResult<()> {
 
 fn request_hash(request: &AppendTransactionRequest) -> RuntimeEventStoreResult<String> {
     Ok(hash_bytes(&serde_json::to_vec(request)?))
+}
+
+fn request_hash_with_terminal(
+    request: &AppendTransactionRequest,
+    terminal: Option<&SessionTerminalInput>,
+) -> RuntimeEventStoreResult<String> {
+    terminal.map_or_else(
+        || request_hash(request),
+        |terminal| Ok(hash_bytes(&serde_json::to_vec(&(request, terminal))?)),
+    )
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
@@ -2932,6 +3331,23 @@ mod tests {
         }
     }
 
+    fn fenced_terminal(id: &str, claim_revision: u64) -> SessionTerminalInput {
+        SessionTerminalInput {
+            terminal_id: format!("terminal-{id}"),
+            message_id: format!("assistant-{id}"),
+            session_id: format!("session-{id}"),
+            execution_id: Some(format!("execution-{id}")),
+            turn_id: Some(format!("turn-{id}")),
+            request_id: Some(format!("request-{id}")),
+            session_generation: Some(1),
+            input_sequence: Some(1),
+            input_claim_owner: Some("session-worker-old".to_string()),
+            input_claim_token: Some(format!("claim-old-{id}")),
+            input_claim_revision: Some(claim_revision),
+            payload_ref: format!("assistant_json:\"{id}\""),
+        }
+    }
+
     #[test]
     fn migration_snapshot_round_trip_preserves_canonical_digest_and_rejects_nonempty_target() {
         let source = RuntimeEventStore::try_open_in_memory().expect("source store");
@@ -2962,6 +3378,12 @@ mod tests {
                     session_id: "migration-session".to_string(),
                     execution_id: Some("migration-execution".to_string()),
                     turn_id: Some("migration-turn".to_string()),
+                    request_id: Some("migration-request".to_string()),
+                    session_generation: Some(1),
+                    input_sequence: Some(1),
+                    input_claim_owner: Some("migration-worker".to_string()),
+                    input_claim_token: Some("migration-claim".to_string()),
+                    input_claim_revision: Some(3),
                     payload_ref: "assistant_json:\"done\"".to_string(),
                 },
             )
@@ -3057,7 +3479,7 @@ mod tests {
         store.append(terminal).unwrap();
 
         let related = store
-            .execution_events_for_session("session-a", 0, 20)
+            .execution_events_for_session("session-a", None, 20)
             .unwrap();
         assert!(related
             .iter()
@@ -3073,7 +3495,7 @@ mod tests {
             .iter()
             .any(|event| event.kind == "runtime.session.terminal_requested"));
         assert!(store
-            .execution_events_for_session("session-b", 0, 20)
+            .execution_events_for_session("session-b", None, 20)
             .unwrap()
             .is_empty());
     }
@@ -3333,6 +3755,43 @@ mod tests {
     }
 
     #[test]
+    fn terminal_drain_probe_tracks_unmaterialized_session_work() {
+        let store = RuntimeEventStore::try_open_in_memory().unwrap();
+        assert!(!store
+            .has_unsettled_session_terminals("drain-session")
+            .unwrap());
+        store
+            .enqueue_session_terminal(
+                "drain-terminal",
+                "drain-message",
+                "drain-session",
+                7,
+                "assistant_json:\"done\"",
+            )
+            .unwrap();
+        assert!(store
+            .has_unsettled_session_terminals("drain-session")
+            .unwrap());
+        assert!(!store
+            .has_unsettled_session_terminals("other-session")
+            .unwrap());
+
+        let claim = store
+            .claim_session_terminals("drain-worker", 100, 50, 1)
+            .unwrap()
+            .remove(0);
+        assert!(store
+            .has_unsettled_session_terminals("drain-session")
+            .unwrap());
+        store
+            .ack_session_terminal(&claim.terminal_id, "drain-worker", claim.revision, 101)
+            .unwrap();
+        assert!(!store
+            .has_unsettled_session_terminals("drain-session")
+            .unwrap());
+    }
+
+    #[test]
     fn materialized_terminal_replay_is_scoped_cursor_ordered_and_excludes_pending() {
         let store = RuntimeEventStore::try_open_in_memory().unwrap();
         for (terminal, message, session, cursor) in [
@@ -3486,5 +3945,137 @@ mod tests {
             1,
             "concurrent workers must claim exactly once"
         );
+    }
+
+    #[test]
+    fn terminal_transaction_requires_a_complete_fence_and_binds_replay_identity() {
+        let store = RuntimeEventStore::try_open_in_memory().unwrap();
+        let request = transaction("terminal-fence-identity");
+        let terminal = fenced_terminal("identity", 2);
+        let first = store
+            .append_transaction_with_terminal(request.clone(), terminal.clone())
+            .expect("fenced terminal commits");
+        assert!(!first.duplicate);
+        let replay = store
+            .append_transaction_with_terminal(request.clone(), terminal.clone())
+            .expect("exact terminal replay is idempotent");
+        assert!(replay.duplicate);
+
+        let mut conflicting = terminal.clone();
+        conflicting.terminal_id = "terminal-conflict".to_string();
+        conflicting.message_id = "assistant-conflict".to_string();
+        assert!(matches!(
+            store.append_transaction_with_terminal(request, conflicting),
+            Err(RuntimeEventStoreError::TransactionConflict { .. })
+        ));
+        assert!(store
+            .session_terminal("terminal-conflict")
+            .unwrap()
+            .is_none());
+
+        let mut unfenced = terminal;
+        unfenced.input_claim_token = None;
+        assert!(matches!(
+            RuntimeEventStore::try_open_in_memory()
+                .unwrap()
+                .append_transaction_with_terminal(transaction("terminal-unfenced"), unfenced),
+            Err(RuntimeEventStoreError::InvalidTransaction(_))
+        ));
+    }
+
+    #[test]
+    fn expired_terminal_delivery_adopts_the_reclaimed_session_fence_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime-terminal-adoption.db");
+        let terminal = fenced_terminal("adoption", 2);
+        {
+            let store = RuntimeEventStore::open(&path).unwrap();
+            store
+                .append_transaction_with_terminal(
+                    transaction("terminal-adoption"),
+                    terminal.clone(),
+                )
+                .unwrap();
+            let delivery = store
+                .claim_session_terminals("delivery-before-crash", 100, 50, 1)
+                .unwrap()
+                .remove(0);
+            assert_eq!(delivery.revision, 1);
+        }
+
+        let store = RuntimeEventStore::open(&path).unwrap();
+        let current = store
+            .session_terminal(&terminal.terminal_id)
+            .unwrap()
+            .unwrap();
+        let adoption = RuntimeSessionTerminalFenceAdoption {
+            terminal_id: terminal.terminal_id.clone(),
+            expected_terminal_revision: current.revision,
+            request_id: terminal.request_id.clone().unwrap(),
+            session_id: terminal.session_id.clone(),
+            turn_id: terminal.turn_id.clone().unwrap(),
+            session_generation: 1,
+            input_sequence: terminal.input_sequence.unwrap(),
+            claim_owner: "session-worker-reclaimed".to_string(),
+            claim_token: "claim-reclaimed".to_string(),
+            claim_revision: 5,
+            claim_expires_at_ms: 1_000,
+            adopted_at_ms: 150,
+        };
+        let adopted = store
+            .adopt_session_terminal_fence(&adoption)
+            .expect("expired delivery adopts live Session fence");
+        assert_eq!(adopted.status, "pending");
+        assert_eq!(
+            adopted.input_claim_owner.as_deref(),
+            Some("session-worker-reclaimed")
+        );
+        assert_eq!(
+            adopted.input_claim_token.as_deref(),
+            Some("claim-reclaimed")
+        );
+        assert_eq!(adopted.input_claim_revision, Some(5));
+        assert_eq!(adopted.claim_owner, None);
+        assert_eq!(adopted.claim_expires_at_ms, None);
+        let replay = store
+            .append_transaction_with_terminal(transaction("terminal-adoption"), terminal.clone())
+            .expect("initial transaction remains idempotent after fence adoption");
+        assert!(replay.duplicate);
+
+        let duplicate = store
+            .adopt_session_terminal_fence(&adoption)
+            .expect("same desired fence is idempotent despite old CAS revision");
+        assert_eq!(duplicate.revision, adopted.revision);
+
+        let claimed = store
+            .claim_session_terminals("delivery-after-adoption", 151, 50, 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(claimed.input_claim_revision, Some(5));
+        let mut stale = adoption.clone();
+        stale.expected_terminal_revision = claimed.revision;
+        stale.claim_token = "claim-stale".to_string();
+        stale.claim_revision = 4;
+        assert!(matches!(
+            store.adopt_session_terminal_fence(&stale),
+            Err(RuntimeEventStoreError::InvalidTransaction(_))
+        ));
+
+        let materialized = store
+            .ack_session_terminal(
+                &claimed.terminal_id,
+                claimed.claim_owner.as_deref().unwrap(),
+                claimed.revision,
+                152,
+            )
+            .unwrap();
+        let mut after_materialized = adoption;
+        after_materialized.expected_terminal_revision = materialized.revision;
+        after_materialized.claim_token = "claim-newer".to_string();
+        after_materialized.claim_revision = 6;
+        assert!(matches!(
+            store.adopt_session_terminal_fence(&after_materialized),
+            Err(RuntimeEventStoreError::InvalidTransaction(_))
+        ));
     }
 }

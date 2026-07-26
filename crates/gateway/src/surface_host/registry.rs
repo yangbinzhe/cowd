@@ -294,6 +294,7 @@ impl SurfaceHost {
         .to_string();
         SurfaceHostHealth {
             status,
+            task_ownership: self.gateway_tasks.health(),
             surface_count: snapshot.surfaces.len(),
             external_surface_count,
             route_count,

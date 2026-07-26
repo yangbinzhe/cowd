@@ -7,7 +7,6 @@ use harness_contract::tool::{
     ResourceScopeDemand, ToolDependency, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
     ToolIntent,
 };
-use memory::{SessionDomainEvent, SessionDomainRef, SessionDomainScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -16,6 +15,7 @@ use uuid::Uuid;
 use crate::execution_core::{RuntimeCompileTarget, RuntimeExecutionDecision};
 use crate::tool_dispatch::ToolRequest;
 use crate::tool_orchestrator::ToolSafetyCategory;
+use crate::{RuntimeSessionEvent, RuntimeSessionEventKind, RuntimeSessionEventRef};
 
 pub const GOVERNED_TOOL_PLAN_CONTRACT_VERSION: u32 = 3;
 pub const DEFAULT_PARALLEL_TOOL_CONCURRENCY: usize = 32;
@@ -499,7 +499,7 @@ impl GovernedToolPlan {
         session_id: impl Into<String>,
         sequence: usize,
         created_at_ms: u64,
-    ) -> SessionDomainEvent {
+    ) -> RuntimeSessionEvent {
         let payload = serde_json::json!({
             "plan_id": self.plan_id,
             "plan_revision": self.revision,
@@ -512,11 +512,10 @@ impl GovernedToolPlan {
             "tasks": self.tasks,
             "batches": self.batches,
         });
-        let mut event = SessionDomainEvent::new(
+        let mut event = RuntimeSessionEvent::new(
             session_id,
             sequence,
-            SessionDomainScope::Tool,
-            "tool.execution_plan.created",
+            RuntimeSessionEventKind::ToolExecutionPlanCreated,
             payload,
             created_at_ms,
         );
@@ -525,7 +524,7 @@ impl GovernedToolPlan {
         event.refs = self
             .tasks
             .iter()
-            .map(|task| SessionDomainRef {
+            .map(|task| RuntimeSessionEventRef {
                 ref_type: "tool_call".to_string(),
                 id: task.tool_call_id.clone(),
                 label: Some(task.tool_name.clone()),
@@ -1209,8 +1208,11 @@ mod tests {
         ]);
         let event = plan.to_runtime_event("session-1", 7, 123);
 
-        assert_eq!(event.scope, SessionDomainScope::Tool);
-        assert_eq!(event.kind, "tool.execution_plan.created");
+        assert_eq!(event.kind.scope(), session::SessionDomainScope::Tool);
+        assert_eq!(
+            event.kind,
+            RuntimeSessionEventKind::ToolExecutionPlanCreated
+        );
         assert_eq!(event.status.as_deref(), Some("planned"));
         assert_eq!(event.refs.len(), 2);
         assert_eq!(event.payload["task_count"], 2);

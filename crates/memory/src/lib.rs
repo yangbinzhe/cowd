@@ -110,19 +110,11 @@ pub mod performance_monitor;
 pub mod project_scope;
 #[path = "graph/resolution.rs"]
 pub mod resolution;
-#[path = "session/runtime_event.rs"]
-pub(crate) mod runtime_event;
 pub mod search;
 #[path = "ingestion/seeds.rs"]
 pub mod seeds;
-#[path = "session/backend.rs"]
-pub mod session_backend;
-#[path = "session/execution_plane.rs"]
-mod session_execution_plane;
 #[path = "session/session_resume.rs"]
 pub mod session_resume;
-#[path = "session/session_store.rs"]
-pub mod session_store;
 #[path = "ops/shared.rs"]
 pub mod shared;
 #[path = "ingestion/splitter.rs"]
@@ -132,8 +124,6 @@ pub mod state_rebuilder;
 pub mod store;
 #[path = "graph/temporal_graph.rs"]
 pub mod temporal_graph;
-#[path = "kernel/tiered_store.rs"]
-pub mod tiered_store;
 #[path = "ops/tool_sandbox.rs"]
 pub mod tool_sandbox;
 #[path = "ops/transaction.rs"]
@@ -211,31 +201,15 @@ pub use memory_pulse::{
 };
 pub use memory_usage::{summarize_usage, MemoryUsageSignal, MemoryUsageSummary};
 pub use orchestrator::{L4PromotionCommand, MemoryOrchestrator};
-pub use runtime_event::{
-    SessionDomainEvent, SessionDomainEventPage, SessionDomainRef, SessionDomainScope,
-    SESSION_DOMAIN_EVENT_TYPE,
-};
 pub use search::{BM25Scorer, HybridSearcher, SearchResult as HybridSearchResult};
-pub use session_backend::{SessionStoreBackend, SharedSessionStoreBackend};
-pub use session_execution_plane::{StorageExecutionPlaneConfig, StorageExecutionPlaneStats};
 pub use session_resume::SessionResume;
-pub use session_store::UnifiedSessionStore;
 pub use state_rebuilder::{
     GsdRebuildOptions, GsdRebuiltState, GsdStateRebuilder, RebuildOptions, RebuiltSessionState,
     StateItem, StateRebuilder, StateSource,
 };
-pub use store::session::{
-    OutboxFailureClass, OutboxStatus, SessionEvent, SessionMessage, SessionMissionOutboxOperation,
-    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
-    SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeOutboxHealth,
-    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
-};
 pub use store::verbatim::{VerbatimEntry, VerbatimSink};
 pub use store::{FtsSearchOptions, FtsSearchResult, MemoryStore, MemoryStoreCapabilities};
 pub use temporal_graph::{temporal_relation, TimeRange};
-pub use tiered_store::{
-    CompressionAlgo, StorageTier, TieredSessionStore, TieredSessionStoreConfig,
-};
 pub use tool_sandbox::{ToolOutputSandbox, ToolOutputSummary};
 pub use types::{
     AgentVisibility, AlertLevel, Blocker, ContextAction, ContextMonitor, Decision, DecisionEntry,

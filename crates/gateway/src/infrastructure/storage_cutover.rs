@@ -279,10 +279,9 @@ impl CutoverContext {
                     let endpoint = source_registry
                         .endpoint(&storage::StorageDomainId::Session)
                         .map_err(stringify)?;
-                    let source = memory::store::session::SqliteSessionStore::open_storage_handle(
-                        &endpoint.as_handle(),
-                    )
-                    .map_err(stringify)?;
+                    let source =
+                        session::SqliteSessionStore::open_storage_handle(&endpoint.as_handle())
+                            .map_err(stringify)?;
                     let target =
                         session_postgres::PostgresSessionStore::new(executor).map_err(stringify)?;
                     record(

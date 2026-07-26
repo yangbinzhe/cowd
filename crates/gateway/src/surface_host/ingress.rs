@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,6 +10,10 @@ use tokio::sync::Semaphore;
 
 use crate::api_routes::AppState;
 use crate::runtime_service::IngressRuntimeOptions;
+use crate::services::session_service::{
+    SurfaceRegisteredResourceEvidence, SurfaceResourceEvidence, SurfaceResourceRegistrationStatus,
+    SurfaceSessionJournalEvent,
+};
 use crate::surface_host::SurfaceTurnCorrelation;
 
 #[derive(Debug, Clone, Copy)]
@@ -17,47 +21,65 @@ struct SurfaceTurnPolicy {
     profile: runtime::ContextProfile,
 }
 
-pub(crate) fn spawn_surface_ingress_dispatcher(state: Arc<AppState>) {
+pub(crate) fn spawn_surface_ingress_dispatcher(
+    state: Arc<AppState>,
+    tasks: Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
+) -> Result<u64, crate::runtime_host::task_set::GatewayTaskSpawnError> {
     let mut rx = state.services.surface.subscribe_events();
     let concurrency = Arc::new(Semaphore::new(32));
     let claim_owner = format!("gateway-surface-ingress-{}", uuid::Uuid::new_v4());
-    tokio::spawn(async move {
-        let mut dispatch_tick = tokio::time::interval(Duration::from_millis(100));
-        dispatch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut retry_tick = tokio::time::interval(Duration::from_secs(5));
-        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = dispatch_tick.tick() => {
-                    dispatch_pending_ingress(&state, &claim_owner, &concurrency).await;
-                }
-                _ = retry_tick.tick() => {
-                    retry_surface_trigger_events(&state).await;
-                    reconcile_surface_terminal_deliveries(&state).await;
-                }
-                received = rx.recv() => {
-                    match received {
-                        Ok(_) => {
-                            // H2 client 已在 ACK 前持久化；broadcast 只负责低延迟唤醒。
-                            dispatch_pending_ingress(&state, &claim_owner, &concurrency).await;
+    let task_owner = Arc::clone(&tasks);
+    tasks.spawn(
+        crate::runtime_host::task_set::GatewayTaskKind::SurfaceIngress,
+        None,
+        move |cancellation| async move {
+            // This is only a process-local scan cache. The durable Surface
+            // ledger and idempotent Session event remain the two authorities;
+            // restart intentionally clears the cache and rechecks terminal
+            // rows to repair a crash between ledger settlement and projection.
+            let mut reconciled_replied_inbox = BTreeSet::new();
+            let mut dispatch_tick = tokio::time::interval(Duration::from_millis(100));
+            dispatch_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut retry_tick = tokio::time::interval(Duration::from_secs(5));
+            retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    _ = dispatch_tick.tick() => {
+                        dispatch_pending_ingress(&state, &claim_owner, &concurrency, &task_owner).await;
+                    }
+                    _ = retry_tick.tick() => {
+                        retry_surface_trigger_events(&state).await;
+                        reconcile_surface_terminal_deliveries(
+                            &state,
+                            &mut reconciled_replied_inbox,
+                        ).await;
+                    }
+                    received = rx.recv() => {
+                        match received {
+                            Ok(_) => {
+                                // H2 client 已在 ACK 前持久化；broadcast 只负责低延迟唤醒。
+                                dispatch_pending_ingress(&state, &claim_owner, &concurrency, &task_owner).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "surface ingress dispatcher lagged");
+                                // Lagged 后直接 repository scan，不依赖丢失的广播内容。
+                                dispatch_pending_ingress(&state, &claim_owner, &concurrency, &task_owner).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "surface ingress dispatcher lagged");
-                            // Lagged 后直接 repository scan，不依赖丢失的广播内容。
-                            dispatch_pending_ingress(&state, &claim_owner, &concurrency).await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
-        }
-    });
+        },
+    )
 }
 
 async fn dispatch_pending_ingress(
     state: &Arc<AppState>,
     claim_owner: &str,
     concurrency: &Arc<Semaphore>,
+    tasks: &Arc<crate::runtime_host::task_set::GatewayRuntimeTaskSet>,
 ) {
     let available = concurrency.available_permits();
     if available == 0 {
@@ -80,29 +102,43 @@ async fn dispatch_pending_ingress(
             break;
         };
         let state = state.clone();
-        tokio::spawn(async move {
-            let record_key = claim.record_key;
-            let result = process_durable_ingress_frame(state.clone(), claim.frame).await;
-            match result {
-                Ok(()) => {
-                    if let Err(error) = state.services.surface.complete_ingress_frame(&record_key) {
-                        tracing::error!(%record_key, error = %error, "surface ingress completion persistence failed");
+        let spawn_result = tasks.spawn(
+            crate::runtime_host::task_set::GatewayTaskKind::SurfaceIngressWork,
+            None,
+            move |cancellation| async move {
+                let record_key = claim.record_key;
+                let result = tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        drop(permit);
+                        return;
+                    }
+                    result = process_durable_ingress_frame(state.clone(), claim.frame) => result,
+                };
+                match result {
+                    Ok(()) => {
+                        if let Err(error) = state.services.surface.complete_ingress_frame(&record_key) {
+                            tracing::error!(%record_key, error = %error, "surface ingress completion persistence failed");
+                        }
+                    }
+                    Err(error) => {
+                        if let Err(persist_error) = state
+                            .services
+                            .surface
+                            .fail_ingress_frame(&record_key, &error)
+                        {
+                            tracing::error!(%record_key, error = %persist_error, work_error = %error, "surface ingress failure persistence failed");
+                        } else {
+                            tracing::warn!(%record_key, error = %error, "surface durable ingress work failed");
+                        }
                     }
                 }
-                Err(error) => {
-                    if let Err(persist_error) = state
-                        .services
-                        .surface
-                        .fail_ingress_frame(&record_key, &error)
-                    {
-                        tracing::error!(%record_key, error = %persist_error, work_error = %error, "surface ingress failure persistence failed");
-                    } else {
-                        tracing::warn!(%record_key, error = %error, "surface durable ingress work failed");
-                    }
-                }
-            }
-            drop(permit);
-        });
+                drop(permit);
+            },
+        );
+        if let Err(error) = spawn_result {
+            tracing::debug!(%error, "surface ingress work admission closed during shutdown");
+            break;
+        }
     }
 }
 
@@ -129,13 +165,11 @@ async fn process_durable_ingress_frame(
 /// correlations from the durable inbox plus Session ingress identity, then
 /// sends through the unchanged Surface outbox with a stable idempotency key.
 /// It never treats transient TextDelta as a channel reply.
-async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
-    let Some(runtime_service) = state.services.runtime.as_ref() else {
-        return;
-    };
-    let Some(store) = runtime_service.session_kernel().unified_store() else {
-        return;
-    };
+async fn reconcile_surface_terminal_deliveries(
+    state: &Arc<AppState>,
+    reconciled_replied_inbox: &mut BTreeSet<String>,
+) {
+    let runtime_service = state.services.runtime.as_ref();
     let inboxes = match state.services.surface.all_inbox() {
         Ok(inboxes) => inboxes,
         Err(error) => {
@@ -144,9 +178,77 @@ async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
         }
     };
     for inbox in inboxes {
-        if !matches!(inbox.status.as_str(), "processing" | "processed") {
+        // The inbox row and durable ingress frame are the projection outbox.
+        // Every scan reconstructs the phases implied by that durable state;
+        // no process-local acknowledgement is required for correctness.
+        if let Err(error) = repair_surface_baseline_projection(state, &inbox).await {
+            tracing::warn!(
+                surface = %inbox.surface,
+                message_id = %inbox.message_id,
+                error = %error,
+                "surface timeline baseline repair failed"
+            );
             continue;
         }
+        if inbox.status != "received" {
+            if let Err(error) = repair_surface_resource_projection(state, &inbox).await {
+                tracing::warn!(
+                    surface = %inbox.surface,
+                    message_id = %inbox.message_id,
+                    error = %error,
+                    "surface resources projection repair failed"
+                );
+            }
+        }
+        if let Some(correlation) = inbox.correlation.as_ref() {
+            if let Err(error) = append_surface_accepted_projection(
+                state,
+                &inbox,
+                &correlation.turn_id,
+                &correlation.execution_id,
+            )
+            .await
+            {
+                tracing::warn!(
+                    surface = %inbox.surface,
+                    message_id = %inbox.message_id,
+                    error = %error,
+                    "surface accepted projection repair failed"
+                );
+            }
+        }
+        if inbox.status == "replied" {
+            if reconciled_replied_inbox.contains(&inbox.idempotency_key) {
+                continue;
+            }
+            let repair = repair_surface_replied_projection(state, &inbox).await;
+            match repair {
+                Ok(()) => {
+                    reconciled_replied_inbox.insert(inbox.idempotency_key.clone());
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        surface = %inbox.surface,
+                        message_id = %inbox.message_id,
+                        error = %error,
+                        "surface replied projection repair failed"
+                    );
+                }
+            }
+            continue;
+        }
+        if inbox.status == "failed" {
+            continue;
+        }
+        if !matches!(
+            inbox.status.as_str(),
+            "processing" | "processed" | "reply_failed"
+        ) {
+            continue;
+        }
+        let Some(runtime_service) = runtime_service else {
+            continue;
+        };
         let correlation = inbox.correlation.as_ref();
         let (Some(session_id), Some(turn_id)) = (
             correlation
@@ -158,10 +260,7 @@ async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
         ) else {
             continue;
         };
-        let records = match store
-            .session_runtime_outbox_for_session(session_id, 100)
-            .await
-        {
+        let records = match state.services.session.runtime_inputs(session_id, 100).await {
             Ok(records) => records,
             Err(error) => {
                 tracing::warn!(
@@ -176,7 +275,25 @@ async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
         let Some(record) = records.into_iter().find(|record| record.turn_id == turn_id) else {
             continue;
         };
-        if record.status == memory::OutboxStatus::BlockedMaterialization {
+        let execution_id =
+            runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id);
+        if correlation.is_some_and(|item| item.execution_id != execution_id) {
+            tracing::error!(
+                surface = %inbox.surface,
+                message_id = %inbox.message_id,
+                correlated = ?correlation.map(|item| &item.execution_id),
+                derived = %execution_id,
+                "surface turn correlation does not match durable ingress identity"
+            );
+            continue;
+        }
+        if matches!(
+            record.status,
+            session::SessionRuntimeInputStatus::Failed
+                | session::SessionRuntimeInputStatus::Blocked
+                | session::SessionRuntimeInputStatus::Cancelled
+                | session::SessionRuntimeInputStatus::Expired
+        ) {
             let error = record
                 .last_error
                 .unwrap_or_else(|| "Runtime could not materialize the surface turn".to_string());
@@ -203,19 +320,11 @@ async fn reconcile_surface_terminal_deliveries(state: &Arc<AppState>) {
             .await;
             continue;
         }
-        if record.status != memory::OutboxStatus::Materialized {
-            continue;
-        }
-        let execution_id =
-            runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id);
-        if correlation.is_some_and(|item| item.execution_id != execution_id) {
-            tracing::error!(
-                surface = %inbox.surface,
-                message_id = %inbox.message_id,
-                correlated = ?correlation.map(|item| &item.execution_id),
-                derived = %execution_id,
-                "surface turn correlation does not match durable ingress identity"
-            );
+        if !matches!(
+            record.status,
+            session::SessionRuntimeInputStatus::Completed
+                | session::SessionRuntimeInputStatus::Supplemented
+        ) {
             continue;
         }
         let terminal_id = format!("turn-terminal:{}", record.request_id);
@@ -276,10 +385,27 @@ async fn deliver_surface_terminal(
             .record_inbox_terminal_delivery(&inbox.idempotency_key, terminal_id)?;
     }
     if text.trim().is_empty() {
-        state
-            .services
-            .surface
-            .mark_inbox_replied(&inbox.idempotency_key)?;
+        let replied_projection = SurfaceSessionJournalEvent::SurfaceMessageReplied {
+            surface: inbox.surface.clone(),
+            message_id: inbox.message_id.clone(),
+            turn_id: correlation
+                .map(|item| item.turn_id.clone())
+                .unwrap_or_default(),
+            execution_id: correlation
+                .map(|item| item.execution_id.clone())
+                .unwrap_or_default(),
+            terminal_id: terminal_id.to_string(),
+            status: "empty_terminal".to_string(),
+            empty_terminal: true,
+            outbox_ref: None,
+            error_code: None,
+        }
+        .projection_draft(session_id.to_string())
+        .map_err(|error| error.to_string())?;
+        state.services.surface.mark_inbox_replied(
+            &inbox.idempotency_key,
+            std::slice::from_ref(&replied_projection),
+        )?;
         notify_surface_processing_lifecycle(
             state,
             &inbox.surface,
@@ -288,6 +414,7 @@ async fn deliver_surface_terminal(
             None,
         )
         .await;
+        flush_surface_projection(state, &inbox.idempotency_key, "replied").await?;
         return Ok(());
     }
     let recipient = surface_reply_recipient(&inbox.payload_json)
@@ -331,10 +458,30 @@ async fn deliver_surface_terminal(
         .await;
         return Err(error.message.clone());
     }
-    state
-        .services
-        .surface
-        .mark_inbox_replied(&inbox.idempotency_key)?;
+    let replied_projection = SurfaceSessionJournalEvent::SurfaceMessageReplied {
+        surface: inbox.surface.clone(),
+        message_id: inbox.message_id.clone(),
+        turn_id: correlation
+            .map(|item| item.turn_id.clone())
+            .unwrap_or_default(),
+        execution_id: correlation
+            .map(|item| item.execution_id.clone())
+            .unwrap_or_default(),
+        terminal_id: terminal_id.to_string(),
+        status: "replied".to_string(),
+        empty_terminal: false,
+        outbox_ref: outbound
+            .message_id
+            .as_ref()
+            .map(|message_id| format!("surface-outbox:{}:{message_id}", inbox.surface)),
+        error_code: outbound.error.as_ref().map(|error| error.code.clone()),
+    }
+    .projection_draft(session_id.to_string())
+    .map_err(|error| error.to_string())?;
+    state.services.surface.mark_inbox_replied(
+        &inbox.idempotency_key,
+        std::slice::from_ref(&replied_projection),
+    )?;
     notify_surface_processing_lifecycle(
         state,
         &inbox.surface,
@@ -343,19 +490,7 @@ async fn deliver_surface_terminal(
         None,
     )
     .await;
-    append_surface_timeline_event(
-        state,
-        session_id,
-        "SurfaceMessageReplied",
-        serde_json::json!({
-            "type": "SurfaceMessageReplied",
-            "surface": inbox.surface,
-            "message_id": inbox.message_id,
-            "terminal_id": terminal_id,
-            "outbound": outbound,
-        }),
-    )
-    .await?;
+    flush_surface_projection(state, &inbox.idempotency_key, "replied").await?;
     Ok(())
 }
 
@@ -533,6 +668,41 @@ async fn handle_surface_message(
         .get("metadata")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let inbox_key = format!("{}:{message_id}", surface::normalize_surface_id(&surface));
+    let content_preview = payload_string(&payload, "text")
+        .or_else(|| payload_string(&payload, "content"))
+        .unwrap_or_else(|| serde_json::to_string(&payload).unwrap_or_default())
+        .chars()
+        .take(160)
+        .collect();
+    let payload_sha256 = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_string(&payload)
+                .unwrap_or_default()
+                .as_bytes()
+        )
+    );
+    let baseline_projections = vec![
+        SurfaceSessionJournalEvent::SurfaceMessageReceived {
+            surface: surface.clone(),
+            message_id: message_id.clone(),
+            thread_id: thread_id.clone(),
+            user_id: user_id.clone(),
+            content_preview,
+            inbox_ref: format!("surface-inbox:{inbox_key}"),
+            payload_sha256,
+        }
+        .projection_draft(session_id.clone())
+        .map_err(|error| error.to_string())?,
+        SurfaceSessionJournalEvent::SurfaceSessionRuntimeActivated {
+            surface: surface.clone(),
+            session_id: session_id.clone(),
+            message_id: message_id.clone(),
+        }
+        .projection_draft(session_id.clone())
+        .map_err(|error| error.to_string())?,
+    ];
     let inbox = state.services.surface.record_inbox_received(
         &surface,
         &message_id,
@@ -540,47 +710,20 @@ async fn handle_surface_message(
         &session_id,
         thread_id.clone(),
         user_id.clone(),
+        &baseline_projections,
     )?;
     if inbox.duplicate {
         tracing::info!(
             %surface,
             %message_id,
             status = %inbox.record.status,
-            "surface message ignored as durable duplicate"
+            "surface message resumed from durable duplicate"
         );
-        return Ok(());
     }
-    state
-        .services
-        .surface
-        .mark_inbox_processing(&inbox.record.idempotency_key)?;
     ensure_surface_runtime_session(&state, &surface, &session_id, user_id.as_deref(), &metadata)
         .await?;
+    repair_surface_baseline_projection(&state, &inbox.record).await?;
 
-    state
-        .services
-        .session
-        .append_timeline_event(
-            &session_id,
-            "SurfaceMessageReceived",
-            serde_json::json!({
-                "type": "SurfaceMessageReceived",
-                "surface": surface,
-                "message_id": message_id,
-                "thread_id": thread_id,
-                "user_id": user_id,
-                "content_preview": content.chars().take(160).collect::<String>(),
-                "payload": payload,
-            }),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let runtime_service = state
-        .services
-        .runtime
-        .as_ref()
-        .ok_or_else(|| "runtime service unavailable".to_string())?;
     let current_media = payload_media_attachments(&payload, &message_id);
     let recent_media = if current_media.is_empty() && content_references_surface_media(&content) {
         recent_surface_media(&state, &surface, &session_id, &message_id)?
@@ -590,15 +733,33 @@ async fn handle_surface_message(
     let current_resources =
         register_surface_resources(&state, &surface, &session_id, &current_media);
     let recent_resources = register_surface_resources(&state, &surface, &session_id, &recent_media);
-    append_surface_resource_evidence(
-        &state,
-        &surface,
-        &session_id,
-        &message_id,
-        &current_resources,
-        &recent_resources,
-    )
-    .await?;
+    let resource_projection = SurfaceSessionJournalEvent::SurfaceMessageResourcesRegistered {
+        surface: surface.clone(),
+        message_id: message_id.clone(),
+        current: surface_resource_evidence_rows(&current_resources),
+        recent: surface_resource_evidence_rows(&recent_resources),
+    }
+    .projection_draft(session_id.clone())
+    .map_err(|error| error.to_string())?;
+    if !inbox
+        .record
+        .session_projections
+        .iter()
+        .any(|projection| projection.phase == "resources")
+    {
+        if inbox.record.status == "received" {
+            state.services.surface.mark_inbox_processing(
+                &inbox.record.idempotency_key,
+                std::slice::from_ref(&resource_projection),
+            )?;
+        } else {
+            state.services.surface.stage_inbox_projections(
+                &inbox.record.idempotency_key,
+                std::slice::from_ref(&resource_projection),
+            )?;
+        }
+    }
+    flush_surface_projection(&state, &inbox.record.idempotency_key, "resources").await?;
     let pre_messages = surface_runtime_pre_messages(&content, &current_media, &recent_media);
     let runtime_content = surface_runtime_content(&content, &current_resources, &recent_resources);
     let turn_policy = surface_turn_policy(&runtime_content);
@@ -624,23 +785,59 @@ async fn handle_surface_message(
         &inbox.record.idempotency_key,
         &surface_turn_id,
     );
-    state.services.surface.mark_inbox_admitted(
-        &inbox.record.idempotency_key,
-        SurfaceTurnCorrelation {
-            surface: surface.clone(),
-            message_id: message_id.clone(),
-            inbox_idempotency_key: inbox.record.idempotency_key.clone(),
-            session_id: session_id.clone(),
-            turn_id: surface_turn_id.clone(),
-            execution_id: execution_id.clone(),
-            reply_to_message_id: surface_platform_reply_to(&payload, &message_id),
-            reply_idempotency_key: format!("surface-reply:{surface}:{message_id}"),
-            terminal_id: None,
-            terminal_delivery_revision: 0,
-        },
-    )?;
-    let admission = runtime_service
-        .admit_session_input_with_materialized(
+    if inbox.duplicate {
+        let durable_input_exists = if let Some(correlation) = inbox.record.correlation.as_ref() {
+            let exists = state
+                .services
+                .session
+                .runtime_inputs(&session_id, 500)
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .any(|record| {
+                    record.request_id == inbox.record.idempotency_key
+                        && record.turn_id == correlation.turn_id
+                });
+            if exists {
+                append_surface_accepted_projection(
+                    &state,
+                    &inbox.record,
+                    &correlation.turn_id,
+                    &correlation.execution_id,
+                )
+                .await?;
+            }
+            exists
+        } else {
+            false
+        };
+        if !surface_duplicate_requires_runtime_admission(
+            &inbox.record.status,
+            inbox.record.correlation.is_some(),
+            durable_input_exists,
+        ) {
+            if inbox.record.status == "replied" {
+                repair_surface_replied_projection(&state, &inbox.record).await?;
+            }
+            return Ok(());
+        }
+    }
+    let correlation = SurfaceTurnCorrelation {
+        surface: surface.clone(),
+        message_id: message_id.clone(),
+        inbox_idempotency_key: inbox.record.idempotency_key.clone(),
+        session_id: session_id.clone(),
+        turn_id: surface_turn_id.clone(),
+        execution_id: execution_id.clone(),
+        reply_to_message_id: surface_platform_reply_to(&payload, &message_id),
+        reply_idempotency_key: format!("surface-reply:{surface}:{message_id}"),
+        terminal_id: None,
+        terminal_delivery_revision: 0,
+    };
+    let admission = state
+        .services
+        .session
+        .admit_input(
             SessionInputEnvelope::text(
                 session_id.clone(),
                 InputSourceKind::Surface,
@@ -659,22 +856,22 @@ async fn handle_surface_message(
             })),
         )
         .await
-        .map_err(|error| error.message())?;
+        .map_err(|error| error)?;
     debug_assert_eq!(execution_id, admission.execution_graph_id);
-    append_surface_timeline_event(
-        &state,
-        &session_id,
-        "SurfaceMessageAccepted",
-        serde_json::json!({
-            "type": "SurfaceMessageAccepted",
-            "surface": surface,
-            "message_id": message_id,
-            "turn_id": surface_turn_id,
-            "execution_id": admission.execution_graph_id,
-            "input_receipt": admission.receipt,
-        }),
-    )
-    .await?;
+    let accepted_projection = SurfaceSessionJournalEvent::SurfaceMessageAccepted {
+        surface,
+        message_id,
+        turn_id: surface_turn_id,
+        execution_id: admission.execution_graph_id,
+    }
+    .projection_draft(session_id)
+    .map_err(|error| error.to_string())?;
+    state.services.surface.mark_inbox_admitted(
+        &inbox.record.idempotency_key,
+        correlation,
+        std::slice::from_ref(&accepted_projection),
+    )?;
+    flush_surface_projection(&state, &inbox.record.idempotency_key, "accepted").await?;
     Ok(())
 }
 
@@ -785,6 +982,17 @@ fn stable_surface_turn_digest(session_id: &str, idempotency_key: &str) -> String
         .collect()
 }
 
+fn surface_duplicate_requires_runtime_admission(
+    status: &str,
+    has_correlation: bool,
+    durable_input_exists: bool,
+) -> bool {
+    if matches!(status, "replied" | "failed" | "dead_letter" | "cancelled") {
+        return false;
+    }
+    !(has_correlation && durable_input_exists)
+}
+
 async fn send_surface_failure_notice(
     state: &AppState,
     surface: &str,
@@ -845,73 +1053,291 @@ fn surface_failure_notice_text(error: &str) -> String {
     )
 }
 
-async fn append_surface_timeline_event(
+async fn flush_surface_projection(
     state: &AppState,
-    session_id: &str,
-    event_type: &'static str,
-    payload: serde_json::Value,
+    inbox_key: &str,
+    phase: &str,
 ) -> Result<(), String> {
-    state
+    let inbox = state
         .services
-        .session
-        .append_timeline_event(session_id, event_type, payload)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-async fn append_surface_resource_evidence(
-    state: &AppState,
-    surface: &str,
-    session_id: &str,
-    message_id: &str,
-    current_resources: &[SurfaceResourceRegistration],
-    recent_resources: &[SurfaceResourceRegistration],
-) -> Result<(), String> {
-    if current_resources.is_empty() && recent_resources.is_empty() {
+        .surface
+        .all_inbox()?
+        .into_iter()
+        .find(|record| record.idempotency_key == inbox_key)
+        .ok_or_else(|| format!("surface inbox `{inbox_key}` not found during projection"))?;
+    let projection = inbox
+        .session_projections
+        .iter()
+        .find(|projection| projection.phase == phase)
+        .cloned()
+        .ok_or_else(|| {
+            format!("surface inbox `{inbox_key}` has no durable `{phase}` projection")
+        })?;
+    if projection.projection_state == "applied" {
         return Ok(());
     }
-    append_surface_timeline_event(
-        state,
-        session_id,
-        "SurfaceMessageResourcesRegistered",
-        serde_json::json!({
-            "type": "SurfaceMessageResourcesRegistered",
-            "surface": surface,
-            "message_id": message_id,
-            "current": surface_resource_evidence_rows(current_resources),
-            "recent": surface_resource_evidence_rows(recent_resources),
-        }),
-    )
-    .await
+    match state
+        .services
+        .session
+        .append_surface_journal_projection(inbox_key, &projection)
+        .await
+    {
+        Ok(_) => state.services.surface.mark_inbox_projection_applied(
+            inbox_key,
+            &projection.event_id,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+        ),
+        Err(error) => {
+            let error = error.to_string();
+            let _ = state.services.surface.mark_inbox_projection_failed(
+                inbox_key,
+                &projection.event_id,
+                &error,
+            );
+            Err(error)
+        }
+    }
+}
+
+async fn repair_surface_baseline_projection(
+    state: &AppState,
+    inbox: &crate::surface_host::SurfaceInboxRecord,
+) -> Result<(), String> {
+    let session_id = inbox
+        .correlation
+        .as_ref()
+        .map(|item| item.session_id.as_str())
+        .or(inbox.runtime_session_id.as_deref())
+        .ok_or_else(|| {
+            format!(
+                "surface inbox `{}` has no Runtime Session identity",
+                inbox.idempotency_key
+            )
+        })?;
+    if !inbox
+        .session_projections
+        .iter()
+        .any(|projection| projection.phase == "received")
+    {
+        let content_preview = payload_string(&inbox.payload_json, "text")
+            .or_else(|| payload_string(&inbox.payload_json, "content"))
+            .unwrap_or_else(|| inbox.payload_summary.clone())
+            .chars()
+            .take(160)
+            .collect();
+        let drafts = vec![
+            SurfaceSessionJournalEvent::SurfaceMessageReceived {
+                surface: inbox.surface.clone(),
+                message_id: inbox.message_id.clone(),
+                thread_id: inbox.thread_id.clone(),
+                user_id: inbox.sender_id.clone(),
+                content_preview,
+                inbox_ref: format!("surface-inbox:{}", inbox.idempotency_key),
+                payload_sha256: inbox.payload_hash.clone(),
+            }
+            .projection_draft(session_id.to_string())
+            .map_err(|error| error.to_string())?,
+            SurfaceSessionJournalEvent::SurfaceSessionRuntimeActivated {
+                surface: inbox.surface.clone(),
+                session_id: session_id.to_string(),
+                message_id: inbox.message_id.clone(),
+            }
+            .projection_draft(session_id.to_string())
+            .map_err(|error| error.to_string())?,
+        ];
+        state
+            .services
+            .surface
+            .stage_inbox_projections(&inbox.idempotency_key, &drafts)?;
+    }
+    flush_surface_projection(state, &inbox.idempotency_key, "received").await?;
+    flush_surface_projection(state, &inbox.idempotency_key, "activated").await
+}
+
+async fn append_surface_accepted_projection(
+    state: &AppState,
+    inbox: &crate::surface_host::SurfaceInboxRecord,
+    turn_id: &str,
+    execution_id: &str,
+) -> Result<(), String> {
+    let session_id = inbox
+        .correlation
+        .as_ref()
+        .map(|item| item.session_id.as_str())
+        .or(inbox.runtime_session_id.as_deref())
+        .ok_or_else(|| {
+            format!(
+                "surface inbox `{}` has no Runtime Session identity",
+                inbox.idempotency_key
+            )
+        })?;
+    if !inbox
+        .session_projections
+        .iter()
+        .any(|projection| projection.phase == "accepted")
+    {
+        let draft = SurfaceSessionJournalEvent::SurfaceMessageAccepted {
+            surface: inbox.surface.clone(),
+            message_id: inbox.message_id.clone(),
+            turn_id: turn_id.to_string(),
+            execution_id: execution_id.to_string(),
+        }
+        .projection_draft(session_id.to_string())
+        .map_err(|error| error.to_string())?;
+        state
+            .services
+            .surface
+            .stage_inbox_projections(&inbox.idempotency_key, std::slice::from_ref(&draft))?;
+    }
+    flush_surface_projection(state, &inbox.idempotency_key, "accepted").await
+}
+
+async fn repair_surface_resource_projection(
+    state: &AppState,
+    inbox: &crate::surface_host::SurfaceInboxRecord,
+) -> Result<(), String> {
+    if inbox
+        .session_projections
+        .iter()
+        .any(|projection| projection.phase == "resources")
+    {
+        return flush_surface_projection(state, &inbox.idempotency_key, "resources").await;
+    }
+    let session_id = inbox
+        .correlation
+        .as_ref()
+        .map(|item| item.session_id.as_str())
+        .or(inbox.runtime_session_id.as_deref())
+        .ok_or_else(|| {
+            format!(
+                "surface inbox `{}` has no Runtime Session identity",
+                inbox.idempotency_key
+            )
+        })?;
+    let content = payload_string(&inbox.payload_json, "text")
+        .or_else(|| payload_string(&inbox.payload_json, "content"))
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            (!payload_media_attachments(&inbox.payload_json, &inbox.message_id).is_empty())
+                .then(|| "[Attachment]".to_string())
+        })
+        .unwrap_or_default();
+    let current_media = payload_media_attachments(&inbox.payload_json, &inbox.message_id);
+    let recent_media = if current_media.is_empty() && content_references_surface_media(&content) {
+        recent_surface_media(state, &inbox.surface, session_id, &inbox.message_id)?
+    } else {
+        Vec::new()
+    };
+    let current_resources =
+        register_surface_resources(state, &inbox.surface, session_id, &current_media);
+    let recent_resources =
+        register_surface_resources(state, &inbox.surface, session_id, &recent_media);
+    let draft = SurfaceSessionJournalEvent::SurfaceMessageResourcesRegistered {
+        surface: inbox.surface.clone(),
+        message_id: inbox.message_id.clone(),
+        current: surface_resource_evidence_rows(&current_resources),
+        recent: surface_resource_evidence_rows(&recent_resources),
+    }
+    .projection_draft(session_id.to_string())
+    .map_err(|error| error.to_string())?;
+    state
+        .services
+        .surface
+        .stage_inbox_projections(&inbox.idempotency_key, std::slice::from_ref(&draft))?;
+    flush_surface_projection(state, &inbox.idempotency_key, "resources").await
+}
+
+async fn repair_surface_replied_projection(
+    state: &AppState,
+    inbox: &crate::surface_host::SurfaceInboxRecord,
+) -> Result<(), String> {
+    if inbox
+        .session_projections
+        .iter()
+        .any(|projection| projection.phase == "replied")
+    {
+        return flush_surface_projection(state, &inbox.idempotency_key, "replied").await;
+    }
+    let correlation = inbox.correlation.as_ref().ok_or_else(|| {
+        format!(
+            "replied surface inbox `{}` has no turn correlation",
+            inbox.idempotency_key
+        )
+    })?;
+    let terminal_id = correlation.terminal_id.as_deref().ok_or_else(|| {
+        format!(
+            "replied surface inbox `{}` has no terminal identity",
+            inbox.idempotency_key
+        )
+    })?;
+    let outbound = state
+        .services
+        .surface
+        .outbox(&inbox.surface)?
+        .into_iter()
+        .find(|record| record.idempotency_key == correlation.reply_idempotency_key);
+    let draft = SurfaceSessionJournalEvent::SurfaceMessageReplied {
+        surface: inbox.surface.clone(),
+        message_id: inbox.message_id.clone(),
+        turn_id: correlation.turn_id.clone(),
+        execution_id: correlation.execution_id.clone(),
+        terminal_id: terminal_id.to_string(),
+        status: if outbound.is_some() {
+            "replied".to_string()
+        } else {
+            "empty_terminal".to_string()
+        },
+        empty_terminal: outbound.is_none(),
+        outbox_ref: outbound
+            .as_ref()
+            .map(|record| format!("surface-outbox:{}", record.delivery_id)),
+        error_code: None,
+    }
+    .projection_draft(correlation.session_id.clone())
+    .map_err(|error| error.to_string())?;
+    state
+        .services
+        .surface
+        .stage_inbox_projections(&inbox.idempotency_key, std::slice::from_ref(&draft))?;
+    flush_surface_projection(state, &inbox.idempotency_key, "replied").await
 }
 
 fn surface_resource_evidence_rows(
     resources: &[SurfaceResourceRegistration],
-) -> Vec<serde_json::Value> {
+) -> Vec<SurfaceResourceEvidence> {
     resources
         .iter()
         .map(|registration| {
-            let resource = registration.resource.as_ref().map(|(resource, hint)| {
-                serde_json::json!({
-                    "resource_id": resource.id,
-                    "uri": resource.uri,
-                    "kind": resource.kind,
-                    "declared_mime": resource.declared_mime,
-                    "detected_mime": resource.detected_mime,
-                    "artifact_selector": resource.artifact.selector,
-                    "sha256": resource.artifact.sha256,
-                    "bytes": resource.artifact.bytes,
-                    "hint": hint,
-                })
+            let resource = registration.resource.as_ref().map(|(resource, _hint)| {
+                SurfaceRegisteredResourceEvidence {
+                    resource_id: resource.id.clone(),
+                    uri: resource.uri.clone(),
+                    kind: resource.kind.as_str().to_string(),
+                    declared_mime: resource.declared_mime.clone(),
+                    detected_mime: resource.detected_mime.clone(),
+                    artifact_selector: resource.artifact.selector.clone(),
+                    sha256: resource.artifact.sha256.clone(),
+                    bytes: resource.artifact.bytes,
+                }
             });
-            serde_json::json!({
-                "source_message_id": registration.attachment.source_message_id,
-                "local_path": registration.attachment.local_path,
-                "media_type": registration.attachment.media_type,
-                "resource": resource,
-                "status": if registration.resource.is_some() { "registered" } else { "failed" },
-            })
+            SurfaceResourceEvidence {
+                source_message_id: registration.attachment.source_message_id.clone(),
+                media_type: registration.attachment.media_type.clone(),
+                resource,
+                status: if registration.resource.is_some() {
+                    SurfaceResourceRegistrationStatus::Registered
+                } else {
+                    SurfaceResourceRegistrationStatus::Failed
+                },
+                error_code: registration
+                    .error
+                    .as_ref()
+                    .map(|_| "resource_registration_failed".to_string()),
+            }
         })
         .collect()
 }
@@ -923,16 +1349,12 @@ async fn ensure_surface_runtime_session(
     user_id: Option<&str>,
     metadata: &serde_json::Value,
 ) -> Result<(), String> {
-    let manager = state
-        .services
-        .session_manager
-        .as_ref()
-        .ok_or_else(|| "unified session manager unavailable".to_string())?;
+    let session_service = &state.services.session;
     let model = default_surface_session_model(state);
-    let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+    let mut request = crate::services::EnsureSessionRequest::new(
         session_id,
         Some(model),
-        crate::unified_session_manager::SessionSource::Surface(surface.to_string()),
+        crate::services::SessionSource::Surface(surface.to_string()),
     );
     request.user_id = user_id.map(ToOwned::to_owned);
     request.chat_id = payload_string(metadata, "chat_id");
@@ -946,21 +1368,7 @@ async fn ensure_surface_runtime_session(
         "source": "surface_ingress_dispatcher",
         "metadata": metadata,
     });
-    manager.ensure_session(request).await?;
-    state
-        .services
-        .session
-        .append_timeline_event(
-            session_id,
-            "SurfaceSessionRuntimeActivated",
-            serde_json::json!({
-                "type": "SurfaceSessionRuntimeActivated",
-                "surface": surface,
-                "session_id": session_id,
-            }),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    session_service.ensure_surface_session(request).await?;
     Ok(())
 }
 
@@ -1061,8 +1469,13 @@ fn register_surface_resources(
                 Arc::clone(artifact_store),
                 state.services.resource_capability_index(),
             );
-            match store.register_resource_from_path(
+            let resource_key = format!(
+                "surface:{surface}:session:{session_id}:message:{}:type:{}:path:{}",
+                attachment.source_message_id, attachment.media_type, attachment.local_path
+            );
+            match store.register_resource_from_path_idempotent(
                 &attachment.local_path,
+                &resource_key,
                 format!("surface:{surface}"),
                 Some(attachment.source_message_id.clone()),
                 Some(session_id.to_string()),
@@ -1365,6 +1778,38 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_after_correlation_crash_resumes_only_when_durable_input_is_missing() {
+        assert!(surface_duplicate_requires_runtime_admission(
+            "processing",
+            false,
+            false
+        ));
+        assert!(surface_duplicate_requires_runtime_admission(
+            "processed",
+            true,
+            false
+        ));
+        assert!(!surface_duplicate_requires_runtime_admission(
+            "processed",
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn terminal_duplicate_repairs_projection_without_reopening_runtime_admission() {
+        assert!(!surface_duplicate_requires_runtime_admission(
+            "replied", true, true
+        ));
+        assert!(!surface_duplicate_requires_runtime_admission(
+            "replied", false, false
+        ));
+        assert!(!surface_duplicate_requires_runtime_admission(
+            "failed", true, false
+        ));
+    }
+
+    #[test]
     fn readme_followup_uses_deep_surface_profile_without_business_budget() {
         let policy = surface_turn_policy("我已经更新，看是否最新的readme还有问题");
 
@@ -1561,6 +2006,59 @@ mod tests {
             });
 
         assert_eq!(content.as_deref(), Some("[Attachment]"));
+    }
+
+    #[test]
+    fn resources_projection_inputs_rebuild_from_durable_inbox_payload() {
+        let payload = serde_json::json!({
+            "message_id": "om-resource",
+            "text": "inspect attachment",
+            "media_urls": ["/tmp/cowd-resource-a.png", "/tmp/cowd-resource-b.pdf"],
+            "media_types": ["image/png", "application/pdf"]
+        });
+
+        let first = payload_media_attachments(&payload, "om-resource");
+        let replayed_payload: serde_json::Value =
+            serde_json::from_str(&payload.to_string()).expect("durable payload roundtrips");
+        let replay = payload_media_attachments(&replayed_payload, "om-resource");
+
+        assert_eq!(first, replay);
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].source_message_id, "om-resource");
+        assert_eq!(replay[0].media_type, "image/png");
+        assert_eq!(replay[1].local_path, "/tmp/cowd-resource-b.pdf");
+    }
+
+    #[test]
+    fn resources_projection_replay_uses_content_addressed_registration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let resource_path = temp.path().join("replay-resource.txt");
+        std::fs::write(&resource_path, b"stable resource payload").expect("resource writes");
+        let store = runtime::ResourceStore::default_for_config_home(&temp.path().join("home"));
+
+        let first = store
+            .register_resource_from_path_idempotent(
+                &resource_path,
+                "surface:feishu:session:session-resource:message:om-resource:type:text/plain:path:replay-resource.txt",
+                "surface:feishu",
+                Some("om-resource".to_string()),
+                Some("session-resource".to_string()),
+                Some("text/plain".to_string()),
+            )
+            .expect("initial registration");
+        let replay = store
+            .register_resource_from_path_idempotent(
+                &resource_path,
+                "surface:feishu:session:session-resource:message:om-resource:type:text/plain:path:replay-resource.txt",
+                "surface:feishu",
+                Some("om-resource".to_string()),
+                Some("session-resource".to_string()),
+                Some("text/plain".to_string()),
+            )
+            .expect("replayed registration");
+
+        assert_eq!(first.0.id, replay.0.id);
+        assert_eq!(first.0.artifact.sha256, replay.0.artifact.sha256);
     }
 
     #[test]

@@ -2,14 +2,14 @@
 // Gateway foreground mode is a gateway process with an internal runtime host providing:
 //   - HTTP API (0.0.0.0:8642) + SSE streaming
 //   - Surface registry (builtin TUI/WebUI plus external JSONL sidecars)
-// Shared state: ActiveSessions, CognitiveContextManager, ToolCatalog, SessionEventBus
+// Shared state: HotSessionPool, CognitiveContextManager, ToolCatalog, SessionProjectionHub
 
 use std::collections::BTreeMap;
-use std::future::IntoFuture;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -23,20 +23,25 @@ use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::api_routes;
-use crate::event_bus::SessionEventBus;
-use crate::gateway::ActiveSessions;
+use crate::event_bus::SessionProjectionHub;
+use crate::gateway::HotSessionPool;
 use crate::runtime_service::RuntimeService;
-use crate::session_kernel::SessionKernel;
-use crate::session_lifecycle_kernel::SessionLifecycleKernel;
+use crate::services::session_service::presence::SessionPresenceLedger;
+use crate::services::session_service::repository::SessionRepository;
 use memory::cognitive::CognitiveContextManager;
 use memory::MemoryConfig;
 use runtime::mcp_tool_bridge::{McpConnectionStatus, McpToolInfo, McpToolRegistry};
 use runtime::{McpServerManager, RuntimeConfig};
 use surface::SurfaceManifest;
 
-use runtime::session_lifecycle::{EvictionPolicy, SessionLifecycleConfig, SessionLifecycleManager};
+use runtime::session_lifecycle::{
+    EvictionPolicy, SessionLifecycleConfig, SessionWorkingSetManager,
+};
 
 pub mod config_reload;
+pub(crate) mod task_set;
+
+use task_set::{GatewayRuntimeTaskSet, GatewayTaskKind};
 
 /// Gateway composition adapter for paired Definition evaluation. It owns no
 /// scoring, candidate state, or release decision: `harness-eval` loads and
@@ -98,7 +103,7 @@ impl AuthBrokerProcess {
             std::fs::remove_file(&socket_path)
                 .map_err(|error| format!("failed to remove stale auth broker socket: {error}"))?;
         }
-        let mut child = sandbox_launcher::cowd_internal_process_command()?
+        let child = sandbox_launcher::cowd_internal_process_command()?
             .arg("__cowd_internal")
             .arg("auth-broker")
             .arg("--root")
@@ -113,7 +118,13 @@ impl AuthBrokerProcess {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|error| format!("failed to spawn auth broker: {error}"))?;
-        let mut stdin = child
+        let mut broker = Self {
+            child,
+            socket_path,
+            socket_identity: None,
+        };
+        let mut stdin = broker
+            .child
             .stdin
             .take()
             .ok_or_else(|| "auth broker stdin is unavailable".to_string())?;
@@ -124,17 +135,14 @@ impl AuthBrokerProcess {
             .map_err(|error| format!("failed to enroll auth broker: {error}"))?;
         drop(stdin);
 
-        let client = auth_broker::BrokerClient::new(&socket_path);
+        let client = auth_broker::BrokerClient::new(&broker.socket_path);
         for _ in 0..40 {
             if client.trust_metadata().is_ok() {
-                let socket_identity = socket_file_identity(&socket_path);
-                return Ok(Self {
-                    child,
-                    socket_path,
-                    socket_identity,
-                });
+                broker.socket_identity = socket_file_identity(&broker.socket_path);
+                return Ok(broker);
             }
-            if let Some(status) = child
+            if let Some(status) = broker
+                .child
                 .try_wait()
                 .map_err(|error| format!("failed to inspect auth broker: {error}"))?
             {
@@ -142,8 +150,6 @@ impl AuthBrokerProcess {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        let _ = child.kill();
-        let _ = child.wait();
         Err("auth broker did not become ready within one second".to_string())
     }
 
@@ -151,6 +157,12 @@ impl AuthBrokerProcess {
         let _ = self.child.kill();
         let _ = self.child.wait();
         remove_socket_if_owned(&self.socket_path, self.socket_identity);
+    }
+}
+
+impl Drop for AuthBrokerProcess {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -246,6 +258,10 @@ impl RuntimeMcpServiceAdapter {
             }
         }
         Self { registry }
+    }
+
+    fn shutdown(&self) -> Result<(), String> {
+        self.registry.shutdown_all()
     }
 
     fn server_projection(
@@ -388,23 +404,6 @@ impl mcp::McpService for RuntimeMcpServiceAdapter {
 ///
 /// Uses `spawn_blocking` + `block_on` internally because the session
 /// entry's `MutexGuard` is `!Send` across `.await` points.
-fn spawn_session_cleanup_task(
-    session_manager: Arc<crate::unified_session_manager::UnifiedSessionManager>,
-    interval: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            let unloaded = session_manager.run_resource_cleanup().await;
-            if unloaded > 0 {
-                tracing::info!(unloaded, "session resource cleanup completed");
-            }
-        }
-    })
-}
-
 // ── Config ─────────────────────────────────────────────────────
 
 pub struct RuntimeHostConfig {
@@ -667,13 +666,449 @@ impl Drop for PidFileGuard {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GatewayRuntimeShutdownReport {
+    phases: Vec<String>,
+    failures: Vec<String>,
+    active_turns: Option<crate::runtime_service::ActiveTurnDrainReport>,
+    memory: Option<memory::cognitive::MemoryBackgroundShutdownReport>,
+    tasks: task_set::GatewayTaskShutdownReport,
+}
+
+#[derive(Default)]
+struct GatewayRuntimeShutdownState {
+    report: Option<GatewayRuntimeShutdownReport>,
+}
+
+/// Process-level owner for the complete Gateway close transaction.
+///
+/// `GatewayRuntimeTaskSet` owns leaf tasks; this coordinator serializes every
+/// component phase around it. The first caller is the leader. Followers wait
+/// on the same gate and receive the immutable report published by the leader.
+struct GatewayRuntimeShutdownCoordinator {
+    gateway_tasks: Arc<GatewayRuntimeTaskSet>,
+    gate: tokio::sync::Mutex<()>,
+    state: Mutex<GatewayRuntimeShutdownState>,
+}
+
+impl GatewayRuntimeShutdownCoordinator {
+    fn new(gateway_tasks: Arc<GatewayRuntimeTaskSet>) -> Arc<Self> {
+        Arc::new(Self {
+            gateway_tasks,
+            gate: tokio::sync::Mutex::new(()),
+            state: Mutex::new(GatewayRuntimeShutdownState::default()),
+        })
+    }
+
+    fn publish(&self, phase: &str, failures: &[String]) {
+        self.gateway_tasks.observe_shutdown_phase(phase, failures);
+    }
+
+    fn completed_report(&self) -> Option<GatewayRuntimeShutdownReport> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .report
+            .clone()
+    }
+
+    fn finish(&self, report: GatewayRuntimeShutdownReport) {
+        let phase = if report.failures.is_empty() {
+            "closed"
+        } else {
+            "closed_with_failures"
+        };
+        self.publish(phase, &report.failures);
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .report = Some(report);
+    }
+
+    async fn coordinate<F, Fut>(&self, shutdown: F) -> GatewayRuntimeShutdownReport
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = GatewayRuntimeShutdownReport>,
+    {
+        let _leader = self.gate.lock().await;
+        if let Some(report) = self.completed_report() {
+            return report;
+        }
+        let report = shutdown().await;
+        self.finish(report.clone());
+        report
+    }
+}
+
+struct GatewayRuntimeShutdownResources<'a> {
+    session_worker_supervisor:
+        Option<&'a Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>>,
+    selected_storage: Option<&'a Arc<crate::selected_storage::SelectedStorageTopology>>,
+    session_service: Option<&'a Arc<crate::services::SessionService>>,
+    session_activation:
+        Option<&'a Arc<crate::services::session_service::activation::SessionActivationCoordinator>>,
+    runtime_service: Option<&'a Arc<RuntimeService>>,
+    runtime_services: Option<&'a Arc<runtime::RuntimeServices>>,
+    cognitive: Option<&'a Arc<CognitiveContextManager>>,
+    surface_host: Option<&'a Arc<crate::surface_host::SurfaceHost>>,
+    runtime_mcp_service: Option<&'a Arc<RuntimeMcpServiceAdapter>>,
+    auth_broker: &'a Arc<tokio::sync::Mutex<Option<AuthBrokerProcess>>>,
+}
+
+struct GatewayRuntimeStartupRegistry {
+    coordinator: Arc<GatewayRuntimeShutdownCoordinator>,
+    auth_broker: Arc<tokio::sync::Mutex<Option<AuthBrokerProcess>>>,
+    selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
+    cognitive: Option<Arc<CognitiveContextManager>>,
+    surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
+    runtime_mcp_service: Option<Arc<RuntimeMcpServiceAdapter>>,
+    runtime_services: Option<Arc<runtime::RuntimeServices>>,
+    runtime_service: Option<Arc<RuntimeService>>,
+    session_activation:
+        Option<Arc<crate::services::session_service::activation::SessionActivationCoordinator>>,
+    session_service: Option<Arc<crate::services::SessionService>>,
+    session_worker_supervisor: Option<Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>>,
+}
+
+impl GatewayRuntimeStartupRegistry {
+    fn new(coordinator: Arc<GatewayRuntimeShutdownCoordinator>) -> Self {
+        Self {
+            coordinator,
+            auth_broker: Arc::new(tokio::sync::Mutex::new(None)),
+            selected_storage: None,
+            cognitive: None,
+            surface_host: None,
+            runtime_mcp_service: None,
+            runtime_services: None,
+            runtime_service: None,
+            session_activation: None,
+            session_service: None,
+            session_worker_supervisor: None,
+        }
+    }
+
+    fn shutdown_resources(&self) -> GatewayRuntimeShutdownResources<'_> {
+        GatewayRuntimeShutdownResources {
+            session_worker_supervisor: self.session_worker_supervisor.as_ref(),
+            selected_storage: self.selected_storage.as_ref(),
+            session_service: self.session_service.as_ref(),
+            session_activation: self.session_activation.as_ref(),
+            runtime_service: self.runtime_service.as_ref(),
+            runtime_services: self.runtime_services.as_ref(),
+            cognitive: self.cognitive.as_ref(),
+            surface_host: self.surface_host.as_ref(),
+            runtime_mcp_service: self.runtime_mcp_service.as_ref(),
+            auth_broker: &self.auth_broker,
+        }
+    }
+
+    async fn shutdown(
+        &self,
+        initiating_failure: Option<(&'static str, String)>,
+    ) -> GatewayRuntimeShutdownReport {
+        shutdown_runtime_host_resources(
+            &self.coordinator,
+            self.shutdown_resources(),
+            initiating_failure,
+        )
+        .await
+    }
+
+    async fn rollback(&self, error: String) -> String {
+        self.shutdown(Some(("startup_rollback", error)))
+            .await
+            .failures
+            .join("; ")
+    }
+}
+
+fn record_task_shutdown_failures(
+    phase: &str,
+    report: &task_set::GatewayTaskShutdownReport,
+    failures: &mut Vec<String>,
+) {
+    if report.panicked > 0 {
+        failures.push(format!(
+            "{phase} observed {} panicked task(s)",
+            report.panicked
+        ));
+    }
+    if report.forced_aborts > 0 {
+        failures.push(format!(
+            "{phase} required {} forced task abort(s)",
+            report.forced_aborts
+        ));
+    }
+}
+
+async fn shutdown_runtime_host_resources(
+    coordinator: &Arc<GatewayRuntimeShutdownCoordinator>,
+    resources: GatewayRuntimeShutdownResources<'_>,
+    initiating_failure: Option<(&'static str, String)>,
+) -> GatewayRuntimeShutdownReport {
+    coordinator
+        .coordinate(|| async move {
+            let gateway_tasks = &coordinator.gateway_tasks;
+            let initial_phase = initiating_failure.as_ref().map(|(phase, _)| *phase);
+            let mut failures = initiating_failure
+                .into_iter()
+                .map(|(_, failure)| failure)
+                .collect::<Vec<_>>();
+            let mut phases = Vec::new();
+            let mut active_turn_report = None;
+            let mut memory_report = None;
+            let mut enter_phase = |phase: &str, failures: &[String]| {
+                phases.push(phase.to_string());
+                coordinator.publish(phase, failures);
+            };
+            if let Some(initial_phase) = initial_phase {
+                enter_phase(initial_phase, &failures);
+            }
+
+            // Close every ingress fence before cancelling accepted work. Runtime turn
+            // admission shares the same registry lock as turn insertion, so the
+            // cancellation snapshot cannot race with a newly accepted turn.
+            enter_phase("stop_accepting", &failures);
+            gateway_tasks.stop_accepting();
+            if let Some(supervisor) = resources.session_worker_supervisor {
+                supervisor.stop_accepting();
+            }
+            let cancelled_turns = resources.runtime_service.map_or_else(Vec::new, |runtime| {
+                runtime.stop_accepting_and_cancel_active_turns("Gateway process shutdown")
+            });
+
+            enter_phase("drain_ingress", &failures);
+            let admission_report = gateway_tasks
+                .cancel_and_drain_kinds(
+                    &[
+                        GatewayTaskKind::HttpServer,
+                        GatewayTaskKind::ConfigReload,
+                        GatewayTaskKind::SurfaceIngress,
+                        GatewayTaskKind::SurfaceIngressWork,
+                    ],
+                    Duration::from_secs(10),
+                )
+                .await;
+            record_task_shutdown_failures(
+                "Gateway admission drain",
+                &admission_report,
+                &mut failures,
+            );
+            if admission_report.panicked > 0 || admission_report.forced_aborts > 0 {
+                coordinator.publish("drain_ingress", &failures);
+            }
+            tracing::info!(
+                joined = admission_report.joined,
+                panicked = admission_report.panicked,
+                forced_aborts = admission_report.forced_aborts,
+                "Gateway admission tasks drained"
+            );
+
+            enter_phase("drain_surface", &failures);
+            if let Some(surface_host) = resources.surface_host {
+                if let Err(error) = surface_host.shutdown().await {
+                    failures.push(format!("surface host shutdown incomplete: {error}"));
+                    coordinator.publish("drain_surface", &failures);
+                }
+            }
+
+            enter_phase("drain_live_eval", &failures);
+            let live_eval_report = gateway_tasks
+                .cancel_and_drain_kinds(
+                    &[
+                        GatewayTaskKind::LiveSubscription,
+                        GatewayTaskKind::EvalWorker,
+                    ],
+                    Duration::from_secs(30),
+                )
+                .await;
+            record_task_shutdown_failures(
+                "Gateway Live/Eval drain",
+                &live_eval_report,
+                &mut failures,
+            );
+            if live_eval_report.panicked > 0 || live_eval_report.forced_aborts > 0 {
+                coordinator.publish("drain_live_eval", &failures);
+            }
+            tracing::info!(
+                joined = live_eval_report.joined,
+                panicked = live_eval_report.panicked,
+                forced_aborts = live_eval_report.forced_aborts,
+                "Live and Eval tasks drained"
+            );
+
+            enter_phase("drain_active_turns", &failures);
+            if let Some(runtime_service) = resources.runtime_service {
+                let report = runtime_service
+                    .wait_for_active_turns(cancelled_turns.len(), Duration::from_secs(30))
+                    .await;
+                if !report.remaining_turn_ids.is_empty() {
+                    failures.push(format!(
+                        "Runtime active turn drain timed out with {} turn(s): {}",
+                        report.remaining_turn_ids.len(),
+                        report.remaining_turn_ids.join(",")
+                    ));
+                    coordinator.publish("drain_active_turns", &failures);
+                }
+                active_turn_report = Some(report);
+            }
+
+            enter_phase("drain_session_workers", &failures);
+            if let Some(supervisor) = resources.session_worker_supervisor {
+                supervisor.shutdown().await;
+                let worker_health = supervisor.health();
+                if worker_health.forced_aborts > 0 {
+                    failures.push(format!(
+                        "Session worker shutdown required {} forced abort(s)",
+                        worker_health.forced_aborts
+                    ));
+                    coordinator.publish("drain_session_workers", &failures);
+                }
+                tracing::info!(
+                    accepting = worker_health.accepting,
+                    workers = worker_health.workers.len(),
+                    forced_aborts = worker_health.forced_aborts,
+                    "Session worker supervisor drained"
+                );
+            }
+
+            // A Runtime carrier is removed only after its active turn guard reached
+            // terminal state. On timeout retain the carrier and publish failure rather
+            // than manufacturing an apparently clean close by dropping live state.
+            enter_phase("unload_sessions", &failures);
+            let active_turns_drained = active_turn_report
+                .as_ref()
+                .is_none_or(|report| report.remaining_turn_ids.is_empty());
+            let active_session_ids = resources
+                .session_service
+                .map_or_else(Vec::new, |service| service.list_active_session_ids());
+            if active_turns_drained {
+                if let Some(session_activation) = resources.session_activation {
+                    for session_id in &active_session_ids {
+                        session_activation.unload_runtime(session_id).await;
+                    }
+                }
+            }
+
+            enter_phase("drain_runtime", &failures);
+            let runtime_report = gateway_tasks
+                .cancel_and_drain_kinds(
+                    &[
+                        GatewayTaskKind::RuntimeRestoration,
+                        GatewayTaskKind::MissionSchedule,
+                    ],
+                    Duration::from_secs(10),
+                )
+                .await;
+            record_task_shutdown_failures(
+                "Gateway Runtime task drain",
+                &runtime_report,
+                &mut failures,
+            );
+            if runtime_report.panicked > 0 || runtime_report.forced_aborts > 0 {
+                coordinator.publish("drain_runtime", &failures);
+            }
+            if let Some(runtime_services) = resources
+                .runtime_service
+                .map(|runtime| runtime.runtime_services())
+                .or_else(|| resources.runtime_services.cloned())
+            {
+                runtime_services.shutdown_maintenance().await;
+            }
+            if let Some(cognitive) = resources.cognitive {
+                let report = cognitive.shutdown_background_tasks().await;
+                if report.forced_aborts > 0 {
+                    failures.push(format!(
+                        "Memory background shutdown required {} forced abort(s)",
+                        report.forced_aborts
+                    ));
+                }
+                failures.extend(
+                    report
+                        .errors
+                        .iter()
+                        .map(|error| format!("Memory background shutdown incomplete: {error}")),
+                );
+                if report.forced_aborts > 0 || !report.errors.is_empty() {
+                    coordinator.publish("drain_runtime", &failures);
+                }
+                memory_report = Some(report);
+            }
+            if let Some(runtime_mcp_service) = resources.runtime_mcp_service {
+                if let Err(error) = runtime_mcp_service.shutdown() {
+                    failures.push(format!("MCP worker shutdown incomplete: {error}"));
+                    coordinator.publish("drain_runtime", &failures);
+                }
+            }
+            if let Some(broker) = resources.auth_broker.lock().await.as_mut() {
+                broker.shutdown();
+            }
+            tracing::info!(
+                active_session_count = active_session_ids.len(),
+                joined = runtime_report.joined,
+                panicked = runtime_report.panicked,
+                forced_aborts = runtime_report.forced_aborts,
+                "Runtime restoration, scheduling, MCP and maintenance drained"
+            );
+
+            // Storage is the first durable resource constructed and the last
+            // business dependency closed. Runtime maintenance, Memory and MCP
+            // retain their journal ports until their workers have joined.
+            enter_phase("drain_session_repository", &failures);
+            if let Some(selected_storage) = resources.selected_storage {
+                match selected_storage
+                    .session_store
+                    .shutdown_and_drain(Duration::from_secs(10))
+                    .await
+                {
+                    Ok(repository_stats) => tracing::info!(
+                        accepting = repository_stats.accepting,
+                        drained = repository_stats.drained,
+                        active = repository_stats.active,
+                        queued = repository_stats.queued,
+                        rejected = repository_stats.queue_rejected,
+                        "Session repository shutdown complete"
+                    ),
+                    Err(error) => {
+                        failures.push(format!("Session repository shutdown incomplete: {error}"));
+                        coordinator.publish("drain_session_repository", &failures);
+                    }
+                }
+            }
+
+            enter_phase("drain_task_set", &failures);
+            let gateway_task_report = gateway_tasks.shutdown().await;
+            record_task_shutdown_failures(
+                "Gateway final task-set drain",
+                &gateway_task_report,
+                &mut failures,
+            );
+            if gateway_task_report.panicked > 0 || gateway_task_report.forced_aborts > 0 {
+                coordinator.publish("drain_task_set", &failures);
+            }
+            GatewayRuntimeShutdownReport {
+                phases,
+                failures,
+                active_turns: active_turn_report,
+                memory: memory_report,
+                tasks: gateway_task_report,
+            }
+        })
+        .await
+}
+
 // ── Gateway entry point ─────────────────────────────────────────
 
 pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String> {
     let started_at = Instant::now();
-    spawn_event_loop_lag_probe();
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
+    let gateway_tasks =
+        crate::runtime_host::task_set::GatewayRuntimeTaskSet::new(Duration::from_secs(5));
+    let shutdown_coordinator = GatewayRuntimeShutdownCoordinator::new(Arc::clone(&gateway_tasks));
+    let mut startup_registry =
+        GatewayRuntimeStartupRegistry::new(Arc::clone(&shutdown_coordinator));
+    let auth_broker = Arc::clone(&startup_registry.auth_broker);
 
     // 1. Resolve configuration and compose every durable owner exactly once.
     let approval_dir = std::env::var_os("COWD_CONFIG_HOME")
@@ -685,55 +1120,81 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         })
         .unwrap_or_else(|| std::path::PathBuf::from(".cowd"));
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let loaded = runtime::ConfigLoader::new(&workspace_root, &approval_dir)
-        .load_with_diagnostics()
-        .map_err(|error| format!("failed to load runtime configuration: {error}"))?;
+    let loaded =
+        match runtime::ConfigLoader::new(&workspace_root, &approval_dir).load_with_diagnostics() {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let error = format!("failed to load runtime configuration: {error}");
+                return Err(startup_registry.rollback(error).await);
+            }
+        };
     let runtime_config = loaded.config;
     let config_diagnostics = loaded.diagnostics;
     for diagnostic in &config_diagnostics {
         tracing::warn!(code = %diagnostic.code, message = %diagnostic.message, "runtime config diagnostic");
     }
-    let selected_storage = Arc::new(
-        crate::selected_storage::SelectedStorageTopology::compose_for_runtime(
+    let selected_storage =
+        match crate::selected_storage::SelectedStorageTopology::compose_for_runtime(
             runtime_config.storage(),
             runtime_config.apps(),
             &approval_dir,
             &workspace_root,
-        )
-        .map_err(|error| format!("failed to compose selected storage topology: {error}"))?,
-    );
+        ) {
+            Ok(storage) => Arc::new(storage),
+            Err(error) => {
+                let error = format!("failed to compose selected storage topology: {error}");
+                return Err(startup_registry.rollback(error).await);
+            }
+        };
+    startup_registry.selected_storage = Some(Arc::clone(&selected_storage));
     tracing::info!(
         backend = selected_storage.backend_label(),
         health = %selected_storage.health_projection(),
         "selected storage topology is ready"
     );
-    let sessions = Arc::new(ActiveSessions::default());
+    let sessions = Arc::new(HotSessionPool::default());
     let unified_store = Some(Arc::clone(&selected_storage.session_store));
     let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {
             tracing::info!("initialising memory manager over selected storage...");
             let sqlite_auxiliaries =
                 selected_storage.backend == runtime::StorageBackendSelection::Sqlite;
-            Some(Arc::new(
-                CognitiveContextManager::new_with_selected_store_and_auxiliaries(
-                    mem_cfg.clone(),
-                    Some(workspace_root.clone()),
-                    unified_store.clone(),
-                    Arc::clone(&selected_storage.memory_store),
-                    sqlite_auxiliaries,
-                )
-                .await
-                .map_err(|error| format!("memory manager initialization failed: {error}"))?,
-            ))
+            match CognitiveContextManager::new_with_selected_store_and_auxiliaries(
+                mem_cfg.clone(),
+                Some(workspace_root.clone()),
+                unified_store
+                    .as_ref()
+                    .map(|store| Arc::new(store.history_reader())),
+                Arc::clone(&selected_storage.memory_store),
+                sqlite_auxiliaries,
+            )
+            .await
+            {
+                Ok(cognitive) => Some(Arc::new(cognitive)),
+                Err(error) => {
+                    let error = format!("memory manager initialization failed: {error}");
+                    return Err(startup_registry.rollback(error).await);
+                }
+            }
         }
         None => None,
     };
-    let event_bus = SessionEventBus::new();
+    startup_registry.cognitive.clone_from(&cognitive);
+    let surface_host = Arc::new(
+        crate::surface_host::SurfaceHost::with_configs_message_store_and_tasks(
+            crate::surface_host::default_surface_roots(&approval_dir),
+            config.surface_runtime_configs.clone(),
+            Arc::clone(&selected_storage.surface_messages),
+            Arc::clone(&gateway_tasks),
+        ),
+    );
+    startup_registry.surface_host = Some(Arc::clone(&surface_host));
+    let event_bus = SessionProjectionHub::new();
     let lease_registry = Arc::new(SessionLeaseRegistry::default());
-    let lifecycle_kernel = Arc::new(SessionLifecycleKernel::with_store(Arc::clone(
+    let presence_ledger = Arc::new(SessionPresenceLedger::with_store(Arc::clone(
         &selected_storage.session_store,
     )));
-    let session_kernel = Arc::new(SessionKernel::new(
+    let session_repository = Arc::new(SessionRepository::new(
         sessions.clone(),
         unified_store.clone(),
         event_bus.clone(),
@@ -742,30 +1203,50 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // exactly the same enabled-APP set that will later build AppRegistry, so
     // a disabled APP cannot remain present in the broker's capability
     // catalogue.
-    let auth_catalog = auth_broker::AuthorizationCatalog::from_app_descriptors(
+    let auth_catalog = match auth_broker::AuthorizationCatalog::from_app_descriptors(
         crate::services::enabled_app_descriptors(runtime_config.apps()),
-    )
-    .map_err(|error| format!("failed to compose auth profile catalogue: {error}"))?;
-    let mut auth_broker = config
+    ) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let error = format!("failed to compose auth profile catalogue: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
+    let started_auth_broker = match config
         .auth_token
         .as_deref()
         .map(|credential| AuthBrokerProcess::start(&approval_dir, credential, &auth_catalog))
-        .transpose()?;
-    let provider_registry = Arc::new(
-        runtime::ProviderRegistry::new(runtime_config.providers().clone()).map_err(|rejected| {
-            format!(
+        .transpose()
+    {
+        Ok(broker) => broker,
+        Err(error) => {
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
+    *auth_broker.lock().await = started_auth_broker;
+    let provider_registry = match runtime::ProviderRegistry::new(runtime_config.providers().clone())
+    {
+        Ok(registry) => Arc::new(registry),
+        Err(rejected) => {
+            let error = format!(
                 "failed to initialize provider registry: {}",
                 rejected.diagnostics.errors.join("; ")
-            )
-        })?,
-    );
+            );
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
     let upgrade_coordinator = Arc::new(runtime::UpgradeCoordinator::new());
-    let runtime_bootstrap = crate::runtime_bootstrap::assemble_runtime_state_with_loader(
+    let runtime_bootstrap = match crate::runtime_bootstrap::assemble_runtime_state_with_loader(
         &workspace_root,
         &runtime::ConfigLoader::new(&workspace_root, &approval_dir),
         &runtime_config,
-    )
-    .map_err(|error| format!("failed to build tool catalog: {error}"))?;
+    ) {
+        Ok(runtime_bootstrap) => runtime_bootstrap,
+        Err(error) => {
+            let error = format!("failed to build tool catalog: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
     let tools = Arc::new(runtime_bootstrap.tool_registry.clone());
     if let Some(mcp_state) = runtime_bootstrap.mcp_state {
         let _ = mcp_state
@@ -775,6 +1256,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     }
     let runtime_mcp_service =
         Arc::new(RuntimeMcpServiceAdapter::from_runtime_config(&runtime_config).await);
+    startup_registry.runtime_mcp_service = Some(Arc::clone(&runtime_mcp_service));
     let approval_ledger = Arc::clone(&selected_storage.approval_ledger);
     let approval_gate = Arc::new(runtime::approval_gate::SmartApprovalGate::new(
         Arc::new(
@@ -808,7 +1290,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         eviction_policy: EvictionPolicy::Lru,
         cleanup_interval: Duration::from_secs(300),
     };
-    let lifecycle = Arc::new(SessionLifecycleManager::new(lifecycle_config));
+    let lifecycle = Arc::new(SessionWorkingSetManager::new(lifecycle_config));
     let static_webui =
         crate::gateway_static::resolve_static_webui_source(config.webui_dir.as_deref());
     let startup_diagnostics = build_startup_diagnostics(
@@ -821,20 +1303,12 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     );
     emit_startup_diagnostics(&startup_diagnostics);
 
-    let surface_host = Arc::new(
-        crate::surface_host::SurfaceHost::with_configs_and_message_store(
-            crate::surface_host::default_surface_roots(&approval_dir),
-            config.surface_runtime_configs.clone(),
-            Arc::clone(&selected_storage.surface_messages),
-        ),
-    );
     if let Some(webui_dir) = static_webui.configured_path.as_deref() {
         if static_webui.available {
             surface_host.register_webui_static_resource(webui_dir);
         }
     }
     let surface_discovery = surface_host.discover();
-    surface_host.start_monitor();
     tracing::info!(
         discovered = surface_discovery.discovered,
         failures = surface_discovery.failures.len(),
@@ -847,7 +1321,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         tools::ToolHostSnapshot::new(
             Arc::clone(&tools),
             Arc::new(tools::lsp_client::LspRegistry::new()),
-            Some(runtime_mcp_service),
+            Some(runtime_mcp_service.clone()),
         ),
     ));
     let gateway_runtime_tool_host = Arc::new(
@@ -878,6 +1352,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 evolution_executor,
             ),
         )));
+    let session_runtime_port = crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
     let mut runtime_services_builder =
         runtime::RuntimeServices::builder(&approval_dir, &workspace_root)
             .provider_registry(Arc::clone(&provider_registry))
@@ -903,7 +1378,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                     .policy
                     .mission_schedule
                     .clone(),
-            );
+            )
+            .session_query_port(session_runtime_port.clone())
+            .session_ingress_port(session_runtime_port.clone())
+            .session_journal_port(session_runtime_port.clone());
     let startup_skill_assets = crate::services::runtime_skill_assets_for_workspace(&workspace_root);
     runtime_services_builder =
         runtime_services_builder.skill_catalog(runtime::RuntimeSkillCatalog::new(
@@ -914,62 +1392,100 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         runtime_services_builder =
             runtime_services_builder.memory_manager(Arc::clone(memory_manager));
     }
-    if let Some(store) = unified_store.as_ref() {
-        runtime_services_builder = runtime_services_builder.session_store(Arc::clone(store));
-    }
-    let runtime_services = runtime_services_builder
-        .build()
-        .map_err(|error| format!("failed to initialize runtime services: {error}"))?;
-    evolution_runtime
+    let runtime_services = match runtime_services_builder.build() {
+        Ok(runtime_services) => runtime_services,
+        Err(error) => {
+            let error = format!("failed to initialize runtime services: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
+    startup_registry.runtime_services = Some(Arc::clone(&runtime_services));
+    if evolution_runtime
         .set(Arc::downgrade(&runtime_services))
-        .map_err(|_| "failed to bind Runtime evolution evaluation executor".to_string())?;
-    run_artifact_startup_migration(
-        &approval_dir,
-        &selected_storage.session_store,
-        &selected_storage.artifact_store,
-    )
-    .await?;
-    run_legacy_execution_startup_migration(&runtime_services, &approval_dir)?;
-    gateway_runtime_tool_host
-        .bind_runtime_services(Arc::clone(&runtime_services))
-        .map_err(|error| format!("failed to bind runtime services: {error}"))?;
-    let startup_recovery = runtime_services
-        .recover_execution_graphs_on_startup()
-        .await
-        .map_err(|error| format!("failed to recover execution graphs on startup: {error}"))?;
+        .is_err()
+    {
+        let error = "failed to bind Runtime evolution evaluation executor".to_string();
+        return Err(startup_registry.rollback(error).await);
+    }
+    if let Err(error) =
+        gateway_runtime_tool_host.bind_runtime_services(Arc::clone(&runtime_services))
+    {
+        let error = format!("failed to bind runtime services: {error}");
+        return Err(startup_registry.rollback(error).await);
+    }
+    let startup_recovery = match runtime_services.recover_execution_graphs_on_startup().await {
+        Ok(report) => report,
+        Err(error) => {
+            let error = format!("failed to recover execution graphs on startup: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
     emit_execution_startup_recovery(&startup_recovery);
-    let runtime_service = Arc::new(
-        RuntimeService::new(
-            sessions.clone(),
-            lease_registry.clone(),
-            session_kernel.clone(),
-            lifecycle_kernel.clone(),
-            started_at,
-            Arc::clone(&provider_registry),
-            Arc::clone(&upgrade_coordinator),
-            runtime_services,
-        )
-        .map_err(|error| format!("failed to initialize runtime session bridge: {error}"))?
-        .with_tool_host(tool_host)
-        .with_approval_gate(approval_gate.clone()),
+    let runtime_service = match RuntimeService::new_with_gateway_tasks(
+        sessions.clone(),
+        lease_registry.clone(),
+        session_runtime_port.clone(),
+        event_bus.clone(),
+        started_at,
+        Arc::clone(&provider_registry),
+        Arc::clone(&upgrade_coordinator),
+        Arc::clone(&runtime_services),
+        Arc::clone(&gateway_tasks),
+    ) {
+        Ok(runtime_service) => Arc::new(
+            runtime_service
+                .with_tool_host(tool_host)
+                .with_approval_gate(approval_gate.clone()),
+        ),
+        Err(error) => {
+            let error = format!("failed to initialize runtime session bridge: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
+    startup_registry.runtime_service = Some(Arc::clone(&runtime_service));
+    let session_activation = Arc::new(
+        crate::services::session_service::activation::SessionActivationCoordinator::new(
+            Arc::clone(&runtime_service),
+            Arc::clone(&session_repository),
+            Arc::clone(&presence_ledger),
+            Arc::clone(&lifecycle),
+            100,
+            config.session_recovery,
+        ),
     );
-    let session_bridge_store = unified_store.clone().ok_or_else(|| {
-        "durable UnifiedSessionStore is required for the Runtime session bridge".to_string()
-    })?;
-    let session_manager = Arc::new(crate::unified_session_manager::UnifiedSessionManager::new(
+    startup_registry.session_activation = Some(Arc::clone(&session_activation));
+    let session_service = Arc::new(crate::services::SessionService::new_unbound(
         Arc::clone(&runtime_service),
-        Arc::clone(&lifecycle),
-        100,
-        config.session_recovery,
+        Arc::clone(&session_activation),
     ));
-    let session_activation_port: Arc<dyn crate::runtime_service::SessionActivationPort> =
-        session_manager.clone();
-    runtime_service.install_session_activator(Arc::downgrade(&session_activation_port))?;
-    let session_runtime_bridge = crate::session_runtime_bridge::SessionRuntimeBridge::start(
-        Arc::clone(&runtime_service),
-        session_bridge_store,
-        Arc::clone(&event_bus),
-    )?;
+    startup_registry.session_service = Some(Arc::clone(&session_service));
+    if let Err(error) = session_runtime_port.bind(&session_service) {
+        return Err(startup_registry.rollback(error).await);
+    }
+    let listener = match TcpListener::bind(&config.http_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let error = format!("failed to bind HTTP {}: {error}", config.http_addr);
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
+    let session_worker_supervisor =
+        match crate::session_runtime_bridge::SessionWorkerSupervisor::start(
+            Arc::clone(&runtime_service),
+            Arc::clone(&session_service),
+            Arc::clone(&event_bus),
+        )
+        .await
+        {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                return Err(startup_registry.rollback(error).await);
+            }
+        };
+    startup_registry.session_worker_supervisor = Some(Arc::clone(&session_worker_supervisor));
+    if let Err(error) = session_service.install_supervisor(Arc::clone(&session_worker_supervisor)) {
+        return Err(startup_registry.rollback(error).await);
+    }
     let weak_runtime_service = Arc::downgrade(&runtime_service);
     upgrade_coordinator.register_collector(Arc::new(
         runtime::ClosureUpgradeInventoryCollector::new("active_turns", move || {
@@ -987,51 +1503,36 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
-    let services = crate::services::GatewayServices::new_with_session_manager_and_storage(
+    let services = crate::services::GatewayServices::new_with_bound_session_and_storage(
         Arc::clone(&runtime_service),
+        Arc::clone(&session_service),
         task_kernel.clone(),
         surface_host.clone(),
         cognitive.clone(),
         approval_gate.clone(),
         approval_ledger,
-        Arc::clone(&session_manager),
+        Arc::clone(&session_activation),
+        Arc::clone(&session_worker_supervisor),
         &approval_dir,
         capacity_config,
         Arc::clone(&selected_storage),
     );
-    let app_registry = crate::services::broker_backed_app_registry_with_storage(
+    let app_registry = match crate::services::broker_backed_app_registry_with_storage(
         services.app_host_context(),
         runtime_config.apps(),
         selected_storage.registry.clone(),
         selected_storage.app_topology.clone(),
-    )
-    .map_err(|error| format!("failed to provision enabled APP storage: {error}"))?;
-    let services = Arc::new(services.with_app_registry(app_registry));
-    let _cleanup_handle =
-        spawn_session_cleanup_task(Arc::clone(&session_manager), Duration::from_secs(300));
-    tokio::spawn(async move {
-        let summary = session_manager.recover_active_sessions().await;
-        tracing::info!(
-            discovered = summary.discovered,
-            metadata_loaded = summary.metadata_loaded,
-            required = summary.required,
-            attached = summary.attached,
-            recent = summary.recent,
-            recovered = summary.recovered,
-            already_active = summary.already_active,
-            failed = summary.failed,
-            hot_bytes = summary.hot_bytes,
-            "session startup recovery completed"
-        );
-        for failure in summary.failures {
-            tracing::warn!(error = %failure, "session startup recovery item failed");
+    ) {
+        Ok(registry) => registry,
+        Err(error) => {
+            let error = format!("failed to provision enabled APP storage: {error}");
+            return Err(startup_registry.rollback(error).await);
         }
-    });
-
+    };
+    let services = Arc::new(services.with_app_registry(app_registry));
     let app_state = Arc::new(api_routes::AppState {
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
-        event_bus: event_bus.clone(),
         static_webui: static_webui.clone(),
         approval_gate: Some(approval_gate),
         auth_token: config.auth_token.clone(),
@@ -1041,15 +1542,9 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         profile_manager,
         services,
         session_lease_registry: Some(lease_registry.clone()),
+        live_registry: Arc::new(api_routes::live_routes::LiveRegistry::new()),
     });
-    let mission_schedule_timer = spawn_runtime_schedule_timer(runtime_service.runtime_services());
     config_reload::initialize_config_reload_status(&config_reload, &app_state);
-    let _config_reload_watcher = config_reload::spawn_config_reload_watcher(
-        config_reload,
-        app_state.clone(),
-        Duration::from_secs(2),
-    );
-    crate::surface_host::spawn_surface_ingress_dispatcher(app_state.clone());
 
     // 2. Build HTTP router (reuse api_routes + SSE)
     let app = {
@@ -1100,10 +1595,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     };
 
-    // 3. HTTP listener
-    let listener = TcpListener::bind(&config.http_addr)
-        .await
-        .map_err(|e| format!("failed to bind HTTP {}: {}", config.http_addr, e))?;
+    // 3. HTTP listener was bound before worker startup so bind failure cannot
+    // strand a running supervisor.
     tracing::info!("HTTP + SSE on {}", config.http_addr);
 
     if let Err(e) = std::fs::write(
@@ -1116,102 +1609,142 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     // 4. Edge surfaces/connectors are discovered and represented in SurfaceHost.
     // External sidecar process launch is driven by edge requests, not by runtime boot.
 
-    // 5. HTTP server with graceful shutdown on SIGINT/SIGTERM
-    let (shutdown_started_tx, mut shutdown_started_rx) = tokio::sync::watch::channel(false);
-    let shutdown_signal = async move {
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(signal) => signal,
-                    Err(error) => {
-                        tracing::error!("failed to install SIGTERM handler: {error}");
-                        return;
-                    }
-                };
-            let mut sigint =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                    Ok(signal) => signal,
-                    Err(error) => {
-                        tracing::error!("failed to install SIGINT handler: {error}");
-                        return;
-                    }
-                };
+    // 5. Start every Gateway-owned background task behind one admission and
+    // shutdown owner. Any partial startup failure falls through to the same
+    // cleanup path as SIGINT/SIGTERM.
+    let (server_result_tx, server_result_rx) = tokio::sync::oneshot::channel();
+    let background_start = (|| -> Result<(), String> {
+        surface_host.start_monitor()?;
+        spawn_event_loop_lag_probe(Arc::clone(&gateway_tasks))?;
+        spawn_runtime_schedule_timer(
+            runtime_service.runtime_services(),
+            Arc::clone(&gateway_tasks),
+        )?;
+        config_reload::spawn_config_reload_watcher(
+            config_reload,
+            app_state.clone(),
+            Duration::from_secs(2),
+            Arc::clone(&gateway_tasks),
+        )
+        .map_err(|error| format!("failed to start config reload watcher: {error}"))?;
+        crate::surface_host::spawn_surface_ingress_dispatcher(
+            app_state.clone(),
+            Arc::clone(&gateway_tasks),
+        )
+        .map_err(|error| format!("failed to start surface ingress dispatcher: {error}"))?;
+        gateway_tasks
+            .spawn(
+                GatewayTaskKind::HttpServer,
+                None,
+                move |cancellation| async move {
+                    let shutdown = async move {
+                        cancellation.cancelled().await;
+                    };
+                    let result = axum::serve(listener, app)
+                        .with_graceful_shutdown(shutdown)
+                        .await;
+                    let _ = server_result_tx.send(result);
+                },
+            )
+            .map_err(|error| format!("failed to start HTTP server: {error}"))?;
+        Ok(())
+    })();
+
+    let serve_result = match background_start {
+        Err(error) => Err(error),
+        Ok(()) => {
             tokio::select! {
-                _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
-                _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => tracing::info!("shutdown signal received"),
-                Err(error) => tracing::error!("failed to install ctrl_c handler: {error}"),
-            }
-        }
-        let _ = shutdown_started_tx.send(true);
-    };
-
-    let mut server = Box::pin(
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal)
-            .into_future(),
-    );
-    let serve_result = tokio::select! {
-        result = &mut server => result,
-        changed = shutdown_started_rx.changed() => {
-            if changed.is_err() || !*shutdown_started_rx.borrow() {
-                server.await
-            } else {
-                const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-                match tokio::time::timeout(GRACEFUL_SHUTDOWN_TIMEOUT, &mut server).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(
-                            timeout_ms = GRACEFUL_SHUTDOWN_TIMEOUT.as_millis(),
-                            "Gateway graceful shutdown deadline expired; closing long-lived HTTP/SSE connections"
-                        );
-                        Ok(())
-                    }
-                }
+                signal = wait_for_shutdown_signal() => signal,
+                result = server_result_rx => match result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(format!("HTTP server error: {error}")),
+                    Err(_) => Err("HTTP server task exited without a completion result".to_string()),
+                },
             }
         }
     };
-    serve_result.map_err(|e| format!("HTTP server error: {e}"))?;
-
     // ── Cleanup after shutdown ──
     tracing::info!("cleaning up runtime host resources...");
-
-    session_runtime_bridge.shutdown().await;
-    mission_schedule_timer.abort();
-    let _ = mission_schedule_timer.await;
-    if let Some(broker) = auth_broker.as_mut() {
-        broker.shutdown();
-    }
-
-    surface_host
-        .shutdown()
-        .await
-        .map_err(|error| format!("surface host shutdown incomplete: {error}"))?;
-    tracing::info!("surface host shutdown complete");
-
+    let shutdown_report = startup_registry
+        .shutdown(
+            serve_result
+                .as_ref()
+                .err()
+                .cloned()
+                .map(|error| ("runtime_failure", error)),
+        )
+        .await;
     // PID file is cleaned up by PidFileGuard drop
-    tracing::info!("runtime host shutdown complete");
+    tracing::info!(
+        phases = ?shutdown_report.phases,
+        active_turns_cancelled = shutdown_report
+            .active_turns
+            .as_ref()
+            .map_or(0, |report| report.cancelled),
+        active_turns_remaining = shutdown_report
+            .active_turns
+            .as_ref()
+            .map_or(0, |report| report.remaining_turn_ids.len()),
+        memory_forced_aborts = shutdown_report
+            .memory
+            .as_ref()
+            .map_or(0, |report| report.forced_aborts),
+        tasks_joined = shutdown_report.tasks.joined,
+        tasks_forced_aborts = shutdown_report.tasks.forced_aborts,
+        failures = shutdown_report.failures.len(),
+        "runtime host shutdown complete"
+    );
+    if shutdown_report.failures.is_empty() {
+        Ok(())
+    } else {
+        Err(shutdown_report.failures.join("; "))
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|error| format!("failed to install SIGTERM handler: {error}"))?;
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|error| format!("failed to install SIGINT handler: {error}"))?;
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received, shutting down"),
+            _ = sigint.recv() => tracing::info!("SIGINT received, shutting down"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|error| format!("failed to install ctrl_c handler: {error}"))?;
+        tracing::info!("shutdown signal received");
+    }
     Ok(())
 }
 
-fn spawn_event_loop_lag_probe() {
-    tokio::spawn(async {
-        let interval = Duration::from_millis(250);
-        loop {
-            let started = Instant::now();
-            tokio::time::sleep(interval).await;
-            runtime::execution_core::performance::observe_duration(
-                "event_loop_lag_ms",
-                started.elapsed().saturating_sub(interval),
-            );
-        }
-    });
+fn spawn_event_loop_lag_probe(tasks: Arc<GatewayRuntimeTaskSet>) -> Result<u64, String> {
+    tasks
+        .spawn(
+            GatewayTaskKind::EventLoopProbe,
+            None,
+            |cancellation| async move {
+                let interval = Duration::from_millis(250);
+                loop {
+                    let started = Instant::now();
+                    tokio::select! {
+                        _ = cancellation.cancelled() => break,
+                        _ = tokio::time::sleep(interval) => {
+                            runtime::execution_core::performance::observe_duration(
+                                "event_loop_lag_ms",
+                                started.elapsed().saturating_sub(interval),
+                            );
+                        }
+                    }
+                }
+            },
+        )
+        .map_err(|error| format!("failed to start event-loop lag probe: {error}"))
 }
 
 /// The timer is an event source only. It claims due Mission schedules and
@@ -1220,30 +1753,43 @@ fn spawn_event_loop_lag_probe() {
 /// ownership of all execution state, retry and terminal transitions.
 fn spawn_runtime_schedule_timer(
     runtime_services: Arc<runtime::RuntimeServices>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let policy = runtime_services.mission_schedule_policy();
-            if policy.enabled {
-                if let Err(error) = runtime_services
-                    .dispatch_due_mission_schedules(epoch_millis())
-                    .await
-                {
-                    tracing::warn!(%error, "mission schedule timer dispatch failed");
+    tasks: Arc<GatewayRuntimeTaskSet>,
+) -> Result<u64, String> {
+    tasks
+        .spawn(GatewayTaskKind::MissionSchedule, None, move |cancellation| async move {
+            loop {
+                let policy = runtime_services.mission_schedule_policy();
+                if policy.enabled {
+                    let dispatch = runtime_services.dispatch_due_mission_schedules(epoch_millis());
+                    tokio::select! {
+                        _ = cancellation.cancelled() => break,
+                        result = dispatch => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "mission schedule timer dispatch failed");
+                            }
+                        }
+                    }
+                }
+                // Managed Agents have independent trigger definitions. They do
+                // not become inert merely because Mission scheduling is disabled;
+                // the existing interval is only the shared wake-up cadence.
+                let dispatch =
+                    runtime_services.dispatch_managed_agents("gateway-runtime-scheduler", 16);
+                tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    result = dispatch => {
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "managed Agent timer dispatch failed");
+                        }
+                    }
+                }
+                tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(policy.tick_interval_ms)) => {}
                 }
             }
-            // Managed Agents have independent trigger definitions. They do
-            // not become inert merely because Mission scheduling is disabled;
-            // the existing interval is only the shared wake-up cadence.
-            if let Err(error) = runtime_services
-                .dispatch_managed_agents("gateway-runtime-scheduler", 16)
-                .await
-            {
-                tracing::warn!(%error, "managed Agent timer dispatch failed");
-            }
-            tokio::time::sleep(Duration::from_millis(policy.tick_interval_ms)).await;
-        }
-    })
+        })
+        .map_err(|error| format!("failed to start Mission schedule timer: {error}"))
 }
 
 fn epoch_millis() -> u64 {
@@ -1251,86 +1797,6 @@ fn epoch_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn run_legacy_execution_startup_migration(
-    runtime_services: &Arc<runtime::RuntimeServices>,
-    config_home: &std::path::Path,
-) -> Result<(), String> {
-    let migration_root = config_home.join("migrations");
-    let legacy_inventory = migration_root.join("v3-active-inventory.json");
-    let legacy_receipt = migration_root.join("v3-clean-shutdown-receipt.json");
-    if !legacy_inventory.exists() && !legacy_receipt.exists() {
-        return Ok(());
-    }
-    runtime_services
-        .import_legacy_execution_receipt(&legacy_receipt, env!("CARGO_PKG_VERSION"))
-        .map_err(|error| format!("legacy execution migration failed; startup blocked: {error}"))
-}
-
-async fn run_artifact_startup_migration(
-    config_home: &Path,
-    session_store: &Arc<memory::UnifiedSessionStore>,
-    artifact_store: &Arc<runtime::ArtifactStore>,
-) -> Result<(), String> {
-    let resource_store = runtime::ResourceStore::from_artifact_store(
-        config_home,
-        Arc::clone(artifact_store),
-        runtime::ResourceCapabilityIndex::default(),
-    );
-    let resource_report =
-        resource_store.migrate_legacy_resources(runtime::ResourceMigrationOptions {
-            dry_run: false,
-            resume_after: None,
-            limit: usize::MAX,
-        });
-    let evidence_report = runtime::migrate_legacy_raw_evidence(
-        Arc::clone(session_store),
-        Arc::clone(artifact_store),
-        runtime::RawEvidenceMigrationOptions {
-            dry_run: false,
-            resume_after_session: None,
-            session_limit: usize::MAX,
-        },
-    )
-    .await;
-    let report = serde_json::json!({
-        "schema": "cowd.artifact-migration.v1",
-        "completed_at_ms": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or_default(),
-        "resource": resource_report,
-        "raw_evidence": evidence_report,
-    });
-    let migration_root = config_home.join("migrations");
-    std::fs::create_dir_all(&migration_root)
-        .map_err(|error| format!("create artifact migration report directory: {error}"))?;
-    let report_path = migration_root.join("artifact-v1-report.json");
-    let staging_path = migration_root.join("artifact-v1-report.json.pending");
-    std::fs::write(
-        &staging_path,
-        serde_json::to_vec_pretty(&report)
-            .map_err(|error| format!("encode artifact migration report: {error}"))?,
-    )
-    .map_err(|error| format!("write artifact migration report: {error}"))?;
-    std::fs::rename(&staging_path, &report_path)
-        .map_err(|error| format!("publish artifact migration report: {error}"))?;
-    let resource_complete = report["resource"]["complete"].as_bool().unwrap_or(false);
-    let evidence_complete = report["raw_evidence"]["complete"]
-        .as_bool()
-        .unwrap_or(false);
-    if !resource_complete || !evidence_complete {
-        return Err(format!(
-            "artifact migration is incomplete; inspect {}",
-            report_path.display()
-        ));
-    }
-    tracing::info!(
-        path = %report_path.display(),
-        "artifact and raw-evidence migration gate passed"
-    );
-    Ok(())
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -1341,6 +1807,7 @@ mod tests {
     use mcp::McpService;
     use memory::MemoryConfig;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn temp_webui_dir(label: &str) -> std::path::PathBuf {
         let unique = format!(
@@ -1395,32 +1862,122 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[test]
-    fn startup_migration_missing_receipt_fails_and_blocks_runtime_mutation() {
-        let root = temp_webui_dir("migration-missing-receipt");
-        let workspace = root.join("workspace");
-        let config_home = root.join("home");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(config_home.join("migrations")).unwrap();
-        fs::write(
-            config_home
-                .join("migrations")
-                .join("v3-active-inventory.json"),
-            b"{}",
-        )
-        .unwrap();
-        let services = runtime::RuntimeServices::builder(&config_home, &workspace)
-            .build()
-            .unwrap();
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn complete_shutdown_followers_wait_for_one_immutable_report() {
+        let tasks = GatewayRuntimeTaskSet::new(Duration::from_secs(1));
+        let coordinator = GatewayRuntimeShutdownCoordinator::new(Arc::clone(&tasks));
+        let executions = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut callers = Vec::new();
 
-        let result = run_legacy_execution_startup_migration(&services, &config_home);
+        for _ in 0..12 {
+            let coordinator = Arc::clone(&coordinator);
+            let body_coordinator = Arc::clone(&coordinator);
+            let executions = Arc::clone(&executions);
+            let release = Arc::clone(&release);
+            callers.push(tokio::spawn(async move {
+                coordinator
+                    .coordinate(move || async move {
+                        executions.fetch_add(1, Ordering::SeqCst);
+                        body_coordinator.publish("drain_active_turns", &[]);
+                        release
+                            .acquire()
+                            .await
+                            .expect("shutdown test permit")
+                            .forget();
+                        let tasks = body_coordinator.gateway_tasks.shutdown().await;
+                        GatewayRuntimeShutdownReport {
+                            phases: vec![
+                                "stop_accepting".to_string(),
+                                "drain_active_turns".to_string(),
+                                "drain_task_set".to_string(),
+                            ],
+                            failures: Vec::new(),
+                            active_turns: None,
+                            memory: None,
+                            tasks,
+                        }
+                    })
+                    .await
+            }));
+        }
 
-        assert!(result.unwrap_err().contains("startup blocked"));
-        assert!(matches!(
-            services.ensure_mutation_allowed(),
-            Err(runtime::RuntimeServicesError::UpgradeRecoveryRequired)
-        ));
-        let _ = fs::remove_dir_all(root);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while executions.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one shutdown leader should start");
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(callers.iter().all(|caller| !caller.is_finished()));
+        assert_eq!(tasks.health().shutdown_phase, "drain_active_turns");
+
+        release.add_permits(1);
+        let mut reports = Vec::new();
+        for caller in callers {
+            reports.push(caller.await.expect("shutdown caller"));
+        }
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(reports.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(tasks.health().shutdown_phase, "closed");
+    }
+
+    #[tokio::test]
+    async fn startup_failure_uses_the_complete_coordinator_and_stays_observable() {
+        let tasks = GatewayRuntimeTaskSet::new(Duration::from_secs(1));
+        let coordinator = GatewayRuntimeShutdownCoordinator::new(Arc::clone(&tasks));
+        let registry = GatewayRuntimeStartupRegistry::new(Arc::clone(&coordinator));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_in_task = Arc::clone(&cancelled);
+        tasks
+            .spawn(
+                GatewayTaskKind::ConfigReload,
+                None,
+                move |token| async move {
+                    token.cancelled().await;
+                    cancelled_in_task.store(true, Ordering::SeqCst);
+                },
+            )
+            .expect("startup task");
+
+        let first_error = registry
+            .rollback("injected startup failure".to_string())
+            .await;
+        let first = coordinator
+            .completed_report()
+            .expect("startup rollback report");
+        let second = registry
+            .shutdown(Some((
+                "runtime_failure",
+                "follower must not replace the report".to_string(),
+            )))
+            .await;
+
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(first_error, "injected startup failure");
+        assert_eq!(first, second);
+        assert_eq!(
+            first.phases,
+            vec![
+                "startup_rollback",
+                "stop_accepting",
+                "drain_ingress",
+                "drain_surface",
+                "drain_live_eval",
+                "drain_active_turns",
+                "drain_session_workers",
+                "unload_sessions",
+                "drain_runtime",
+                "drain_session_repository",
+                "drain_task_set",
+            ]
+        );
+        let health = tasks.health();
+        assert_eq!(health.shutdown_phase, "closed_with_failures");
+        assert_eq!(health.shutdown_failures, vec!["injected startup failure"]);
+        assert_eq!(health.active, 0);
     }
 
     #[tokio::test]

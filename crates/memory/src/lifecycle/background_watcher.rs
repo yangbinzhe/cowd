@@ -48,9 +48,33 @@ impl Default for BackgroundWatcherConfig {
 /// OR when the receiving end of the KG rebuild channel is closed.
 #[must_use = "The watcher thread stops when this handle is dropped"]
 pub struct BackgroundWatcherHandle {
-    /// Signals the watcher thread to exit.  Dropping this sender causes
-    /// the thread to wake at the next loop iteration and clean up.
-    _stop: tokio::sync::oneshot::Sender<()>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BackgroundWatcherHandle {
+    /// Stop and synchronously reap the watcher thread.
+    pub fn shutdown(mut self) -> Result<(), String> {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            join.join()
+                .map_err(|_| "background watcher thread panicked".to_string())?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BackgroundWatcherHandle {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +143,10 @@ impl BackgroundWatcher {
             tracing::debug!(
                 "background_watcher: memory/watch feature disabled; watcher not started"
             );
-            BackgroundWatcherHandle { _stop: stop_tx }
+            BackgroundWatcherHandle {
+                stop: Some(stop_tx),
+                join: None,
+            }
         }
 
         #[cfg(feature = "watch")]
@@ -127,7 +154,7 @@ impl BackgroundWatcher {
             let poll_interval = Duration::from_secs(config.poll_interval_secs);
             let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
 
-            std::thread::Builder::new()
+            let join = std::thread::Builder::new()
             .name("bg-fs-watcher".into())
             .spawn(move || {
                 let (tx, rx) = std::sync::mpsc::channel();
@@ -231,7 +258,10 @@ impl BackgroundWatcher {
             })
             .expect("failed to spawn background watcher thread");
 
-            BackgroundWatcherHandle { _stop: stop_tx }
+            BackgroundWatcherHandle {
+                stop: Some(stop_tx),
+                join: Some(join),
+            }
         }
     }
 

@@ -230,14 +230,7 @@ async fn send_message(
     Json(body): Json<SendMessageRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let ingress_started = std::time::Instant::now();
-    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "runtime service unavailable".to_string(),
-            }),
-        )
-    })?;
+    let session_service = &state.services.session;
     let session_exists = state
         .services
         .session
@@ -251,7 +244,7 @@ async fn send_message(
                 }),
             )
         })?;
-    if session_exists || runtime_service.has_active_session(&id) {
+    if session_exists || session_service.has_active_session(&id) {
         authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     }
     super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
@@ -260,28 +253,19 @@ async fn send_message(
     // still restore a cold session before ingress; conversely the foreign
     // check above runs before activation so a guessed id cannot warm or
     // mutate another principal's session.
-    if !runtime_service.has_active_session(&id) {
-        let mut request = crate::unified_session_manager::EnsureSessionRequest::new(
+    if !session_service.has_active_session(&id) {
+        let mut request = crate::services::EnsureSessionRequest::new(
             &id,
             None,
-            crate::unified_session_manager::SessionSource::WebUi,
+            crate::services::SessionSource::WebUi,
         );
         request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
         request.allow_legacy_owner_migration = principal.0.is_human_interactive()
             && principal.0.has_capability("runtime.maintenance.manage");
         state
             .services
-            .session_manager
-            .as_ref()
-            .ok_or_else(|| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse {
-                        error: "unified session manager unavailable".to_string(),
-                    }),
-                )
-            })?
-            .ensure_session(request)
+            .session
+            .activate_existing_session(request)
             .await
             .map_err(|error| {
                 (
@@ -292,8 +276,6 @@ async fn send_message(
                 )
             })?;
     }
-
-    let runtime_service = runtime_service.clone();
 
     tracing::info!(
         %id,
@@ -311,15 +293,13 @@ async fn send_message(
 
     let session_id = id.clone();
     let run_id = uuid::Uuid::new_v4().to_string();
-    let active_projection = runtime_service
-        .session_input_projection(&session_id)
+    let active_projection = session_service
+        .input_projection(&session_id)
         .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
+                Json(ErrorResponse { error }),
             )
         })?;
     let observer_id = headers
@@ -353,15 +333,13 @@ async fn send_message(
     {
         envelope = envelope.with_idempotency_key(idempotency_key.trim().to_string());
     }
-    let admission = runtime_service
-        .admit_session_input_with_materialized(envelope)
+    let admission = session_service
+        .admit_input(envelope)
         .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
+                Json(ErrorResponse { error }),
             )
         })?;
     let execution_graph_id = admission.execution_graph_id;
@@ -369,12 +347,9 @@ async fn send_message(
     let turn_id = admission.turn_id;
     let materialized = admission.materialized;
     let receipt = admission.receipt;
-    let projection = runtime_service
-        .session_input_projection(&session_id)
-        .await
-        .ok();
-    let inbox = runtime_service
-        .active_turn_inbox(&session_id, receipt.active_turn_id.clone())
+    let projection = session_service.input_projection(&session_id).await.ok();
+    let inbox = session_service
+        .turn_inbox(&session_id, receipt.active_turn_id.clone())
         .await
         .ok();
     let response = serde_json::json!({
@@ -414,23 +389,15 @@ async fn get_session_input_projection(
     Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
-    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "runtime service unavailable".to_string(),
-            }),
-        )
-    })?;
-    let projection = runtime_service
-        .session_input_projection(&id)
+    let projection = state
+        .services
+        .session
+        .input_projection(&id)
         .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
+                Json(ErrorResponse { error }),
             )
         })?;
     Ok(Json(projection))
@@ -443,24 +410,16 @@ async fn get_turn_inbox(
     Query(params): Query<TurnInboxParams>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
-    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "runtime service unavailable".to_string(),
-            }),
-        )
-    })?;
     let turn_id = params.turn_id.map(TurnId::from_string);
-    let inbox = runtime_service
-        .active_turn_inbox(&id, turn_id)
+    let inbox = state
+        .services
+        .session
+        .turn_inbox(&id, turn_id)
         .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
+                Json(ErrorResponse { error }),
             )
         })?;
     Ok(Json(inbox))
@@ -472,23 +431,15 @@ async fn get_turn_inbox_by_path(
     Extension(principal): Extension<AuthenticatedPrincipal>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
-    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "runtime service unavailable".to_string(),
-            }),
-        )
-    })?;
-    let inbox = runtime_service
-        .active_turn_inbox(&id, Some(TurnId::from_string(turn_id)))
+    let inbox = state
+        .services
+        .session
+        .turn_inbox(&id, Some(TurnId::from_string(turn_id)))
         .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
+                Json(ErrorResponse { error }),
             )
         })?;
     Ok(Json(inbox))
@@ -503,47 +454,38 @@ async fn cancel_session_input(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
-    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "runtime service unavailable".to_string(),
-            }),
-        )
-    })?;
+    let session_service = &state.services.session;
     let reason = body
         .reason
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("cancelled by user");
-    let input = runtime_service
-        .cancel_session_input(&id, SessionInputId::from_string(input_id), reason)
+    let input = session_service
+        .cancel_input(&id, SessionInputId::from_string(input_id), reason)
         .await
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
+                Json(ErrorResponse { error }),
             )
         })?;
     let mut projection_warnings = Vec::new();
-    let projection = match runtime_service.session_input_projection(&id).await {
+    let projection = match session_service.input_projection(&id).await {
         Ok(projection) => Some(projection),
         Err(error) => {
             projection_warnings.push(serde_json::json!({
                 "projection": "input_projection",
-                "error": error.message(),
+                "error": error,
             }));
             None
         }
     };
-    let inbox = match runtime_service.active_turn_inbox(&id, None).await {
+    let inbox = match session_service.turn_inbox(&id, None).await {
         Ok(inbox) => Some(inbox),
         Err(error) => {
             projection_warnings.push(serde_json::json!({
                 "projection": "turn_inbox",
-                "error": error.message(),
+                "error": error,
             }));
             None
         }
@@ -568,21 +510,14 @@ async fn reclassify_session_input(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
     super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
-    let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "runtime service unavailable".to_string(),
-            }),
-        )
-    })?;
+    let session_service = &state.services.session;
     let reason = body
         .reason
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("manual route override");
-    let input = runtime_service
-        .reclassify_session_input(
+    let input = session_service
+        .reclassify_input(
             &id,
             SessionInputId::from_string(input_id),
             body.decision,
@@ -592,28 +527,26 @@ async fn reclassify_session_input(
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: error.message(),
-                }),
+                Json(ErrorResponse { error }),
             )
         })?;
     let mut projection_warnings = Vec::new();
-    let projection = match runtime_service.session_input_projection(&id).await {
+    let projection = match session_service.input_projection(&id).await {
         Ok(projection) => Some(projection),
         Err(error) => {
             projection_warnings.push(serde_json::json!({
                 "projection": "input_projection",
-                "error": error.message(),
+                "error": error,
             }));
             None
         }
     };
-    let inbox = match runtime_service.active_turn_inbox(&id, None).await {
+    let inbox = match session_service.turn_inbox(&id, None).await {
         Ok(inbox) => Some(inbox),
         Err(error) => {
             projection_warnings.push(serde_json::json!({
                 "projection": "turn_inbox",
-                "error": error.message(),
+                "error": error,
             }));
             None
         }
@@ -877,10 +810,11 @@ pub(super) async fn cleanup_revoked_session_stream_authority(
 }
 
 pub(super) fn stream_durable_cursor(data: &str) -> Option<u64> {
-    serde_json::from_str::<serde_json::Value>(data)
-        .ok()?
-        .get("runtime_commit_cursor")?
-        .as_u64()
+    stream_durable_cursor_value(&serde_json::from_str::<serde_json::Value>(data).ok()?)
+}
+
+pub(super) fn stream_durable_cursor_value(data: &serde_json::Value) -> Option<u64> {
+    data.get("runtime_commit_cursor")?.as_u64()
 }
 
 pub(super) async fn replay_materialized_terminal_events(
@@ -1031,6 +965,12 @@ mod tests {
             payload_ref: "assistant_json:\"completed\"".to_string(),
             execution_id: Some("execution-1".to_string()),
             turn_id: Some("turn-1".to_string()),
+            request_id: Some("request-1".to_string()),
+            session_generation: Some(1),
+            input_sequence: Some(1),
+            input_claim_owner: Some("worker-1".to_string()),
+            input_claim_token: Some("claim-1".to_string()),
+            input_claim_revision: Some(1),
             status: "materialized".to_string(),
             attempts: 1,
             next_attempt_at_ms: None,
@@ -1063,9 +1003,9 @@ mod tests {
         state
             .services
             .session
-            .unified_store()
-            .expect("test session store")
-            .create_session(&crate::api_routes::new_api_session_record(session_id, None))
+            .create_stored_session_for_tests(&crate::api_routes::new_api_session_record(
+                session_id, None,
+            ))
             .await
             .expect("create test session");
         for (actor, surface) in [(revoked_actor, "tui"), (surviving_actor, "web")] {

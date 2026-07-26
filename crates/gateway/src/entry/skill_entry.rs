@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::command::slash::SkillSlashDispatch;
-use crate::services::GatewayServices;
+use crate::services::{embedded_app_registry, GatewayAppHostBinding, SkillService};
 
 pub(crate) fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option<String> {
     let bare_first_token = trimmed.split_whitespace().next().unwrap_or_default();
@@ -13,11 +13,10 @@ pub(crate) fn try_resolve_bare_skill_prompt(cwd: &Path, trimmed: &str) -> Option
     if !looks_like_skill_name {
         return None;
     }
-    let services = GatewayServices::baseline();
-    match services
-        .skill
-        .resolve_invocation(cwd, services.app_registry.as_ref(), Some(trimmed))
-    {
+    let app_host = GatewayAppHostBinding::new();
+    let app_registry =
+        embedded_app_registry(&runtime::cowd_dirs::config_home_dir(), app_host.context());
+    match SkillService::new().resolve_invocation(cwd, &app_registry, Some(trimmed)) {
         Ok(SkillSlashDispatch::Invoke(prompt)) => Some(prompt),
         _ => None,
     }

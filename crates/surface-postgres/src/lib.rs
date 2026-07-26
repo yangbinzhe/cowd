@@ -19,8 +19,8 @@ use surface::{
     normalize_surface_id, SurfaceDeliveryEvent, SurfaceFrame, SurfaceInboxReceipt,
     SurfaceInboxRecord, SurfaceIngressClaim, SurfaceIngressFrameRecord, SurfaceMessageLedger,
     SurfaceMessageLedgerMigrationSnapshot, SurfaceMessageSnapshot, SurfaceOperationResult,
-    SurfaceOutboxRecord, SurfaceSendRequest, SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord,
-    SurfaceTurnCorrelation,
+    SurfaceOutboxRecord, SurfaceSendRequest, SurfaceSessionProjectionDraft,
+    SurfaceTriggerEventReceipt, SurfaceTriggerEventRecord, SurfaceTurnCorrelation,
 };
 
 const DOMAIN: &str = "surface_message";
@@ -272,11 +272,12 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         session: &str,
         thread: Option<String>,
         sender: Option<String>,
+        projections: &[SurfaceSessionProjectionDraft],
     ) -> Result<SurfaceInboxReceipt, String> {
         let surface = normalize_surface_id(surface);
         let key = inbound_key(&surface, message_id);
         let now = now_ms();
-        let record = SurfaceInboxRecord {
+        let mut record = SurfaceInboxRecord {
             id: key.clone(),
             surface: surface.clone(),
             message_id: message_id.to_string(),
@@ -292,13 +293,18 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
             runtime_session_id: Some(session.to_string()),
             runtime_turn_id: None,
             correlation: None,
+            session_projections: Vec::new(),
             last_error: None,
         };
+        record.stage_session_projections(projections)?;
         let mut connection = self.executor.checkout_runtime().map_err(stringify)?;
         let mut tx = connection.transaction().map_err(stringify)?;
         let inserted = tx.execute("INSERT INTO surface_inbox(record_key,surface,status,next_retry_at_ms,updated_at_ms,record_json) VALUES($1,$2,$3,NULL,$4,$5) ON CONFLICT(record_key) DO NOTHING", &[&key,&surface,&record.status,&now,&serde_json::to_value(&record).map_err(stringify)?]).map_err(stringify)?;
         if inserted == 0 {
-            let existing = inbox_for_update(&mut tx, &key)?;
+            let mut existing = inbox_for_update(&mut tx, &key)?;
+            existing.stage_session_projections(projections)?;
+            existing.updated_at_ms = now_ms();
+            store_inbox(&mut tx, &existing)?;
             tx.commit().map_err(stringify)?;
             return Ok(SurfaceInboxReceipt {
                 record: existing,
@@ -320,10 +326,15 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         })
     }
 
-    fn mark_inbox_processing(&self, key: &str) -> Result<(), String> {
+    fn mark_inbox_processing(
+        &self,
+        key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
         self.update_inbox(
             key,
             |r| {
+                r.stage_session_projections(projections)?;
                 r.status = "processing".into();
                 r.last_error = None;
                 Ok(())
@@ -347,10 +358,16 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         )
         .map(|_| ())
     }
-    fn mark_inbox_admitted(&self, key: &str, c: SurfaceTurnCorrelation) -> Result<(), String> {
+    fn mark_inbox_admitted(
+        &self,
+        key: &str,
+        c: SurfaceTurnCorrelation,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
         self.update_inbox(
             key,
             |r| {
+                r.stage_session_projections(projections)?;
                 r.status = "processed".into();
                 r.runtime_session_id = Some(c.session_id.clone());
                 r.runtime_turn_id = Some(c.turn_id.clone());
@@ -380,15 +397,58 @@ impl SurfaceMessageLedger for PostgresSurfaceMessageLedger {
         )
         .map(|_| ())
     }
-    fn mark_inbox_replied(&self, key: &str) -> Result<(), String> {
+    fn mark_inbox_replied(
+        &self,
+        key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
         self.update_inbox(
             key,
             |r| {
+                r.stage_session_projections(projections)?;
                 r.status = "replied".into();
                 r.last_error = None;
                 Ok(())
             },
             "replied",
+        )
+        .map(|_| ())
+    }
+    fn mark_inbox_projection_applied(
+        &self,
+        key: &str,
+        event_id: &str,
+        projected_at_ms: i64,
+    ) -> Result<(), String> {
+        self.update_inbox(
+            key,
+            |record| record.mark_session_projection_applied(event_id, projected_at_ms),
+            "projection_applied",
+        )
+        .map(|_| ())
+    }
+    fn stage_inbox_projections(
+        &self,
+        key: &str,
+        projections: &[SurfaceSessionProjectionDraft],
+    ) -> Result<(), String> {
+        self.update_inbox(
+            key,
+            |record| record.stage_session_projections(projections),
+            "projection_staged",
+        )
+        .map(|_| ())
+    }
+    fn mark_inbox_projection_failed(
+        &self,
+        key: &str,
+        event_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        self.update_inbox(
+            key,
+            |record| record.mark_session_projection_failed(event_id, error),
+            "projection_pending",
         )
         .map(|_| ())
     }
@@ -1480,6 +1540,18 @@ mod tests {
         }
     }
 
+    fn session_projection(phase: &str) -> SurfaceSessionProjectionDraft {
+        SurfaceSessionProjectionDraft {
+            phase: phase.to_string(),
+            session_id: "session-1".to_string(),
+            scope: "message".to_string(),
+            kind: format!("surface.message_{phase}"),
+            status: phase.to_string(),
+            payload_json: serde_json::json!({"type": phase, "message_id": "message-1"}),
+            phase_offset_ms: 0,
+        }
+    }
+
     /// The only live-database adapter test.  It is opt-in so ordinary unit
     /// test runs never use ambient connection credentials.
     #[test]
@@ -1533,6 +1605,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        let received_projection = session_projection("received");
         let received = contract
             .record_inbox_received(
                 "feishu",
@@ -1541,6 +1614,7 @@ mod tests {
                 "session-1",
                 Some("thread-1".to_string()),
                 Some("user-1".to_string()),
+                std::slice::from_ref(&received_projection),
             )
             .unwrap();
         assert!(!received.duplicate);
@@ -1553,21 +1627,42 @@ mod tests {
                     "session-1",
                     None,
                     None,
+                    std::slice::from_ref(&received_projection),
                 )
                 .unwrap()
                 .duplicate
         );
         let inbox_key = received.record.idempotency_key;
-        contract.mark_inbox_processing(&inbox_key).unwrap();
+        let event_id = received.record.session_projections[0].event_id.clone();
+        contract
+            .mark_inbox_projection_applied(&inbox_key, &event_id, 42)
+            .unwrap();
+        contract
+            .mark_inbox_processing(&inbox_key, &[session_projection("resources")])
+            .unwrap();
         contract
             .mark_inbox_processed(&inbox_key, Some("turn-1".to_string()))
             .unwrap();
         contract
-            .mark_inbox_admitted(&inbox_key, correlation())
+            .mark_inbox_admitted(&inbox_key, correlation(), &[])
             .unwrap();
         contract
             .record_inbox_terminal_delivery(&inbox_key, "terminal-1")
             .unwrap();
+        let durable_inbox = contract
+            .list_all_inbox()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.idempotency_key == inbox_key)
+            .expect("durable inbox");
+        assert_eq!(durable_inbox.session_projections.len(), 2);
+        let received_projection = durable_inbox
+            .session_projections
+            .iter()
+            .find(|projection| projection.phase == "received")
+            .expect("received projection");
+        assert_eq!(received_projection.event_id, event_id);
+        assert_eq!(received_projection.projection_state, "applied");
 
         let trigger = trigger_event("contract");
         assert!(
@@ -1697,6 +1792,7 @@ mod tests {
                 "copy-session",
                 None,
                 None,
+                &[],
             )
             .unwrap();
         source

@@ -1,18 +1,24 @@
 //! Complete durable session backend contract.
 //!
-//! Application code keeps using [`crate::session_store::UnifiedSessionStore`].
+//! Application code uses [`super::UnifiedSessionStore`].
 //! This port is intentionally synchronous because the existing SQLite and
 //! PostgreSQL executors own bounded connection pools; the public facade keeps
 //! its async API without adding a process-wide mutex around database work.
 
-use crate::store::session::{
-    OutboxFailureClass, SessionEvent, SessionListOptions, SessionListPage, SessionMessage,
-    SessionMissionOutboxRecord, SessionMissionOutboxRequest, SessionRecord,
-    SessionRecoveryManifest, SessionRecoverySignal, SessionRuntimeOutboxHealth,
-    SessionRuntimeOutboxRecord, SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
-    SqliteSessionStore,
+use crate::error::Result;
+use crate::persistence::sqlite::{
+    OutboxFailureClass, SessionBranchRequest, SessionBranchResult, SessionEvent,
+    SessionInputAdmission, SessionLifecycleFenceRequest, SessionLifecycleTombstoneRequest,
+    SessionListOptions, SessionListPage, SessionMessage, SessionMissionOutboxRecord,
+    SessionMissionOutboxRequest, SessionRecord, SessionRecoveryManifest, SessionRecoverySignal,
+    SessionRuntimeInputStatus, SessionRuntimeOutboxHealth, SessionRuntimeOutboxRecord,
+    SessionRuntimeOutboxRequest, SessionSearchResult, SessionSnapshot,
+    SessionTerminalTranscriptCommit, SessionTerminalTranscriptReceipt, SqliteSessionStore,
 };
-use crate::store::Result;
+use crate::{
+    SessionBranchActivation, SessionBranchActivationTransition, SessionLifecycleIntent,
+    SessionLifecyclePlan, SessionLifecycleTransition,
+};
 
 macro_rules! session_store_backend_contract {
     ($macro:ident) => {
@@ -25,6 +31,12 @@ macro_rules! session_store_backend_contract {
             (update_session, (session: &SessionRecord), Result<()>),
             (upsert_session, (session: &SessionRecord), Result<()>),
             (upsert_session_with_mission_outbox, (session: &SessionRecord, request: &SessionMissionOutboxRequest), Result<SessionMissionOutboxRecord>),
+            (plan_session_lifecycle, (plan: &SessionLifecyclePlan), Result<SessionLifecycleIntent>),
+            (get_session_lifecycle_intent, (operation_id: &str), Result<Option<SessionLifecycleIntent>>),
+            (list_recoverable_session_lifecycle_intents, (limit: usize), Result<Vec<SessionLifecycleIntent>>),
+            (fence_session_lifecycle, (request: &SessionLifecycleFenceRequest), Result<SessionLifecycleIntent>),
+            (transition_session_lifecycle, (transition: &SessionLifecycleTransition), Result<SessionLifecycleIntent>),
+            (commit_session_lifecycle_tombstone, (request: &SessionLifecycleTombstoneRequest), Result<SessionLifecycleIntent>),
             (delete_session, (session_id: &str), Result<()>),
             (delete_session_with_mission_outbox, (request: &SessionMissionOutboxRequest), Result<bool>),
             (mark_session_closed, (session_id: &str), Result<()>),
@@ -39,6 +51,8 @@ macro_rules! session_store_backend_contract {
             (disassociate_memory, (session_id: &str, memory_id: &str), Result<()>),
             (append_event, (event: &SessionEvent), Result<()>),
             (append_event_allocating_sequence, (event: &SessionEvent), Result<SessionEvent>),
+            (append_session_domain_event_if_absent_allocating_sequence, (event: &SessionEvent, event_id: &str), Result<(SessionEvent, bool)>),
+            (get_session_domain_event_by_id, (session_id: &str, event_id: &str), Result<Option<SessionEvent>>),
             (append_events_allocating_sequence, (events: &[SessionEvent]), Result<Vec<SessionEvent>>),
             (append_events_allocating_sequence_if_checkpoint_absent, (events: &[SessionEvent], checkpoint_id: &str), Result<Option<Vec<SessionEvent>>>),
             (append_context_envelope_event_if_absent, (event: &SessionEvent), Result<bool>),
@@ -47,6 +61,8 @@ macro_rules! session_store_backend_contract {
             (get_events_limited, (session_id: &str, from_seq: usize, limit: usize), Result<Vec<SessionEvent>>),
             (get_session_domain_timeline_limited, (session_id: &str, from_seq: usize, limit: usize), Result<Vec<SessionEvent>>),
             (count_session_domain_timeline_from, (session_id: &str, from_seq: usize), Result<usize>),
+            (get_session_domain_events_by_kind_limited, (session_id: &str, kind: &str, from_seq: usize, limit: usize), Result<Vec<SessionEvent>>),
+            (count_session_domain_events_by_kind_from, (session_id: &str, kind: &str, from_seq: usize), Result<usize>),
             (get_events_by_type_limited, (session_id: &str, event_type: &str, from_seq: usize, limit: usize), Result<Vec<SessionEvent>>),
             (count_events_from, (session_id: &str, from_seq: usize), Result<usize>),
             (count_events_by_type_from, (session_id: &str, event_type: &str, from_seq: usize), Result<usize>),
@@ -58,17 +74,29 @@ macro_rules! session_store_backend_contract {
             (get_latest_snapshot, (session_id: &str), Result<Option<SessionSnapshot>>),
             (prune_before, (cutoff_iso8601: &str), Result<usize>),
             (insert_message, (msg: &SessionMessage), Result<()>),
-            (append_terminal_message_idempotent, (message_id: &str, session_id: &str, content_json: &str, token_usage_json: Option<&str>, created_at_ms: u64), Result<(SessionMessage, bool)>),
-            (append_terminal_transcript_idempotent, (terminal_message_id: &str, ingress_message_id: &str, session_id: &str, messages: &[SessionMessage], created_at_ms: u64), Result<(Vec<SessionMessage>, bool)>),
+            (commit_terminal_transcript_if_fenced, (request: &SessionTerminalTranscriptCommit), Result<SessionTerminalTranscriptReceipt>),
             (insert_messages_batch, (messages: &[SessionMessage]), Result<()>),
+            (copy_session_messages_at_cutoff, (source_session_id: &str, target_session_id: &str, source_message_count: usize), Result<usize>),
+            (branch_session_at_cutoff, (request: &SessionBranchRequest), Result<SessionBranchResult>),
+            (get_session_branch_activation, (operation_id: &str), Result<Option<SessionBranchActivation>>),
+            (list_recoverable_session_branch_activations, (limit: usize), Result<Vec<SessionBranchActivation>>),
+            (transition_session_branch_activation, (transition: &SessionBranchActivationTransition), Result<SessionBranchActivation>),
             (append_message_with_runtime_outbox, (message: &SessionMessage, request: &SessionRuntimeOutboxRequest), Result<SessionRuntimeOutboxRecord>),
             (append_ingress_with_runtime_outbox, (session_id: &str, role: &str, content_json: Option<&str>, created_at_ms: u64, request: &SessionRuntimeOutboxRequest), Result<SessionRuntimeOutboxRecord>),
             (claim_session_runtime_outbox, (worker_id: &str, now_ms: u64, lease_ms: u64, limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
-            (ack_session_runtime_outbox, (request_id: &str, worker_id: &str, expected_revision: u64, runtime_commit_cursor: u64, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
-            (renew_session_runtime_outbox_lease, (request_id: &str, worker_id: &str, expected_revision: u64, now_ms: u64, lease_ms: u64), Result<SessionRuntimeOutboxRecord>),
-            (fail_session_runtime_outbox, (request_id: &str, worker_id: &str, expected_revision: u64, failure_class: OutboxFailureClass, error: &str, retry_at_ms: u64, max_attempts: u32, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
-            (retry_blocked_session_runtime_outbox, (request_id: &str, expected_revision: u64, actor: &str, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (mark_session_runtime_outbox_running, (request_id: &str, worker_id: &str, session_generation: u64, claim_token: &str, expected_revision: u64, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (ack_session_runtime_outbox, (request_id: &str, worker_id: &str, session_generation: u64, claim_token: &str, expected_revision: u64, terminal_status: SessionRuntimeInputStatus, runtime_commit_cursor: u64, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (renew_session_runtime_outbox_lease, (request_id: &str, worker_id: &str, session_generation: u64, claim_token: &str, expected_revision: u64, now_ms: u64, lease_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (fail_session_runtime_outbox, (request_id: &str, worker_id: &str, session_generation: u64, claim_token: &str, expected_revision: u64, failure_class: OutboxFailureClass, error: &str, retry_at_ms: u64, max_attempts: u32, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (requeue_claimed_session_runtime_outbox, (request_id: &str, worker_id: &str, session_generation: u64, claim_token: &str, expected_revision: u64, decision: harness_contract::turn::InputRoutingDecision, target_turn_id: Option<&str>, classification_json: Option<&str>, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (retry_blocked_session_runtime_outbox, (request_id: &str, session_generation: u64, expected_revision: u64, actor: &str, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (cancel_session_runtime_outbox, (input_id: &str, session_generation: u64, expected_revision: u64, actor: &str, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (reclassify_session_runtime_outbox, (input_id: &str, session_generation: u64, expected_revision: u64, decision: harness_contract::turn::InputRoutingDecision, target_turn_id: Option<&str>, classification_json: Option<&str>, actor: &str, reason: &str, now_ms: u64), Result<SessionRuntimeOutboxRecord>),
+            (get_session_input_admission, (session_id: &str), Result<Option<SessionInputAdmission>>),
+            (close_session_input_admission, (session_id: &str, expected_generation: u64, actor: &str, reason: &str, now_ms: u64), Result<SessionInputAdmission>),
+            (advance_session_input_generation, (session_id: &str, expected_generation: u64, open: bool, actor: &str, reason: &str, now_ms: u64), Result<SessionInputAdmission>),
             (get_session_runtime_outbox, (request_id: &str), Result<Option<SessionRuntimeOutboxRecord>>),
+            (get_session_runtime_outbox_by_input_id, (input_id: &str), Result<Option<SessionRuntimeOutboxRecord>>),
             (session_runtime_outbox_for_session, (session_id: &str, limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
             (active_session_runtime_outbox, (limit: usize), Result<Vec<SessionRuntimeOutboxRecord>>),
             (session_runtime_outbox_health, (), Result<SessionRuntimeOutboxHealth>),

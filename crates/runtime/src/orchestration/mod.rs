@@ -905,7 +905,7 @@ mod tests {
 
     use async_trait::async_trait;
     use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
-    use memory::SessionRecord;
+    use session::SessionRecord;
 
     use super::*;
 
@@ -1086,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_session_compiles_and_starts_the_canonical_handoff_graph() {
-        let store = Arc::new(memory::UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let timestamp = chrono::Utc::now().to_rfc3339();
         for session_id in ["session-1", "session-2"] {
             store
@@ -1110,7 +1110,9 @@ mod tests {
                 .unwrap();
         }
         let services = RuntimeServices::in_memory().expect("runtime services");
-        services.install_session_store(Arc::clone(&store)).unwrap();
+        services
+            .install_test_session_store(Arc::clone(&store))
+            .unwrap();
         let mut request = request(RuntimeOrchestrationAction::DispatchSession);
         request.target_session_id = Some("session-2".to_string());
         request.evidence_refs = vec!["evidence:source".to_string()];

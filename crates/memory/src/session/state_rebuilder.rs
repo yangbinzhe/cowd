@@ -12,12 +12,12 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use serde::{Deserialize, Serialize};
+use session::{SessionHistoryReader, SessionMessage, SessionRecord};
 
 use crate::legacy_jsonl::legacy_jsonl_session_import_enabled;
 use crate::types::{
     Decision, DecisionStatus, HandoffData, MemoryEntry, MemoryLayer, WorkItem, WorkItemStatus,
 };
-use crate::{SessionMessage, SessionRecord, UnifiedSessionStore};
 
 /// Source of state for reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,7 +203,7 @@ pub struct StateRebuilder {
     #[allow(dead_code)] // Derived field; cc_dir is the active path
     workspace: PathBuf,
     cc_dir: PathBuf,
-    session_store: Option<Arc<UnifiedSessionStore>>,
+    session_history: Option<Arc<SessionHistoryReader>>,
 }
 
 impl StateRebuilder {
@@ -214,22 +214,22 @@ impl StateRebuilder {
         Self {
             workspace,
             cc_dir,
-            session_store: None,
+            session_history: None,
         }
     }
 
     /// Attach the selected durable session owner. State rebuilding must not
     /// infer a SQLite filename or open a database behind composition's back.
     #[must_use]
-    pub fn with_session_store(
+    pub fn with_session_history(
         workspace: impl Into<PathBuf>,
-        session_store: Arc<UnifiedSessionStore>,
+        session_history: Arc<SessionHistoryReader>,
     ) -> Self {
         let workspace = workspace.into();
         Self {
             cc_dir: workspace.join(".cowd"),
             workspace,
-            session_store: Some(session_store),
+            session_history: Some(session_history),
         }
     }
 
@@ -510,17 +510,19 @@ impl StateRebuilder {
 
     /// Rebuild from session store.
     async fn rebuild_from_session_store(&self) -> Option<SessionStoreEntry> {
-        let store = self.session_store.as_ref()?;
-        let record = store.list_sessions().await.ok()?.into_iter().next()?;
-        let latest = session_store_entry(&record);
-        let message_count = store.get_message_count(&latest.id).await.ok()?;
-        let recent_offset = message_count.saturating_sub(16);
-        let messages = store
-            .get_messages(&latest.id, recent_offset, 16)
+        let store = self.session_history.as_ref()?;
+        let record = store
+            .list_recent_sessions(1)
             .await
-            .ok()?;
+            .ok()?
+            .into_iter()
+            .next()?;
+        let latest = session_store_entry(&record);
+        let message_count = store.message_count(&latest.id).await.ok()?;
+        let recent_offset = message_count.saturating_sub(16);
+        let messages = store.messages(&latest.id, recent_offset, 16).await.ok()?;
         let snapshot_summary = store
-            .get_latest_snapshot(&latest.id)
+            .latest_snapshot(&latest.id)
             .await
             .ok()
             .flatten()
@@ -828,7 +830,7 @@ mod tests {
     #[tokio::test]
     async fn test_rebuild_uses_session_store_context_tasks_and_decisions() {
         let tmp = TempDir::new().unwrap();
-        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         store
             .create_session(&SessionRecord {
                 session_id: "session-a".to_string(),
@@ -865,7 +867,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .save_snapshot(&crate::store::session::SessionSnapshot {
+            .save_snapshot(&session::SessionSnapshot {
                 session_id: "session-a".to_string(),
                 event_idx: 1,
                 messages_json: "[{\"content\":\"snapshot summary\"}]".to_string(),
@@ -874,7 +876,8 @@ mod tests {
             .await
             .unwrap();
 
-        let rebuilder = StateRebuilder::with_session_store(tmp.path(), store);
+        let rebuilder =
+            StateRebuilder::with_session_history(tmp.path(), Arc::new(store.history_reader()));
         let state = rebuilder
             .rebuild(&RebuildOptions {
                 include_history: false,

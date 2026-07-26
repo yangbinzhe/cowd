@@ -38,6 +38,7 @@ pub(crate) struct SurfaceDiscoveryFailure {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct SurfaceHostHealth {
     pub(crate) status: String,
+    pub(crate) task_ownership: crate::runtime_host::task_set::GatewayTaskHealthSnapshot,
     pub(crate) surface_count: usize,
     pub(crate) external_surface_count: usize,
     pub(crate) route_count: usize,

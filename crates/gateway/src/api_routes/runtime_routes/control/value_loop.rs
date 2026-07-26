@@ -330,6 +330,7 @@ mod tests {
         RuntimeEvent {
             sequence: sequence as u64,
             commit_cursor: None,
+            transaction_index: None,
             stream_id: None,
             scope: scope.to_string(),
             kind: kind.to_string(),
