@@ -2675,14 +2675,32 @@ impl PostgresSessionStore {
     /// cutover-only API; normal request handling stays on the selected owner.
     pub fn export_migration_snapshot(&self) -> memory::store::Result<SessionMigrationSnapshot> {
         let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
-        let sessions = connection.query("SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status FROM session_records ORDER BY session_id", &[]).map_err(postgres_error)?.iter().map(row_to_session).collect::<memory::store::Result<_>>()?;
+        let sessions = connection
+            .query("SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status FROM session_records ORDER BY session_id", &[])
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_session)
+            .collect::<memory::store::Result<_>>()
+            .map_err(|error| migration_export_error("session_records", error))?;
         let associations = connection.query("SELECT session_id,memory_id,created_at FROM session_memory_associations ORDER BY session_id,memory_id",&[]).map_err(postgres_error)?.iter().map(|row| Ok(SessionMemoryAssociation { session_id: row.try_get(0).map_err(postgres_error)?, memory_id: row.try_get(1).map_err(postgres_error)?, created_at: row.try_get(2).map_err(postgres_error)?})).collect::<memory::store::Result<_>>()?;
         let messages = connection.query("SELECT stable_message_id,session_id,sequence,role,content_json,blocks_count,tool_use_id,tool_name,token_usage_json,created_at_ms FROM session_messages ORDER BY session_id,sequence",&[]).map_err(postgres_error)?.iter().map(row_to_message).collect::<memory::store::Result<_>>()?;
         let events = connection.query("SELECT session_id,event_type,event_json,sequence,created_at_ms FROM session_events ORDER BY session_id,sequence",&[]).map_err(postgres_error)?.iter().map(row_to_event).collect::<memory::store::Result<_>>()?;
         let checkpoints = connection.query("SELECT session_id,checkpoint_id FROM session_event_checkpoints ORDER BY session_id,checkpoint_id",&[]).map_err(postgres_error)?.iter().map(|row| Ok(SessionEventCheckpoint {session_id: row.try_get(0).map_err(postgres_error)?,checkpoint_id: row.try_get(1).map_err(postgres_error)?})).collect::<memory::store::Result<_>>()?;
         let snapshots = connection.query("SELECT session_id,event_idx,messages_json,created_at_ms FROM session_snapshots ORDER BY session_id,event_idx",&[]).map_err(postgres_error)?.iter().map(row_to_snapshot).collect::<memory::store::Result<_>>()?;
-        let runtime_outbox = connection.query("SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,runtime_options_json FROM session_runtime_outbox ORDER BY request_id",&[]).map_err(postgres_error)?.iter().map(row_to_runtime_outbox).collect::<memory::store::Result<_>>()?;
-        let mission_outbox = connection.query("SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms FROM session_mission_outbox ORDER BY request_id",&[]).map_err(postgres_error)?.iter().map(row_to_mission_outbox).collect::<memory::store::Result<_>>()?;
+        let runtime_outbox = connection
+            .query("SELECT request_id,turn_id,message_id,session_id,sequence,status,runtime_commit_cursor,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms,runtime_options_json FROM session_runtime_outbox ORDER BY request_id",&[])
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_runtime_outbox)
+            .collect::<memory::store::Result<_>>()
+            .map_err(|error| migration_export_error("session_runtime_outbox", error))?;
+        let mission_outbox = connection
+            .query("SELECT request_id,session_id,title,workspace_key,operation,status,attempts,next_attempt_at_ms,claim_owner,claim_expires_at_ms,failure_class,last_error,revision,created_at_ms,updated_at_ms FROM session_mission_outbox ORDER BY request_id",&[])
+            .map_err(postgres_error)?
+            .iter()
+            .map(row_to_mission_outbox)
+            .collect::<memory::store::Result<_>>()
+            .map_err(|error| migration_export_error("session_mission_outbox", error))?;
         let runtime_history = pg_history_rows(&mut connection, "session_runtime_outbox_history")?;
         let mission_history = pg_history_rows(&mut connection, "session_mission_outbox_history")?;
         Ok(SessionMigrationSnapshot {
@@ -3083,7 +3101,7 @@ fn insert_mission_outbox_tx(
 fn row_to_mission_outbox(row: &Row) -> memory::store::Result<SessionMissionOutboxRecord> {
     let operation: String = row.try_get(4).map_err(postgres_error)?;
     let status: String = row.try_get(5).map_err(postgres_error)?;
-    let failure: Option<String> = row.try_get(11).map_err(postgres_error)?;
+    let failure: Option<String> = row.try_get(10).map_err(postgres_error)?;
     Ok(SessionMissionOutboxRecord {
         request_id: row.try_get(0).map_err(postgres_error)?,
         session_id: row.try_get(1).map_err(postgres_error)?,
@@ -3110,14 +3128,14 @@ fn row_to_mission_outbox(row: &Row) -> memory::store::Result<SessionMissionOutbo
                     .map_err(|error| memory::MemoryError::Store(error.to_string()))
             })
             .transpose()?,
-        last_error: row.try_get(12).map_err(postgres_error)?,
-        revision: i64_to_u64(row.try_get(13).map_err(postgres_error)?, "mission revision")?,
+        last_error: row.try_get(11).map_err(postgres_error)?,
+        revision: i64_to_u64(row.try_get(12).map_err(postgres_error)?, "mission revision")?,
         created_at_ms: i64_to_u64(
-            row.try_get(14).map_err(postgres_error)?,
+            row.try_get(13).map_err(postgres_error)?,
             "mission created time",
         )?,
         updated_at_ms: i64_to_u64(
-            row.try_get(15).map_err(postgres_error)?,
+            row.try_get(14).map_err(postgres_error)?,
             "mission updated time",
         )?,
     })
@@ -3751,6 +3769,10 @@ fn postgres_error(error: postgres::Error) -> memory::MemoryError {
     memory::MemoryError::Store(detail)
 }
 
+fn migration_export_error(table: &str, error: memory::MemoryError) -> memory::MemoryError {
+    memory::MemoryError::Store(format!("export PostgreSQL `{table}` snapshot: {error}"))
+}
+
 fn to_i64(value: usize, label: &str) -> memory::store::Result<i64> {
     i64::try_from(value).map_err(|_| memory::MemoryError::Store(format!("{label} overflow")))
 }
@@ -4243,6 +4265,19 @@ mod tests {
             .create_session(&session("migration-session"))
             .expect("session");
         source
+            .upsert_session_with_mission_outbox(
+                &session("migration-session"),
+                &SessionMissionOutboxRequest {
+                    request_id: "mission-copy".to_string(),
+                    session_id: "migration-session".to_string(),
+                    title: "Migrate a non-empty mission outbox".to_string(),
+                    workspace_key: "workspace-copy".to_string(),
+                    operation: SessionMissionOutboxOperation::Start,
+                    created_at_ms: 7,
+                },
+            )
+            .expect("mission outbox");
+        source
             .insert_message(&SessionMessage {
                 stable_message_id: "m-1".to_string(),
                 session_id: "migration-session".to_string(),
@@ -4293,6 +4328,7 @@ mod tests {
         assert_eq!(first.events.len(), 2);
         assert_eq!(first.checkpoints.len(), 1);
         assert_eq!(first.snapshots.len(), 1);
+        assert_eq!(first.mission_outbox.len(), 1);
     }
 
     #[tokio::test]
@@ -4304,6 +4340,19 @@ mod tests {
         source
             .create_session(&session("migration-session"))
             .expect("session");
+        source
+            .upsert_session_with_mission_outbox(
+                &session("migration-session"),
+                &SessionMissionOutboxRequest {
+                    request_id: "mission-copy".to_string(),
+                    session_id: "migration-session".to_string(),
+                    title: "Migrate a non-empty mission outbox".to_string(),
+                    workspace_key: "workspace-copy".to_string(),
+                    operation: SessionMissionOutboxOperation::Start,
+                    created_at_ms: 7,
+                },
+            )
+            .expect("mission outbox");
         source
             .insert_message(&SessionMessage {
                 stable_message_id: "m-copy".to_string(),
@@ -4323,6 +4372,12 @@ mod tests {
             copy_quiesced_session_store(&source, &target, root.path().join("session.json"))
                 .expect("copy");
         assert_eq!(manifest.source_digest, manifest.target_digest);
+        let copied = target
+            .export_migration_snapshot()
+            .expect("export copied PostgreSQL snapshot");
+        assert_eq!(copied.mission_outbox.len(), 1);
+        assert_eq!(copied.mission_outbox[0].request_id, "mission-copy");
+        assert_eq!(copied.mission_outbox[0].revision, 0);
         let injected = UnifiedSessionStore::from_backend(Arc::new(target.clone()));
         assert_eq!(
             injected

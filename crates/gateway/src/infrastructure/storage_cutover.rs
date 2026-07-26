@@ -208,199 +208,249 @@ impl CutoverContext {
             let source = Arc::clone(&source);
             let target = Arc::clone(&target);
             let path = detail_root.join("fact.json");
-            jobs.push(tokio::task::spawn_blocking(move || {
-                record(
-                    "fact_ledger",
-                    fact_postgres::copy_quiesced_fact_ledger(
-                        source.fact_ledger.as_ref(),
-                        target.fact_ledger.as_ref(),
-                        path,
+            jobs.push((
+                "fact_ledger",
+                tokio::task::spawn_blocking(move || {
+                    record(
+                        "fact_ledger",
+                        fact_postgres::copy_quiesced_fact_ledger(
+                            source.fact_ledger.as_ref(),
+                            target.fact_ledger.as_ref(),
+                            path,
+                        )
+                        .map_err(stringify)?,
                     )
-                    .map_err(stringify)?,
-                )
-            }));
+                }),
+            ));
         }
         {
             let source_registry = source.registry.clone();
             let executor = executor.clone();
             let path = detail_root.join("matrix.json");
-            jobs.push(tokio::task::spawn_blocking(move || {
-                let endpoint = source_registry
-                    .endpoint(&storage::StorageDomainId::Matrix)
+            jobs.push((
+                "matrix",
+                tokio::task::spawn_blocking(move || {
+                    let endpoint = source_registry
+                        .endpoint(&storage::StorageDomainId::Matrix)
+                        .map_err(stringify)?;
+                    let source = matrix_repository::MatrixSqliteRepository::open_storage_handle(
+                        &endpoint.as_handle(),
+                    )
                     .map_err(stringify)?;
-                let source = matrix_repository::MatrixSqliteRepository::open_storage_handle(
-                    &endpoint.as_handle(),
-                )
-                .map_err(stringify)?;
-                let target = matrix_repository::PostgresMatrixRepository::new(executor)
-                    .map_err(stringify)?;
-                record(
-                    "matrix",
-                    matrix_repository::copy_quiesced_matrix_store(&source, &target, path)
-                        .map_err(stringify)?,
-                )
-            }));
+                    let target = matrix_repository::PostgresMatrixRepository::new(executor)
+                        .map_err(stringify)?;
+                    record(
+                        "matrix",
+                        matrix_repository::copy_quiesced_matrix_store(&source, &target, path)
+                            .map_err(stringify)?,
+                    )
+                }),
+            ));
         }
         {
             let source_registry = source.registry.clone();
             let executor = executor.clone();
             let path = detail_root.join("approval.json");
-            jobs.push(tokio::task::spawn_blocking(move || {
-                let endpoint = source_registry
-                    .endpoint(&storage::StorageDomainId::Approval)
-                    .map_err(stringify)?;
-                let source =
-                    approval::SqliteApprovalHistoryLedger::open(endpoint).map_err(stringify)?;
-                let target =
-                    approval::PostgresApprovalHistoryLedger::new(executor).map_err(stringify)?;
-                record(
-                    "approval_history",
-                    approval::copy_quiesced_approval_history(&source, &target, path)
-                        .map_err(stringify)?,
-                )
-            }));
+            jobs.push((
+                "approval_history",
+                tokio::task::spawn_blocking(move || {
+                    let endpoint = source_registry
+                        .endpoint(&storage::StorageDomainId::Approval)
+                        .map_err(stringify)?;
+                    let source =
+                        approval::SqliteApprovalHistoryLedger::open(endpoint).map_err(stringify)?;
+                    let target = approval::PostgresApprovalHistoryLedger::new(executor)
+                        .map_err(stringify)?;
+                    record(
+                        "approval_history",
+                        approval::copy_quiesced_approval_history(&source, &target, path)
+                            .map_err(stringify)?,
+                    )
+                }),
+            ));
         }
         {
             let source_registry = source.registry.clone();
             let executor = executor.clone();
             let path = detail_root.join("session.json");
-            jobs.push(tokio::task::spawn_blocking(move || {
-                let endpoint = source_registry
-                    .endpoint(&storage::StorageDomainId::Session)
+            jobs.push((
+                "session",
+                tokio::task::spawn_blocking(move || {
+                    let endpoint = source_registry
+                        .endpoint(&storage::StorageDomainId::Session)
+                        .map_err(stringify)?;
+                    let source = memory::store::session::SqliteSessionStore::open_storage_handle(
+                        &endpoint.as_handle(),
+                    )
                     .map_err(stringify)?;
-                let source = memory::store::session::SqliteSessionStore::open_storage_handle(
-                    &endpoint.as_handle(),
-                )
-                .map_err(stringify)?;
-                let target =
-                    session_postgres::PostgresSessionStore::new(executor).map_err(stringify)?;
-                record(
-                    "session",
-                    session_postgres::copy_quiesced_session_store(&source, &target, path)
-                        .map_err(stringify)?,
-                )
-            }));
+                    let target =
+                        session_postgres::PostgresSessionStore::new(executor).map_err(stringify)?;
+                    record(
+                        "session",
+                        session_postgres::copy_quiesced_session_store(&source, &target, path)
+                            .map_err(stringify)?,
+                    )
+                }),
+            ));
         }
         {
             let source = Arc::clone(&source);
             let target = Arc::clone(&target);
             let path = detail_root.join("runtime-event.json");
-            jobs.push(tokio::task::spawn_blocking(move || {
-                record(
-                    "runtime_event",
-                    runtime_postgres::copy_quiesced_runtime_event_store(
-                        source.runtime_event_store.as_ref(),
-                        target.runtime_event_store.as_ref(),
-                        path,
+            jobs.push((
+                "runtime_event",
+                tokio::task::spawn_blocking(move || {
+                    record(
+                        "runtime_event",
+                        runtime_postgres::copy_quiesced_runtime_event_store(
+                            source.runtime_event_store.as_ref(),
+                            target.runtime_event_store.as_ref(),
+                            path,
+                        )
+                        .map_err(stringify)?,
                     )
-                    .map_err(stringify)?,
-                )
-            }));
+                }),
+            ));
         }
         {
             let source = source.task_kernel.runtime_kernel();
             let target = target.task_kernel.runtime_kernel();
             let path = detail_root.join("task.json");
-            jobs.push(tokio::task::spawn_blocking(move || {
-                record(
-                    "runtime_task",
-                    runtime_postgres::copy_quiesced_task_kernel(&source, &target, path)
-                        .map_err(stringify)?,
-                )
-            }));
+            jobs.push((
+                "runtime_task",
+                tokio::task::spawn_blocking(move || {
+                    record(
+                        "runtime_task",
+                        runtime_postgres::copy_quiesced_task_kernel(&source, &target, path)
+                            .map_err(stringify)?,
+                    )
+                }),
+            ));
         }
         {
             let source_store = Arc::clone(&source.memory_store);
             let executor = executor.clone();
-            jobs.push(tokio::task::spawn_blocking(move || {
-                let target =
-                    memory_postgres::PostgresMemoryStore::new(executor).map_err(stringify)?;
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(stringify)?;
-                record(
-                    "memory",
-                    runtime
-                        .block_on(memory_postgres::copy_quiesced_memory_store(
-                            source_store.as_ref(),
-                            &target,
-                        ))
-                        .map_err(stringify)?,
-                )
-            }));
+            jobs.push((
+                "memory",
+                tokio::task::spawn_blocking(move || {
+                    let target =
+                        memory_postgres::PostgresMemoryStore::new(executor).map_err(stringify)?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(stringify)?;
+                    record(
+                        "memory",
+                        runtime
+                            .block_on(memory_postgres::copy_quiesced_memory_store(
+                                source_store.as_ref(),
+                                &target,
+                            ))
+                            .map_err(stringify)?,
+                    )
+                }),
+            ));
         }
         {
             let source_store = Arc::clone(&source.knowledge_store);
             let executor = executor.clone();
-            jobs.push(tokio::task::spawn_blocking(move || {
-                let target =
-                    memory_postgres::PostgresKnowledgeStore::new(executor).map_err(stringify)?;
-                record(
-                    "knowledge",
-                    memory_postgres::copy_quiesced_knowledge_store(source_store.as_ref(), &target)
+            jobs.push((
+                "knowledge",
+                tokio::task::spawn_blocking(move || {
+                    let target = memory_postgres::PostgresKnowledgeStore::new(executor)
+                        .map_err(stringify)?;
+                    record(
+                        "knowledge",
+                        memory_postgres::copy_quiesced_knowledge_store(
+                            source_store.as_ref(),
+                            &target,
+                        )
                         .map_err(stringify)?,
-                )
-            }));
+                    )
+                }),
+            ));
         }
         {
             let source_messages = Arc::clone(&source.surface_messages);
             let executor = executor.clone();
             let path = detail_root.join("surface.json");
-            jobs.push(tokio::task::spawn_blocking(move || {
-                let target = surface_postgres::PostgresSurfaceMessageLedger::new(executor)
-                    .map_err(stringify)?;
-                record(
-                    "surface_message",
-                    surface_postgres::copy_quiesced_surface_message_ledger(
-                        source_messages.as_ref(),
-                        &target,
-                        path,
+            jobs.push((
+                "surface_message",
+                tokio::task::spawn_blocking(move || {
+                    let target = surface_postgres::PostgresSurfaceMessageLedger::new(executor)
+                        .map_err(stringify)?;
+                    record(
+                        "surface_message",
+                        surface_postgres::copy_quiesced_surface_message_ledger(
+                            source_messages.as_ref(),
+                            &target,
+                            path,
+                        )
+                        .map_err(stringify)?,
                     )
-                    .map_err(stringify)?,
-                )
-            }));
+                }),
+            ));
         }
         {
             let source_factory = Arc::clone(&source.connector_factory);
             let source_handle = source.connector_handle.clone();
             let executor = executor.clone();
-            jobs.push(tokio::task::spawn_blocking(move || {
-                let source = source_factory.open(&source_handle).map_err(stringify)?;
-                let target = connector_postgres::PostgresResourceDirectory::new(executor)
-                    .map_err(stringify)?;
-                record(
-                    "connector_directory",
-                    connector_postgres::copy_quiesced_resource_directory(source.as_ref(), &target)
+            jobs.push((
+                "connector_directory",
+                tokio::task::spawn_blocking(move || {
+                    let source = source_factory.open(&source_handle).map_err(stringify)?;
+                    let target = connector_postgres::PostgresResourceDirectory::new(executor)
+                        .map_err(stringify)?;
+                    record(
+                        "connector_directory",
+                        connector_postgres::copy_quiesced_resource_directory(
+                            source.as_ref(),
+                            &target,
+                        )
                         .map_err(stringify)?,
-                )
-            }));
+                    )
+                }),
+            ));
         }
         {
             let source_registry = source.registry.clone();
             let target_registry = target.registry.clone();
             let executor = executor.clone();
             let enabled = enabled_apps(self.runtime_config.apps());
-            jobs.push(tokio::task::spawn_blocking(move || {
-                let enabled = enabled.into_iter().collect::<BTreeSet<_>>();
-                record(
-                    "apps",
-                    cowd_product_apps::migrate_enabled_storage(
-                        source_registry,
-                        cowd_product_apps::AppStorageTopology::Sqlite,
-                        target_registry,
-                        cowd_product_apps::AppStorageTopology::Postgres { executor },
-                        &|app_id| enabled.contains(app_id),
+            jobs.push((
+                "apps",
+                tokio::task::spawn_blocking(move || {
+                    let enabled = enabled.into_iter().collect::<BTreeSet<_>>();
+                    record(
+                        "apps",
+                        cowd_product_apps::migrate_enabled_storage(
+                            source_registry,
+                            cowd_product_apps::AppStorageTopology::Sqlite,
+                            target_registry,
+                            cowd_product_apps::AppStorageTopology::Postgres { executor },
+                            &|app_id| enabled.contains(app_id),
+                        )
+                        .map_err(stringify)?,
                     )
-                    .map_err(stringify)?,
-                )
-            }));
+                }),
+            ));
         }
 
         let mut domains = BTreeMap::new();
-        for completed in futures::future::join_all(jobs).await {
-            let (domain, evidence) = completed
-                .map_err(|error| format!("storage migration worker failed: {error}"))??;
+        for (scheduled_domain, job) in jobs {
+            let (domain, evidence) = job
+                .await
+                .map_err(|error| {
+                    format!("storage migration worker `{scheduled_domain}` failed: {error}")
+                })?
+                .map_err(|error| {
+                    format!("storage migration domain `{scheduled_domain}` failed: {error}")
+                })?;
+            if domain != scheduled_domain {
+                return Err(format!(
+                    "storage migration worker `{scheduled_domain}` returned evidence for `{domain}`"
+                ));
+            }
             if domains.insert(domain.clone(), evidence).is_some() {
                 return Err(format!("duplicate migration evidence for {domain}"));
             }
