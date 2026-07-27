@@ -1293,7 +1293,7 @@ impl EvolutionGovernanceService {
                 .iter()
                 .flat_map(|evaluation| {
                     evaluation.evidence_refs.iter().map(|reference| {
-                        EvidenceRef::new("agent_run_evidence", reference.clone())
+                        EvidenceRef::observed("agent_run_evidence", reference.clone())
                             .with_source(evaluation.evaluation_id.clone())
                     })
                 })
@@ -2480,7 +2480,7 @@ mod tests {
                 ],
             },
             evaluation_policy_floor: EvaluationPolicyFloor::default(),
-            source_evidence_refs: vec![EvidenceRef::new("agent_run", "baseline-1")],
+            source_evidence_refs: vec![EvidenceRef::observed("agent_run", "baseline-1")],
             canary_policy: CanaryRolloutPolicy {
                 traffic_basis_points: 1_000,
                 minimum_samples: 10,
@@ -2534,7 +2534,7 @@ mod tests {
                 },
             ],
             source_run_refs: vec!["eval:paired-1".to_string()],
-            evidence_refs: vec![EvidenceRef::new("evaluation", "paired-1")],
+            evidence_refs: vec![EvidenceRef::observed("evaluation", "paired-1")],
             created_at_ms: now_ms(),
         }
     }
@@ -2657,7 +2657,7 @@ mod tests {
             .request_evaluation_policy_change(EvaluationPolicyChangeIntent {
                 request_id: "raise-minimum-samples".to_string(),
                 next_policy: next_policy.clone(),
-                evidence_refs: vec![EvidenceRef::new("audit", "evaluation-policy-2026-07")],
+                evidence_refs: vec![EvidenceRef::observed("audit", "evaluation-policy-2026-07")],
             })
             .expect("policy review");
         assert_eq!(service.evaluation_policy_floor().revision, 1);
@@ -2700,7 +2700,7 @@ mod tests {
             service.request_evaluation_policy_change(EvaluationPolicyChangeIntent {
                 request_id: "invalid-policy-jump".to_string(),
                 next_policy: skipped,
-                evidence_refs: vec![EvidenceRef::new("audit", "invalid")],
+                evidence_refs: vec![EvidenceRef::observed("audit", "invalid")],
             }),
             Err(EvolutionGovernanceError::InvalidReleaseChangeRequest(_))
         ));
@@ -2711,7 +2711,7 @@ mod tests {
             .request_evaluation_policy_change(EvaluationPolicyChangeIntent {
                 request_id: "policy-denied-with-wrong-lease".to_string(),
                 next_policy,
-                evidence_refs: vec![EvidenceRef::new("audit", "policy")],
+                evidence_refs: vec![EvidenceRef::observed("audit", "policy")],
             })
             .expect("review");
         let principal = crate::security::test_human_interactive_principal();
@@ -2811,7 +2811,7 @@ mod tests {
             canary_assignment_id: canary.assignment_id.clone(),
             generation: canary.generation,
             source_run_refs: vec!["agent-run:canary-1".to_string()],
-            evidence_refs: vec![EvidenceRef::new("evaluation", "canary-window")],
+            evidence_refs: vec![EvidenceRef::observed("evaluation", "canary-window")],
             sample_count: 40,
             minimum_samples: 10,
             observed_duration_ms: 120_000,
@@ -2876,7 +2876,7 @@ mod tests {
                 canary_assignment_id: canary.assignment_id.clone(),
                 generation: canary.generation,
                 source_run_refs: vec!["agent-run:canary-stop".to_string()],
-                evidence_refs: vec![EvidenceRef::new("evaluation", "canary-stop")],
+                evidence_refs: vec![EvidenceRef::observed("evaluation", "canary-stop")],
                 sample_count: 20,
                 minimum_samples: 10,
                 observed_duration_ms: 120_000,
@@ -2896,7 +2896,7 @@ mod tests {
                 action: ReleaseChangeAction::StopCanary,
                 selector: None,
                 candidate_id: Some(candidate.candidate_id.clone()),
-                evidence_refs: vec![EvidenceRef::new("incident", "canary-regression")],
+                evidence_refs: vec![EvidenceRef::observed("incident", "canary-regression")],
             })
             .expect("stop review");
         let stop_lease = crate::security::test_verified_decision_lease(
@@ -3118,7 +3118,7 @@ mod tests {
                 action: ReleaseChangeAction::StopCanary,
                 selector: None,
                 candidate_id: Some(candidate.candidate_id.clone()),
-                evidence_refs: vec![EvidenceRef::new("incident", "team-canary")],
+                evidence_refs: vec![EvidenceRef::observed("incident", "team-canary")],
             })
             .expect("stop review");
         let stop_lease = crate::security::test_verified_decision_lease(
@@ -3157,7 +3157,7 @@ mod tests {
                 action: ReleaseChangeAction::SetDefaultExact,
                 selector: None,
                 candidate_id: None,
-                evidence_refs: vec![EvidenceRef::new("audit", "pointer")],
+                evidence_refs: vec![EvidenceRef::observed("audit", "pointer")],
             }),
             Err(EvolutionGovernanceError::InvalidReleaseChangeRequest(_))
         ));
@@ -3168,7 +3168,7 @@ mod tests {
                 action: ReleaseChangeAction::Rollback,
                 selector: Some(RevisionSelector::ExactApprovedRevision { revision: 1 }),
                 candidate_id: None,
-                evidence_refs: vec![EvidenceRef::new("incident", "rollback")],
+                evidence_refs: vec![EvidenceRef::observed("incident", "rollback")],
             })
             .expect("rollback review");
         assert_eq!(review.class, ReleaseChangeReviewClass::Rollback);

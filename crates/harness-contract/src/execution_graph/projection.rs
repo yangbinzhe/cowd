@@ -36,6 +36,7 @@ pub struct ExecutionGraphProjection {
     pub graph_id: String,
     pub revision: u64,
     pub objective: String,
+    #[serde(default)]
     pub service_class: ExecutionServiceClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,

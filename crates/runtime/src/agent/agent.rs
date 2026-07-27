@@ -217,7 +217,7 @@ impl SubAgentResult {
             child_agent_id.clone(),
             preview_text(&self.output, 700),
         )
-        .with_evidence_ref(EvidenceRef::new(
+        .with_evidence_ref(EvidenceRef::observed(
             "agent",
             format!("agent://{child_agent_id}"),
         ))
@@ -230,7 +230,7 @@ impl SubAgentResult {
                     self.tool_call_count, self.tokens_used
                 ),
             )
-            .with_evidence_ref(EvidenceRef::new(
+            .with_evidence_ref(EvidenceRef::observed(
                 "agent",
                 format!("agent://{child_agent_id}"),
             )),

@@ -1338,7 +1338,7 @@ fn make_chunk(
         ordinal,
         title: title.to_string(),
         text: text.trim().to_string(),
-        evidence_ref: EvidenceRef::new("knowledge_chunk", chunk_id)
+        evidence_ref: EvidenceRef::observed("knowledge_chunk", chunk_id)
             .with_source(source.clone().unwrap_or_else(|| title.to_string())),
         token_estimate: estimate_tokens(text),
     }

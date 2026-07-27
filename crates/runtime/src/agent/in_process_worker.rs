@@ -2149,7 +2149,7 @@ mod tests {
     #[test]
     fn fresh_tool_receipt_is_evidence_even_when_content_ref_matches_upstream() {
         let upstream = harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::context::EvidenceRef::new("tool", "same-content"),
+            harness_contract::context::EvidenceRef::observed("tool", "same-content"),
             "sha256:same",
             1,
             "text/plain",
@@ -2185,7 +2185,7 @@ mod tests {
         };
         let encoded = serde_json::to_string(&change).expect("change receipt JSON");
         let evidence = harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::context::EvidenceRef::new("runtime_change", encoded),
+            harness_contract::context::EvidenceRef::observed("runtime_change", encoded),
             "sha256:change",
             1,
             "application/json",
@@ -2871,7 +2871,7 @@ mod tests {
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: vec![harness_contract::context::EvidenceAccessRef::durable(
-                harness_contract::context::EvidenceRef::new("upstream", "frame"),
+                harness_contract::context::EvidenceRef::observed("upstream", "frame"),
                 "sha256:frame",
                 1,
                 "text/plain",
@@ -2891,7 +2891,7 @@ mod tests {
             idempotency_key: "key".into(),
         };
         let tool_access = harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::context::EvidenceRef::new("tool", "tool-1"),
+            harness_contract::context::EvidenceRef::observed("tool", "tool-1"),
             "sha256:tool",
             1,
             "text/plain",

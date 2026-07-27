@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use harness_contract::outcome::{ExecutionOutcome, OutcomeTerminalClass};
 use harness_contract::reality::EvidenceRef;
 use sha2::{Digest, Sha256};
 
@@ -10,6 +11,7 @@ use super::{
     EvolutionDiscoveryService, EvolutionSignal, EvolutionSignalSeverity, EvolutionSignalSource,
     EvolutionSignalType,
 };
+use crate::execution_core::outcome_service::OUTCOME_EVENT_KIND;
 use crate::{
     CancellationToken, CommittedEventBatch, DurableRuntimeEvent, RuntimeEventInput,
     RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeTransactionEventInput,
@@ -205,7 +207,9 @@ impl EvolutionSignalProjector {
         event: &DurableRuntimeEvent,
         source_cursor: u64,
     ) -> Result<(), String> {
-        let signal = if event.kind == "agent.run_evaluated" {
+        let signal = if event.kind == OUTCOME_EVENT_KIND {
+            outcome_signal(event)?
+        } else if event.kind == "agent.run_evaluated" {
             self.repeated_agent_failure_signal(event)?
         } else {
             signal_from_source_event(event)
@@ -311,7 +315,7 @@ impl EvolutionSignalProjector {
             .rev()
             .take(10)
             .map(|evaluation| {
-                EvidenceRef::new("agent_run_evaluation", evaluation.evaluation_id.clone())
+                EvidenceRef::observed("agent_run_evaluation", evaluation.evaluation_id.clone())
                     .with_source(format!(
                         "{}@{}",
                         evaluation.definition_id, evaluation.definition_revision
@@ -445,6 +449,75 @@ impl EvolutionSignalProjector {
     }
 }
 
+fn outcome_signal(event: &DurableRuntimeEvent) -> Result<Option<EvolutionSignal>, String> {
+    let outcome = serde_json::from_value::<ExecutionOutcome>(event.payload.clone())
+        .map_err(|error| format!("canonical outcome payload is invalid: {error}"))?;
+    let classification = match &outcome.terminal {
+        OutcomeTerminalClass::Failed(reason)
+        | OutcomeTerminalClass::Blocked(reason)
+        | OutcomeTerminalClass::PartialFailure(reason) => Some((
+            EvolutionSignalType::RecoveryGap,
+            EvolutionSignalSeverity::Critical,
+            format!(
+                "{} execution {}: {}",
+                outcome.terminal.class_name(),
+                outcome.identity.execution_id,
+                reason
+            ),
+            "Create an isolated recovery candidate and falsify it against the pinned baseline.",
+            false,
+        )),
+        OutcomeTerminalClass::Cancelled(reason) => Some((
+            EvolutionSignalType::SlowProgress,
+            EvolutionSignalSeverity::Info,
+            format!(
+                "execution {} was cancelled: {}",
+                outcome.identity.execution_id, reason
+            ),
+            "Inspect the attributable cancellation evidence before proposing any policy change.",
+            true,
+        )),
+        OutcomeTerminalClass::Succeeded(_) if outcome.usage.duplicate_tool_calls > 0 => Some((
+            EvolutionSignalType::LowNoveltyToolLoop,
+            EvolutionSignalSeverity::Warning,
+            format!(
+                "execution {} completed with {} duplicate tool calls",
+                outcome.identity.execution_id, outcome.usage.duplicate_tool_calls
+            ),
+            "Compare a dependency-aware batch or Tool DAG candidate against the pinned baseline.",
+            true,
+        )),
+        _ => None,
+    };
+    let Some((signal_type, severity, summary, suggested_action, continue_task)) = classification
+    else {
+        return Ok(None);
+    };
+    let mut evidence_refs = outcome.evidence_refs.clone();
+    evidence_refs.push(
+        EvidenceRef::observed("execution_outcome", event.event_id.clone())
+            .with_source(outcome.identity.execution_id.clone()),
+    );
+    let signal_digest = format!("{:x}", Sha256::digest(event.event_id.as_bytes()));
+    Ok(Some(EvolutionSignal {
+        signal_id: format!("evo-signal-outcome-{}", &signal_digest[..24]),
+        signal_type,
+        source: EvolutionSignalSource {
+            owner: "runtime.outcome".to_string(),
+            session_id: Some(outcome.identity.session_id),
+            agent_id: outcome.identity.agent_id,
+            team_id: outcome.identity.team_id,
+            run_id: Some(outcome.identity.execution_id),
+        },
+        evidence_refs,
+        severity,
+        summary,
+        suggested_action: suggested_action.to_string(),
+        immediate_task_can_continue: continue_task,
+        created_at_ms: u128::from(event.created_at_ms),
+    }))
+}
+
 fn signal_from_source_event(event: &DurableRuntimeEvent) -> Option<EvolutionSignal> {
     let (signal_type, severity, summary, suggested_action, continue_task) =
         classify_source_event(event)?;
@@ -463,8 +536,10 @@ fn signal_from_source_event(event: &DurableRuntimeEvent) -> Option<EvolutionSign
         signal_id: format!("evo-signal-source-{}", &digest[..24]),
         signal_type,
         source,
-        evidence_refs: vec![EvidenceRef::new("runtime_event", event.event_id.clone())
-            .with_source(event.kind.clone())],
+        evidence_refs: vec![
+            EvidenceRef::observed("runtime_event", event.event_id.clone())
+                .with_source(event.kind.clone()),
+        ],
         severity,
         summary,
         suggested_action,
@@ -556,22 +631,6 @@ fn classify_source_event(
             "Preserve the terminal evidence and evaluate a bounded recovery strategy.".to_string(),
             false,
         )),
-        "task.failure.recorded" | "agent.blocked" | "agent.blocked_recovery" => Some((
-            EvolutionSignalType::RecoveryGap,
-            EvolutionSignalSeverity::Critical,
-            format!("Runtime recorded {}", event.kind),
-            "Preserve the terminal evidence and evaluate an isolated recovery candidate."
-                .to_string(),
-            false,
-        )),
-        "agent.terminal" if event.status.as_deref() != Some("completed") => Some((
-            EvolutionSignalType::AgentFailurePattern,
-            EvolutionSignalSeverity::Warning,
-            "An Agent reached a non-success terminal state.".to_string(),
-            "Cluster the failure with its definition revision and evaluate a candidate revision."
-                .to_string(),
-            true,
-        )),
         _ => None,
     }
 }
@@ -636,6 +695,14 @@ fn projector_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_contract::{
+        outcome::{
+            OutcomeIdentity, OutcomeObservation, OutcomeQuality, OutcomeTiming, OutcomeUsage,
+            RuntimeIdentity, StrategyIdentity, OUTCOME_SCHEMA_REVISION,
+        },
+        reality::EvidenceCompleteness,
+        strategy::ExecutionCandidateKind,
+    };
 
     fn failed_agent_evaluation(index: u64) -> crate::AgentRunEvaluation {
         crate::AgentRunEvaluation {
@@ -669,6 +736,52 @@ mod tests {
             tool_calls: 1,
             evidence_refs: vec![format!("evidence-{index}")],
             created_at_ms: index,
+        }
+    }
+
+    fn failed_outcome() -> ExecutionOutcome {
+        ExecutionOutcome {
+            identity: OutcomeIdentity {
+                execution_id: "execution-outcome-failed".to_string(),
+                session_id: "session-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                terminal_generation: 1,
+                paired_sample_id: None,
+                task_id: None,
+                mission_id: None,
+                agent_id: None,
+                team_id: None,
+                execution_graph_ref: None,
+            },
+            runtime: RuntimeIdentity {
+                workspace_key: "workspace".to_string(),
+                runtime_revision: "test".to_string(),
+                config_revision: "config".to_string(),
+            },
+            provider: None,
+            strategy: StrategyIdentity {
+                decision_id: "decision".to_string(),
+                policy_revision: "policy".to_string(),
+                decision_source: "test".to_string(),
+                selected_candidate: ExecutionCandidateKind::Direct,
+                selected_pattern: "direct".to_string(),
+            },
+            timing: OutcomeTiming {
+                started_at_ms: 1,
+                completed_at_ms: 2,
+                duration_ms: 1,
+            },
+            usage: OutcomeUsage::default(),
+            terminal: OutcomeTerminalClass::Failed("provider failed".to_string()),
+            quality: OutcomeQuality::Unknown,
+            observation: OutcomeObservation {
+                source: "test".to_string(),
+                observed_at_ms: 2,
+                freshness_ms: 0,
+            },
+            evidence_refs: Vec::new(),
+            evidence_completeness: EvidenceCompleteness::None,
+            schema_revision: OUTCOME_SCHEMA_REVISION,
         }
     }
 
@@ -706,13 +819,23 @@ mod tests {
 
         events
             .append(RuntimeEventInput {
-                stream_id: "task:task-1".to_string(),
-                scope: RuntimeEventScope::Task,
-                kind: "task.failure.recorded".to_string(),
+                stream_id: "goal:goal-2".to_string(),
+                scope: RuntimeEventScope::Goal,
+                kind: "goal.observation".to_string(),
                 status: Some("failed".to_string()),
-                actor: Some("runtime.task".to_string()),
+                actor: Some("runtime.goal".to_string()),
                 refs: Vec::new(),
-                payload: serde_json::json!({}),
+                payload: serde_json::json!({
+                    "observation": {
+                        "result_class": "failed",
+                        "failure_class": "provider_unavailable",
+                        "cost_delta": {"tool_calls": 0},
+                        "information_gain": {
+                            "new_evidence": 0,
+                            "resolved_unknowns": 0
+                        }
+                    }
+                }),
             })
             .expect("second source event");
         assert_eq!(projector.run_once(1).expect("second pass"), 1);
@@ -770,5 +893,24 @@ mod tests {
             .list_stream(PROJECTOR_STREAM)
             .expect("projector stream")
             .is_empty());
+    }
+
+    #[test]
+    fn canonical_outcome_enters_governed_evolution_without_direct_promotion() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let projector = EvolutionSignalProjector::new(Arc::clone(&events), Arc::clone(&discovery));
+        crate::execution_core::OutcomeService::new(Arc::clone(&events))
+            .record_terminal(&failed_outcome())
+            .expect("outcome");
+
+        assert_eq!(projector.run_once(64).expect("project"), 1);
+        assert_eq!(discovery.list_signals().expect("signals").len(), 1);
+        assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+        assert!(events
+            .list_scope(RuntimeEventScope::Evolution, 1_000)
+            .expect("events")
+            .iter()
+            .all(|event| !event.kind.contains("stable")));
     }
 }

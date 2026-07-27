@@ -271,7 +271,7 @@ impl NodeExecutor for AgentTaskExecutor {
         let mut evidence_refs = returned.evidence_refs;
         evidence_refs.extend(returned.acceptance.iter().map(|criterion| {
             harness_contract::context::EvidenceAccessRef::unavailable(
-                harness_contract::context::EvidenceRef::new(
+                harness_contract::context::EvidenceRef::observed(
                     "runtime_acceptance",
                     acceptance_marker_id(packet.node_id(), criterion),
                 ),
@@ -286,7 +286,7 @@ impl NodeExecutor for AgentTaskExecutor {
                 .filter_map(|receipt| {
                     let encoded = serde_json::to_string(receipt).ok()?;
                     Some(harness_contract::context::EvidenceAccessRef::unavailable(
-                        harness_contract::context::EvidenceRef::new("runtime_change", encoded),
+                        harness_contract::context::EvidenceRef::observed("runtime_change", encoded),
                         "application/vnd.cowd.runtime-change+json",
                         format!("execution-node:{}", packet.node_id()),
                     ))

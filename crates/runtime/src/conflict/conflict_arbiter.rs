@@ -1,13 +1,16 @@
 //! Runtime-owned conflict arbitration receipts.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     MissionEvidenceBus, MissionEvidenceRef, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope,
-    RuntimeEventStore,
+    RuntimeEventStore, RuntimeTransactionEventInput,
 };
+
+const CONFLICT_EVENT_KIND: &str = "runtime.conflict.resolved.v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,7 +67,6 @@ pub struct ConflictResolutionReceipt {
 
 #[derive(Debug)]
 pub struct ConflictArbiter {
-    receipts: Mutex<Vec<ConflictResolutionReceipt>>,
     evidence_bus: Arc<MissionEvidenceBus>,
     event_store: Arc<RuntimeEventStore>,
 }
@@ -73,18 +75,22 @@ impl ConflictArbiter {
     #[must_use]
     pub fn new(evidence_bus: Arc<MissionEvidenceBus>, event_store: Arc<RuntimeEventStore>) -> Self {
         Self {
-            receipts: Mutex::new(Vec::new()),
             evidence_bus,
             event_store,
         }
     }
 
-    pub fn resolve(&self, request: ConflictResolutionRequest) -> ConflictResolutionReceipt {
+    pub fn resolve(
+        &self,
+        request: ConflictResolutionRequest,
+    ) -> Result<ConflictResolutionReceipt, String> {
         let created_at_ms = now_ms();
         let conflict_id = format!("conflict-{}", uuid::Uuid::new_v4());
+        let evidence_id = format!("mission-evidence-{}", uuid::Uuid::new_v4());
         let decision = decision_for(request.severity);
-        let mission_evidence = self.evidence_bus.record(MissionEvidenceRef {
-            evidence_id: String::new(),
+        let mission_evidence = MissionEvidenceRef {
+            evidence: EvidenceRef::conflict("runtime_conflict", evidence_id)
+                .with_source("runtime.conflict_arbiter"),
             mission_id: Some("mission-control".to_string()),
             session_id: first_scope_with_prefix(&request.affected_scope, "session:")
                 .unwrap_or_else(|| "mission-control".to_string()),
@@ -93,33 +99,36 @@ impl ConflictArbiter {
             kind: "conflict".to_string(),
             summary: request.summary.clone(),
             source_ref: Some(conflict_id.clone()),
-            created_at_ms: 0,
-        });
+            created_at_ms,
+        };
         let receipt = ConflictResolutionReceipt {
-            conflict_id,
+            conflict_id: conflict_id.clone(),
             source: request.source,
             severity: request.severity,
             decision,
             summary: request.summary,
             evidence_refs: request.evidence_refs,
             affected_scope: request.affected_scope,
-            mission_evidence,
+            mission_evidence: mission_evidence.clone(),
             created_at_ms,
         };
-        self.receipts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(receipt.clone());
-        record_conflict_event(&self.event_store, &receipt);
-        receipt
+        self.evidence_bus.record_with_related_event(
+            mission_evidence,
+            conflict_event(&receipt)?,
+            format!("runtime-conflict:{conflict_id}"),
+        )?;
+        Ok(receipt)
     }
 
     #[must_use]
     pub fn receipts(&self) -> Vec<ConflictResolutionReceipt> {
-        self.receipts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.event_store
+            .all_events(10_000)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|event| event.kind == CONFLICT_EVENT_KIND)
+            .filter_map(|event| serde_json::from_value(event.payload).ok())
+            .collect()
     }
 
     #[must_use]
@@ -142,7 +151,9 @@ fn decision_for(severity: ConflictSeverity) -> ConflictDecisionKind {
     }
 }
 
-fn record_conflict_event(event_store: &RuntimeEventStore, receipt: &ConflictResolutionReceipt) {
+fn conflict_event(
+    receipt: &ConflictResolutionReceipt,
+) -> Result<RuntimeTransactionEventInput, String> {
     let refs = receipt
         .affected_scope
         .iter()
@@ -154,15 +165,19 @@ fn record_conflict_event(event_store: &RuntimeEventStore, receipt: &ConflictReso
             })
         })
         .collect::<Vec<_>>();
-    let _ = event_store.append(RuntimeEventInput {
-        stream_id: format!("conflict:{}", receipt.conflict_id),
-        scope: RuntimeEventScope::Mission,
-        kind: "runtime.conflict.resolved".to_string(),
-        status: Some(format!("{:?}", receipt.decision).to_ascii_lowercase()),
-        actor: Some("conflict_arbiter".to_string()),
-        refs,
-        payload: serde_json::json!(receipt),
-    });
+    Ok(RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: format!("conflict:{}", receipt.conflict_id),
+            scope: RuntimeEventScope::Mission,
+            kind: CONFLICT_EVENT_KIND.to_string(),
+            status: Some(format!("{:?}", receipt.decision).to_ascii_lowercase()),
+            actor: Some("runtime.conflict_arbiter".to_string()),
+            refs,
+            payload: serde_json::to_value(receipt).map_err(|error| error.to_string())?,
+        },
+        idempotency_key: Some(format!("conflict:{}", receipt.conflict_id)),
+        schema_version: 1,
+    })
 }
 
 fn first_scope_with_prefix(scopes: &[String], prefix: &str) -> Option<String> {
@@ -190,15 +205,17 @@ mod tests {
     }
 
     #[test]
-    fn conflict_arbiter_records_receipt_event_and_evidence() {
+    fn conflict_arbiter_commits_receipt_and_evidence_atomically() {
         let arbiter = arbiter();
-        let receipt = arbiter.resolve(ConflictResolutionRequest {
-            source: ConflictSourceKind::ExecutionGraph,
-            severity: ConflictSeverity::High,
-            summary: "downstream node blocked".to_string(),
-            evidence_refs: vec!["execution_graph:test".to_string()],
-            affected_scope: vec!["session:s1".to_string(), "team:t1".to_string()],
-        });
+        let receipt = arbiter
+            .resolve(ConflictResolutionRequest {
+                source: ConflictSourceKind::ExecutionGraph,
+                severity: ConflictSeverity::High,
+                summary: "downstream node blocked".to_string(),
+                evidence_refs: vec!["execution_graph:test".to_string()],
+                affected_scope: vec!["session:s1".to_string(), "team:t1".to_string()],
+            })
+            .unwrap();
 
         assert_eq!(receipt.decision, ConflictDecisionKind::PauseAffectedScope);
         assert_eq!(receipt.mission_evidence.kind, "conflict");

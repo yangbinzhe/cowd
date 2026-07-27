@@ -118,7 +118,7 @@ pub async fn try_register_and_evaluate(
         .services
         .record_evolution_signal(runtime::EvolutionSignal::eval_failure(
             format!("{candidate_id}:baseline"),
-            vec![EvidenceRef::new(
+            vec![EvidenceRef::observed(
                 "agent_run",
                 format!("{candidate_id}:baseline"),
             )],
@@ -158,7 +158,7 @@ pub async fn try_register_and_evaluate(
                 revision_ref: candidate_ref,
             },
             baseline_revision,
-            source_evidence_refs: vec![EvidenceRef::new(
+            source_evidence_refs: vec![EvidenceRef::observed(
                 "agent_run",
                 format!("{candidate_id}:baseline"),
             )],
@@ -187,7 +187,7 @@ pub fn qualified_observation(
         canary_assignment_id: assignment.assignment_id.clone(),
         generation: assignment.generation,
         source_run_refs: vec![format!("agent-run:{candidate_id}:1")],
-        evidence_refs: vec![EvidenceRef::new(
+        evidence_refs: vec![EvidenceRef::observed(
             "canary_evaluation",
             format!("{candidate_id}:canary"),
         )],
@@ -340,7 +340,7 @@ impl EvolutionEvalRunner for EligibleEvalRunner {
             evaluation_contract_digest: candidate.evaluation_contract_digest(),
             dimensions,
             source_run_refs: vec![format!("paired-run:{}", candidate.candidate_id)],
-            evidence_refs: vec![EvidenceRef::new(
+            evidence_refs: vec![EvidenceRef::observed(
                 "paired_evaluation",
                 candidate.candidate_id.clone(),
             )],

@@ -27,7 +27,7 @@ async fn release_generation_fence_rejects_a_stale_canary_review_without_partial_
             action: ReleaseChangeAction::SetDefaultLatest,
             selector: None,
             candidate_id: None,
-            evidence_refs: vec![EvidenceRef::new("audit", "advance-generation")],
+            evidence_refs: vec![EvidenceRef::observed("audit", "advance-generation")],
         })
         .expect("pointer review");
     fixture

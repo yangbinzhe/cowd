@@ -89,7 +89,7 @@ impl AgentRuntimeBackend for CompletedBackend {
     ) -> Result<AgentReturnPacket, String> {
         let mut evidence_refs = packet.evidence_refs.clone();
         evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::context::EvidenceRef::new(
+            harness_contract::context::EvidenceRef::observed(
                 "tool",
                 format!("materialized:{}", packet.node_id()),
             ),

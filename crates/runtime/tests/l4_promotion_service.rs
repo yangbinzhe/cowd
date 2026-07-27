@@ -67,7 +67,7 @@ fn candidate() -> L4PromotionCandidate {
         title: "Verified architecture decision".to_string(),
         claim: "Use the reviewed Runtime Team instantiation path for durable Team work."
             .to_string(),
-        evidence_refs: vec![EvidenceRef::new("review", "evidence:review:1")],
+        evidence_refs: vec![EvidenceRef::observed("review", "evidence:review:1")],
         authority: KnowledgeAuthority::AgentObservation,
         lineage: KnowledgeLineage::default(),
         novelty: KnowledgeNovelty::New,

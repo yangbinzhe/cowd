@@ -151,7 +151,10 @@ impl MatrixFact {
                 .get("valid_to")
                 .and_then(|value| serde_json::from_value(value.clone()).ok()),
             source_ref: Some(fact.source.id),
-            confidence: Some(f32::from(fact.confidence.basis_points()) / 10_000.0),
+            confidence: fact
+                .confidence
+                .basis_points()
+                .map(|value| f32::from(value) / 10_000.0),
             raw_hash: fact
                 .value
                 .get("raw_hash")

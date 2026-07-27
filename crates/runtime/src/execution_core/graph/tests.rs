@@ -524,7 +524,7 @@ impl NodeExecutor for EvidenceExecutor {
             .as_ref()
             .map(|id| {
                 vec![EvidenceAccessRef::durable(
-                    EvidenceRef::new("evidence", id),
+                    EvidenceRef::observed("evidence", id),
                     format!("sha:{id}"),
                     1,
                     "text/plain",

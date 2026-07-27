@@ -295,7 +295,7 @@ mod tests {
         let signal = EvolutionSignal::memory_noise(
             "runtime",
             "session-1",
-            vec![EvidenceRef::new("memory", "packet:noise")],
+            vec![EvidenceRef::observed("memory", "packet:noise")],
         );
         let proposal = EvolutionProposal::from_signals(&[signal]);
         assert_eq!(

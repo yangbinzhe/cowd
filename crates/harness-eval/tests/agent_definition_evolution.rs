@@ -164,7 +164,7 @@ fn observation(
         succeeded: candidate,
         acceptance_total: 1,
         acceptance_satisfied: 1,
-        evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+        evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
             "evaluation",
             format!(
                 "{candidate_id}:{}:{sample_index}",
@@ -193,7 +193,7 @@ fn candidate() -> EvolutionGovernanceCandidate {
             "task_success",
         ),
         evaluation_policy_floor: EvaluationPolicyFloor::default(),
-        source_evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+        source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
             "source", "baseline",
         )],
         canary_policy: CanaryRolloutPolicy::default(),

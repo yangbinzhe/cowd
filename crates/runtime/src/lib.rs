@@ -212,12 +212,16 @@ pub mod lane_completion;
 pub mod mission_command_interpreter;
 #[path = "orchestration/mod.rs"]
 pub mod orchestration;
+#[path = "recovery/outcome_projector.rs"]
+pub mod outcome_projector;
 #[path = "agent/pairing.rs"]
 pub mod pairing;
 #[path = "infrastructure/profile.rs"]
 pub mod profile;
 #[path = "infrastructure/projection.rs"]
 pub mod projection;
+#[path = "provider/outcome_selector.rs"]
+pub mod provider_outcome_selector;
 #[path = "provider/provider_registry.rs"]
 pub mod provider_registry;
 #[path = "provider/provider_runtime_client.rs"]
@@ -381,9 +385,9 @@ pub use config::{
     McpConfigCollection, McpManagedProxyServerConfig, McpOAuthConfig, McpRemoteServerConfig,
     McpSdkServerConfig, McpServerConfig, McpStdioServerConfig, McpTransport,
     McpWebSocketServerConfig, MemoryConfig, PlatformConfig as GatewayPlatformConfig,
-    PostgresTopologyConfig, ResolvedPermissionMode, RuntimeConfig, RuntimeControlConfig,
-    RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig, RuntimePluginConfig,
-    ScopedMcpServerConfig, SessionRecoveryConfig, SessionResetPolicy,
+    PostgresTopologyConfig, ResolvedPermissionMode, RoutingMode, RuntimeConfig,
+    RuntimeControlConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePermissionRuleConfig,
+    RuntimePluginConfig, ScopedMcpServerConfig, SessionRecoveryConfig, SessionResetPolicy,
     SessionStorageExecutionConfig, StorageBackendSelection, StorageTopologyConfig,
     COWD_SETTINGS_SCHEMA_NAME,
 };
@@ -429,17 +433,18 @@ pub use execution_core::{
     build_runtime_execution_decision, execution_pattern_catalog_response, rewoo_plan_for_intent,
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
     runtime_orchestration_action_guidance, runtime_orchestration_actions, tool_intents_from_rewoo,
-    CrossPlaneRuntimeError, CrossPlaneRuntimeService, DeliberationMode, DeliberationPlan,
-    ExecutionCommitService, ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphHost,
-    ExecutionGraphHostReceipt, ExecutionGraphStateStore, ExecutionPatternCatalog,
-    ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport,
-    ReflexionRecord, ReflexionTrigger, RewooEvidencePlan, RewooEvidenceResult, RewooEvidenceStep,
-    RewooObservation, RewooSolverContract, RuntimeActionSelectionReport, RuntimeCompileTarget,
-    RuntimeEventReader, RuntimeEvidenceSummary, RuntimeExecutionActionHint,
-    RuntimeExecutionDecision, RuntimeExecutionHealth, RuntimeExecutionOwnerReport,
-    RuntimeExecutionPatternCandidate, RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec,
-    RuntimeExecutionShutdownReport, RuntimeExecutionSupervisor, RuntimeServices,
-    RuntimeServicesBuilder, RuntimeServicesError, RuntimeWorkAdmissionReceipt,
+    CalibrationOutcomeImportReceipt, CrossPlaneRuntimeError, CrossPlaneRuntimeService,
+    DeliberationMode, DeliberationPlan, ExecutionCommitService, ExecutionCompileRequest,
+    ExecutionGraphCompiler, ExecutionGraphHost, ExecutionGraphHostReceipt,
+    ExecutionGraphStateStore, ExecutionPatternCatalog, ExecutionStartupRecoveryError,
+    ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport, LegacyOutcomeImportReceipt,
+    OutcomeRecordReceipt, ReflexionRecord, ReflexionTrigger, RewooEvidencePlan,
+    RewooEvidenceResult, RewooEvidenceStep, RewooObservation, RewooSolverContract,
+    RuntimeActionSelectionReport, RuntimeCompileTarget, RuntimeEventReader, RuntimeEvidenceSummary,
+    RuntimeExecutionActionHint, RuntimeExecutionDecision, RuntimeExecutionHealth,
+    RuntimeExecutionOwnerReport, RuntimeExecutionPatternCandidate, RuntimeExecutionPatternSpec,
+    RuntimeExecutionReportSpec, RuntimeExecutionShutdownReport, RuntimeExecutionSupervisor,
+    RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError, RuntimeWorkAdmissionReceipt,
     SessionTerminalDeliveryPort, StrategyDecisionEngine, StrategyLease, StrategyResourceHealth,
     ToolIntentDependency, ToolIntentDependencyKind, ToolIntentGraph, ToolIntentNode,
     TurnStrategyActualOutcome, TurnStrategyDecisionState, TurnStrategyDecisionStatus,
@@ -588,6 +593,10 @@ pub use orchestration::{
     RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision, RuntimeOrchestrationRequest,
     RuntimeOrchestrationResult,
 };
+pub use outcome_projector::{
+    OutcomeProjectionCheckpoint, OutcomeProjectionDlqEntry, OutcomeProjectionHealth,
+    OutcomeProjector, OutcomeReadSnapshot, OutcomeSegmentSnapshot,
+};
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest, SharedPrompter,
@@ -608,6 +617,10 @@ pub use prompt::{
 };
 pub use prompt_assembly::{PromptAssembly, PromptContextPacket};
 pub use provider::{detect_provider_kind, model_context_window_with_overrides, ProviderKind};
+pub use provider_outcome_selector::{
+    select_provider_from_outcome_snapshot, ProviderSelectionCandidateReceipt,
+    ProviderSelectionReceipt,
+};
 pub use provider_registry::{
     ProviderRegistry, ProviderRegistryDiagnostics, ProviderRegistryRejected,
     ProviderRegistrySnapshot, ProviderRegistryUpdate,
@@ -769,17 +782,18 @@ pub use budget_policy::{
     DEFAULT_SUBSYSTEM_BUDGET_RATIO_BP,
 };
 pub use context_runtime::{
-    AgentContextLease, AgentContextView, AgentReturnContextProjection, AgentReturnRequirement,
-    AssembledContext, ContextAuthority, ContextBudgetAllocation, ContextBudgetExplanation,
-    ContextBudgetReport, ContextCacheStabilityReport, ContextDegradationPath, ContextDiagnostics,
-    ContextEnvelope, ContextEnvelopeRequest, ContextEpochReport, ContextIdentity, ContextItem,
-    ContextLeanProbe, ContextLease, ContextMode, ContextModeCoverageEntry,
-    ContextModeCoverageReport, ContextOmission, ContextPolicyAction, ContextPolicyDecision,
-    ContextPolicyProposal, ContextPressureLevel, ContextProfile, ContextRole, ContextRuntimeKernel,
-    ContextSegmentChange, ContextSegmentKind, ContextSegmentSnapshot, ContextSnapshot,
-    ContextSnapshotDiff, ContextSourceKind, ContextSourceLifecycle, ContextSourceRef,
-    ContextVisibility, ResumeContextPacket, ResumeContextSource, StableHeadComparison,
-    ToolTracePacket, ToolTraceStatus, WorkspacePacket,
+    context_authority_for_reality_boundary, AgentContextLease, AgentContextView,
+    AgentReturnContextProjection, AgentReturnRequirement, AssembledContext, ContextAuthority,
+    ContextBudgetAllocation, ContextBudgetExplanation, ContextBudgetReport,
+    ContextCacheStabilityReport, ContextDegradationPath, ContextDiagnostics, ContextEnvelope,
+    ContextEnvelopeRequest, ContextEpochReport, ContextIdentity, ContextItem, ContextLeanProbe,
+    ContextLease, ContextMode, ContextModeCoverageEntry, ContextModeCoverageReport,
+    ContextOmission, ContextPolicyAction, ContextPolicyDecision, ContextPolicyProposal,
+    ContextPressureLevel, ContextProfile, ContextRole, ContextRuntimeKernel, ContextSegmentChange,
+    ContextSegmentKind, ContextSegmentSnapshot, ContextSnapshot, ContextSnapshotDiff,
+    ContextSourceKind, ContextSourceLifecycle, ContextSourceRef, ContextVisibility,
+    ResumeContextPacket, ResumeContextSource, StableHeadComparison, ToolTracePacket,
+    ToolTraceStatus, WorkspacePacket,
 };
 pub use runtime_control::{
     AgentControlPolicy, ContextControlPolicy, MemoryControlPolicy, MissionSchedulePolicy,

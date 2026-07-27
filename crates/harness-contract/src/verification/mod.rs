@@ -1,6 +1,9 @@
 //! Verification ledger for Cowd AI work kernel.
 
-use crate::core::{AiKernelError, AiKernelResult, KernelRef};
+use crate::{
+    core::{AiKernelError, AiKernelResult, KernelRef},
+    reality::{ClaimSupportState, EvidenceCompleteness, EvidenceRef},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +36,7 @@ pub enum VerificationStatus {
     Supported,
     Unsupported,
     Contradicted,
+    Both,
     NotRun,
 }
 
@@ -49,7 +53,7 @@ pub struct Evidence {
     pub id: String,
     pub kind: EvidenceKind,
     pub summary: String,
-    pub refs: Vec<KernelRef>,
+    pub refs: Vec<EvidenceRef>,
 }
 
 impl Evidence {
@@ -64,8 +68,8 @@ impl Evidence {
     }
 
     #[must_use]
-    pub fn with_ref(mut self, reference: KernelRef) -> Self {
-        self.refs.push(reference);
+    pub fn with_ref(mut self, reference: impl Into<EvidenceRef>) -> Self {
+        self.refs.push(reference.into());
         self
     }
 }
@@ -76,6 +80,12 @@ pub struct Claim {
     pub kind: ClaimKind,
     pub statement: String,
     pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub counter_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub support: ClaimSupportState,
+    #[serde(default)]
+    pub completeness: EvidenceCompleteness,
     pub status: VerificationStatus,
     pub required: bool,
 }
@@ -88,6 +98,9 @@ impl Claim {
             kind,
             statement: statement.into(),
             evidence_ids: Vec::new(),
+            counter_evidence_ids: Vec::new(),
+            support: ClaimSupportState::Unknown,
+            completeness: EvidenceCompleteness::None,
             status: VerificationStatus::Pending,
             required: true,
         }
@@ -155,7 +168,51 @@ impl VerificationLedger {
         if !claim.evidence_ids.iter().any(|id| id == evidence_id) {
             claim.evidence_ids.push(evidence_id.to_string());
         }
-        claim.status = VerificationStatus::Supported;
+        claim.support = claim.support.combine(ClaimSupportState::Supported);
+        claim.completeness = EvidenceCompleteness::Partial;
+        claim.status = status_from_support(claim.support);
+        Ok(())
+    }
+
+    pub fn contradict_claim(&mut self, claim_id: &str, evidence_id: &str) -> AiKernelResult<()> {
+        if !self
+            .evidence
+            .iter()
+            .any(|evidence| evidence.id == evidence_id)
+        {
+            return Err(AiKernelError::InvalidInput(format!(
+                "evidence {evidence_id} not found"
+            )));
+        }
+        let claim = self
+            .claims
+            .iter_mut()
+            .find(|claim| claim.id == claim_id)
+            .ok_or_else(|| AiKernelError::InvalidInput(format!("claim {claim_id} not found")))?;
+        if !claim
+            .counter_evidence_ids
+            .iter()
+            .any(|id| id == evidence_id)
+        {
+            claim.counter_evidence_ids.push(evidence_id.to_string());
+        }
+        claim.support = claim.support.combine(ClaimSupportState::Contradicted);
+        claim.completeness = EvidenceCompleteness::Partial;
+        claim.status = status_from_support(claim.support);
+        Ok(())
+    }
+
+    pub fn set_completeness(
+        &mut self,
+        claim_id: &str,
+        completeness: EvidenceCompleteness,
+    ) -> AiKernelResult<()> {
+        let claim = self
+            .claims
+            .iter_mut()
+            .find(|claim| claim.id == claim_id)
+            .ok_or_else(|| AiKernelError::InvalidInput(format!("claim {claim_id} not found")))?;
+        claim.completeness = completeness;
         Ok(())
     }
 
@@ -181,6 +238,7 @@ impl VerificationLedger {
                         VerificationStatus::Pending
                             | VerificationStatus::Unsupported
                             | VerificationStatus::Contradicted
+                            | VerificationStatus::Both
                     )
             })
             .cloned()
@@ -198,7 +256,7 @@ impl VerificationLedger {
         if self.claims.is_empty() {
             blocking_reasons.push("verification ledger has no claims".to_string());
         }
-        let can_finalize = unsupported_required_claims.is_empty();
+        let can_finalize = !self.claims.is_empty() && unsupported_required_claims.is_empty();
         let severity = if !can_finalize {
             VerificationSeverity::Blocking
         } else if !not_run_claims.is_empty() || self.evidence.is_empty() {
@@ -227,6 +285,22 @@ impl VerificationLedger {
                 report.unsupported_required_claims.len()
             )))
         }
+    }
+}
+
+fn status_from_support(support: ClaimSupportState) -> VerificationStatus {
+    match support {
+        ClaimSupportState::Unknown => VerificationStatus::Pending,
+        ClaimSupportState::Supported => VerificationStatus::Supported,
+        ClaimSupportState::Contradicted => VerificationStatus::Contradicted,
+        ClaimSupportState::Both => VerificationStatus::Both,
+    }
+}
+
+impl From<KernelRef> for EvidenceRef {
+    fn from(reference: KernelRef) -> Self {
+        EvidenceRef::unknown(reference.ref_type, reference.id)
+            .with_source(reference.label.unwrap_or_else(|| "ai_kernel".to_string()))
     }
 }
 
@@ -279,5 +353,40 @@ mod tests {
         let report = ledger.report();
         assert!(report.can_finalize);
         assert_eq!(report.not_run_claims.len(), 1);
+    }
+
+    #[test]
+    fn support_and_contradiction_are_order_independent() {
+        for reverse in [false, true] {
+            let mut ledger = VerificationLedger::new();
+            let claim = ledger.add_claim(Claim::required(
+                ClaimKind::SourceFact,
+                "claim has mixed evidence",
+            ));
+            let support =
+                ledger.add_evidence(Evidence::new(EvidenceKind::Source, "supporting source"));
+            let contradiction =
+                ledger.add_evidence(Evidence::new(EvidenceKind::Source, "counter source"));
+            if reverse {
+                ledger.contradict_claim(&claim, &contradiction).unwrap();
+                ledger.support_claim(&claim, &support).unwrap();
+            } else {
+                ledger.support_claim(&claim, &support).unwrap();
+                ledger.contradict_claim(&claim, &contradiction).unwrap();
+            }
+            assert_eq!(ledger.claims[0].support, ClaimSupportState::Both);
+            assert_eq!(ledger.claims[0].status, VerificationStatus::Both);
+            assert!(!ledger.report().can_finalize);
+        }
+    }
+
+    #[test]
+    fn empty_ledger_cannot_finalize() {
+        let report = VerificationLedger::new().report();
+        assert!(!report.can_finalize);
+        assert!(report
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("no claims")));
     }
 }

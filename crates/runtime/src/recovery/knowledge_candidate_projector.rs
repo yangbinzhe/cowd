@@ -513,7 +513,7 @@ mod tests {
             scope: KnowledgeCandidateScope::AgentPrivate(run_id),
             title: title.to_string(),
             claim: claim.to_string(),
-            evidence_refs: vec![EvidenceRef::new(
+            evidence_refs: vec![EvidenceRef::observed(
                 "tool_receipt",
                 format!("evidence-{candidate_id}"),
             )],
@@ -541,7 +541,7 @@ mod tests {
             scope: KnowledgeCandidateScope::Team(team_id),
             title: "Team synthesis".to_string(),
             claim: "The reviewed team synthesis is reusable.".to_string(),
-            evidence_refs: vec![EvidenceRef::new("team_evidence", "team-evidence-1")],
+            evidence_refs: vec![EvidenceRef::observed("team_evidence", "team-evidence-1")],
             authority: KnowledgeAuthority::TeamSynthesis,
             lineage: KnowledgeLineage::default(),
             novelty: KnowledgeNovelty::New,

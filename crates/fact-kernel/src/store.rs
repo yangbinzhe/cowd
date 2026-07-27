@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-use crate::core::{EvidenceId, EvidencePacket, FactId, FactRecord};
+use crate::core::{EvidencePacket, FactEvidenceId, FactId, FactRecord};
 
 pub trait FactStore {
     fn upsert_fact(&mut self, fact: FactRecord) -> FactRecord;
     fn get_fact(&self, id: &FactId) -> Option<&FactRecord>;
     fn list_facts(&self) -> Vec<FactRecord>;
     fn insert_evidence(&mut self, evidence: EvidencePacket) -> EvidencePacket;
-    fn get_evidence(&self, id: &EvidenceId) -> Option<&EvidencePacket>;
+    fn get_evidence(&self, id: &FactEvidenceId) -> Option<&EvidencePacket>;
     fn list_evidence(&self) -> Vec<EvidencePacket>;
 }
 
@@ -75,7 +75,7 @@ impl FactStore for InMemoryFactStore {
         evidence
     }
 
-    fn get_evidence(&self, id: &EvidenceId) -> Option<&EvidencePacket> {
+    fn get_evidence(&self, id: &FactEvidenceId) -> Option<&EvidencePacket> {
         self.evidence.get(id.as_str())
     }
 

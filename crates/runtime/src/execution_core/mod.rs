@@ -12,6 +12,7 @@ pub mod goal;
 pub mod graph;
 pub mod model_affordance;
 pub mod orchestration_binding;
+pub mod outcome_service;
 pub mod pattern_catalog;
 pub mod performance;
 pub mod protocols;
@@ -40,6 +41,10 @@ pub use model_affordance::{
 };
 pub use orchestration_binding::{
     runtime_orchestration_action_guidance, runtime_orchestration_actions,
+};
+pub use outcome_service::{
+    CalibrationOutcomeImportReceipt, LegacyOutcomeImportReceipt, OutcomeRecordReceipt,
+    OutcomeService, OUTCOME_EVENT_KIND, OUTCOME_IMPORT_EVENT_KIND,
 };
 pub use pattern_catalog::{
     execution_pattern_catalog_response, ExecutionPatternCatalog, RuntimeCompileTarget,

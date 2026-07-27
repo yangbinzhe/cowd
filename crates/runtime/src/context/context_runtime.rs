@@ -6,6 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use harness_contract::knowledge::KnowledgeTurnReport;
+use harness_contract::reality::RealityBoundary;
 use serde::{Deserialize, Serialize};
 
 use model_protocol::fingerprint::stable_hash_bytes;
@@ -124,6 +125,22 @@ pub enum ContextAuthority {
     Agent,
     Tool,
     Derived,
+}
+
+/// Translate a canonical Reality boundary into Context's local authority.
+///
+/// Retrieval rank and confidence are deliberately absent: they may order
+/// candidates but cannot promote an inferred or simulated claim.
+#[must_use]
+pub const fn context_authority_for_reality_boundary(boundary: RealityBoundary) -> ContextAuthority {
+    match boundary {
+        RealityBoundary::Observed => ContextAuthority::Project,
+        RealityBoundary::Inferred
+        | RealityBoundary::Simulated
+        | RealityBoundary::Hypothetical
+        | RealityBoundary::Conflict
+        | RealityBoundary::Unknown => ContextAuthority::Derived,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2354,7 +2371,7 @@ mod tests {
             active_pack_ids: vec!["pack-a".to_string()],
             blocked_namespaces: vec!["global/noisy".to_string()],
             compliance_warnings: Vec::new(),
-            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                 "knowledge_pack",
                 "pack-a",
             )],
@@ -2421,7 +2438,7 @@ mod tests {
             active_pack_ids: vec!["pack-a".to_string()],
             blocked_namespaces: vec!["global/noisy".to_string()],
             compliance_warnings: Vec::new(),
-            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                 "knowledge_pack",
                 "pack-a",
             )],
@@ -3306,5 +3323,25 @@ mod tests {
         assert!(item
             .evidence
             .contains(&"workspace://symbol/ContextRuntimeKernel".to_string()));
+    }
+
+    #[test]
+    fn retrieval_rank_cannot_promote_non_observed_reality() {
+        assert_eq!(
+            context_authority_for_reality_boundary(RealityBoundary::Observed),
+            ContextAuthority::Project
+        );
+        for boundary in [
+            RealityBoundary::Inferred,
+            RealityBoundary::Simulated,
+            RealityBoundary::Hypothetical,
+            RealityBoundary::Conflict,
+            RealityBoundary::Unknown,
+        ] {
+            assert_eq!(
+                context_authority_for_reality_boundary(boundary),
+                ContextAuthority::Derived
+            );
+        }
     }
 }

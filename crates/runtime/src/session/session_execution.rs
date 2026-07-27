@@ -1654,7 +1654,7 @@ mod tests {
                 scope: Vec::new(),
                 context_lens: Vec::new(),
                 evidence_refs: vec![harness_contract::context::EvidenceAccessRef::durable(
-                    harness_contract::reality::EvidenceRef::new("tool", "raw-1"),
+                    harness_contract::reality::EvidenceRef::observed("tool", "raw-1"),
                     "sha256:abc",
                     3,
                     "text/plain",

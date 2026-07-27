@@ -3141,7 +3141,7 @@ mod tests {
                 spec: harness_contract::task::TaskSpec::new(
                     "prove canonical Task outbox reaches PostgreSQL event store",
                 ),
-                evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "test_fixture",
                     "test://runtime-postgres/composed-task",
                 )],
@@ -3170,7 +3170,7 @@ mod tests {
                 source_session_id: "session-pg-migration".to_string(),
                 source_turn_id: "turn-pg-migration".to_string(),
                 spec: TaskSpec::new("Migrate the task control plane"),
-                evidence_refs: vec![EvidenceRef::new(
+                evidence_refs: vec![EvidenceRef::observed(
                     "test_fixture",
                     "test://runtime-postgres/task-migration",
                 )],

@@ -946,7 +946,7 @@ mod tests {
                 .push(packet.objective.clone());
             let evidence_id = format!("materialized:{}", packet.node_id());
             let evidence = harness_contract::context::EvidenceAccessRef::durable(
-                harness_contract::context::EvidenceRef::new("tool", evidence_id),
+                harness_contract::context::EvidenceRef::observed("tool", evidence_id),
                 "a".repeat(64),
                 1,
                 "application/json",

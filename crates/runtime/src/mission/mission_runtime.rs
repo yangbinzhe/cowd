@@ -598,7 +598,7 @@ impl MissionRuntime {
         select: impl Fn(&mut MissionAggregate) -> &mut Vec<MissionEntityRef>,
     ) -> Result<MissionMutationReceipt, String> {
         validate_required("unlinked entity id", id)?;
-        evidence_refs.push(EvidenceRef::new(ref_type, id).with_source("runtime.mission"));
+        evidence_refs.push(EvidenceRef::observed(ref_type, id).with_source("runtime.mission"));
         let id = id.to_string();
         self.mutate_aggregate(
             mission_id,

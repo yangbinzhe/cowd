@@ -520,7 +520,7 @@ impl AgentRuntime {
             services.task_runtime_port().link_mission_agent_run(
                 packet.mission_id(),
                 packet.run_id(),
-                vec![EvidenceRef::new(
+                vec![EvidenceRef::observed(
                     "agent_run",
                     format!("agent-run://{}", packet.run_id()),
                 )],
@@ -790,6 +790,8 @@ impl AgentRuntime {
         let refresh_canary_observation = evaluation.as_ref().is_some_and(|evaluation| {
             evaluation.release_channel == Some(harness_contract::agent::ReleaseChannel::Canary)
         });
+        let started_at_ms = terminal.started_at_ms;
+        let completed_at_ms = terminal.updated_at_ms;
         self.persist_snapshot_with_evaluation(
             terminal,
             "agent.terminal",
@@ -798,6 +800,7 @@ impl AgentRuntime {
             Some(returned.clone()),
             evaluation,
         )?;
+        self.record_agent_outcome(&packet, &returned, started_at_ms, completed_at_ms)?;
         if refresh_canary_observation {
             if let Some(services) = self.services() {
                 if let Err(error) = services.refresh_evolution_canary_observations() {
@@ -815,6 +818,134 @@ impl AgentRuntime {
             }
         }
         Ok(returned)
+    }
+
+    fn record_agent_outcome(
+        &self,
+        packet: &AgentTaskPacket,
+        returned: &AgentReturnPacket,
+        started_at_ms: u64,
+        completed_at_ms: u64,
+    ) -> Result<(), String> {
+        let Some(services) = self.services() else {
+            return Ok(());
+        };
+        let identity = &packet.assignment.execution_identity;
+        let turn_id = identity
+            .turn_id()
+            .ok_or_else(|| "Agent outcome has no canonical turn identity".to_string())?;
+        let terminal = match returned.status {
+            AgentTerminalStatus::Completed => {
+                harness_contract::outcome::OutcomeTerminalClass::Succeeded(returned.outcome.clone())
+            }
+            AgentTerminalStatus::Failed => harness_contract::outcome::OutcomeTerminalClass::Failed(
+                returned
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| "failed".to_string()),
+            ),
+            AgentTerminalStatus::Cancelled => {
+                harness_contract::outcome::OutcomeTerminalClass::Cancelled(
+                    returned
+                        .failure
+                        .clone()
+                        .unwrap_or_else(|| "cancelled".to_string()),
+                )
+            }
+            AgentTerminalStatus::Blocked => {
+                harness_contract::outcome::OutcomeTerminalClass::Blocked(
+                    returned
+                        .failure
+                        .clone()
+                        .unwrap_or_else(|| "blocked".to_string()),
+                )
+            }
+        };
+        let binding = packet
+            .binding
+            .as_ref()
+            .ok_or_else(|| "Agent outcome has no immutable binding".to_string())?;
+        let evidence_refs = returned
+            .evidence_refs
+            .iter()
+            .map(|reference| reference.evidence_ref.clone())
+            .collect::<Vec<_>>();
+        let evidence_completeness = if evidence_refs.is_empty() {
+            harness_contract::reality::EvidenceCompleteness::None
+        } else {
+            harness_contract::reality::EvidenceCompleteness::Partial
+        };
+        let outcome = harness_contract::outcome::ExecutionOutcome {
+            identity: harness_contract::outcome::OutcomeIdentity {
+                execution_id: returned.run_id.clone(),
+                session_id: returned.session_id.clone(),
+                turn_id: turn_id.to_string(),
+                terminal_generation: u64::from(returned.attempt).saturating_add(1),
+                paired_sample_id: None,
+                task_id: Some(returned.task_id.clone()),
+                mission_id: Some(returned.mission_id.clone()),
+                agent_id: Some(returned.agent_id.clone()),
+                team_id: returned.team_id.clone(),
+                execution_graph_ref: Some(returned.graph_id.clone()),
+            },
+            runtime: harness_contract::outcome::RuntimeIdentity {
+                workspace_key: identity.workspace_id().to_string(),
+                runtime_revision: env!("CARGO_PKG_VERSION").to_string(),
+                config_revision: format!("agent-binding:{}", binding.binding_digest),
+            },
+            provider: (!returned.provider.is_empty() || !returned.model.is_empty()).then(|| {
+                harness_contract::outcome::ProviderIdentity {
+                    registry_revision: None,
+                    provider_name: returned.provider.clone(),
+                    model: returned.model.clone(),
+                    profile: None,
+                    protocol: None,
+                }
+            }),
+            strategy: harness_contract::outcome::StrategyIdentity {
+                decision_id: binding.binding_digest.clone(),
+                policy_revision: format!(
+                    "agent-definition:{}@{}",
+                    binding.definition_ref.definition_id.as_str(),
+                    binding.definition_ref.revision
+                ),
+                decision_source: "runtime.agent_binding".to_string(),
+                selected_candidate: if returned.team_id.is_some() {
+                    harness_contract::strategy::ExecutionCandidateKind::Team
+                } else {
+                    harness_contract::strategy::ExecutionCandidateKind::Direct
+                },
+                selected_pattern: "agent".to_string(),
+            },
+            timing: harness_contract::outcome::OutcomeTiming {
+                started_at_ms,
+                completed_at_ms,
+                duration_ms: completed_at_ms.saturating_sub(started_at_ms),
+            },
+            usage: harness_contract::outcome::OutcomeUsage {
+                input_tokens: Some(returned.input_tokens),
+                output_tokens: Some(returned.output_tokens),
+                cached_tokens: Some(returned.cached_tokens),
+                evaluation_tokens: None,
+                tool_calls: returned.tool_calls,
+                duplicate_tool_calls: returned.duplicate_tool_calls,
+                retries: u64::from(returned.attempt),
+                max_observed_concurrency: 1,
+            },
+            terminal,
+            quality: harness_contract::outcome::OutcomeQuality::Unknown,
+            observation: harness_contract::outcome::OutcomeObservation {
+                source: "runtime.agent_terminal".to_string(),
+                observed_at_ms: completed_at_ms,
+                freshness_ms: 0,
+            },
+            evidence_refs,
+            evidence_completeness,
+            schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
+        };
+        services.outcome_service().record_terminal(&outcome)?;
+        services.outcome_projector().project_available(128)?;
+        Ok(())
     }
 
     /// Immutable per-run evidence, written only with a terminal lifecycle

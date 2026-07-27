@@ -591,6 +591,7 @@ pub struct RuntimeFeatureConfig {
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
     model: Option<String>,
+    routing_mode: RoutingMode,
     aliases: BTreeMap<String, String>,
     model_context_windows: BTreeMap<String, u32>,
     permission_mode: Option<ResolvedPermissionMode>,
@@ -609,6 +610,14 @@ pub struct RuntimeFeatureConfig {
     storage: StorageTopologyConfig,
     gate_auto_fix: GateAutoFixConfig,
     runtime_control: RuntimeControlConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingMode {
+    #[default]
+    Pinned,
+    Auto,
 }
 
 /// Process-wide durable backend selection.  Credentials are deliberately
@@ -1179,6 +1188,7 @@ impl ConfigLoader {
             },
             oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
             model: parse_optional_model(&merged_value),
+            routing_mode: parse_routing_mode(&merged_value)?,
             aliases: parse_optional_aliases(&merged_value)?,
             model_context_windows: parse_optional_model_context_windows(&merged_value)?,
             permission_mode: parse_optional_permission_mode(&merged_value)?,
@@ -1286,6 +1296,11 @@ impl RuntimeConfig {
     #[must_use]
     pub fn model_context_windows(&self) -> &BTreeMap<String, u32> {
         &self.feature_config.model_context_windows
+    }
+
+    #[must_use]
+    pub const fn routing_mode(&self) -> RoutingMode {
+        self.feature_config.routing_mode
     }
 
     #[must_use]
@@ -1493,6 +1508,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn model_context_windows(&self) -> &BTreeMap<String, u32> {
         &self.model_context_windows
+    }
+
+    #[must_use]
+    pub const fn routing_mode(&self) -> RoutingMode {
+        self.routing_mode
     }
 
     #[must_use]
@@ -1833,6 +1853,25 @@ fn parse_optional_model(root: &JsonValue) -> Option<String> {
         .and_then(|object| object.get("model"))
         .and_then(JsonValue::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn parse_routing_mode(root: &JsonValue) -> Result<RoutingMode, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(RoutingMode::Pinned);
+    };
+    let Some(value) = object.get("routing_mode") else {
+        return Ok(RoutingMode::Pinned);
+    };
+    let mode = value.as_str().ok_or_else(|| {
+        ConfigError::Parse("merged settings: field routing_mode must be a string".to_string())
+    })?;
+    match mode {
+        "pinned" => Ok(RoutingMode::Pinned),
+        "auto" => Ok(RoutingMode::Auto),
+        other => Err(ConfigError::Parse(format!(
+            "merged settings: unsupported routing_mode `{other}`; expected pinned or auto"
+        ))),
+    }
 }
 
 fn parse_optional_aliases(root: &JsonValue) -> Result<BTreeMap<String, String>, ConfigError> {
@@ -3797,11 +3836,11 @@ mod tests {
         deep_merge_objects, parse_optional_compression_config,
         parse_optional_context_budget_config, parse_optional_gateway_config,
         parse_optional_model_context_windows, parse_optional_session_history_config,
-        parse_optional_storage_config, parse_permission_mode_label, redact_serde_json,
-        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport, ProviderProtocol,
-        ResolvedPermissionMode, RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig,
-        RuntimePluginConfig, SessionCompactConfig, StorageBackendSelection,
-        COWD_SETTINGS_SCHEMA_NAME,
+        parse_optional_storage_config, parse_permission_mode_label, parse_routing_mode,
+        redact_serde_json, ConfigLoader, ConfigSource, DomainProfile, McpServerConfig,
+        McpTransport, ProviderProtocol, ResolvedPermissionMode, RoutingMode, RuntimeConfig,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
+        StorageBackendSelection, COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -5286,6 +5325,24 @@ gateway:
             .expect_err("sub-1024 context window must fail validation")
             .to_string()
             .contains("at least 1024"));
+    }
+
+    #[test]
+    fn routing_mode_is_pinned_by_default_and_rejects_unknown_values() {
+        assert_eq!(
+            parse_routing_mode(&JsonValue::parse("{}").unwrap()).unwrap(),
+            RoutingMode::Pinned
+        );
+        assert_eq!(
+            parse_routing_mode(&JsonValue::parse(r#"{"routing_mode":"auto"}"#).unwrap()).unwrap(),
+            RoutingMode::Auto
+        );
+        assert!(
+            parse_routing_mode(&JsonValue::parse(r#"{"routing_mode":"adaptive"}"#).unwrap())
+                .expect_err("unknown routing mode must fail closed")
+                .to_string()
+                .contains("unsupported routing_mode")
+        );
     }
 
     #[test]

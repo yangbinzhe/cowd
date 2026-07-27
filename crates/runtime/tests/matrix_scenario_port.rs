@@ -88,7 +88,7 @@ fn matrix_scenario_port_requires_the_binding_snapshot_lease_and_emits_candidate_
         .expect("candidate only");
     assert_eq!(
         candidate.reality,
-        fact_kernel::hypothesis::FactReality::Simulated
+        fact_kernel::hypothesis::RealityBoundary::Simulated
     );
     assert!(candidate.source.id.starts_with("matrix:scenario_result:"));
 

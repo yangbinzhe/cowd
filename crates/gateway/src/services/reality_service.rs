@@ -7,7 +7,7 @@ use memory::{
     rank_and_deduplicate_candidates, RecallCandidate, RecallOmission, RecallReport,
     RecallSourceResult,
 };
-use runtime::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
+use runtime::{ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -535,7 +535,9 @@ impl RealityService {
                 MemoryLayer::L3,
                 RecallSourceKind::Fact,
                 (hit.score as f32 / 40.0).clamp(0.1, 1.0),
-                fact.confidence.basis_points() as f32 / 10_000.0,
+                fact.confidence
+                    .basis_points()
+                    .map_or(0.0, |value| f32::from(value) / 10_000.0),
                 refs.clone(),
                 boundary,
             );
@@ -577,7 +579,7 @@ impl RealityService {
                         omitted += 1;
                         continue;
                     }
-                    let boundary = matrix_boundary(fact.confidence);
+                    let boundary = matrix_source_boundary();
                     if !boundary.can_be_authoritative() {
                         omitted += 1;
                         continue;
@@ -618,7 +620,7 @@ impl RealityService {
                                 omitted += 1;
                                 continue;
                             }
-                            let boundary = matrix_boundary(packet.confidence);
+                            let boundary = matrix_source_boundary();
                             if !boundary.can_be_authoritative() {
                                 omitted += 1;
                                 continue;
@@ -733,30 +735,7 @@ fn merge_recall_source(sources: &mut Vec<RecallSourceResult>, incoming: RecallSo
 }
 
 fn fact_boundary(fact: &fact_kernel::FactRecord) -> RealityBoundary {
-    let status = fact.status.to_ascii_lowercase();
-    if matches!(
-        status.as_str(),
-        "conflict"
-            | "conflicted"
-            | "superseded"
-            | "stale"
-            | "archived"
-            | "rejected"
-            | "held"
-            | "hold"
-    ) {
-        return RealityBoundary::Conflict;
-    }
-    if matches!(status.as_str(), "simulated" | "simulation") {
-        return RealityBoundary::Simulated;
-    }
-    if matches!(status.as_str(), "hypothetical" | "candidate") {
-        return RealityBoundary::Hypothetical;
-    }
-    if fact.confidence.basis_points() < 5_000 {
-        return RealityBoundary::Inferred;
-    }
-    RealityBoundary::Observed
+    fact.boundary
 }
 
 fn fact_references(fact: &fact_kernel::FactRecord) -> Vec<String> {
@@ -784,29 +763,28 @@ fn fact_context_item(
             fact.fact_type,
             fact.status,
             boundary.as_str(),
-            fact.confidence.basis_points(),
+            fact.confidence
+                .basis_points()
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
             fact.statement
         ),
     );
-    item.authority = if boundary == RealityBoundary::Observed {
-        ContextAuthority::Derived
-    } else {
-        ContextAuthority::Tool
-    };
+    item.authority = runtime::context_authority_for_reality_boundary(boundary);
     item.visibility = ContextVisibility::Shared;
-    item.score = fact.confidence.basis_points() as f32 / 10_000.0;
+    item.score = fact
+        .confidence
+        .basis_points()
+        .map_or(0.0, |value| f32::from(value) / 10_000.0);
     item.evidence = refs.to_vec();
     item
 }
 
-fn matrix_boundary(confidence: f32) -> RealityBoundary {
-    if confidence >= 0.5 {
-        RealityBoundary::Observed
-    } else if confidence >= 0.35 {
-        RealityBoundary::Inferred
-    } else {
-        RealityBoundary::Hypothetical
-    }
+const fn matrix_source_boundary() -> RealityBoundary {
+    // Matrix facts and evidence packets are durable observations imported
+    // from source snapshots. Simulations use a separate scenario-result
+    // contract and never enter this source-fact list. Confidence ranks recall;
+    // it does not redefine the epistemic boundary.
+    RealityBoundary::Observed
 }
 
 fn matrix_fact_references(fact: &matrix_core::MatrixFact) -> Vec<String> {
@@ -837,7 +815,7 @@ fn matrix_context_item(id: &str, content: String, refs: &[String], confidence: f
         ContextRole::Evidence,
         content,
     );
-    item.authority = ContextAuthority::Derived;
+    item.authority = runtime::context_authority_for_reality_boundary(matrix_source_boundary());
     item.visibility = ContextVisibility::Shared;
     item.score = confidence.clamp(0.0, 1.0);
     item.evidence = refs.to_vec();

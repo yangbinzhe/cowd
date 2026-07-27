@@ -874,7 +874,7 @@ impl TaskRuntimePort {
         self.missions
             .ensure_session_linked(mission_id, session_id, evidence_refs.to_vec())?;
         let mut task_evidence = evidence_refs.to_vec();
-        task_evidence.push(EvidenceRef::new("task", task_id).with_source("runtime.task"));
+        task_evidence.push(EvidenceRef::observed("task", task_id).with_source("runtime.task"));
         self.missions
             .ensure_task_linked(mission_id, task_id, task_evidence)
             .map(|_| ())
@@ -1026,7 +1026,7 @@ mod tests {
                 source_session_id: "session-a".to_string(),
                 source_turn_id: "turn-a".to_string(),
                 spec: TaskSpec::new("continue after process restart"),
-                evidence_refs: vec![EvidenceRef::new(
+                evidence_refs: vec![EvidenceRef::observed(
                     "test_fixture",
                     "test://task/cross-session-restart",
                 )],

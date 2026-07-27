@@ -1831,7 +1831,7 @@ pub(crate) mod tests {
             format!("test-turn-{task_id}"),
             objective.to_string(),
             yolo_mode,
-            vec![harness_contract::reality::EvidenceRef::new(
+            vec![harness_contract::reality::EvidenceRef::observed(
                 "test_fixture",
                 format!("test://tasks/{task_id}"),
             )],
@@ -12524,7 +12524,7 @@ providers:
                 "evidence".to_string(),
                 "test".to_string(),
                 "cargo test -p runtime context_runtime".to_string(),
-                vec![harness_contract::reality::EvidenceRef::new(
+                vec![harness_contract::reality::EvidenceRef::observed(
                     "test_fixture",
                     "test://tasks/task-resume-context/artifacts/1",
                 )],
@@ -15895,7 +15895,7 @@ providers:
             ))
             .await
             .unwrap();
-        let evidence_ref = harness_contract::reality::EvidenceRef::new("tool", "tool-1");
+        let evidence_ref = harness_contract::reality::EvidenceRef::observed("tool", "tool-1");
         let projection = harness_contract::context::EvidenceAuditProjection {
             evidence_ref: evidence_ref.clone(),
             content_kind: harness_contract::context::EvidenceContentKind::Text,

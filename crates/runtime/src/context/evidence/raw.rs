@@ -348,7 +348,7 @@ mod tests {
 
     fn write() -> RawEvidenceWrite {
         RawEvidenceWrite {
-            evidence_ref: EvidenceRef::new("tool", "raw-1"),
+            evidence_ref: EvidenceRef::observed("tool", "raw-1"),
             session_id: "s1".to_string(),
             media_type: "text/plain".to_string(),
             visibility_scope: "session:s1".to_string(),
@@ -509,7 +509,7 @@ mod tests {
         );
         let access = adapter
             .persist_artifact(
-                EvidenceRef::new("tool", "native-staged"),
+                EvidenceRef::observed("tool", "native-staged"),
                 "s1".to_string(),
                 artifact.clone(),
                 serde_json::json!({"native_staged_artifact": true}),

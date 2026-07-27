@@ -101,7 +101,7 @@ impl TeamRuntime {
         self.tasks.link_mission_team_run(
             &mission_id,
             &team_id,
-            vec![EvidenceRef::new(
+            vec![EvidenceRef::observed(
                 "team_run",
                 format!("team-run://{team_id}?graph={}", registered.id),
             )],
@@ -161,7 +161,7 @@ impl TeamRuntime {
         self.tasks.link_mission_team_run(
             mission_id,
             team_id,
-            vec![EvidenceRef::new(
+            vec![EvidenceRef::observed(
                 "team_run",
                 format!("team-run://{team_id}?graph={}", registered.id),
             )],
@@ -219,7 +219,7 @@ impl TeamRuntime {
                 &task.task_id,
                 graph_id,
                 graph_revision,
-                vec![EvidenceRef::new(
+                vec![EvidenceRef::observed(
                     "execution_graph",
                     format!("execution-graph://{graph_id}?revision={graph_revision}"),
                 )],

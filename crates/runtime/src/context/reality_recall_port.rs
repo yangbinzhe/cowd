@@ -8,11 +8,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fact_kernel::hypothesis::FactReality;
 use fact_kernel::{
     Confidence, FactCandidate, FactLedger, FactScope, FactSource, SourceKind, UnavailableFactLedger,
 };
 use harness_contract::agent::AgentBindingSnapshot;
+use harness_contract::reality::RealityBoundary;
 use matrix_core::{MatrixScenarioResult, MatrixScenarioRun, MatrixScenarioSpec, MatrixSnapshotRef};
 #[cfg(test)]
 use matrix_repository::open_matrix_sqlite_repository_handle;
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use storage::StorageRegistry;
 
-use crate::{ContextAuthority, ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
+use crate::{ContextItem, ContextRole, ContextSourceKind, ContextVisibility};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RealityRecallSourceStatus {
@@ -356,7 +356,7 @@ impl MatrixScenarioPort {
             FactScope::Task(binding.data_lease.task_id.clone()),
             source,
         )
-        .with_reality(FactReality::Simulated)
+        .with_reality(RealityBoundary::Simulated)
         .with_confidence(Confidence::from_basis_points(5_000))
         .with_payload(result.outputs.clone())
         .with_tags(vec![
@@ -412,8 +412,7 @@ fn fact_granted(
 ) -> bool {
     let reference = format!("fact:{}", fact.id.as_str());
     let direct = granted_refs.contains(&reference);
-    let boundary = fact_boundary(fact);
-    let boundary_granted = granted_boundaries.contains(&boundary.to_string());
+    let boundary_granted = granted_boundaries.contains(&fact.boundary.as_str().to_string());
     direct || boundary_granted
 }
 
@@ -427,14 +426,17 @@ fn fact_context_item(fact: fact_kernel::FactRecord) -> ContextItem {
             fact.fact_type, fact.statement
         ),
     );
-    item.authority = ContextAuthority::Project;
+    item.authority = crate::context_authority_for_reality_boundary(fact.boundary);
     item.visibility = ContextVisibility::Private;
-    item.score = fact.confidence.basis_points() as f32 / 10_000.0;
+    item.score = fact
+        .confidence
+        .basis_points()
+        .map_or(0.0, |value| f32::from(value) / 10_000.0);
     item.source_id = Some(format!("fact:{}", fact.id.as_str()));
     item.source_version = Some(fact.updated_at.to_rfc3339());
     item.source_reason = Some(format!(
         "{} fact under Binding data lease",
-        fact_boundary(&fact)
+        fact.boundary.as_str()
     ));
     item.evidence = fact
         .evidence
@@ -458,7 +460,7 @@ fn matrix_context_item(fact: matrix_core::MatrixFact) -> ContextItem {
             compact_json(&fact.measures, 480),
         ),
     );
-    item.authority = ContextAuthority::Project;
+    item.authority = crate::context_authority_for_reality_boundary(RealityBoundary::Observed);
     item.visibility = ContextVisibility::Private;
     item.score = fact.confidence.clamp(0.0, 1.0);
     item.source_id = Some(format!("matrix:fact:{}", fact.fact_id));
@@ -499,15 +501,6 @@ fn query_matches(value: &str, terms: &[String]) -> bool {
     }
     let value = value.to_lowercase();
     terms.iter().any(|term| value.contains(term))
-}
-
-fn fact_boundary(fact: &fact_kernel::FactRecord) -> &'static str {
-    match fact.status.as_str() {
-        "active" | "validated" => "observed",
-        "candidate" | "held" => "inferred",
-        "conflict" | "conflicted" => "conflict",
-        _ => "hypothetical",
-    }
 }
 
 fn compact_json(value: &Value, limit: usize) -> String {
@@ -659,7 +652,7 @@ mod tests {
         let candidate = port
             .fact_candidate(&granted, &result, "simulated risk is high")
             .unwrap();
-        assert_eq!(candidate.reality, FactReality::Simulated);
+        assert_eq!(candidate.reality, RealityBoundary::Simulated);
         assert_eq!(candidate.status, fact_kernel::FactStatus::Candidate);
     }
 

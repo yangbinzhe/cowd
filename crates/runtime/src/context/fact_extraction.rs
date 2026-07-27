@@ -1,5 +1,5 @@
 use fact_kernel::{
-    Confidence, EvidenceId, ExtractionMethod, FactCandidate, FactExtractionBatch,
+    Confidence, ExtractionMethod, FactCandidate, FactEvidenceId, FactExtractionBatch,
     FactExtractionTokenUsage, FactExtractionTrigger, FactScope, FactSource, SourceKind,
 };
 use serde::{Deserialize, Serialize};
@@ -135,10 +135,10 @@ impl RuntimeFactExtractionInput {
     }
 
     #[must_use]
-    pub fn source_evidence(&self) -> Vec<EvidenceId> {
+    pub fn source_evidence(&self) -> Vec<FactEvidenceId> {
         self.evidence_refs
             .iter()
-            .map(|reference| EvidenceId::from_string(reference.clone()))
+            .map(|reference| FactEvidenceId::from_string(reference.clone()))
             .collect()
     }
 }

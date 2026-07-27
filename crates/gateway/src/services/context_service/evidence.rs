@@ -483,7 +483,7 @@ fn evidence_access_from_raw_event(
     payload: &serde_json::Value,
 ) -> Option<EvidenceAccessRef> {
     Some(EvidenceAccessRef::durable(
-        EvidenceRef::new("tool", evidence_id),
+        EvidenceRef::observed("tool", evidence_id),
         payload.get("content_hash")?.as_str()?,
         payload.get("byte_count")?.as_u64()?,
         payload.get("media_type")?.as_str()?,
@@ -550,7 +550,7 @@ mod tests {
     };
 
     fn projection(session_id: &str, raw: &str) -> EvidenceAuditProjection {
-        let evidence_ref = EvidenceRef::new("tool", "evidence-1");
+        let evidence_ref = EvidenceRef::observed("tool", "evidence-1");
         EvidenceAuditProjection {
             evidence_ref: evidence_ref.clone(),
             content_kind: EvidenceContentKind::Text,
@@ -655,7 +655,7 @@ mod tests {
             ))
             .await
             .expect("persist raw evidence");
-        let evidence_ref = EvidenceRef::new("tool", "evidence-1");
+        let evidence_ref = EvidenceRef::observed("tool", "evidence-1");
         let projection = EvidenceAuditProjection {
             evidence_ref: evidence_ref.clone(),
             content_kind: EvidenceContentKind::Text,

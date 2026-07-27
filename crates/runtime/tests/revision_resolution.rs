@@ -150,7 +150,7 @@ async fn pin_and_rollback_are_both_applied_only_through_typed_runtime_reviews() 
             action: ReleaseChangeAction::SetDefaultExact,
             selector: Some(RevisionSelector::ExactApprovedRevision { revision: 1 }),
             candidate_id: None,
-            evidence_refs: vec![EvidenceRef::new("operator", "pin-r1")],
+            evidence_refs: vec![EvidenceRef::observed("operator", "pin-r1")],
         })
         .expect("exact pointer review");
     fixture
@@ -222,7 +222,7 @@ async fn pin_and_rollback_are_both_applied_only_through_typed_runtime_reviews() 
             action: ReleaseChangeAction::Rollback,
             selector: Some(RevisionSelector::ExactApprovedRevision { revision: 1 }),
             candidate_id: None,
-            evidence_refs: vec![EvidenceRef::new("incident", "rollback-r1")],
+            evidence_refs: vec![EvidenceRef::observed("incident", "rollback-r1")],
         })
         .expect("rollback review");
     fixture

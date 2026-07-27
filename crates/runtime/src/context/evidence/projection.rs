@@ -32,7 +32,7 @@ mod tests {
 
     fn receipt() -> ModelReceipt {
         ModelReceipt {
-            evidence_ref: EvidenceRef::new("tool", "raw-1"),
+            evidence_ref: EvidenceRef::observed("tool", "raw-1"),
             content_kind: EvidenceContentKind::Text,
             summary: "receipt".to_string(),
             raw_tokens: 100,
@@ -64,7 +64,7 @@ mod tests {
     fn mismatched_durable_reference_is_not_exposed() {
         let receipt = receipt();
         let access = EvidenceAccessRef::durable(
-            EvidenceRef::new("tool", "other"),
+            EvidenceRef::observed("tool", "other"),
             "sha256:raw",
             300,
             "text/plain",

@@ -68,7 +68,7 @@ mod tests {
             rule_id: Some("r1".to_string()),
             level: KnowledgeGovernanceLevel::Blocking,
             summary: "must stop on missing safety evidence".to_string(),
-            evidence_refs: vec![EvidenceRef::new("test", "e1")],
+            evidence_refs: vec![EvidenceRef::observed("test", "e1")],
         }]);
 
         assert_eq!(decision.action, KnowledgeComplianceAction::Block);

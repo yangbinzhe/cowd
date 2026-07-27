@@ -361,7 +361,7 @@ async fn execute_runtime_effect(
             )?;
             let mut evidence_refs = command.evidence_refs.clone();
             evidence_refs.extend(relation.evidence_refs.iter().map(|id| {
-                EvidenceRef::new("session_relation", id).with_source("runtime.mission_command")
+                EvidenceRef::observed("session_relation", id).with_source("runtime.mission_command")
             }));
             Ok((
                 serde_json::json!({ "relation": relation }),

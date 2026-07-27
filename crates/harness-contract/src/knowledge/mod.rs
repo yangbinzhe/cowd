@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn observed_candidate_is_valid() {
-        assert!(candidate(EvidenceRef::new("tool", "receipt-1"))
+        assert!(candidate(EvidenceRef::observed("tool", "receipt-1"))
             .validate()
             .is_ok());
     }
@@ -432,7 +432,8 @@ mod tests {
     #[test]
     fn simulated_candidate_cannot_be_authoritative_knowledge() {
         let error = candidate(
-            EvidenceRef::new("simulation", "scenario-1").with_boundary(RealityBoundary::Simulated),
+            EvidenceRef::observed("simulation", "scenario-1")
+                .with_boundary(RealityBoundary::Simulated),
         )
         .validate()
         .unwrap_err();
@@ -442,7 +443,7 @@ mod tests {
     #[test]
     fn inferred_candidate_requires_explicit_confidence() {
         let error = candidate(
-            EvidenceRef::new("analysis", "inference-1")
+            EvidenceRef::observed("analysis", "inference-1")
                 .with_boundary(RealityBoundary::Inferred)
                 .with_confidence_bp(6_999),
         )

@@ -9,11 +9,12 @@ use crate::core::{EvidencePacket, FactId, FactRecord, Provenance};
 use crate::extraction::FactExtractionBatch;
 use crate::growth::{GrowthCandidate, PromotionDecision};
 use crate::health::{FactHealthIssue, FactHealthIssueKind};
-use crate::hypothesis::FactReality;
 use crate::indexer::{FactIndex, FactSearchHit};
 use crate::memory::RecallQuery;
 use crate::review::{FactConflict, FactReviewDecision, FactReviewReceipt};
 use crate::store::{FactStore, InMemoryFactStore};
+use harness_contract::reality::RealityBoundary;
+use harness_contract::reality::{ClaimSupportState, EvidenceCompleteness};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromotionReceipt {
@@ -134,12 +135,18 @@ where
         let facts = self.store.list_facts();
 
         for fact in &facts {
-            if fact.confidence.basis_points() < 5_000 {
-                issues.push(FactHealthIssue {
+            match fact.confidence.basis_points() {
+                None => issues.push(FactHealthIssue {
+                    fact_id: Some(fact.id.clone()),
+                    kind: FactHealthIssueKind::UnknownConfidence,
+                    detail: "fact confidence has not been assessed".to_string(),
+                }),
+                Some(confidence) if confidence < 5_000 => issues.push(FactHealthIssue {
                     fact_id: Some(fact.id.clone()),
                     kind: FactHealthIssueKind::LowConfidence,
                     detail: "fact confidence is below operational floor".to_string(),
-                });
+                }),
+                Some(_) => {}
             }
 
             for evidence_id in &fact.evidence {
@@ -160,12 +167,19 @@ where
     fn fact_from_candidate(&self, candidate: &GrowthCandidate) -> Option<FactRecord> {
         match candidate {
             GrowthCandidate::Memory(memory) => {
-                if memory.boundary.reality != FactReality::Observed {
+                if memory.boundary.reality != RealityBoundary::Observed {
                     return None;
                 }
                 let mut fact = FactRecord::new("memory", memory.summary.clone());
                 fact.confidence = memory.confidence;
                 fact.evidence = memory.evidence.clone();
+                fact.boundary = memory.boundary.reality;
+                fact.support = ClaimSupportState::Supported;
+                fact.evidence_completeness = if fact.evidence.is_empty() {
+                    EvidenceCompleteness::None
+                } else {
+                    EvidenceCompleteness::Sufficient
+                };
                 fact.provenance.push(Provenance {
                     source: memory.source.clone(),
                     observed_at: Utc::now(),
@@ -174,7 +188,7 @@ where
                 Some(fact)
             }
             GrowthCandidate::Matrix(matrix) => {
-                if matrix.boundary.reality != FactReality::Observed {
+                if matrix.boundary.reality != RealityBoundary::Observed {
                     return None;
                 }
                 let statement = format!("{} {} {}", matrix.entity, matrix.predicate, matrix.value);
@@ -182,6 +196,13 @@ where
                 fact.id = matrix.id.clone();
                 fact.confidence = matrix.confidence;
                 fact.evidence = matrix.evidence.clone();
+                fact.boundary = matrix.boundary.reality;
+                fact.support = ClaimSupportState::Supported;
+                fact.evidence_completeness = if fact.evidence.is_empty() {
+                    EvidenceCompleteness::None
+                } else {
+                    EvidenceCompleteness::Sufficient
+                };
                 fact.provenance.push(Provenance {
                     source: matrix.source.clone(),
                     observed_at: Utc::now(),
@@ -195,6 +216,9 @@ where
             } => {
                 let mut fact = FactRecord::new("policy_learning", summary.clone());
                 fact.confidence = *confidence;
+                fact.boundary = RealityBoundary::Inferred;
+                fact.support = ClaimSupportState::Supported;
+                fact.evidence_completeness = EvidenceCompleteness::Partial;
                 Some(fact)
             }
         }
@@ -205,7 +229,8 @@ where
             return FactReviewDecision::hold(candidate, "fact candidate has no evidence");
         }
 
-        if candidate.reality != FactReality::Observed && candidate.reality != FactReality::Inferred
+        if candidate.reality != RealityBoundary::Observed
+            && candidate.reality != RealityBoundary::Inferred
         {
             return FactReviewDecision::reject(
                 candidate,
@@ -251,6 +276,9 @@ where
         fact.scope_key = Some(candidate.scope.key());
         fact.confidence = candidate.confidence;
         fact.evidence = candidate.evidence.clone();
+        fact.boundary = candidate.reality;
+        fact.support = ClaimSupportState::Supported;
+        fact.evidence_completeness = EvidenceCompleteness::Sufficient;
         fact.provenance.push(Provenance {
             source: candidate.source.clone(),
             observed_at: Utc::now(),
@@ -386,10 +414,11 @@ mod tests {
     use crate::extraction::{FactExtractionBatch, FactExtractionTrigger};
     use crate::growth::{GrowthCandidate, PromotionDecision};
     use crate::health::FactHealthIssueKind;
-    use crate::hypothesis::{FactReality, HypothesisBoundary};
+    use crate::hypothesis::HypothesisBoundary;
     use crate::matrix::MatrixFact;
     use crate::memory::{MemoryCandidate, RecallQuery};
     use crate::review::FactReviewDecisionKind;
+    use harness_contract::reality::RealityBoundary;
 
     fn source() -> FactSource {
         FactSource {
@@ -477,7 +506,8 @@ mod tests {
     fn health_reports_missing_evidence() {
         let mut service = FactKernelService::new();
         let mut fact = FactRecord::new("memory", "needs real evidence");
-        fact.evidence.push(crate::core::EvidenceId::new());
+        fact.confidence = Confidence::from_basis_points(8_000);
+        fact.evidence.push(crate::core::FactEvidenceId::new());
         let stored = service.upsert_fact(fact);
 
         let issues = service.evaluate_health();
@@ -485,6 +515,26 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].fact_id, Some(stored.id));
         assert_eq!(issues[0].kind, FactHealthIssueKind::MissingEvidence);
+    }
+
+    #[test]
+    fn health_distinguishes_unknown_from_low_confidence() {
+        let mut service = FactKernelService::new();
+        let unknown = service.upsert_fact(FactRecord::new("memory", "unknown confidence"));
+        let mut low = FactRecord::new("memory", "low confidence");
+        low.confidence = Confidence::from_basis_points(4_999);
+        let low = service.upsert_fact(low);
+
+        let issues = service.evaluate_health();
+
+        assert!(issues.iter().any(|issue| {
+            issue.fact_id == Some(unknown.id.clone())
+                && issue.kind == FactHealthIssueKind::UnknownConfidence
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.fact_id == Some(low.id.clone())
+                && issue.kind == FactHealthIssueKind::LowConfidence
+        }));
     }
 
     #[test]
@@ -567,7 +617,7 @@ mod tests {
         let evidence = service.ingest_evidence(EvidencePacket::new(source(), json!({"turn": 1})));
         let candidate = review_candidate("hypothetical future preference")
             .with_evidence(vec![evidence.id])
-            .with_reality(FactReality::Hypothetical);
+            .with_reality(RealityBoundary::Hypothetical);
         let batch = FactExtractionBatch::new(FactExtractionTrigger::Manual, vec![candidate]);
 
         let receipt = service.review_candidates(batch);

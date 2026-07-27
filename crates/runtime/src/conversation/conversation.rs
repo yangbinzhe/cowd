@@ -58,7 +58,7 @@ use harness_contract::{
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{
         ExecutionCandidateKind, StrategyCandidateCostSummary, StrategyExperienceRecord,
-        StrategyExperienceStore, StrategyInput,
+        StrategyInput,
     },
     turn::{
         SessionInputEnvelope, SessionInputProjection, SessionInputReceipt, TurnId,
@@ -82,7 +82,6 @@ use crate::budget_policy::{
     RuntimeBudgetInputs, RuntimeBudgetPlan,
 };
 
-static STRATEGY_EXPERIENCE_IO_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 static EVALUATION_PROVIDER_TOKEN_LEASE: OnceLock<
     std::sync::Mutex<Option<EvaluationProviderTokenLeaseState>>,
 > = OnceLock::new();
@@ -668,7 +667,7 @@ pub enum AssistantEvent {
     /// only after the provider has produced a protocol event, so it is never
     /// mistaken for a configured fallback that was merely considered.
     ProviderModel {
-        model: String,
+        identity: harness_contract::outcome::ProviderIdentity,
     },
     TextDelta(String),
     /// P1-7: Extended thinking delta (reasoning model output)
@@ -1654,6 +1653,14 @@ pub struct ConversationRuntime<C, T> {
     artifact_store: Option<Arc<crate::ArtifactStore>>,
     /// Durable execution lifecycle store. Session-domain events never use it.
     runtime_event_store: Option<Arc<RuntimeEventStore>>,
+    /// Sole durable Outcome writer supplied by RuntimeServices.
+    outcome_service: Option<Arc<crate::execution_core::OutcomeService>>,
+    /// Immutable, asynchronously maintained Outcome read projection.
+    outcome_projector: Option<Arc<crate::OutcomeProjector>>,
+    routing_mode: crate::RoutingMode,
+    runtime_config_revision: String,
+    active_provider_identity: std::sync::Mutex<Option<harness_contract::outcome::ProviderIdentity>>,
+    provider_selection_receipt: std::sync::Mutex<Option<crate::ProviderSelectionReceipt>>,
     /// Optional event log for time-travel debugging and session rebuild.
     event_log: Option<std::sync::Mutex<SessionEventLog>>,
     /// Runtime-local searchable index for oversized tool outputs.
@@ -2076,6 +2083,17 @@ where
             session_journal_port: None,
             artifact_store: None,
             runtime_event_store: None,
+            outcome_service: None,
+            outcome_projector: None,
+            routing_mode: feature_config.routing_mode(),
+            runtime_config_revision: format!(
+                "{:016x}",
+                model_protocol::fingerprint::stable_hash_bytes(
+                    format!("{feature_config:?}").as_bytes()
+                )
+            ),
+            active_provider_identity: std::sync::Mutex::new(None),
+            provider_selection_receipt: std::sync::Mutex::new(None),
             event_log: None,
             tool_output_sandbox: memory::ToolOutputSandbox::new()
                 .map(|sandbox| Arc::new(std::sync::Mutex::new(sandbox)))
@@ -2671,8 +2689,13 @@ where
                     };
                     first_event_at.get_or_insert_with(Instant::now);
                     match event {
-                        Ok(AssistantEvent::ProviderModel { model }) => {
-                            effective_model = Some(model);
+                        Ok(AssistantEvent::ProviderModel { identity }) => {
+                            effective_model = Some(identity.model.clone());
+                            *self
+                                .active_provider_identity
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(identity);
                         }
                         Ok(AssistantEvent::TextDelta(delta)) => text.push_str(&delta),
                         Ok(AssistantEvent::ThinkingDelta(delta)) => thinking.push_str(&delta),
@@ -3747,7 +3770,22 @@ where
     /// Attach the durable store that owns tool, graph, agent, and task execution state.
     #[must_use]
     pub(crate) fn with_runtime_event_store(mut self, store: Arc<RuntimeEventStore>) -> Self {
+        self.outcome_service = Some(Arc::new(crate::execution_core::OutcomeService::new(
+            Arc::clone(&store),
+        )));
+        self.outcome_projector = Some(Arc::new(crate::OutcomeProjector::new(Arc::clone(&store))));
         self.runtime_event_store = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_outcome_runtime(
+        mut self,
+        service: Arc<crate::execution_core::OutcomeService>,
+        projector: Arc<crate::OutcomeProjector>,
+    ) -> Self {
+        self.outcome_service = Some(service);
+        self.outcome_projector = Some(projector);
         self
     }
 
@@ -4695,8 +4733,12 @@ where
                 };
                 first_event_at.get_or_insert_with(Instant::now);
                 match event {
-                    Ok(AssistantEvent::ProviderModel { model }) => {
-                        effective_model = Some(model);
+                    Ok(AssistantEvent::ProviderModel { identity }) => {
+                        effective_model = Some(identity.model.clone());
+                        *self
+                            .active_provider_identity
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
                     }
                     Ok(AssistantEvent::TextDelta(delta)) => {
                         if !first_text_delta_observed {
@@ -6180,6 +6222,40 @@ where
             // embedded runtimes valid when they intentionally rely on a provider default.
             routed.push(String::new());
         }
+        let strategy_segment = self
+            .active_turn_strategy()
+            .map(|state| (state.policy_version.clone(), state.selected_candidate));
+        let receipt = if let Some(projector) = self.outcome_projector.as_ref() {
+            let (selected, receipt) = crate::select_provider_from_outcome_snapshot(
+                self.routing_mode,
+                &routed,
+                &self.runtime_config_revision,
+                strategy_segment
+                    .as_ref()
+                    .map(|(policy_revision, _)| policy_revision.as_str()),
+                strategy_segment
+                    .as_ref()
+                    .map(|(_, selected_candidate)| *selected_candidate),
+                &projector.snapshot(),
+                now_ms(),
+            );
+            routed = selected;
+            receipt
+        } else {
+            crate::ProviderSelectionReceipt {
+                requested_mode: self.routing_mode,
+                effective_mode: crate::RoutingMode::Pinned,
+                snapshot_revision: 0,
+                selected_model: routed.first().cloned().unwrap_or_default(),
+                fallback_reason: (self.routing_mode == crate::RoutingMode::Auto)
+                    .then(|| "outcome projection is unavailable".to_string()),
+                candidates: Vec::new(),
+            }
+        };
+        *self
+            .provider_selection_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(receipt);
         routed
     }
 
@@ -6405,11 +6481,11 @@ where
                 checkpoint.token_stats.after,
             )
             .with_evidence_ref(
-                EvidenceRef::new("checkpoint", checkpoint.checkpoint_id.clone())
+                EvidenceRef::observed("checkpoint", checkpoint.checkpoint_id.clone())
                     .with_source("semantic_compaction_checkpoint"),
             )
             .with_evidence_ref(
-                EvidenceRef::new(
+                EvidenceRef::observed(
                     "fact-extraction",
                     fact_extraction_decision.mode.as_str().to_string(),
                 )
@@ -6468,7 +6544,7 @@ where
                         memory_receipt.fact_review.batch_id.as_str()
                     ));
                     receipt_mut.evidence_refs.push(
-                        EvidenceRef::new(
+                        EvidenceRef::observed(
                             "fact-review",
                             memory_receipt.fact_review.batch_id.as_str().to_string(),
                         )
@@ -6484,8 +6560,11 @@ where
                 Err(error) => {
                     tracing::warn!(%error, "semantic compaction fact projection deferred");
                     receipt_mut.evidence_refs.push(
-                        EvidenceRef::new("memory", "semantic_checkpoint_fact_projection_deferred")
-                            .with_source(error.to_string()),
+                        EvidenceRef::observed(
+                            "memory",
+                            "semantic_checkpoint_fact_projection_deferred",
+                        )
+                        .with_source(error.to_string()),
                     );
                 }
             }
@@ -7398,7 +7477,7 @@ where
     ) -> Result<(EvidenceRef, EvidenceAccessRef), RuntimeError> {
         let content_hash = model_protocol::fingerprint::stable_hash_bytes(output.as_bytes());
         let evidence_id = format!("tool-raw-{tool_use_id}-{content_hash:016x}");
-        let evidence_ref = EvidenceRef::new("tool", evidence_id.clone());
+        let evidence_ref = EvidenceRef::observed("tool", evidence_id.clone());
         if let Some(access) = self.existing_evidence_access(&evidence_ref) {
             return Ok((evidence_ref, access));
         }
@@ -7480,7 +7559,7 @@ where
             "tool-raw-{tool_use_id}-{}",
             artifact.sha256.trim_start_matches("sha256:")
         );
-        let evidence_ref = EvidenceRef::new("tool", evidence_id.clone());
+        let evidence_ref = EvidenceRef::observed("tool", evidence_id.clone());
         if let Some(access) = self.existing_evidence_access(&evidence_ref) {
             return Ok((evidence_ref, access));
         }
@@ -7967,50 +8046,55 @@ where
     }
 
     fn strategy_input_for_turn(&self, user_input: &str) -> StrategyInput {
-        let _io_guard = STRATEGY_EXPERIENCE_IO_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let path = strategy_experience_path();
-        let mut store = StrategyExperienceStore::load_or_default(path.clone());
-        if let Ok(report_path) = std::env::var("COWD_STRATEGY_CALIBRATION_REPORT") {
-            match std::fs::read(&report_path)
-                .map_err(|error| error.to_string())
-                .and_then(|bytes| {
-                    serde_json::from_slice::<serde_json::Value>(&bytes)
-                        .map_err(|error| error.to_string())
-                }) {
-                Ok(report) => {
-                    let positive = store.import_paired_evaluation_report(&report);
-                    let negative = store.import_negative_benefit_report(&report);
-                    let imported = positive.as_ref().copied().unwrap_or(0)
-                        + negative.as_ref().copied().unwrap_or(0);
-                    if imported > 0 {
-                        if let Err(error) = store.save(&path) {
-                            tracing::warn!(
-                                %error,
-                                report_path,
-                                "failed to persist imported strategy calibration"
-                            );
-                        }
-                    }
-                    if let (Err(positive), Err(negative)) = (positive, negative) {
-                        tracing::warn!(
-                            positive_error = %positive,
-                            negative_error = %negative,
-                            report_path,
-                            "rejected strategy calibration report"
-                        );
-                    }
-                }
-                Err(error) => tracing::warn!(
-                    %error,
-                    report_path,
-                    "failed to read strategy calibration report"
-                ),
+        let mut input = StrategyInput::from_prompt(user_input.to_string());
+        let Some(projector) = self.outcome_projector.as_ref() else {
+            return input;
+        };
+        let snapshot = projector.snapshot();
+        for candidate in [
+            ExecutionCandidateKind::Direct,
+            ExecutionCandidateKind::ParallelTools,
+            ExecutionCandidateKind::Team,
+        ] {
+            let matching = snapshot
+                .segments
+                .values()
+                .filter(|segment| {
+                    segment.key.as_ref().is_some_and(|key| {
+                        key.candidate == candidate
+                            && key.config_revision == self.runtime_config_revision
+                    }) && segment.sample_count > 0
+                })
+                .collect::<Vec<_>>();
+            if matching.is_empty() {
+                continue;
             }
+            let sample_count = matching.iter().fold(0_u64, |total, segment| {
+                total.saturating_add(segment.sample_count)
+            });
+            let weighted = |value: fn(&crate::OutcomeSegmentSnapshot) -> u64| {
+                matching
+                    .iter()
+                    .fold(0_u64, |total, segment| {
+                        total.saturating_add(value(segment).saturating_mul(segment.sample_count))
+                    })
+                    .saturating_div(sample_count.max(1))
+            };
+            input.candidate_costs.insert(
+                candidate,
+                StrategyCandidateCostSummary {
+                    sample_count: u32::try_from(sample_count).unwrap_or(u32::MAX),
+                    average_critical_path_ms: weighted(|segment| segment.duration_p50_ms),
+                    average_total_tokens: weighted(|segment| segment.total_tokens_p50),
+                    average_coordination_cost_ms: 0,
+                    calibration_source: format!(
+                        "runtime.outcome_snapshot.v1:{}",
+                        snapshot.revision
+                    ),
+                },
+            );
         }
-        store.enrich_input(StrategyInput::from_prompt(user_input.to_string()))
+        input
     }
 
     /// Admit exactly one strategy identity for a turn. This is the only
@@ -8031,6 +8115,14 @@ where
         resource_snapshot: Option<harness_contract::strategy::StrategyResourceSnapshot>,
     ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
         let turn_ref = turn_ref.into();
+        *self
+            .active_provider_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .provider_selection_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let mut guard = self
             .active_turn_strategy
             .lock()
@@ -8497,21 +8589,18 @@ where
             state.outcome = Some(outcome);
             state
         };
-        if state.execution_graph_ref.is_some() {
-            if let Err(error) = self.append_turn_strategy_event(
-                "runtime.strategy.outcome",
-                &state,
-                "turn terminal owner recorded actual outcome",
-            ) {
-                *self
-                    .active_turn_strategy
-                    .lock()
-                    .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? =
-                    Some(state);
-                return Err(error);
-            }
+        if let Err(error) = self.append_turn_strategy_event(
+            "runtime.strategy.outcome",
+            &state,
+            "turn terminal owner recorded actual outcome",
+        ) {
+            *self
+                .active_turn_strategy
+                .lock()
+                .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? = Some(state);
+            return Err(error);
         }
-        self.record_turn_strategy_experience(&state);
+        self.record_canonical_outcome(&state)?;
         Ok(())
     }
 
@@ -8585,6 +8674,10 @@ where
                     "collaboration_receipt": state.collaboration_receipt,
                     "evidence_scopes": state.focus_partition_plans,
                     "outcome": state.outcome,
+                    "provider_selection": self.provider_selection_receipt
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
                 }),
             })
             .map(|_| ())
@@ -8595,49 +8688,159 @@ where
             })
     }
 
-    fn record_turn_strategy_experience(
+    fn record_canonical_outcome(
         &self,
         state: &crate::execution_core::TurnStrategyDecisionState,
-    ) {
-        if state.resource_snapshot.sample_source.contains("corpus=") {
-            return;
-        }
+    ) -> Result<(), RuntimeError> {
         let Some(outcome) = state.outcome.as_ref() else {
-            return;
+            return Ok(());
         };
-        let _io_guard = STRATEGY_EXPERIENCE_IO_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
+        let service = self
+            .outcome_service
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("canonical outcome service is unavailable"))?;
+        let completed_at_ms = now_ms();
+        let terminal = match state.status {
+            crate::execution_core::TurnStrategyDecisionStatus::Completed
+                if outcome.failed_tool_calls > 0 =>
+            {
+                harness_contract::outcome::OutcomeTerminalClass::PartialFailure(format!(
+                    "{}; {} tool calls failed before terminal synthesis",
+                    outcome.terminal_reason, outcome.failed_tool_calls
+                ))
+            }
+            crate::execution_core::TurnStrategyDecisionStatus::Completed => {
+                harness_contract::outcome::OutcomeTerminalClass::Succeeded(
+                    outcome.terminal_reason.clone(),
+                )
+            }
+            crate::execution_core::TurnStrategyDecisionStatus::Cancelled => {
+                harness_contract::outcome::OutcomeTerminalClass::Cancelled(
+                    outcome.terminal_reason.clone(),
+                )
+            }
+            crate::execution_core::TurnStrategyDecisionStatus::EarlyStopped => {
+                harness_contract::outcome::OutcomeTerminalClass::Blocked(
+                    outcome.terminal_reason.clone(),
+                )
+            }
+            _ => harness_contract::outcome::OutcomeTerminalClass::Failed(
+                outcome.terminal_reason.clone(),
+            ),
+        };
+        let quality = outcome.quality_score_bp.map_or(
+            harness_contract::outcome::OutcomeQuality::Unknown,
+            |value| {
+                harness_contract::outcome::OutcomeQuality::estimate(
+                    value,
+                    "runtime.turn_verification",
+                    None,
+                )
+            },
+        );
+        let provider = self
+            .active_provider_identity
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let understanding = &state.decision.strategy.understanding;
-        let path = strategy_experience_path();
-        let mut store = StrategyExperienceStore::load_or_default(path.clone());
-        store.record(StrategyExperienceRecord {
-            domain: understanding.domain,
-            complexity: understanding.complexity,
-            risk: understanding.risk,
-            selected_pattern: state.decision.pattern(),
-            selected_candidate: Some(state.selected_candidate),
-            succeeded: state.status == crate::execution_core::TurnStrategyDecisionStatus::Completed,
-            verification_blocked: outcome.quality_score_bp == Some(0),
-            context_pressure: false,
-            composite_execution: state.selected_candidate
-                != harness_contract::strategy::ExecutionCandidateKind::Team
-                && state.collaboration_receipt.is_some(),
-            // One live turn has no paired counterfactual. Keep absolute cost
-            // telemetry, but never infer causal lift from graph shape.
-            multi_agent_positive_lift: false,
-            created_at_ms: now_ms(),
-            actual_duration_ms: outcome.duration_ms,
-            actual_input_tokens: outcome.input_tokens,
-            actual_output_tokens: outcome.output_tokens,
-            actual_cached_tokens: outcome.cached_tokens,
-            actual_coordination_cost_ms: outcome.merge_cost_ms,
-            paired_calibration: None,
-        });
-        if let Err(error) = store.save(path) {
-            tracing::warn!(%error, "failed to persist AI strategy experience");
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let evaluation_isolated = state.resource_snapshot.sample_source.contains("corpus=");
+        let config_revision = if evaluation_isolated {
+            format!(
+                "{}:evaluation:{:016x}",
+                self.runtime_config_revision,
+                model_protocol::fingerprint::stable_hash_bytes(
+                    state.resource_snapshot.sample_source.as_bytes()
+                )
+            )
+        } else {
+            self.runtime_config_revision.clone()
+        };
+        let canonical = harness_contract::outcome::ExecutionOutcome {
+            identity: harness_contract::outcome::OutcomeIdentity {
+                execution_id: format!("turn:{}", state.decision_id),
+                session_id: state.session_ref.clone(),
+                turn_id: state.turn_ref.clone(),
+                terminal_generation: state.revision,
+                paired_sample_id: None,
+                task_id: self
+                    .execution_identity
+                    .as_ref()
+                    .and_then(|identity| identity.task_id().map(str::to_string)),
+                mission_id: self
+                    .execution_identity
+                    .as_ref()
+                    .and_then(|identity| identity.mission_id().map(str::to_string)),
+                agent_id: self
+                    .execution_identity
+                    .as_ref()
+                    .and_then(|identity| identity.agent_run_id().map(str::to_string)),
+                team_id: self
+                    .execution_identity
+                    .as_ref()
+                    .and_then(|identity| identity.team_run_id().map(str::to_string)),
+                execution_graph_ref: state.execution_graph_ref.clone(),
+            },
+            runtime: harness_contract::outcome::RuntimeIdentity {
+                workspace_key: self.checkpoint_workspace_id.clone(),
+                runtime_revision: env!("CARGO_PKG_VERSION").to_string(),
+                config_revision,
+            },
+            provider,
+            strategy: harness_contract::outcome::StrategyIdentity {
+                decision_id: state.decision_id.clone(),
+                policy_revision: state.policy_version.clone(),
+                decision_source: format!("{:?}", state.decision.strategy.source)
+                    .to_ascii_lowercase(),
+                selected_candidate: state.selected_candidate,
+                selected_pattern: state.decision.pattern().as_str().to_string(),
+            },
+            timing: harness_contract::outcome::OutcomeTiming {
+                started_at_ms: completed_at_ms.saturating_sub(outcome.duration_ms),
+                completed_at_ms,
+                duration_ms: outcome.duration_ms,
+            },
+            usage: harness_contract::outcome::OutcomeUsage {
+                input_tokens: Some(outcome.input_tokens),
+                output_tokens: Some(outcome.output_tokens),
+                cached_tokens: Some(outcome.cached_tokens),
+                evaluation_tokens: outcome
+                    .evaluation_budget_observed
+                    .then_some(outcome.evaluation_tokens_consumed),
+                tool_calls: outcome.tool_calls,
+                duplicate_tool_calls: outcome.duplicate_tool_calls,
+                retries: 0,
+                max_observed_concurrency: outcome.max_tool_concurrency_observed,
+            },
+            terminal,
+            quality,
+            observation: harness_contract::outcome::OutcomeObservation {
+                source: if evaluation_isolated {
+                    "harness_eval.conversation_terminal".to_string()
+                } else {
+                    "runtime.conversation_terminal".to_string()
+                },
+                observed_at_ms: completed_at_ms,
+                freshness_ms: 0,
+            },
+            evidence_refs: Vec::new(),
+            evidence_completeness: if outcome.working_state_verified {
+                harness_contract::reality::EvidenceCompleteness::Sufficient
+            } else if outcome.evidence_overlap_observed {
+                harness_contract::reality::EvidenceCompleteness::Partial
+            } else {
+                harness_contract::reality::EvidenceCompleteness::None
+            },
+            schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
+        };
+        service
+            .record_terminal(&canonical)
+            .map_err(|error| RuntimeError::new(format!("record canonical outcome: {error}")))?;
+        if let Some(projector) = self.outcome_projector.as_ref() {
+            if let Err(error) = projector.project_available(128) {
+                tracing::warn!(%error, "outcome projector notification pass failed");
+            }
         }
+        Ok(())
     }
 
     fn append_execution_runtime_event(
@@ -9016,7 +9219,7 @@ fn source_message_evidence_refs(
         .enumerate()
         .map(|(offset, message)| {
             let index = start + offset;
-            EvidenceRef::new("session-message", format!("{session_id}:{index}"))
+            EvidenceRef::observed("session-message", format!("{session_id}:{index}"))
                 .with_source(message_index_label(message))
         })
         .collect()
@@ -9193,12 +9396,6 @@ fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {
         .count()
 }
 
-fn strategy_experience_path() -> std::path::PathBuf {
-    crate::cowd_dirs::config_home_dir()
-        .join("ai")
-        .join("strategy-experience.json")
-}
-
 fn eval_override_selection(
     override_: &str,
     _requires_write: bool,
@@ -9370,9 +9567,9 @@ fn strategy_experience_projection(trace: &RuntimeAiKernelTrace) -> serde_json::V
         "verification_blocked": record.verification_blocked,
         "context_pressure": record.context_pressure,
         "multi_agent_positive_lift": record.multi_agent_positive_lift,
-        "calibration_status": "assumed_structural_only",
-        "persisted_for_routing": false,
-        "store_ref": strategy_experience_path().display().to_string(),
+        "calibration_status": "outcome_projection_only",
+        "persisted_for_routing": true,
+        "store_ref": "runtime_event_store/outcome-projector",
     })
 }
 
@@ -9634,7 +9831,7 @@ mod tests {
             "read_file",
             &output,
             false,
-            &harness_contract::reality::EvidenceRef::new("tool", "small-exact-read"),
+            &harness_contract::reality::EvidenceRef::observed("tool", "small-exact-read"),
             None,
         );
 
@@ -10090,7 +10287,15 @@ mod tests {
                 vec![Err(RuntimeError::new("primary unavailable"))]
             } else {
                 vec![
-                    Ok(AssistantEvent::ProviderModel { model }),
+                    Ok(AssistantEvent::ProviderModel {
+                        identity: harness_contract::outcome::ProviderIdentity {
+                            registry_revision: Some(1),
+                            provider_name: "test".to_string(),
+                            model,
+                            profile: None,
+                            protocol: Some("completions".to_string()),
+                        },
+                    }),
                     Ok(AssistantEvent::TextDelta("fallback answer".to_string())),
                     Ok(AssistantEvent::MessageStop),
                 ]
@@ -10283,7 +10488,20 @@ mod tests {
                 1,
             )
             .await;
-        assert!(result.is_err(), "stale tool fence result: {result:?}");
+        let result = result.expect("stale tool fence is returned as a governed tool result");
+        assert_eq!(result.failed, 1, "stale tool fence result: {result:?}");
+        assert!(result.messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    crate::session::ContentBlock::ToolResult {
+                        output,
+                        is_error: true,
+                        ..
+                    } if output.contains("Session execution fence rejected")
+                )
+            })
+        }));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -10866,6 +11084,120 @@ mod tests {
     }
 
     #[test]
+    fn canonical_outcome_covers_direct_and_parallel_tool_turns_without_graph_ref() {
+        for candidate in [
+            harness_contract::strategy::ExecutionCandidateKind::Direct,
+            harness_contract::strategy::ExecutionCandidateKind::ParallelTools,
+        ] {
+            let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+            let runtime = ConversationRuntime::new(
+                Session::new(),
+                MockApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                vec!["system".to_string()],
+            )
+            .without_memory()
+            .with_runtime_event_store(Arc::clone(&store));
+            let state = runtime
+                .begin_turn_strategy(format!("turn-{candidate:?}"), "give a concise answer")
+                .expect("admit strategy");
+            runtime
+                .retarget_active_turn_strategy(
+                    candidate,
+                    harness_contract::core::ExecutionPattern::Execute,
+                    "test binds the canonical execution candidate",
+                )
+                .expect("retarget");
+            runtime
+                .finish_turn_strategy(
+                    &state.turn_ref,
+                    crate::execution_core::TurnStrategyDecisionStatus::Completed,
+                    crate::execution_core::TurnStrategyActualOutcome {
+                        duration_ms: 10,
+                        tool_calls: u64::from(candidate
+                            == harness_contract::strategy::ExecutionCandidateKind::ParallelTools),
+                        terminal_reason: "satisfied".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .expect("finish");
+            let outcomes = store
+                .all_events(100)
+                .expect("outcomes")
+                .into_iter()
+                .filter(|event| event.kind == crate::execution_core::OUTCOME_EVENT_KIND)
+                .collect::<Vec<_>>();
+            assert_eq!(outcomes.len(), 1);
+            let outcome: harness_contract::outcome::ExecutionOutcome =
+                serde_json::from_value(outcomes[0].payload.clone()).expect("Outcome contract");
+            assert_eq!(outcome.strategy.selected_candidate, candidate);
+            assert!(outcome.identity.execution_graph_ref.is_none());
+        }
+    }
+
+    #[test]
+    fn canonical_outcome_preserves_failure_cancel_block_and_partial_tool_terminal_classes() {
+        let cases = [
+            (
+                crate::execution_core::TurnStrategyDecisionStatus::Failed,
+                0,
+                "failed",
+            ),
+            (
+                crate::execution_core::TurnStrategyDecisionStatus::Cancelled,
+                0,
+                "cancelled",
+            ),
+            (
+                crate::execution_core::TurnStrategyDecisionStatus::EarlyStopped,
+                0,
+                "blocked",
+            ),
+            (
+                crate::execution_core::TurnStrategyDecisionStatus::Completed,
+                1,
+                "partial_failure",
+            ),
+        ];
+        for (status, failed_tool_calls, expected_class) in cases {
+            let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+            let runtime = ConversationRuntime::new(
+                Session::new(),
+                MockApi,
+                StaticToolExecutor::new(),
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                vec!["system".to_string()],
+            )
+            .without_memory()
+            .with_runtime_event_store(Arc::clone(&store));
+            let state = runtime
+                .begin_turn_strategy(format!("terminal-{expected_class}"), "test terminal")
+                .expect("strategy");
+            runtime
+                .finish_turn_strategy(
+                    &state.turn_ref,
+                    status,
+                    crate::execution_core::TurnStrategyActualOutcome {
+                        failed_tool_calls,
+                        terminal_reason: expected_class.to_string(),
+                        ..Default::default()
+                    },
+                )
+                .expect("finish");
+            let event = store
+                .all_events(10)
+                .expect("outcome")
+                .into_iter()
+                .find(|event| event.kind == crate::execution_core::OUTCOME_EVENT_KIND)
+                .expect("canonical Outcome");
+            let outcome: harness_contract::outcome::ExecutionOutcome =
+                serde_json::from_value(event.payload).expect("Outcome");
+            assert_eq!(outcome.terminal.class_name(), expected_class);
+        }
+    }
+
+    #[test]
     fn high_overlap_publishes_downgrade_with_visible_reason() {
         let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let runtime = ConversationRuntime::new(
@@ -11141,7 +11473,7 @@ mod tests {
         );
         let session_id = runtime.session().session_id;
         let access = harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::reality::EvidenceRef::new("tool", evidence_id),
+            harness_contract::reality::EvidenceRef::observed("tool", evidence_id),
             "sha256:test",
             output.len() as u64,
             "text/plain; charset=utf-8",
@@ -11871,6 +12203,51 @@ mod tests {
         ) -> Option<crate::tool_orchestrator::ToolSafetyCategory> {
             (name == "ToolSearch").then_some(crate::tool_orchestrator::ToolSafetyCategory::ReadOnly)
         }
+
+        fn registered_tool_effect(
+            &self,
+            name: &str,
+            _input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            use harness_contract::policy::{
+                PermissionOperation, PermissionResource, PermissionScope,
+            };
+            use harness_contract::tool::{
+                ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
+                ToolPermissionMode,
+            };
+
+            (name == "ToolSearch").then(|| ToolEffectDescriptor {
+                tool_id: name.to_string(),
+                descriptor_hash: "dynamic-tool-search-v1".to_string(),
+                effect_kind: ToolEffectKind::Read,
+                idempotency: ToolIdempotency::Idempotent,
+                scopes: vec![PermissionScope::new(
+                    PermissionResource::Tool,
+                    PermissionOperation::Read,
+                )],
+                required_permission: ToolPermissionMode::ReadOnly,
+                approval_class: ToolApprovalClass::None,
+                uses_network: false,
+                spawns_process: false,
+                mutates_packages: false,
+                mutates_system: false,
+            })
+        }
+
+        fn execute_authorized(
+            &self,
+            authorization: &harness_contract::tool::ToolExecutionAuthorization,
+            name: &str,
+            input: &str,
+        ) -> Result<String, crate::ToolError> {
+            if authorization.tool_id != name {
+                return Err(crate::ToolError::new(
+                    "dynamic tool authorization names a different tool",
+                ));
+            }
+            self.execute(name, input)
+        }
     }
 
     #[tokio::test]
@@ -12384,7 +12761,7 @@ mod tests {
             active_pack_ids: vec!["pack-domain-default".to_string()],
             blocked_namespaces: vec!["project:irrelevant not relevant to intent".to_string()],
             compliance_warnings: Vec::new(),
-            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                 "knowledge_chunk",
                 "chunk-1",
             )],

@@ -140,7 +140,7 @@ mod tests {
             "read_data",
             &output,
             false,
-            EvidenceRef::new("tool", "raw-1"),
+            EvidenceRef::observed("tool", "raw-1"),
             120,
         );
         assert!(receipt.truncated);

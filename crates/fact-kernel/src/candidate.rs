@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::core::{Confidence, EvidenceId, FactSource};
-use crate::hypothesis::FactReality;
+use crate::core::{Confidence, FactEvidenceId, FactSource};
+use harness_contract::reality::RealityBoundary;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FactCandidateId(String);
@@ -100,9 +100,9 @@ pub struct FactCandidate {
     pub statement: String,
     pub structured_payload: Option<Value>,
     pub scope: FactScope,
-    pub reality: FactReality,
+    pub reality: RealityBoundary,
     pub source: FactSource,
-    pub evidence: Vec<EvidenceId>,
+    pub evidence: Vec<FactEvidenceId>,
     pub confidence: Confidence,
     pub extraction_method: ExtractionMethod,
     pub extractor_version: String,
@@ -126,7 +126,7 @@ impl FactCandidate {
             statement: statement.into(),
             structured_payload: None,
             scope,
-            reality: FactReality::Observed,
+            reality: RealityBoundary::Observed,
             source,
             evidence: Vec::new(),
             confidence: Confidence::default(),
@@ -140,7 +140,7 @@ impl FactCandidate {
     }
 
     #[must_use]
-    pub fn with_evidence(mut self, evidence: Vec<EvidenceId>) -> Self {
+    pub fn with_evidence(mut self, evidence: Vec<FactEvidenceId>) -> Self {
         self.evidence = evidence;
         self
     }
@@ -159,7 +159,7 @@ impl FactCandidate {
     }
 
     #[must_use]
-    pub fn with_reality(mut self, reality: FactReality) -> Self {
+    pub fn with_reality(mut self, reality: RealityBoundary) -> Self {
         self.reality = reality;
         self
     }

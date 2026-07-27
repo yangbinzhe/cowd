@@ -325,7 +325,7 @@ mod tests {
         let signal = EvolutionSignal::memory_noise(
             "runtime",
             "session-1",
-            vec![EvidenceRef::new("memory", "memory:noise")],
+            vec![EvidenceRef::observed("memory", "memory:noise")],
         );
         let diagnosis = EvolutionDiagnosisEngine::diagnose(&[signal]);
 

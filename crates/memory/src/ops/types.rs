@@ -777,7 +777,7 @@ mod fact_kernel_bridge_tests {
 
         assert_eq!(candidate.summary, entry.content);
         assert_eq!(candidate.source.kind, SourceKind::Memory);
-        assert_eq!(candidate.confidence.basis_points(), 8_200);
+        assert_eq!(candidate.confidence.basis_points(), Some(8_200));
         assert_eq!(candidate.tags, vec!["architecture"]);
     }
 

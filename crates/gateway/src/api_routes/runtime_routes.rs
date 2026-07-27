@@ -901,7 +901,7 @@ async fn record_upgrade_disposition(
                             .result_refs
                             .iter()
                             .map(|reference| {
-                                harness_contract::reality::EvidenceRef::new(
+                                harness_contract::reality::EvidenceRef::observed(
                                     "upgrade_result",
                                     reference,
                                 )

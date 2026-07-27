@@ -999,7 +999,7 @@ mod tests {
             harness_contract::context::ContextPressureState::new("default", 32_000, 100),
         )
         .with_audit_projection(harness_contract::context::EvidenceAuditProjection {
-            evidence_ref: harness_contract::context::EvidenceRef::new(
+            evidence_ref: harness_contract::context::EvidenceRef::observed(
                 "workspace_file",
                 "src/lib.rs",
             ),

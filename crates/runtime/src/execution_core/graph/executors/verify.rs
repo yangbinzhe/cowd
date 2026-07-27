@@ -390,7 +390,7 @@ mod tests {
 
     fn evidence(id: &str) -> EvidenceAccessRef {
         EvidenceAccessRef::durable(
-            EvidenceRef::new("evidence", id),
+            EvidenceRef::observed("evidence", id),
             "sha",
             1,
             "text/plain",

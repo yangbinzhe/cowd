@@ -216,7 +216,7 @@ mod tests {
             outcome: r#"{"evidence":"checked"}"#.to_string(),
             acceptance: task.acceptance.clone(),
             evidence_refs: vec![EvidenceAccessRef::durable(
-                EvidenceRef::new("tool", "read-1"),
+                EvidenceRef::observed("tool", "read-1"),
                 "a".repeat(64),
                 1,
                 "text/plain",
@@ -293,7 +293,7 @@ mod tests {
             .expect("upstream contract")
         )];
         let upstream = EvidenceAccessRef::durable(
-            EvidenceRef::new("tool", "upstream"),
+            EvidenceRef::observed("tool", "upstream"),
             "b".repeat(64),
             1,
             "text/plain",
@@ -317,7 +317,7 @@ mod tests {
     fn fresh_runtime_read_accepts_the_same_content_addressed_evidence_ref() {
         let mut task = team_task();
         let shared = EvidenceAccessRef::durable(
-            EvidenceRef::new("tool", "same-content"),
+            EvidenceRef::observed("tool", "same-content"),
             "c".repeat(64),
             10,
             "text/plain",

@@ -8,6 +8,7 @@ pub enum FactHealthIssueKind {
     Duplicate,
     Conflict,
     Stale,
+    UnknownConfidence,
     LowConfidence,
     MissingEvidence,
     HypothesisLeak,

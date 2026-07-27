@@ -575,8 +575,10 @@ mod tests {
         commit_failures: BTreeSet<String>,
         deferred_once: Mutex<BTreeSet<String>>,
         admission_notify: Arc<tokio::sync::Notify>,
+        started_notify: tokio::sync::Notify,
         cancelled: AtomicBool,
         cancellation_notify: tokio::sync::Notify,
+        active_cancellation_notify: tokio::sync::Notify,
         active: AtomicUsize,
         max_active: AtomicUsize,
         starts: Mutex<Vec<String>>,
@@ -595,8 +597,10 @@ mod tests {
                 commit_failures: BTreeSet::new(),
                 deferred_once: Mutex::new(BTreeSet::new()),
                 admission_notify: Arc::new(tokio::sync::Notify::new()),
+                started_notify: tokio::sync::Notify::new(),
                 cancelled: AtomicBool::new(false),
                 cancellation_notify: tokio::sync::Notify::new(),
+                active_cancellation_notify: tokio::sync::Notify::new(),
                 active: AtomicUsize::new(0),
                 max_active: AtomicUsize::new(0),
                 starts: Mutex::new(Vec::new()),
@@ -704,12 +708,13 @@ mod tests {
                     .lock()
                     .expect("starts lock")
                     .push(task.tool_call_id.clone());
+                self.started_notify.notify_one();
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_active.fetch_max(active, Ordering::SeqCst);
                 let delay = self.delays_ms.get(&task.tool_call_id).copied().unwrap_or(1);
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_millis(delay)) => {}
-                    () = self.cancellation_notify.notified() => {
+                    () = self.active_cancellation_notify.notified() => {
                         self.active.fetch_sub(1, Ordering::SeqCst);
                         return Err(format!("{} cancelled", task.tool_call_id));
                     }
@@ -748,6 +753,7 @@ mod tests {
                 .lock()
                 .expect("cancelled active lock")
                 .push(task_id.to_string());
+            self.active_cancellation_notify.notify_waiters();
         }
     }
 
@@ -952,7 +958,7 @@ mod tests {
             let context = Arc::clone(&context);
             async move { GovernedToolExecutor.execute(&dag, context.as_ref()).await }
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        context.started_notify.notified().await;
         context.cancel();
 
         let report = tokio::time::timeout(Duration::from_secs(1), execution)

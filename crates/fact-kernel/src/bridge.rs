@@ -59,7 +59,10 @@ pub fn decide_candidate_promotion(candidate: GrowthCandidate) -> BridgeDecision 
             BridgeDecision::hold(candidate, "matrix fact has no evidence")
         }
         GrowthCandidate::Memory(memory)
-            if memory.confidence.basis_points() < PROMOTION_CONFIDENCE_FLOOR =>
+            if memory
+                .confidence
+                .basis_points()
+                .is_none_or(|value| value < PROMOTION_CONFIDENCE_FLOOR) =>
         {
             BridgeDecision::hold(
                 candidate,
@@ -67,12 +70,17 @@ pub fn decide_candidate_promotion(candidate: GrowthCandidate) -> BridgeDecision 
             )
         }
         GrowthCandidate::Matrix(matrix)
-            if matrix.confidence.basis_points() < PROMOTION_CONFIDENCE_FLOOR =>
+            if matrix
+                .confidence
+                .basis_points()
+                .is_none_or(|value| value < PROMOTION_CONFIDENCE_FLOOR) =>
         {
             BridgeDecision::hold(candidate, "matrix fact confidence is below promotion floor")
         }
         GrowthCandidate::PolicyLearning { confidence, .. }
-            if confidence.basis_points() < PROMOTION_CONFIDENCE_FLOOR =>
+            if confidence
+                .basis_points()
+                .is_none_or(|value| value < PROMOTION_CONFIDENCE_FLOOR) =>
         {
             BridgeDecision::hold(
                 candidate,
@@ -89,7 +97,7 @@ mod tests {
 
     use crate::{
         bridge::decide_candidate_promotion,
-        core::{Confidence, EvidenceId, FactId, FactSource, SourceKind},
+        core::{Confidence, FactEvidenceId, FactId, FactSource, SourceKind},
         growth::{GrowthCandidate, PromotionDecision},
         hypothesis::HypothesisBoundary,
         matrix::MatrixFact,
@@ -109,7 +117,7 @@ mod tests {
         let decision = decide_candidate_promotion(GrowthCandidate::Memory(MemoryCandidate {
             summary: "simulated preference".to_string(),
             source: source(),
-            evidence: vec![EvidenceId::new()],
+            evidence: vec![FactEvidenceId::new()],
             confidence: Confidence::from_basis_points(9_000),
             boundary: HypothesisBoundary::hypothetical("scenario-1"),
             tags: vec!["simulation".to_string()],
@@ -126,7 +134,7 @@ mod tests {
             predicate: "passes_gate".to_string(),
             value: json!(true),
             source: source(),
-            evidence: vec![EvidenceId::new()],
+            evidence: vec![FactEvidenceId::new()],
             confidence: Confidence::from_basis_points(8_500),
             boundary: HypothesisBoundary::observed(),
         }));

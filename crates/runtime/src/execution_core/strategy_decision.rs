@@ -115,6 +115,8 @@ pub struct TurnStrategyActualOutcome {
     pub output_tokens: u64,
     pub cached_tokens: u64,
     pub tool_calls: u64,
+    #[serde(default)]
+    pub failed_tool_calls: u64,
     pub duplicate_tool_calls: u64,
     #[serde(default)]
     pub max_tool_concurrency_observed: u64,

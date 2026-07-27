@@ -192,8 +192,8 @@ async fn checkpoint_compaction_promotes_only_reviewed_candidates() {
     existing.scope = MemoryScope::Task("task-checkpoint".to_string());
     manager.remember(existing).await.unwrap();
 
-    let evidence_ref =
-        EvidenceRef::new("session-message", "session-checkpoint:0").with_source("source message");
+    let evidence_ref = EvidenceRef::observed("session-message", "session-checkpoint:0")
+        .with_source("source message");
     let checkpoint = SessionSemanticCheckpoint {
         schema_version: SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
         checkpoint_id: "checkpoint-review".to_string(),

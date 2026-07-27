@@ -546,6 +546,7 @@ async fn forward_provider_attempt(
         &entry.client,
         &message_request,
         &entry.model,
+        &entry.request_context.profile,
         emit_output,
         stream_callback,
         &sender,
@@ -610,6 +611,7 @@ async fn forward_provider_stream(
     client: &ProviderClient,
     message_request: &MessageRequest,
     effective_model: &str,
+    resolved_profile: &ResolvedProviderProfile,
     emit_output: bool,
     stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
@@ -633,7 +635,7 @@ async fn forward_provider_stream(
             if !forward_event(
                 sender,
                 AssistantEvent::ProviderModel {
-                    model: effective_model.to_string(),
+                    identity: outcome_provider_identity(resolved_profile, effective_model),
                 },
                 emit_output,
                 &stream_callback,
@@ -838,13 +840,26 @@ async fn forward_provider_stream(
     events.insert(
         0,
         AssistantEvent::ProviderModel {
-            model: effective_model.to_string(),
+            identity: outcome_provider_identity(resolved_profile, effective_model),
         },
     );
     if forward_events(sender, events, emit_output, &stream_callback, &mut emitted).await {
         Ok(ForwardedProviderStream::Completed)
     } else {
         Ok(ForwardedProviderStream::ConsumerDropped)
+    }
+}
+
+fn outcome_provider_identity(
+    profile: &ResolvedProviderProfile,
+    effective_model: &str,
+) -> harness_contract::outcome::ProviderIdentity {
+    harness_contract::outcome::ProviderIdentity {
+        registry_revision: Some(profile.registry_revision),
+        provider_name: profile.provider_name.clone(),
+        model: effective_model.to_string(),
+        profile: None,
+        protocol: profile.protocol.clone(),
     }
 }
 
@@ -1233,7 +1248,13 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         sender
             .send(Ok(AssistantEvent::ProviderModel {
-                model: "test".to_string(),
+                identity: harness_contract::outcome::ProviderIdentity {
+                    registry_revision: Some(1),
+                    provider_name: "test".to_string(),
+                    model: "test".to_string(),
+                    profile: None,
+                    protocol: Some("completions".to_string()),
+                },
             }))
             .await
             .unwrap();

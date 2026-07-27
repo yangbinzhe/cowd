@@ -11,7 +11,6 @@ use crate::core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,31 +631,6 @@ impl StrategyExperienceStore {
             trusted_calibration_reports: Vec::new(),
             negative_benefit_observations: Vec::new(),
         }
-    }
-
-    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(Self::new());
-        }
-        let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        std::fs::write(path, bytes)
-    }
-
-    pub fn load_or_default(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        Self::load(path).unwrap_or_default()
     }
 
     pub fn record(&mut self, record: StrategyExperienceRecord) {
@@ -3531,26 +3505,6 @@ mod tests {
         assert_eq!(summary.multi_agent_lift_sample_count, 0);
         assert_eq!(summary.average_total_tokens, 15);
         assert_eq!(summary.actual_cost_sample_count, 4);
-    }
-
-    #[test]
-    fn strategy_experience_store_persists_json() {
-        let decision = decide_strategy(&StrategyInput::from_prompt("修复这个单文件小问题"));
-        let mut store = StrategyExperienceStore::new();
-        store.record(StrategyExperienceRecord::from_decision(
-            &decision, true, false, false, true, 1,
-        ));
-        let path = std::env::temp_dir().join(format!(
-            "cowd-strategy-experience-{}.json",
-            std::process::id()
-        ));
-
-        store.save(&path).unwrap();
-        let loaded = StrategyExperienceStore::load(&path).unwrap();
-        let _ = std::fs::remove_file(path);
-
-        assert_eq!(loaded.records.len(), 1);
-        assert_eq!(loaded.records[0].selected_pattern, decision.pattern);
     }
 
     #[test]

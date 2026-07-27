@@ -197,16 +197,16 @@ mod tests {
             EvolutionSignal::low_novelty_tool_loop(
                 "runtime",
                 "session-1",
-                vec![EvidenceRef::new("tool", "tool:read:1")],
+                vec![EvidenceRef::observed("tool", "tool:read:1")],
             ),
             EvolutionSignal::memory_noise(
                 "runtime",
                 "session-1",
-                vec![EvidenceRef::new("memory", "memory:packet:noise")],
+                vec![EvidenceRef::observed("memory", "memory:packet:noise")],
             ),
             EvolutionSignal::eval_failure(
                 "run-1",
-                vec![EvidenceRef::new("evaluation_report", "report:gate")],
+                vec![EvidenceRef::observed("evaluation_report", "report:gate")],
             ),
         ];
         assert_eq!(signals.len(), 3);

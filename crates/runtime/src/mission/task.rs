@@ -1099,7 +1099,7 @@ fn now_ms() -> u64 {
 
 #[must_use]
 pub fn synthetic_evidence(ref_type: &str, id: impl Into<String>) -> EvidenceRef {
-    EvidenceRef::new(ref_type, id).with_source("runtime.task")
+    EvidenceRef::observed(ref_type, id).with_source("runtime.task")
 }
 
 #[cfg(test)]

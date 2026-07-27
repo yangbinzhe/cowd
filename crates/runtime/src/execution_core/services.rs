@@ -890,6 +890,7 @@ impl RuntimeServicesBuilder {
             .map_err(RuntimeServicesError::AgentRuntime)?;
         services.materialize_evolution_release_assignments()?;
         services.knowledge_candidate_projector.start();
+        services.outcome_projector.start();
         services.evolution_signal_projector.start();
         services
             .team_runtime()
@@ -923,6 +924,8 @@ pub struct RuntimeServices {
     team_runtime: Arc<TeamRuntime>,
     l4_promotion_service: Arc<crate::L4PromotionService>,
     knowledge_candidate_projector: Arc<crate::KnowledgeCandidateProjector>,
+    outcome_service: Arc<crate::execution_core::OutcomeService>,
+    outcome_projector: Arc<crate::OutcomeProjector>,
     verify_executor: Arc<VerifyNodeExecutor>,
     synthesize_executor: Arc<SynthesizeNodeExecutor>,
     graph_state_store: ExecutionGraphStateStore,
@@ -1061,6 +1064,7 @@ impl RuntimeServices {
             .map_err(RuntimeServicesError::AgentRuntime)?;
         services.materialize_evolution_release_assignments()?;
         services.knowledge_candidate_projector.start();
+        services.outcome_projector.start();
         services.evolution_signal_projector.start();
         Ok(services)
     }
@@ -1218,6 +1222,10 @@ impl RuntimeServices {
             Arc::clone(&event_store),
             Arc::clone(&l4_promotion_service),
         ));
+        let outcome_service = Arc::new(crate::execution_core::OutcomeService::new(Arc::clone(
+            &event_store,
+        )));
+        let outcome_projector = Arc::new(crate::OutcomeProjector::new(Arc::clone(&event_store)));
         let gate_store = Arc::clone(&event_store);
         let gate_workspace = workspace_key.clone();
         let gate_root = workspace_root.clone();
@@ -1253,11 +1261,17 @@ impl RuntimeServices {
         );
         let managed_projection_store = graph_state_store.clone();
         let managed_projection_dispatcher = Arc::clone(&managed_agents);
+        let outcome_projection_store = graph_state_store.clone();
+        let settled_outcome_service = Arc::clone(&outcome_service);
+        let settled_outcome_projector = Arc::clone(&outcome_projector);
         execution_supervisor
             .install_graph_settled_observer(move |graph_id| {
                 let graph_id = graph_id.to_string();
                 let graph_store = managed_projection_store.clone();
                 let dispatcher = Arc::clone(&managed_projection_dispatcher);
+                let outcome_store = outcome_projection_store.clone();
+                let outcome_service = Arc::clone(&settled_outcome_service);
+                let outcome_projector = Arc::clone(&settled_outcome_projector);
                 tokio::spawn(async move {
                     if let Err(error) =
                         project_managed_invocation_terminal(graph_store, dispatcher, &graph_id)
@@ -1267,6 +1281,20 @@ impl RuntimeServices {
                             graph_id,
                             error,
                             "managed Agent terminal projector could not reduce graph state"
+                        );
+                    }
+                    if let Err(error) = project_team_terminal_outcome(
+                        outcome_store,
+                        outcome_service,
+                        outcome_projector,
+                        &graph_id,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            graph_id,
+                            error,
+                            "Team terminal Outcome projector could not reduce graph state"
                         );
                     }
                 });
@@ -1292,6 +1320,8 @@ impl RuntimeServices {
             team_runtime,
             l4_promotion_service,
             knowledge_candidate_projector,
+            outcome_service,
+            outcome_projector,
             verify_executor,
             synthesize_executor,
             graph_state_store,
@@ -1433,6 +1463,7 @@ impl RuntimeServices {
     /// Stop accepting detached maintenance and await every retained task.
     pub async fn shutdown_maintenance(&self) {
         self.evolution_signal_projector.shutdown().await;
+        self.outcome_projector.shutdown().await;
         self.knowledge_candidate_projector.shutdown().await;
         self.maintenance_supervisor.shutdown_and_drain().await;
     }
@@ -1475,6 +1506,39 @@ impl RuntimeServices {
     #[must_use]
     pub fn knowledge_candidate_projector(&self) -> &Arc<crate::KnowledgeCandidateProjector> {
         &self.knowledge_candidate_projector
+    }
+
+    #[must_use]
+    pub fn outcome_service(&self) -> &Arc<crate::execution_core::OutcomeService> {
+        &self.outcome_service
+    }
+
+    #[must_use]
+    pub fn outcome_projector(&self) -> &Arc<crate::OutcomeProjector> {
+        &self.outcome_projector
+    }
+
+    pub fn import_legacy_strategy_outcomes(
+        &self,
+        path: &Path,
+    ) -> Result<crate::execution_core::LegacyOutcomeImportReceipt, RuntimeServicesError> {
+        self.outcome_service
+            .import_legacy_strategy_file(path)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn import_calibration_outcomes(
+        &self,
+        path: &Path,
+    ) -> Result<crate::execution_core::CalibrationOutcomeImportReceipt, RuntimeServicesError> {
+        let receipt = self
+            .outcome_service
+            .import_calibration_file(path)
+            .map_err(RuntimeServicesError::Invariant)?;
+        self.outcome_projector
+            .project_available(128)
+            .map_err(RuntimeServicesError::Invariant)?;
+        Ok(receipt)
     }
 
     /// Runtime-owned read port for Fact and Matrix context. Each call requires
@@ -2038,6 +2102,14 @@ impl RuntimeServices {
         &self,
     ) -> Result<crate::EvolutionProjectorHealth, RuntimeServicesError> {
         self.evolution_signal_projector
+            .health()
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn outcome_projection_health(
+        &self,
+    ) -> Result<crate::OutcomeProjectionHealth, RuntimeServicesError> {
+        self.outcome_projector
             .health()
             .map_err(RuntimeServicesError::Invariant)
     }
@@ -4075,6 +4147,167 @@ async fn project_managed_invocation_terminal(
     }
 }
 
+async fn project_team_terminal_outcome(
+    graph_state_store: ExecutionGraphStateStore,
+    outcome_service: Arc<crate::execution_core::OutcomeService>,
+    outcome_projector: Arc<crate::OutcomeProjector>,
+    graph_id: &str,
+) -> Result<(), String> {
+    let graph = match graph_state_store.load_async(graph_id).await {
+        Ok(graph) => graph,
+        Err(ExecutionStateStoreError::NotFound(_)) => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if graph.node_statuses.is_empty()
+        || graph
+            .node_statuses
+            .values()
+            .any(|status| !status.is_terminal())
+    {
+        return Ok(());
+    }
+    let Some(packet) = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        .filter_map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok())
+        .find(|packet| packet.team_id().is_some())
+    else {
+        // Direct and Tool-only graphs are owned by the parent Turn Outcome;
+        // standalone Agent nodes emit their own Agent terminal Outcome.
+        return Ok(());
+    };
+    let team_id = packet
+        .team_id()
+        .ok_or_else(|| "Team graph has no team identity".to_string())?;
+    let identity = &packet.assignment.execution_identity;
+    let turn_id = identity
+        .turn_id()
+        .ok_or_else(|| "Team outcome has no canonical turn identity".to_string())?;
+    let has_failed = graph_has_status(&graph, ExecutionNodeStatus::Failed);
+    let has_blocked = graph_has_status(&graph, ExecutionNodeStatus::Blocked);
+    let has_cancelled = graph_has_status(&graph, ExecutionNodeStatus::Cancelled);
+    let has_completed = graph_has_status(&graph, ExecutionNodeStatus::Completed);
+    let terminal = if has_failed && has_completed {
+        harness_contract::outcome::OutcomeTerminalClass::PartialFailure(
+            "Team graph contains completed and failed nodes".to_string(),
+        )
+    } else if has_failed {
+        harness_contract::outcome::OutcomeTerminalClass::Failed(
+            "Team graph contains failed nodes".to_string(),
+        )
+    } else if has_blocked {
+        harness_contract::outcome::OutcomeTerminalClass::Blocked(
+            "Team graph contains blocked nodes".to_string(),
+        )
+    } else if has_cancelled {
+        harness_contract::outcome::OutcomeTerminalClass::Cancelled(
+            "Team graph contains cancelled nodes".to_string(),
+        )
+    } else {
+        harness_contract::outcome::OutcomeTerminalClass::Succeeded(
+            "Team graph completed".to_string(),
+        )
+    };
+    let completed_at_ms = graph
+        .node_results
+        .values()
+        .map(|result| result.finished_at_ms)
+        .max()
+        .unwrap_or_else(now_ms);
+    let duration_ms = graph.node_results.values().fold(0_u64, |total, result| {
+        total.saturating_add(result.usage.duration_ms)
+    });
+    let usage = graph.node_results.values().fold(
+        harness_contract::outcome::OutcomeUsage::default(),
+        |mut usage, result| {
+            usage.input_tokens = Some(
+                usage
+                    .input_tokens
+                    .unwrap_or_default()
+                    .saturating_add(result.usage.input_tokens),
+            );
+            usage.output_tokens = Some(
+                usage
+                    .output_tokens
+                    .unwrap_or_default()
+                    .saturating_add(result.usage.output_tokens),
+            );
+            usage.cached_tokens = Some(
+                usage
+                    .cached_tokens
+                    .unwrap_or_default()
+                    .saturating_add(result.usage.cached_tokens),
+            );
+            usage.tool_calls = usage.tool_calls.saturating_add(result.usage.tool_calls);
+            usage.duplicate_tool_calls = usage
+                .duplicate_tool_calls
+                .saturating_add(result.usage.duplicate_tool_calls);
+            usage
+        },
+    );
+    let mut evidence_refs = graph
+        .node_results
+        .values()
+        .flat_map(|result| result.evidence_refs.iter())
+        .map(|reference| reference.evidence_ref.clone())
+        .collect::<Vec<_>>();
+    dedupe_evolution_evidence(&mut evidence_refs);
+    let outcome = harness_contract::outcome::ExecutionOutcome {
+        identity: harness_contract::outcome::OutcomeIdentity {
+            execution_id: format!("team:{team_id}:{}", graph.id),
+            session_id: packet.session_id().to_string(),
+            turn_id: turn_id.to_string(),
+            terminal_generation: graph.revision,
+            paired_sample_id: None,
+            task_id: Some(packet.task_id().to_string()),
+            mission_id: Some(packet.mission_id().to_string()),
+            agent_id: None,
+            team_id: Some(team_id.to_string()),
+            execution_graph_ref: Some(graph.id.clone()),
+        },
+        runtime: harness_contract::outcome::RuntimeIdentity {
+            workspace_key: identity.workspace_id().to_string(),
+            runtime_revision: env!("CARGO_PKG_VERSION").to_string(),
+            config_revision: packet.binding.as_ref().map_or_else(
+                || "team-graph:unknown-binding".to_string(),
+                |binding| format!("team-binding:{}", binding.binding_digest),
+            ),
+        },
+        provider: None,
+        strategy: harness_contract::outcome::StrategyIdentity {
+            decision_id: format!("team-graph:{}", graph.id),
+            policy_revision: "runtime.team_graph.v1".to_string(),
+            decision_source: "runtime.execution_supervisor".to_string(),
+            selected_candidate: harness_contract::strategy::ExecutionCandidateKind::Team,
+            selected_pattern: "team".to_string(),
+        },
+        timing: harness_contract::outcome::OutcomeTiming {
+            started_at_ms: completed_at_ms.saturating_sub(duration_ms),
+            completed_at_ms,
+            duration_ms,
+        },
+        usage,
+        terminal,
+        quality: harness_contract::outcome::OutcomeQuality::Unknown,
+        observation: harness_contract::outcome::OutcomeObservation {
+            source: "runtime.team_terminal".to_string(),
+            observed_at_ms: completed_at_ms,
+            freshness_ms: 0,
+        },
+        evidence_completeness: if evidence_refs.is_empty() {
+            harness_contract::reality::EvidenceCompleteness::None
+        } else {
+            harness_contract::reality::EvidenceCompleteness::Partial
+        },
+        evidence_refs,
+        schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
+    };
+    outcome_service.record_terminal(&outcome)?;
+    outcome_projector.project_available(128)?;
+    Ok(())
+}
+
 fn scenario_observation(
     packet: &AgentTaskPacket,
     returned: &harness_contract::agent::AgentReturnPacket,
@@ -4185,8 +4418,11 @@ fn team_scenario_observation(
         .unwrap_or_default();
     evidence_refs.extend(matched.iter().flat_map(|evaluation| {
         evaluation.evidence_refs.iter().map(|reference| {
-            harness_contract::reality::EvidenceRef::new("agent_run_evidence", reference.clone())
-                .with_source(evaluation.evaluation_id.clone())
+            harness_contract::reality::EvidenceRef::observed(
+                "agent_run_evidence",
+                reference.clone(),
+            )
+            .with_source(evaluation.evaluation_id.clone())
         })
     }));
     dedupe_evolution_evidence(&mut evidence_refs);
@@ -4460,7 +4696,7 @@ mod tests {
                 source_session_id: "session-startup-recovery".to_string(),
                 source_turn_id: "turn-startup-recovery".to_string(),
                 spec: harness_contract::task::TaskSpec::new("recover committed task side effects"),
-                evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "test_fixture",
                     "test://task/startup-recovery",
                 )],
@@ -4857,7 +5093,7 @@ mod tests {
         ) -> Result<AgentReturnPacket, String> {
             let mut evidence_refs = packet.evidence_refs.clone();
             evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
-                harness_contract::context::EvidenceRef::new(
+                harness_contract::context::EvidenceRef::observed(
                     "tool",
                     format!("materialized:{}", packet.node_id()),
                 ),
@@ -4926,7 +5162,7 @@ mod tests {
             self.active.fetch_sub(1, Ordering::SeqCst);
             let mut evidence_refs = packet.evidence_refs.clone();
             evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
-                harness_contract::context::EvidenceRef::new(
+                harness_contract::context::EvidenceRef::observed(
                     "tool",
                     format!("materialized:{}", packet.node_id()),
                 ),
@@ -5235,7 +5471,7 @@ mod tests {
         let signal = services
             .record_evolution_signal(crate::EvolutionSignal::eval_failure(
                 "canary-fixture",
-                vec![harness_contract::reality::EvidenceRef::new(
+                vec![harness_contract::reality::EvidenceRef::observed(
                     "agent_run",
                     "baseline",
                 )],
@@ -5271,7 +5507,7 @@ mod tests {
                     revision_ref: candidate_revision.revision.revision_ref.clone(),
                 },
                 baseline_revision: 1,
-                source_evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "agent_run",
                     "baseline",
                 )],
@@ -5323,7 +5559,7 @@ mod tests {
                     },
                 ],
                 source_run_refs: vec!["eval:paired".to_string()],
-                evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "evaluation",
                     "paired",
                 )],
@@ -5377,7 +5613,7 @@ mod tests {
                 action: crate::ReleaseChangeAction::StopCanary,
                 selector: None,
                 candidate_id: Some(candidate.candidate_id.clone()),
-                evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "incident", "fixture",
                 )],
             })

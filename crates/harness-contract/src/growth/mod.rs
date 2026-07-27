@@ -142,7 +142,7 @@ impl GrowthEvidenceRef {
         summary: impl Into<String>,
     ) -> Self {
         Self {
-            evidence: EvidenceRef::new(kind, reference),
+            evidence: EvidenceRef::observed(kind, reference),
             summary: summary.into(),
         }
     }

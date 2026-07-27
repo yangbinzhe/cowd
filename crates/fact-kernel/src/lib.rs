@@ -33,7 +33,8 @@ pub use candidate::{
     FactCandidateRelationKind, FactScope, FactStatus,
 };
 pub use core::{
-    Confidence, EvidenceId, EvidencePacket, FactId, FactRecord, FactSource, Provenance, SourceKind,
+    Confidence, EvidencePacket, FactEvidenceId, FactId, FactRecord, FactSource, Provenance,
+    SourceKind,
 };
 pub use extraction::{
     FactExtractionBatch, FactExtractionBatchId, FactExtractionTokenUsage, FactExtractionTrigger,

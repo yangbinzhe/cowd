@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use fact_kernel::{
-    Confidence, EvidenceId, ExtractionMethod, FactCandidate, FactCandidateId, FactExtractionBatch,
-    FactExtractionTokenUsage, FactExtractionTrigger, FactScope, FactSource, SourceKind,
+    Confidence, ExtractionMethod, FactCandidate, FactCandidateId, FactEvidenceId,
+    FactExtractionBatch, FactExtractionTokenUsage, FactExtractionTrigger, FactScope, FactSource,
+    SourceKind,
 };
 use harness_contract::{execution::ExecutionIdentity, reality::EvidenceRef};
 use serde::{Deserialize, Serialize};
@@ -460,8 +461,8 @@ impl SessionCheckpointFact {
     }
 }
 
-fn evidence_id_from_ref(reference: &EvidenceRef) -> EvidenceId {
-    EvidenceId::from_string(format!("{}:{}", reference.ref_type, reference.id))
+fn evidence_id_from_ref(reference: &EvidenceRef) -> FactEvidenceId {
+    FactEvidenceId::from_string(format!("{}:{}", reference.ref_type, reference.id))
 }
 
 impl SessionCompactor {
@@ -1619,7 +1620,7 @@ mod tests {
     #[test]
     fn semantic_checkpoint_exports_fact_extraction_batch_with_stable_scope() {
         let evidence_ref =
-            EvidenceRef::new("session-message", "session-a:0").with_source("source message");
+            EvidenceRef::observed("session-message", "session-a:0").with_source("source message");
         let checkpoint = SessionSemanticCheckpoint {
             schema_version: SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id: "checkpoint-a".to_string(),

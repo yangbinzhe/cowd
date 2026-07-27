@@ -339,7 +339,7 @@ impl TeamInstantiationService {
                         }],
                         execution_policy: TaskExecutionPolicy::default(),
                     },
-                    evidence_refs: vec![EvidenceRef::new(
+                    evidence_refs: vec![EvidenceRef::observed(
                         "team_request",
                         format!(
                             "team://{}/requests/{}/roles/{}/{}",

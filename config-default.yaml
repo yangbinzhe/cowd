@@ -84,6 +84,10 @@ session_history:
 # protocol 可选；不配置时 cowd 会根据 provider 名、base_url、model 名本地探测。
 # 显式配置后不再探测，合法值为: anthropic, completions, responses。
 
+# Provider 路由默认严格按 primary/fallback 配置。auto 仅消费版本匹配、
+# 新鲜且具有完整质量证据的 Outcome 投影；证据不足时整次回退 pinned。
+routing_mode: pinned
+
 providers: {}
 # 示例:
 # providers:

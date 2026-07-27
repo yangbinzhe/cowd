@@ -84,7 +84,7 @@ impl EvolutionEvalRunner for EligibleRunner {
                 },
             ],
             source_run_refs: vec!["agent-run:paired".to_string()],
-            evidence_refs: vec![EvidenceRef::new("evaluation", "paired")],
+            evidence_refs: vec![EvidenceRef::observed("evaluation", "paired")],
             created_at_ms: 1,
         })
     }
@@ -244,7 +244,7 @@ async fn stable_requires_approved_canary_and_eligible_observation_before_human_p
     let signal = services
         .record_evolution_signal(runtime::EvolutionSignal::eval_failure(
             "stable-review",
-            vec![EvidenceRef::new("agent_run", "baseline")],
+            vec![EvidenceRef::observed("agent_run", "baseline")],
         ))
         .expect("signal");
     let proposal = services
@@ -281,7 +281,7 @@ async fn stable_requires_approved_canary_and_eligible_observation_before_human_p
                 .expect("revision"),
             },
             baseline_revision: 1,
-            source_evidence_refs: vec![EvidenceRef::new("agent_run", "baseline")],
+            source_evidence_refs: vec![EvidenceRef::observed("agent_run", "baseline")],
             canary_policy: CanaryRolloutPolicy {
                 traffic_basis_points: 10_000,
                 minimum_samples: 1,
@@ -321,7 +321,7 @@ async fn stable_requires_approved_canary_and_eligible_observation_before_human_p
             canary_assignment_id: canary.assignment_id,
             generation: canary.generation,
             source_run_refs: vec!["agent-run:canary-1".to_string()],
-            evidence_refs: vec![EvidenceRef::new("canary_evaluation", "canary-1")],
+            evidence_refs: vec![EvidenceRef::observed("canary_evaluation", "canary-1")],
             sample_count: 1,
             minimum_samples: 1,
             observed_duration_ms: 1,

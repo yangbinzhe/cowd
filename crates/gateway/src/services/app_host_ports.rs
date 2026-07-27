@@ -337,7 +337,7 @@ impl RuntimePort for GatewayAppHostBinding {
                         request.source_turn_id,
                         request.objective,
                         request.preemptive,
-                        vec![harness_contract::reality::EvidenceRef::new(
+                        vec![harness_contract::reality::EvidenceRef::observed(
                             "app_intent",
                             format!("app://{}/requests/{}", context.surface, context.request_id),
                         )],

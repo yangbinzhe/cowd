@@ -171,6 +171,10 @@ where
         .with_knowledge_activation(services.knowledge_activation())
         .with_explicit_team_escalation(root_provider_owner)
         .with_runtime_event_store(Arc::clone(services.event_store()))
+        .with_outcome_runtime(
+            Arc::clone(services.outcome_service()),
+            Arc::clone(services.outcome_projector()),
+        )
         .with_artifact_store(Arc::clone(services.artifact_store()))
         .with_skill_profiles(config.skill_profiles)
         .with_agent_skill_profile(config.agent_skill_profile)
@@ -686,6 +690,10 @@ where
     let turn_started_at = std::time::Instant::now();
     let mut runtime = runtime
         .with_runtime_event_store(Arc::clone(services.event_store()))
+        .with_outcome_runtime(
+            Arc::clone(services.outcome_service()),
+            Arc::clone(services.outcome_projector()),
+        )
         .with_artifact_store(Arc::clone(services.artifact_store()))
         .with_maintenance_supervisor(services.maintenance_supervisor())
         .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
@@ -1341,7 +1349,20 @@ where
         });
         let (status, outcome) = match &result {
             Ok(summary) => (
-                crate::execution_core::TurnStrategyDecisionStatus::Completed,
+                match summary.terminal_completion {
+                    harness_contract::goal::GoalCompletion::Satisfied => {
+                        crate::execution_core::TurnStrategyDecisionStatus::Completed
+                    }
+                    harness_contract::goal::GoalCompletion::Blocked => {
+                        crate::execution_core::TurnStrategyDecisionStatus::EarlyStopped
+                    }
+                    harness_contract::goal::GoalCompletion::Cancelled => {
+                        crate::execution_core::TurnStrategyDecisionStatus::Cancelled
+                    }
+                    harness_contract::goal::GoalCompletion::Open => {
+                        crate::execution_core::TurnStrategyDecisionStatus::Failed
+                    }
+                },
                 crate::execution_core::TurnStrategyActualOutcome {
                     duration_ms: end_to_end_duration_ms,
                     // The evaluation lease is process-wide and reconciles
@@ -1368,6 +1389,14 @@ where
                         |budget| budget.cached_consumed,
                     ),
                     tool_calls: summary.tool_results.len() as u64,
+                    failed_tool_calls: summary
+                        .tool_results
+                        .iter()
+                        .flat_map(|message| message.blocks.iter())
+                        .filter(|block| {
+                            matches!(block, ContentBlock::ToolResult { is_error: true, .. })
+                        })
+                        .count() as u64,
                     duplicate_tool_calls: summary.duplicate_tool_calls,
                     max_tool_concurrency_observed: u64::try_from(
                         summary.max_tool_concurrency_observed,
@@ -9313,7 +9342,7 @@ mod tests {
         ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
             let evidence_id = format!("materialized:{}", packet.node_id());
             let evidence = harness_contract::context::EvidenceAccessRef::durable(
-                harness_contract::context::EvidenceRef::new("tool", evidence_id),
+                harness_contract::context::EvidenceRef::observed("tool", evidence_id),
                 "a".repeat(64),
                 1,
                 "application/json",

@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use crate::core::{Confidence, EvidenceId, FactSource};
+use crate::core::{Confidence, FactEvidenceId, FactSource};
 use crate::hypothesis::HypothesisBoundary;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryCandidate {
     pub summary: String,
     pub source: FactSource,
-    pub evidence: Vec<EvidenceId>,
+    pub evidence: Vec<FactEvidenceId>,
     pub confidence: Confidence,
     pub boundary: HypothesisBoundary,
     pub tags: Vec<String>,

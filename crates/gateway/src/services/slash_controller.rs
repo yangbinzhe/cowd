@@ -318,7 +318,7 @@ fn command_turn_id(args: &serde_json::Value) -> String {
 }
 
 fn command_evidence(session_id: &str, turn_id: &str, operation: &str) -> Vec<EvidenceRef> {
-    vec![EvidenceRef::new(
+    vec![EvidenceRef::observed(
         "slash_command",
         format!("slash://sessions/{session_id}/turns/{turn_id}?operation={operation}"),
     )]

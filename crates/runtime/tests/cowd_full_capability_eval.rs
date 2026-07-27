@@ -317,7 +317,7 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         evidence_refs: agent_evidence
             .iter()
             .map(|evidence| {
-                EvidenceRef::new(
+                EvidenceRef::observed(
                     "agent_evidence",
                     evidence["id"].as_str().unwrap().to_string(),
                 )

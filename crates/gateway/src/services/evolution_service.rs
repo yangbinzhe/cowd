@@ -67,11 +67,13 @@ impl EvolutionService {
     ) -> Result<Value, EvolutionServiceError> {
         let signals = runtime.evolution_signals().map_err(internal)?;
         let health = runtime.evolution_projector_health().map_err(internal)?;
+        let outcome_health = runtime.outcome_projection_health().map_err(internal)?;
         Ok(json!({
             "kind": "evolution.signals",
             "envelope": self.envelope("signals"),
             "count": signals.len(),
             "projector": health,
+            "outcome_projector": outcome_health,
             "signals": signals,
         }))
     }
@@ -365,7 +367,7 @@ mod tests {
                         team_id: None,
                         run_id: None,
                     },
-                    evidence_refs: vec![EvidenceRef::new("memory", "packet:noise")],
+                    evidence_refs: vec![EvidenceRef::observed("memory", "packet:noise")],
                     severity: runtime::EvolutionSignalSeverity::Warning,
                     summary: "memory packet contained unrelated working memory".to_string(),
                     suggested_action: "tighten scope and salience gates".to_string(),

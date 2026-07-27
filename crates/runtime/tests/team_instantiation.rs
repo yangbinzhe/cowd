@@ -232,7 +232,7 @@ impl AgentRuntimeBackend for CompletedBackend {
     ) -> Result<AgentReturnPacket, String> {
         let mut evidence_refs = packet.evidence_refs.clone();
         evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::context::EvidenceRef::new(
+            harness_contract::context::EvidenceRef::observed(
                 "tool",
                 format!("materialized:{}", packet.node_id()),
             ),
@@ -357,5 +357,32 @@ async fn terminal_role_transition_commits_team_working_state_with_graph() {
     assert_eq!(
         replayed, state,
         "event replay must not duplicate semantic state"
+    );
+    let mut outcome_samples = 0_u64;
+    for _ in 0..50 {
+        services
+            .outcome_projector()
+            .project_available(128)
+            .expect("Outcome projection");
+        outcome_samples = services
+            .outcome_projector()
+            .snapshot()
+            .segments
+            .values()
+            .filter(|segment| {
+                segment.key.as_ref().is_some_and(|key| {
+                    key.candidate == harness_contract::strategy::ExecutionCandidateKind::Team
+                })
+            })
+            .map(|segment| segment.sample_count)
+            .sum();
+        if outcome_samples >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        outcome_samples >= 2,
+        "Team execution must persist both Agent and Team terminal Outcomes"
     );
 }

@@ -14,7 +14,7 @@ pub fn opaque_session_evidence_ref(
     reference: impl Into<String>,
 ) -> EvidenceAccessRef {
     EvidenceAccessRef::unavailable(
-        EvidenceRef::new("handoff", reference.into()),
+        EvidenceRef::observed("handoff", reference.into()),
         "application/x-cowd-reference",
         format!("session:{source_session_id}"),
     )

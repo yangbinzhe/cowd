@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::candidate::FactCandidate;
-use crate::core::EvidenceId;
+use crate::core::FactEvidenceId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FactExtractionBatchId(String);
@@ -58,7 +58,7 @@ pub struct FactExtractionBatch {
     pub task_id: Option<String>,
     pub team_id: Option<String>,
     pub candidates: Vec<FactCandidate>,
-    pub source_evidence: Vec<EvidenceId>,
+    pub source_evidence: Vec<FactEvidenceId>,
     pub token_usage: FactExtractionTokenUsage,
     pub created_at: DateTime<Utc>,
 }
@@ -105,7 +105,7 @@ impl FactExtractionBatch {
     }
 
     #[must_use]
-    pub fn with_source_evidence(mut self, source_evidence: Vec<EvidenceId>) -> Self {
+    pub fn with_source_evidence(mut self, source_evidence: Vec<FactEvidenceId>) -> Self {
         self.source_evidence = source_evidence;
         self
     }

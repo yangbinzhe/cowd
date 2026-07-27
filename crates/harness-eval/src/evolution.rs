@@ -529,7 +529,7 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
                 release_mutation_count: 0,
                 runtime_port_implemented: true,
                 status: "failed".to_string(),
-                evidence_refs: vec![EvidenceRef::new("candidate_error", error)],
+                evidence_refs: vec![EvidenceRef::observed("candidate_error", error)],
             };
         }
     };
@@ -557,7 +557,7 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
             release_mutation_count: 0,
             runtime_port_implemented: true,
             status: "failed".to_string(),
-            evidence_refs: vec![EvidenceRef::new("evaluation_error", error)],
+            evidence_refs: vec![EvidenceRef::observed("evaluation_error", error)],
         },
     }
 }
@@ -605,7 +605,7 @@ impl DefinitionEvolutionWorkload for ClosureWorkload {
                 },
             ],
             source_run_refs: vec!["harness-eval:closure:paired-workload".to_string()],
-            evidence_refs: vec![EvidenceRef::new("harness_eval", "closure:report")],
+            evidence_refs: vec![EvidenceRef::observed("harness_eval", "closure:report")],
             created_at_ms: 1,
         })
     }
@@ -642,7 +642,7 @@ fn closure_candidate() -> Result<runtime::EvolutionGovernanceCandidate, String> 
         },
         evaluation_policy_floor: harness_contract::evaluation::EvaluationPolicyFloor::default(),
         proposal_id: "proposal-agent-v2".to_string(),
-        source_evidence_refs: vec![EvidenceRef::new("harness_eval", "closure:source")],
+        source_evidence_refs: vec![EvidenceRef::observed("harness_eval", "closure:source")],
         canary_policy: runtime::CanaryRolloutPolicy::default(),
         lifecycle: runtime::EvolutionCandidateLifecycle::Draft,
         comparison_report_ref: None,

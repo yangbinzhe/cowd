@@ -700,7 +700,7 @@ mod tests {
         EvolutionSignal::low_novelty_tool_loop(
             "runtime",
             "session-1",
-            vec![EvidenceRef::new("runtime_event", "event-1")],
+            vec![EvidenceRef::observed("runtime_event", "event-1")],
         )
     }
 

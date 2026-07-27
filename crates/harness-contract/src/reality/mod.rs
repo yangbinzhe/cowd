@@ -10,6 +10,7 @@ pub enum RealityBoundary {
     Simulated,
     Hypothetical,
     Conflict,
+    Unknown,
 }
 
 impl RealityBoundary {
@@ -20,11 +21,99 @@ impl RealityBoundary {
             Self::Simulated => "simulated",
             Self::Hypothetical => "hypothetical",
             Self::Conflict => "conflict",
+            Self::Unknown => "unknown",
         }
     }
 
     pub const fn can_be_authoritative(self) -> bool {
         matches!(self, Self::Observed | Self::Inferred)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaimSupportState {
+    #[default]
+    Unknown,
+    Supported,
+    Contradicted,
+    Both,
+}
+
+impl ClaimSupportState {
+    #[must_use]
+    pub const fn combine(self, incoming: Self) -> Self {
+        use ClaimSupportState::{Both, Contradicted, Supported, Unknown};
+        match (self, incoming) {
+            (Both, _) | (_, Both) | (Supported, Contradicted) | (Contradicted, Supported) => Both,
+            (Supported, _) | (_, Supported) => Supported,
+            (Contradicted, _) | (_, Contradicted) => Contradicted,
+            (Unknown, Unknown) => Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceCompleteness {
+    #[default]
+    None,
+    Partial,
+    Sufficient,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSourceAuthority {
+    Unverified,
+    UserAsserted,
+    RuntimeObserved,
+    IndependentlyVerified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ConfidenceEstimate {
+    Heuristic {
+        basis: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value_bp: Option<u16>,
+    },
+    Calibrated {
+        value_bp: u16,
+        calibration_ref: String,
+    },
+}
+
+impl ConfidenceEstimate {
+    pub fn calibrated(value_bp: u16, calibration_ref: impl Into<String>) -> Result<Self, String> {
+        let calibration_ref = calibration_ref.into();
+        if calibration_ref.trim().is_empty() {
+            return Err("calibrated confidence requires a calibration reference".to_string());
+        }
+        Ok(Self::Calibrated {
+            value_bp: value_bp.min(10_000),
+            calibration_ref,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProbabilityEstimate {
+    pub value_bp: u16,
+    pub calibration_ref: String,
+}
+
+impl ProbabilityEstimate {
+    pub fn new(value_bp: u16, calibration_ref: impl Into<String>) -> Result<Self, String> {
+        let calibration_ref = calibration_ref.into();
+        if calibration_ref.trim().is_empty() {
+            return Err("probability requires a calibration reference".to_string());
+        }
+        Ok(Self {
+            value_bp: value_bp.min(10_000),
+            calibration_ref,
+        })
     }
 }
 
@@ -100,20 +189,51 @@ pub struct EvidenceRef {
 }
 
 impl EvidenceRef {
-    /// Construct an observed evidence reference.
+    /// Construct an evidence reference with an explicitly unknown boundary.
     ///
-    /// Observed is the safe default for existing durable tool, artifact, and
-    /// runtime receipts. Inferred or simulated evidence must opt in through
-    /// [`Self::with_boundary`] so non-authoritative material cannot be
-    /// promoted accidentally.
+    /// Callers that possess checked evidence must use one of the named
+    /// constructors below. This fail-closed constructor remains only for
+    /// deserialisation migrations and never confers authority.
     pub fn new(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::unknown(ref_type, id)
+    }
+
+    fn with_explicit_boundary(
+        ref_type: impl Into<String>,
+        id: impl Into<String>,
+        boundary: RealityBoundary,
+    ) -> Self {
         Self {
             ref_type: ref_type.into(),
             id: id.into(),
             source: None,
-            boundary: RealityBoundary::Observed,
+            boundary,
             confidence_bp: None,
         }
+    }
+
+    pub fn observed(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::with_explicit_boundary(ref_type, id, RealityBoundary::Observed)
+    }
+
+    pub fn inferred(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::with_explicit_boundary(ref_type, id, RealityBoundary::Inferred)
+    }
+
+    pub fn simulated(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::with_explicit_boundary(ref_type, id, RealityBoundary::Simulated)
+    }
+
+    pub fn hypothetical(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::with_explicit_boundary(ref_type, id, RealityBoundary::Hypothetical)
+    }
+
+    pub fn conflict(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::with_explicit_boundary(ref_type, id, RealityBoundary::Conflict)
+    }
+
+    pub fn unknown(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
+        Self::with_explicit_boundary(ref_type, id, RealityBoundary::Unknown)
     }
 
     #[must_use]
@@ -134,7 +254,7 @@ impl EvidenceRef {
 
     #[must_use]
     pub fn durable(id: impl Into<String>) -> Self {
-        Self::new("durable_evidence", id).with_source("runtime.artifact")
+        Self::observed("durable_evidence", id).with_source("runtime.artifact")
     }
 
     #[must_use]
@@ -229,5 +349,51 @@ mod tests {
         assert!(!RealityBoundary::Simulated.can_be_authoritative());
         assert!(!RealityBoundary::Hypothetical.can_be_authoritative());
         assert!(!RealityBoundary::Conflict.can_be_authoritative());
+        assert!(!RealityBoundary::Unknown.can_be_authoritative());
+    }
+
+    #[test]
+    fn support_reducer_is_order_independent() {
+        assert_eq!(
+            ClaimSupportState::Supported.combine(ClaimSupportState::Contradicted),
+            ClaimSupportState::Both
+        );
+        assert_eq!(
+            ClaimSupportState::Contradicted.combine(ClaimSupportState::Supported),
+            ClaimSupportState::Both
+        );
+    }
+
+    #[test]
+    fn default_evidence_reference_is_not_observed() {
+        assert_eq!(
+            EvidenceRef::new("migration", "unknown").boundary,
+            RealityBoundary::Unknown
+        );
+    }
+
+    #[test]
+    fn all_reality_boundaries_round_trip_without_collapsing() {
+        for boundary in [
+            RealityBoundary::Observed,
+            RealityBoundary::Inferred,
+            RealityBoundary::Simulated,
+            RealityBoundary::Hypothetical,
+            RealityBoundary::Conflict,
+            RealityBoundary::Unknown,
+        ] {
+            let wire = serde_json::to_value(boundary).unwrap();
+            assert_eq!(
+                serde_json::from_value::<RealityBoundary>(wire).unwrap(),
+                boundary
+            );
+        }
+    }
+
+    #[test]
+    fn calibrated_probability_requires_provenance() {
+        assert!(ProbabilityEstimate::new(5_000, "").is_err());
+        assert!(ConfidenceEstimate::calibrated(5_000, "").is_err());
+        assert!(ProbabilityEstimate::new(5_000, "calibration:test").is_ok());
     }
 }

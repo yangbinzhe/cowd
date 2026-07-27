@@ -7,7 +7,7 @@ use fact_kernel::{
     hypothesis::HypothesisBoundary,
     matrix::MatrixFact as KernelMatrixFact,
     memory::MemoryCandidate as KernelMemoryCandidate,
-    Confidence, EvidenceId, FactGrowthBatch, FactId, FactKernelService, GrowthPromotionRecord,
+    Confidence, FactEvidenceId, FactGrowthBatch, FactId, FactKernelService, GrowthPromotionRecord,
     InMemoryFactStore,
 };
 use harness_contract::growth::{GrowthEvent, GrowthMatrixSignal, GrowthMemoryCandidate};
@@ -246,7 +246,7 @@ impl GrowthService {
                 "evidence_refs": event.evidence_refs,
             }),
         );
-        evidence.id = EvidenceId::from_string(format!("growth:evidence:{}", event.id));
+        evidence.id = FactEvidenceId::from_string(format!("growth:evidence:{}", event.id));
         kernel.ingest_evidence(evidence.clone());
 
         let mut receipts = Vec::new();
@@ -700,7 +700,7 @@ fn kernel_memory_candidate(
     event: &GrowthEvent,
     candidate: &GrowthMemoryCandidate,
     source: &FactSource,
-    evidence_id: &fact_kernel::EvidenceId,
+    evidence_id: &fact_kernel::FactEvidenceId,
 ) -> KernelMemoryCandidate {
     KernelMemoryCandidate {
         summary: candidate.summary.clone(),
@@ -720,7 +720,7 @@ fn kernel_matrix_fact(
     event: &GrowthEvent,
     signal: &GrowthMatrixSignal,
     source: &FactSource,
-    evidence_id: &fact_kernel::EvidenceId,
+    evidence_id: &fact_kernel::FactEvidenceId,
 ) -> KernelMatrixFact {
     KernelMatrixFact {
         id: FactId::from_string(format!("growth-matrix:{}:{}", event.id, signal.fact_type)),

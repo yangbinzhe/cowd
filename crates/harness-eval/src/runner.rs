@@ -795,18 +795,27 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             );
         }
     };
-    runtime_services
-        .conflict_resolver()
-        .resolve(runtime::ConflictResolutionRequest {
-            source: runtime::ConflictSourceKind::SessionRelation,
-            severity: runtime::ConflictSeverity::Medium,
-            summary: relation.summary.clone(),
-            evidence_refs: relation.evidence_refs.clone(),
-            affected_scope: vec![
-                format!("session:{}", relation.from_session_id),
-                format!("session:{}", relation.to_session_id),
-            ],
-        });
+    if let Err(error) =
+        runtime_services
+            .conflict_resolver()
+            .resolve(runtime::ConflictResolutionRequest {
+                source: runtime::ConflictSourceKind::SessionRelation,
+                severity: runtime::ConflictSeverity::Medium,
+                summary: relation.summary.clone(),
+                evidence_refs: relation.evidence_refs.clone(),
+                affected_scope: vec![
+                    format!("session:{}", relation.from_session_id),
+                    format!("session:{}", relation.to_session_id),
+                ],
+            })
+    {
+        return mission_runtime_collaboration_failure(
+            started,
+            objective,
+            "record_session_conflict_evidence",
+            error,
+        );
+    }
     let conflict_count = runtime_services.conflict_resolver().receipts().len() as u64;
     let projection = runtime_services.mission_runtime().projection(
         runtime_services.session_relations(),
