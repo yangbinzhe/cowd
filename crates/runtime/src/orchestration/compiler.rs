@@ -144,6 +144,9 @@ pub fn compile_orchestration(
         resource_scopes: orchestration_resource_scopes(request),
     })?;
     graph.parent_execution = parent_execution;
+    if graph.parent_execution.is_some() {
+        graph.service_class = harness_contract::execution_graph::ExecutionServiceClass::Foreground;
+    }
     let expected_revision = graph.revision;
     Ok(CompiledOrchestration {
         graph,
@@ -220,6 +223,7 @@ fn compile_session_dispatch(
     let mut graph = ExecutionGraph::new(request.intent.clone());
     graph.id = format!("runtime-session-dispatch:{request_id}");
     graph.parent_execution = parent_execution;
+    graph.service_class = harness_contract::execution_graph::ExecutionServiceClass::Foreground;
     let node = ExecutionNodeSpec::new(
         ExecutionNodeKind::SessionDispatch,
         crate::SESSION_DISPATCH_EXECUTOR,

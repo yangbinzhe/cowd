@@ -42,17 +42,15 @@ use crate::agent::binding::request_for_intent;
 use crate::agent::definition::ExplicitTomlAgentImport;
 use crate::managed_agent::ManagedAgentRestartDisposition;
 use crate::runtime_event_store::RuntimeEventStoreError;
-#[cfg(feature = "test-fixtures")]
-use crate::RuntimeEventInput;
 use crate::{
     AgentBindingCompiler, AgentBindingRequest, AgentDefinitionDraftReceipt, AgentRuntime,
     AgentRuntimeResolver, ApprovalQueue, CompiledAgentBinding, ConflictArbiter,
     DefinitionRegistryError, DurableRuntimeEvent, ExecutionGraphHost, InProcessAgentWorker,
     ManagedAgentRuntimeDispatchReport, MissionEvidenceBus, MissionRuntime, MissionScheduleStore,
-    ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventReplayer,
-    RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
-    RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, SessionInputRouter,
-    SessionRelationGraph, TeamResultReducer, TeamRuntime,
+    ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventInput,
+    RuntimeEventRef, RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore,
+    RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord,
+    SessionInputRouter, SessionRelationGraph, TeamResultReducer, TeamRuntime,
 };
 
 #[derive(Debug, Error)]
@@ -107,6 +105,7 @@ pub enum RuntimeServicesError {
 pub struct ExecutionStartupRecoveryReport {
     pub examined_graphs: usize,
     pub recovered_graphs: usize,
+    pub notified_graphs: usize,
     pub advanced_graphs: usize,
     pub terminal_graphs: usize,
     pub waiting_graphs: usize,
@@ -1147,6 +1146,31 @@ impl RuntimeServices {
         )?;
         let commit_service = ExecutionCommitService::new(Arc::clone(&event_store));
         let resource_manager = Arc::new(ExecutionResourceManager::new(resource_quotas));
+        let resource_event_store = Arc::clone(&event_store);
+        resource_manager
+            .install_grant_observer(move |receipt| {
+                if let Err(error) = resource_event_store.append(RuntimeEventInput {
+                    stream_id: format!("resource-admission:{}", receipt.request_id),
+                    scope: RuntimeEventScope::Schedule,
+                    kind: "resource.admission.granted".to_string(),
+                    status: Some("granted".to_string()),
+                    actor: Some("execution_resource_manager".to_string()),
+                    refs: vec![RuntimeEventRef {
+                        kind: "resource_request".to_string(),
+                        id: receipt.request_id.to_string(),
+                    }],
+                    payload: serde_json::to_value(receipt).unwrap_or_else(
+                        |error| serde_json::json!({ "serialization_error": error.to_string() }),
+                    ),
+                }) {
+                    tracing::warn!(
+                        error = %error,
+                        request_id = %receipt.request_id,
+                        "resource admission grant evidence could not be persisted"
+                    );
+                }
+            })
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         let tool_execution_plane = Arc::new(crate::ToolExecutionPlane::new(
             Arc::clone(&resource_manager),
             Arc::clone(&scope_locks),
@@ -1180,7 +1204,6 @@ impl RuntimeServices {
             Arc::clone(&agent_runtime),
             Arc::clone(&event_store),
             Arc::clone(&definition_registry),
-            Arc::clone(&resource_manager),
             Arc::clone(&evolution_governance),
             workspace_key.clone(),
             task_runtime_port,
@@ -1228,6 +1251,27 @@ impl RuntimeServices {
             )
             .map_err(RuntimeServicesError::Mission)?,
         );
+        let managed_projection_store = graph_state_store.clone();
+        let managed_projection_dispatcher = Arc::clone(&managed_agents);
+        execution_supervisor
+            .install_graph_settled_observer(move |graph_id| {
+                let graph_id = graph_id.to_string();
+                let graph_store = managed_projection_store.clone();
+                let dispatcher = Arc::clone(&managed_projection_dispatcher);
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        project_managed_invocation_terminal(graph_store, dispatcher, &graph_id)
+                            .await
+                    {
+                        tracing::warn!(
+                            graph_id,
+                            error,
+                            "managed Agent terminal projector could not reduce graph state"
+                        );
+                    }
+                });
+            })
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         let session_relations = Arc::new(
             SessionRelationGraph::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
@@ -2840,21 +2884,14 @@ impl RuntimeServices {
             if error.is_none() && (managed_fences.is_empty() || managed_runnable) {
                 let current = self.graph_state_store.load_async(&graph_id).await?;
                 if graph_can_advance(&current) {
-                    match self
-                        .execution_supervisor
-                        .wait_for_quiescence(&graph_id)
-                        .await
-                    {
-                        Ok(_) => {
-                            let advanced = self.graph_state_store.load_async(&graph_id).await?;
-                            if advanced.revision != current.revision {
-                                report.advanced_graphs += 1;
-                                action = if had_running {
-                                    "recovered_and_advanced".to_string()
-                                } else {
-                                    "advanced_ready".to_string()
-                                };
-                            }
+                    match self.execution_supervisor.notify_graph(&graph_id).await {
+                        Ok(()) => {
+                            report.notified_graphs += 1;
+                            action = if had_running {
+                                "recovered_and_notified".to_string()
+                            } else {
+                                "notified_ready".to_string()
+                            };
                         }
                         Err(run_error) => {
                             let message = run_error.to_string();
@@ -3076,7 +3113,9 @@ impl RuntimeServices {
                     format!("mission-schedule-dispatch:{}", fire.fire_id),
                 );
             match interpretation.command {
-                crate::MissionInterpretedCommand::SubmitExecutionGraph { graph, .. } => {
+                crate::MissionInterpretedCommand::SubmitExecutionGraph { mut graph, .. } => {
+                    graph.service_class =
+                        harness_contract::execution_graph::ExecutionServiceClass::Background;
                     let graph_id = graph.id.clone();
                     let graph = match self.compile_graph_agent_intents(graph) {
                         Ok(graph) => graph,
@@ -3297,18 +3336,31 @@ impl RuntimeServices {
         limit: usize,
     ) -> Result<ManagedAgentRuntimeDispatchReport, RuntimeServicesError> {
         let (completed, mut failed) = self.reconcile_managed_agent_invocations().await?;
-        let health_affected = self
+        let mut health_affected = self
             .managed_agents
-            .enforce_run_health(now_ms())
+            .reclaim_expired_claims(now_ms())
             .map_err(RuntimeServicesError::Mission)?;
+        health_affected.extend(
+            self.managed_agents
+                .enforce_run_health(now_ms())
+                .map_err(RuntimeServicesError::Mission)?,
+        );
         let scheduled = self
             .managed_agents
             .accept_due_schedules(now_ms())
             .map_err(RuntimeServicesError::Mission)?;
-        let claimed = self
-            .managed_agents
-            .claim_ready(dispatcher_id, now_ms(), limit)
-            .map_err(RuntimeServicesError::Mission)?;
+        let available_submission_slots = self
+            .execution_supervisor
+            .submission_capacity_snapshot()
+            .available_slots
+            .min(limit);
+        let claimed = if available_submission_slots == 0 {
+            Vec::new()
+        } else {
+            self.managed_agents
+                .claim_ready(dispatcher_id, now_ms(), 30_000, available_submission_slots)
+                .map_err(RuntimeServicesError::Mission)?
+        };
         let mut submitted = Vec::new();
         for invocation in &claimed {
             match self
@@ -3329,31 +3381,49 @@ impl RuntimeServices {
                                 invocation.invocation_id
                             ))
                         })?;
-                    let completed_invocation =
-                        if current.status == crate::ManagedAgentInvocationStatus::Claimed {
-                            self.managed_agents
-                                .fail_claimed_invocation(
-                                    &invocation.invocation_id,
-                                    dispatcher_id,
-                                    invocation.fence_generation,
-                                    now_ms(),
-                                    error.to_string(),
-                                )
-                                .map_err(RuntimeServicesError::Mission)?
-                        } else {
-                            self.managed_agents
-                                .complete_invocation(
-                                    &invocation.invocation_id,
-                                    dispatcher_id,
-                                    invocation.fence_generation,
-                                    false,
-                                    now_ms(),
-                                    None,
-                                    Vec::new(),
-                                    Some(error.to_string()),
-                                )
-                                .map_err(RuntimeServicesError::Mission)?
-                        };
+                    let completed_invocation = match current.status {
+                        crate::ManagedAgentInvocationStatus::Claimed => self
+                            .managed_agents
+                            .fail_claimed_invocation(
+                                &invocation.invocation_id,
+                                dispatcher_id,
+                                invocation.fence_generation,
+                                now_ms(),
+                                error.to_string(),
+                            )
+                            .map_err(RuntimeServicesError::Mission)?,
+                        crate::ManagedAgentInvocationStatus::Running => self
+                            .managed_agents
+                            .complete_invocation(
+                                &invocation.invocation_id,
+                                dispatcher_id,
+                                invocation.fence_generation,
+                                false,
+                                now_ms(),
+                                None,
+                                Vec::new(),
+                                Some(error.to_string()),
+                            )
+                            .map_err(RuntimeServicesError::Mission)?,
+                        crate::ManagedAgentInvocationStatus::Materialized => self
+                            .managed_agents
+                            .mark_invocation_reconciliation_required(
+                                &invocation.invocation_id,
+                                dispatcher_id,
+                                invocation.fence_generation,
+                                current.claim_token.as_deref().ok_or_else(|| {
+                                    RuntimeServicesError::Invariant(
+                                        "materialized Managed Agent invocation lost its claim token"
+                                            .to_string(),
+                                    )
+                                })?,
+                                format!(
+                                    "graph was materialized but Runtime could not start it: {error}"
+                                ),
+                            )
+                            .map_err(RuntimeServicesError::Mission)?,
+                        _ => current,
+                    };
                     failed.push(completed_invocation);
                 }
             }
@@ -3401,6 +3471,7 @@ impl RuntimeServices {
             .map_err(RuntimeServicesError::Mission)?
             .into_iter()
             .filter(|invocation| invocation.status == crate::ManagedAgentInvocationStatus::Running)
+            .take(256)
             .collect::<Vec<_>>();
         let mut completed = Vec::new();
         let mut failed = Vec::new();
@@ -3440,25 +3511,36 @@ impl RuntimeServices {
             evidence_refs.push(format!("execution-graph:{graph_id}@{}", graph.revision));
             evidence_refs.sort();
             evidence_refs.dedup();
-            let terminal = self
-                .managed_agents
-                .complete_invocation(
-                    &invocation.invocation_id,
-                    dispatcher_id,
-                    invocation.fence_generation,
-                    succeeded,
-                    now_ms(),
-                    Some(graph_id.to_string()),
-                    evidence_refs,
-                    (!succeeded).then(|| {
-                        format!(
-                            "managed execution graph reached non-success terminal state at revision {}",
-                            graph.revision
-                        )
-                    }),
-                )
-                .map_err(RuntimeServicesError::Mission)?;
-            if succeeded {
+            let terminal = match self.managed_agents.complete_invocation(
+                &invocation.invocation_id,
+                dispatcher_id,
+                invocation.fence_generation,
+                succeeded,
+                now_ms(),
+                Some(graph_id.to_string()),
+                evidence_refs,
+                (!succeeded).then(|| {
+                    format!(
+                        "managed execution graph reached non-success terminal state at revision {}",
+                        graph.revision
+                    )
+                }),
+            ) {
+                Ok(terminal) => terminal,
+                Err(error) => {
+                    let current = self
+                        .managed_agents
+                        .invocations()
+                        .map_err(RuntimeServicesError::Mission)?
+                        .into_iter()
+                        .find(|current| current.invocation_id == invocation.invocation_id);
+                    match current {
+                        Some(current) if !current.status.is_active() => current,
+                        _ => return Err(RuntimeServicesError::Mission(error)),
+                    }
+                }
+            };
+            if terminal.status == crate::ManagedAgentInvocationStatus::Completed {
                 completed.push(terminal);
             } else {
                 failed.push(terminal);
@@ -3587,6 +3669,8 @@ impl RuntimeServices {
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
                 let mut graph = ExecutionGraph::new(definition.objective.clone());
                 graph.id = packet.graph_id().to_string();
+                graph.service_class =
+                    harness_contract::execution_graph::ExecutionServiceClass::Background;
                 let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
                     ExecutionNodeKind::AgentTask,
                     AgentTaskExecutor::KIND,
@@ -3597,17 +3681,42 @@ impl RuntimeServices {
                 node.idempotency_key = packet.idempotency_key.clone();
                 node.acceptance.criteria = packet.acceptance.clone();
                 graph.nodes.push(node);
+                let claim_token = invocation.claim_token.as_deref().ok_or_else(|| {
+                    RuntimeServicesError::Invariant(
+                        "claimed Managed Agent invocation has no claim token".to_string(),
+                    )
+                })?;
+                self.managed_agents
+                    .begin_graph_registration(
+                        &invocation.invocation_id,
+                        dispatcher_id,
+                        invocation.fence_generation,
+                        claim_token,
+                        graph.id.clone(),
+                    )
+                    .map_err(RuntimeServicesError::Mission)?;
                 let graph = self
                     .execution_supervisor
                     .register_graph(graph)
                     .await
                     .map_err(RuntimeServicesError::GraphRunner)?;
+                self.managed_agents
+                    .materialize_invocation(
+                        &invocation.invocation_id,
+                        dispatcher_id,
+                        invocation.fence_generation,
+                        claim_token,
+                        graph.id.clone(),
+                        format!("graph-registration-receipt:{}@{}", graph.id, graph.revision),
+                    )
+                    .map_err(RuntimeServicesError::Mission)?;
                 let running = self
                     .managed_agents
                     .start_invocation(
                         &invocation.invocation_id,
                         dispatcher_id,
                         invocation.fence_generation,
+                        claim_token,
                         graph.id.clone(),
                         now_ms(),
                     )
@@ -3688,10 +3797,35 @@ impl RuntimeServices {
                     .team_runtime
                     .plan(request)
                     .map_err(RuntimeServicesError::Mission)?;
+                let graph_id = instantiated.graph.id.clone();
+                let claim_token = invocation.claim_token.as_deref().ok_or_else(|| {
+                    RuntimeServicesError::Invariant(
+                        "claimed Managed Team invocation has no claim token".to_string(),
+                    )
+                })?;
+                self.managed_agents
+                    .begin_graph_registration(
+                        &invocation.invocation_id,
+                        dispatcher_id,
+                        invocation.fence_generation,
+                        claim_token,
+                        graph_id.clone(),
+                    )
+                    .map_err(RuntimeServicesError::Mission)?;
                 let graph_id = self
                     .team_runtime
                     .prepare_planned(&mission_id, &team_id, instantiated)
                     .await
+                    .map_err(RuntimeServicesError::Mission)?;
+                self.managed_agents
+                    .materialize_invocation(
+                        &invocation.invocation_id,
+                        dispatcher_id,
+                        invocation.fence_generation,
+                        claim_token,
+                        graph_id.clone(),
+                        format!("graph-registration-receipt:{graph_id}"),
+                    )
                     .map_err(RuntimeServicesError::Mission)?;
                 let running = self
                     .managed_agents
@@ -3699,6 +3833,7 @@ impl RuntimeServices {
                         &invocation.invocation_id,
                         dispatcher_id,
                         invocation.fence_generation,
+                        claim_token,
                         graph_id.clone(),
                         now_ms(),
                     )
@@ -3860,6 +3995,84 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+async fn project_managed_invocation_terminal(
+    graph_state_store: ExecutionGraphStateStore,
+    managed_agents: Arc<crate::ManagedAgentDispatcher>,
+    graph_id: &str,
+) -> Result<(), String> {
+    let Some(invocation) = managed_agents
+        .invocations()?
+        .into_iter()
+        .find(|invocation| {
+            invocation.status == crate::ManagedAgentInvocationStatus::Running
+                && invocation.execution_ref.as_deref() == Some(graph_id)
+        })
+    else {
+        return Ok(());
+    };
+    let graph = match graph_state_store.load_async(graph_id).await {
+        Ok(graph) => graph,
+        Err(ExecutionStateStoreError::NotFound(_)) => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    if graph
+        .node_statuses
+        .values()
+        .any(|status| !status.is_terminal())
+    {
+        return Ok(());
+    }
+    let succeeded = !graph.node_statuses.is_empty()
+        && graph
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::Completed);
+    let dispatcher_id = invocation.claimed_by.as_deref().ok_or_else(|| {
+        format!(
+            "running managed invocation `{}` has no dispatcher fence owner",
+            invocation.invocation_id
+        )
+    })?;
+    let mut evidence_refs = graph
+        .node_results
+        .values()
+        .flat_map(|result| result.evidence_refs.iter())
+        .map(|reference| reference.evidence_ref.id.clone())
+        .collect::<Vec<_>>();
+    evidence_refs.push(format!("execution-graph:{graph_id}@{}", graph.revision));
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    match managed_agents.complete_invocation(
+        &invocation.invocation_id,
+        dispatcher_id,
+        invocation.fence_generation,
+        succeeded,
+        now_ms(),
+        Some(graph_id.to_string()),
+        evidence_refs,
+        (!succeeded).then(|| {
+            format!(
+                "managed execution graph reached non-success terminal state at revision {}",
+                graph.revision
+            )
+        }),
+    ) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let already_terminal = managed_agents
+                .invocations()?
+                .into_iter()
+                .find(|current| current.invocation_id == invocation.invocation_id)
+                .is_some_and(|current| !current.status.is_active());
+            if already_terminal {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 fn scenario_observation(
@@ -5522,6 +5735,13 @@ mod tests {
         assert!(matches!(
             services
                 .execution_supervisor()
+                .notify_graph(&graph_id)
+                .await,
+            Ok(())
+        ));
+        assert!(matches!(
+            services
+                .execution_supervisor()
                 .wait_for_quiescence(&graph_id)
                 .await,
             Err(super::super::graph::ExecutionRunnerError::Driver(_))
@@ -5618,9 +5838,13 @@ mod tests {
             .expect("startup recovery");
         assert_eq!(report.examined_graphs, 1);
         assert_eq!(report.recovered_graphs, 1);
-        assert_eq!(report.advanced_graphs, 1);
-        assert_eq!(report.terminal_graphs, 1);
+        assert_eq!(report.notified_graphs, 1);
         assert!(report.errors.is_empty());
+        restarted
+            .execution_supervisor()
+            .wait_for_quiescence(&graph_id)
+            .await
+            .expect("recovered graph reaches quiescence");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let graph = restarted.graph_state_store().load(&graph_id).unwrap();
         assert_eq!(

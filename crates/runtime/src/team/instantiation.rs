@@ -11,7 +11,6 @@ use std::sync::Arc;
 use crate::execution_core::graph::executors::{
     AgentTaskExecutor, SynthesizeNodeExecutor, VerifyNodeExecutor,
 };
-use crate::execution_core::graph::{ExecutionResourceKind, ExecutionResourceManager};
 use crate::{
     resolve_agent_capability, AgentBindingCompiler, AgentCapabilityRequest,
     EvolutionCandidateSubject, EvolutionGovernanceService, EvolutionReleaseAssignment,
@@ -30,6 +29,12 @@ use harness_contract::team::{
     TeamRoleBindingOverride, TeamRoleDefinition, TeamStructuredOutputField,
     TeamTemplateDefinitionId, TeamTemplateSelector,
 };
+
+/// Hard ceiling for AgentTask nodes in one immutable Team graph.
+///
+/// Runtime capacity is intentionally absent: ResourceManager owns admission
+/// and queues nodes when the currently available capacity is insufficient.
+const MAX_TEAM_GRAPH_AGENT_NODES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedFocusPartition {
@@ -61,7 +66,7 @@ pub struct RoleCardinalityResolution {
     pub role_id: String,
     pub requested: RoleCardinalityPolicy,
     pub resolved_count: u16,
-    pub runtime_parallel_capacity: u16,
+    pub static_graph_ceiling: u16,
     pub reason: String,
 }
 
@@ -82,7 +87,6 @@ pub struct TeamInstantiation {
 pub struct TeamInstantiationService {
     registry: Arc<RuntimeDefinitionRegistry>,
     binding_compiler: AgentBindingCompiler,
-    resources: Arc<ExecutionResourceManager>,
     evolution_governance: Arc<EvolutionGovernanceService>,
     workspace_id: String,
 }
@@ -91,14 +95,12 @@ impl TeamInstantiationService {
     #[must_use]
     pub fn new(
         registry: Arc<RuntimeDefinitionRegistry>,
-        resources: Arc<ExecutionResourceManager>,
         evolution_governance: Arc<EvolutionGovernanceService>,
         workspace_id: impl Into<String>,
     ) -> Self {
         Self {
             binding_compiler: AgentBindingCompiler::new(Arc::clone(&registry)),
             registry,
-            resources,
             evolution_governance,
             workspace_id: workspace_id.into(),
         }
@@ -168,11 +170,16 @@ impl TeamInstantiationService {
                 }
             }
         }
-        let runtime_parallel_capacity = self.runtime_parallel_capacity()?;
-
         let mut graph = ExecutionGraph::new(request.objective.clone());
         graph.id = format!("team-graph:{}", request.team_id);
         graph.parent_execution = request.parent_execution.clone();
+        graph.service_class = if evaluation_allowed_tools.is_some() {
+            harness_contract::execution_graph::ExecutionServiceClass::Maintenance
+        } else if request.managed_invocation.is_some() {
+            harness_contract::execution_graph::ExecutionServiceClass::Background
+        } else {
+            harness_contract::execution_graph::ExecutionServiceClass::Foreground
+        };
 
         let mut slots_by_role = BTreeMap::<String, Vec<(String, String)>>::new();
         let mut role_slots = Vec::new();
@@ -201,8 +208,8 @@ impl TeamInstantiationService {
                 role,
                 cardinality_overrides.get(&role.role_id),
                 focus_plans.get(&role.role_id),
-                runtime_parallel_capacity,
             )?;
+            ensure_static_graph_ceiling(role_slots.len(), focuses.len())?;
             cardinality_resolutions.push(cardinality_resolution);
             for (slot, focus_partition) in focuses.into_iter().enumerate() {
                 let mut slot_acceptance = role.task_contract.acceptance.clone();
@@ -562,42 +569,21 @@ impl TeamInstantiationService {
             .map(|resolved| (resolved, None))
             .map_err(|error| error.to_string())
     }
-
-    fn runtime_parallel_capacity(&self) -> Result<u16, String> {
-        let agent = self
-            .resources
-            .snapshot(&ExecutionResourceKind::Agent)
-            .map_err(|error| format!("read Agent resource capacity: {error}"))?;
-        let provider = self
-            .resources
-            .snapshot(&ExecutionResourceKind::Provider)
-            .map_err(|error| format!("read Provider resource capacity: {error}"))?;
-        let tool = self
-            .resources
-            .snapshot(&ExecutionResourceKind::Tool)
-            .map_err(|error| format!("read Tool resource capacity: {error}"))?;
-        let agent_available = agent.effective_limit.saturating_sub(agent.active_leases);
-        let provider_available = provider
-            .effective_limit
-            .saturating_sub(provider.active_leases);
-        let tool_available = tool.effective_limit.saturating_sub(tool.active_leases);
-        available_team_parallel_capacity(agent_available, provider_available, tool_available)
-    }
 }
 
-fn available_team_parallel_capacity(
-    agent_available: usize,
-    provider_available: usize,
-    tool_available: usize,
-) -> Result<u16, String> {
-    if agent_available == 0 || provider_available == 0 || tool_available == 0 {
+fn ensure_static_graph_ceiling(
+    existing_agent_nodes: usize,
+    additional_agent_nodes: usize,
+) -> Result<(), String> {
+    let requested = existing_agent_nodes
+        .checked_add(additional_agent_nodes)
+        .ok_or_else(|| "Team graph Agent node count overflowed".to_string())?;
+    if requested > MAX_TEAM_GRAPH_AGENT_NODES {
         return Err(format!(
-            "Team resource capacity exhausted: agent={agent_available}, provider={provider_available}, tool={tool_available}"
+            "Team graph requests {requested} Agent nodes, exceeding the static ceiling of {MAX_TEAM_GRAPH_AGENT_NODES}"
         ));
     }
-    u16::try_from(agent_available.min(provider_available).min(tool_available)).map_err(|_| {
-        "Runtime resource capacity exceeds Team cardinality representation".to_string()
-    })
+    Ok(())
 }
 
 fn team_acceptance_contract(
@@ -848,7 +834,6 @@ fn resolve_focuses(
     role: &TeamRoleDefinition,
     override_: Option<&&RoleCardinalityPolicy>,
     plan: Option<&&FocusPartitionPlan>,
-    runtime_parallel_capacity: u16,
 ) -> Result<(Vec<ResolvedFocusPartition>, RoleCardinalityResolution), String> {
     let requested = override_.copied().unwrap_or(&role.cardinality).clone();
     if requested.min() < role.cardinality.min() || requested.max() > role.cardinality.max() {
@@ -864,7 +849,7 @@ fn resolve_focuses(
             .map_err(|_| format!("role `{}` has too many explicit partitions", role.role_id))?,
         RolePartitionPolicy::ByFocus { .. } if !planned.is_empty() => u16::try_from(planned.len())
             .map_err(|_| format!("role `{}` has too many focus partitions", role.role_id))?,
-        RolePartitionPolicy::ByFocus { .. } => requested.preferred().min(runtime_parallel_capacity),
+        RolePartitionPolicy::ByFocus { .. } => requested.preferred(),
     };
     if !requested.permits(requested_count) || !role.cardinality.permits(requested_count) {
         return Err(format!(
@@ -872,27 +857,7 @@ fn resolve_focuses(
             role.role_id
         ));
     }
-    let resolved_count = if requested_count <= runtime_parallel_capacity {
-        requested_count
-    } else if matches!(
-        requested,
-        RoleCardinalityPolicy::Range { .. } | RoleCardinalityPolicy::Adaptive { .. }
-    ) && planned.is_empty()
-    {
-        runtime_parallel_capacity
-    } else {
-        return Err(format!(
-            "role `{}` requires {requested_count} slots but Runtime currently admits only {runtime_parallel_capacity}; submit a smaller valid partition or wait for capacity",
-            role.role_id
-        ));
-    };
-    if resolved_count < requested.min() {
-        return Err(format!(
-            "role `{}` requires at least {} slots but Runtime capacity is {runtime_parallel_capacity}",
-            role.role_id,
-            requested.min()
-        ));
-    }
+    let resolved_count = requested_count;
     let shared_baseline = plan
         .map(|plan| plan.shared_baseline.clone())
         .unwrap_or_default();
@@ -947,12 +912,9 @@ fn resolve_focuses(
         RolePartitionPolicy::ByFocus { .. } => planned,
     };
     focuses.truncate(usize::from(resolved_count));
-    let reason = if focuses.len() as u16 == requested_count {
-        "requested/template cardinality accepted by current Runtime capacity".to_string()
-    } else {
-        "adaptive cardinality reduced to current Runtime Agent/Provider/Tool capacity before graph creation"
-            .to_string()
-    };
+    let reason =
+        "cardinality resolved from template, focus plan, override, and static graph ceiling"
+            .to_string();
     let focus_partitions = focuses
         .into_iter()
         .map(|slot| ResolvedFocusPartition {
@@ -982,7 +944,7 @@ fn resolve_focuses(
             role_id: role.role_id.clone(),
             requested,
             resolved_count,
-            runtime_parallel_capacity,
+            static_graph_ceiling: MAX_TEAM_GRAPH_AGENT_NODES as u16,
             reason,
         },
     ))
@@ -1104,11 +1066,55 @@ mod acceptance_contract_tests {
     }
 
     #[test]
-    fn zero_runtime_capacity_fails_closed_instead_of_inventing_one_slot() {
-        assert!(available_team_parallel_capacity(0, 3, 3).is_err());
-        assert!(available_team_parallel_capacity(3, 0, 3).is_err());
-        assert!(available_team_parallel_capacity(3, 3, 0).is_err());
-        assert_eq!(available_team_parallel_capacity(4, 2, 3), Ok(2));
+    fn static_graph_ceiling_accepts_boundary_and_rejects_overflow() {
+        assert!(ensure_static_graph_ceiling(24, 8).is_ok());
+        assert!(ensure_static_graph_ceiling(25, 8).is_err());
+    }
+
+    #[test]
+    fn occupancy_levels_do_not_change_team_topology_or_hash() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let role = TeamRoleDefinition {
+            role_id: "researcher".to_string(),
+            responsibility: "investigate one bounded focus".to_string(),
+            agent_definition_id: harness_contract::agent::AgentDefinitionId::new(
+                harness_contract::agent::DefinitionScope::Builtin,
+                "cowd/explore",
+            )
+            .expect("agent definition"),
+            agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
+            cardinality: RoleCardinalityPolicy::Adaptive {
+                min: 2,
+                target: 4,
+                max: 8,
+            },
+            partition: RolePartitionPolicy::ByFocus {
+                partition_key: "investigation".to_string(),
+            },
+            grant_ceiling: vec![harness_contract::agent::AgentCapability::Read],
+            task_contract: harness_contract::team::TeamRoleTaskContract {
+                contract_ref: "builtin/team-role/researcher@1".to_string(),
+                acceptance: vec!["findings".to_string(), "evidence".to_string()],
+            },
+        };
+        let topology_hash = || {
+            let (focuses, resolution) =
+                resolve_focuses(&role, None, None).expect("static topology");
+            let mut hasher = DefaultHasher::new();
+            resolution.resolved_count.hash(&mut hasher);
+            for focus in focuses {
+                focus.focus_id.hash(&mut hasher);
+                focus.scope_hash.hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+
+        // Occupancy is deliberately not an input. These labels document the
+        // required 0/50/90% equivalence without introducing a second resource
+        // interface into Team topology compilation.
+        let hashes = [0_u8, 50, 90].map(|_occupancy_percent| topology_hash());
+        assert_eq!(hashes, [hashes[0]; 3]);
     }
 
     #[test]

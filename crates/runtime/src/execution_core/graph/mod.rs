@@ -24,11 +24,13 @@ pub use registry::{
     NodeExecutor, NodeExecutorError, NodeExecutorRegistry,
 };
 pub use resources::{
-    ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager,
-    ExecutionResourceSnapshot, ResourceAcquireError, ResourceLimitAdjustment, ResourceObservation,
-    ResourceObservationFreshness, ResourceQuota, ResourceResultClass, ScopeLockError,
-    ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
-    WorktreeLease, WorktreeLeaseError, WorktreeLeaseManager, WorktreeLeaseRecord,
+    ExecutionAdmissionPolicy, ExecutionResourceKind, ExecutionResourceLease,
+    ExecutionResourceManager, ExecutionResourceSnapshot, ExecutionServiceClass,
+    ResourceAcquireError, ResourceAdmissionDecision, ResourceAdmissionRequest,
+    ResourceGrantReceipt, ResourceLimitAdjustment, ResourceObservation,
+    ResourceObservationFreshness, ResourceQuota, ResourceResultClass, ResourceWaitReason,
+    ScopeLockError, ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest,
+    ScopedResource, WorktreeLease, WorktreeLeaseError, WorktreeLeaseManager, WorktreeLeaseRecord,
     WorktreeLeaseRequest, WorktreeLeaseStatus, WorktreeOwnership,
 };
 #[cfg(test)]

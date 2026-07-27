@@ -644,6 +644,7 @@ impl TaskRuntimePort {
             .ok_or_else(|| format!("task `{task_id}` not found"))?;
         let mut graph = ExecutionGraph::new(objective.unwrap_or_else(|| task.objective.clone()));
         graph.id = format!("execution-graph-task-{task_id}");
+        graph.service_class = harness_contract::execution_graph::ExecutionServiceClass::Foreground;
         graph.nodes = nodes;
         graph.edges = edges;
         validate_execution_graph(&graph).map_err(|error| error.to_string())?;

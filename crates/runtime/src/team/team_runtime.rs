@@ -10,8 +10,6 @@ use harness_contract::{
     team::{TeamInstantiationRequest, TeamTemplateRevisionRef},
 };
 
-use crate::execution_core::graph::ExecutionResourceManager;
-
 use crate::{
     AgentRuntime, EvolutionGovernanceService, ExecutionGraphHostReceipt, ExecutionGraphStateStore,
     LegacyTeamImportReport, LegacyTeamProfileMigrationReport, MissionRuntime,
@@ -43,7 +41,6 @@ impl TeamRuntime {
         agents: Arc<AgentRuntime>,
         event_store: Arc<RuntimeEventStore>,
         definition_registry: Arc<RuntimeDefinitionRegistry>,
-        resources: Arc<ExecutionResourceManager>,
         evolution_governance: Arc<EvolutionGovernanceService>,
         workspace_id: impl Into<String>,
         tasks: TaskRuntimePort,
@@ -53,7 +50,6 @@ impl TeamRuntime {
             execution,
             instantiation: crate::TeamInstantiationService::new(
                 definition_registry,
-                resources,
                 evolution_governance,
                 workspace_id,
             ),

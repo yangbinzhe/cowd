@@ -19,7 +19,6 @@ use crate::{
     ToolCallback, ToolExecutor, TurnSummary,
 };
 use async_trait::async_trait;
-use futures::{stream, StreamExt};
 use harness_contract::agent::AgentTaskIntent;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
@@ -132,6 +131,17 @@ where
     pub fn new(config: StandardRuntimeHostConfig<T>) -> Result<Self, String> {
         let services = Arc::clone(&config.runtime_services);
         let root_provider_owner = config.execution_parent.is_none();
+        let execution_service_class = if config
+            .reality_binding
+            .as_ref()
+            .is_some_and(|binding| binding.evaluation.is_some())
+        {
+            harness_contract::execution_graph::ExecutionServiceClass::Maintenance
+        } else if config.execution_parent.is_some() {
+            harness_contract::execution_graph::ExecutionServiceClass::Foreground
+        } else {
+            harness_contract::execution_graph::ExecutionServiceClass::Interactive
+        };
         let approval_gate_slot = Arc::new(std::sync::RwLock::new(None));
         let active_model = config.model.clone();
         let model_context_window = config.model_context_window.unwrap_or_else(|| {
@@ -173,10 +183,9 @@ where
         )
         .with_checkpoint_identity(services.workspace_key(), config.execution_identity)
         .with_maintenance_supervisor(services.maintenance_supervisor())
-        .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
-        if root_provider_owner {
-            runtime = runtime.with_provider_admission(Arc::clone(services.resource_manager()));
-        }
+        .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()))
+        .with_execution_service_class(execution_service_class)
+        .with_provider_admission(Arc::clone(services.resource_manager()));
         if let Some(binding) = config.reality_binding {
             runtime = runtime
                 .with_reality_binding(services.reality_recall_port().as_ref().clone(), binding);
@@ -288,6 +297,14 @@ where
 
     pub fn set_context_profile(&self, profile: ContextProfile) {
         self.runtime_ref().set_context_profile(profile);
+    }
+
+    pub fn set_execution_service_class(
+        &mut self,
+        service_class: harness_contract::execution_graph::ExecutionServiceClass,
+    ) {
+        self.runtime_mut()
+            .set_execution_service_class(service_class);
     }
 
     pub fn set_model_step_limit_override(&self, limit: usize) {
@@ -897,6 +914,10 @@ where
             })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
         graph.parent_execution = execution_parent;
+        if graph.parent_execution.is_some() {
+            graph.service_class =
+                harness_contract::execution_graph::ExecutionServiceClass::Foreground;
+        }
         if let Some(ingress) = &ingress {
             let compiled_graph_id = graph.id.clone();
             graph.id = crate::session_execution::session_ingress_graph_id(
@@ -2631,6 +2652,7 @@ fn compile_retargeted_conversation_graph(
     }
     replacement.id.clone_from(&current.id);
     replacement.parent_execution = current.parent_execution.clone();
+    replacement.service_class = current.service_class;
     for node in &mut replacement.nodes {
         node.executor_kind = match node.kind {
             ExecutionNodeKind::InlineModel => "inline_model".to_string(),
@@ -5923,6 +5945,150 @@ struct GovernedToolBatchResult {
     parallel_batches: usize,
 }
 
+struct HostGovernedToolContext<'a> {
+    host: Arc<dyn crate::RuntimeExecutionHost>,
+    calls: &'a [ModelToolCall],
+    session_id: &'a str,
+    model_lease: Option<&'a str>,
+    ticket: &'a NodeExecutionTicket,
+    tool_authorizations:
+        &'a std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
+    prepared_invocations:
+        &'a std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
+    plan_id: &'a str,
+    plan_revision: u64,
+    execution_plane: &'a Arc<crate::ToolExecutionPlane>,
+    commit_service: &'a crate::execution_core::graph::ExecutionCommitService,
+}
+
+impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
+    type Output = crate::RuntimeToolExecutionOutcome;
+    type Admission = Option<crate::ToolExecutionAdmission>;
+    type Receipt = crate::RuntimeToolExecutionOutcome;
+
+    fn local_ceiling(&self) -> usize {
+        crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
+    }
+
+    fn try_admit<'a>(
+        &'a self,
+        _task: &'a crate::GovernedToolPlanTask,
+    ) -> crate::GovernedToolFuture<'a, crate::GovernedToolAdmission<Self::Admission>> {
+        Box::pin(async { crate::GovernedToolAdmission::Granted(None) })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        task: &'a crate::GovernedToolPlanTask,
+        admission: &'a mut Self::Admission,
+    ) -> crate::GovernedToolFuture<'a, Result<Self::Output, String>> {
+        Box::pin(async move {
+            let call = self.calls.get(task.original_call_index).ok_or_else(|| {
+                format!(
+                    "governed tool task `{}` references missing original call index {}",
+                    task.tool_call_id, task.original_call_index
+                )
+            })?;
+            let host = Arc::clone(&self.host);
+            let authorization = self.tool_authorizations.get(&call.id).cloned();
+            let effect = self
+                .prepared_invocations
+                .get(&call.id)
+                .map(|invocation| invocation.effect.clone());
+            let commit_service = self.commit_service.clone();
+            let request = bound_runtime_tool_request(
+                call,
+                task,
+                self.plan_id,
+                self.plan_revision,
+                self.session_id,
+                self.model_lease,
+                self.ticket,
+                authorization,
+            );
+            let (execution, retained_admission) = self
+                .execution_plane
+                .execute_classified_retained(
+                    &task.resource_demand,
+                    Some(std::time::Duration::from_secs(
+                        task.safety_category.default_timeout_secs(),
+                    )),
+                    self.ticket.service_class,
+                    Some(self.ticket.service_class),
+                    move || {
+                        execute_fenced_runtime_tool(
+                            host.as_ref(),
+                            &commit_service,
+                            &request,
+                            effect.as_ref(),
+                        )
+                    },
+                )
+                .await;
+            *admission = retained_admission;
+            execution.map_err(|error| error.to_string())
+        })
+    }
+
+    fn classify_output(&self, output: &Self::Output) -> Result<(), String> {
+        if output.status == crate::RuntimeToolExecutionStatus::Executed {
+            Ok(())
+        } else {
+            Err(output.error.clone().unwrap_or_else(|| {
+                format!("tool `{}` did not complete successfully", output.tool_name)
+            }))
+        }
+    }
+
+    fn commit_terminal<'a>(
+        &'a self,
+        task: &'a crate::GovernedToolPlanTask,
+        terminal: &'a crate::GovernedToolTaskTerminal<Self::Output>,
+    ) -> crate::GovernedToolFuture<'a, Result<Self::Receipt, String>> {
+        Box::pin(async move {
+            let call = self.calls.get(task.original_call_index).ok_or_else(|| {
+                format!(
+                    "governed tool task `{}` references missing original call index {}",
+                    task.tool_call_id, task.original_call_index
+                )
+            })?;
+            let outcome = match terminal {
+                crate::GovernedToolTaskTerminal::Succeeded(outcome)
+                | crate::GovernedToolTaskTerminal::FailedOutput {
+                    output: outcome, ..
+                } => outcome.clone(),
+                _ => failed_governed_tool_outcome(
+                    call,
+                    task.safety_category,
+                    host_tool_terminal_reason(terminal),
+                ),
+            };
+            if self
+                .prepared_invocations
+                .get(&call.id)
+                .is_some_and(|invocation| {
+                    invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read
+                })
+            {
+                let request = bound_runtime_tool_request(
+                    call,
+                    task,
+                    self.plan_id,
+                    self.plan_revision,
+                    self.session_id,
+                    self.model_lease,
+                    self.ticket,
+                    self.tool_authorizations.get(&call.id).cloned(),
+                );
+                self.commit_service
+                    .commit_readonly_tool_receipts(&[(request, outcome.clone())])
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(outcome)
+        })
+    }
+}
+
 async fn execute_governed_runtime_tool_batch(
     host: Arc<dyn crate::RuntimeExecutionHost>,
     calls: &[ModelToolCall],
@@ -5950,7 +6116,7 @@ async fn execute_governed_runtime_tool_batch(
             depends_on: call.depends_on.clone(),
         })
         .collect::<Vec<_>>();
-    let plan = crate::GovernedToolCompiler.compile(&requests, Some(decision), |name, input| {
+    let plan = crate::GovernedToolCompiler.compile(&requests, |name, input| {
         requests
             .iter()
             .find(|request| {
@@ -5968,174 +6134,74 @@ async fn execute_governed_runtime_tool_batch(
                 )
             })
     });
-    let max_concurrency_observed = plan
-        .batches
-        .iter()
-        .map(|batch| batch.max_concurrency.min(batch.indices.len()))
-        .max()
-        .unwrap_or(0);
-    let parallel_batches = plan
-        .batches
-        .iter()
-        .filter(|batch| batch.max_concurrency > 1 && batch.indices.len() > 1)
-        .count();
-    let mut results = vec![None; calls.len()];
-
-    for batch in plan.batches.clone() {
-        let wave_indices = batch.indices.clone();
-        let parallel = batch.max_concurrency > 1
-            && batch.indices.len() > 1
-            && batch.indices.iter().all(|index| {
-                plan.tasks
-                    .get(*index)
-                    .is_some_and(|task| task.can_parallelize)
-            });
-        if parallel {
-            let limit = batch.max_concurrency.min(batch.indices.len()).max(1);
-            let completed = stream::iter(batch.indices.into_iter().map(|index| {
-                let host = Arc::clone(&host);
-                let execution_plane = Arc::clone(execution_plane);
-                let demand = plan.tasks[index].resource_demand.clone();
-                let authorization = tool_authorizations.get(&calls[index].id).cloned();
-                let effect = prepared_invocations
-                    .get(&calls[index].id)
-                    .map(|invocation| invocation.effect.clone());
-                let commit_service = commit_service.clone();
-                let request = bound_runtime_tool_request(
-                    &calls[index],
-                    &plan.tasks[index],
-                    &plan.plan_id,
-                    plan.revision,
-                    session_id,
-                    model_lease,
-                    ticket,
-                    authorization,
-                );
-                async move {
-                    let executed = execution_plane
-                        .execute(&demand, None, move || {
-                            execute_fenced_runtime_tool(
-                                host.as_ref(),
-                                &commit_service,
-                                &request,
-                                effect.as_ref(),
-                            )
-                        })
-                        .await;
-                    (index, executed.map_err(|error| error.to_string()))
-                }
-            }))
-            .buffer_unordered(limit)
-            .collect::<Vec<_>>()
-            .await;
-            for (index, joined) in completed {
-                results[index] = Some(match joined {
-                    Ok(outcome) => outcome,
-                    Err(error) => failed_governed_tool_outcome(
-                        &calls[index],
-                        plan.tasks[index].safety_category,
-                        format!("governed tool execution failed: {error}"),
-                    ),
-                });
-            }
-        } else {
-            for index in batch.indices {
-                let host = Arc::clone(&host);
-                let authorization = tool_authorizations.get(&calls[index].id).cloned();
-                let effect = prepared_invocations
-                    .get(&calls[index].id)
-                    .map(|invocation| invocation.effect.clone());
-                let commit_service = commit_service.clone();
-                let request = bound_runtime_tool_request(
-                    &calls[index],
-                    &plan.tasks[index],
-                    &plan.plan_id,
-                    plan.revision,
-                    session_id,
-                    model_lease,
-                    ticket,
-                    authorization,
-                );
-                let demand = plan.tasks[index].resource_demand.clone();
-                results[index] = Some(
-                    match execution_plane
-                        .execute(&demand, None, move || {
-                            execute_fenced_runtime_tool(
-                                host.as_ref(),
-                                &commit_service,
-                                &request,
-                                effect.as_ref(),
-                            )
-                        })
-                        .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(error) => failed_governed_tool_outcome(
-                            &calls[index],
-                            plan.tasks[index].safety_category,
-                            format!("governed tool execution failed: {error}"),
-                        ),
-                    },
-                );
-            }
-        }
-        let readonly_receipts = wave_indices
-            .iter()
-            .filter_map(|index| {
-                let invocation = prepared_invocations.get(&calls[*index].id)?;
-                (invocation.effect.effect_kind == harness_contract::tool::ToolEffectKind::Read)
-                    .then(|| {
-                        let outcome = results[*index].clone().unwrap_or_else(|| {
-                            failed_governed_tool_outcome(
-                                &calls[*index],
-                                plan.tasks[*index].safety_category,
-                                "tool scheduler did not produce a wave result".to_string(),
-                            )
-                        });
-                        (
-                            bound_runtime_tool_request(
-                                &calls[*index],
-                                &plan.tasks[*index],
-                                &plan.plan_id,
-                                plan.revision,
-                                session_id,
-                                model_lease,
-                                ticket,
-                                tool_authorizations.get(&calls[*index].id).cloned(),
-                            ),
-                            outcome,
-                        )
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            return GovernedToolBatchResult {
+                messages: calls
+                    .iter()
+                    .map(|call| {
+                        tool_outcome_message(failed_governed_tool_outcome(
+                            call,
+                            crate::ToolSafetyCategory::Destructive,
+                            format!("governed tool DAG rejected before execution: {error}"),
+                        ))
                     })
-            })
-            .collect::<Vec<_>>();
-        if let Err(error) = commit_service.commit_readonly_tool_receipts(&readonly_receipts) {
-            for index in wave_indices {
-                if prepared_invocations
-                    .get(&calls[index].id)
-                    .is_some_and(|invocation| {
-                        invocation.effect.effect_kind
-                            == harness_contract::tool::ToolEffectKind::Read
-                    })
-                {
-                    results[index] = Some(failed_governed_tool_outcome(
-                        &calls[index],
-                        plan.tasks[index].safety_category,
-                        format!("tool completed but its durable read receipt failed: {error}"),
-                    ));
-                }
-            }
+                    .collect(),
+                max_concurrency_observed: 0,
+                parallel_batches: 0,
+            };
         }
+    };
+    let validation = plan.validate_against_execution_decision(decision);
+    if !validation.allowed {
+        let reason = format!(
+            "runtime strategy lease `{}` denied tool batch: {}",
+            validation.lease_id,
+            validation.findings.join(", ")
+        );
+        return GovernedToolBatchResult {
+            messages: calls
+                .iter()
+                .enumerate()
+                .map(|(index, call)| {
+                    tool_outcome_message(failed_governed_tool_outcome(
+                        call,
+                        plan.tasks[index].safety_category,
+                        reason.clone(),
+                    ))
+                })
+                .collect(),
+            max_concurrency_observed: 0,
+            parallel_batches: 0,
+        };
     }
-
-    let messages = results
+    let context = HostGovernedToolContext {
+        host,
+        calls,
+        session_id,
+        model_lease,
+        ticket,
+        tool_authorizations,
+        prepared_invocations,
+        plan_id: &plan.plan_id,
+        plan_revision: plan.revision,
+        execution_plane,
+        commit_service,
+    };
+    let report = crate::GovernedToolExecutor.execute(&plan, &context).await;
+    let max_concurrency_observed = report.max_active;
+    let parallel_batches = usize::from(report.max_active > 1);
+    let messages = report
+        .outcomes
         .into_iter()
         .enumerate()
-        .map(|(index, result)| {
-            tool_outcome_message(result.unwrap_or_else(|| {
+        .map(|(index, outcome)| {
+            tool_outcome_message(outcome.receipt.unwrap_or_else(|| {
                 failed_governed_tool_outcome(
                     &calls[index],
                     plan.tasks[index].safety_category,
-                    "tool scheduler did not produce a result".to_string(),
+                    "tool reached terminal state without a durable receipt".to_string(),
                 )
             }))
         })
@@ -6144,6 +6210,23 @@ async fn execute_governed_runtime_tool_batch(
         messages,
         max_concurrency_observed,
         parallel_batches,
+    }
+}
+
+fn host_tool_terminal_reason(
+    terminal: &crate::GovernedToolTaskTerminal<crate::RuntimeToolExecutionOutcome>,
+) -> String {
+    match terminal {
+        crate::GovernedToolTaskTerminal::Succeeded(_) => "tool completed".to_string(),
+        crate::GovernedToolTaskTerminal::FailedOutput { error, .. }
+        | crate::GovernedToolTaskTerminal::Failed { error } => error.clone(),
+        crate::GovernedToolTaskTerminal::Refused { reason }
+        | crate::GovernedToolTaskTerminal::Cancelled { reason }
+        | crate::GovernedToolTaskTerminal::Panicked { reason } => reason.clone(),
+        crate::GovernedToolTaskTerminal::Blocked {
+            predecessor_id,
+            reason,
+        } => format!("blocked by predecessor `{predecessor_id}`: {reason}"),
     }
 }
 
@@ -8721,6 +8804,7 @@ mod tests {
             graph_id: graph.id.clone(),
             node_id: model.id,
             executor_kind: "inline_model".to_string(),
+            service_class: graph.service_class,
             attempt: 1,
             idempotency_key: "model-attempt".to_string(),
             payload_ref: "{}".to_string(),
@@ -10496,6 +10580,7 @@ mod tests {
             graph_id: "graph".to_string(),
             node_id: "tools".to_string(),
             executor_kind: "tool_batch".to_string(),
+            service_class: harness_contract::execution_graph::ExecutionServiceClass::Interactive,
             attempt: 1,
             idempotency_key: "batch".to_string(),
             payload_ref: String::new(),
@@ -10821,6 +10906,7 @@ mod tests {
             graph_id: "graph".to_string(),
             node_id: "graph:3:tools-1".to_string(),
             executor_kind: "tool_batch".to_string(),
+            service_class: harness_contract::execution_graph::ExecutionServiceClass::Interactive,
             attempt: 1,
             idempotency_key: "write-batch".to_string(),
             payload_ref: String::new(),
@@ -11358,6 +11444,7 @@ mod tests {
             graph_id: "graph-a".to_string(),
             node_id: "node-a".to_string(),
             executor_kind: "inline_model".to_string(),
+            service_class: harness_contract::execution_graph::ExecutionServiceClass::Interactive,
             attempt: 1,
             idempotency_key: "scope-test".to_string(),
             payload_ref: r#"{"session_id":"shared-session"}"#.to_string(),

@@ -186,15 +186,36 @@ fn terminal_failures_open_the_health_circuit_until_human_reset() {
         .trigger_manual("workspace/cowd/research-watch", "first", 2)
         .expect("trigger");
     let claim = dispatcher
-        .claim_ready("dispatcher-a", 3, 1)
+        .claim_ready("dispatcher-a", 3, 30_000, 1)
         .expect("claim")
         .pop()
         .expect("one claim");
+    let claim_token = claim.claim_token.as_deref().expect("claim token");
+    dispatcher
+        .begin_graph_registration(
+            &claim.invocation_id,
+            "dispatcher-a",
+            claim.fence_generation,
+            claim_token,
+            "run:first".to_string(),
+        )
+        .expect("graph registration intent");
+    dispatcher
+        .materialize_invocation(
+            &claim.invocation_id,
+            "dispatcher-a",
+            claim.fence_generation,
+            claim_token,
+            "run:first".to_string(),
+            "graph-receipt:run:first".to_string(),
+        )
+        .expect("graph registration receipt");
     dispatcher
         .start_invocation(
             &claim.invocation_id,
             "dispatcher-a",
             claim.fence_generation,
+            claim_token,
             "run:first".to_string(),
             4,
         )
@@ -262,16 +283,10 @@ async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_
         .wait_for_quiescence(&graph_id)
         .await
         .expect("managed graph completes");
-    let reconciled = services
-        .dispatch_managed_agents("runtime-test-dispatcher", 4)
-        .await
-        .expect("Runtime reconciliation");
-    assert_eq!(reconciled.completed.len(), 1);
-    assert_eq!(
-        reconciled.completed[0].status,
-        ManagedAgentInvocationStatus::Completed
-    );
-    assert!(reconciled.completed[0]
+    let completed =
+        await_terminal_projection(&services, &admitted.submitted[0].invocation_id).await;
+    assert_eq!(completed.status, ManagedAgentInvocationStatus::Completed);
+    assert!(completed
         .execution_ref
         .as_deref()
         .is_some_and(|reference| reference.starts_with("managed-agent:")));
@@ -327,18 +342,31 @@ async fn runtime_dispatch_uses_team_instantiation_for_managed_team_targets() {
         .wait_for_quiescence(&graph_id)
         .await
         .expect("managed Team graph completes");
-    let reconciled = services
-        .dispatch_managed_agents("runtime-test-dispatcher", 4)
-        .await
-        .expect("Runtime Team reconciliation");
-    assert_eq!(reconciled.completed.len(), 1, "{reconciled:?}");
-    assert!(reconciled.failed.is_empty(), "{reconciled:?}");
-    assert_eq!(
-        reconciled.completed[0].status,
-        ManagedAgentInvocationStatus::Completed
-    );
-    assert!(reconciled.completed[0]
+    let completed =
+        await_terminal_projection(&services, &admitted.submitted[0].invocation_id).await;
+    assert_eq!(completed.status, ManagedAgentInvocationStatus::Completed);
+    assert!(completed
         .evidence_refs
         .iter()
         .any(|reference| reference.starts_with("team-graph:")));
+}
+
+async fn await_terminal_projection(
+    services: &Arc<RuntimeServices>,
+    invocation_id: &str,
+) -> runtime::ManagedAgentInvocation {
+    for _ in 0..100 {
+        let invocation = services
+            .managed_agents()
+            .invocations()
+            .expect("managed projection")
+            .into_iter()
+            .find(|current| current.invocation_id == invocation_id)
+            .expect("submitted invocation remains queryable");
+        if !invocation.status.is_active() {
+            return invocation;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("graph terminal observer did not project Managed invocation terminal state");
 }

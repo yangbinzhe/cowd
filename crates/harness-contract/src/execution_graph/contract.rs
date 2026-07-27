@@ -177,11 +177,50 @@ pub struct ExecutionParentBinding {
     pub node_id: String,
 }
 
+/// Runtime-owned service class for one durable execution graph.
+///
+/// This is persisted with the graph so recovery cannot silently promote
+/// background or maintenance work based on a process-local naming heuristic.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionServiceClass {
+    #[default]
+    Interactive,
+    Foreground,
+    Background,
+    Maintenance,
+}
+
+impl ExecutionServiceClass {
+    /// A child may inherit or lower its service class, but cannot promote
+    /// itself above the parent class supplied by Runtime.
+    #[must_use]
+    pub const fn bounded_by(self, parent_ceiling: Option<Self>) -> Self {
+        match parent_ceiling {
+            Some(parent) if self.rank() < parent.rank() => parent,
+            _ => self,
+        }
+    }
+
+    const fn rank(self) -> usize {
+        match self {
+            Self::Interactive => 0,
+            Self::Foreground => 1,
+            Self::Background => 2,
+            Self::Maintenance => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionGraph {
     pub id: String,
     pub revision: u64,
     pub objective: String,
+    #[serde(default)]
+    pub service_class: ExecutionServiceClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
     pub nodes: Vec<ExecutionNodeSpec>,
@@ -198,6 +237,7 @@ impl ExecutionGraph {
             id: format!("execution-graph-{}", uuid::Uuid::new_v4()),
             revision: 0,
             objective: objective.into(),
+            service_class: ExecutionServiceClass::Interactive,
             parent_execution: None,
             nodes: Vec::new(),
             edges: Vec::new(),

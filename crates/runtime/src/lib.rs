@@ -196,6 +196,8 @@ pub mod execution_live;
 pub mod execution_projection;
 #[path = "context/fact_extraction.rs"]
 pub mod fact_extraction;
+#[path = "tooling/governed_tool_executor.rs"]
+pub mod governed_tool_executor;
 #[path = "tooling/governed_tool_plan.rs"]
 pub mod governed_tool_plan;
 #[path = "session/input_classifier.rs"]
@@ -516,9 +518,13 @@ pub use evolution::{
 };
 #[cfg(feature = "test-fixtures")]
 pub use execution_core::RuntimeFixtureEventPort;
+pub use governed_tool_executor::{
+    GovernedToolAdmission, GovernedToolExecutionContext, GovernedToolExecutionReport,
+    GovernedToolExecutor, GovernedToolFuture, GovernedToolTaskOutcome, GovernedToolTaskTerminal,
+};
 pub use governed_tool_plan::{
-    GovernedExecutionBatch, GovernedExecutionBatchMode, GovernedToolCompiler,
-    GovernedToolExecutionMode, GovernedToolPlan, GovernedToolPlanTask,
+    GovernedToolCompileError, GovernedToolCompiler, GovernedToolExecutionMode, GovernedToolPlan,
+    GovernedToolPlanTask, ValidatedGovernedToolDag,
 };
 pub use harness_contract::mission::{
     MissionCommand, MissionCommandAction, MissionCommandReceipt, MissionCommandSagaPhase,
@@ -726,7 +732,7 @@ pub use team_working_state::{
     FocusOverlapAssessment, TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStateKind,
 };
 pub use tool_execution_plane::{
-    ToolExecutionPlane, ToolExecutionPlaneError, ToolExecutionPlaneStats,
+    ToolExecutionAdmission, ToolExecutionPlane, ToolExecutionPlaneError, ToolExecutionPlaneStats,
 };
 pub use tool_host::{
     RuntimeExecutionHost, RuntimeToolExecutionOutcome, RuntimeToolExecutionRequest,

@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -12,7 +12,7 @@ use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 use super::graph::{
@@ -23,11 +23,14 @@ use crate::CancellationToken;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 1_024;
 const DEFAULT_MAX_PARALLEL_GRAPHS: usize = 64;
+const DEFAULT_MAX_ACTIVE_NODES_PER_GRAPH: usize = 64;
 const DEFAULT_MAX_PARALLEL_OWNED_TASKS: usize = 256;
 const DEFAULT_QUEUE_PARTITIONS: u16 = 32;
 const LIFECYCLE_OPEN: u8 = 0;
 const LIFECYCLE_CLOSING: u8 = 1;
 const LIFECYCLE_CLOSED: u8 = 2;
+
+type GraphSettledObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeExecutionHealth {
@@ -73,6 +76,13 @@ pub struct RuntimeWorkAdmissionReceipt {
     pub admission_id: String,
     pub owner: String,
     pub accepted_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionSubmissionCapacitySnapshot {
+    pub active_graphs: usize,
+    pub queued_graphs: usize,
+    pub available_slots: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +179,13 @@ impl DriverSlot {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         !state.active && state.completed_generation >= state.requested_generation
+    }
+
+    fn requested_generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .requested_generation
     }
 }
 
@@ -303,9 +320,42 @@ pub struct RuntimeExecutionSupervisor {
     queue_capacity: usize,
     queue_partitions: u16,
     shutdown_timeout: Duration,
+    graph_settled_observer: Arc<OnceLock<GraphSettledObserver>>,
 }
 
 impl RuntimeExecutionSupervisor {
+    #[must_use]
+    pub(crate) fn submission_capacity_snapshot(&self) -> ExecutionSubmissionCapacitySnapshot {
+        let slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active_graphs = slots
+            .values()
+            .filter(|slot| {
+                slot.state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .active
+            })
+            .count();
+        let queued_graphs = slots
+            .values()
+            .filter(|slot| {
+                let state = slot
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                !state.active && state.requested_generation > state.completed_generation
+            })
+            .count();
+        ExecutionSubmissionCapacitySnapshot {
+            active_graphs,
+            queued_graphs,
+            available_slots: self.parallelism.available_permits(),
+        }
+    }
+
     #[must_use]
     pub(crate) fn new(runner: Arc<ExecutionGraphRunner>) -> Self {
         Self::with_limits(
@@ -341,7 +391,17 @@ impl RuntimeExecutionSupervisor {
             queue_capacity,
             queue_partitions: DEFAULT_QUEUE_PARTITIONS,
             shutdown_timeout,
+            graph_settled_observer: Arc::new(OnceLock::new()),
         }
+    }
+
+    pub(crate) fn install_graph_settled_observer(
+        &self,
+        observer: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Result<(), &'static str> {
+        self.graph_settled_observer
+            .set(Arc::new(observer))
+            .map_err(|_| "graph settled observer is already installed")
     }
 
     pub(crate) fn install_mutation_gate(
@@ -406,6 +466,7 @@ impl RuntimeExecutionSupervisor {
         let owned_parallelism = Arc::clone(&self.owned_parallelism);
         let cancellation = self.cancellation.clone();
         let metrics = Arc::clone(&self.metrics);
+        let graph_settled_observer = Arc::clone(&self.graph_settled_observer);
         *dispatcher = Some(tokio::spawn(async move {
             dispatch_loop(
                 receiver,
@@ -416,6 +477,7 @@ impl RuntimeExecutionSupervisor {
                 owned_parallelism,
                 cancellation,
                 metrics,
+                graph_settled_observer,
             )
             .await;
         }));
@@ -576,6 +638,11 @@ impl RuntimeExecutionSupervisor {
         Ok(receipt)
     }
 
+    pub(crate) async fn notify_graph(&self, graph_id: &str) -> Result<(), ExecutionRunnerError> {
+        let _ = self.enqueue(graph_id).await?;
+        Ok(())
+    }
+
     fn receipt(
         &self,
         graph: &ExecutionGraph,
@@ -642,8 +709,26 @@ impl RuntimeExecutionSupervisor {
         &self,
         graph_id: &str,
     ) -> Result<ExecutionRunReport, ExecutionRunnerError> {
-        let (slot, generation) = self.enqueue(graph_id).await?;
-        self.await_slot(graph_id, slot, generation).await
+        let slot = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(graph_id)
+            .cloned();
+        if let Some(slot) = slot {
+            let generation = slot.requested_generation();
+            if generation > 0 {
+                return self.await_slot(graph_id, slot, generation).await;
+            }
+        }
+        let (report, quiescent) = self.runner.current_report(graph_id).await?;
+        if quiescent {
+            Ok(report)
+        } else {
+            Err(ExecutionRunnerError::SupervisorUnavailable(format!(
+                "graph `{graph_id}` is not admitted; submit or notify it before waiting"
+            )))
+        }
     }
 
     pub async fn submit_command_and_wait(
@@ -836,7 +921,7 @@ impl ExecutionGraphHost for RuntimeExecutionSupervisor {
         let should_wake = command_advances(&command);
         let graph = self.runner.command(graph_id, command).await?;
         if should_wake {
-            let _ = self.enqueue(graph_id).await?;
+            self.notify_graph(graph_id).await?;
         }
         Ok(self.receipt(&graph, "command", now_ms()))
     }
@@ -858,6 +943,7 @@ async fn dispatch_loop(
     owned_parallelism: Arc<Semaphore>,
     cancellation: CancellationToken,
     metrics: Arc<SupervisorMetrics>,
+    graph_settled_observer: Arc<OnceLock<GraphSettledObserver>>,
 ) {
     let mut workers = JoinSet::new();
     let mut active = HashMap::<String, u64>::new();
@@ -896,6 +982,7 @@ async fn dispatch_loop(
                             {
                                 slot.finish(generation, outcome.clone());
                             }
+                            notify_graph_settled(&graph_settled_observer, &graph_id);
                             match outcome {
                                 DriverOutcome::Completed(_) => {
                                     metrics.completed.fetch_add(1, Ordering::Relaxed);
@@ -972,7 +1059,7 @@ async fn dispatch_loop(
                         }
                         if let Some((generation, slot)) = prepare_worker(&slots, &graph_id) {
                             active.insert(graph_id.clone(), generation);
-                            spawn_driver(
+                            spawn_graph_pump(
                                 &mut workers,
                                 graph_id,
                                 generation,
@@ -1028,6 +1115,7 @@ async fn dispatch_loop(
                             .cloned();
                         if let Some(slot) = slot {
                             slot.finish(generation, outcome.clone());
+                            notify_graph_settled(&graph_settled_observer, &graph_id);
                             match outcome {
                                 DriverOutcome::Completed(_) => {
                                     metrics.completed.fetch_add(1, Ordering::Relaxed);
@@ -1044,7 +1132,7 @@ async fn dispatch_loop(
                             if pending.remove(&graph_id) || slot.has_newer_request(generation) {
                                 let next_generation = slot.start();
                                 active.insert(graph_id.clone(), next_generation);
-                                spawn_driver(
+                                spawn_graph_pump(
                                     &mut workers,
                                     graph_id,
                                     next_generation,
@@ -1088,6 +1176,12 @@ async fn dispatch_loop(
     }
 }
 
+fn notify_graph_settled(observer: &OnceLock<GraphSettledObserver>, graph_id: &str) {
+    if let Some(observer) = observer.get() {
+        observer(graph_id);
+    }
+}
+
 fn prepare_worker(
     slots: &StdMutex<HashMap<String, Arc<DriverSlot>>>,
     graph_id: &str,
@@ -1101,7 +1195,7 @@ fn prepare_worker(
     Some((generation, slot))
 }
 
-fn spawn_driver(
+fn spawn_graph_pump(
     workers: &mut JoinSet<SupervisorCompletion>,
     graph_id: String,
     generation: u64,
@@ -1130,19 +1224,12 @@ fn spawn_driver(
                 }
             };
             metrics.active_drivers.fetch_add(1, Ordering::Relaxed);
-            let result = tokio::select! {
-                _ = cancellation.cancelled() => {
-                    DriverOutcome::Aborted(
-                        "execution cancelled while graph was running".to_string()
-                    )
-                }
-                result = runner.run_until_quiescent(&graph_id) => {
-                    match result {
-                        Ok(report) => DriverOutcome::Completed(report),
-                        Err(error) => DriverOutcome::Failed(error.to_string()),
-                    }
-                }
-            };
+            let result = run_completion_pump(
+                Arc::clone(&runner),
+                &graph_id,
+                cancellation.clone(),
+            )
+            .await;
             metrics.active_drivers.fetch_sub(1, Ordering::Relaxed);
             drop(permit);
             result
@@ -1163,6 +1250,83 @@ fn spawn_driver(
             outcome,
         }
     });
+}
+
+async fn run_completion_pump(
+    runner: Arc<ExecutionGraphRunner>,
+    graph_id: &str,
+    cancellation: CancellationToken,
+) -> DriverOutcome {
+    let durable_progress = Arc::new(Notify::new());
+    let mut active_nodes = JoinSet::new();
+    let mut in_flight = BTreeSet::new();
+
+    loop {
+        let snapshot = match runner.pump_snapshot(graph_id, &in_flight).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                active_nodes.abort_all();
+                while active_nodes.join_next().await.is_some() {}
+                return DriverOutcome::Failed(error.to_string());
+            }
+        };
+
+        let available = DEFAULT_MAX_ACTIVE_NODES_PER_GRAPH.saturating_sub(active_nodes.len());
+        for node in snapshot.ready.into_iter().take(available) {
+            let node_id = node.id.clone();
+            if !in_flight.insert(node_id.clone()) {
+                continue;
+            }
+            let runner = Arc::clone(&runner);
+            let graph_id = graph_id.to_string();
+            let progress = Arc::clone(&durable_progress);
+            active_nodes.spawn(async move {
+                let result = runner.execute_pump_node(&graph_id, node, progress).await;
+                (node_id, result)
+            });
+        }
+
+        if active_nodes.is_empty() {
+            return DriverOutcome::Completed(snapshot.report);
+        }
+
+        tokio::select! {
+            _ = cancellation.cancelled() => {
+                active_nodes.abort_all();
+                while active_nodes.join_next().await.is_some() {}
+                return DriverOutcome::Aborted(
+                    "execution cancelled while graph pump was running".to_string(),
+                );
+            }
+            () = durable_progress.notified() => {
+                // Durable terminal truth is already committed. Re-read it and
+                // release direct successors without waiting for unrelated work.
+            }
+            joined = active_nodes.join_next() => {
+                let Some(joined) = joined else {
+                    continue;
+                };
+                match joined {
+                    Ok((node_id, Ok(()))) => {
+                        in_flight.remove(&node_id);
+                    }
+                    Ok((node_id, Err(error))) => {
+                        in_flight.remove(&node_id);
+                        active_nodes.abort_all();
+                        while active_nodes.join_next().await.is_some() {}
+                        return DriverOutcome::Failed(error.to_string());
+                    }
+                    Err(error) => {
+                        active_nodes.abort_all();
+                        while active_nodes.join_next().await.is_some() {}
+                        return DriverOutcome::Failed(format!(
+                            "execution node task failed to join: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn spawn_owned_work(
@@ -1282,5 +1446,270 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
         message.clone()
     } else {
         "unknown panic payload".to_string()
+    }
+}
+
+#[cfg(test)]
+mod completion_pump_tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use harness_contract::execution_graph::{
+        ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind,
+        ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
+    };
+
+    use super::*;
+    use crate::execution_core::graph::{
+        ExecutionCommitService, ExecutionGraphStateStore, ExecutionResourceKind,
+        ExecutionResourceManager, NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket,
+        NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ResourceQuota, ScopeLockManager,
+        WorktreeLeaseManager,
+    };
+    use crate::runtime_event_store::RuntimeEventStore;
+
+    struct PumpTestExecutor {
+        delays: BTreeMap<String, Duration>,
+        running: AtomicUsize,
+        max_running: AtomicUsize,
+        slow_finished: AtomicBool,
+        successor_started_before_slow_finished: AtomicBool,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl PumpTestExecutor {
+        fn new(delays: impl IntoIterator<Item = (String, Duration)>) -> Self {
+            Self {
+                delays: delays.into_iter().collect(),
+                running: AtomicUsize::new(0),
+                max_running: AtomicUsize::new(0),
+                slow_finished: AtomicBool::new(false),
+                successor_started_before_slow_finished: AtomicBool::new(false),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NodeExecutor for PumpTestExecutor {
+        fn kind(&self) -> &str {
+            "completion_pump_test"
+        }
+
+        fn validate(&self, _node: &ExecutionNodeSpec) -> Result<(), NodeExecutorError> {
+            Ok(())
+        }
+
+        async fn start(
+            &self,
+            context: NodeExecutionContext,
+        ) -> Result<NodeExecutionTicket, NodeExecutorError> {
+            Ok(NodeExecutionTicket {
+                graph_id: context.graph.id.clone(),
+                node_id: context.node.id.clone(),
+                executor_kind: self.kind().to_string(),
+                service_class: context.graph.service_class,
+                attempt: context.attempt,
+                idempotency_key: format!("{}:{}", context.node.idempotency_key, context.attempt),
+                payload_ref: context.node.payload_ref,
+            })
+        }
+
+        async fn poll_or_await(
+            &self,
+            ticket: &NodeExecutionTicket,
+        ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+            if ticket.node_id == "successor" {
+                self.successor_started_before_slow_finished
+                    .store(!self.slow_finished.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_running.fetch_max(running, Ordering::SeqCst);
+            tokio::time::sleep(
+                self.delays
+                    .get(&ticket.node_id)
+                    .copied()
+                    .unwrap_or(Duration::from_millis(1)),
+            )
+            .await;
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            if ticket.node_id == "slow" {
+                self.slow_finished.store(true, Ordering::SeqCst);
+            }
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(ticket.node_id.clone());
+            Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some(format!("result:{}", ticket.node_id)),
+                summary: None,
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            }))
+        }
+    }
+
+    fn test_node(id: &str) -> ExecutionNodeSpec {
+        ExecutionNodeSpec {
+            id: id.to_string(),
+            kind: ExecutionNodeKind::ToolBatch,
+            payload_ref: format!("payload:{id}"),
+            executor_kind: "completion_pump_test".to_string(),
+            idempotency_key: format!("idempotency:{id}"),
+            lease_ref: None,
+            acceptance: Default::default(),
+            retry_policy: Default::default(),
+            resource_scopes: Vec::new(),
+        }
+    }
+
+    fn test_supervisor(executor: Arc<PumpTestExecutor>) -> RuntimeExecutionSupervisor {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+        let registry = Arc::new(NodeExecutorRegistry::new());
+        registry.register(executor).expect("register executor");
+        let workspace_id = format!("completion-pump-{}", uuid::Uuid::new_v4());
+        let leases = WorktreeLeaseManager::open(
+            std::env::temp_dir()
+                .join("cowd-completion-pump-tests")
+                .join(&workspace_id)
+                .join("leases.json"),
+        )
+        .expect("worktree leases");
+        let runner = ExecutionGraphRunner::new(
+            registry,
+            ExecutionGraphStateStore::new(Arc::clone(&event_store)),
+            ExecutionCommitService::new(event_store),
+            Arc::new(ExecutionResourceManager::new([
+                (
+                    ExecutionResourceKind::Provider,
+                    ResourceQuota::new(1, 4, 8).expect("provider quota"),
+                ),
+                (
+                    ExecutionResourceKind::Agent,
+                    ResourceQuota::new(1, 4, 8).expect("agent quota"),
+                ),
+                (
+                    ExecutionResourceKind::Tool,
+                    ResourceQuota::new(1, 4, 8).expect("tool quota"),
+                ),
+            ])),
+            Arc::new(ScopeLockManager::new()),
+            Arc::new(leases),
+            workspace_id,
+            std::env::temp_dir(),
+        );
+        RuntimeExecutionSupervisor::with_limits(Arc::new(runner), 16, 2, Duration::from_secs(2))
+    }
+
+    #[tokio::test]
+    async fn committed_fast_branch_releases_successor_before_unrelated_slow_branch() {
+        let executor = Arc::new(PumpTestExecutor::new([
+            ("fast".to_string(), Duration::from_millis(10)),
+            ("slow".to_string(), Duration::from_millis(250)),
+            ("successor".to_string(), Duration::from_millis(1)),
+        ]));
+        let supervisor = test_supervisor(Arc::clone(&executor));
+        let mut graph = ExecutionGraph::new("immediate successor release");
+        graph.id = "completion-pump-successor".to_string();
+        graph.nodes = vec![test_node("fast"), test_node("slow"), test_node("successor")];
+        graph.edges.push(ExecutionEdge {
+            from: "fast".to_string(),
+            to: "successor".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+
+        let (_, report) = supervisor
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .expect("graph completes");
+
+        assert_eq!(report.completed, 3);
+        assert!(
+            executor
+                .successor_started_before_slow_finished
+                .load(Ordering::SeqCst),
+            "a committed fast branch must release its successor immediately"
+        );
+        assert_eq!(executor.calls.lock().unwrap().len(), 3);
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_pump_runs_independent_ready_nodes_concurrently() {
+        let executor =
+            Arc::new(PumpTestExecutor::new((0..4).map(|index| {
+                (format!("parallel-{index}"), Duration::from_millis(40))
+            })));
+        let supervisor = test_supervisor(Arc::clone(&executor));
+        let mut graph = ExecutionGraph::new("parallel ready nodes");
+        graph.id = "completion-pump-concurrency".to_string();
+        graph.nodes = (0..4)
+            .map(|index| test_node(&format!("parallel-{index}")))
+            .collect();
+
+        let (_, report) = supervisor
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .expect("graph completes");
+
+        assert_eq!(report.completed, 4);
+        assert!(
+            executor.max_running.load(Ordering::SeqCst) > 1,
+            "independent ready nodes must overlap"
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wait_is_observer_only_and_notify_is_the_explicit_execution_signal() {
+        let executor = Arc::new(PumpTestExecutor::new([(
+            "observed".to_string(),
+            Duration::from_millis(1),
+        )]));
+        let supervisor = test_supervisor(Arc::clone(&executor));
+        let mut graph = ExecutionGraph::new("observer separation");
+        graph.id = "completion-pump-observer".to_string();
+        graph.nodes.push(test_node("observed"));
+        supervisor
+            .register_graph(graph)
+            .await
+            .expect("register graph");
+
+        let error = supervisor
+            .wait_for_quiescence("completion-pump-observer")
+            .await
+            .expect_err("an observer must not start an unadmitted graph");
+        assert!(matches!(
+            error,
+            ExecutionRunnerError::SupervisorUnavailable(_)
+        ));
+        assert!(executor.calls.lock().unwrap().is_empty());
+
+        supervisor
+            .notify_graph("completion-pump-observer")
+            .await
+            .expect("notify graph");
+        let report = supervisor
+            .wait_for_quiescence("completion-pump-observer")
+            .await
+            .expect("observe admitted graph");
+        assert_eq!(report.completed, 1);
+        assert_eq!(executor.calls.lock().unwrap().as_slice(), &["observed"]);
+        supervisor.shutdown().await;
     }
 }

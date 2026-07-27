@@ -464,6 +464,7 @@ impl CrossPlaneRuntimeService {
         ));
         let digest = Sha256::digest(idempotency_key.as_bytes());
         graph.id = format!("cross-plane-graph-{digest:x}");
+        graph.service_class = harness_contract::execution_graph::ExecutionServiceClass::Foreground;
         let mut tool = ExecutionNodeSpec::new(
             ExecutionNodeKind::ToolBatch,
             "cross_plane_connector",

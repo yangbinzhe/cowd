@@ -63,6 +63,7 @@ impl<'a> ExecutionGraphRecovery<'a> {
                 graph_id: graph.id.clone(),
                 node_id: node.id.clone(),
                 executor_kind: node.executor_kind.clone(),
+                service_class: graph.service_class,
                 attempt,
                 idempotency_key: node.idempotency_key.clone(),
                 payload_ref: node.payload_ref.clone(),

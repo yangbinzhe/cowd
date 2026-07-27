@@ -10,9 +10,11 @@ mod scope_lock;
 mod worktree_lease;
 
 pub use manager::{
-    ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager,
-    ExecutionResourceSnapshot, ResourceAcquireError, ResourceLimitAdjustment, ResourceObservation,
-    ResourceObservationFreshness, ResourceQuota, ResourceResultClass,
+    ExecutionAdmissionPolicy, ExecutionResourceKind, ExecutionResourceLease,
+    ExecutionResourceManager, ExecutionResourceSnapshot, ExecutionServiceClass,
+    ResourceAcquireError, ResourceAdmissionDecision, ResourceAdmissionRequest,
+    ResourceGrantReceipt, ResourceLimitAdjustment, ResourceObservation,
+    ResourceObservationFreshness, ResourceQuota, ResourceResultClass, ResourceWaitReason,
 };
 pub use scope_lock::{
     ScopeLockError, ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest,

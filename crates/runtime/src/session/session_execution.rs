@@ -364,6 +364,7 @@ impl NodeExecutor for SessionDispatchNodeExecutor {
             graph_id: context.graph.id.clone(),
             node_id: context.node.id.clone(),
             executor_kind: self.kind().to_string(),
+            service_class: context.graph.service_class,
             attempt: context.attempt,
             idempotency_key: context.node.idempotency_key,
             payload_ref: context.node.payload_ref,

@@ -209,6 +209,7 @@ impl ExecutionGraphStateStore {
             graph_id: graph.id.clone(),
             revision: graph.revision,
             objective: graph.objective.clone(),
+            service_class: graph.service_class,
             parent_execution: graph.parent_execution.clone(),
             nodes: graph
                 .nodes

@@ -292,6 +292,10 @@ use crate::fact_extraction::{
     RuntimeFactExtractionPolicy, RuntimeFactExtractionScheduler, RuntimeFactExtractionTrigger,
     RuntimeFactExtractor,
 };
+use crate::governed_tool_executor::{
+    GovernedToolAdmission, GovernedToolExecutionContext, GovernedToolExecutor, GovernedToolFuture,
+    GovernedToolTaskTerminal,
+};
 use crate::governed_tool_plan::{
     GovernedToolCompiler, GovernedToolPlan, GovernedToolPolicyValidationReport,
 };
@@ -1757,9 +1761,13 @@ pub struct ConversationRuntime<C, T> {
         std::sync::Mutex<Option<harness_contract::knowledge::KnowledgeTurnReport>>,
     /// Sole bounded execution boundary for synchronous Tool implementations.
     tool_execution_plane: Arc<crate::ToolExecutionPlane>,
-    /// 普通 Conversation 与 ExecutionGraph 共享的 Provider admission owner。
-    /// Graph-owned child host 已由外层 node lease 覆盖，因此不会重复申请。
+    /// Every root and delegated Conversation shares the Runtime Provider
+    /// admission owner. AgentTask leases govern Agent slots, not Provider
+    /// transport, so child conversations must not bypass this boundary.
     provider_admission: Option<Arc<crate::execution_core::graph::ExecutionResourceManager>>,
+    /// Runtime-owned service class propagated from the durable graph/Agent
+    /// binding. Models and surfaces cannot promote this value.
+    execution_service_class: crate::execution_core::graph::ExecutionServiceClass,
     /// Maximum duration for a single tool execution. `None` means no timeout.
     tool_timeout: Option<Duration>,
     /// Only the root user turn may turn an explicit team requirement into a
@@ -1779,6 +1787,118 @@ pub struct ConversationRuntime<C, T> {
     /// Present only for a Gateway-owned durable Session ingress. It fences
     /// provider/tool/terminal side effects against generation and claim loss.
     session_execution_fence: Option<crate::SessionExecutionFence>,
+}
+
+struct ConversationGovernedToolContext<'a, C, T> {
+    runtime: &'a ConversationRuntime<C, T>,
+    pending_tool_uses: &'a [(String, String, String)],
+    prompter: &'a crate::permissions::SharedPrompter,
+    iterations: usize,
+    strategy_approval_satisfied: bool,
+    plan_id: &'a str,
+    plan_revision: u64,
+}
+
+impl<C, T> GovernedToolExecutionContext for ConversationGovernedToolContext<'_, C, T>
+where
+    C: ApiClient + Sync,
+    T: ToolExecutor,
+{
+    type Output = (ConversationMessage, Option<String>);
+    type Admission = Option<crate::ToolExecutionAdmission>;
+    type Receipt = (ConversationMessage, Option<String>);
+
+    fn local_ceiling(&self) -> usize {
+        crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.runtime.cancellation_token.is_cancelled()
+    }
+
+    fn wait_for_cancellation(&self) -> GovernedToolFuture<'_, ()> {
+        Box::pin(self.runtime.cancellation_token.cancelled())
+    }
+
+    fn try_admit<'a>(
+        &'a self,
+        _task: &'a crate::governed_tool_plan::GovernedToolPlanTask,
+    ) -> GovernedToolFuture<'a, GovernedToolAdmission<Self::Admission>> {
+        Box::pin(async { GovernedToolAdmission::Granted(None) })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        task: &'a crate::governed_tool_plan::GovernedToolPlanTask,
+        admission: &'a mut Self::Admission,
+    ) -> GovernedToolFuture<'a, Result<Self::Output, String>> {
+        Box::pin(async move {
+            let input = self
+                .pending_tool_uses
+                .get(task.original_call_index)
+                .map(|(_, _, input)| input.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "governed tool task `{}` references missing original call index {}",
+                        task.tool_call_id, task.original_call_index
+                    )
+                })?;
+            self.runtime
+                .execute_single_tool(
+                    task,
+                    self.plan_id,
+                    self.plan_revision,
+                    input,
+                    self.prompter,
+                    self.iterations,
+                    self.strategy_approval_satisfied,
+                    admission,
+                )
+                .await
+                .map(|message| self.runtime.collect_tool_result_message(message).1)
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn classify_output(&self, output: &Self::Output) -> Result<(), String> {
+        if conversation_tool_result_is_error(&output.0) {
+            Err(conversation_tool_result_text(&output.0))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn commit_terminal<'a>(
+        &'a self,
+        task: &'a crate::governed_tool_plan::GovernedToolPlanTask,
+        terminal: &'a GovernedToolTaskTerminal<Self::Output>,
+    ) -> GovernedToolFuture<'a, Result<Self::Receipt, String>> {
+        Box::pin(async move {
+            match terminal {
+                GovernedToolTaskTerminal::Succeeded(output)
+                | GovernedToolTaskTerminal::FailedOutput { output, .. } => Ok(output.clone()),
+                _ => {
+                    let message = ConversationMessage::tool_result(
+                        task.tool_call_id.clone(),
+                        task.tool_name.clone(),
+                        conversation_tool_terminal_reason(terminal),
+                        true,
+                    );
+                    self.runtime
+                        .session
+                        .write()
+                        .await
+                        .push_message(message.clone())
+                        .map_err(|error| error.to_string())?;
+                    self.runtime.record_message_event(
+                        &message,
+                        self.runtime.session().message_count().wrapping_sub(1),
+                    );
+                    Ok(self.runtime.collect_tool_result_message(message).1)
+                }
+            }
+        })
+    }
 }
 
 enum MemoryManagerComposition {
@@ -2071,6 +2191,8 @@ where
                 Arc::new(crate::execution_core::graph::ScopeLockManager::new()),
             )),
             provider_admission: None,
+            execution_service_class:
+                crate::execution_core::graph::ExecutionServiceClass::Interactive,
             tool_timeout: Some(Duration::from_secs(120)),
             explicit_team_escalation: true,
             model_step_limit_override: AtomicUsize::new(0),
@@ -2128,6 +2250,22 @@ where
     ) -> Self {
         self.provider_admission = Some(manager);
         self
+    }
+
+    #[must_use]
+    pub fn with_execution_service_class(
+        mut self,
+        service_class: crate::execution_core::graph::ExecutionServiceClass,
+    ) -> Self {
+        self.execution_service_class = service_class;
+        self
+    }
+
+    pub fn set_execution_service_class(
+        &mut self,
+        service_class: crate::execution_core::graph::ExecutionServiceClass,
+    ) {
+        self.execution_service_class = service_class;
     }
 
     #[must_use]
@@ -4453,17 +4591,34 @@ where
             let cancellation = self.cancellation_token.clone();
             let provider_queue_started = Instant::now();
             let provider_lease = if let Some(manager) = &self.provider_admission {
-                let acquire = manager.acquire(
-                    crate::execution_core::graph::ExecutionResourceKind::Provider,
-                    Some(Duration::from_secs(30)),
-                );
+                let request = crate::execution_core::graph::ResourceAdmissionRequest::new(
+                    self.execution_service_class,
+                    [(
+                        crate::execution_core::graph::ExecutionResourceKind::Provider,
+                        1,
+                    )],
+                )
+                .with_parent_class_ceiling(self.execution_service_class)
+                .with_deadline_at_ms(now_ms().saturating_add(30_000))
+                .with_fairness_key(format!("session:{}", self.session().session_id));
+                let acquire = manager.admit(request);
                 let lease = tokio::select! {
                     () = cancellation.cancelled() => {
                         return Err(RuntimeError::new("turn cancelled while waiting for provider capacity"));
                     }
-                    lease = acquire => lease.map_err(|error| RuntimeError::new(format!(
-                        "provider capacity admission failed: {error}"
-                    )))?,
+                    decision = acquire => {
+                        match decision.map_err(|error| RuntimeError::new(format!(
+                            "provider capacity admission failed: {error}"
+                        )))? {
+                            crate::execution_core::graph::ResourceAdmissionDecision::Granted { lease, .. } => lease,
+                            crate::execution_core::graph::ResourceAdmissionDecision::Deferred { wait_reason, .. }
+                            | crate::execution_core::graph::ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
+                                return Err(RuntimeError::new(format!(
+                                    "provider capacity admission did not grant: {wait_reason:?}"
+                                )));
+                            }
+                        }
+                    },
                 };
                 crate::execution_core::performance::observe_duration(
                     "provider_admission_queue_ms",
@@ -4748,7 +4903,10 @@ where
         calls: &[ModelToolCall],
         prompter: &crate::permissions::SharedPrompter,
         iteration: usize,
-    ) -> Result<ToolBatchStepResult, RuntimeError> {
+    ) -> Result<ToolBatchStepResult, RuntimeError>
+    where
+        C: Sync,
+    {
         if self.cancellation_token.is_cancelled() {
             return Err(RuntimeError::new("turn cancelled before tool execution"));
         }
@@ -4773,7 +4931,7 @@ where
             .map(|state| state.decision)
             .ok_or_else(|| RuntimeError::new("tool batch has no admitted turn strategy"))?;
         let prepared = self.tool_executor.prepare_governed_invocations(&requests);
-        let mut plan = GovernedToolCompiler.compile(&requests, None, |name, input| {
+        let plan = GovernedToolCompiler.compile(&requests, |name, input| {
             prepared
                 .iter()
                 .find(|invocation| {
@@ -4788,6 +4946,54 @@ where
                     )
                 })
         });
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                let reason = format!("governed tool DAG rejected before execution: {error}");
+                self.append_execution_runtime_event(
+                    RuntimeEventScope::Tool,
+                    "tool.plan.rejected",
+                    Some("rejected".to_string()),
+                    calls
+                        .iter()
+                        .map(|call| RuntimeEventRef {
+                            kind: "tool_call".to_string(),
+                            id: call.id.clone(),
+                        })
+                        .collect(),
+                    serde_json::json!({
+                        "reason": error.to_string(),
+                        "tool_count": calls.len(),
+                    }),
+                );
+                let mut messages = Vec::with_capacity(calls.len());
+                for call in calls {
+                    let message = ConversationMessage::tool_result(
+                        call.id.clone(),
+                        call.name.clone(),
+                        reason.clone(),
+                        true,
+                    );
+                    self.session
+                        .write()
+                        .await
+                        .push_message(message.clone())
+                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                    self.record_message_event(
+                        &message,
+                        self.session().message_count().wrapping_sub(1),
+                    );
+                    self.remember_tool_trace_from_message(&message);
+                    messages.push(message);
+                }
+                return Ok(ToolBatchStepResult {
+                    failed: messages.len(),
+                    messages,
+                    max_concurrency_observed: 0,
+                    parallel_batches: 0,
+                });
+            }
+        };
         self.record_governed_tool_plan(&plan, self.session().message_count());
         let model_team_conflicts_with_admission = model_team_request_conflicts_with_admission(
             decision.strategy.selected_candidate,
@@ -4891,7 +5097,6 @@ where
             decision.compile_target = crate::execution_core::RuntimeCompileTarget::ExecutionGraph;
         }
         self.tool_executor.bind_execution_decision(decision.clone());
-        plan.apply_execution_decision(&requests, &decision);
         let mut validation = plan.validate_against_execution_decision(&decision);
         if model_team_conflicts_with_admission {
             validation.allowed = false;
@@ -4905,33 +5110,32 @@ where
                 .await;
         }
         self.record_tool_strategy_validation(&validation, self.session().message_count());
-        let mut result_map = std::collections::HashMap::new();
         let mut max_concurrency_observed = 0;
         let mut parallel_batches = 0;
+        let mut messages = Vec::with_capacity(calls.len());
         if validation.allowed {
-            max_concurrency_observed = plan
-                .batches
-                .iter()
-                .map(|batch| batch.max_concurrency.min(batch.indices.len()))
-                .max()
-                .unwrap_or(0);
-            parallel_batches = plan
-                .batches
-                .iter()
-                .filter(|batch| batch.max_concurrency > 1 && batch.indices.len() > 1)
-                .count();
             self.record_tool_schedule(&plan, &requests, self.session().message_count());
-            for batch in &plan.batches {
-                self.execute_tool_schedule_batch(
-                    batch,
-                    &plan,
-                    &pending,
-                    prompter,
-                    iteration,
-                    validation.approval_satisfied,
-                    &mut result_map,
-                )
-                .await?;
+            let context = ConversationGovernedToolContext {
+                runtime: self,
+                pending_tool_uses: &pending,
+                prompter,
+                iterations: iteration,
+                strategy_approval_satisfied: validation.approval_satisfied,
+                plan_id: &plan.plan_id,
+                plan_revision: plan.revision,
+            };
+            let report = GovernedToolExecutor.execute(&plan, &context).await;
+            max_concurrency_observed = report.max_active;
+            parallel_batches = usize::from(report.max_active > 1);
+            for outcome in report.outcomes {
+                let Some((message, _)) = outcome.receipt else {
+                    return Err(RuntimeError::new(format!(
+                        "governed tool task `{}` reached terminal state without a durable result receipt",
+                        outcome.task_id
+                    )));
+                };
+                self.remember_tool_trace_from_message(&message);
+                messages.push(message);
             }
         } else {
             let reason = format!(
@@ -4952,12 +5156,6 @@ where
                     .push_message(message.clone())
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
                 self.record_message_event(&message, self.session().message_count().wrapping_sub(1));
-                result_map.insert(call.id.clone(), (message, None));
-            }
-        }
-        let mut messages = Vec::with_capacity(calls.len());
-        for call in calls {
-            if let Some((message, _)) = result_map.remove(&call.id) {
                 self.remember_tool_trace_from_message(&message);
                 messages.push(message);
             }
@@ -5267,13 +5465,19 @@ where
         let checkpoint_demand = crate::governed_tool_plan::resource_demand_from_effect(&descriptor);
         let result = self
             .tool_execution_plane
-            .execute(&checkpoint_demand, Some(timeout), move || {
-                executor.execute_authorized(
-                    &authorization.authorization,
-                    "checkpoint_create",
-                    &checkpoint_input,
-                )
-            })
+            .execute_classified(
+                &checkpoint_demand,
+                Some(timeout),
+                self.execution_service_class,
+                Some(self.execution_service_class),
+                move || {
+                    executor.execute_authorized(
+                        &authorization.authorization,
+                        "checkpoint_create",
+                        &checkpoint_input,
+                    )
+                },
+            )
             .await;
         match result {
             Ok(Ok(output)) => {
@@ -5309,6 +5513,7 @@ where
         prompter: &crate::permissions::SharedPrompter,
         iterations: usize,
         strategy_approval_satisfied: bool,
+        retained_admission: &mut Option<crate::ToolExecutionAdmission>,
     ) -> Result<ConversationMessage, RuntimeError> {
         let tool_use_id = task.tool_call_id.as_str();
         let tool_name = task.tool_name.as_str();
@@ -5592,27 +5797,38 @@ where
                     }
                     crate::execution_core::graph::ToolEffectState::Fresh
                     | crate::execution_core::graph::ToolEffectState::NotRequired => {
-                        plane
-                            .execute(&demand, Some(tool_timeout), move || {
-                                if is_evidence_retrieve {
-                                    return retrieve_tool_evidence_from_sandbox(
+                        let (execution, admission) = plane
+                            .execute_classified_retained(
+                                &demand,
+                                Some(tool_timeout),
+                                self.execution_service_class,
+                                Some(self.execution_service_class),
+                                move || {
+                                    if is_evidence_retrieve {
+                                        return retrieve_tool_evidence_from_sandbox(
                                         evidence_sandbox.as_ref(),
                                         &tinput,
                                     )
                                     .map(harness_contract::context::ToolOutputDraft::bounded_inline)
                                     .map_err(ToolError::new);
-                                }
-                                if matches!(tname.as_str(), "ToolSearch" | "runtime_capabilities") {
-                                    tool_exec.execute_output(&tname, &tinput)
-                                } else {
-                                    tool_exec.execute_authorized_output(
-                                        &authorization.authorization,
-                                        &tname,
-                                        &tinput,
-                                    )
-                                }
-                            })
-                            .await
+                                    }
+                                    if matches!(
+                                        tname.as_str(),
+                                        "ToolSearch" | "runtime_capabilities"
+                                    ) {
+                                        tool_exec.execute_output(&tname, &tinput)
+                                    } else {
+                                        tool_exec.execute_authorized_output(
+                                            &authorization.authorization,
+                                            &tname,
+                                            &tinput,
+                                        )
+                                    }
+                                },
+                            )
+                            .await;
+                        *retained_admission = admission;
+                        execution
                     }
                 };
                 let (output_draft, mut is_error, mut failure_kind) = match execution {
@@ -5891,250 +6107,6 @@ where
                 Ok(denied)
             }
         }
-    }
-
-    async fn execute_tool_schedule_batch(
-        &self,
-        batch: &crate::governed_tool_plan::GovernedExecutionBatch,
-        plan: &GovernedToolPlan,
-        pending_tool_uses: &[(String, String, String)],
-        prompter: &crate::permissions::SharedPrompter,
-        iterations: usize,
-        strategy_approval_satisfied: bool,
-        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
-    ) -> Result<(), RuntimeError> {
-        match batch.mode {
-            crate::governed_tool_plan::GovernedExecutionBatchMode::DependencyWave
-            | crate::governed_tool_plan::GovernedExecutionBatchMode::SerialStrategy => {
-                self.execute_tool_indices_serial_into_map(
-                    &batch.indices,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    strategy_approval_satisfied,
-                    result_map,
-                )
-                .await
-            }
-            crate::governed_tool_plan::GovernedExecutionBatchMode::ParallelRead => {
-                self.execute_tool_indices_concurrently_into_map(
-                    &batch.indices,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    batch.max_concurrency,
-                    strategy_approval_satisfied,
-                    result_map,
-                )
-                .await
-            }
-            crate::governed_tool_plan::GovernedExecutionBatchMode::LimitedNetwork => {
-                self.execute_tool_indices_concurrently_into_map(
-                    &batch.indices,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    batch.max_concurrency,
-                    strategy_approval_satisfied,
-                    result_map,
-                )
-                .await
-            }
-            crate::governed_tool_plan::GovernedExecutionBatchMode::LimitedWrite => {
-                self.execute_write_scope_groups_into_map(
-                    batch,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    strategy_approval_satisfied,
-                    result_map,
-                )
-                .await
-            }
-            crate::governed_tool_plan::GovernedExecutionBatchMode::SerialDestructive => {
-                self.execute_tool_indices_serial_into_map(
-                    &batch.indices,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    strategy_approval_satisfied,
-                    result_map,
-                )
-                .await
-            }
-        }
-    }
-
-    async fn execute_tool_indices_concurrently_into_map(
-        &self,
-        indices: &[usize],
-        plan: &GovernedToolPlan,
-        pending_tool_uses: &[(String, String, String)],
-        prompter: &crate::permissions::SharedPrompter,
-        iterations: usize,
-        max_concurrency: usize,
-        strategy_approval_satisfied: bool,
-        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
-    ) -> Result<(), RuntimeError> {
-        use futures::stream::{FuturesUnordered, StreamExt};
-
-        let limit = bounded_tool_concurrency(max_concurrency, indices.len());
-        for chunk in indices.chunks(limit) {
-            let mut futures = FuturesUnordered::new();
-            for &idx in chunk {
-                futures.push(self.execute_tool_index_collect(
-                    idx,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    strategy_approval_satisfied,
-                ));
-            }
-            while let Some(result) = futures.next().await {
-                let (id, message) = result?;
-                result_map.insert(id, message);
-            }
-        }
-        Ok(())
-    }
-
-    async fn execute_write_scope_groups_into_map(
-        &self,
-        batch: &crate::governed_tool_plan::GovernedExecutionBatch,
-        plan: &GovernedToolPlan,
-        pending_tool_uses: &[(String, String, String)],
-        prompter: &crate::permissions::SharedPrompter,
-        iterations: usize,
-        strategy_approval_satisfied: bool,
-        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
-    ) -> Result<(), RuntimeError> {
-        use futures::stream::{FuturesUnordered, StreamExt};
-
-        if batch.scope_groups.is_empty() {
-            return self
-                .execute_tool_indices_concurrently_into_map(
-                    &batch.indices,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    batch.max_concurrency,
-                    strategy_approval_satisfied,
-                    result_map,
-                )
-                .await;
-        }
-
-        let limit = bounded_tool_concurrency(batch.max_concurrency, batch.scope_groups.len());
-        for chunk in batch.scope_groups.chunks(limit) {
-            let mut futures = FuturesUnordered::new();
-            for group in chunk {
-                futures.push(self.execute_tool_indices_serial_collect(
-                    &group.indices,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    strategy_approval_satisfied,
-                ));
-            }
-            while let Some(result) = futures.next().await {
-                for (id, message) in result? {
-                    result_map.insert(id, message);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn execute_tool_indices_serial_into_map(
-        &self,
-        indices: &[usize],
-        plan: &GovernedToolPlan,
-        pending_tool_uses: &[(String, String, String)],
-        prompter: &crate::permissions::SharedPrompter,
-        iterations: usize,
-        strategy_approval_satisfied: bool,
-        result_map: &mut std::collections::HashMap<String, (ConversationMessage, Option<String>)>,
-    ) -> Result<(), RuntimeError> {
-        for (id, message) in self
-            .execute_tool_indices_serial_collect(
-                indices,
-                plan,
-                pending_tool_uses,
-                prompter,
-                iterations,
-                strategy_approval_satisfied,
-            )
-            .await?
-        {
-            result_map.insert(id, message);
-        }
-        Ok(())
-    }
-
-    async fn execute_tool_indices_serial_collect(
-        &self,
-        indices: &[usize],
-        plan: &GovernedToolPlan,
-        pending_tool_uses: &[(String, String, String)],
-        prompter: &crate::permissions::SharedPrompter,
-        iterations: usize,
-        strategy_approval_satisfied: bool,
-    ) -> Result<Vec<(String, (ConversationMessage, Option<String>))>, RuntimeError> {
-        let mut results = Vec::with_capacity(indices.len());
-        for &idx in indices {
-            results.push(
-                self.execute_tool_index_collect(
-                    idx,
-                    plan,
-                    pending_tool_uses,
-                    prompter,
-                    iterations,
-                    strategy_approval_satisfied,
-                )
-                .await?,
-            );
-        }
-        Ok(results)
-    }
-
-    async fn execute_tool_index_collect(
-        &self,
-        idx: usize,
-        plan: &GovernedToolPlan,
-        pending_tool_uses: &[(String, String, String)],
-        prompter: &crate::permissions::SharedPrompter,
-        iterations: usize,
-        strategy_approval_satisfied: bool,
-    ) -> Result<(String, (ConversationMessage, Option<String>)), RuntimeError> {
-        let Some((_, _, input)) = pending_tool_uses.get(idx) else {
-            return Err(RuntimeError::new(format!(
-                "tool schedule referenced missing tool index {idx}"
-            )));
-        };
-
-        let task = plan.tasks.get(idx).ok_or_else(|| {
-            RuntimeError::new(format!("governed plan referenced missing tool index {idx}"))
-        })?;
-        let result_msg = self
-            .execute_single_tool(
-                task,
-                &plan.plan_id,
-                plan.revision,
-                input,
-                prompter,
-                iterations,
-                strategy_approval_satisfied,
-            )
-            .await?;
-        Ok(self.collect_tool_result_message(result_msg))
     }
 
     fn collect_tool_result_message(
@@ -7834,7 +7806,9 @@ where
             serde_json::json!({
                 "plan_id": plan.plan_id,
                 "plan_revision": plan.revision,
-                "schedule": plan.batches,
+                "topology_hash": plan.topology_hash,
+                "topological_order": plan.topological_order,
+                "task_count": plan.task_count,
                 "tool_count": requests.len(),
             }),
         );
@@ -8984,6 +8958,41 @@ fn extract_tool_info(msg: &ConversationMessage) -> (String, String) {
     }
 }
 
+fn conversation_tool_result_is_error(message: &ConversationMessage) -> bool {
+    message
+        .blocks
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { is_error: true, .. }))
+}
+
+fn conversation_tool_result_text(message: &ConversationMessage) -> String {
+    message
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::ToolResult { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "tool returned an error without a result payload".to_string())
+}
+
+fn conversation_tool_terminal_reason(
+    terminal: &GovernedToolTaskTerminal<(ConversationMessage, Option<String>)>,
+) -> String {
+    match terminal {
+        GovernedToolTaskTerminal::Succeeded(_) => "tool completed".to_string(),
+        GovernedToolTaskTerminal::FailedOutput { error, .. }
+        | GovernedToolTaskTerminal::Failed { error } => error.clone(),
+        GovernedToolTaskTerminal::Refused { reason }
+        | GovernedToolTaskTerminal::Cancelled { reason }
+        | GovernedToolTaskTerminal::Panicked { reason } => reason.clone(),
+        GovernedToolTaskTerminal::Blocked {
+            predecessor_id,
+            reason,
+        } => format!("blocked by predecessor `{predecessor_id}`: {reason}"),
+    }
+}
+
 fn compacted_source_messages(
     messages: &[ConversationMessage],
     start: usize,
@@ -9170,16 +9179,6 @@ fn fact_extraction_trigger_for_turn(
         return Some(RuntimeFactExtractionTrigger::TurnEnd);
     }
     None
-}
-
-fn bounded_tool_concurrency(max_concurrency: usize, item_count: usize) -> usize {
-    if item_count == 0 {
-        return 1;
-    }
-    max_concurrency
-        .max(1)
-        .min(item_count)
-        .min(crate::governed_tool_plan::DEFAULT_PARALLEL_TOOL_CONCURRENCY)
 }
 
 fn count_failed_tool_results(messages: &[ConversationMessage]) -> usize {

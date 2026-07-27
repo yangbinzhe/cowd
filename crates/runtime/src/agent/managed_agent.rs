@@ -28,10 +28,12 @@ use crate::{RuntimeEventInput, RuntimeEventScope, RuntimeEventStore};
 pub enum ManagedAgentInvocationStatus {
     Pending,
     Claimed,
+    Materialized,
     Running,
     RetryScheduled,
     Completed,
     Failed,
+    Blocked,
     SuppressedOverlap,
     Cancelled,
     ReconciliationRequired,
@@ -42,7 +44,11 @@ impl ManagedAgentInvocationStatus {
     pub fn is_active(&self) -> bool {
         matches!(
             self,
-            Self::Pending | Self::Claimed | Self::Running | Self::RetryScheduled
+            Self::Pending
+                | Self::Claimed
+                | Self::Materialized
+                | Self::Running
+                | Self::RetryScheduled
         )
     }
 }
@@ -80,6 +86,16 @@ pub struct ManagedAgentInvocation {
     pub ready_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_registration_intent_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_registration_receipt_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -563,11 +579,13 @@ impl ManagedAgentDispatcher {
         &self,
         dispatcher_id: &str,
         now_ms: u64,
+        lease_ms: u64,
         limit: usize,
     ) -> Result<Vec<ManagedAgentInvocation>, String> {
-        if dispatcher_id.trim().is_empty() || limit == 0 {
+        if dispatcher_id.trim().is_empty() || lease_ms == 0 || limit == 0 {
             return Err(
-                "managed Agent claim requires dispatcher_id and positive limit".to_string(),
+                "managed Agent claim requires dispatcher_id, positive lease and positive limit"
+                    .to_string(),
             );
         }
         self.mutate("managed_agent.invocation.claimed.v1", |state| {
@@ -592,6 +610,17 @@ impl ManagedAgentDispatcher {
                 invocation.status = ManagedAgentInvocationStatus::Claimed;
                 invocation.fence_generation = invocation.fence_generation.saturating_add(1);
                 invocation.claimed_by = Some(dispatcher_id.to_string());
+                let claim_token = managed_claim_token(
+                    &invocation.invocation_id,
+                    dispatcher_id,
+                    invocation.fence_generation,
+                    now_ms,
+                );
+                invocation.claim_token = Some(claim_token);
+                invocation.claimed_at_ms = Some(now_ms);
+                invocation.claim_expires_at_ms = Some(now_ms.saturating_add(lease_ms));
+                invocation.graph_registration_intent_ref = None;
+                invocation.graph_registration_receipt_ref = None;
                 invocation.ready_at_ms = None;
                 claimed.push(invocation.clone());
             }
@@ -599,23 +628,103 @@ impl ManagedAgentDispatcher {
         })
     }
 
+    pub fn begin_graph_registration(
+        &self,
+        invocation_id: &str,
+        dispatcher_id: &str,
+        fence_generation: u64,
+        claim_token: &str,
+        execution_ref: String,
+    ) -> Result<ManagedAgentInvocation, String> {
+        self.mutate(
+            "managed_agent.invocation.graph_registration_intent.v1",
+            |state| {
+                let invocation = invocation_for_claim(
+                    state,
+                    invocation_id,
+                    dispatcher_id,
+                    fence_generation,
+                    claim_token,
+                )?;
+                if invocation.status != ManagedAgentInvocationStatus::Claimed {
+                    return Err("managed Agent invocation is not claimed".to_string());
+                }
+                invocation.graph_registration_intent_ref =
+                    Some(format!("graph-registration-intent:{execution_ref}"));
+                invocation.execution_ref = Some(execution_ref.clone());
+                Ok(invocation.clone())
+            },
+        )
+    }
+
+    pub fn materialize_invocation(
+        &self,
+        invocation_id: &str,
+        dispatcher_id: &str,
+        fence_generation: u64,
+        claim_token: &str,
+        execution_ref: String,
+        receipt_ref: String,
+    ) -> Result<ManagedAgentInvocation, String> {
+        self.mutate(
+            "managed_agent.invocation.graph_registration_materialized.v1",
+            |state| {
+                let invocation = invocation_for_claim(
+                    state,
+                    invocation_id,
+                    dispatcher_id,
+                    fence_generation,
+                    claim_token,
+                )?;
+                if invocation.status != ManagedAgentInvocationStatus::Claimed {
+                    return Err("managed Agent invocation is not claimed".to_string());
+                }
+                if invocation.execution_ref.as_deref() != Some(execution_ref.as_str())
+                    || invocation.graph_registration_intent_ref.is_none()
+                {
+                    return Err(
+                        "managed Agent graph registration has no matching durable intent"
+                            .to_string(),
+                    );
+                }
+                invocation.status = ManagedAgentInvocationStatus::Materialized;
+                invocation.graph_registration_receipt_ref = Some(receipt_ref.clone());
+                Ok(invocation.clone())
+            },
+        )
+    }
+
     pub fn start_invocation(
         &self,
         invocation_id: &str,
         dispatcher_id: &str,
         fence_generation: u64,
+        claim_token: &str,
         execution_ref: String,
         now_ms: u64,
     ) -> Result<ManagedAgentInvocation, String> {
         self.mutate("managed_agent.invocation.started.v1", |state| {
-            let invocation =
-                invocation_for_fence(state, invocation_id, dispatcher_id, fence_generation)?;
-            if invocation.status != ManagedAgentInvocationStatus::Claimed {
-                return Err("managed Agent invocation is not claimed".to_string());
+            let invocation = invocation_for_claim(
+                state,
+                invocation_id,
+                dispatcher_id,
+                fence_generation,
+                claim_token,
+            )?;
+            if invocation.status != ManagedAgentInvocationStatus::Materialized {
+                return Err("managed Agent invocation is not materialized".to_string());
+            }
+            if invocation.execution_ref.as_deref() != Some(execution_ref.as_str())
+                || invocation.graph_registration_receipt_ref.is_none()
+            {
+                return Err(
+                    "managed Agent invocation cannot run without a matching graph receipt"
+                        .to_string(),
+                );
             }
             invocation.status = ManagedAgentInvocationStatus::Running;
-            invocation.execution_ref = Some(execution_ref.clone());
             invocation.started_at_ms = Some(now_ms);
+            invocation.claim_expires_at_ms = None;
             Ok(invocation.clone())
         })
     }
@@ -657,6 +766,10 @@ impl ManagedAgentDispatcher {
                 } else {
                     invocation.status = ManagedAgentInvocationStatus::Failed;
                 }
+                clear_claim_lease(invocation);
+                invocation.execution_ref = None;
+                invocation.graph_registration_intent_ref = None;
+                invocation.graph_registration_receipt_ref = None;
                 invocation.clone()
             };
             if failed.status == ManagedAgentInvocationStatus::Failed {
@@ -668,6 +781,42 @@ impl ManagedAgentDispatcher {
             }
             Ok(failed)
         })
+    }
+
+    pub fn mark_invocation_reconciliation_required(
+        &self,
+        invocation_id: &str,
+        dispatcher_id: &str,
+        fence_generation: u64,
+        claim_token: &str,
+        error: String,
+    ) -> Result<ManagedAgentInvocation, String> {
+        self.mutate(
+            "managed_agent.invocation.reconciliation_required.v1",
+            |state| {
+                let invocation = invocation_for_claim(
+                    state,
+                    invocation_id,
+                    dispatcher_id,
+                    fence_generation,
+                    claim_token,
+                )?;
+                if !matches!(
+                    invocation.status,
+                    ManagedAgentInvocationStatus::Claimed
+                        | ManagedAgentInvocationStatus::Materialized
+                ) {
+                    return Err(
+                        "managed Agent invocation is not in a recoverable registration state"
+                            .to_string(),
+                    );
+                }
+                invocation.status = ManagedAgentInvocationStatus::ReconciliationRequired;
+                invocation.error = Some(error.clone());
+                invocation.claim_expires_at_ms = None;
+                Ok(invocation.clone())
+            },
+        )
     }
 
     /// Stop invocations whose declared maximum age elapsed.  The status is
@@ -778,6 +927,7 @@ impl ManagedAgentDispatcher {
                 } else {
                     invocation.status = ManagedAgentInvocationStatus::Failed;
                 }
+                clear_claim_lease(invocation);
                 invocation.clone()
             };
             if succeeded {
@@ -970,19 +1120,55 @@ impl ManagedAgentDispatcher {
             for invocation in state.invocations.values_mut() {
                 match invocation.status {
                     ManagedAgentInvocationStatus::Claimed => {
-                        invocation.status = ManagedAgentInvocationStatus::Pending;
-                        invocation.claimed_by = None;
-                        invocation.ready_at_ms = Some(now_ms);
+                        if invocation.graph_registration_intent_ref.is_some() {
+                            invocation.status =
+                                ManagedAgentInvocationStatus::ReconciliationRequired;
+                            invocation.error = Some(
+                                "Runtime restarted after graph registration intent without a durable materialization receipt"
+                                    .to_string(),
+                            );
+                        } else {
+                            reset_claim_for_retry(invocation, now_ms);
+                        }
+                        affected.push(invocation.clone());
+                    }
+                    ManagedAgentInvocationStatus::Materialized => {
+                        match dispositions.get(&invocation.invocation_id) {
+                            Some(ManagedAgentRestartDisposition::PreserveRunning) => {
+                                invocation.status = ManagedAgentInvocationStatus::Running;
+                                invocation.started_at_ms.get_or_insert(now_ms);
+                                invocation.claim_expires_at_ms = None;
+                            }
+                            Some(ManagedAgentRestartDisposition::RetrySafe) => {
+                                reset_claim_for_retry(invocation, now_ms);
+                                invocation.execution_ref = None;
+                                invocation.graph_registration_intent_ref = None;
+                                invocation.graph_registration_receipt_ref = None;
+                            }
+                            Some(ManagedAgentRestartDisposition::ReconciliationRequired(reason)) => {
+                                invocation.status =
+                                    ManagedAgentInvocationStatus::ReconciliationRequired;
+                                invocation.error = Some(reason.clone());
+                            }
+                            None => {
+                                invocation.status =
+                                    ManagedAgentInvocationStatus::ReconciliationRequired;
+                                invocation.error = Some(
+                                    "materialized Managed Agent graph requires recovery disposition"
+                                        .to_string(),
+                                );
+                            }
+                        }
                         affected.push(invocation.clone());
                     }
                     ManagedAgentInvocationStatus::Running => {
                         match dispositions.get(&invocation.invocation_id) {
                             Some(ManagedAgentRestartDisposition::RetrySafe) => {
-                                invocation.status = ManagedAgentInvocationStatus::Pending;
-                                invocation.claimed_by = None;
+                                reset_claim_for_retry(invocation, now_ms);
                                 invocation.execution_ref = None;
                                 invocation.started_at_ms = None;
-                                invocation.ready_at_ms = Some(now_ms);
+                                invocation.graph_registration_intent_ref = None;
+                                invocation.graph_registration_receipt_ref = None;
                                 invocation.error = Some(
                                     "Runtime restarted before any Managed Agent node started; the invocation is safe to reclaim"
                                         .to_string(),
@@ -1018,6 +1204,37 @@ impl ManagedAgentDispatcher {
                             .to_string(),
                     );
                 }
+            }
+            Ok(affected)
+        })
+    }
+
+    pub fn reclaim_expired_claims(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<ManagedAgentInvocation>, String> {
+        self.mutate("managed_agent.invocation.claim_expired.v1", |state| {
+            let mut affected = Vec::new();
+            for invocation in state.invocations.values_mut() {
+                if invocation.status != ManagedAgentInvocationStatus::Claimed
+                    || invocation
+                        .claim_expires_at_ms
+                        .is_none_or(|expires_at| expires_at > now_ms)
+                {
+                    continue;
+                }
+                if invocation.graph_registration_intent_ref.is_some() {
+                    invocation.status = ManagedAgentInvocationStatus::ReconciliationRequired;
+                    invocation.error = Some(
+                        "managed Agent claim expired after graph registration intent; reconcile before retry"
+                            .to_string(),
+                    );
+                } else {
+                    reset_claim_for_retry(invocation, now_ms);
+                    invocation.error =
+                        Some("managed Agent claim expired before graph registration".to_string());
+                }
+                affected.push(invocation.clone());
             }
             Ok(affected)
         })
@@ -1213,6 +1430,11 @@ fn accept_invocation(
         created_at_ms: now_ms,
         ready_at_ms: Some(now_ms),
         claimed_by: None,
+        claim_token: None,
+        claimed_at_ms: None,
+        claim_expires_at_ms: None,
+        graph_registration_intent_ref: None,
+        graph_registration_receipt_ref: None,
         execution_ref: None,
         started_at_ms: None,
         error: None,
@@ -1238,6 +1460,49 @@ fn invocation_for_fence<'a>(
         return Err("stale dispatcher fence".to_string());
     }
     Ok(invocation)
+}
+
+fn invocation_for_claim<'a>(
+    state: &'a mut ManagedAgentState,
+    invocation_id: &str,
+    dispatcher_id: &str,
+    fence_generation: u64,
+    claim_token: &str,
+) -> Result<&'a mut ManagedAgentInvocation, String> {
+    let invocation = invocation_for_fence(state, invocation_id, dispatcher_id, fence_generation)?;
+    if invocation.claim_token.as_deref() != Some(claim_token) {
+        return Err("stale managed Agent claim token".to_string());
+    }
+    Ok(invocation)
+}
+
+fn managed_claim_token(
+    invocation_id: &str,
+    dispatcher_id: &str,
+    fence_generation: u64,
+    claimed_at_ms: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(invocation_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(dispatcher_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(fence_generation.to_le_bytes());
+    hasher.update(claimed_at_ms.to_le_bytes());
+    format!("managed-claim:{:x}", hasher.finalize())
+}
+
+fn reset_claim_for_retry(invocation: &mut ManagedAgentInvocation, ready_at_ms: u64) {
+    invocation.status = ManagedAgentInvocationStatus::Pending;
+    clear_claim_lease(invocation);
+    invocation.ready_at_ms = Some(ready_at_ms);
+}
+
+fn clear_claim_lease(invocation: &mut ManagedAgentInvocation) {
+    invocation.claimed_by = None;
+    invocation.claim_token = None;
+    invocation.claimed_at_ms = None;
+    invocation.claim_expires_at_ms = None;
 }
 
 fn event_matches(
@@ -1421,6 +1686,45 @@ mod tests {
         }
     }
 
+    fn materialize_and_start(
+        dispatcher: &ManagedAgentDispatcher,
+        claim: &ManagedAgentInvocation,
+        dispatcher_id: &str,
+        graph_id: &str,
+        now_ms: u64,
+    ) {
+        let token = claim.claim_token.as_deref().expect("claim token");
+        dispatcher
+            .begin_graph_registration(
+                &claim.invocation_id,
+                dispatcher_id,
+                claim.fence_generation,
+                token,
+                graph_id.to_string(),
+            )
+            .expect("registration intent");
+        dispatcher
+            .materialize_invocation(
+                &claim.invocation_id,
+                dispatcher_id,
+                claim.fence_generation,
+                token,
+                graph_id.to_string(),
+                format!("graph-registration-receipt:{graph_id}"),
+            )
+            .expect("materialize");
+        dispatcher
+            .start_invocation(
+                &claim.invocation_id,
+                dispatcher_id,
+                claim.fence_generation,
+                token,
+                graph_id.to_string(),
+                now_ms,
+            )
+            .expect("start");
+    }
+
     #[test]
     fn event_trigger_is_deduplicated_and_overlap_is_durable() {
         let dispatcher = dispatcher();
@@ -1498,19 +1802,11 @@ mod tests {
             .trigger_manual("workspace/cowd/research-watch", "request-1", 2)
             .expect("manual");
         let claim = dispatcher
-            .claim_ready("dispatcher-a", 3, 1)
+            .claim_ready("dispatcher-a", 3, 100, 1)
             .expect("claim")
             .pop()
             .expect("claimed invocation");
-        dispatcher
-            .start_invocation(
-                &claim.invocation_id,
-                "dispatcher-a",
-                claim.fence_generation,
-                "run:1".to_string(),
-                4,
-            )
-            .expect("start");
+        materialize_and_start(&dispatcher, &claim, "dispatcher-a", "run:1", 4);
         dispatcher
             .enqueue_effect(
                 &invocation.invocation_id,
@@ -1544,6 +1840,73 @@ mod tests {
     }
 
     #[test]
+    fn claim_lease_reclaims_safe_work_and_fences_stale_dispatcher() {
+        let dispatcher = dispatcher();
+        dispatcher
+            .register_definition(definition(ManagedAgentTrigger::Manual), 1)
+            .expect("definition");
+        dispatcher
+            .trigger_manual("workspace/cowd/research-watch", "claim-expiry", 2)
+            .expect("manual");
+        let first = dispatcher
+            .claim_ready("dispatcher-a", 3, 5, 1)
+            .expect("first claim")
+            .pop()
+            .expect("claimed");
+        let reclaimed = dispatcher
+            .reclaim_expired_claims(9)
+            .expect("reclaim expired");
+        assert_eq!(reclaimed[0].status, ManagedAgentInvocationStatus::Pending);
+        let second = dispatcher
+            .claim_ready("dispatcher-b", 10, 5, 1)
+            .expect("second claim")
+            .pop()
+            .expect("reclaimed");
+        assert!(second.fence_generation > first.fence_generation);
+        assert_ne!(second.claim_token, first.claim_token);
+        let stale = dispatcher.begin_graph_registration(
+            &first.invocation_id,
+            "dispatcher-a",
+            first.fence_generation,
+            first.claim_token.as_deref().expect("first token"),
+            "graph:stale".to_string(),
+        );
+        assert!(stale.is_err());
+    }
+
+    #[test]
+    fn expired_claim_with_graph_intent_requires_reconciliation() {
+        let dispatcher = dispatcher();
+        dispatcher
+            .register_definition(definition(ManagedAgentTrigger::Manual), 1)
+            .expect("definition");
+        dispatcher
+            .trigger_manual("workspace/cowd/research-watch", "intent-expiry", 2)
+            .expect("manual");
+        let claim = dispatcher
+            .claim_ready("dispatcher-a", 3, 5, 1)
+            .expect("claim")
+            .pop()
+            .expect("claimed");
+        dispatcher
+            .begin_graph_registration(
+                &claim.invocation_id,
+                "dispatcher-a",
+                claim.fence_generation,
+                claim.claim_token.as_deref().expect("claim token"),
+                "graph:ambiguous".to_string(),
+            )
+            .expect("registration intent");
+        let affected = dispatcher
+            .reclaim_expired_claims(9)
+            .expect("reclaim expired");
+        assert_eq!(
+            affected[0].status,
+            ManagedAgentInvocationStatus::ReconciliationRequired
+        );
+    }
+
+    #[test]
     fn restart_dispositions_retry_only_safe_work_and_preserve_or_block_uncertain_work() {
         let dispatcher = dispatcher();
         dispatcher
@@ -1553,19 +1916,11 @@ mod tests {
             .trigger_manual("workspace/cowd/research-watch", "restart-request", 2)
             .expect("manual");
         let first_claim = dispatcher
-            .claim_ready("dispatcher-a", 3, 1)
+            .claim_ready("dispatcher-a", 3, 100, 1)
             .expect("claim")
             .pop()
             .expect("claimed invocation");
-        dispatcher
-            .start_invocation(
-                &first_claim.invocation_id,
-                "dispatcher-a",
-                first_claim.fence_generation,
-                "graph:first".to_string(),
-                4,
-            )
-            .expect("start");
+        materialize_and_start(&dispatcher, &first_claim, "dispatcher-a", "graph:first", 4);
 
         let retried = dispatcher
             .recover_with_dispositions(
@@ -1582,20 +1937,18 @@ mod tests {
         assert!(retried[0].execution_ref.is_none());
 
         let second_claim = dispatcher
-            .claim_ready("dispatcher-b", 6, 1)
+            .claim_ready("dispatcher-b", 6, 100, 1)
             .expect("reclaim")
             .pop()
             .expect("reclaimed invocation");
         assert!(second_claim.fence_generation > first_claim.fence_generation);
-        dispatcher
-            .start_invocation(
-                &second_claim.invocation_id,
-                "dispatcher-b",
-                second_claim.fence_generation,
-                "graph:second".to_string(),
-                7,
-            )
-            .expect("restart");
+        materialize_and_start(
+            &dispatcher,
+            &second_claim,
+            "dispatcher-b",
+            "graph:second",
+            7,
+        );
         let preserved = dispatcher
             .recover_with_dispositions(
                 8,

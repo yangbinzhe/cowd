@@ -97,6 +97,7 @@ impl NodeExecutor for ApprovalNodeExecutor {
             graph_id: context.graph.id.clone(),
             node_id: context.node.id,
             executor_kind: Self::KIND.into(),
+            service_class: context.graph.service_class,
             attempt: context.attempt,
             // Waiting for approval is a completed observation, not the
             // irreversible approved transition. A resumed node must receive

@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::execution_core::graph::{
-    ExecutionResourceKind, ExecutionResourceManager, ResourceObservation, ResourceResultClass,
-    ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
+    ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager, ExecutionServiceClass,
+    ResourceAdmissionDecision, ResourceAdmissionRequest, ResourceObservation, ResourceResultClass,
+    ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +43,52 @@ struct PlaneCounters {
     failed: AtomicU64,
     timed_out_waiters: AtomicU64,
     panicked: AtomicU64,
+}
+
+/// Resource ownership retained by the governed executor until its durable
+/// terminal receipt has been committed.
+pub struct ToolExecutionAdmission {
+    _scope_lease: ScopeLockLease,
+    _resource_lease: ExecutionResourceLease,
+    resources: Arc<ExecutionResourceManager>,
+    queue_wait: Duration,
+    service_started: Instant,
+    result_class: ResourceResultClass,
+}
+
+impl ToolExecutionAdmission {
+    fn new(
+        scope_lease: ScopeLockLease,
+        resource_lease: ExecutionResourceLease,
+        resources: Arc<ExecutionResourceManager>,
+        queue_wait: Duration,
+    ) -> Self {
+        Self {
+            _scope_lease: scope_lease,
+            _resource_lease: resource_lease,
+            resources,
+            queue_wait,
+            service_started: Instant::now(),
+            result_class: ResourceResultClass::Failed,
+        }
+    }
+
+    fn set_result_class(&mut self, result_class: ResourceResultClass) {
+        self.result_class = result_class;
+    }
+}
+
+impl Drop for ToolExecutionAdmission {
+    fn drop(&mut self) {
+        let _ = self.resources.record_observation(
+            &ExecutionResourceKind::Tool,
+            ResourceObservation::terminal(
+                self.queue_wait,
+                self.service_started.elapsed(),
+                self.result_class,
+            ),
+        );
+    }
 }
 
 /// Runtime-owned bounded execution boundary for every synchronous Tool.
@@ -83,31 +130,118 @@ impl ToolExecutionPlane {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        self.execute_classified(
+            demand,
+            timeout,
+            ExecutionServiceClass::Foreground,
+            None,
+            operation,
+        )
+        .await
+    }
+
+    pub async fn execute_classified<T, F>(
+        &self,
+        demand: &ResourceDemand,
+        timeout: Option<Duration>,
+        service_class: ExecutionServiceClass,
+        parent_class_ceiling: Option<ExecutionServiceClass>,
+        operation: F,
+    ) -> Result<T, ToolExecutionPlaneError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (execution, admission) = self
+            .execute_classified_retained(
+                demand,
+                timeout,
+                service_class,
+                parent_class_ceiling,
+                operation,
+            )
+            .await;
+        drop(admission);
+        execution
+    }
+
+    /// Execute one synchronous Tool while retaining its scope and capacity
+    /// leases for the caller. Governed callers must keep the returned
+    /// admission alive through durable terminal commit.
+    pub async fn execute_classified_retained<T, F>(
+        &self,
+        demand: &ResourceDemand,
+        timeout: Option<Duration>,
+        service_class: ExecutionServiceClass,
+        parent_class_ceiling: Option<ExecutionServiceClass>,
+        operation: F,
+    ) -> (
+        Result<T, ToolExecutionPlaneError>,
+        Option<ToolExecutionAdmission>,
+    )
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
         self.counters.submitted.fetch_add(1, Ordering::Relaxed);
         let admission_started = Instant::now();
-        let scope_requests = scope_requests(demand)?;
-        let scope_lease = self
-            .scopes
-            .acquire(scope_requests, timeout)
-            .await
-            .map_err(|error| ToolExecutionPlaneError::Admission(error.to_string()))?;
+        let scope_requests = match scope_requests(demand) {
+            Ok(requests) => requests,
+            Err(error) => return (Err(error), None),
+        };
+        let normalized_scope = format!("{scope_requests:?}");
+        let scope_lease = match self.scopes.acquire(scope_requests, timeout).await {
+            Ok(lease) => lease,
+            Err(error) => {
+                return (
+                    Err(ToolExecutionPlaneError::Admission(error.to_string())),
+                    None,
+                );
+            }
+        };
         let resource_demands = execution_resource_demands(demand);
-        let lease = self
-            .resources
-            .acquire_bundle(
-                resource_demands,
-                remaining_timeout(timeout, admission_started),
-            )
-            .await
-            .map_err(|error| ToolExecutionPlaneError::Admission(error.to_string()))?;
+        let mut request = ResourceAdmissionRequest::new(service_class, resource_demands)
+            .with_scope(normalized_scope, true)
+            .with_fairness_key(format!("tool:{service_class:?}"));
+        if let Some(parent_class_ceiling) = parent_class_ceiling {
+            request = request.with_parent_class_ceiling(parent_class_ceiling);
+        }
+        if let Some(remaining) = remaining_timeout(timeout, admission_started) {
+            request = request
+                .with_deadline_at_ms(wall_now_ms().saturating_add(duration_millis(remaining)));
+        }
+        let decision = match self.resources.admit(request).await {
+            Ok(decision) => decision,
+            Err(error) => {
+                return (
+                    Err(ToolExecutionPlaneError::Admission(error.to_string())),
+                    None,
+                );
+            }
+        };
+        let lease = match decision {
+            ResourceAdmissionDecision::Granted { lease, .. } => lease,
+            ResourceAdmissionDecision::Deferred { wait_reason, .. }
+            | ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
+                return (
+                    Err(ToolExecutionPlaneError::Admission(format!(
+                        "resource admission did not grant: {wait_reason:?}"
+                    ))),
+                    None,
+                );
+            }
+        };
         let queue_wait = admission_started.elapsed();
+        let mut admission = ToolExecutionAdmission::new(
+            scope_lease,
+            lease,
+            Arc::clone(&self.resources),
+            queue_wait,
+        );
         self.counters.active.fetch_add(1, Ordering::AcqRel);
         let counters = Arc::clone(&self.counters);
-        let service_started = Instant::now();
         let mut worker = tokio::task::spawn_blocking(move || {
             let result = std::panic::catch_unwind(AssertUnwindSafe(operation));
-            drop(scope_lease);
-            drop(lease);
             counters.active.fetch_sub(1, Ordering::AcqRel);
             match result {
                 Ok(value) => {
@@ -122,45 +256,47 @@ impl ToolExecutionPlane {
             }
         });
 
+        let mut soft_timed_out = false;
         let execution = if let Some(timeout) = timeout {
             match tokio::time::timeout(timeout, &mut worker).await {
-                Ok(joined) => {
-                    joined.map_err(|error| ToolExecutionPlaneError::Worker(error.to_string()))?
-                }
+                Ok(joined) => joined.unwrap_or_else(|error| {
+                    Err(ToolExecutionPlaneError::Worker(error.to_string()))
+                }),
                 Err(_) => {
+                    soft_timed_out = true;
                     self.counters
                         .timed_out_waiters
                         .fetch_add(1, Ordering::Relaxed);
-                    if let Some(supervisor) =
-                        self.supervisor.get().and_then(std::sync::Weak::upgrade)
-                    {
-                        supervisor.reap_join_handle("tool_blocking_reaper", worker);
-                    } else {
-                        tracing::warn!(
-                            "timed-out tool blocking worker has no Runtime execution supervisor"
-                        );
-                    }
-                    Err(ToolExecutionPlaneError::TimedOut(timeout))
+                    tracing::warn!(
+                        ?timeout,
+                        "synchronous tool crossed its soft timeout; waiting for truthful completion"
+                    );
+                    worker.await.unwrap_or_else(|error| {
+                        Err(ToolExecutionPlaneError::Worker(error.to_string()))
+                    })
                 }
             }
         } else {
             worker
                 .await
-                .map_err(|error| ToolExecutionPlaneError::Worker(error.to_string()))?
+                .unwrap_or_else(|error| Err(ToolExecutionPlaneError::Worker(error.to_string())))
         };
-        let result_class = match &execution {
-            Ok(_) => ResourceResultClass::Completed,
-            Err(ToolExecutionPlaneError::TimedOut(_)) => ResourceResultClass::TimedOut,
-            Err(ToolExecutionPlaneError::Panicked | ToolExecutionPlaneError::Worker(_)) => {
-                ResourceResultClass::Failed
+        let result_class = if soft_timed_out {
+            ResourceResultClass::TimedOut
+        } else {
+            match &execution {
+                Ok(_) => ResourceResultClass::Completed,
+                Err(ToolExecutionPlaneError::TimedOut(_)) => ResourceResultClass::TimedOut,
+                Err(ToolExecutionPlaneError::Panicked | ToolExecutionPlaneError::Worker(_)) => {
+                    ResourceResultClass::Failed
+                }
+                Err(ToolExecutionPlaneError::Admission(_)) => {
+                    ResourceResultClass::DownstreamOverload
+                }
             }
-            Err(ToolExecutionPlaneError::Admission(_)) => ResourceResultClass::DownstreamOverload,
         };
-        let _ = self.resources.record_observation(
-            &ExecutionResourceKind::Tool,
-            ResourceObservation::terminal(queue_wait, service_started.elapsed(), result_class),
-        );
-        execution
+        admission.set_result_class(result_class);
+        (execution, Some(admission))
     }
 
     #[must_use]
@@ -174,6 +310,18 @@ impl ToolExecutionPlane {
             panicked: self.counters.panicked.load(Ordering::Relaxed),
         }
     }
+}
+
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn execution_resource_demands(demand: &ResourceDemand) -> Vec<(ExecutionResourceKind, usize)> {
@@ -275,20 +423,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_started_work_keeps_lease_until_real_completion() {
+    async fn soft_timeout_waits_for_truthful_completion() {
         let plane = plane(1);
-        let error = plane
+        plane
             .execute(
                 &ResourceDemand::default(),
                 Some(Duration::from_millis(5)),
                 || std::thread::sleep(Duration::from_millis(30)),
             )
             .await
-            .expect_err("waiter timeout");
-        assert!(matches!(error, ToolExecutionPlaneError::TimedOut(_)));
-        assert_eq!(plane.stats().active, 1);
-        tokio::time::sleep(Duration::from_millis(40)).await;
+            .expect("soft timeout must not invent a terminal result");
         assert_eq!(plane.stats().active, 0);
+        assert_eq!(plane.stats().timed_out_waiters, 1);
+    }
+
+    #[tokio::test]
+    async fn retained_admission_blocks_conflicts_until_terminal_owner_releases_it() {
+        let plane = plane(2);
+        let demand = ResourceDemand {
+            scopes: vec![ResourceScopeDemand {
+                key: "file:shared".to_string(),
+                access: ResourceAccess::Write,
+            }],
+            ..ResourceDemand::default()
+        };
+        let (first, admission) = plane
+            .execute_classified_retained(
+                &demand,
+                None,
+                ExecutionServiceClass::Interactive,
+                None,
+                || 1,
+            )
+            .await;
+        assert_eq!(first.expect("first execution"), 1);
+        let admission = admission.expect("retained admission");
+
+        let waiting = {
+            let plane = plane.clone();
+            let demand = demand.clone();
+            tokio::spawn(async move { plane.execute(&demand, None, || 2).await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!waiting.is_finished());
+
+        drop(admission);
+        assert_eq!(waiting.await.unwrap().unwrap(), 2);
     }
 
     #[tokio::test]

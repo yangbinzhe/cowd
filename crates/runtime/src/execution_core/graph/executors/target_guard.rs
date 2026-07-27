@@ -39,6 +39,7 @@ impl NodeExecutor for CompileTargetGuardExecutor {
             graph_id: context.graph.id.clone(),
             node_id: context.node.id,
             executor_kind: Self::KIND.to_string(),
+            service_class: context.graph.service_class,
             attempt: context.attempt,
             idempotency_key: context.node.idempotency_key,
             payload_ref: context.node.payload_ref,

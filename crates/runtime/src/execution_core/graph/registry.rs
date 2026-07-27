@@ -43,6 +43,8 @@ pub struct NodeExecutionTicket {
     pub graph_id: String,
     pub node_id: String,
     pub executor_kind: String,
+    #[serde(default)]
+    pub service_class: harness_contract::execution_graph::ExecutionServiceClass,
     pub attempt: u32,
     pub idempotency_key: String,
     pub payload_ref: String,

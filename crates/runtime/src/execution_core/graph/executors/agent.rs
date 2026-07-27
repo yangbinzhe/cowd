@@ -111,6 +111,7 @@ impl NodeExecutor for AgentTaskExecutor {
             graph_id: context.graph.id.clone(),
             node_id: context.node.id.clone(),
             executor_kind: Self::KIND.into(),
+            service_class: context.graph.service_class,
             attempt: context.attempt,
             idempotency_key: packet.idempotency_key,
             payload_ref: context.node.payload_ref,

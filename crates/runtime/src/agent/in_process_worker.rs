@@ -288,6 +288,13 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // parent session authority but must not inherit MainTurn's broad,
         // open-ended exploration profile.
         runtime.set_context_profile(ContextProfile::SubAgent);
+        runtime.set_execution_service_class(if binding.evaluation.is_some() {
+            harness_contract::execution_graph::ExecutionServiceClass::Maintenance
+        } else if packet.managed_invocation.is_some() {
+            harness_contract::execution_graph::ExecutionServiceClass::Background
+        } else {
+            harness_contract::execution_graph::ExecutionServiceClass::Foreground
+        });
         if let Some(limit) = agent_model_step_limit(packet.budget_lease.max_tokens) {
             runtime.set_model_step_limit_override(limit);
         }

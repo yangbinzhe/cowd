@@ -1,11 +1,15 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Notify;
 use uuid::Uuid;
+
+pub use harness_contract::execution_graph::ExecutionServiceClass;
+
+type ResourceGrantObserver = Arc<dyn Fn(&ResourceGrantReceipt) + Send + Sync>;
 
 /// Independently throttled execution resource families.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -16,6 +20,189 @@ pub enum ExecutionResourceKind {
     Agent,
     Tool,
     Custom(String),
+}
+
+const fn service_class_index(class: ExecutionServiceClass) -> usize {
+    match class {
+        ExecutionServiceClass::Interactive => 0,
+        ExecutionServiceClass::Foreground => 1,
+        ExecutionServiceClass::Background => 2,
+        ExecutionServiceClass::Maintenance => 3,
+    }
+}
+
+/// Versioned bounds for the single instance-local admission queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionAdmissionPolicy {
+    pub revision: u64,
+    pub max_pending_instance: usize,
+    pub max_pending_per_class: usize,
+    pub max_pending_per_key: usize,
+    pub aging_interval: Duration,
+}
+
+impl Default for ExecutionAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            revision: 1,
+            max_pending_instance: 4_096,
+            max_pending_per_class: 2_048,
+            max_pending_per_key: 512,
+            aging_interval: Duration::from_secs(5),
+        }
+    }
+}
+
+impl ExecutionAdmissionPolicy {
+    pub fn validate(self) -> Result<Self, ResourceAcquireError> {
+        if self.max_pending_instance == 0
+            || self.max_pending_per_class == 0
+            || self.max_pending_per_key == 0
+            || self.max_pending_per_class > self.max_pending_instance
+            || self.max_pending_per_key > self.max_pending_per_class
+            || self.aging_interval.is_zero()
+        {
+            return Err(ResourceAcquireError::InvalidAdmissionPolicy);
+        }
+        Ok(self)
+    }
+}
+
+/// One atomic admission request. Scope feasibility is supplied by the scope
+/// owner; this manager records and enforces the result without duplicating
+/// scope-lock ownership.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceAdmissionRequest {
+    pub request_id: Uuid,
+    pub requested_priority: Option<u8>,
+    pub deadline_at_ms: Option<u64>,
+    pub requested_service_class: ExecutionServiceClass,
+    pub parent_class_ceiling: Option<ExecutionServiceClass>,
+    pub demands: Vec<(ExecutionResourceKind, usize)>,
+    pub normalized_scope: Option<String>,
+    pub scope_feasible: bool,
+    pub fairness_key: String,
+}
+
+impl ResourceAdmissionRequest {
+    #[must_use]
+    pub fn new(
+        requested_service_class: ExecutionServiceClass,
+        demands: impl IntoIterator<Item = (ExecutionResourceKind, usize)>,
+    ) -> Self {
+        let demands = normalize_demands(demands);
+        Self {
+            request_id: Uuid::new_v4(),
+            requested_priority: None,
+            deadline_at_ms: None,
+            requested_service_class,
+            parent_class_ceiling: None,
+            fairness_key: default_fairness_key(&demands),
+            demands,
+            normalized_scope: None,
+            scope_feasible: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn resolved_service_class(&self) -> ExecutionServiceClass {
+        self.requested_service_class
+            .bounded_by(self.parent_class_ceiling)
+    }
+
+    #[must_use]
+    pub fn with_parent_class_ceiling(mut self, ceiling: ExecutionServiceClass) -> Self {
+        self.parent_class_ceiling = Some(ceiling);
+        self
+    }
+
+    #[must_use]
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.requested_priority = Some(priority);
+        self
+    }
+
+    #[must_use]
+    pub fn with_deadline_at_ms(mut self, deadline_at_ms: u64) -> Self {
+        self.deadline_at_ms = Some(deadline_at_ms);
+        self
+    }
+
+    #[must_use]
+    pub fn with_scope(mut self, normalized_scope: impl Into<String>, feasible: bool) -> Self {
+        let normalized_scope = normalized_scope.into();
+        let normalized_scope = normalized_scope.trim();
+        self.normalized_scope =
+            (!normalized_scope.is_empty()).then(|| normalized_scope.to_string());
+        self.scope_feasible = feasible;
+        self
+    }
+
+    #[must_use]
+    pub fn with_fairness_key(mut self, fairness_key: impl Into<String>) -> Self {
+        let fairness_key = fairness_key.into();
+        let fairness_key = fairness_key.trim();
+        if !fairness_key.is_empty() {
+            self.fairness_key = fairness_key.to_string();
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceWaitReason {
+    Capacity,
+    ClassFifo,
+    HigherServiceClass,
+    ScopeInfeasible,
+    DeadlineExpired,
+    InstancePendingLimit,
+    ClassPendingLimit,
+    KeyPendingLimit,
+}
+
+/// Auditable evidence emitted for every successful atomic grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceGrantReceipt {
+    pub request_id: Uuid,
+    pub requested_priority: Option<u8>,
+    pub deadline_at_ms: Option<u64>,
+    pub requested_service_class: ExecutionServiceClass,
+    pub resolved_service_class: ExecutionServiceClass,
+    pub parent_class_ceiling: Option<ExecutionServiceClass>,
+    pub demands: Vec<(ExecutionResourceKind, usize)>,
+    pub normalized_scope: Option<String>,
+    pub fairness_key: String,
+    pub enqueue_sequence: u64,
+    pub enqueued_at_ms: u64,
+    pub granted_at_ms: u64,
+    pub queue_age_ms: u64,
+    pub wait_reason: Option<ResourceWaitReason>,
+    pub blocker: Option<Uuid>,
+    pub policy_revision: u64,
+}
+
+/// Terminal result of the single fair admission API.
+// Keep the hot-path grant inline; boxing its receipt would add an allocation to every admission.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum ResourceAdmissionDecision {
+    Granted {
+        lease: ExecutionResourceLease,
+        receipt: ResourceGrantReceipt,
+    },
+    Deferred {
+        request_id: Uuid,
+        wait_reason: ResourceWaitReason,
+        policy_revision: u64,
+    },
+    Overloaded {
+        request_id: Uuid,
+        wait_reason: ResourceWaitReason,
+        policy_revision: u64,
+        pending: usize,
+    },
 }
 
 /// Bounds used when adapting an effective concurrency limit.
@@ -170,6 +357,14 @@ pub enum ResourceAcquireError {
     },
     #[error("resource waiter registration was lost before acquisition")]
     RegistrationLost,
+    #[error("invalid resource admission policy")]
+    InvalidAdmissionPolicy,
+    #[error("resource admission request id is already pending or active: {0}")]
+    DuplicateRequest(Uuid),
+    #[error("resource admission queue is overloaded: {reason:?}")]
+    AdmissionOverloaded { reason: ResourceWaitReason },
+    #[error("resource admission was deferred: {reason:?}")]
+    AdmissionDeferred { reason: ResourceWaitReason },
     #[error("timed out waiting for resource {kind:?} after {waited_ms} ms")]
     TimedOut {
         kind: ExecutionResourceKind,
@@ -197,6 +392,20 @@ struct ActiveResourceDemand {
 struct PendingResourceDemand {
     id: Uuid,
     demands: Vec<(ExecutionResourceKind, usize)>,
+    requested_priority: Option<u8>,
+    deadline_at_ms: Option<u64>,
+    requested_service_class: ExecutionServiceClass,
+    resolved_service_class: ExecutionServiceClass,
+    parent_class_ceiling: Option<ExecutionServiceClass>,
+    normalized_scope: Option<String>,
+    scope_feasible: bool,
+    fairness_key: String,
+    enqueue_sequence: u64,
+    enqueued_at_ms: u64,
+    enqueued_at: Instant,
+    policy_revision: u64,
+    last_wait_reason: Option<ResourceWaitReason>,
+    last_blocker: Option<Uuid>,
 }
 
 const RESOURCE_SAMPLE_CAPACITY: usize = 256;
@@ -211,6 +420,8 @@ const FAILURE_TIMEOUT_UCB_THRESHOLD_BP: u16 = 3_500;
 struct ManagerState {
     resources: HashMap<ExecutionResourceKind, ResourceState>,
     waiters: VecDeque<PendingResourceDemand>,
+    admission_policy: ExecutionAdmissionPolicy,
+    next_enqueue_sequence: u64,
 }
 
 #[derive(Debug, Default)]
@@ -244,13 +455,41 @@ struct IncreaseBaseline {
 }
 
 /// Instance-owned dynamic quota and backpressure manager.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ExecutionResourceManager {
     shared: Arc<Shared>,
+    grant_observer: Arc<OnceLock<ResourceGrantObserver>>,
+}
+
+impl std::fmt::Debug for ExecutionResourceManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionResourceManager")
+            .field(
+                "grant_observer_installed",
+                &self.grant_observer.get().is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl ExecutionResourceManager {
     pub fn new(quotas: impl IntoIterator<Item = (ExecutionResourceKind, ResourceQuota)>) -> Self {
+        Self::from_validated_policy(quotas, ExecutionAdmissionPolicy::default())
+    }
+
+    pub fn with_admission_policy(
+        quotas: impl IntoIterator<Item = (ExecutionResourceKind, ResourceQuota)>,
+        admission_policy: ExecutionAdmissionPolicy,
+    ) -> Result<Self, ResourceAcquireError> {
+        let admission_policy = admission_policy.validate()?;
+        Ok(Self::from_validated_policy(quotas, admission_policy))
+    }
+
+    fn from_validated_policy(
+        quotas: impl IntoIterator<Item = (ExecutionResourceKind, ResourceQuota)>,
+        admission_policy: ExecutionAdmissionPolicy,
+    ) -> Self {
         let resources = quotas
             .into_iter()
             .map(|(kind, quota)| {
@@ -271,10 +510,22 @@ impl ExecutionResourceManager {
                 state: Mutex::new(ManagerState {
                     resources,
                     waiters: VecDeque::new(),
+                    admission_policy,
+                    next_enqueue_sequence: 0,
                 }),
                 changed: Notify::new(),
             }),
+            grant_observer: Arc::new(OnceLock::new()),
         }
+    }
+
+    pub(crate) fn install_grant_observer(
+        &self,
+        observer: impl Fn(&ResourceGrantReceipt) + Send + Sync + 'static,
+    ) -> Result<(), &'static str> {
+        self.grant_observer
+            .set(Arc::new(observer))
+            .map_err(|_| "resource grant observer is already installed")
     }
 
     /// Records one typed terminal observation and applies the sole adaptive
@@ -358,114 +609,210 @@ impl ExecutionResourceManager {
 
     /// Atomically acquires a weighted set of resource families.
     ///
-    /// A waiter may bypass an earlier waiter only when their demand sets are
-    /// disjoint. This preserves FIFO fairness for contended resources without
-    /// serializing independent Provider, Agent, Tool, process, or network work.
+    /// Existing callers enter the canonical admission queue as foreground
+    /// work. Typed callers should use [`Self::admit`] to provide service class,
+    /// parent ceiling, deadline, scope evidence, and a fairness key.
     pub async fn acquire_bundle(
         &self,
         demands: impl IntoIterator<Item = (ExecutionResourceKind, usize)>,
         timeout: Option<Duration>,
     ) -> Result<ExecutionResourceLease, ResourceAcquireError> {
-        let demands = normalize_demands(demands);
-        let waiter_id = Uuid::new_v4();
-        {
+        let request = ResourceAdmissionRequest::new(ExecutionServiceClass::Foreground, demands);
+        let kind = request.demands[0].0.clone();
+        match self.admit_with_timeout(request, timeout).await? {
+            ResourceAdmissionDecision::Granted { lease, .. } => Ok(lease),
+            ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
+                Err(ResourceAcquireError::AdmissionOverloaded {
+                    reason: wait_reason,
+                })
+            }
+            ResourceAdmissionDecision::Deferred {
+                wait_reason: ResourceWaitReason::DeadlineExpired,
+                ..
+            } => Err(ResourceAcquireError::TimedOut {
+                kind,
+                waited_ms: timeout.map_or(0, duration_millis),
+            }),
+            ResourceAdmissionDecision::Deferred { wait_reason, .. } => {
+                Err(ResourceAcquireError::AdmissionDeferred {
+                    reason: wait_reason,
+                })
+            }
+        }
+    }
+
+    /// The sole fair admission API. It resolves the child ceiling, registers a
+    /// bounded waiter, and grants the complete resource bundle atomically.
+    pub async fn admit(
+        &self,
+        request: ResourceAdmissionRequest,
+    ) -> Result<ResourceAdmissionDecision, ResourceAcquireError> {
+        self.admit_with_timeout(request, None).await
+    }
+
+    /// Wait for one admission-state transition without exposing queue
+    /// ownership. Durable graph pumps use this only after typed overload; the
+    /// bounded fallback closes the `notify_waiters` registration race.
+    pub(crate) async fn wait_for_change(&self) {
+        let notified = self.shared.changed.notified();
+        tokio::select! {
+            () = notified => {}
+            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+        }
+    }
+
+    async fn admit_with_timeout(
+        &self,
+        mut request: ResourceAdmissionRequest,
+        timeout: Option<Duration>,
+    ) -> Result<ResourceAdmissionDecision, ResourceAcquireError> {
+        request.demands = normalize_demands(request.demands);
+        if request.fairness_key.trim().is_empty() {
+            request.fairness_key = default_fairness_key(&request.demands);
+        }
+        let resolved_service_class = request.resolved_service_class();
+        let started = Instant::now();
+        let policy_revision = {
             let mut guard = self
                 .shared
                 .state
                 .lock()
                 .map_err(|_| ResourceAcquireError::Poisoned)?;
-            for (kind, weight) in &demands {
-                let state = guard
-                    .resources
-                    .get(kind)
-                    .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
-                if *weight > state.quota.maximum {
-                    return Err(ResourceAcquireError::DemandExceedsQuota {
-                        kind: kind.clone(),
-                        demand: *weight,
-                        maximum: state.quota.maximum,
-                    });
-                }
+            validate_request_resources(&guard, &request)?;
+            if request
+                .deadline_at_ms
+                .is_some_and(|deadline| deadline <= now_ms())
+            {
+                return Ok(ResourceAdmissionDecision::Deferred {
+                    request_id: request.request_id,
+                    wait_reason: ResourceWaitReason::DeadlineExpired,
+                    policy_revision: guard.admission_policy.revision,
+                });
             }
+            if !request.scope_feasible {
+                return Ok(ResourceAdmissionDecision::Deferred {
+                    request_id: request.request_id,
+                    wait_reason: ResourceWaitReason::ScopeInfeasible,
+                    policy_revision: guard.admission_policy.revision,
+                });
+            }
+            if request_id_exists(&guard, request.request_id) {
+                return Err(ResourceAcquireError::DuplicateRequest(request.request_id));
+            }
+            if let Some(reason) =
+                pending_limit_reason(&guard, resolved_service_class, &request.fairness_key)
+            {
+                return Ok(ResourceAdmissionDecision::Overloaded {
+                    request_id: request.request_id,
+                    wait_reason: reason,
+                    policy_revision: guard.admission_policy.revision,
+                    pending: guard.waiters.len(),
+                });
+            }
+            let enqueue_sequence = guard.next_enqueue_sequence;
+            guard.next_enqueue_sequence = guard.next_enqueue_sequence.wrapping_add(1);
+            let enqueued_at_ms = now_ms();
+            let policy_revision = guard.admission_policy.revision;
             guard.waiters.push_back(PendingResourceDemand {
-                id: waiter_id,
-                demands: demands.clone(),
+                id: request.request_id,
+                demands: request.demands.clone(),
+                requested_priority: request.requested_priority,
+                deadline_at_ms: request.deadline_at_ms,
+                requested_service_class: request.requested_service_class,
+                resolved_service_class,
+                parent_class_ceiling: request.parent_class_ceiling,
+                normalized_scope: request.normalized_scope.clone(),
+                scope_feasible: request.scope_feasible,
+                fairness_key: request.fairness_key.clone(),
+                enqueue_sequence,
+                enqueued_at_ms,
+                enqueued_at: started,
+                policy_revision,
+                last_wait_reason: None,
+                last_blocker: None,
             });
-        }
+            policy_revision
+        };
+        self.shared.changed.notify_waiters();
 
-        let started = Instant::now();
         let mut registration = WaiterRegistration {
             shared: Arc::clone(&self.shared),
-            waiter_id,
-            demands: demands.clone(),
+            waiter_id: request.request_id,
+            demands: request.demands.clone(),
             started,
             active: true,
         };
 
         loop {
             let notified = self.shared.changed.notified();
-            let acquired = {
+            let outcome = {
                 let mut guard = self
                     .shared
                     .state
                     .lock()
                     .map_err(|_| ResourceAcquireError::Poisoned)?;
-                let position = guard
-                    .waiters
-                    .iter()
-                    .position(|waiter| waiter.id == waiter_id)
-                    .ok_or(ResourceAcquireError::RegistrationLost)?;
-                let blocked_by_earlier_conflict = guard
-                    .waiters
-                    .iter()
-                    .take(position)
-                    .any(|earlier| demand_sets_overlap(&demands, &earlier.demands));
-                let has_capacity = demands.iter().all(|(kind, weight)| {
-                    guard.resources.get(kind).is_some_and(|state| {
-                        active_weight(state).saturating_add(*weight) <= state.effective_limit
-                    })
-                });
-                if !blocked_by_earlier_conflict && has_capacity {
-                    guard.waiters.remove(position);
-                    for (kind, weight) in &demands {
-                        let Some(state) = guard.resources.get_mut(kind) else {
-                            return Err(ResourceAcquireError::RegistrationLost);
-                        };
-                        state
-                            .active
-                            .insert(waiter_id, ActiveResourceDemand { weight: *weight });
-                    }
-                    true
-                } else {
-                    false
-                }
+                evaluate_and_grant(&mut guard, request.request_id, Instant::now(), now_ms())?
             };
 
-            if acquired {
-                registration.active = false;
-                return Ok(ExecutionResourceLease {
-                    shared: Arc::clone(&self.shared),
-                    demands,
-                    lease_id: waiter_id,
-                    queue_wait: started.elapsed(),
-                    released: false,
-                });
+            match outcome {
+                AdmissionAttempt::Granted { receipt } => {
+                    registration.active = false;
+                    self.shared.changed.notify_waiters();
+                    if let Some(observer) = self.grant_observer.get() {
+                        observer(&receipt);
+                    }
+                    return Ok(ResourceAdmissionDecision::Granted {
+                        lease: ExecutionResourceLease {
+                            shared: Arc::clone(&self.shared),
+                            demands: request.demands.clone(),
+                            lease_id: request.request_id,
+                            queue_wait: started.elapsed(),
+                            released: false,
+                        },
+                        receipt,
+                    });
+                }
+                AdmissionAttempt::Deferred {
+                    wait_reason: ResourceWaitReason::DeadlineExpired,
+                    ..
+                } => {
+                    registration.finish(ResourceResultClass::TimedOut);
+                    return Ok(ResourceAdmissionDecision::Deferred {
+                        request_id: request.request_id,
+                        wait_reason: ResourceWaitReason::DeadlineExpired,
+                        policy_revision,
+                    });
+                }
+                AdmissionAttempt::Deferred { .. } => {}
             }
 
-            if let Some(limit) = timeout {
-                let Some(remaining) = limit.checked_sub(started.elapsed()) else {
-                    registration.finish(ResourceResultClass::TimedOut);
-                    return Err(ResourceAcquireError::TimedOut {
-                        kind: demands[0].0.clone(),
-                        waited_ms: duration_millis(limit),
-                    });
-                };
-                if tokio::time::timeout(remaining, notified).await.is_err() {
-                    registration.finish(ResourceResultClass::TimedOut);
-                    return Err(ResourceAcquireError::TimedOut {
-                        kind: demands[0].0.clone(),
-                        waited_ms: duration_millis(limit),
-                    });
+            let recheck_after = {
+                let guard = self
+                    .shared
+                    .state
+                    .lock()
+                    .map_err(|_| ResourceAcquireError::Poisoned)?;
+                scheduler_recheck_after(&guard, request.request_id, Instant::now(), now_ms())
+            };
+            let remaining_timeout = timeout.and_then(|limit| limit.checked_sub(started.elapsed()));
+            if timeout.is_some() && remaining_timeout.is_none() {
+                registration.finish(ResourceResultClass::TimedOut);
+                return Ok(ResourceAdmissionDecision::Deferred {
+                    request_id: request.request_id,
+                    wait_reason: ResourceWaitReason::DeadlineExpired,
+                    policy_revision,
+                });
+            }
+            let sleep_for = match (recheck_after, remaining_timeout) {
+                (Some(recheck), Some(remaining)) => Some(recheck.min(remaining)),
+                (Some(recheck), None) => Some(recheck),
+                (None, Some(remaining)) => Some(remaining),
+                (None, None) => None,
+            };
+            if let Some(sleep_for) = sleep_for {
+                tokio::select! {
+                    () = notified => {}
+                    () = tokio::time::sleep(sleep_for) => {}
                 }
             } else {
                 notified.await;
@@ -518,6 +865,302 @@ impl ExecutionResourceManager {
     }
 }
 
+#[derive(Debug)]
+enum AdmissionAttempt {
+    Granted { receipt: ResourceGrantReceipt },
+    Deferred { wait_reason: ResourceWaitReason },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AdmissionEvaluation {
+    Grantable {
+        wait_reason: Option<ResourceWaitReason>,
+        blocker: Option<Uuid>,
+    },
+    Deferred {
+        wait_reason: ResourceWaitReason,
+        blocker: Option<Uuid>,
+    },
+}
+
+fn validate_request_resources(
+    state: &ManagerState,
+    request: &ResourceAdmissionRequest,
+) -> Result<(), ResourceAcquireError> {
+    for (kind, weight) in &request.demands {
+        let resource = state
+            .resources
+            .get(kind)
+            .ok_or_else(|| ResourceAcquireError::UnknownResource(kind.clone()))?;
+        if *weight > resource.quota.maximum {
+            return Err(ResourceAcquireError::DemandExceedsQuota {
+                kind: kind.clone(),
+                demand: *weight,
+                maximum: resource.quota.maximum,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn request_id_exists(state: &ManagerState, request_id: Uuid) -> bool {
+    state.waiters.iter().any(|waiter| waiter.id == request_id)
+        || state
+            .resources
+            .values()
+            .any(|resource| resource.active.contains_key(&request_id))
+}
+
+fn pending_limit_reason(
+    state: &ManagerState,
+    service_class: ExecutionServiceClass,
+    fairness_key: &str,
+) -> Option<ResourceWaitReason> {
+    if state.waiters.len() >= state.admission_policy.max_pending_instance {
+        return Some(ResourceWaitReason::InstancePendingLimit);
+    }
+    let class_pending = state
+        .waiters
+        .iter()
+        .filter(|waiter| waiter.resolved_service_class == service_class)
+        .count();
+    if class_pending >= state.admission_policy.max_pending_per_class {
+        return Some(ResourceWaitReason::ClassPendingLimit);
+    }
+    let key_pending = state
+        .waiters
+        .iter()
+        .filter(|waiter| waiter.fairness_key == fairness_key)
+        .count();
+    (key_pending >= state.admission_policy.max_pending_per_key)
+        .then_some(ResourceWaitReason::KeyPendingLimit)
+}
+
+fn evaluate_and_grant(
+    state: &mut ManagerState,
+    request_id: Uuid,
+    now: Instant,
+    wall_now_ms: u64,
+) -> Result<AdmissionAttempt, ResourceAcquireError> {
+    let position = state
+        .waiters
+        .iter()
+        .position(|waiter| waiter.id == request_id)
+        .ok_or(ResourceAcquireError::RegistrationLost)?;
+    let evaluation = evaluate_waiter(state, position, now, wall_now_ms);
+    match evaluation {
+        AdmissionEvaluation::Grantable {
+            wait_reason,
+            blocker,
+        } => {
+            let waiter = state
+                .waiters
+                .remove(position)
+                .ok_or(ResourceAcquireError::RegistrationLost)?;
+            for (kind, weight) in &waiter.demands {
+                let resource = state
+                    .resources
+                    .get_mut(kind)
+                    .ok_or(ResourceAcquireError::RegistrationLost)?;
+                resource
+                    .active
+                    .insert(waiter.id, ActiveResourceDemand { weight: *weight });
+            }
+            Ok(AdmissionAttempt::Granted {
+                receipt: ResourceGrantReceipt {
+                    request_id: waiter.id,
+                    requested_priority: waiter.requested_priority,
+                    deadline_at_ms: waiter.deadline_at_ms,
+                    requested_service_class: waiter.requested_service_class,
+                    resolved_service_class: waiter.resolved_service_class,
+                    parent_class_ceiling: waiter.parent_class_ceiling,
+                    demands: waiter.demands,
+                    normalized_scope: waiter.normalized_scope,
+                    fairness_key: waiter.fairness_key,
+                    enqueue_sequence: waiter.enqueue_sequence,
+                    enqueued_at_ms: waiter.enqueued_at_ms,
+                    granted_at_ms: wall_now_ms,
+                    queue_age_ms: duration_millis(
+                        now.saturating_duration_since(waiter.enqueued_at),
+                    ),
+                    wait_reason,
+                    blocker,
+                    policy_revision: waiter.policy_revision,
+                },
+            })
+        }
+        AdmissionEvaluation::Deferred {
+            wait_reason,
+            blocker,
+        } => {
+            let waiter = state
+                .waiters
+                .get_mut(position)
+                .ok_or(ResourceAcquireError::RegistrationLost)?;
+            waiter.last_wait_reason = Some(wait_reason);
+            waiter.last_blocker = blocker;
+            Ok(AdmissionAttempt::Deferred { wait_reason })
+        }
+    }
+}
+
+fn evaluate_waiter(
+    state: &ManagerState,
+    position: usize,
+    now: Instant,
+    wall_now_ms: u64,
+) -> AdmissionEvaluation {
+    let waiter = &state.waiters[position];
+    if waiter
+        .deadline_at_ms
+        .is_some_and(|deadline| deadline <= wall_now_ms)
+    {
+        return AdmissionEvaluation::Deferred {
+            wait_reason: ResourceWaitReason::DeadlineExpired,
+            blocker: None,
+        };
+    }
+    if !waiter.scope_feasible {
+        return AdmissionEvaluation::Deferred {
+            wait_reason: ResourceWaitReason::ScopeInfeasible,
+            blocker: None,
+        };
+    }
+    if let Some(blocker) = same_class_fifo_blocker(state, position) {
+        return AdmissionEvaluation::Deferred {
+            wait_reason: ResourceWaitReason::ClassFifo,
+            blocker: Some(blocker),
+        };
+    }
+    if let Some(blocker) = capacity_blocker(state, &waiter.demands) {
+        return AdmissionEvaluation::Deferred {
+            wait_reason: ResourceWaitReason::Capacity,
+            blocker,
+        };
+    }
+
+    let precedence = scheduling_precedence(waiter, now, state.admission_policy.aging_interval);
+    let mut first_demand_owner_by_class =
+        std::array::from_fn::<_, 4, _>(|_| HashMap::<ExecutionResourceKind, Uuid>::new());
+    let mut higher = None::<((usize, u64), Uuid)>;
+    for (other_position, other) in state.waiters.iter().enumerate() {
+        let class_demands =
+            &mut first_demand_owner_by_class[service_class_index(other.resolved_service_class)];
+        let fifo_blocked = other
+            .demands
+            .iter()
+            .find_map(|(kind, _)| class_demands.get(kind).copied())
+            .is_some();
+        if other_position != position
+            && other.resolved_service_class != waiter.resolved_service_class
+            && demand_sets_overlap(&waiter.demands, &other.demands)
+            && other.scope_feasible
+            && other
+                .deadline_at_ms
+                .is_none_or(|deadline| deadline > wall_now_ms)
+            && !fifo_blocked
+            && capacity_blocker(state, &other.demands).is_none()
+        {
+            let other_precedence =
+                scheduling_precedence(other, now, state.admission_policy.aging_interval);
+            if other_precedence < precedence
+                && higher.is_none_or(|(selected, _)| other_precedence < selected)
+            {
+                higher = Some((other_precedence, other.id));
+            }
+        }
+        for (kind, _) in &other.demands {
+            class_demands.entry(kind.clone()).or_insert(other.id);
+        }
+    }
+    let higher = higher.map(|(_, request_id)| request_id);
+    if let Some(blocker) = higher {
+        return AdmissionEvaluation::Deferred {
+            wait_reason: ResourceWaitReason::HigherServiceClass,
+            blocker: Some(blocker),
+        };
+    }
+
+    AdmissionEvaluation::Grantable {
+        wait_reason: waiter.last_wait_reason,
+        blocker: waiter.last_blocker,
+    }
+}
+
+fn same_class_fifo_blocker(state: &ManagerState, position: usize) -> Option<Uuid> {
+    let waiter = &state.waiters[position];
+    state
+        .waiters
+        .iter()
+        .take(position)
+        .find(|earlier| {
+            earlier.resolved_service_class == waiter.resolved_service_class
+                && demand_sets_overlap(&earlier.demands, &waiter.demands)
+        })
+        .map(|earlier| earlier.id)
+}
+
+fn capacity_blocker(
+    state: &ManagerState,
+    demands: &[(ExecutionResourceKind, usize)],
+) -> Option<Option<Uuid>> {
+    demands.iter().find_map(|(kind, weight)| {
+        let resource = state.resources.get(kind)?;
+        (active_weight(resource).saturating_add(*weight) > resource.effective_limit)
+            .then(|| resource.active.keys().copied().min())
+    })
+}
+
+fn scheduling_precedence(
+    waiter: &PendingResourceDemand,
+    now: Instant,
+    aging_interval: Duration,
+) -> (usize, u64) {
+    let age_steps = duration_millis(now.saturating_duration_since(waiter.enqueued_at))
+        / duration_millis(aging_interval).max(1);
+    (
+        service_class_index(waiter.resolved_service_class).saturating_sub(age_steps as usize),
+        waiter.enqueue_sequence,
+    )
+}
+
+fn scheduler_recheck_after(
+    state: &ManagerState,
+    request_id: Uuid,
+    now: Instant,
+    wall_now_ms: u64,
+) -> Option<Duration> {
+    let aging_interval = state.admission_policy.aging_interval;
+    let mut next = state
+        .waiters
+        .iter()
+        .filter_map(|waiter| {
+            let rank = service_class_index(waiter.resolved_service_class);
+            if rank == 0 {
+                return None;
+            }
+            let age = now.saturating_duration_since(waiter.enqueued_at);
+            let elapsed_steps = duration_millis(age) / duration_millis(aging_interval).max(1);
+            if elapsed_steps >= rank as u64 {
+                return None;
+            }
+            let next_boundary = aging_interval.saturating_mul((elapsed_steps + 1) as u32);
+            Some(next_boundary.saturating_sub(age))
+        })
+        .min();
+    if let Some(deadline) = state
+        .waiters
+        .iter()
+        .find(|waiter| waiter.id == request_id)
+        .and_then(|waiter| waiter.deadline_at_ms)
+    {
+        let until_deadline = Duration::from_millis(deadline.saturating_sub(wall_now_ms));
+        next = Some(next.map_or(until_deadline, |current| current.min(until_deadline)));
+    }
+    next
+}
+
+#[derive(Debug)]
 pub struct ExecutionResourceLease {
     shared: Arc<Shared>,
     demands: Vec<(ExecutionResourceKind, usize)>,
@@ -684,6 +1327,15 @@ fn normalize_demands(
         normalized.push((ExecutionResourceKind::Tool, 1));
     }
     normalized
+}
+
+fn default_fairness_key(demands: &[(ExecutionResourceKind, usize)]) -> String {
+    let kinds = demands
+        .iter()
+        .map(|(kind, _)| format!("{kind:?}"))
+        .collect::<Vec<_>>()
+        .join("+");
+    format!("resource:{kinds}")
 }
 
 fn demand_sets_overlap(
@@ -987,6 +1639,459 @@ mod tests {
             Duration::from_millis(service_ms),
             result_class,
         )
+    }
+
+    fn admission_policy(
+        max_pending_instance: usize,
+        max_pending_per_class: usize,
+        max_pending_per_key: usize,
+    ) -> ExecutionAdmissionPolicy {
+        ExecutionAdmissionPolicy {
+            revision: 7,
+            max_pending_instance,
+            max_pending_per_class,
+            max_pending_per_key,
+            aging_interval: Duration::from_millis(10),
+        }
+    }
+
+    fn fair_manager(limit: usize, policy: ExecutionAdmissionPolicy) -> ExecutionResourceManager {
+        ExecutionResourceManager::with_admission_policy(
+            [
+                (
+                    ExecutionResourceKind::Tool,
+                    ResourceQuota::new(1, limit, limit).unwrap(),
+                ),
+                (
+                    ExecutionResourceKind::Provider,
+                    ResourceQuota::new(1, limit, limit).unwrap(),
+                ),
+            ],
+            policy,
+        )
+        .unwrap()
+    }
+
+    async fn wait_for_pending(
+        manager: &ExecutionResourceManager,
+        kind: &ExecutionResourceKind,
+        expected: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.snapshot(kind).unwrap().queued_waiters == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter must register");
+    }
+
+    fn granted(
+        decision: ResourceAdmissionDecision,
+    ) -> (ExecutionResourceLease, ResourceGrantReceipt) {
+        match decision {
+            ResourceAdmissionDecision::Granted { lease, receipt } => (lease, receipt),
+            decision => panic!("expected grant, got {decision:?}"),
+        }
+    }
+
+    #[test]
+    fn service_classes_are_fixed_and_child_ceiling_cannot_promote() {
+        let classes = [
+            ExecutionServiceClass::Interactive,
+            ExecutionServiceClass::Foreground,
+            ExecutionServiceClass::Background,
+            ExecutionServiceClass::Maintenance,
+        ];
+        assert_eq!(classes.len(), 4);
+        assert_eq!(
+            ExecutionServiceClass::Interactive.bounded_by(Some(ExecutionServiceClass::Background)),
+            ExecutionServiceClass::Background
+        );
+        assert_eq!(
+            ExecutionServiceClass::Maintenance.bounded_by(Some(ExecutionServiceClass::Foreground)),
+            ExecutionServiceClass::Maintenance
+        );
+    }
+
+    #[test]
+    fn invalid_pending_bounds_fail_closed() {
+        let invalid = admission_policy(2, 3, 1);
+        assert_eq!(
+            ExecutionResourceManager::with_admission_policy([], invalid).unwrap_err(),
+            ResourceAcquireError::InvalidAdmissionPolicy
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_receipt_records_resolved_class_wait_and_policy_evidence() {
+        let manager = fair_manager(1, admission_policy(8, 4, 2));
+        let occupied = manager
+            .acquire(ExecutionResourceKind::Tool, None)
+            .await
+            .unwrap();
+        let request = ResourceAdmissionRequest::new(
+            ExecutionServiceClass::Interactive,
+            [(ExecutionResourceKind::Tool, 1)],
+        )
+        .with_parent_class_ceiling(ExecutionServiceClass::Background)
+        .with_priority(91)
+        .with_scope("workspace:/tmp/project", true)
+        .with_fairness_key("session:receipt");
+        let request_id = request.request_id;
+        let waiter = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.admit(request).await.unwrap() })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 1).await;
+        drop(occupied);
+        let (lease, receipt) = granted(waiter.await.unwrap());
+        assert_eq!(receipt.request_id, request_id);
+        assert_eq!(
+            receipt.requested_service_class,
+            ExecutionServiceClass::Interactive
+        );
+        assert_eq!(
+            receipt.resolved_service_class,
+            ExecutionServiceClass::Background
+        );
+        assert_eq!(receipt.requested_priority, Some(91));
+        assert_eq!(receipt.policy_revision, 7);
+        assert_eq!(receipt.wait_reason, Some(ResourceWaitReason::Capacity));
+        assert!(receipt.blocker.is_some());
+        assert_eq!(
+            receipt.normalized_scope.as_deref(),
+            Some("workspace:/tmp/project")
+        );
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn same_class_contended_requests_are_stable_fifo() {
+        let manager = fair_manager(1, admission_policy(8, 4, 4));
+        let occupied = manager
+            .acquire(ExecutionResourceKind::Tool, None)
+            .await
+            .unwrap();
+        let first = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit(
+                        ResourceAdmissionRequest::new(
+                            ExecutionServiceClass::Foreground,
+                            [(ExecutionResourceKind::Tool, 1)],
+                        )
+                        .with_fairness_key("session:first"),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 1).await;
+        let second = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit(
+                        ResourceAdmissionRequest::new(
+                            ExecutionServiceClass::Foreground,
+                            [(ExecutionResourceKind::Tool, 1)],
+                        )
+                        .with_fairness_key("session:second"),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 2).await;
+        drop(occupied);
+        let (first_lease, first_receipt) = granted(
+            tokio::time::timeout(Duration::from_secs(1), first)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(!second.is_finished());
+        assert_eq!(first_receipt.enqueue_sequence, 1);
+        drop(first_lease);
+        let (second_lease, second_receipt) = granted(second.await.unwrap());
+        assert_eq!(second_receipt.enqueue_sequence, 2);
+        assert!(second_receipt.wait_reason.is_some());
+        drop(second_lease);
+    }
+
+    #[tokio::test]
+    async fn bounded_aging_eventually_serves_old_background_before_new_interactive() {
+        let manager = fair_manager(1, admission_policy(8, 4, 4));
+        let occupied = manager
+            .acquire(ExecutionResourceKind::Tool, None)
+            .await
+            .unwrap();
+        let background = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit(
+                        ResourceAdmissionRequest::new(
+                            ExecutionServiceClass::Background,
+                            [(ExecutionResourceKind::Tool, 1)],
+                        )
+                        .with_fairness_key("mission:old"),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 1).await;
+        {
+            let mut guard = manager.shared.state.lock().unwrap();
+            guard.waiters[0].enqueued_at = Instant::now()
+                .checked_sub(Duration::from_millis(30))
+                .unwrap();
+        }
+        let interactive = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit(
+                        ResourceAdmissionRequest::new(
+                            ExecutionServiceClass::Interactive,
+                            [(ExecutionResourceKind::Tool, 1)],
+                        )
+                        .with_fairness_key("session:new"),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 2).await;
+        drop(occupied);
+        let (background_lease, receipt) = granted(
+            tokio::time::timeout(Duration::from_secs(1), background)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            receipt.resolved_service_class,
+            ExecutionServiceClass::Background
+        );
+        assert!(!interactive.is_finished());
+        drop(background_lease);
+        let (interactive_lease, _) = granted(interactive.await.unwrap());
+        drop(interactive_lease);
+    }
+
+    #[tokio::test]
+    async fn infeasible_high_class_does_not_idle_disjoint_capacity() {
+        let manager = fair_manager(1, admission_policy(8, 4, 4));
+        let occupied = manager
+            .acquire(ExecutionResourceKind::Tool, None)
+            .await
+            .unwrap();
+        let blocked_interactive = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit(ResourceAdmissionRequest::new(
+                        ExecutionServiceClass::Interactive,
+                        [(ExecutionResourceKind::Tool, 1)],
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 1).await;
+        let background = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Background,
+                [(ExecutionResourceKind::Provider, 1)],
+            ))
+            .await
+            .unwrap();
+        let (background_lease, _) = granted(background);
+        assert!(!blocked_interactive.is_finished());
+        drop(background_lease);
+        drop(occupied);
+        let (interactive_lease, _) = granted(blocked_interactive.await.unwrap());
+        drop(interactive_lease);
+    }
+
+    #[tokio::test]
+    async fn lower_class_borrows_capacity_when_high_class_bundle_is_not_feasible() {
+        let manager = fair_manager(2, admission_policy(8, 4, 4));
+        let occupied = manager
+            .acquire(ExecutionResourceKind::Tool, None)
+            .await
+            .unwrap();
+        let blocked_interactive = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit(ResourceAdmissionRequest::new(
+                        ExecutionServiceClass::Interactive,
+                        [(ExecutionResourceKind::Tool, 2)],
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 1).await;
+        let background = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Background,
+                [(ExecutionResourceKind::Tool, 1)],
+            ))
+            .await
+            .unwrap();
+        let (background_lease, _) = granted(background);
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Tool)
+                .unwrap()
+                .active_leases,
+            2
+        );
+        assert!(!blocked_interactive.is_finished());
+        drop(background_lease);
+        drop(occupied);
+        let (interactive_lease, _) = granted(blocked_interactive.await.unwrap());
+        assert_eq!(interactive_lease.demands()[0].1, 2);
+        drop(interactive_lease);
+    }
+
+    #[tokio::test]
+    async fn scope_infeasibility_is_typed_and_never_enters_pending() {
+        let manager = fair_manager(1, admission_policy(8, 4, 4));
+        let decision = manager
+            .admit(
+                ResourceAdmissionRequest::new(
+                    ExecutionServiceClass::Foreground,
+                    [(ExecutionResourceKind::Tool, 1)],
+                )
+                .with_scope("workspace:/locked", false),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision,
+            ResourceAdmissionDecision::Deferred {
+                wait_reason: ResourceWaitReason::ScopeInfeasible,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Tool)
+                .unwrap()
+                .queued_waiters,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_is_typed_and_never_enters_pending() {
+        let manager = fair_manager(1, admission_policy(8, 4, 4));
+        let decision = manager
+            .admit(
+                ResourceAdmissionRequest::new(
+                    ExecutionServiceClass::Foreground,
+                    [(ExecutionResourceKind::Tool, 1)],
+                )
+                .with_deadline_at_ms(now_ms().saturating_sub(1)),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision,
+            ResourceAdmissionDecision::Deferred {
+                wait_reason: ResourceWaitReason::DeadlineExpired,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager
+                .snapshot(&ExecutionResourceKind::Tool)
+                .unwrap()
+                .queued_waiters,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_queue_is_bounded_by_instance_class_and_key() {
+        async fn overload_reason(
+            policy: ExecutionAdmissionPolicy,
+            second_class: ExecutionServiceClass,
+            second_key: &'static str,
+        ) -> ResourceWaitReason {
+            let manager = fair_manager(1, policy);
+            let occupied = manager
+                .acquire(ExecutionResourceKind::Tool, None)
+                .await
+                .unwrap();
+            let first = {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .admit(
+                            ResourceAdmissionRequest::new(
+                                ExecutionServiceClass::Foreground,
+                                [(ExecutionResourceKind::Tool, 1)],
+                            )
+                            .with_fairness_key("shared"),
+                        )
+                        .await
+                })
+            };
+            wait_for_pending(&manager, &ExecutionResourceKind::Tool, 1).await;
+            let decision = manager
+                .admit(
+                    ResourceAdmissionRequest::new(second_class, [(ExecutionResourceKind::Tool, 1)])
+                        .with_fairness_key(second_key),
+                )
+                .await
+                .unwrap();
+            first.abort();
+            let _ = first.await;
+            drop(occupied);
+            match decision {
+                ResourceAdmissionDecision::Overloaded { wait_reason, .. } => wait_reason,
+                decision => panic!("expected overload, got {decision:?}"),
+            }
+        }
+
+        assert_eq!(
+            overload_reason(
+                admission_policy(1, 1, 1),
+                ExecutionServiceClass::Background,
+                "other"
+            )
+            .await,
+            ResourceWaitReason::InstancePendingLimit
+        );
+        assert_eq!(
+            overload_reason(
+                admission_policy(2, 1, 1),
+                ExecutionServiceClass::Foreground,
+                "other"
+            )
+            .await,
+            ResourceWaitReason::ClassPendingLimit
+        );
+        assert_eq!(
+            overload_reason(
+                admission_policy(2, 2, 1),
+                ExecutionServiceClass::Background,
+                "shared"
+            )
+            .await,
+            ResourceWaitReason::KeyPendingLimit
+        );
     }
 
     #[test]

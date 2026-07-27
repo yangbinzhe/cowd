@@ -49,7 +49,7 @@ fn recovered_claim_can_only_be_started_by_newer_dispatcher_fence() {
         .trigger_manual("workspace/cowd/fenced-watch", "manual-1", 2)
         .expect("invocation");
     let stale_claim = dispatcher
-        .claim_ready("dispatcher-a", 3, 1)
+        .claim_ready("dispatcher-a", 3, 30_000, 1)
         .expect("claim")
         .pop()
         .expect("one claim");
@@ -62,7 +62,7 @@ fn recovered_claim_can_only_be_started_by_newer_dispatcher_fence() {
     let recovered = dispatcher.invocations().expect("projection");
     assert_eq!(recovered[0].status, ManagedAgentInvocationStatus::Pending);
     let fresh_claim = dispatcher
-        .claim_ready("dispatcher-b", 5, 1)
+        .claim_ready("dispatcher-b", 5, 30_000, 1)
         .expect("new claim")
         .pop()
         .expect("one new claim");
@@ -72,15 +72,43 @@ fn recovered_claim_can_only_be_started_by_newer_dispatcher_fence() {
             &invocation.invocation_id,
             "dispatcher-a",
             stale_claim.fence_generation,
+            stale_claim
+                .claim_token
+                .as_deref()
+                .expect("stale claim token"),
             "stale-run".to_string(),
             6,
         )
         .is_err());
+    let fresh_claim_token = fresh_claim
+        .claim_token
+        .as_deref()
+        .expect("fresh claim token");
+    dispatcher
+        .begin_graph_registration(
+            &invocation.invocation_id,
+            "dispatcher-b",
+            fresh_claim.fence_generation,
+            fresh_claim_token,
+            "fresh-run".to_string(),
+        )
+        .expect("graph registration intent");
+    dispatcher
+        .materialize_invocation(
+            &invocation.invocation_id,
+            "dispatcher-b",
+            fresh_claim.fence_generation,
+            fresh_claim_token,
+            "fresh-run".to_string(),
+            "graph-receipt:fresh-run".to_string(),
+        )
+        .expect("graph registration receipt");
     dispatcher
         .start_invocation(
             &invocation.invocation_id,
             "dispatcher-b",
             fresh_claim.fence_generation,
+            fresh_claim_token,
             "fresh-run".to_string(),
             6,
         )

@@ -49,15 +49,36 @@ fn completed_effect_is_never_claimed_or_executed_twice() {
         .trigger_manual("workspace/cowd/effect-watch", "manual-1", 2)
         .expect("invocation");
     let claim = dispatcher
-        .claim_ready("dispatcher-a", 3, 1)
+        .claim_ready("dispatcher-a", 3, 30_000, 1)
         .expect("claim")
         .pop()
         .expect("one claim");
+    let claim_token = claim.claim_token.as_deref().expect("claim token");
+    dispatcher
+        .begin_graph_registration(
+            &invocation.invocation_id,
+            "dispatcher-a",
+            claim.fence_generation,
+            claim_token,
+            "run".to_string(),
+        )
+        .expect("graph registration intent");
+    dispatcher
+        .materialize_invocation(
+            &invocation.invocation_id,
+            "dispatcher-a",
+            claim.fence_generation,
+            claim_token,
+            "run".to_string(),
+            "graph-receipt:run".to_string(),
+        )
+        .expect("graph registration receipt");
     dispatcher
         .start_invocation(
             &invocation.invocation_id,
             "dispatcher-a",
             claim.fence_generation,
+            claim_token,
             "run".to_string(),
             4,
         )

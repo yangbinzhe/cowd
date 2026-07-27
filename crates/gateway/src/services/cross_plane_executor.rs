@@ -331,6 +331,7 @@ mod tests {
                 graph_id: "graph-1".into(),
                 node_id: "send-1".into(),
                 executor_kind: "cross_plane_connector".into(),
+                service_class: harness_contract::execution_graph::ExecutionServiceClass::Foreground,
                 attempt: 1,
                 idempotency_key: key.into(),
                 payload_ref: "payload".into(),

@@ -130,6 +130,11 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 id: request.graph_id.clone(),
                 revision: 0,
                 objective: request.objective.clone(),
+                service_class: if request.parent_execution.is_some() {
+                    harness_contract::execution_graph::ExecutionServiceClass::Foreground
+                } else {
+                    harness_contract::execution_graph::ExecutionServiceClass::Interactive
+                },
                 parent_execution: request.parent_execution.clone(),
                 nodes: Vec::new(),
                 edges: Vec::new(),

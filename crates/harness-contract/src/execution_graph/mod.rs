@@ -100,4 +100,25 @@ mod tests {
             Err(ExecutionTransitionError::StaleRevision { .. })
         ));
     }
+
+    #[test]
+    fn service_class_is_durable_projected_and_cannot_promote_a_child() {
+        let mut graph = ExecutionGraph::new("managed background execution");
+        graph.service_class = ExecutionServiceClass::Background;
+        let encoded = serde_json::to_string(&graph).expect("encode graph");
+        let decoded: ExecutionGraph = serde_json::from_str(&encoded).expect("decode graph");
+        assert_eq!(decoded.service_class, ExecutionServiceClass::Background);
+        assert_eq!(
+            project_execution_graph(&decoded).service_class,
+            ExecutionServiceClass::Background
+        );
+        assert_eq!(
+            ExecutionServiceClass::Interactive.bounded_by(Some(ExecutionServiceClass::Background)),
+            ExecutionServiceClass::Background
+        );
+        assert_eq!(
+            ExecutionServiceClass::Maintenance.bounded_by(Some(ExecutionServiceClass::Foreground)),
+            ExecutionServiceClass::Maintenance
+        );
+    }
 }

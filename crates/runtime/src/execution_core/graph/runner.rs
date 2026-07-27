@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
@@ -10,7 +10,6 @@ use harness_contract::execution_graph::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{futures::OwnedNotified, Mutex, Notify, OwnedMutexGuard};
-use tokio::task::JoinSet;
 
 use super::commit_service::{ExecutionCommitError, ExecutionCommitService, ExecutionEffectState};
 use super::events::ExecutionNodeBinding;
@@ -20,9 +19,10 @@ use super::registry::{
     NodeExecutorError, NodeExecutorRegistry,
 };
 use super::resources::{
-    ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager, ScopeLockLease,
-    ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource, WorktreeLease,
-    WorktreeLeaseManager, WorktreeLeaseRequest, WorktreeOwnership,
+    ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager,
+    ResourceAdmissionDecision, ResourceAdmissionRequest, ScopeLockLease, ScopeLockManager,
+    ScopeLockMode, ScopeLockRequest, ScopedResource, WorktreeLease, WorktreeLeaseManager,
+    WorktreeLeaseRequest, WorktreeOwnership,
 };
 use super::state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
 
@@ -49,6 +49,8 @@ pub enum ExecutionRunnerError {
     InvalidStartCommand,
     #[error("execution resource acquisition failed for node `{node_id}`: {reason}")]
     Resource { node_id: String, reason: String },
+    #[error("execution resource admission deferred for node `{node_id}`: {reason}")]
+    ResourceDeferred { node_id: String, reason: String },
     #[error("execution mutation is blocked: {0}")]
     MutationBlocked(String),
     #[error("execution node `{node_id}` was superseded by a graph command")]
@@ -68,6 +70,12 @@ pub struct ExecutionRunReport {
     pub blocked: usize,
     pub cancelled: usize,
     pub waiting: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct ExecutionGraphPumpSnapshot {
+    pub(crate) ready: Vec<harness_contract::execution_graph::ExecutionNodeSpec>,
+    pub(crate) report: ExecutionRunReport,
 }
 
 struct ActiveNode {
@@ -338,153 +346,216 @@ impl ExecutionGraphRunner {
         Ok(self.commit_service.register_graph_async(graph).await?.graph)
     }
 
+    #[cfg(test)]
     pub(crate) async fn run_until_quiescent(
         &self,
         graph_id: &str,
     ) -> Result<ExecutionRunReport, ExecutionRunnerError> {
-        self.ensure_mutation_allowed()?;
+        let durable_progress = Arc::new(Notify::new());
+        let mut active_nodes = tokio::task::JoinSet::new();
+        let mut in_flight = BTreeSet::new();
         loop {
-            let mut graph = self.state_store.load_async(graph_id).await?;
-            graph = self.advance_dependencies(graph).await?;
-            let ready = graph
-                .nodes
-                .iter()
-                .filter(|node| graph.node_statuses[&node.id] == ExecutionNodeStatus::Ready)
-                .map(|node| node.id.clone())
-                .collect::<Vec<_>>();
-            if ready.is_empty() {
-                return Ok(report(&graph));
-            }
-
-            let mut wave = JoinSet::new();
-            for node_id in ready {
-                let node = graph
-                    .nodes
-                    .iter()
-                    .find(|node| node.id == node_id)
-                    .ok_or_else(|| ExecutionRunnerError::NodeMissing(node_id.clone()))?
-                    .clone();
+            let snapshot = self.pump_snapshot(graph_id, &in_flight).await?;
+            for node in snapshot
+                .ready
+                .into_iter()
+                .take(64usize.saturating_sub(active_nodes.len()))
+            {
+                let node_id = node.id.clone();
+                if !in_flight.insert(node_id.clone()) {
+                    continue;
+                }
                 let runner = self.clone();
                 let graph_id = graph_id.to_string();
-                wave.spawn(async move { runner.start_and_execute_node(&graph_id, node).await });
+                let progress = Arc::clone(&durable_progress);
+                active_nodes.spawn(async move {
+                    (
+                        node_id,
+                        runner.execute_pump_node(&graph_id, node, progress).await,
+                    )
+                });
             }
-
-            while let Some(joined) = wave.join_next().await {
-                let result =
-                    joined.map_err(|error| ExecutionRunnerError::Join(error.to_string()))?;
-                let (node_id, outcome) = match result {
-                    Err(ExecutionRunnerError::CommandSuperseded { .. }) => continue,
-                    Err(ExecutionRunnerError::Resource { node_id, reason }) => {
-                        self.block_unstarted_resource_node(graph_id, &node_id, reason)
-                            .await?;
-                        continue;
-                    }
-                    Ok(value) => value,
-                    Err(ExecutionRunnerError::Executor(error)) => {
-                        // `start` failed before a durable Running transition
-                        // or effect intent exists. Keeping the node Ready lets
-                        // an explicit caller decide whether to retry; treating
-                        // it as a completed wave would immediately schedule it
-                        // again and spin forever.
-                        if matches!(error, NodeExecutorError::Start { .. }) {
-                            return Err(ExecutionRunnerError::Executor(error));
-                        }
-                        let node_id = executor_error_node_id(&error).to_string();
-                        if let Some(waiter) = self.command_intent_waiter(graph_id) {
-                            waiter.await;
-                        }
-                        self.active
-                            .lock()
-                            .await
-                            .remove(&(graph_id.to_string(), node_id.clone()));
-                        let result = failed_result(&error);
-                        let terminal_status = result.status;
-                        let _coordination = self.graph_coordination_without_command(graph_id).await;
-                        let current = self.state_store.load_async(graph_id).await?;
-                        if current.node_statuses.get(&node_id)
-                            == Some(&ExecutionNodeStatus::Running)
-                        {
-                            self.commit_service
-                                .transition_node_async(
-                                    current,
-                                    node_id,
-                                    terminal_status,
-                                    Some(result),
-                                    Vec::new(),
-                                )
-                                .await?;
-                            continue;
-                        }
-                        // A Pause/Cancel command may have superseded the
-                        // executor while it was returning its terminal
-                        // result. The command's durable graph state wins.
-                        continue;
-                    }
-                    Err(error) => return Err(error),
-                };
-                validate_outcome(&node_id, &outcome)?;
-                if let Some(waiter) = self.command_intent_waiter(graph_id) {
-                    waiter.await;
-                }
-                // Durable graph state must be serialized, but executor callbacks are
-                // process-local follow-up work. Holding the graph coordination lock
-                // while an executor publishes its transcript can deadlock unrelated
-                // graph progress and leave a durable successor permanently Ready.
-                let committed_executor = {
-                    let _coordination = self.graph_coordination_without_command(graph_id).await;
-                    let current = self.state_store.load_async(graph_id).await?;
-                    if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running) {
-                        self.active
-                            .lock()
-                            .await
-                            .remove(&(graph_id.to_string(), node_id.clone()));
-                        continue;
-                    }
-                    if let Some(replan) = outcome.replan {
-                        self.registry.validate_nodes(&replan.nodes)?;
-                        self.commit_service
-                            .transition_node_with_replan_async(
-                                current,
-                                node_id.clone(),
-                                outcome.result,
-                                outcome.domain_events,
-                                replan.nodes,
-                                replan.edges,
-                                replan.reason,
-                            )
-                            .await?;
-                    } else {
-                        self.commit_service
-                            .transition_node_async(
-                                current,
-                                node_id.clone(),
-                                outcome.result.status,
-                                Some(outcome.result),
-                                outcome.domain_events,
-                            )
-                            .await?;
-                    }
-                    self.active
-                        .lock()
-                        .await
-                        .get(&(graph_id.to_string(), node_id.clone()))
-                        .map(|active| (Arc::clone(&active.executor), active.ticket.clone()))
-                };
-                if let Some((executor, ticket)) = committed_executor {
-                    let after_commit = executor.after_commit(&ticket).await;
-                    self.active
-                        .lock()
-                        .await
-                        .remove(&(graph_id.to_string(), node_id.clone()));
-                    after_commit?;
-                } else {
-                    self.active
-                        .lock()
-                        .await
-                        .remove(&(graph_id.to_string(), node_id.clone()));
+            if active_nodes.is_empty() {
+                return Ok(snapshot.report);
+            }
+            tokio::select! {
+                () = durable_progress.notified() => {}
+                joined = active_nodes.join_next() => {
+                    let (node_id, result) = joined
+                        .ok_or_else(|| ExecutionRunnerError::Join(
+                            "test completion pump closed unexpectedly".to_string(),
+                        ))?
+                        .map_err(|error| ExecutionRunnerError::Join(error.to_string()))?;
+                    in_flight.remove(&node_id);
+                    result?;
                 }
             }
         }
+    }
+
+    pub(crate) async fn pump_snapshot(
+        &self,
+        graph_id: &str,
+        in_flight: &BTreeSet<String>,
+    ) -> Result<ExecutionGraphPumpSnapshot, ExecutionRunnerError> {
+        self.ensure_mutation_allowed()?;
+        let graph = self.state_store.load_async(graph_id).await?;
+        let graph = self.advance_dependencies(graph).await?;
+        let ready = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                graph.node_statuses[&node.id] == ExecutionNodeStatus::Ready
+                    && !in_flight.contains(&node.id)
+            })
+            .cloned()
+            .collect();
+        Ok(ExecutionGraphPumpSnapshot {
+            ready,
+            report: report(&graph),
+        })
+    }
+
+    pub(crate) async fn current_report(
+        &self,
+        graph_id: &str,
+    ) -> Result<(ExecutionRunReport, bool), ExecutionRunnerError> {
+        let graph = self.state_store.load_async(graph_id).await?;
+        let has_actionable_node = graph.nodes.iter().any(|node| {
+            let status = graph.node_statuses[&node.id];
+            if matches!(
+                status,
+                ExecutionNodeStatus::Ready | ExecutionNodeStatus::Running
+            ) {
+                return true;
+            }
+            if status != ExecutionNodeStatus::Planned {
+                return false;
+            }
+            graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
+                .all(|edge| graph.node_statuses[&edge.from].is_terminal())
+        });
+        let quiescent = !has_actionable_node;
+        Ok((report(&graph), quiescent))
+    }
+
+    pub(crate) async fn execute_pump_node(
+        &self,
+        graph_id: &str,
+        node: harness_contract::execution_graph::ExecutionNodeSpec,
+        durable_progress: Arc<Notify>,
+    ) -> Result<(), ExecutionRunnerError> {
+        let result = self.start_and_execute_node(graph_id, node).await;
+        let (node_id, outcome) = match result {
+            Err(ExecutionRunnerError::CommandSuperseded { .. }) => return Ok(()),
+            Err(ExecutionRunnerError::ResourceDeferred { .. }) => return Ok(()),
+            Err(ExecutionRunnerError::Resource { node_id, reason }) => {
+                self.block_unstarted_resource_node(graph_id, &node_id, reason)
+                    .await?;
+                durable_progress.notify_one();
+                return Ok(());
+            }
+            Ok(value) => value,
+            Err(ExecutionRunnerError::Executor(error)) => {
+                // A failed start has no durable Running/effect intent. Returning
+                // the error prevents a speculative retry loop.
+                if matches!(error, NodeExecutorError::Start { .. }) {
+                    return Err(ExecutionRunnerError::Executor(error));
+                }
+                let node_id = executor_error_node_id(&error).to_string();
+                if let Some(waiter) = self.command_intent_waiter(graph_id) {
+                    waiter.await;
+                }
+                self.active
+                    .lock()
+                    .await
+                    .remove(&(graph_id.to_string(), node_id.clone()));
+                let result = failed_result(&error);
+                let terminal_status = result.status;
+                let _coordination = self.graph_coordination_without_command(graph_id).await;
+                let current = self.state_store.load_async(graph_id).await?;
+                if current.node_statuses.get(&node_id) == Some(&ExecutionNodeStatus::Running) {
+                    self.commit_service
+                        .transition_node_async(
+                            current,
+                            node_id,
+                            terminal_status,
+                            Some(result),
+                            Vec::new(),
+                        )
+                        .await?;
+                    durable_progress.notify_one();
+                }
+                // A Pause/Cancel command may have superseded the executor while
+                // it returned. The command's durable graph state remains truth.
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        validate_outcome(&node_id, &outcome)?;
+        if let Some(waiter) = self.command_intent_waiter(graph_id) {
+            waiter.await;
+        }
+        // Commit terminal graph truth before waking the pump or publishing
+        // process-local executor output.
+        let committed_executor = {
+            let _coordination = self.graph_coordination_without_command(graph_id).await;
+            let current = self.state_store.load_async(graph_id).await?;
+            if current.node_statuses.get(&node_id) != Some(&ExecutionNodeStatus::Running) {
+                self.active
+                    .lock()
+                    .await
+                    .remove(&(graph_id.to_string(), node_id.clone()));
+                return Ok(());
+            }
+            if let Some(replan) = outcome.replan {
+                self.registry.validate_nodes(&replan.nodes)?;
+                self.commit_service
+                    .transition_node_with_replan_async(
+                        current,
+                        node_id.clone(),
+                        outcome.result,
+                        outcome.domain_events,
+                        replan.nodes,
+                        replan.edges,
+                        replan.reason,
+                    )
+                    .await?;
+            } else {
+                self.commit_service
+                    .transition_node_async(
+                        current,
+                        node_id.clone(),
+                        outcome.result.status,
+                        Some(outcome.result),
+                        outcome.domain_events,
+                    )
+                    .await?;
+            }
+            durable_progress.notify_one();
+            self.active
+                .lock()
+                .await
+                .get(&(graph_id.to_string(), node_id.clone()))
+                .map(|active| (Arc::clone(&active.executor), active.ticket.clone()))
+        };
+        if let Some((executor, ticket)) = committed_executor {
+            let after_commit = executor.after_commit(&ticket).await;
+            self.active
+                .lock()
+                .await
+                .remove(&(graph_id.to_string(), node_id));
+            after_commit?;
+        } else {
+            self.active
+                .lock()
+                .await
+                .remove(&(graph_id.to_string(), node_id));
+        }
+        Ok(())
     }
 
     async fn start_and_execute_node(
@@ -765,15 +836,32 @@ impl ExecutionGraphRunner {
             | harness_contract::execution_graph::ExecutionNodeKind::Timer => None,
         };
         let resource = if let Some(resource_kind) = resource_kind {
-            Some(
-                self.resource_manager
-                    .acquire(resource_kind, Some(std::time::Duration::from_secs(30)))
-                    .await
-                    .map_err(|error| ExecutionRunnerError::Resource {
+            let request = ResourceAdmissionRequest::new(graph.service_class, [(resource_kind, 1)])
+                .with_fairness_key(format!("graph:{}", graph.id));
+            let decision = self
+                .resource_manager
+                .admit(request)
+                .await
+                .map_err(|error| ExecutionRunnerError::Resource {
+                    node_id: node.id.clone(),
+                    reason: error.to_string(),
+                })?;
+            Some(match decision {
+                ResourceAdmissionDecision::Granted { lease, .. } => lease,
+                ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
+                    self.resource_manager.wait_for_change().await;
+                    return Err(ExecutionRunnerError::ResourceDeferred {
                         node_id: node.id.clone(),
-                        reason: error.to_string(),
-                    })?,
-            )
+                        reason: format!("resource admission overloaded: {wait_reason:?}"),
+                    });
+                }
+                ResourceAdmissionDecision::Deferred { wait_reason, .. } => {
+                    return Err(ExecutionRunnerError::Resource {
+                        node_id: node.id.clone(),
+                        reason: format!("resource admission refused: {wait_reason:?}"),
+                    });
+                }
+            })
         } else {
             None
         };
