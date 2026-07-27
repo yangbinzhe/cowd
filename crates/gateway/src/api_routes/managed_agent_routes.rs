@@ -196,7 +196,7 @@ async fn managed_agent_dispatch_handler(
         ));
     }
     runtime_services(&state)?
-        .dispatch_managed_agents(&request.dispatcher_id, request.limit)
+        .wake_managed_agents(request.dispatcher_id, request.limit)
         .await
         .map(Json)
         .map_err(managed_error)

@@ -13,14 +13,14 @@ use harness_contract::{
 use crate::execution_core::graph::ExecutionResourceManager;
 
 use crate::{
-    AgentRuntime, EvolutionGovernanceService, ExecutionGraphRunner, ExecutionGraphStateStore,
+    AgentRuntime, EvolutionGovernanceService, ExecutionGraphHostReceipt, ExecutionGraphStateStore,
     LegacyTeamImportReport, LegacyTeamProfileMigrationReport, MissionRuntime,
-    RuntimeDefinitionRegistry, RuntimeEventStore, TaskRuntimePort, TeamProjection,
-    TeamProjectionReader,
+    RuntimeDefinitionRegistry, RuntimeEventStore, RuntimeExecutionSupervisor, TaskRuntimePort,
+    TeamProjection, TeamProjectionReader,
 };
 
 pub struct TeamRuntime {
-    runner: Arc<ExecutionGraphRunner>,
+    execution: Arc<RuntimeExecutionSupervisor>,
     instantiation: crate::TeamInstantiationService,
     projection: TeamProjectionReader,
     event_store: Arc<RuntimeEventStore>,
@@ -38,7 +38,7 @@ impl TeamRuntime {
 
     #[must_use]
     pub fn new(
-        runner: Arc<ExecutionGraphRunner>,
+        execution: Arc<RuntimeExecutionSupervisor>,
         graphs: ExecutionGraphStateStore,
         agents: Arc<AgentRuntime>,
         event_store: Arc<RuntimeEventStore>,
@@ -50,7 +50,7 @@ impl TeamRuntime {
         missions: Arc<MissionRuntime>,
     ) -> Self {
         Self {
-            runner,
+            execution,
             instantiation: crate::TeamInstantiationService::new(
                 definition_registry,
                 resources,
@@ -93,8 +93,8 @@ impl TeamRuntime {
         self.instantiation.validate_release(&instantiated)?;
         let graph_id = instantiated.graph.id.clone();
         let registered = self
-            .runner
-            .register(instantiated.graph)
+            .execution
+            .register_graph(instantiated.graph)
             .await
             .map_err(|error| error.to_string())?;
         self.admit_tasks(
@@ -111,11 +111,68 @@ impl TeamRuntime {
                 RealityBoundary::Observed,
             )],
         )?;
-        self.runner
-            .run_until_quiescent(&registered.id)
+        self.execution
+            .drive_registered(&registered.id)
             .await
             .map_err(|error| error.to_string())?;
         self.projection.project(&graph_id)
+    }
+
+    /// Admit a Team graph and return after durable submission. The supervisor
+    /// owns all Agent/model/tool execution after this boundary.
+    pub async fn admit(
+        &self,
+        request: TeamInstantiationRequest,
+    ) -> Result<ExecutionGraphHostReceipt, String> {
+        let mission_id = request.mission_id.clone();
+        let team_id = request.team_id.clone();
+        let instantiated = self.plan(request)?;
+        self.admit_planned(&mission_id, &team_id, instantiated)
+            .await
+    }
+
+    pub(crate) async fn admit_planned(
+        &self,
+        mission_id: &str,
+        team_id: &str,
+        instantiated: crate::TeamInstantiation,
+    ) -> Result<ExecutionGraphHostReceipt, String> {
+        let graph_id = self
+            .prepare_planned(mission_id, team_id, instantiated)
+            .await?;
+        self.execution
+            .admit_registered(&graph_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn prepare_planned(
+        &self,
+        mission_id: &str,
+        team_id: &str,
+        instantiated: crate::TeamInstantiation,
+    ) -> Result<String, String> {
+        self.instantiation.validate_release(&instantiated)?;
+        let registered = self
+            .execution
+            .register_graph(instantiated.graph)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.admit_tasks(
+            &instantiated.task_commands,
+            &registered.id,
+            registered.revision,
+        )?;
+        self.tasks.link_mission_team_run(
+            mission_id,
+            team_id,
+            vec![EvidenceRef::new(
+                "team_run",
+                format!("team-run://{team_id}?graph={}", registered.id),
+                RealityBoundary::Observed,
+            )],
+        )?;
+        Ok(registered.id)
     }
 
     /// Run one evaluation-only Team graph. The candidate template is selected
@@ -140,8 +197,8 @@ impl TeamRuntime {
         };
         let graph_id = instantiated.graph.id.clone();
         let registered = self
-            .runner
-            .register(instantiated.graph)
+            .execution
+            .register_graph(instantiated.graph)
             .await
             .map_err(|error| error.to_string())?;
         self.admit_tasks(
@@ -149,8 +206,8 @@ impl TeamRuntime {
             &registered.id,
             registered.revision,
         )?;
-        self.runner
-            .run_until_quiescent(&registered.id)
+        self.execution
+            .drive_registered(&registered.id)
             .await
             .map_err(|error| error.to_string())?;
         self.projection.project(&graph_id)

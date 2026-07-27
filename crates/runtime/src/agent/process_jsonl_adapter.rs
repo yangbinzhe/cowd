@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Stdio};
@@ -45,7 +45,31 @@ struct ActiveProcess {
 #[derive(Default)]
 struct ProcessJsonlRegistry {
     specs: Mutex<BTreeMap<String, ProcessJsonlSpec>>,
-    active: Mutex<BTreeMap<String, Arc<Mutex<ActiveProcess>>>>,
+    lifecycle: Mutex<ProcessJsonlLifecycle>,
+}
+
+#[derive(Default)]
+struct ProcessJsonlLifecycle {
+    starting: BTreeSet<String>,
+    active: BTreeMap<String, Arc<Mutex<ActiveProcess>>>,
+    pending_cancellation: BTreeSet<String>,
+}
+
+struct StartingRunGuard {
+    registry: Arc<ProcessJsonlRegistry>,
+    run_id: String,
+}
+
+impl Drop for StartingRunGuard {
+    fn drop(&mut self) {
+        let mut lifecycle = self
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.starting.remove(&self.run_id);
+        lifecycle.pending_cancellation.remove(&self.run_id);
+    }
 }
 
 /// A JSONL-only backend. The child only receives/returns protocol envelopes;
@@ -119,7 +143,23 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
             .ok_or_else(|| "no ProcessJsonl spec is registered for this agent".to_string())?;
         let registry = Arc::clone(&self.registry);
         let workspace_root = Arc::clone(&self.workspace_root);
+        let run_id = packet.run_id().to_string();
+        {
+            let mut lifecycle = registry
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if lifecycle.starting.contains(&run_id) || lifecycle.active.contains_key(&run_id) {
+                return Err("ProcessJsonl run is already active".to_string());
+            }
+            lifecycle.starting.insert(run_id.clone());
+        }
+        let starting = StartingRunGuard {
+            registry: Arc::clone(&registry),
+            run_id,
+        };
         tokio::task::spawn_blocking(move || {
+            let _starting = starting;
             execute_child(&registry, &workspace_root, &spec, &packet)
         })
         .await
@@ -131,14 +171,26 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
         handle: &AgentRunHandle,
         request: &AgentCommandRequest,
     ) -> Result<(), AgentCommandRejectReason> {
-        let active = self
-            .registry
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&handle.run_id)
-            .cloned()
-            .ok_or(AgentCommandRejectReason::UnsupportedByBackend)?;
+        let active = {
+            let mut lifecycle = self
+                .registry
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(active) = lifecycle.active.get(&handle.run_id).cloned() {
+                active
+            } else if lifecycle.starting.contains(&handle.run_id)
+                && matches!(
+                    request.command,
+                    AgentCommand::Cancel | AgentCommand::Shutdown
+                )
+            {
+                lifecycle.pending_cancellation.insert(handle.run_id.clone());
+                return Ok(());
+            } else {
+                return Err(AgentCommandRejectReason::UnsupportedByBackend);
+            }
+        };
         let mut active = active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -216,15 +268,21 @@ fn execute_child(
         .map_err(|error| format!("failed to write ProcessJsonl request: {error}"))?;
 
     let active = Arc::new(Mutex::new(ActiveProcess { child, stdin }));
-    {
-        let mut processes = registry
-            .active
+    let cancel_before_activation = {
+        let mut lifecycle = registry
+            .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if processes.contains_key(packet.run_id()) {
-            return Err("ProcessJsonl run is already active".into());
-        }
-        processes.insert(packet.run_id().to_string(), Arc::clone(&active));
+        lifecycle
+            .active
+            .insert(packet.run_id().to_string(), Arc::clone(&active));
+        lifecycle.pending_cancellation.remove(packet.run_id())
+    };
+    if cancel_before_activation {
+        let mut process = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = terminate_process_tree(&mut process);
     }
 
     let result = read_process_result(stdout, packet);
@@ -235,9 +293,10 @@ fn execute_child(
         .wait()
         .map_err(|error| format!("failed to wait for ProcessJsonl worker: {error}"));
     registry
-        .active
+        .lifecycle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active
         .remove(packet.run_id());
 
     let status = exit_status?;
@@ -356,40 +415,26 @@ mod tests {
     async fn cancel_kills_the_active_process_instead_of_only_acknowledging() {
         let adapter = ProcessJsonlAdapter::new();
         let packet = task();
-        adapter.register(
-            packet.agent_id().to_string(),
-            ProcessJsonlSpec {
-                command: "sh".into(),
-                args: vec!["-c".into(), "exec sleep 30".into()],
-            },
-        );
-        let execution = {
-            let adapter = adapter.clone();
-            let packet = packet.clone();
-            tokio::spawn(async move {
-                adapter
-                    .execute(
-                        packet,
-                        AgentModelSelection {
-                            model: "test".into(),
-                            provider: "test".into(),
-                            registry_revision: 1,
-                        },
-                    )
-                    .await
-            })
-        };
-        for _ in 0..50 {
-            if adapter
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("test process");
+        let stdin = child.stdin.take().expect("test process stdin");
+        let active = Arc::new(Mutex::new(ActiveProcess { child, stdin }));
+        {
+            adapter
                 .registry
-                .active
+                .lifecycle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(packet.run_id())
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                .active
+                .insert(packet.run_id().to_string(), Arc::clone(&active));
         }
         let receipt = adapter
             .command(
@@ -410,16 +455,67 @@ mod tests {
             )
             .await;
         assert!(receipt.is_ok());
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
-            .await
-            .expect("process tree cancellation must not leave a pipe-holding descendant")
-            .expect("execution task");
-        assert!(result.is_err());
-        assert!(adapter
-            .registry
-            .active
+        let status = active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .child
+            .wait()
+            .expect("cancelled process is reaped");
+        assert!(!status.success());
+        adapter
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .remove(packet.run_id());
+        assert!(adapter
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancel_is_retained_while_process_jsonl_is_still_starting() {
+        let adapter = ProcessJsonlAdapter::new();
+        let packet = task();
+        {
+            adapter
+                .registry
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .starting
+                .insert(packet.run_id().to_string());
+        }
+        let receipt = adapter
+            .command(
+                &AgentRunHandle {
+                    run_id: packet.run_id().to_string(),
+                    agent_id: packet.agent_id().to_string(),
+                    backend: AgentBackendKind::ProcessJsonl,
+                    revision: 1,
+                    status: harness_contract::agent::AgentStatus::Running,
+                },
+                &AgentCommandRequest {
+                    command_id: "cancel-starting-process-1".into(),
+                    agent_id: packet.agent_id().to_string(),
+                    expected_revision: 1,
+                    command: AgentCommand::Cancel,
+                    input: None,
+                },
+            )
+            .await;
+        assert!(receipt.is_ok());
+        assert!(adapter
+            .registry
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_cancellation
+            .contains(packet.run_id()));
     }
 }

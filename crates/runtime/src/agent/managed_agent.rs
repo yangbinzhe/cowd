@@ -136,6 +136,7 @@ pub struct ManagedAgentRuntimeDispatchReport {
     pub health_affected: Vec<ManagedAgentInvocation>,
     pub scheduled: ManagedAgentDispatchReport,
     pub claimed: Vec<ManagedAgentInvocation>,
+    pub submitted: Vec<ManagedAgentInvocation>,
     pub completed: Vec<ManagedAgentInvocation>,
     pub failed: Vec<ManagedAgentInvocation>,
 }
@@ -157,6 +158,13 @@ pub struct ManagedAgentHealth {
     pub consecutive_failures: u16,
     pub max_consecutive_failures: u16,
     pub active_invocation_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManagedAgentRestartDisposition {
+    RetrySafe,
+    PreserveRunning,
+    ReconciliationRequired(String),
 }
 
 /// Runtime's decision at an external-effect boundary.  A completed receipt
@@ -612,6 +620,56 @@ impl ManagedAgentDispatcher {
         })
     }
 
+    pub fn fail_claimed_invocation(
+        &self,
+        invocation_id: &str,
+        dispatcher_id: &str,
+        fence_generation: u64,
+        now_ms: u64,
+        error: String,
+    ) -> Result<ManagedAgentInvocation, String> {
+        self.mutate("managed_agent.invocation.claim_failed.v1", |state| {
+            let (definition_id, definition_revision) = {
+                let invocation =
+                    invocation_for_fence(state, invocation_id, dispatcher_id, fence_generation)?;
+                if invocation.status != ManagedAgentInvocationStatus::Claimed {
+                    return Err("managed Agent invocation is not claimed".to_string());
+                }
+                (
+                    invocation.definition_id.clone(),
+                    invocation.definition_revision,
+                )
+            };
+            let retry_policy = definition_at(state, &definition_id, definition_revision)?
+                .retry_policy
+                .clone();
+            let failed = {
+                let invocation =
+                    invocation_for_fence(state, invocation_id, dispatcher_id, fence_generation)?;
+                invocation.error = Some(error.clone());
+                if invocation.attempt_no < retry_policy.max_attempts {
+                    invocation.attempt_no = invocation.attempt_no.saturating_add(1);
+                    invocation.status = ManagedAgentInvocationStatus::RetryScheduled;
+                    invocation.ready_at_ms = Some(
+                        now_ms
+                            .saturating_add(retry_backoff_ms(&retry_policy, invocation.attempt_no)),
+                    );
+                } else {
+                    invocation.status = ManagedAgentInvocationStatus::Failed;
+                }
+                invocation.clone()
+            };
+            if failed.status == ManagedAgentInvocationStatus::Failed {
+                let failures = state
+                    .consecutive_failures
+                    .entry(definition_id.clone())
+                    .or_default();
+                *failures = failures.saturating_add(1);
+            }
+            Ok(failed)
+        })
+    }
+
     /// Stop invocations whose declared maximum age elapsed.  The status is
     /// reconciliation-required rather than failed/retryable because the
     /// process may still have performed an external effect after Runtime
@@ -899,6 +957,14 @@ impl ManagedAgentDispatcher {
     /// Pending. A Running invocation or claimed effect is deliberately not
     /// replayed: its external result is uncertain and must be reconciled.
     pub fn recover(&self, now_ms: u64) -> Result<Vec<ManagedAgentInvocation>, String> {
+        self.recover_with_dispositions(now_ms, &BTreeMap::new())
+    }
+
+    pub(crate) fn recover_with_dispositions(
+        &self,
+        now_ms: u64,
+        dispositions: &BTreeMap<String, ManagedAgentRestartDisposition>,
+    ) -> Result<Vec<ManagedAgentInvocation>, String> {
         self.mutate("managed_agent.dispatcher.recovered.v1", |state| {
             let mut affected = Vec::new();
             for invocation in state.invocations.values_mut() {
@@ -910,12 +976,36 @@ impl ManagedAgentDispatcher {
                         affected.push(invocation.clone());
                     }
                     ManagedAgentInvocationStatus::Running => {
-                        invocation.status = ManagedAgentInvocationStatus::ReconciliationRequired;
-                        invocation.error = Some(
-                            "Runtime restarted while Managed Agent invocation was running; external effects require reconciliation"
-                                .to_string(),
-                        );
-                        affected.push(invocation.clone());
+                        match dispositions.get(&invocation.invocation_id) {
+                            Some(ManagedAgentRestartDisposition::RetrySafe) => {
+                                invocation.status = ManagedAgentInvocationStatus::Pending;
+                                invocation.claimed_by = None;
+                                invocation.execution_ref = None;
+                                invocation.started_at_ms = None;
+                                invocation.ready_at_ms = Some(now_ms);
+                                invocation.error = Some(
+                                    "Runtime restarted before any Managed Agent node started; the invocation is safe to reclaim"
+                                        .to_string(),
+                                );
+                                affected.push(invocation.clone());
+                            }
+                            Some(ManagedAgentRestartDisposition::PreserveRunning) => {}
+                            Some(ManagedAgentRestartDisposition::ReconciliationRequired(reason)) => {
+                                invocation.status =
+                                    ManagedAgentInvocationStatus::ReconciliationRequired;
+                                invocation.error = Some(reason.clone());
+                                affected.push(invocation.clone());
+                            }
+                            None => {
+                                invocation.status =
+                                    ManagedAgentInvocationStatus::ReconciliationRequired;
+                                invocation.error = Some(
+                                    "Runtime restarted while Managed Agent invocation was running; external effects require reconciliation"
+                                        .to_string(),
+                                );
+                                affected.push(invocation.clone());
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1450,6 +1540,96 @@ mod tests {
         assert_eq!(
             dispatcher.outbox().expect("outbox")[0].status,
             FencedEffectStatus::ReconciliationRequired
+        );
+    }
+
+    #[test]
+    fn restart_dispositions_retry_only_safe_work_and_preserve_or_block_uncertain_work() {
+        let dispatcher = dispatcher();
+        dispatcher
+            .register_definition(definition(ManagedAgentTrigger::Manual), 1)
+            .expect("definition");
+        let invocation = dispatcher
+            .trigger_manual("workspace/cowd/research-watch", "restart-request", 2)
+            .expect("manual");
+        let first_claim = dispatcher
+            .claim_ready("dispatcher-a", 3, 1)
+            .expect("claim")
+            .pop()
+            .expect("claimed invocation");
+        dispatcher
+            .start_invocation(
+                &first_claim.invocation_id,
+                "dispatcher-a",
+                first_claim.fence_generation,
+                "graph:first".to_string(),
+                4,
+            )
+            .expect("start");
+
+        let retried = dispatcher
+            .recover_with_dispositions(
+                5,
+                &BTreeMap::from([(
+                    invocation.invocation_id.clone(),
+                    ManagedAgentRestartDisposition::RetrySafe,
+                )]),
+            )
+            .expect("safe recovery");
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].status, ManagedAgentInvocationStatus::Pending);
+        assert!(retried[0].claimed_by.is_none());
+        assert!(retried[0].execution_ref.is_none());
+
+        let second_claim = dispatcher
+            .claim_ready("dispatcher-b", 6, 1)
+            .expect("reclaim")
+            .pop()
+            .expect("reclaimed invocation");
+        assert!(second_claim.fence_generation > first_claim.fence_generation);
+        dispatcher
+            .start_invocation(
+                &second_claim.invocation_id,
+                "dispatcher-b",
+                second_claim.fence_generation,
+                "graph:second".to_string(),
+                7,
+            )
+            .expect("restart");
+        let preserved = dispatcher
+            .recover_with_dispositions(
+                8,
+                &BTreeMap::from([(
+                    invocation.invocation_id.clone(),
+                    ManagedAgentRestartDisposition::PreserveRunning,
+                )]),
+            )
+            .expect("preserve waiting work");
+        assert!(preserved.is_empty());
+        assert_eq!(
+            dispatcher.invocations().expect("invocations")[0].status,
+            ManagedAgentInvocationStatus::Running
+        );
+
+        let blocked = dispatcher
+            .recover_with_dispositions(
+                9,
+                &BTreeMap::from([(
+                    invocation.invocation_id,
+                    ManagedAgentRestartDisposition::ReconciliationRequired(
+                        "external effect outcome is uncertain".to_string(),
+                    ),
+                )]),
+            )
+            .expect("block uncertain work");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0].status,
+            ManagedAgentInvocationStatus::ReconciliationRequired
+        );
+        assert_eq!(
+            blocked[0].error.as_deref(),
+            Some("external effect outcome is uncertain")
         );
     }
 }

@@ -132,7 +132,8 @@ pub struct AgentRuntime {
     backends: RwLock<BTreeMap<AgentBackendKind, Arc<dyn AgentRuntimeBackend>>>,
     services: RwLock<Option<Weak<RuntimeServices>>>,
     pending_cancellations: Mutex<BTreeSet<String>>,
-    lifecycle_lock: Mutex<()>,
+    run_locks: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    lifecycle_locks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
 }
 
 impl AgentRuntime {
@@ -149,10 +150,65 @@ impl AgentRuntime {
             backends: RwLock::new(BTreeMap::new()),
             services: RwLock::new(None),
             pending_cancellations: Mutex::new(BTreeSet::new()),
-            lifecycle_lock: Mutex::new(()),
+            run_locks: Mutex::new(BTreeMap::new()),
+            lifecycle_locks: Mutex::new(BTreeMap::new()),
         };
         runtime.restore_projection();
         runtime
+    }
+
+    async fn acquire_run_lock(&self, agent_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .run_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(agent_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(agent_id.to_string(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+
+    fn lifecycle_lock(&self, agent_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .lifecycle_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(agent_id).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(agent_id.to_string(), Arc::downgrade(&lock));
+            lock
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_lock_counts(&self) -> (usize, usize) {
+        let run_locks = {
+            let mut locks = self
+                .run_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            locks.len()
+        };
+        let lifecycle_locks = {
+            let mut locks = self
+                .lifecycle_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            locks.len()
+        };
+        (run_locks, lifecycle_locks)
     }
 
     pub fn bind_services(&self, services: Arc<RuntimeServices>) {
@@ -438,6 +494,7 @@ impl AgentRuntime {
     }
 
     pub async fn execute_task(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String> {
+        let _run_guard = self.acquire_run_lock(packet.agent_id()).await;
         if let Some(existing) = self.get(packet.agent_id()) {
             if existing.run_id == packet.run_id() && existing.status.is_terminal() {
                 return self
@@ -766,30 +823,39 @@ impl AgentRuntime {
             .is_none()
         {
             if let (Some(services), Some(evaluation)) = (self.services(), evolution_trigger) {
-                tokio::spawn(async move {
-                    match services.consider_agent_evolution(&evaluation) {
-                        Ok(Some(candidate)) => {
-                            match services.evaluate_evolution_candidate(&candidate.candidate_id).await {
-                                Ok(evaluated)
-                                    if evaluated.lifecycle
-                                        == crate::EvolutionCandidateLifecycle::EvaluatedEligible =>
+                let execution_supervisor = Arc::clone(services.execution_supervisor());
+                if let Err(error) = execution_supervisor
+                    .spawn_owned("evolution_observer", async move {
+                        match services.consider_agent_evolution(&evaluation) {
+                            Ok(Some(candidate)) => {
+                                match services
+                                    .evaluate_evolution_candidate(&candidate.candidate_id)
+                                    .await
                                 {
-                                    if let Err(error) = services
-                                        .request_evolution_canary_review(&candidate.candidate_id)
+                                    Ok(evaluated)
+                                        if evaluated.lifecycle
+                                            == crate::EvolutionCandidateLifecycle::EvaluatedEligible =>
                                     {
-                                        tracing::warn!(candidate_id = %candidate.candidate_id, error = %error, "automatic evolution candidate could not enter human Canary review");
+                                        if let Err(error) = services
+                                            .request_evolution_canary_review(&candidate.candidate_id)
+                                        {
+                                            tracing::warn!(candidate_id = %candidate.candidate_id, error = %error, "automatic evolution candidate could not enter human Canary review");
+                                        }
                                     }
+                                    Ok(_) => {}
+                                    Err(error) => tracing::warn!(candidate_id = %candidate.candidate_id, error = %error, "automatic evolution candidate evaluation failed"),
                                 }
-                                Ok(_) => {}
-                                Err(error) => tracing::warn!(candidate_id = %candidate.candidate_id, error = %error, "automatic evolution candidate evaluation failed"),
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(evaluation_id = %evaluation.evaluation_id, error = %error, "automatic Agent evolution planning failed")
                             }
                         }
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(evaluation_id = %evaluation.evaluation_id, error = %error, "automatic Agent evolution planning failed")
-                        }
-                    }
-                });
+                    })
+                    .await
+                {
+                    tracing::warn!(%error, "Runtime execution supervisor rejected evolution observer");
+                }
             }
         }
         Ok(returned)
@@ -1188,8 +1254,8 @@ impl AgentRuntime {
         evaluation: Option<AgentRunEvaluation>,
     ) -> Result<AgentCommandReceipt, String> {
         validate_snapshot_identity(&snapshot)?;
-        let _lifecycle_guard = self
-            .lifecycle_lock
+        let lifecycle_lock = self.lifecycle_lock(&snapshot.agent_id);
+        let _lifecycle_guard = lifecycle_lock
             .lock()
             .map_err(|_| "AgentRuntime lifecycle lock poisoned".to_string())?;
         let current = self
@@ -2347,6 +2413,44 @@ mod tests {
         assert_eq!(snapshot.status, AgentStatus::Blocked);
         assert!(snapshot.failure.is_some());
         assert_eq!(runtime.events(packet.agent_id()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_locks_are_keyed_and_reclaimed_after_the_last_holder() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            configured_registry(),
+        );
+
+        let first_run = runtime.acquire_run_lock("agent-a").await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                runtime.acquire_run_lock("agent-a")
+            )
+            .await
+            .is_err(),
+            "the same agent key must remain serialized"
+        );
+        let other_run = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            runtime.acquire_run_lock("agent-b"),
+        )
+        .await
+        .expect("different agent keys must not share a global run lock");
+
+        let lifecycle_a = runtime.lifecycle_lock("agent-a");
+        let lifecycle_a_again = runtime.lifecycle_lock("agent-a");
+        let lifecycle_b = runtime.lifecycle_lock("agent-b");
+        assert!(Arc::ptr_eq(&lifecycle_a, &lifecycle_a_again));
+        assert!(!Arc::ptr_eq(&lifecycle_a, &lifecycle_b));
+
+        drop(lifecycle_a);
+        drop(lifecycle_a_again);
+        drop(lifecycle_b);
+        drop(other_run);
+        drop(first_run);
+        assert_eq!(runtime.retained_lock_counts(), (0, 0));
     }
 
     #[test]

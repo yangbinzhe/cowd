@@ -21,6 +21,7 @@ pub mod rewoo_plan;
 pub mod safety_fuse;
 pub mod services;
 pub mod strategy_decision;
+mod supervisor;
 pub mod tool_intents;
 
 pub use cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
@@ -29,10 +30,10 @@ pub use evidence::RuntimeEvidenceSummary;
 pub use goal::{policy::InterventionPolicy, GoalProgressReducer, GoalProjection, GoalStore};
 pub use graph::{
     ExecutionCommitService, ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler,
-    ExecutionGraphHost, ExecutionGraphHostReceipt, ExecutionGraphReplan, ExecutionGraphRunner,
-    ExecutionGraphStateStore, ExecutionRunnerError, ExecutionStateStoreError, NodeExecutionContext,
-    NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor, NodeExecutorError,
-    NodeExecutorRegistry, ScopedNodeBackend, ScopedNodeExecutor,
+    ExecutionGraphHost, ExecutionGraphHostReceipt, ExecutionGraphReplan, ExecutionGraphStateStore,
+    ExecutionRunnerError, ExecutionStateStoreError, NodeExecutionContext, NodeExecutionOutcome,
+    NodeExecutionTicket, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ScopedNodeBackend,
+    ScopedNodeExecutor,
 };
 pub use model_affordance::{
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
@@ -73,6 +74,10 @@ pub use strategy_decision::{
     RuntimeExecutionDecision, RuntimeExecutionPatternCandidate, StrategyDecisionEngine,
     StrategyLease, StrategyResourceHealth, TurnStrategyActualOutcome, TurnStrategyDecisionState,
     TurnStrategyDecisionStatus,
+};
+pub use supervisor::{
+    RuntimeExecutionHealth, RuntimeExecutionOwnerReport, RuntimeExecutionShutdownReport,
+    RuntimeExecutionSupervisor, RuntimeWorkAdmissionReceipt,
 };
 pub use tool_intents::{
     tool_intents_from_rewoo, ToolIntentDependency, ToolIntentDependencyKind, ToolIntentGraph,

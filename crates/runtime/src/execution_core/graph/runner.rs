@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
 
 use harness_contract::execution_graph::{
@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 
 use super::commit_service::{ExecutionCommitError, ExecutionCommitService, ExecutionEffectState};
 use super::events::ExecutionNodeBinding;
+use super::recovery::{ExecutionGraphRecovery, ExecutionRecoveryError};
 use super::registry::{
     NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor,
     NodeExecutorError, NodeExecutorRegistry,
@@ -52,6 +53,10 @@ pub enum ExecutionRunnerError {
     MutationBlocked(String),
     #[error("execution node `{node_id}` was superseded by a graph command")]
     CommandSuperseded { node_id: String },
+    #[error("runtime execution supervisor is unavailable: {0}")]
+    SupervisorUnavailable(String),
+    #[error("runtime execution driver failed: {0}")]
+    Driver(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +115,7 @@ impl Drop for NodeResourceGuards {
 }
 
 #[derive(Clone)]
-pub struct ExecutionGraphRunner {
+pub(crate) struct ExecutionGraphRunner {
     registry: Arc<NodeExecutorRegistry>,
     state_store: ExecutionGraphStateStore,
     commit_service: ExecutionCommitService,
@@ -120,7 +125,7 @@ pub struct ExecutionGraphRunner {
     workspace_id: String,
     workspace_root: PathBuf,
     active: Arc<Mutex<BTreeMap<(String, String), ActiveNode>>>,
-    coordination: Arc<Mutex<()>>,
+    coordination: Arc<StdMutex<BTreeMap<String, Weak<Mutex<()>>>>>,
     command_intents: Arc<StdMutex<BTreeMap<String, Arc<Notify>>>>,
     mutation_gate: Arc<RwLock<Option<MutationGate>>>,
 }
@@ -206,7 +211,7 @@ impl Drop for CommandIntentOwner {
 
 impl ExecutionGraphRunner {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         registry: Arc<NodeExecutorRegistry>,
         state_store: ExecutionGraphStateStore,
         commit_service: ExecutionCommitService,
@@ -226,7 +231,7 @@ impl ExecutionGraphRunner {
             workspace_id: workspace_id.into(),
             workspace_root: workspace_root.into(),
             active: Arc::new(Mutex::new(BTreeMap::new())),
-            coordination: Arc::new(Mutex::new(())),
+            coordination: Arc::new(StdMutex::new(BTreeMap::new())),
             command_intents: Arc::new(StdMutex::new(BTreeMap::new())),
             mutation_gate: Arc::new(RwLock::new(None)),
         }
@@ -241,13 +246,26 @@ impl ExecutionGraphRunner {
             .map(Notify::notified_owned)
     }
 
+    pub(crate) fn state_store(&self) -> &ExecutionGraphStateStore {
+        &self.state_store
+    }
+
+    pub(crate) async fn recover_graph(
+        &self,
+        graph_id: &str,
+    ) -> Result<ExecutionGraph, ExecutionRecoveryError> {
+        ExecutionGraphRecovery::new(&self.state_store, &self.commit_service, &self.registry)
+            .recover(graph_id)
+            .await
+    }
+
     async fn graph_coordination_without_command(&self, graph_id: &str) -> OwnedMutexGuard<()> {
         loop {
             if let Some(waiter) = self.command_intent_waiter(graph_id) {
                 waiter.await;
                 continue;
             }
-            let coordination = Arc::clone(&self.coordination).lock_owned().await;
+            let coordination = self.graph_coordination(graph_id).await;
             if let Some(waiter) = self.command_intent_waiter(graph_id) {
                 drop(coordination);
                 waiter.await;
@@ -257,7 +275,27 @@ impl ExecutionGraphRunner {
         }
     }
 
-    pub fn install_mutation_gate(
+    async fn graph_coordination(&self, graph_id: &str) -> OwnedMutexGuard<()> {
+        {
+            let mut registry = self
+                .coordination
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.retain(|_, lock| lock.strong_count() > 0);
+            registry
+                .get(graph_id)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let lock = Arc::new(Mutex::new(()));
+                    registry.insert(graph_id.to_string(), Arc::downgrade(&lock));
+                    lock
+                })
+        }
+        .lock_owned()
+        .await
+    }
+
+    pub(crate) fn install_mutation_gate(
         &self,
         gate: impl Fn() -> Result<(), String> + Send + Sync + 'static,
     ) {
@@ -278,7 +316,8 @@ impl ExecutionGraphRunner {
         })
     }
 
-    pub async fn start(
+    #[cfg(test)]
+    pub(crate) async fn start(
         &self,
         graph: ExecutionGraph,
     ) -> Result<ExecutionRunReport, ExecutionRunnerError> {
@@ -289,7 +328,7 @@ impl ExecutionGraphRunner {
     /// Persist a valid graph without executing its first node. Callers that
     /// need live surface attachment use this boundary to publish the durable
     /// graph identity before any provider or tool work begins.
-    pub async fn register(
+    pub(crate) async fn register(
         &self,
         graph: ExecutionGraph,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
@@ -299,7 +338,7 @@ impl ExecutionGraphRunner {
         Ok(self.commit_service.register_graph_async(graph).await?.graph)
     }
 
-    pub async fn run_until_quiescent(
+    pub(crate) async fn run_until_quiescent(
         &self,
         graph_id: &str,
     ) -> Result<ExecutionRunReport, ExecutionRunnerError> {
@@ -878,7 +917,7 @@ impl ExecutionGraphRunner {
         Ok(())
     }
 
-    pub async fn command(
+    pub(crate) async fn command(
         &self,
         graph_id: &str,
         command: ExecutionGraphCommand,
@@ -888,7 +927,7 @@ impl ExecutionGraphRunner {
             command,
             ExecutionGraphCommand::Pause { .. } | ExecutionGraphCommand::Cancel { .. }
         ) {
-            let coordination = self.graph_coordination_without_command(graph_id).await;
+            let coordination = self.graph_coordination(graph_id).await;
             let graph = self.state_store.load_async(graph_id).await?;
             self.commit_service
                 .validate_command_revision(&graph, &command)?;
@@ -936,7 +975,7 @@ impl ExecutionGraphRunner {
                 }
             }
 
-            let coordination = self.coordination.lock().await;
+            let coordination = self.graph_coordination(graph_id).await;
             let current = self.state_store.load_async(graph_id).await?;
             if let Some((_, error)) = cancellation_errors.into_iter().find(|(node_id, _)| {
                 current
@@ -978,25 +1017,10 @@ impl ExecutionGraphRunner {
             .await?
             .graph;
         drop(coordination);
-        if matches!(
-            command,
-            ExecutionGraphCommand::Resume { .. }
-                | ExecutionGraphCommand::Advance { .. }
-                | ExecutionGraphCommand::SubmitApproval { approved: true, .. }
-                | ExecutionGraphCommand::ResolveExternal { .. }
-        ) {
-            self.run_until_quiescent(graph_id).await?;
-            return self
-                .state_store
-                .load_async(graph_id)
-                .await
-                .map_err(Into::into);
-        } else {
-            Ok(graph)
-        }
+        Ok(graph)
     }
 
-    pub async fn projection(
+    pub(crate) async fn projection(
         &self,
         graph_id: &str,
     ) -> Result<harness_contract::execution_graph::ExecutionGraphProjection, ExecutionRunnerError>

@@ -33,7 +33,8 @@ pub use resources::{
 };
 #[cfg(test)]
 pub(crate) use runner::validate_worktree_path;
-pub use runner::{ExecutionGraphRunner, ExecutionRunReport, ExecutionRunnerError};
+pub(crate) use runner::ExecutionGraphRunner;
+pub use runner::{ExecutionRunReport, ExecutionRunnerError};
 pub use state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
 
 #[cfg(test)]

@@ -213,12 +213,12 @@ async fn submit_session_handoff(
         return Err("session handoff did not compile to an execution graph".to_string());
     };
     let receipt = services
-        .graph_runner()
+        .execution_supervisor()
         .submit_graph(graph, graph_command)
         .await
         .map_err(|error| error.to_string())?;
     Ok((
-        serde_json::json!({ "graph": receipt.graph, "run": receipt.run }),
+        serde_json::json!({ "admission": receipt }),
         command.evidence_refs.clone(),
     ))
 }

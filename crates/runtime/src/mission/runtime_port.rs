@@ -88,7 +88,7 @@ impl MissionRuntimePort {
             } => {
                 let submitted = self
                     .services
-                    .graph_runner()
+                    .execution_supervisor()
                     .submit_graph(graph, graph_command)
                     .await
                     .map(|receipt| serde_json::to_value(receipt).unwrap_or_default())
@@ -135,13 +135,13 @@ impl MissionRuntimePort {
         let team = self.team_projection(team_id)?;
         let projection = self
             .services
-            .graph_runner()
+            .execution_supervisor()
             .graph_projection(&team.graph_id)
             .await
             .map_err(|error| error.to_string())?;
         let receipt = self
             .services
-            .graph_runner()
+            .execution_supervisor()
             .command_graph(
                 &projection.graph_id,
                 ExecutionGraphCommand::Cancel {

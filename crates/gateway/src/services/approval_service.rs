@@ -3,7 +3,7 @@ use std::sync::Arc;
 use approval::SharedApprovalHistoryLedger;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::policy::RiskGateReceipt;
-use runtime::{approval_gate::SmartApprovalGate, ApprovalConfig};
+use runtime::{approval_gate::SmartApprovalGate, ApprovalConfig, ExecutionGraphHost};
 
 use super::ServiceEnvelope;
 
@@ -276,17 +276,24 @@ impl ApprovalService {
                     approved,
                     decision_ref: format!("approval-decision:{id}"),
                 };
-                let graph = services
-                    .graph_runner()
-                    .command(&graph_id, command)
+                let graph_receipt = services
+                    .execution_supervisor()
+                    .command_graph(&graph_id, command)
                     .await
                     .map_err(|error| format!("approval_graph_command_failed: {error}"))?;
+                let graph = services
+                    .execution_supervisor()
+                    .graph_projection(&graph_id)
+                    .await
+                    .map_err(|error| format!("approval_graph_projection_failed: {error}"))?;
                 services.approval_queue().refresh();
                 Some(serde_json::json!({
                     "graph_id": graph_id,
                     "node_id": node_id,
-                    "revision": graph.revision,
-                    "node_status": graph.node_statuses.get(&node_id),
+                    "revision": graph_receipt.accepted_revision,
+                    "node_status": graph.nodes.iter()
+                        .find(|node| node.node_id == node_id)
+                        .map(|node| node.status),
                 }))
             } else {
                 None
@@ -404,8 +411,8 @@ mod tests {
         let node_id = node.id.clone();
         graph.nodes.push(node);
         let graph_id = graph.id.clone();
-        let waiting = services
-            .graph_runner()
+        services
+            .execution_supervisor()
             .submit_graph(
                 graph,
                 ExecutionGraphCommand::Start {
@@ -413,8 +420,17 @@ mod tests {
                 },
             )
             .await
-            .unwrap()
-            .graph;
+            .unwrap();
+        services
+            .execution_supervisor()
+            .wait_for_quiescence(&graph_id)
+            .await
+            .unwrap();
+        let waiting = services
+            .execution_supervisor()
+            .projection(&graph_id)
+            .await
+            .unwrap();
         assert_eq!(
             waiting
                 .nodes
@@ -426,8 +442,8 @@ mod tests {
         let approval_id =
             runtime::execution_core::graph::executors::graph_approval_id(&graph_id, &node_id);
         services
-            .graph_runner()
-            .command(
+            .execution_supervisor()
+            .command_graph(
                 &graph_id,
                 ExecutionGraphCommand::SubmitApproval {
                     expected_revision: waiting.revision,
@@ -436,6 +452,11 @@ mod tests {
                     decision_ref: format!("approval-decision:{approval_id}"),
                 },
             )
+            .await
+            .unwrap();
+        services
+            .execution_supervisor()
+            .wait_for_quiescence(&graph_id)
             .await
             .unwrap();
         services.approval_queue().refresh();

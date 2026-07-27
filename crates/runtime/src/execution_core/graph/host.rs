@@ -4,7 +4,7 @@ use harness_contract::execution_graph::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{ExecutionGraphRunner, ExecutionRunReport, ExecutionRunnerError};
+use super::ExecutionRunnerError;
 
 /// The only stateful entry point callers may use to drive an execution graph.
 ///
@@ -33,49 +33,9 @@ pub trait ExecutionGraphHost: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionGraphHostReceipt {
-    pub graph: ExecutionGraphProjection,
-    pub run: Option<ExecutionRunReport>,
-}
-
-#[async_trait]
-impl ExecutionGraphHost for ExecutionGraphRunner {
-    async fn submit_graph(
-        &self,
-        graph: ExecutionGraph,
-        command: ExecutionGraphCommand,
-    ) -> Result<ExecutionGraphHostReceipt, ExecutionRunnerError> {
-        if !matches!(
-            command,
-            ExecutionGraphCommand::Start { expected_revision }
-                if expected_revision == graph.revision
-        ) {
-            return Err(ExecutionRunnerError::InvalidStartCommand);
-        }
-        let graph_id = graph.id.clone();
-        let run = self.start(graph).await?;
-        let graph = self.projection(&graph_id).await?;
-        Ok(ExecutionGraphHostReceipt {
-            graph,
-            run: Some(run),
-        })
-    }
-
-    async fn command_graph(
-        &self,
-        graph_id: &str,
-        command: ExecutionGraphCommand,
-    ) -> Result<ExecutionGraphHostReceipt, ExecutionRunnerError> {
-        self.command(graph_id, command).await?;
-        Ok(ExecutionGraphHostReceipt {
-            graph: self.projection(graph_id).await?,
-            run: None,
-        })
-    }
-
-    async fn graph_projection(
-        &self,
-        graph_id: &str,
-    ) -> Result<ExecutionGraphProjection, ExecutionRunnerError> {
-        self.projection(graph_id).await
-    }
+    pub graph_id: String,
+    pub admission_id: String,
+    pub accepted_revision: u64,
+    pub queue_partition: u16,
+    pub accepted_at_ms: u64,
 }

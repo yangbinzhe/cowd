@@ -1013,6 +1013,19 @@ async fn shutdown_runtime_host_resources(
                 .map(|runtime| runtime.runtime_services())
                 .or_else(|| resources.runtime_services.cloned())
             {
+                let execution_report = runtime_services.shutdown_execution().await;
+                if execution_report.forced_aborts > 0 {
+                    failures.push(format!(
+                        "Runtime execution shutdown required {} forced abort(s)",
+                        execution_report.forced_aborts
+                    ));
+                }
+                failures.extend(
+                    execution_report
+                        .errors
+                        .iter()
+                        .map(|error| format!("Runtime execution shutdown incomplete: {error}")),
+                );
                 runtime_services.shutdown_maintenance().await;
             }
             if let Some(cognitive) = resources.cognitive {
@@ -1758,7 +1771,7 @@ fn spawn_runtime_schedule_timer(
             loop {
                 let policy = runtime_services.mission_schedule_policy();
                 if policy.enabled {
-                    let dispatch = runtime_services.dispatch_due_mission_schedules(epoch_millis());
+                    let dispatch = runtime_services.wake_due_mission_schedules(epoch_millis());
                     tokio::select! {
                         _ = cancellation.cancelled() => break,
                         result = dispatch => {
@@ -1771,8 +1784,8 @@ fn spawn_runtime_schedule_timer(
                 // Managed Agents have independent trigger definitions. They do
                 // not become inert merely because Mission scheduling is disabled;
                 // the existing interval is only the shared wake-up cadence.
-                let dispatch =
-                    runtime_services.dispatch_managed_agents("gateway-runtime-scheduler", 16);
+                let dispatch = runtime_services
+                    .wake_managed_agents("gateway-runtime-scheduler".to_string(), 16);
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
                     result = dispatch => {

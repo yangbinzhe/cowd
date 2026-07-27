@@ -2,7 +2,7 @@
 //!
 //! The store uses RuntimeEventStore goal streams directly. It deliberately has
 //! no scheduler, model loop, or Gateway dependency; interventions remain
-//! proposals until ExecutionGraphRunner applies them at a checkpoint.
+//! proposals until RuntimeExecutionSupervisor applies them at a checkpoint.
 
 use std::sync::Arc;
 

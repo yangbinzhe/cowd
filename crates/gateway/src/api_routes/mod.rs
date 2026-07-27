@@ -1529,7 +1529,7 @@ pub(crate) mod tests {
     use runtime::permission_enforcer::{
         ApprovalPersistence, ApprovalVerdict, DestructivePatternDetector,
     };
-    use runtime::{ContextProfile, ResumeContextSource};
+    use runtime::{ContextProfile, ExecutionGraphHost, ResumeContextSource};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
@@ -3696,10 +3696,20 @@ pub(crate) mod tests {
         graph.nodes.push(node);
         let execution_id = graph.id.clone();
         runtime
-            .graph_runner()
-            .register(graph)
+            .execution_supervisor()
+            .submit_graph(
+                graph,
+                harness_contract::execution_graph::ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("graph registers");
+        runtime
+            .execution_supervisor()
+            .wait_for_quiescence(&execution_id)
+            .await
+            .expect("graph reaches a stable projection before command testing");
         let observer_id = "test.execution-projection";
         attach_test_writer(&state, session_id, observer_id).await;
         let app = api_router(Arc::clone(&state));
@@ -12689,9 +12699,14 @@ providers:
         });
         graph.nodes = vec![approval.clone(), tool.clone()];
         let graph_id = graph.id.clone();
-        let report = runtime_services
-            .graph_runner()
-            .start(graph)
+        let (_, report) = runtime_services
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                harness_contract::execution_graph::ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("graph reaches approval wait");
         assert_eq!(report.waiting, 1);
@@ -12709,8 +12724,8 @@ providers:
         );
         assert!(matches!(
             runtime_services
-                .graph_runner()
-                .command(
+                .execution_supervisor()
+                .command_graph(
                     &graph_id,
                     harness_contract::execution_graph::ExecutionGraphCommand::SubmitApproval {
                         expected_revision: waiting.revision.saturating_sub(1),
@@ -12757,7 +12772,13 @@ providers:
         );
         let body: serde_json::Value = serde_json::from_slice(&response_body).unwrap();
         assert_eq!(body["execution_graph"]["graph_id"], graph_id);
-        assert_eq!(body["execution_graph"]["node_status"], "completed");
+        assert_eq!(body["execution_graph"]["node_status"], "ready");
+
+        runtime_services
+            .execution_supervisor()
+            .wait_for_quiescence(&graph_id)
+            .await
+            .expect("approved graph reaches quiescence through the supervisor");
 
         let terminal = runtime_services
             .graph_state_store()
@@ -12898,7 +12919,7 @@ providers:
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let terminal = runtime_services
-            .graph_runner()
+            .execution_supervisor()
             .projection(&projection.graph_id)
             .await
             .expect("terminal cross-plane graph");

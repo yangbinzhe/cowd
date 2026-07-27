@@ -145,6 +145,7 @@ where
                 active_model.clone(),
                 config.tool_definitions,
             )?
+            .with_execution_supervisor(services.execution_supervisor())
             .with_emit_output(config.emit_output)
             .with_stream_callback(config.stream_callback.clone()),
             config.tool_executor.clone(),
@@ -336,7 +337,7 @@ where
                 "Runtime host has no conversation available for this turn",
             ));
         };
-        self.start_turn(runtime, content, prompter, None);
+        self.start_turn(runtime, content, prompter, None).await?;
         self.await_started_turn().await
     }
 
@@ -359,7 +360,8 @@ where
             &ingress.request_id,
             &ingress.turn_id,
         );
-        self.start_turn(runtime, content, prompter, Some((ingress, execution_id)));
+        self.start_turn(runtime, content, prompter, Some((ingress, execution_id)))
+            .await?;
         self.await_started_turn().await
     }
 
@@ -409,85 +411,110 @@ where
     /// conversation runtime.  This is the cancellation boundary: dropping a
     /// request future leaves the receiver in `self`, while the task keeps
     /// running long enough to send the runtime back.
-    fn start_turn(
+    async fn start_turn(
         &mut self,
         runtime: crate::ConversationRuntime<ProviderRuntimeClient, T>,
         content: &str,
         prompter: &SharedPrompter,
         ingress: Option<(TurnIngressRef, String)>,
-    ) {
+    ) -> Result<(), RuntimeError> {
         debug_assert!(self.inflight_turn.is_none());
         let services = Arc::clone(&self.services);
         let content = content.to_string();
         let prompter = prompter.clone();
         let execution_parent = self.execution_parent.clone();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.inflight_turn = Some(receiver);
-        tokio::spawn(async move {
-            let (runtime, result) = match ingress {
-                Some((ingress, execution_id)) => {
-                    // Scope every provider/tool/approval event to the
-                    // deterministic SessionIngress execution. The guard lives
-                    // in the owning task, so it also clears if the caller has
-                    // already been cancelled.
-                    let execution_scope = runtime.cowd_bus().cloned().map(|bus| {
-                        bus.enter_execution(crate::CowdExecutionContext {
-                            execution_id,
-                            session_id: ingress.session_id.clone(),
-                            turn_id: ingress.turn_id.clone(),
-                        })
-                    });
-                    let runtime = runtime;
-                    let fence = match usize::try_from(ingress.input_sequence) {
-                        Ok(input_sequence) => match services.session_query_port() {
-                            Some(query) => crate::SessionExecutionFence::from_claim(
-                                query,
-                                ingress.request_id.clone(),
-                                ingress.session_id.clone(),
-                                ingress.session_generation,
-                                input_sequence,
-                                ingress.claim_owner.clone(),
-                                ingress.claim_token.clone(),
-                            ),
-                            None => Err("Session ingress requires a durable execution fence store"
-                                .to_string()),
-                        },
-                        Err(_) => Err(format!(
-                            "Session ingress sequence {} exceeds this platform's durable index range",
-                            ingress.input_sequence
-                        )),
-                    };
-                    let completed = match fence {
-                        Ok(fence) => {
-                            submit_owned_conversation_turn_with_ingress(
-                                runtime.with_session_execution_fence(fence),
-                                services,
-                                &content,
-                                &prompter,
-                                Some(ingress),
-                                execution_parent,
-                            )
-                            .await
-                        }
-                        Err(error) => (runtime, Err(RuntimeError::new(error))),
-                    };
-                    drop(execution_scope);
-                    completed
-                }
-                None => {
-                    submit_owned_conversation_turn_with_ingress(
-                        runtime,
-                        services,
-                        &content,
-                        &prompter,
-                        None,
-                        execution_parent,
-                    )
-                    .await
-                }
-            };
-            let _ = sender.send((runtime, result));
-        });
+        let (runtime_sender, runtime_receiver) =
+            tokio::sync::oneshot::channel::<crate::ConversationRuntime<ProviderRuntimeClient, T>>();
+        let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
+        let execution_supervisor = Arc::clone(services.execution_supervisor());
+        if let Err(error) = execution_supervisor
+            .spawn_owned("conversation_turn", async move {
+                let Ok(runtime) = runtime_receiver.await else {
+                    return;
+                };
+                let (runtime, result) = match ingress {
+                    Some((ingress, execution_id)) => {
+                        // Scope every provider/tool/approval event to the
+                        // deterministic SessionIngress execution. The guard lives
+                        // in the owning task, so it also clears if the caller has
+                        // already been cancelled.
+                        let execution_scope = runtime.cowd_bus().cloned().map(|bus| {
+                            bus.enter_execution(crate::CowdExecutionContext {
+                                execution_id,
+                                session_id: ingress.session_id.clone(),
+                                turn_id: ingress.turn_id.clone(),
+                            })
+                        });
+                        let runtime = runtime;
+                        let fence = match usize::try_from(ingress.input_sequence) {
+                            Ok(input_sequence) => match services.session_query_port() {
+                                Some(query) => crate::SessionExecutionFence::from_claim(
+                                    query,
+                                    ingress.request_id.clone(),
+                                    ingress.session_id.clone(),
+                                    ingress.session_generation,
+                                    input_sequence,
+                                    ingress.claim_owner.clone(),
+                                    ingress.claim_token.clone(),
+                                ),
+                                None => {
+                                    Err("Session ingress requires a durable execution fence store"
+                                        .to_string())
+                                }
+                            },
+                            Err(_) => Err(format!(
+                                "Session ingress sequence {} exceeds this platform's durable index range",
+                                ingress.input_sequence
+                            )),
+                        };
+                        let completed = match fence {
+                            Ok(fence) => {
+                                submit_owned_conversation_turn_with_ingress(
+                                    runtime.with_session_execution_fence(fence),
+                                    services,
+                                    &content,
+                                    &prompter,
+                                    Some(ingress),
+                                    execution_parent,
+                                )
+                                .await
+                            }
+                            Err(error) => (runtime, Err(RuntimeError::new(error))),
+                        };
+                        drop(execution_scope);
+                        completed
+                    }
+                    None => {
+                        submit_owned_conversation_turn_with_ingress(
+                            runtime,
+                            services,
+                            &content,
+                            &prompter,
+                            None,
+                            execution_parent,
+                        )
+                        .await
+                    }
+                };
+                let _ = completion_sender.send((runtime, result));
+            })
+            .await
+        {
+            self.runtime = Some(runtime);
+            return Err(RuntimeError::new(error.to_string()));
+        }
+        match runtime_sender.send(runtime) {
+            Ok(()) => {
+                self.inflight_turn = Some(completion_receiver);
+                Ok(())
+            }
+            Err(runtime) => {
+                self.runtime = Some(runtime);
+                Err(RuntimeError::new(
+                    "Runtime execution supervisor stopped before accepting the conversation turn",
+                ))
+            }
+        }
     }
 
     async fn await_started_turn(&mut self) -> Result<TurnSummary, RuntimeError> {
@@ -1081,11 +1108,14 @@ where
                     .await
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
             }
-            services.graph_runner().run_until_quiescent(&graph_id).await
+            services
+                .execution_supervisor()
+                .wait_for_quiescence(&graph_id)
+                .await
         } else {
             let mut registered = services
-                .graph_runner()
-                .register(graph)
+                .execution_supervisor()
+                .register_graph(graph)
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
             // Publish the durable graph ID before execution. Surfaces can now
@@ -1167,9 +1197,10 @@ where
                     .map_err(|error| RuntimeError::new(error.to_string()))?;
             }
             services
-                .graph_runner()
-                .run_until_quiescent(&registered.id)
+                .execution_supervisor()
+                .drive_registered(&registered.id)
                 .await
+                .map(|(_, report)| report)
         };
         run_result.map_err(|error| RuntimeError::new(error.to_string()))?;
         let mut state = state.lock().await;
@@ -1213,7 +1244,7 @@ where
             )));
         };
         let projection = services
-            .graph_runner()
+            .execution_supervisor()
             .projection(&graph_id)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -6170,7 +6201,7 @@ where
         }
         let projection = self
             .services
-            .graph_runner()
+            .execution_supervisor()
             .projection(&ticket.graph_id)
             .await
             .map_err(|error| error.to_string())?;
@@ -6329,7 +6360,7 @@ where
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), String> {
         let projection = self
             .services
-            .graph_runner()
+            .execution_supervisor()
             .projection(&ticket.graph_id)
             .await
             .map_err(|error| error.to_string())?;
@@ -9249,6 +9280,27 @@ mod tests {
         assert!(host.inflight_turn.is_none());
     }
 
+    #[tokio::test]
+    async fn rejected_turn_admission_restores_the_conversation_runtime_to_its_host() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let mut host = standard_host_with_services(Arc::clone(&services));
+        services.shutdown_execution().await;
+        let runtime = host.runtime.take().expect("fixture runtime");
+
+        let result = host
+            .start_turn(
+                runtime,
+                "must not be admitted",
+                &SharedPrompter::none(),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(host.runtime.is_some());
+        assert!(host.inflight_turn.is_none());
+    }
+
     #[derive(Clone)]
     struct TwoToolClient {
         requests: usize,
@@ -9973,8 +10025,8 @@ mod tests {
             })
             .expect("initial Team parent graph");
         let registered = services
-            .graph_runner()
-            .register(current)
+            .execution_supervisor()
+            .register_graph(current)
             .await
             .expect("registered initial graph");
         let stable_parent = registered.nodes.first().expect("initial root").id.clone();

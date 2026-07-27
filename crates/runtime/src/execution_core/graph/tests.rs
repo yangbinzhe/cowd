@@ -687,6 +687,228 @@ fn completed_result(id: &str) -> ExecutionNodeResult {
     }
 }
 
+#[tokio::test]
+async fn supervisor_runs_one_hundred_graphs_with_bounded_cross_key_parallelism() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(10)));
+    registry.register(executor.clone()).unwrap();
+    let supervisor = Arc::new(crate::RuntimeExecutionSupervisor::with_limits(
+        Arc::new(test_runner(registry, state, commits)),
+        128,
+        8,
+        Duration::from_secs(2),
+    ));
+
+    let mut graph_ids = Vec::new();
+    for index in 0..100 {
+        let mut graph = ExecutionGraph::new(format!("parallel graph {index}"));
+        graph.id = format!("parallel-graph-{index}");
+        graph.nodes.push(node(&format!("node-{index}")));
+        let receipt = supervisor
+            .submit_graph(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
+        graph_ids.push(receipt.graph_id);
+    }
+
+    let mut waiters = tokio::task::JoinSet::new();
+    for graph_id in graph_ids {
+        let supervisor = Arc::clone(&supervisor);
+        waiters.spawn(async move {
+            supervisor
+                .wait_for_quiescence(&graph_id)
+                .await
+                .expect("graph reaches quiescence");
+        });
+    }
+    while let Some(result) = waiters.join_next().await {
+        result.unwrap();
+    }
+
+    let max_running = executor.max_running.load(Ordering::SeqCst);
+    assert!(
+        max_running > 1,
+        "different graph keys must run concurrently"
+    );
+    assert!(
+        max_running <= 8,
+        "supervisor concurrency must respect its configured upper bound"
+    );
+    assert_eq!(executor.calls.lock().unwrap().len(), 100);
+    assert_eq!(supervisor.health().tracked_keys, 0);
+    let shutdown = supervisor.shutdown().await;
+    assert_eq!(shutdown.remaining_keys, 0);
+    assert_eq!(shutdown.forced_aborts, 0);
+}
+
+#[tokio::test]
+async fn supervisor_coalesces_same_key_wakes_and_reclaims_the_slot() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(50)));
+    registry.register(executor.clone()).unwrap();
+    let supervisor = Arc::new(crate::RuntimeExecutionSupervisor::with_limits(
+        Arc::new(test_runner(registry, state, commits)),
+        64,
+        8,
+        Duration::from_secs(2),
+    ));
+    let mut graph = ExecutionGraph::new("same key");
+    graph.id = "same-key-graph".to_string();
+    graph.nodes.push(node("same-key-node"));
+    supervisor
+        .submit_graph(
+            graph,
+            ExecutionGraphCommand::Start {
+                expected_revision: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut waiters = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        let supervisor = Arc::clone(&supervisor);
+        waiters.spawn(async move {
+            supervisor
+                .wait_for_quiescence("same-key-graph")
+                .await
+                .expect("same key waiter");
+        });
+    }
+    while let Some(result) = waiters.join_next().await {
+        result.unwrap();
+    }
+
+    assert_eq!(executor.max_running.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        executor.calls.lock().unwrap().as_slice(),
+        &["same-key-node".to_string()]
+    );
+    assert_eq!(supervisor.health().tracked_keys, 0);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn graph_host_returns_after_admission_before_slow_execution_finishes() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(200)));
+    registry.register(executor).unwrap();
+    let supervisor = crate::RuntimeExecutionSupervisor::with_limits(
+        Arc::new(test_runner(registry, state, commits)),
+        8,
+        1,
+        Duration::from_secs(2),
+    );
+    let mut graph = ExecutionGraph::new("admission only");
+    graph.id = "admission-only-graph".to_string();
+    graph.nodes.push(node("slow-node"));
+    let receipt = supervisor
+        .submit_graph(
+            graph,
+            ExecutionGraphCommand::Start {
+                expected_revision: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(receipt.graph_id, "admission-only-graph");
+    let projection = supervisor.projection(&receipt.graph_id).await.unwrap();
+    assert!(
+        projection
+            .nodes
+            .iter()
+            .any(|node| !node.status.is_terminal()),
+        "admission must not wait for the slow node to finish"
+    );
+    supervisor
+        .wait_for_quiescence(&receipt.graph_id)
+        .await
+        .unwrap();
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
+async fn supervisor_shutdown_cancels_owned_work_and_zeroes_owner_health() {
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let supervisor = crate::RuntimeExecutionSupervisor::with_limits(
+        Arc::new(test_runner(registry, state, commits)),
+        8,
+        1,
+        Duration::from_secs(2),
+    );
+    let started = Arc::new(Notify::new());
+    let started_work = Arc::clone(&started);
+    supervisor
+        .spawn_owned("shutdown-test", async move {
+            started_work.notify_one();
+            std::future::pending::<()>().await;
+        })
+        .await
+        .unwrap();
+    started.notified().await;
+
+    let report = supervisor.shutdown().await;
+    let owner = report.owners.get("shutdown-test").unwrap();
+    assert_eq!(owner.active, 0);
+    assert_eq!(owner.aborted, 1);
+    assert_eq!(report.forced_aborts, 0);
+    assert_eq!(report.remaining_keys, 0);
+}
+
+#[tokio::test]
+async fn supervisor_reaps_aborted_join_handles_through_its_owned_reaper() {
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let supervisor = crate::RuntimeExecutionSupervisor::with_limits(
+        Arc::new(test_runner(registry, state, commits)),
+        1,
+        1,
+        Duration::from_secs(2),
+    );
+    let worker = tokio::spawn(std::future::pending::<()>());
+
+    supervisor.reap_join_handle("join-handle-reaper-test", worker);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if supervisor
+                .health()
+                .owners
+                .get("join-handle-reaper-test")
+                .is_some_and(|owner| owner.completed == 1 && owner.active == 0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("aborted join handle is reaped");
+
+    let report = supervisor.shutdown().await;
+    let owner = report.owners.get("join-handle-reaper-test").unwrap();
+    assert_eq!(owner.submitted, 1);
+    assert_eq!(owner.completed, 1);
+    assert_eq!(owner.active, 0);
+    assert_eq!(report.forced_aborts, 0);
+}
+
 #[test]
 fn compiler_exposes_the_three_canonical_bootstrap_targets() {
     let compiler = ExecutionGraphCompiler;
@@ -1186,7 +1408,7 @@ async fn cancel_wins_over_inflight_dynamic_replan_without_partial_graph_mutation
 }
 
 #[tokio::test]
-async fn execution_graph_host_submits_and_projects_the_same_runner_graph() {
+async fn execution_graph_host_admits_and_supervisor_drives_the_same_graph() {
     let (registry, state, commits) = harness();
     registry
         .register(Arc::new(TestExecutor::new(
@@ -1194,13 +1416,14 @@ async fn execution_graph_host_submits_and_projects_the_same_runner_graph() {
             Duration::from_millis(1),
         )))
         .unwrap();
-    let runner = test_runner(registry, state, commits);
+    let supervisor =
+        crate::RuntimeExecutionSupervisor::new(Arc::new(test_runner(registry, state, commits)));
     let mut graph = ExecutionGraph::new("host submission");
     graph.nodes.push(node("host-node"));
     let graph_id = graph.id.clone();
 
-    let receipt = runner
-        .submit_graph(
+    let (receipt, report) = supervisor
+        .submit_and_wait(
             graph,
             ExecutionGraphCommand::Start {
                 expected_revision: 0,
@@ -1209,12 +1432,10 @@ async fn execution_graph_host_submits_and_projects_the_same_runner_graph() {
         .await
         .expect("host submission");
 
-    assert_eq!(receipt.graph.graph_id, graph_id);
-    assert_eq!(
-        receipt.graph.nodes[0].status,
-        ExecutionNodeStatus::Completed
-    );
-    assert_eq!(receipt.run.expect("run report").completed, 1);
+    assert_eq!(receipt.graph_id, graph_id);
+    let projection = supervisor.projection(&graph_id).await.unwrap();
+    assert_eq!(projection.nodes[0].status, ExecutionNodeStatus::Completed);
+    assert_eq!(report.completed, 1);
 }
 
 #[tokio::test]
@@ -1395,7 +1616,12 @@ async fn pause_resume_and_cancel_are_revision_checked() {
         )
         .await
         .unwrap();
-    assert_eq!(resumed.node_statuses["a"], ExecutionNodeStatus::Completed);
+    assert_eq!(resumed.node_statuses["a"], ExecutionNodeStatus::Ready);
+    runner.run_until_quiescent(&graph_id).await.unwrap();
+    assert_eq!(
+        state.load(&graph_id).unwrap().node_statuses["a"],
+        ExecutionNodeStatus::Completed
+    );
 }
 
 #[test]

@@ -284,7 +284,7 @@ impl CrossPlaneService {
                     }));
                 let projection = self
                     .runtime_services
-                    .graph_runner()
+                    .execution_supervisor()
                     .graph_projection(&graph_id)
                     .await
                     .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))?;
@@ -295,9 +295,8 @@ impl CrossPlaneService {
                 {
                     return Ok(projection);
                 }
-                return self
-                    .runtime_services
-                    .graph_runner()
+                self.runtime_services
+                    .execution_supervisor()
                     .command_graph(
                         &graph_id,
                         ExecutionGraphCommand::Advance {
@@ -305,7 +304,17 @@ impl CrossPlaneService {
                         },
                     )
                     .await
-                    .map(|receipt| receipt.graph)
+                    .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))?;
+                self.runtime_services
+                    .execution_supervisor()
+                    .wait_for_quiescence(&graph_id)
+                    .await
+                    .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))?;
+                return self
+                    .runtime_services
+                    .execution_supervisor()
+                    .graph_projection(&graph_id)
+                    .await
                     .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()));
             }
             Err(runtime::execution_core::ExecutionStateStoreError::NotFound(_)) => {}
@@ -323,7 +332,7 @@ impl CrossPlaneService {
                 backend,
             }));
         self.runtime_services
-            .graph_runner()
+            .execution_supervisor()
             .submit_graph(
                 graph,
                 ExecutionGraphCommand::Start {
@@ -331,7 +340,16 @@ impl CrossPlaneService {
                 },
             )
             .await
-            .map(|receipt| receipt.graph)
+            .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))?;
+        self.runtime_services
+            .execution_supervisor()
+            .wait_for_quiescence(&graph_id)
+            .await
+            .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))?;
+        self.runtime_services
+            .execution_supervisor()
+            .graph_projection(&graph_id)
+            .await
             .map_err(|error| CrossPlaneCommitGraphError::Execution(error.to_string()))
     }
 

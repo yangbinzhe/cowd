@@ -11,10 +11,12 @@
 //! - `WaveExecutor`: Trait for executing tasks (implement by application)
 
 use crate::tool_orchestrator::ToolSafetyCategory;
+use futures::{future::join_all, FutureExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -893,7 +895,7 @@ impl WaveOrchestrator {
         context: &TaskContext,
         timeout: Duration,
     ) -> Vec<TaskResult> {
-        let mut handles: Vec<(TaskId, Instant, tokio::task::JoinHandle<TaskResult>)> = Vec::new();
+        let mut workers = Vec::new();
 
         for task_id in task_ids {
             if let Some(task) = self.tasks.get(task_id) {
@@ -902,65 +904,54 @@ impl WaveOrchestrator {
                 let timeout = timeout;
                 let exec = executor.clone();
 
-                let panic_task_id = task.id.clone();
-                let panic_started = Instant::now();
-                let handle: tokio::task::JoinHandle<TaskResult> = tokio::spawn(async move {
-                    let start = Instant::now();
+                workers.push(async move {
+                    let started = Instant::now();
                     let task_id = task.id.clone();
-
-                    // Execute with timeout
-                    let result = tokio::time::timeout(timeout, async {
-                        if context.is_cancelled().await {
-                            return Err(WaveError::Cancelled);
+                    let execution = async {
+                        let result = tokio::time::timeout(timeout, async {
+                            if context.is_cancelled().await {
+                                return Err(WaveError::Cancelled);
+                            }
+                            exec.execute(task, context).await
+                        })
+                        .await;
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        match result {
+                            Ok(Ok(mut task_result)) => {
+                                task_result.duration_ms = duration_ms;
+                                task_result
+                            }
+                            Ok(Err(error)) => TaskResult {
+                                task_id: task_id.clone(),
+                                success: false,
+                                output: None,
+                                error: Some(error.to_string()),
+                                duration_ms,
+                            },
+                            Err(_) => TaskResult {
+                                task_id: task_id.clone(),
+                                success: false,
+                                output: None,
+                                error: Some("Task timeout".to_string()),
+                                duration_ms,
+                            },
                         }
-                        exec.execute(task.clone(), context.clone()).await
-                    })
-                    .await;
-
-                    let duration_ms = start.elapsed().as_millis() as u64;
-
-                    match result {
-                        Ok(Ok(mut task_result)) => {
-                            task_result.duration_ms = duration_ms;
-                            task_result
-                        }
-                        Ok(Err(e)) => TaskResult {
+                    };
+                    AssertUnwindSafe(execution)
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| TaskResult {
                             task_id,
                             success: false,
                             output: None,
-                            error: Some(e.to_string()),
-                            duration_ms,
-                        },
-                        Err(_) => TaskResult {
-                            task_id,
-                            success: false,
-                            output: None,
-                            error: Some("Task timeout".to_string()),
-                            duration_ms,
-                        },
-                    }
+                            error: Some("Task worker panicked".to_string()),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        })
                 });
-
-                handles.push((panic_task_id, panic_started, handle));
             }
         }
 
-        // Wait for all tasks in chunk
-        let mut results: Vec<TaskResult> = Vec::new();
-        for (task_id, started, handle) in handles {
-            match handle.await {
-                Ok(result) => results.push(result),
-                Err(error) => results.push(TaskResult {
-                    task_id,
-                    success: false,
-                    output: None,
-                    error: Some(format!("Task worker failed: {error}")),
-                    duration_ms: started.elapsed().as_millis() as u64,
-                }),
-            }
-        }
-
-        results
+        join_all(workers).await
     }
 
     /// Cancel all execution.
@@ -1365,7 +1356,7 @@ mod tests {
         assert!(panic_result
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("Task worker failed")));
+            .is_some_and(|error| error.contains("Task worker panicked")));
     }
 
     #[test]

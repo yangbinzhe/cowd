@@ -1396,6 +1396,7 @@ impl RuntimeService {
             "runtime_host": status.runtime_host,
             "active_sessions": status.active_sessions,
             "uptime_secs": status.uptime_secs,
+            "execution": self.runtime_services.execution_health(),
         })
     }
 

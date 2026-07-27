@@ -244,22 +244,37 @@ async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_
         .trigger_managed_agent_manual("workspace/cowd/runtime-dispatch", "operator-request")
         .expect("Runtime creates durable invocation");
 
-    let report = services
+    let admitted = services
         .dispatch_managed_agents("runtime-test-dispatcher", 4)
         .await
         .expect("Runtime dispatch");
 
-    assert_eq!(report.claimed.len(), 1);
-    assert_eq!(report.completed.len(), 1);
-    assert!(report.failed.is_empty());
+    assert_eq!(admitted.claimed.len(), 1);
+    assert_eq!(admitted.submitted.len(), 1);
+    assert!(admitted.completed.is_empty());
+    assert!(admitted.failed.is_empty());
+    let graph_id = admitted.submitted[0]
+        .execution_ref
+        .clone()
+        .expect("submitted graph id");
+    services
+        .execution_supervisor()
+        .wait_for_quiescence(&graph_id)
+        .await
+        .expect("managed graph completes");
+    let reconciled = services
+        .dispatch_managed_agents("runtime-test-dispatcher", 4)
+        .await
+        .expect("Runtime reconciliation");
+    assert_eq!(reconciled.completed.len(), 1);
     assert_eq!(
-        report.completed[0].status,
+        reconciled.completed[0].status,
         ManagedAgentInvocationStatus::Completed
     );
-    assert!(report.completed[0]
+    assert!(reconciled.completed[0]
         .execution_ref
         .as_deref()
-        .is_some_and(|reference| reference.starts_with("managed-run:")));
+        .is_some_and(|reference| reference.starts_with("managed-agent:")));
 }
 
 #[tokio::test]
@@ -296,18 +311,33 @@ async fn runtime_dispatch_uses_team_instantiation_for_managed_team_targets() {
         .trigger_managed_agent_manual("workspace/cowd/runtime-team-dispatch", "operator-request")
         .expect("Runtime creates Team invocation");
 
-    let report = services
+    let admitted = services
         .dispatch_managed_agents("runtime-test-dispatcher", 4)
         .await
         .expect("Runtime Team dispatch");
-
-    assert_eq!(report.completed.len(), 1, "{report:?}");
-    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(admitted.submitted.len(), 1, "{admitted:?}");
+    assert!(admitted.completed.is_empty(), "{admitted:?}");
+    assert!(admitted.failed.is_empty(), "{admitted:?}");
+    let graph_id = admitted.submitted[0]
+        .execution_ref
+        .clone()
+        .expect("submitted Team graph id");
+    services
+        .execution_supervisor()
+        .wait_for_quiescence(&graph_id)
+        .await
+        .expect("managed Team graph completes");
+    let reconciled = services
+        .dispatch_managed_agents("runtime-test-dispatcher", 4)
+        .await
+        .expect("Runtime Team reconciliation");
+    assert_eq!(reconciled.completed.len(), 1, "{reconciled:?}");
+    assert!(reconciled.failed.is_empty(), "{reconciled:?}");
     assert_eq!(
-        report.completed[0].status,
+        reconciled.completed[0].status,
         ManagedAgentInvocationStatus::Completed
     );
-    assert!(report.completed[0]
+    assert!(reconciled.completed[0]
         .evidence_refs
         .iter()
         .any(|reference| reference.starts_with("team-graph:")));

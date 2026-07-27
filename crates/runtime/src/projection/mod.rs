@@ -64,7 +64,7 @@ pub async fn snapshot(
 ) -> Result<ExecutionProjection, RuntimeServicesError> {
     validate_context(services, context)?;
     let graph = services
-        .graph_runner()
+        .execution_supervisor()
         .graph_projection(execution_id)
         .await?;
     let full = context.detail_scope == ProjectionDetailScope::Full;
@@ -996,7 +996,7 @@ pub async fn command(
 ) -> Result<ExecutionCommandReceipt, RuntimeServicesError> {
     validate_context(services, context)?;
     let graph = services
-        .graph_runner()
+        .execution_supervisor()
         .graph_projection(execution_id)
         .await?;
     let session_id = session_id_from_graph(services, execution_id);
@@ -1040,12 +1040,12 @@ pub async fn command(
         });
     }
     let receipt = services
-        .graph_runner()
+        .execution_supervisor()
         .command_graph(execution_id, command)
         .await?;
     Ok(ExecutionCommandReceipt {
         command_id: request.command_id,
-        accepted_revision: receipt.graph.revision,
+        accepted_revision: receipt.accepted_revision,
         status: "accepted".to_string(),
         reason: None,
     })
@@ -1057,7 +1057,7 @@ async fn available_commands(
     _context: &ProjectionQueryContext,
 ) -> Result<Vec<ProjectionCommandAvailability>, RuntimeServicesError> {
     let graph = services
-        .graph_runner()
+        .execution_supervisor()
         .graph_projection(execution_id)
         .await?;
     let terminal = graph.nodes.iter().all(|node| node.status.is_terminal());
@@ -1653,8 +1653,13 @@ mod tests {
         let graph = ExecutionGraph::new("projection contract graph");
         let graph_id = graph.id.clone();
         services
-            .graph_runner()
-            .start(graph)
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("graph starts");
         let query = context(&services);
@@ -1692,8 +1697,13 @@ mod tests {
         let parent = ExecutionGraph::new("root execution");
         let parent_id = parent.id.clone();
         services
-            .graph_runner()
-            .start(parent)
+            .execution_supervisor()
+            .submit_and_wait(
+                parent,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("parent graph starts");
 
@@ -1704,16 +1714,26 @@ mod tests {
         });
         let child_id = child.id.clone();
         services
-            .graph_runner()
-            .start(child)
+            .execution_supervisor()
+            .submit_and_wait(
+                child,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("child graph starts");
 
         let sibling = ExecutionGraph::new("unrelated same-runtime execution");
         let sibling_id = sibling.id.clone();
         services
-            .graph_runner()
-            .start(sibling)
+            .execution_supervisor()
+            .submit_and_wait(
+                sibling,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("sibling graph starts");
 
@@ -1810,22 +1830,22 @@ mod tests {
         let graph = session_graph("strategy projection");
         let graph_id = graph.id.clone();
         services
-            .graph_runner()
-            .register(graph)
+            .execution_supervisor()
+            .register_graph(graph)
             .await
             .expect("graph registers");
         let sibling = session_graph("same-session sibling strategy");
         let sibling_id = sibling.id.clone();
         services
-            .graph_runner()
-            .register(sibling)
+            .execution_supervisor()
+            .register_graph(sibling)
             .await
             .expect("sibling graph registers");
         let child = session_graph("same-session child strategy");
         let child_id = child.id.clone();
         services
-            .graph_runner()
-            .register(child)
+            .execution_supervisor()
+            .register_graph(child)
             .await
             .expect("child graph registers");
         let strategy_event = |execution_id: &str, decision_id: &str, kind: &str, revision: u64| {
@@ -2223,8 +2243,13 @@ mod tests {
             .insert("dispatch-a".to_string(), ExecutionNodeStatus::Planned);
         let graph_id = graph.id.clone();
         services
-            .graph_runner()
-            .start(graph)
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("graph starts");
 
@@ -2339,8 +2364,13 @@ mod tests {
         let graph = ExecutionGraph::new("stale projection command");
         let graph_id = graph.id.clone();
         services
-            .graph_runner()
-            .start(graph)
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("graph starts");
         let query = context(&services);
@@ -2371,8 +2401,13 @@ mod tests {
         let graph = ExecutionGraph::new("workspace scope");
         let graph_id = graph.id.clone();
         services
-            .graph_runner()
-            .start(graph)
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("graph starts");
         let mut query = context(&services);

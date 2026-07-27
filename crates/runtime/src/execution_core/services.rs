@@ -1,6 +1,6 @@
 //! Workspace-owned runtime service graph.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -40,13 +40,14 @@ use super::graph::{
 use super::protocols::ProtocolResultReducer;
 use crate::agent::binding::request_for_intent;
 use crate::agent::definition::ExplicitTomlAgentImport;
+use crate::managed_agent::ManagedAgentRestartDisposition;
 use crate::runtime_event_store::RuntimeEventStoreError;
 #[cfg(any(test, feature = "test-fixtures"))]
 use crate::RuntimeEventInput;
 use crate::{
     AgentBindingCompiler, AgentBindingRequest, AgentDefinitionDraftReceipt, AgentRuntime,
     AgentRuntimeResolver, ApprovalQueue, CompiledAgentBinding, ConflictArbiter,
-    DefinitionRegistryError, DurableRuntimeEvent, InProcessAgentWorker,
+    DefinitionRegistryError, DurableRuntimeEvent, ExecutionGraphHost, InProcessAgentWorker,
     ManagedAgentRuntimeDispatchReport, MissionEvidenceBus, MissionRuntime, MissionScheduleStore,
     ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventReplayer,
     RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
@@ -909,7 +910,7 @@ pub struct RuntimeServices {
     synthesize_executor: Arc<SynthesizeNodeExecutor>,
     graph_state_store: ExecutionGraphStateStore,
     commit_service: ExecutionCommitService,
-    graph_runner: Arc<ExecutionGraphRunner>,
+    execution_supervisor: Arc<crate::RuntimeExecutionSupervisor>,
     approval_queue: Arc<ApprovalQueue>,
     evolution_governance: Arc<crate::EvolutionGovernanceService>,
     mission_evidence: Arc<MissionEvidenceBus>,
@@ -1131,6 +1132,8 @@ impl RuntimeServices {
             workspace_key.clone(),
             workspace_root.clone(),
         ));
+        let execution_supervisor = Arc::new(crate::RuntimeExecutionSupervisor::new(graph_runner));
+        tool_execution_plane.bind_supervisor(&execution_supervisor);
         let mission_runtime = Arc::new(
             MissionRuntime::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
@@ -1143,7 +1146,7 @@ impl RuntimeServices {
             commit_service.clone(),
         );
         let team_runtime = Arc::new(TeamRuntime::new(
-            Arc::clone(&graph_runner),
+            Arc::clone(&execution_supervisor),
             graph_state_store.clone(),
             Arc::clone(&agent_runtime),
             Arc::clone(&event_store),
@@ -1161,7 +1164,7 @@ impl RuntimeServices {
         let gate_store = Arc::clone(&event_store);
         let gate_workspace = workspace_key.clone();
         let gate_root = workspace_root.clone();
-        graph_runner.install_mutation_gate(move || {
+        execution_supervisor.install_mutation_gate(move || {
             let importer = crate::upgrade::LegacyExecutionImporter::new(
                 Arc::clone(&gate_store),
                 &gate_workspace,
@@ -1191,9 +1194,6 @@ impl RuntimeServices {
             )
             .map_err(RuntimeServicesError::Mission)?,
         );
-        managed_agents
-            .recover(now_ms())
-            .map_err(RuntimeServicesError::Mission)?;
         let session_relations = Arc::new(
             SessionRelationGraph::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
@@ -1217,7 +1217,7 @@ impl RuntimeServices {
             synthesize_executor,
             graph_state_store,
             commit_service,
-            graph_runner,
+            execution_supervisor,
             approval_queue,
             evolution_governance,
             mission_evidence,
@@ -1352,6 +1352,17 @@ impl RuntimeServices {
     /// Stop accepting detached maintenance and await every retained task.
     pub async fn shutdown_maintenance(&self) {
         self.maintenance_supervisor.shutdown_and_drain().await;
+    }
+
+    /// Stop the one Runtime execution owner and return auditable per-owner
+    /// queue/abort/error evidence to the process host.
+    pub async fn shutdown_execution(&self) -> crate::RuntimeExecutionShutdownReport {
+        self.execution_supervisor.shutdown().await
+    }
+
+    #[must_use]
+    pub fn execution_health(&self) -> crate::RuntimeExecutionHealth {
+        self.execution_supervisor.health()
     }
 
     /// Return a stable copy for primary or delegated turn construction.
@@ -1965,8 +1976,8 @@ impl RuntimeServices {
     pub fn commit_service(&self) -> &ExecutionCommitService {
         &self.commit_service
     }
-    pub fn graph_runner(&self) -> &Arc<ExecutionGraphRunner> {
-        &self.graph_runner
+    pub fn execution_supervisor(&self) -> &Arc<crate::RuntimeExecutionSupervisor> {
+        &self.execution_supervisor
     }
     pub fn approval_queue(&self) -> &Arc<ApprovalQueue> {
         &self.approval_queue
@@ -2625,6 +2636,63 @@ impl RuntimeServices {
         &self,
     ) -> Result<ExecutionStartupRecoveryReport, RuntimeServicesError> {
         self.ensure_mutation_allowed()?;
+        let mut managed_dispositions = BTreeMap::new();
+        for invocation in self
+            .managed_agents
+            .invocations()
+            .map_err(RuntimeServicesError::Mission)?
+        {
+            if invocation.status != crate::ManagedAgentInvocationStatus::Running {
+                continue;
+            }
+            let disposition = match invocation.execution_ref.as_deref() {
+                Some(graph_id) => match self.graph_state_store.load_async(graph_id).await {
+                    Ok(graph)
+                        if graph.node_statuses.values().all(|status| {
+                            matches!(
+                                status,
+                                ExecutionNodeStatus::Planned | ExecutionNodeStatus::Ready
+                            )
+                        }) =>
+                    {
+                        ManagedAgentRestartDisposition::RetrySafe
+                    }
+                    Ok(graph)
+                        if graph
+                            .node_statuses
+                            .values()
+                            .any(|status| *status == ExecutionNodeStatus::Running) =>
+                    {
+                        ManagedAgentRestartDisposition::ReconciliationRequired(
+                            format!(
+                                "Runtime restarted while Managed Agent graph `{graph_id}` had a running node; external completion is uncertain"
+                            ),
+                        )
+                    }
+                    Ok(_) => ManagedAgentRestartDisposition::PreserveRunning,
+                    Err(error) => ManagedAgentRestartDisposition::ReconciliationRequired(
+                        format!(
+                            "Runtime restarted but Managed Agent graph `{graph_id}` cannot be loaded: {error}"
+                        ),
+                    ),
+                },
+                None => ManagedAgentRestartDisposition::ReconciliationRequired(
+                    "Runtime restarted with a running Managed Agent invocation that has no execution graph"
+                        .to_string(),
+                ),
+            };
+            managed_dispositions.insert(invocation.invocation_id, disposition);
+        }
+        self.managed_agents
+            .recover_with_dispositions(now_ms(), &managed_dispositions)
+            .map_err(RuntimeServicesError::Mission)?;
+        let managed_invocations = self
+            .managed_agents
+            .invocations()
+            .map_err(RuntimeServicesError::Mission)?
+            .into_iter()
+            .map(|invocation| (invocation.invocation_id.clone(), invocation))
+            .collect::<BTreeMap<_, _>>();
         let resolved_handoff_results = self.resolve_durable_handoff_results().await?;
         let graph_ids = self.graph_state_store.nonterminal_graph_ids_async().await?;
         let mut report = ExecutionStartupRecoveryReport {
@@ -2632,12 +2700,6 @@ impl RuntimeServices {
             resolved_handoff_results,
             ..ExecutionStartupRecoveryReport::default()
         };
-        let recovery = super::graph::ExecutionGraphRecovery::new(
-            &self.graph_state_store,
-            &self.commit_service,
-            &self.executor_registry,
-        );
-
         for graph_id in graph_ids {
             let before = self.graph_state_store.load_async(&graph_id).await?;
             let before_revision = before.revision;
@@ -2646,9 +2708,55 @@ impl RuntimeServices {
             let had_running = graph_has_status(&before, ExecutionNodeStatus::Running);
             let mut action = "observed".to_string();
             let mut error = None;
+            let managed_fences = managed_invocation_fences(&before);
+            let managed_runnable = managed_fences.iter().all(|fence| {
+                managed_invocations
+                    .get(&fence.invocation_id)
+                    .is_some_and(|invocation| {
+                        invocation.status == crate::ManagedAgentInvocationStatus::Running
+                            && invocation.execution_ref.as_deref() == Some(before.id.as_str())
+                            && invocation.fence_generation == fence.fence_generation
+                            && invocation.claimed_by.as_deref()
+                                == Some(fence.dispatcher_id.as_str())
+                    })
+            });
 
-            if had_running {
-                match recovery.recover(&graph_id).await {
+            if !managed_fences.is_empty() && !managed_runnable {
+                if before.node_statuses.values().all(|status| {
+                    matches!(
+                        status,
+                        ExecutionNodeStatus::Planned | ExecutionNodeStatus::Ready
+                    )
+                }) {
+                    match self
+                        .execution_supervisor
+                        .command_graph(
+                            &graph_id,
+                            ExecutionGraphCommand::Cancel {
+                                expected_revision: before.revision,
+                                reason:
+                                    "Managed Agent execution fence is no longer runnable after restart"
+                                        .to_string(),
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => action = "cancelled_stale_managed_graph".to_string(),
+                        Err(cancel_error) => {
+                            let message = cancel_error.to_string();
+                            report.errors.push(ExecutionStartupRecoveryError {
+                                graph_id: graph_id.clone(),
+                                error: message.clone(),
+                            });
+                            error = Some(message);
+                        }
+                    }
+                } else {
+                    action = "managed_reconciliation_required".to_string();
+                    report.blocked_graphs += 1;
+                }
+            } else if had_running {
+                match self.execution_supervisor.recover_graph(&graph_id).await {
                     Ok(recovered) => {
                         if recovered.revision != before_revision {
                             report.recovered_graphs += 1;
@@ -2666,10 +2774,14 @@ impl RuntimeServices {
                 }
             }
 
-            if error.is_none() {
+            if error.is_none() && (managed_fences.is_empty() || managed_runnable) {
                 let current = self.graph_state_store.load_async(&graph_id).await?;
                 if graph_can_advance(&current) {
-                    match self.graph_runner.run_until_quiescent(&graph_id).await {
+                    match self
+                        .execution_supervisor
+                        .wait_for_quiescence(&graph_id)
+                        .await
+                    {
                         Ok(_) => {
                             let advanced = self.graph_state_store.load_async(&graph_id).await?;
                             if advanced.revision != current.revision {
@@ -2748,8 +2860,6 @@ impl RuntimeServices {
         &self,
         resolution: crate::SessionHandoffResolution,
     ) -> Result<bool, RuntimeServicesError> {
-        use crate::ExecutionGraphHost;
-
         for _ in 0..3 {
             let graph = self
                 .graph_state_store
@@ -2811,7 +2921,7 @@ impl RuntimeServices {
                 )
             })?;
             match self
-                .graph_runner
+                .execution_supervisor
                 .command_graph(
                     &resolution.source_graph_id,
                     ExecutionGraphCommand::ResolveExternal {
@@ -2917,20 +3027,20 @@ impl RuntimeServices {
                             continue;
                         }
                     };
-                    match self.graph_runner.start(graph).await {
-                        Ok(report) if report.failed == 0 => {
-                            submitted.push(
-                                self.mission_schedules
-                                    .mark_submitted(&fire.fire_id, graph_id)?,
-                            );
-                        }
-                        Ok(report) => failed.push(self.mission_schedules.mark_failed(
-                            &fire.fire_id,
-                            format!(
-                                "SessionDispatch graph completed with {} failed nodes",
-                                report.failed
-                            ),
-                        )?),
+                    match self
+                        .execution_supervisor
+                        .submit_graph(
+                            graph,
+                            ExecutionGraphCommand::Start {
+                                expected_revision: 0,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(_) => submitted.push(
+                            self.mission_schedules
+                                .mark_submitted(&fire.fire_id, graph_id)?,
+                        ),
                         Err(error) => failed.push(self.mission_schedules.mark_failed(
                             &fire.fire_id,
                             format!("SessionDispatch graph submission failed: {error}"),
@@ -2948,6 +3058,22 @@ impl RuntimeServices {
             submitted,
             failed,
         })
+    }
+
+    pub async fn wake_due_mission_schedules(
+        self: &Arc<Self>,
+        now_ms: u64,
+    ) -> Result<crate::RuntimeWorkAdmissionReceipt, RuntimeServicesError> {
+        let services = Arc::clone(self);
+        self.execution_supervisor
+            .admit_owned("mission_schedule_dispatch", async move {
+                services
+                    .dispatch_due_mission_schedules(now_ms)
+                    .await
+                    .map(|_| ())
+            })
+            .await
+            .map_err(RuntimeServicesError::GraphRunner)
     }
 
     pub fn mission_runtime(&self) -> &Arc<MissionRuntime> {
@@ -3107,6 +3233,7 @@ impl RuntimeServices {
         dispatcher_id: &str,
         limit: usize,
     ) -> Result<ManagedAgentRuntimeDispatchReport, RuntimeServicesError> {
+        let (completed, mut failed) = self.reconcile_managed_agent_invocations().await?;
         let health_affected = self
             .managed_agents
             .enforce_run_health(now_ms())
@@ -3119,33 +3246,51 @@ impl RuntimeServices {
             .managed_agents
             .claim_ready(dispatcher_id, now_ms(), limit)
             .map_err(RuntimeServicesError::Mission)?;
-        let mut completed = Vec::new();
-        let mut failed = Vec::new();
+        let mut submitted = Vec::new();
         for invocation in &claimed {
             match self
-                .execute_managed_agent_invocation(dispatcher_id, invocation.clone())
+                .submit_managed_agent_invocation(dispatcher_id, invocation.clone())
                 .await
             {
-                Ok(invocation)
-                    if invocation.status == crate::ManagedAgentInvocationStatus::Completed =>
-                {
-                    completed.push(invocation);
-                }
-                Ok(invocation) => failed.push(invocation),
+                Ok(invocation) => submitted.push(invocation),
                 Err(error) => {
-                    let completed_invocation = self
+                    let current = self
                         .managed_agents
-                        .complete_invocation(
-                            &invocation.invocation_id,
-                            dispatcher_id,
-                            invocation.fence_generation,
-                            false,
-                            now_ms(),
-                            None,
-                            Vec::new(),
-                            Some(error.to_string()),
-                        )
-                        .map_err(RuntimeServicesError::Mission)?;
+                        .invocations()
+                        .map_err(RuntimeServicesError::Mission)?
+                        .into_iter()
+                        .find(|current| current.invocation_id == invocation.invocation_id)
+                        .ok_or_else(|| {
+                            RuntimeServicesError::Invariant(format!(
+                                "claimed Managed Agent invocation `{}` disappeared",
+                                invocation.invocation_id
+                            ))
+                        })?;
+                    let completed_invocation =
+                        if current.status == crate::ManagedAgentInvocationStatus::Claimed {
+                            self.managed_agents
+                                .fail_claimed_invocation(
+                                    &invocation.invocation_id,
+                                    dispatcher_id,
+                                    invocation.fence_generation,
+                                    now_ms(),
+                                    error.to_string(),
+                                )
+                                .map_err(RuntimeServicesError::Mission)?
+                        } else {
+                            self.managed_agents
+                                .complete_invocation(
+                                    &invocation.invocation_id,
+                                    dispatcher_id,
+                                    invocation.fence_generation,
+                                    false,
+                                    now_ms(),
+                                    None,
+                                    Vec::new(),
+                                    Some(error.to_string()),
+                                )
+                                .map_err(RuntimeServicesError::Mission)?
+                        };
                     failed.push(completed_invocation);
                 }
             }
@@ -3154,32 +3299,116 @@ impl RuntimeServices {
             health_affected,
             scheduled,
             claimed,
+            submitted,
             completed,
             failed,
         })
     }
 
-    async fn execute_managed_agent_invocation(
+    pub async fn wake_managed_agents(
+        self: &Arc<Self>,
+        dispatcher_id: String,
+        limit: usize,
+    ) -> Result<crate::RuntimeWorkAdmissionReceipt, RuntimeServicesError> {
+        let services = Arc::clone(self);
+        self.execution_supervisor
+            .admit_owned("managed_agent_dispatch", async move {
+                services
+                    .dispatch_managed_agents(&dispatcher_id, limit)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(RuntimeServicesError::GraphRunner)
+    }
+
+    async fn reconcile_managed_agent_invocations(
+        &self,
+    ) -> Result<
+        (
+            Vec<crate::ManagedAgentInvocation>,
+            Vec<crate::ManagedAgentInvocation>,
+        ),
+        RuntimeServicesError,
+    > {
+        let running = self
+            .managed_agents
+            .invocations()
+            .map_err(RuntimeServicesError::Mission)?
+            .into_iter()
+            .filter(|invocation| invocation.status == crate::ManagedAgentInvocationStatus::Running)
+            .collect::<Vec<_>>();
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
+        for invocation in running {
+            let Some(graph_id) = invocation.execution_ref.as_deref() else {
+                continue;
+            };
+            let graph = match self.graph_state_store.load_async(graph_id).await {
+                Ok(graph) => graph,
+                Err(ExecutionStateStoreError::NotFound(_)) => continue,
+                Err(error) => return Err(RuntimeServicesError::GraphState(error)),
+            };
+            if graph
+                .node_statuses
+                .values()
+                .any(|status| !status.is_terminal())
+            {
+                continue;
+            }
+            let succeeded = !graph.node_statuses.is_empty()
+                && graph
+                    .node_statuses
+                    .values()
+                    .all(|status| *status == ExecutionNodeStatus::Completed);
+            let dispatcher_id = invocation.claimed_by.as_deref().ok_or_else(|| {
+                RuntimeServicesError::Invariant(format!(
+                    "running managed invocation `{}` has no dispatcher fence owner",
+                    invocation.invocation_id
+                ))
+            })?;
+            let mut evidence_refs = graph
+                .node_results
+                .values()
+                .flat_map(|result| result.evidence_refs.iter())
+                .map(|reference| reference.evidence_ref.0.id.clone())
+                .collect::<Vec<_>>();
+            evidence_refs.push(format!("execution-graph:{graph_id}@{}", graph.revision));
+            evidence_refs.sort();
+            evidence_refs.dedup();
+            let terminal = self
+                .managed_agents
+                .complete_invocation(
+                    &invocation.invocation_id,
+                    dispatcher_id,
+                    invocation.fence_generation,
+                    succeeded,
+                    now_ms(),
+                    Some(graph_id.to_string()),
+                    evidence_refs,
+                    (!succeeded).then(|| {
+                        format!(
+                            "managed execution graph reached non-success terminal state at revision {}",
+                            graph.revision
+                        )
+                    }),
+                )
+                .map_err(RuntimeServicesError::Mission)?;
+            if succeeded {
+                completed.push(terminal);
+            } else {
+                failed.push(terminal);
+            }
+        }
+        Ok((completed, failed))
+    }
+
+    async fn submit_managed_agent_invocation(
         &self,
         dispatcher_id: &str,
         invocation: crate::ManagedAgentInvocation,
     ) -> Result<crate::ManagedAgentInvocation, RuntimeServicesError> {
-        // Move the durable invocation to Running before resolving the target.
-        // Any later definition/binding/executor failure is then completed by
-        // `dispatch_managed_agents` through the one retry/failure transition,
-        // rather than stranding a claimed reservation after a bad revision.
-        self.managed_agents
-            .start_invocation(
-                &invocation.invocation_id,
-                dispatcher_id,
-                invocation.fence_generation,
-                format!(
-                    "managed-dispatch:{}:{}",
-                    invocation.invocation_id, invocation.attempt_no
-                ),
-                now_ms(),
-            )
-            .map_err(RuntimeServicesError::Mission)?;
         let definition = self
             .managed_agents
             .definition(
@@ -3206,8 +3435,8 @@ impl RuntimeServices {
                     ));
                 }
                 let run_id = format!(
-                    "managed-run:{}:{}",
-                    invocation.invocation_id, invocation.attempt_no
+                    "managed-run:{}:{}:fence:{}",
+                    invocation.invocation_id, invocation.attempt_no, invocation.fence_generation
                 );
                 let task_id = format!("{run_id}:task");
                 let mut request = AgentBindingRequest::new(
@@ -3223,7 +3452,6 @@ impl RuntimeServices {
                 let compiled = AgentBindingCompiler::new(Arc::clone(&self.definition_registry))
                     .compile(request)
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
-                let execution_ref = run_id.clone();
                 let intent = AgentTaskIntent {
                     selected_agent_id: None,
                     definition_ref: Some(compiled.snapshot.definition_ref.clone()),
@@ -3238,7 +3466,10 @@ impl RuntimeServices {
                         .mission_id_for_session(&definition.session_id)
                         .unwrap_or_else(|| self.mission_runtime.default_mission_id().to_string()),
                     team_id: None,
-                    graph_id: format!("managed-agent:{}", invocation.invocation_id),
+                    graph_id: format!(
+                        "managed-agent:{}:fence:{}",
+                        invocation.invocation_id, invocation.fence_generation
+                    ),
                     node_id: format!(
                         "managed-agent:{}:attempt:{}",
                         invocation.invocation_id, invocation.attempt_no
@@ -3280,8 +3511,10 @@ impl RuntimeServices {
                         },
                     ),
                     idempotency_key: format!(
-                        "managed-agent:{}:{}",
-                        invocation.invocation_id, invocation.attempt_no
+                        "managed-agent:{}:{}:fence:{}",
+                        invocation.invocation_id,
+                        invocation.attempt_no,
+                        invocation.fence_generation
                     ),
                 };
                 let execution_identity = self.prepare_agent_task_intent(&intent)?;
@@ -3289,36 +3522,46 @@ impl RuntimeServices {
                     .snapshot
                     .compile_task_packet(intent, execution_identity)
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
-                let returned = self
-                    .agent_runtime
-                    .execute_task(packet)
+                let mut graph = ExecutionGraph::new(definition.objective.clone());
+                graph.id = packet.graph_id().to_string();
+                let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+                    ExecutionNodeKind::AgentTask,
+                    AgentTaskExecutor::KIND,
+                    serde_json::to_string(&packet)
+                        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?,
+                );
+                node.id = packet.node_id().to_string();
+                node.idempotency_key = packet.idempotency_key.clone();
+                node.acceptance.criteria = packet.acceptance.clone();
+                graph.nodes.push(node);
+                let graph = self
+                    .execution_supervisor
+                    .register_graph(graph)
                     .await
-                    .map_err(RuntimeServicesError::AgentRuntime)?;
-                self.managed_agents
-                    .complete_invocation(
+                    .map_err(RuntimeServicesError::GraphRunner)?;
+                let running = self
+                    .managed_agents
+                    .start_invocation(
                         &invocation.invocation_id,
                         dispatcher_id,
                         invocation.fence_generation,
-                        returned.status == AgentTerminalStatus::Completed
-                            && returned.failure.is_none(),
+                        graph.id.clone(),
                         now_ms(),
-                        Some(execution_ref),
-                        returned
-                            .evidence_refs
-                            .iter()
-                            .map(|reference| reference.evidence_ref.0.id.clone())
-                            .collect(),
-                        returned.failure,
                     )
-                    .map_err(RuntimeServicesError::Mission)
+                    .map_err(RuntimeServicesError::Mission)?;
+                self.execution_supervisor
+                    .admit_registered(&graph.id)
+                    .await
+                    .map_err(RuntimeServicesError::GraphRunner)?;
+                Ok(running)
             }
             harness_contract::managed_agent::ManagedAgentTarget::Team {
                 template_id,
                 selector,
             } => {
                 let execution_ref = format!(
-                    "managed-team:{}:{}",
-                    invocation.invocation_id, invocation.attempt_no
+                    "managed-team:{}:{}:fence:{}",
+                    invocation.invocation_id, invocation.attempt_no, invocation.fence_generation
                 );
                 let selector_template_id = match selector {
                     harness_contract::team::TeamTemplateSelector::Exact { revision_ref } => {
@@ -3340,62 +3583,68 @@ impl RuntimeServices {
                         "managed Team target template_id must match its selector".to_string(),
                     ));
                 }
-                let projection = self
+                let request = TeamInstantiationRequest {
+                    request_id: format!(
+                        "managed-team-request:{}:{}",
+                        invocation.invocation_id, invocation.attempt_no
+                    ),
+                    team_id: execution_ref.clone(),
+                    session_id: definition.session_id.clone(),
+                    mission_id: self
+                        .mission_runtime
+                        .mission_id_for_session(&definition.session_id)
+                        .unwrap_or_else(|| self.mission_runtime.default_mission_id().to_string()),
+                    parent_execution: None,
+                    selection_mode: TeamSelectionMode::Explicit,
+                    strategy_binding: None,
+                    template_selector: selector.clone(),
+                    objective: definition.objective.clone(),
+                    acceptance: definition.acceptance.clone(),
+                    risk: None,
+                    role_binding_overrides: Vec::new(),
+                    cardinality_overrides: Vec::new(),
+                    focus_partition_plans: Vec::new(),
+                    permission_lease: definition.permission_lease.clone(),
+                    model_lease: definition.model_lease.clone(),
+                    budget_lease: None,
+                    managed_invocation: Some(
+                        harness_contract::managed_agent::ManagedAgentInvocationFence {
+                            managed_agent_id: definition.managed_agent_id.clone(),
+                            definition_revision: definition.revision,
+                            invocation_id: invocation.invocation_id.clone(),
+                            attempt_no: invocation.attempt_no,
+                            fence_generation: invocation.fence_generation,
+                            dispatcher_id: dispatcher_id.to_string(),
+                        },
+                    ),
+                    resource_scopes: definition.resource_scopes.clone(),
+                };
+                let mission_id = request.mission_id.clone();
+                let team_id = request.team_id.clone();
+                let instantiated = self
                     .team_runtime
-                    .instantiate(TeamInstantiationRequest {
-                        request_id: format!(
-                            "managed-team-request:{}:{}",
-                            invocation.invocation_id, invocation.attempt_no
-                        ),
-                        team_id: execution_ref.clone(),
-                        session_id: definition.session_id.clone(),
-                        mission_id: self
-                            .mission_runtime
-                            .mission_id_for_session(&definition.session_id)
-                            .unwrap_or_else(|| {
-                                self.mission_runtime.default_mission_id().to_string()
-                            }),
-                        parent_execution: None,
-                        selection_mode: TeamSelectionMode::Explicit,
-                        strategy_binding: None,
-                        template_selector: selector.clone(),
-                        objective: definition.objective.clone(),
-                        acceptance: definition.acceptance.clone(),
-                        risk: None,
-                        role_binding_overrides: Vec::new(),
-                        cardinality_overrides: Vec::new(),
-                        focus_partition_plans: Vec::new(),
-                        permission_lease: definition.permission_lease.clone(),
-                        model_lease: definition.model_lease.clone(),
-                        budget_lease: None,
-                        managed_invocation: Some(
-                            harness_contract::managed_agent::ManagedAgentInvocationFence {
-                                managed_agent_id: definition.managed_agent_id.clone(),
-                                definition_revision: definition.revision,
-                                invocation_id: invocation.invocation_id.clone(),
-                                attempt_no: invocation.attempt_no,
-                                fence_generation: invocation.fence_generation,
-                                dispatcher_id: dispatcher_id.to_string(),
-                            },
-                        ),
-                        resource_scopes: definition.resource_scopes.clone(),
-                    })
+                    .plan(request)
+                    .map_err(RuntimeServicesError::Mission)?;
+                let graph_id = self
+                    .team_runtime
+                    .prepare_planned(&mission_id, &team_id, instantiated)
                     .await
                     .map_err(RuntimeServicesError::Mission)?;
-                let succeeded = projection.status == "completed";
-                self.managed_agents
-                    .complete_invocation(
+                let running = self
+                    .managed_agents
+                    .start_invocation(
                         &invocation.invocation_id,
                         dispatcher_id,
                         invocation.fence_generation,
-                        succeeded,
+                        graph_id.clone(),
                         now_ms(),
-                        Some(execution_ref),
-                        vec![format!("team-graph:{}", projection.graph_id)],
-                        (!succeeded)
-                            .then(|| format!("Team graph terminal status: {}", projection.status)),
                     )
-                    .map_err(RuntimeServicesError::Mission)
+                    .map_err(RuntimeServicesError::Mission)?;
+                self.execution_supervisor
+                    .admit_registered(&graph_id)
+                    .await
+                    .map_err(RuntimeServicesError::GraphRunner)?;
+                Ok(running)
             }
         }
     }
@@ -3776,6 +4025,17 @@ fn graph_is_terminal(graph: &ExecutionGraph) -> bool {
             .values()
             .copied()
             .all(ExecutionNodeStatus::is_terminal)
+}
+
+fn managed_invocation_fences(
+    graph: &ExecutionGraph,
+) -> Vec<harness_contract::managed_agent::ManagedAgentInvocationFence> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok())
+        .filter_map(|packet| packet.managed_invocation)
+        .collect()
 }
 
 fn graph_can_advance(graph: &ExecutionGraph) -> bool {
@@ -5126,6 +5386,11 @@ mod tests {
             .graph_id
             .clone()
             .expect("stable graph id");
+        services
+            .execution_supervisor()
+            .wait_for_quiescence(&graph_id)
+            .await
+            .unwrap();
         let graph = services.graph_state_store().load(&graph_id).unwrap();
         assert!(graph
             .node_statuses
@@ -5261,16 +5526,25 @@ mod tests {
         let graph = harness_contract::execution_graph::ExecutionGraph::new("blocked");
         let graph_id = graph.id.clone();
         assert!(matches!(
-            services.graph_runner().start(graph).await,
+            services
+                .execution_supervisor()
+                .submit_and_wait(
+                    graph,
+                    harness_contract::execution_graph::ExecutionGraphCommand::Start {
+                        expected_revision: 0,
+                    },
+                )
+                .await,
             Err(super::super::graph::ExecutionRunnerError::MutationBlocked(
                 _
             ))
         ));
         assert!(matches!(
-            services.graph_runner().run_until_quiescent(&graph_id).await,
-            Err(super::super::graph::ExecutionRunnerError::MutationBlocked(
-                _
-            ))
+            services
+                .execution_supervisor()
+                .wait_for_quiescence(&graph_id)
+                .await,
+            Err(super::super::graph::ExecutionRunnerError::Driver(_))
         ));
         assert!(matches!(
             services.recover_execution_graphs_on_startup().await,
@@ -5278,8 +5552,8 @@ mod tests {
         ));
         assert!(matches!(
             services
-                .graph_runner()
-                .command(
+                .execution_supervisor()
+                .command_graph(
                     &graph_id,
                     harness_contract::execution_graph::ExecutionGraphCommand::Advance {
                         expected_revision: 0,
@@ -5450,9 +5724,14 @@ mod tests {
         let graph = services.compile_graph_agent_intents(graph).unwrap();
         let packet: AgentTaskPacket = serde_json::from_str(&graph.nodes[0].payload_ref).unwrap();
 
-        let report = services
-            .graph_runner()
-            .start(graph)
+        let (_, report) = services
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                harness_contract::execution_graph::ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("run graph");
         assert_eq!(report.completed, 1);
@@ -5591,9 +5870,14 @@ mod tests {
                 })
         }));
 
-        let report = services
-            .graph_runner()
-            .start(graph)
+        let (_, report) = services
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                harness_contract::execution_graph::ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
             .await
             .expect("run graph");
         assert_eq!(report.completed, 8, "parallel agent report: {report:?}");

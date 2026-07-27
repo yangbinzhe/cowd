@@ -125,7 +125,7 @@ impl RuntimeCapabilityCatalog {
                         operation(
                             "inspect_execution_graph",
                             "runtime.execution_graph_runner",
-                            "Read canonical team progress; ExecutionGraphRunner alone advances ready nodes.",
+                            "Read canonical team progress; RuntimeExecutionSupervisor alone advances ready nodes.",
                             "The team already exists and progress or terminal evidence is needed.",
                             "No second team scheduler may mutate graph state.",
                             &["execution_graph_id", "node_statuses", "terminal_result_ref"],

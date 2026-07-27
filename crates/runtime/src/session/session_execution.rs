@@ -1571,7 +1571,16 @@ mod tests {
             .node_statuses
             .insert(node.id.clone(), ExecutionNodeStatus::Planned);
         graph.nodes.push(node);
-        let report = services.graph_runner().start(graph).await.unwrap();
+        let (_, report) = services
+            .execution_supervisor()
+            .submit_and_wait(
+                graph,
+                harness_contract::execution_graph::ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(report.failed, 0);
         assert_eq!(report.completed, 0);
         assert_eq!(report.waiting, 1);
@@ -1778,7 +1787,16 @@ mod tests {
             .node_statuses
             .insert(source_node.id.clone(), ExecutionNodeStatus::Planned);
         source.nodes.push(source_node);
-        services.graph_runner().start(source).await.unwrap();
+        services
+            .execution_supervisor()
+            .submit_and_wait(
+                source,
+                harness_contract::execution_graph::ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
         let claimed = store
             .claim_session_runtime_outbox("target-worker", now_ms(), 1_000, 8)
             .await
@@ -1798,7 +1816,16 @@ mod tests {
             .install_resolver(Arc::new(TerminalSynthesizeResolver {
                 graph_id: target.id.clone(),
             }));
-        let report = services.graph_runner().start(target.clone()).await.unwrap();
+        let (_, report) = services
+            .execution_supervisor()
+            .submit_and_wait(
+                target.clone(),
+                harness_contract::execution_graph::ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(report.completed, 1);
         let resolution = router
             .record_target_terminal(

@@ -92,6 +92,7 @@ pub struct ProviderRuntimeClient {
     tool_schema_cache: Arc<std::sync::Mutex<Option<CompiledToolSchema>>>,
     tool_schema_compilations: Arc<AtomicU64>,
     tool_schema_cache_hits: Arc<AtomicU64>,
+    execution_supervisor: Option<std::sync::Weak<crate::RuntimeExecutionSupervisor>>,
 }
 
 #[derive(Clone)]
@@ -117,6 +118,7 @@ pub struct ToolSchemaCacheStats {
 struct ProviderEventStream {
     receiver: tokio::sync::mpsc::Receiver<Result<AssistantEvent, RuntimeError>>,
     producer: Option<tokio::task::JoinHandle<()>>,
+    execution_supervisor: Option<std::sync::Weak<crate::RuntimeExecutionSupervisor>>,
 }
 
 impl futures::Stream for ProviderEventStream {
@@ -132,8 +134,16 @@ impl Drop for ProviderEventStream {
         // The consumer owns the request lifetime. In particular, a runtime
         // transport timeout must not leave a detached provider request running
         // after its graph node has been failed or replanned.
-        if let Some(producer) = &self.producer {
-            producer.abort();
+        if let Some(producer) = self.producer.take() {
+            if let Some(supervisor) = self
+                .execution_supervisor
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+            {
+                supervisor.reap_join_handle("provider_producer", producer);
+            } else {
+                producer.abort();
+            }
         }
     }
 }
@@ -171,7 +181,17 @@ impl ProviderRuntimeClient {
             tool_schema_cache: Arc::new(std::sync::Mutex::new(None)),
             tool_schema_compilations: Arc::new(AtomicU64::new(0)),
             tool_schema_cache_hits: Arc::new(AtomicU64::new(0)),
+            execution_supervisor: None,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn with_execution_supervisor(
+        mut self,
+        supervisor: &Arc<crate::RuntimeExecutionSupervisor>,
+    ) -> Self {
+        self.execution_supervisor = Some(Arc::downgrade(supervisor));
+        self
     }
 
     #[must_use]
@@ -477,7 +497,11 @@ impl ProviderRuntimeClient {
                 None
             }
         };
-        Box::pin(ProviderEventStream { receiver, producer })
+        Box::pin(ProviderEventStream {
+            receiver,
+            producer,
+            execution_supervisor: self.execution_supervisor.clone(),
+        })
     }
 }
 

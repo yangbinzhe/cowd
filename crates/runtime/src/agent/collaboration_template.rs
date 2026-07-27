@@ -2,7 +2,7 @@
 //!
 //! This is deliberately only a semantic matcher. Role topology, scheduling,
 //! memory writes, and execution belong respectively to the versioned protocol
-//! registry, ExecutionGraphRunner, and Memory maintenance pipeline.
+//! registry, RuntimeExecutionSupervisor, and Memory maintenance pipeline.
 
 use harness_contract::core::{ExecutionModifier, ExecutionPattern, TaskComplexity, TaskRisk};
 use harness_contract::strategy::{StrategyDecision, TaskDomain};

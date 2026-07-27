@@ -1,6 +1,6 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use harness_contract::tool::{ResourceAccess, ResourceDemand};
@@ -50,11 +50,12 @@ struct PlaneCounters {
 /// conflicts are already compiled into the governed plan; `ResourceDemand`
 /// travels with the operation so future process/network/custom quota adapters
 /// can be added without changing Tool callers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolExecutionPlane {
     resources: Arc<ExecutionResourceManager>,
     scopes: Arc<ScopeLockManager>,
     counters: Arc<PlaneCounters>,
+    supervisor: Arc<OnceLock<Weak<crate::RuntimeExecutionSupervisor>>>,
 }
 
 impl ToolExecutionPlane {
@@ -64,7 +65,12 @@ impl ToolExecutionPlane {
             resources,
             scopes,
             counters: Arc::new(PlaneCounters::default()),
+            supervisor: Arc::new(OnceLock::new()),
         }
+    }
+
+    pub(crate) fn bind_supervisor(&self, supervisor: &Arc<crate::RuntimeExecutionSupervisor>) {
+        let _ = self.supervisor.set(Arc::downgrade(supervisor));
     }
 
     pub async fn execute<T, F>(
@@ -125,6 +131,15 @@ impl ToolExecutionPlane {
                     self.counters
                         .timed_out_waiters
                         .fetch_add(1, Ordering::Relaxed);
+                    if let Some(supervisor) =
+                        self.supervisor.get().and_then(std::sync::Weak::upgrade)
+                    {
+                        supervisor.reap_join_handle("tool_blocking_reaper", worker);
+                    } else {
+                        tracing::warn!(
+                            "timed-out tool blocking worker has no Runtime execution supervisor"
+                        );
+                    }
                     Err(ToolExecutionPlaneError::TimedOut(timeout))
                 }
             }

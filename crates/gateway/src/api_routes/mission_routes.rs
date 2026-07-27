@@ -257,7 +257,7 @@ async fn bridge_mission_session_handler(
             graph_command,
         } => runtime_service
             .runtime_services()
-            .graph_runner()
+            .execution_supervisor()
             .submit_graph(graph.clone(), graph_command.clone())
             .await
             .map(|receipt| serde_json::to_value(receipt).unwrap_or_default())

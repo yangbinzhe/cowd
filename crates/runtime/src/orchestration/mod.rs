@@ -1,7 +1,7 @@
 //! Runtime orchestration is a pure intent-to-graph compiler.
 //!
-//! Stateful execution is owned exclusively by `ExecutionGraphRunner` through
-//! `RuntimeServices`. This module must never dispatch tools, agents, teams,
+//! Stateful execution is owned exclusively by `RuntimeExecutionSupervisor`
+//! through `RuntimeServices`. This module must never dispatch tools, agents, teams,
 //! sessions, missions, or approvals directly.
 
 pub mod compiler;
@@ -11,10 +11,11 @@ pub mod result;
 pub mod validator;
 
 use crate::execution_core::{graph::ExecutionRunReport, RuntimeExecutionDecision};
-use crate::RuntimeServices;
+use crate::{ExecutionGraphHost, RuntimeServices};
 use harness_contract::agent::{AgentTaskIntent, AgentTaskPacket};
 use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphProjection, ExecutionNodeKind, ExecutionNodeStatus,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeKind,
+    ExecutionNodeStatus,
 };
 use serde_json::{json, Value};
 
@@ -207,8 +208,13 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
                 .map(|_| ())
         } else {
             services
-                .graph_runner()
-                .start(graph)
+                .execution_supervisor()
+                .submit_and_wait(
+                    graph,
+                    ExecutionGraphCommand::Start {
+                        expected_revision: 0,
+                    },
+                )
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string())
@@ -231,7 +237,7 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
         run_future.await
     };
     match run {
-        Ok(()) => match services.graph_runner().projection(&graph_id).await {
+        Ok(()) => match services.execution_supervisor().projection(&graph_id).await {
             Ok(projection) => {
                 let report = report_from_projection(&projection);
                 let terminal = projection.terminal_result_ref.clone();
@@ -376,8 +382,8 @@ async fn cancel_orchestration_execution(
                     return Ok(());
                 }
                 match services
-                    .graph_runner()
-                    .command(
+                    .execution_supervisor()
+                    .command_graph(
                         graph_id,
                         harness_contract::execution_graph::ExecutionGraphCommand::Cancel {
                             expected_revision: graph.revision,
@@ -388,18 +394,23 @@ async fn cancel_orchestration_execution(
                     )
                     .await
                 {
-                    Ok(cancelled)
-                        if cancelled
-                            .node_statuses
-                            .values()
-                            .all(|status| status.is_terminal()) =>
-                    {
-                        return Ok(());
-                    }
-                    Ok(_) => {
-                        last_error =
-                            Some("Runner cancel returned a non-terminal child graph".to_string());
-                    }
+                    Ok(_) => match services.graph_state_store().load_async(graph_id).await {
+                        Ok(cancelled)
+                            if cancelled
+                                .node_statuses
+                                .values()
+                                .all(|status| status.is_terminal()) =>
+                        {
+                            return Ok(());
+                        }
+                        Ok(_) => {
+                            last_error = Some(
+                                "execution supervisor cancel returned a non-terminal child graph"
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => last_error = Some(error.to_string()),
+                    },
                     Err(error) => last_error = Some(error.to_string()),
                 }
             }
