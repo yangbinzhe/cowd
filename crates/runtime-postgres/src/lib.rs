@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 #[cfg(test)]
 use harness_contract::{
-    reality::{EvidenceRef, RealityBoundary},
+    reality::EvidenceRef,
     task::{TaskCreateCommand, TaskPhaseSpec, TaskSpec},
 };
 use postgres::Row;

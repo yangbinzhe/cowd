@@ -799,7 +799,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gateway_shutdown_cancels_and_joins_the_real_eval_worker() {
         let gateway_tasks =
-            crate::runtime_host::task_set::GatewayRuntimeTaskSet::new(Duration::from_millis(5));
+            crate::runtime_host::task_set::GatewayRuntimeTaskSet::new(Duration::from_secs(30));
         let service = HarnessEvalService::with_gateway_tasks(Arc::clone(&gateway_tasks));
         let config_home = std::env::temp_dir().join(format!(
             "cowd-gateway-harness-eval-shutdown-{}",

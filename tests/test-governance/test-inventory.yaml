@@ -33,6 +33,9 @@ lanes:
   manual:
     default: false
     purpose: live provider, PostgreSQL, terminal, visual, and exploratory evidence
+  certification:
+    default: false
+    purpose: fail-closed terminal certification over independently observed evidence
 
 architecture_gates:
   - path: scripts/architecture/check-boundaries.sh
@@ -99,6 +102,8 @@ surface_gates:
     capability: mfg.tui.operational
 
 manual_suites:
+  - path: crates/harness-eval/templates/certification-manifest-v1.json
+    capability: harness.terminal-certification
   - path: tests/interactive
     capability: tui.gateway.manual_diagnostics
   - path: scripts/scenarios/tui-production-acceptance.sh

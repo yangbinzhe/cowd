@@ -407,7 +407,7 @@ mod tests {
         KnowledgeCandidate {
             candidate_id: "candidate-1".to_string(),
             execution_identity: identity(),
-            scope: KnowledgeCandidateScope::AgentPrivate("agent-1".to_string()),
+            scope: KnowledgeCandidateScope::AgentPrivate("agent-run".to_string()),
             title: "Verified finding".to_string(),
             claim: "The observed build completed.".to_string(),
             evidence_refs: vec![evidence],

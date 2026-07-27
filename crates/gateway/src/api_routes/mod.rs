@@ -3076,7 +3076,11 @@ pub(crate) mod tests {
                                 "team_id": null,
                                 "run_id": null
                             },
-                            "evidence_refs": ["memory:packet:noise"],
+                            "evidence_refs": [{
+                                "ref_type": "memory_packet",
+                                "id": "memory:packet:noise",
+                                "boundary": "observed"
+                            }],
                             "severity": "warning",
                             "summary": "memory packet contained unrelated context",
                             "suggested_action": "tighten scope and salience gates",
@@ -3092,6 +3096,10 @@ pub(crate) mod tests {
         let signal_body = to_bytes(signal.into_body(), usize::MAX).await.unwrap();
         let signal_json: serde_json::Value = serde_json::from_slice(&signal_body).unwrap();
         assert_eq!(signal_json["kind"], "evolution.signal");
+        let signal_id = signal_json["signal"]["signal_id"]
+            .as_str()
+            .expect("signal id")
+            .to_string();
 
         let proposal = app
             .clone()
@@ -3100,7 +3108,9 @@ pub(crate) mod tests {
                     .method("POST")
                     .uri("/api/evolution/proposals")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"signal_ids":[]}"#))
+                    .body(Body::from(
+                        serde_json::json!({"signal_ids": [signal_id]}).to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -3543,8 +3553,11 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(created["ok"], true);
-        assert_eq!(created["mission"]["kind"], "mission.runtime");
-        assert!(created["mission"]["sessions"]
+        assert_eq!(
+            created["snapshot"]["projection"]["mission"]["kind"],
+            "mission.runtime"
+        );
+        assert!(created["snapshot"]["projection"]["sessions"]
             .as_array()
             .expect("mission sessions")
             .iter()
@@ -3588,25 +3601,22 @@ pub(crate) mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(backgrounded["receipt"]["status"], "executed");
-        assert_eq!(
-            backgrounded["receipt"]["result"]["receipt"]["status"],
-            "accepted"
-        );
-        assert!(backgrounded["projection"]["mission"]["sessions"]
+        assert_eq!(backgrounded["receipt"]["status"], "accepted");
+        assert!(backgrounded["snapshot"]["projection"]["sessions"]
             .as_array()
             .expect("mission sessions")
             .iter()
             .any(
                 |session| session["session_id"].as_str() == Some(session_id.as_str())
-                    && session["status"].as_str() == Some("background")
+                    && session["active"] == false
+                    && session["hydration"].as_str() == Some("metadataloaded")
             ));
 
         let projection = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/mission/projection")
+                    .uri("/api/mission/control")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3617,7 +3627,7 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(projection.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(projection["envelope"]["service"], "mission");
-        assert!(projection["mission"]["sessions"]
+        assert!(projection["snapshot"]["projection"]["sessions"]
             .as_array()
             .unwrap()
             .iter()
@@ -4233,7 +4243,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn mission_projection_exposes_durable_presence_events_without_creating_a_mission() {
+    async fn mission_control_exposes_session_presence_with_default_mission() {
         let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
         let session_id = format!("runtime-events-session-{}", uuid::Uuid::new_v4());
@@ -4260,7 +4270,7 @@ pub(crate) mod tests {
         let events = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/mission/projection")
+                    .uri("/api/mission/control")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4270,14 +4280,19 @@ pub(crate) mod tests {
         let events_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(events.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(events_json["mission"]["kind"], "mission.runtime");
-        assert!(events_json["mission"]["aggregate"].is_null());
-        assert!(events_json["events"]
+        let projection = &events_json["snapshot"]["projection"];
+        assert_eq!(projection["mission"]["kind"], "mission.runtime");
+        assert!(projection["mission"]["aggregate"]["mission_id"]
+            .as_str()
+            .is_some_and(|mission_id| mission_id.starts_with("mission-default-")));
+        assert!(projection["sessions"]
             .as_array()
-            .or_else(|| events_json["mission"]["events"].as_array())
-            .expect("events")
+            .expect("mission control sessions")
             .iter()
-            .any(|event| event["event_type"].as_str() == Some("mission.presence.activated")));
+            .any(|session| {
+                session["session_id"].as_str() == Some(session_id.as_str())
+                    && session["lifecycle"].as_str() == Some("active")
+            }));
     }
 
     #[tokio::test]
@@ -6775,7 +6790,7 @@ pub(crate) mod tests {
             .as_str()
             .expect("external incident id")
             .to_string();
-        let incident_task_id = external_incident["task"]["id"]
+        let incident_task_id = external_incident["task"]["task_id"]
             .as_str()
             .expect("external Runtime task id")
             .to_string();
@@ -12953,6 +12968,11 @@ providers:
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        runtime_services
+            .execution_supervisor()
+            .wait_for_quiescence(&projection.graph_id)
+            .await
+            .expect("approved cross-plane graph reaches quiescence");
         let terminal = runtime_services
             .execution_supervisor()
             .projection(&projection.graph_id)
@@ -15634,18 +15654,18 @@ providers:
             .await
             .unwrap();
         store
-            .append_event(&session::SessionEvent {
-                session_id: session_id.to_string(),
-                event_type: "message_appended".to_string(),
-                event_json: serde_json::json!({
+            .append_session_domain_event(&session::SessionDomainEvent::new(
+                session_id,
+                0,
+                session::SessionDomainScope::Message,
+                "message_appended",
+                serde_json::json!({
                     "type": "message_appended",
                     "sequence": 0,
                     "role": "user"
-                })
-                .to_string(),
-                sequence: 0,
-                created_at_ms: 10,
-            })
+                }),
+                10,
+            ))
             .await
             .unwrap();
         store
@@ -15663,26 +15683,33 @@ providers:
             })
             .await
             .unwrap();
+        let mut runtime_run_event = session::SessionDomainEvent::new(
+            session_id,
+            2,
+            session::SessionDomainScope::Turn,
+            "RuntimeRun",
+            message_routes::runtime_run_completed_payload(
+                session_id,
+                "run-runtime-timeline",
+                None,
+                ContextProfile::MainTurn,
+                "completed",
+                Some(1),
+                Some("ctx-runtime-timeline".to_string()),
+                None,
+                20,
+                30,
+            ),
+            12,
+        );
+        runtime_run_event.status = Some("completed".to_string());
+        runtime_run_event.refs = vec![session::SessionDomainRef {
+            ref_type: "context_envelope".to_string(),
+            id: "ctx-runtime-timeline".to_string(),
+            label: None,
+        }];
         store
-            .append_event(&session::SessionEvent {
-                session_id: session_id.to_string(),
-                event_type: "RuntimeRun".to_string(),
-                event_json: message_routes::runtime_run_completed_payload(
-                    session_id,
-                    "run-runtime-timeline",
-                    None,
-                    ContextProfile::MainTurn,
-                    "completed",
-                    Some(1),
-                    Some("ctx-runtime-timeline".to_string()),
-                    None,
-                    20,
-                    30,
-                )
-                .to_string(),
-                sequence: 2,
-                created_at_ms: 12,
-            })
+            .append_session_domain_event(&runtime_run_event)
             .await
             .unwrap();
         store
@@ -15720,9 +15747,8 @@ providers:
             .await
             .unwrap();
         let timeline: serde_json::Value = serde_json::from_slice(&timeline_body).unwrap();
-        assert_eq!(timeline["total"], 4);
+        assert_eq!(timeline["total"], 3);
         assert_eq!(timeline["events"][0]["kind"], "message_appended");
-        assert_eq!(timeline["events"][1]["kind"], "ContextEnvelope");
         let runtime_run = timeline["events"]
             .as_array()
             .expect("timeline events")
@@ -15737,7 +15763,6 @@ providers:
             "Solo"
         );
         assert_eq!(timeline["health_summary"]["scope_counts"]["turn"], 1);
-        assert_eq!(timeline["health_summary"]["scope_counts"]["context"], 1);
         assert_eq!(timeline["health_summary"]["scope_counts"]["message"], 1);
         assert_eq!(timeline["health_summary"]["scope_counts"]["policy"], 1);
 

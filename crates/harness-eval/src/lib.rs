@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 mod auto_strategy_paired;
+mod certification;
 mod evolution;
 mod live_scenario_runner;
 mod measurement;
@@ -40,6 +41,13 @@ mod terminal_matrix;
 
 pub use auto_strategy_paired::{
     run_auto_strategy_paired, write_auto_strategy_report, AutoStrategyPairedOptions,
+};
+pub use certification::{
+    run_certification_manifest, CertificationCheck, CertificationCheckResult,
+    CertificationCollector, CertificationCommand, CertificationComparison, CertificationFixture,
+    CertificationManifest, CertificationProviderRequirement, CertificationReport,
+    CertificationSelector, CertificationSource, CertificationSourceKind, CertificationSourceResult,
+    CertificationTimeoutPolicy,
 };
 pub use evolution::{
     evaluate_evolution_closure, DefinitionEvolutionEvalRunner, DefinitionEvolutionScenarioCatalog,
@@ -689,11 +697,11 @@ fn evaluate_next_gen_harness_scenario(
         provider_rounds: input.provider_rounds,
         token_usage: json!({
             "total_tokens": input.total_tokens,
-            "usage_source": if input.total_tokens > 0 { "provider_or_tool_estimate" } else { "deterministic_contract" }
+            "usage_source": if input.total_tokens > 0 { "observed_provider_or_tool" } else { "not_observed_contract_lane" }
         }),
         latency: json!({
-            "elapsed_ms": 5 + spec.expected_runtime_actions.len() as u64 * 3,
-            "source": "deterministic_eval_clock"
+            "elapsed_ms": Value::Null,
+            "source": "not_measured_contract_lane"
         }),
         evidence_refs,
         terminal_evidence,
@@ -3141,9 +3149,9 @@ mod tests {
             runtime_turn_result_count: 1,
             recovery_applied_count: 1,
             recovery_verified_count: 1,
-            source_fixture_status: "not_required_deterministic".to_string(),
-            sidecar_fixture_status: "not_required_deterministic".to_string(),
-            db_fixture_status: "not_required_deterministic".to_string(),
+            source_fixture_status: "not_observed_contract_lane".to_string(),
+            sidecar_fixture_status: "not_observed_contract_lane".to_string(),
+            db_fixture_status: "not_observed_contract_lane".to_string(),
         });
 
         assert_eq!(report.status, "passed");
@@ -3205,9 +3213,9 @@ mod tests {
                 "commit": "test",
                 "version": "test",
                 "command": "harness-eval full",
-                "source_fixture_status": "not_required_deterministic",
-                "sidecar_fixture_status": "not_required_deterministic",
-                "db_fixture_status": "not_required_deterministic"
+                "source_fixture_status": "not_observed_contract_lane",
+                "sidecar_fixture_status": "not_observed_contract_lane",
+                "db_fixture_status": "not_observed_contract_lane"
             },
             "execution_trace": {
                 "provider_rounds": 0,
@@ -3270,9 +3278,9 @@ mod tests {
                 "commit": "test",
                 "version": "test",
                 "command": "harness-eval deep --allow-real-model",
-                "source_fixture_status": "not_required_deterministic",
-                "sidecar_fixture_status": "not_required_deterministic",
-                "db_fixture_status": "not_required_deterministic"
+                "source_fixture_status": "not_observed_contract_lane",
+                "sidecar_fixture_status": "not_observed_contract_lane",
+                "db_fixture_status": "not_observed_contract_lane"
             },
             "execution_trace": {
                 "provider_rounds": 0,

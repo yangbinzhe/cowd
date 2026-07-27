@@ -429,6 +429,11 @@ impl TaskRuntimePort {
     }
 
     #[must_use]
+    pub fn workspace_default_mission_id(&self) -> &str {
+        self.missions.default_mission_id()
+    }
+
+    #[must_use]
     pub fn mission_id_for_session(&self, session_id: &str) -> String {
         self.missions
             .mission_id_for_session(session_id)

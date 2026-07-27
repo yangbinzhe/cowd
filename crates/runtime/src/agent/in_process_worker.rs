@@ -821,8 +821,12 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "tool `{tool_name}` is outside the AgentTaskPacket allow-list"
             )));
         }
-        let normalized_input =
-            normalize_workspace_internal_resource_paths(tool_name, input, &self.workspace_root)?;
+        let normalized_input = normalize_delegated_resource_paths(
+            tool_name,
+            input,
+            &self.workspace_root,
+            self.resource_scopes.as_deref(),
+        )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
         self.execute_scoped(tool_name, &normalized_input, None)
     }
@@ -879,10 +883,11 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 });
         }
         self.allowed_tools.contains(tool_name).then(|| {
-            let normalized = normalize_workspace_internal_resource_value(
+            let normalized = normalize_delegated_resource_value(
                 tool_name,
                 input.clone(),
                 &self.workspace_root,
+                self.resource_scopes.as_deref(),
             );
             self.host
                 .delegated_tool_effect_descriptor(tool_name, &normalized)
@@ -908,8 +913,12 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 "agent tool authorization does not match the allowed tool request",
             ));
         }
-        let normalized_input =
-            normalize_workspace_internal_resource_paths(tool_name, input, &self.workspace_root)?;
+        let normalized_input = normalize_delegated_resource_paths(
+            tool_name,
+            input,
+            &self.workspace_root,
+            self.resource_scopes.as_deref(),
+        )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
         self.execute_scoped(tool_name, &normalized_input, Some(authorization.clone()))
     }
@@ -1186,16 +1195,99 @@ impl ScopedRuntimeToolExecutor {
     }
 }
 
-fn normalize_workspace_internal_resource_paths(
+fn normalize_delegated_resource_paths(
     tool_name: &str,
     input: &str,
     workspace_root: &std::path::Path,
+    resource_scopes: Option<&[String]>,
 ) -> Result<String, ToolError> {
     let parsed = serde_json::from_str::<serde_json::Value>(input)
         .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
-    let parsed = normalize_workspace_internal_resource_value(tool_name, parsed, workspace_root);
+    let parsed =
+        normalize_delegated_resource_value(tool_name, parsed, workspace_root, resource_scopes);
     serde_json::to_string(&parsed)
         .map_err(|error| ToolError::new(format!("serialize normalized scoped tool input: {error}")))
+}
+
+fn normalize_delegated_resource_value(
+    tool_name: &str,
+    parsed: serde_json::Value,
+    workspace_root: &std::path::Path,
+    resource_scopes: Option<&[String]>,
+) -> serde_json::Value {
+    let mut parsed = normalize_workspace_internal_resource_value(tool_name, parsed, workspace_root);
+    if tool_name != "glob_search" {
+        return parsed;
+    }
+    let Some(scopes) = resource_scopes else {
+        return parsed;
+    };
+    let Some(object) = parsed.as_object_mut() else {
+        return parsed;
+    };
+    let Some(pattern) = object
+        .get("pattern")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.trim().replace('\\', "/"))
+    else {
+        return parsed;
+    };
+    let requested_root = object
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|path| workspace_root_request(path, workspace_root));
+    if !requested_root {
+        return parsed;
+    }
+
+    let mut allowed = scopes
+        .iter()
+        .filter_map(|scope| {
+            let (mode, path) = scope.split_once(':')?;
+            matches!(mode, "read" | "write").then_some(path)
+        })
+        .filter_map(|path| {
+            let parts = normalized_relative_parts(path)?;
+            (!parts.is_empty()).then(|| parts.join("/"))
+        })
+        .filter(|scope| {
+            pattern == **scope
+                || pattern
+                    .strip_prefix(scope.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        .collect::<Vec<_>>();
+    allowed.sort_by_key(|scope| std::cmp::Reverse(scope.len()));
+    let Some(scope) = allowed.first() else {
+        return parsed;
+    };
+    let suffix = pattern
+        .strip_prefix(scope)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    if suffix.is_empty() || !workspace_root.join(scope).is_dir() {
+        return parsed;
+    }
+    object.insert("path".to_string(), serde_json::Value::String(scope.clone()));
+    object.insert(
+        "pattern".to_string(),
+        serde_json::Value::String(suffix.to_string()),
+    );
+    parsed
+}
+
+fn workspace_root_request(path: &str, workspace_root: &std::path::Path) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == "./" {
+        return true;
+    }
+    let requested = std::path::Path::new(trimmed);
+    requested.is_absolute()
+        && requested
+            .canonicalize()
+            .ok()
+            .zip(workspace_root.canonicalize().ok())
+            .is_some_and(|(requested, root)| requested == root)
 }
 
 /// Normalize workspace-internal absolute resource paths before both effect
@@ -2237,7 +2329,7 @@ mod tests {
         };
 
         let (effect_kind, operation, required_permission) = match tool_name {
-            "read_file" | "grep_search" => (
+            "read_file" | "grep_search" | "glob_search" => (
                 ToolEffectKind::Read,
                 PermissionOperation::Read,
                 ToolPermissionMode::ReadOnly,
@@ -2357,7 +2449,7 @@ mod tests {
         .to_string();
 
         let normalized =
-            normalize_workspace_internal_resource_paths("write_file", &input, root.path())
+            normalize_delegated_resource_paths("write_file", &input, root.path(), None)
                 .expect("normalize internal absolute path");
         let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
         assert_eq!(normalized["path"], "fixtures/target.txt");
@@ -2375,7 +2467,7 @@ mod tests {
         let outside = root.path().parent().expect("parent").join("outside.txt");
         let outside_input = serde_json::json!({"path": outside}).to_string();
         assert_eq!(
-            normalize_workspace_internal_resource_paths("read_file", &outside_input, root.path(),)
+            normalize_delegated_resource_paths("read_file", &outside_input, root.path(), None)
                 .expect("unchanged outside input"),
             outside_input
         );
@@ -2413,7 +2505,11 @@ mod tests {
         std::fs::create_dir_all(root.path().join("crates/gateway")).expect("gateway scope");
         let executor = ScopedRuntimeToolExecutor {
             host: Arc::new(EchoRuntimeExecutionHost),
-            allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
+            allowed_tools: BTreeSet::from([
+                "read_file".to_string(),
+                "grep_search".to_string(),
+                "glob_search".to_string(),
+            ]),
             session_id: "session".to_string(),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
@@ -2436,6 +2532,32 @@ mod tests {
             .is_err());
         assert!(executor
             .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
+            .is_err());
+
+        let normalized = normalize_delegated_resource_paths(
+            "glob_search",
+            r#"{"pattern":"crates/runtime/**/*.rs","path":"."}"#,
+            root.path(),
+            executor.resource_scopes.as_deref(),
+        )
+        .expect("bounded glob normalization");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&normalized).expect("normalized input"),
+            serde_json::json!({"pattern":"**/*.rs","path":"crates/runtime"})
+        );
+        executor
+            .enforce_resource_ceiling("glob_search", &normalized)
+            .expect("the narrowed glob remains inside the exact focus scope");
+
+        let outside_glob = normalize_delegated_resource_paths(
+            "glob_search",
+            r#"{"pattern":"crates/gateway/**/*.rs","path":"."}"#,
+            root.path(),
+            executor.resource_scopes.as_deref(),
+        )
+        .expect("outside glob stays representable");
+        assert!(executor
+            .enforce_resource_ceiling("glob_search", &outside_glob)
             .is_err());
 
         let descriptor = test_tool_descriptor_for_input(

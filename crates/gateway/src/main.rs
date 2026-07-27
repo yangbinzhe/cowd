@@ -170,13 +170,6 @@ pub(crate) use entry::env_entry::resolve_tui_model;
 pub(crate) use entry::env_entry::{
     default_permission_mode, parse_permission_mode_arg, resolve_model_alias_with_config,
 };
-#[cfg(test)]
-pub(crate) use entry::gateway_projection_entry::{
-    parse_gateway_approval_slash_command, parse_gateway_context_slash_command,
-    parse_gateway_cross_plane_slash_command, parse_gateway_task_slash_command,
-    GatewayApprovalSlashCommand, GatewayContextSlashCommand, GatewayCrossPlaneSlashCommand,
-    GatewayTaskSlashCommand,
-};
 use entry::init_entry::run_init;
 #[cfg(test)]
 pub(crate) use entry::local_command_entry::print_help_to;
@@ -3678,9 +3671,7 @@ mod tests {
         format_tool_result, format_ultraplan_report, format_unknown_slash_command_message,
         format_user_visible_api_error, gateway_auth_token_from_platform,
         handoff_resume_context_packet, merge_prompt_with_stdin, normalize_permission_mode,
-        parse_args, parse_gateway_approval_slash_command, parse_gateway_args,
-        parse_gateway_context_slash_command, parse_gateway_cross_plane_slash_command,
-        parse_gateway_task_slash_command, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_args, parse_gateway_args, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, permission_policy, print_help_to, push_output_block,
         render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
         render_setup_json, render_setup_report, render_terminal_help,
@@ -3689,11 +3680,9 @@ mod tests {
         session_db_resume_context_packet, slash_command_completion_candidates_with_sessions,
         status_context, strip_ansi_for_tui, suggestions::format_unknown_slash_command,
         try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction,
-        GatewayApprovalSlashCommand, GatewayContextSlashCommand, GatewayCrossPlaneSlashCommand,
-        GatewayTaskSlashCommand, GatewayToolExecutor, GitWorkspaceSummary, LocalHelpTopic,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS,
-        SHARED_RT,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction, GatewayToolExecutor,
+        GitWorkspaceSummary, LocalHelpTopic, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
     };
     use crate::command::slash::{resume_supported_slash_commands, SlashCommand};
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
@@ -3786,110 +3775,6 @@ mod tests {
             gateway_auth_token_from_platform(&platform).as_deref(),
             Some("secret-token")
         );
-    }
-
-    #[test]
-    fn parse_gateway_task_slash_command_maps_core_actions() {
-        assert_eq!(
-            parse_gateway_task_slash_command(None).unwrap(),
-            GatewayTaskSlashCommand::List
-        );
-        assert_eq!(
-            parse_gateway_task_slash_command(Some("status")).unwrap(),
-            GatewayTaskSlashCommand::List
-        );
-        assert_eq!(
-            parse_gateway_task_slash_command(Some("start --yolo finish gateway parity")).unwrap(),
-            GatewayTaskSlashCommand::Start {
-                objective: "finish gateway parity".to_string(),
-                yolo_mode: true,
-            }
-        );
-        assert_eq!(
-            parse_gateway_task_slash_command(Some("cancel task-1")).unwrap(),
-            GatewayTaskSlashCommand::Cancel {
-                id: "task-1".to_string(),
-            }
-        );
-        assert!(parse_gateway_task_slash_command(Some("start --yolo")).is_err());
-        assert!(parse_gateway_task_slash_command(Some("unknown")).is_err());
-    }
-
-    #[test]
-    fn parse_gateway_approval_slash_command_maps_core_actions() {
-        assert_eq!(
-            parse_gateway_approval_slash_command(None).unwrap(),
-            GatewayApprovalSlashCommand::List
-        );
-        assert_eq!(
-            parse_gateway_approval_slash_command(Some(
-                "approve req-1 --persist session --reason trusted channel"
-            ))
-            .unwrap(),
-            GatewayApprovalSlashCommand::Respond {
-                id: "req-1".to_string(),
-                approved: true,
-                persistence: Some("session".to_string()),
-                reason: Some("trusted channel".to_string()),
-            }
-        );
-        assert_eq!(
-            parse_gateway_approval_slash_command(Some("reject req-2")).unwrap(),
-            GatewayApprovalSlashCommand::Respond {
-                id: "req-2".to_string(),
-                approved: false,
-                persistence: None,
-                reason: None,
-            }
-        );
-        assert!(parse_gateway_approval_slash_command(Some("approve")).is_err());
-        assert!(parse_gateway_approval_slash_command(Some("maybe req-1")).is_err());
-    }
-
-    #[test]
-    fn parse_gateway_context_slash_command_maps_core_actions() {
-        assert_eq!(
-            parse_gateway_context_slash_command(None).unwrap(),
-            GatewayContextSlashCommand::Current
-        );
-        assert_eq!(
-            parse_gateway_context_slash_command(Some("runtime")).unwrap(),
-            GatewayContextSlashCommand::Runtime
-        );
-        assert_eq!(
-            parse_gateway_context_slash_command(Some("effective-config")).unwrap(),
-            GatewayContextSlashCommand::Config
-        );
-        assert_eq!(
-            parse_gateway_context_slash_command(Some("memory")).unwrap(),
-            GatewayContextSlashCommand::Memory
-        );
-        assert_eq!(
-            parse_gateway_context_slash_command(Some("channels")).unwrap(),
-            GatewayContextSlashCommand::CrossPlane
-        );
-        assert!(parse_gateway_context_slash_command(Some("unknown")).is_err());
-    }
-
-    #[test]
-    fn parse_gateway_cross_plane_slash_command_maps_core_actions() {
-        assert_eq!(
-            parse_gateway_cross_plane_slash_command(None).unwrap(),
-            GatewayCrossPlaneSlashCommand::Summary
-        );
-        assert_eq!(
-            parse_gateway_cross_plane_slash_command(Some(
-                "preflight {\"operation\":\"send_text\"}"
-            ))
-            .unwrap(),
-            GatewayCrossPlaneSlashCommand::Preflight("{\"operation\":\"send_text\"}".to_string())
-        );
-        assert_eq!(
-            parse_gateway_cross_plane_slash_command(Some("execute {\"id\":\"req-1\"}")).unwrap(),
-            GatewayCrossPlaneSlashCommand::Execute("{\"id\":\"req-1\"}".to_string())
-        );
-        assert!(parse_gateway_cross_plane_slash_command(Some("execute")).is_err());
-        assert!(parse_gateway_cross_plane_slash_command(Some("unknown {}")).is_err());
     }
 
     fn registry_with_plugin_tool() -> TestToolRegistry {
@@ -5585,8 +5470,24 @@ mod tests {
         });
         let checkpoint: memory::compression::session::SessionSemanticCheckpoint =
             serde_json::from_value(serde_json::json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "checkpoint_id": "checkpoint-resume-1",
+                "execution_identity": {
+                    "kind": "task_graph",
+                    "principal_id": "principal-resume",
+                    "workspace_id": "project-a",
+                    "mission_id": "mission-a",
+                    "task_id": "task-a",
+                    "session_id": "resume-semantic",
+                    "turn_id": "turn-a",
+                    "graph_id": "graph-a",
+                    "team_run_id": null,
+                    "agent_run_id": null,
+                    "node_id": null,
+                    "invocation_id": null,
+                    "schedule_id": null,
+                    "fire_id": null
+                },
                 "session_id": "resume-semantic",
                 "agent_id": "primary",
                 "project_id": "project-a",

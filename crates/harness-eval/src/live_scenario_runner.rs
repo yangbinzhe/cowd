@@ -178,7 +178,37 @@ fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
 
 impl LiveScenarioRunner {
     fn run(&self) -> Value {
-        let health = self.get_json("/healthz");
+        let health_observations = [
+            ("gateway", "/healthz"),
+            ("runtime", "/api/runtime/status"),
+            ("runtime_outbox", "/api/runtime/outbox"),
+            ("runtime_control_plane", "/api/runtime/control-plane"),
+            ("evolution_projector", "/api/evolution/signals"),
+            ("surface_host", "/api/surfaces/health"),
+        ]
+        .into_iter()
+        .map(|(id, path)| {
+            let observed = self.get_json(path);
+            (
+                id.to_string(),
+                match observed {
+                    Ok(response) => json!({
+                        "status": "passed",
+                        "path": path,
+                        "response": response,
+                    }),
+                    Err(error) => json!({
+                        "status": "failed",
+                        "path": path,
+                        "error": error,
+                    }),
+                },
+            )
+        })
+        .collect::<serde_json::Map<String, Value>>();
+        let health_passed = health_observations
+            .values()
+            .all(|observation| observation["status"] == "passed");
         let scenarios = [
             LiveScenarioSpec {
                 id: "live_direct_terminal",
@@ -217,17 +247,20 @@ impl LiveScenarioRunner {
             .get("status")
             .and_then(Value::as_str)
             == Some("passed");
+        let metrics = aggregate_scenario_metrics(&scenarios);
         json!({
             "kind": "harness_eval.live_gateway_scenarios",
-            "status": if passed == scenarios.len() && comparison_passed { "passed" } else { "failed" },
+            "status": if health_passed && passed == scenarios.len() && comparison_passed { "passed" } else { "failed" },
             "gateway_url": self.base_url,
             "model": self.model,
             "timeout_cap_ms": self.timeout_cap.map(|value| value.as_millis()),
             "poll_interval_ms": self.poll_interval.as_millis(),
-            "gateway_health": health,
+            "health_status": if health_passed { "passed" } else { "failed" },
+            "health_observations": health_observations,
             "scenario_count": scenarios.len(),
             "passed": passed,
             "failed": scenarios.len().saturating_sub(passed),
+            "metrics": metrics,
             "scenarios": scenarios,
             "collaboration_comparison": collaboration_comparison,
         })
@@ -327,11 +360,10 @@ impl LiveScenarioRunner {
             .as_deref()
             .map(|id| self.execution_lineage_projections(id, &mut trace))
             .unwrap_or_default();
-        let projection = projections.first().cloned().unwrap_or(Value::Null);
         let response_text = message_text(&terminal_wait.message);
         let mut acceptance = spec
             .acceptance
-            .evaluate(&response_text, &timeline, &projection);
+            .evaluate(&response_text, &timeline, &projections);
         let terminal_id = terminal_wait
             .message
             .get("id")
@@ -667,6 +699,81 @@ impl LiveScenarioRunner {
     }
 }
 
+fn aggregate_scenario_metrics(scenarios: &[Value]) -> Value {
+    let total = |key: &str| {
+        scenarios
+            .iter()
+            .filter_map(|scenario| {
+                scenario
+                    .pointer(&format!("/metrics/{key}"))
+                    .and_then(Value::as_u64)
+            })
+            .sum::<u64>()
+    };
+    let maximum = |key: &str| {
+        scenarios
+            .iter()
+            .filter_map(|scenario| {
+                scenario
+                    .pointer(&format!("/metrics/{key}"))
+                    .and_then(Value::as_u64)
+            })
+            .max()
+            .unwrap_or_default()
+    };
+    let wall_ms = scenarios
+        .iter()
+        .filter_map(|scenario| scenario.pointer("/metrics/wall_ms").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
+    let first_token_ms = scenarios
+        .iter()
+        .filter_map(|scenario| {
+            scenario
+                .pointer("/metrics/first_token_latency_ms")
+                .and_then(Value::as_u64)
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "input_tokens": total("input_tokens"),
+        "output_tokens": total("output_tokens"),
+        "cache_tokens": total("cache_tokens"),
+        "total_tokens": total("total_tokens"),
+        "model_rounds": total("model_rounds"),
+        "tool_calls": total("tool_calls"),
+        "max_agent_count": maximum("agent_count"),
+        "max_team_count": maximum("team_count"),
+        "wall_ms": distribution(&wall_ms),
+        "first_token_latency_ms": distribution(&first_token_ms),
+    })
+}
+
+fn distribution(values: &[u64]) -> Value {
+    if values.is_empty() {
+        return json!({"samples": 0});
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    json!({
+        "samples": sorted.len(),
+        "min": sorted[0],
+        "p50": percentile(&sorted, 50),
+        "p95": percentile(&sorted, 95),
+        "p99": percentile(&sorted, 99),
+        "max": sorted[sorted.len() - 1],
+    })
+}
+
+fn percentile(sorted: &[u64], percentile: usize) -> u64 {
+    let index = sorted
+        .len()
+        .saturating_mul(percentile)
+        .saturating_add(99)
+        .saturating_div(100)
+        .saturating_sub(1)
+        .min(sorted.len().saturating_sub(1));
+    sorted[index]
+}
+
 fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) -> Value {
     let graph_usage = execution_graph_usage_metrics(projections);
     let timeline_usage = token_usage_metrics(timeline);
@@ -980,8 +1087,9 @@ impl LiveAcceptance {
         self,
         response: &str,
         timeline: &Value,
-        projection: &Value,
+        projections: &[Value],
     ) -> LiveAcceptanceResult {
+        let projection = projections.first().unwrap_or(&Value::Null);
         match self {
             Self::Contains(expected) => LiveAcceptanceResult {
                 passed: response.contains(expected),
@@ -1008,16 +1116,10 @@ impl LiveAcceptance {
                 }
             }
             Self::ArchitectureQuality { require_team } => {
-                let agent_count = projection
-                    .get("agents")
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
-                let team_count = projection
-                    .get("teams")
-                    .and_then(Value::as_array)
-                    .map_or(0, Vec::len);
-                let quality = architecture_quality(response);
-                let team_projection = agent_count >= 2 || team_count >= 1;
+                let team_health = projected_team_health(projection);
+                let checked_source_receipts = checked_source_receipt_count(timeline, projections);
+                let quality = architecture_quality(response, checked_source_receipts);
+                let team_projection = team_health.passed;
                 LiveAcceptanceResult {
                     passed: !response.trim().is_empty()
                         && quality.score >= quality.required
@@ -1026,7 +1128,7 @@ impl LiveAcceptance {
                     checks: vec![
                         json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                         json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
-                        json!({"name": "team_or_multi_agent_projection", "required": require_team, "passed": !require_team || team_projection, "agents": agent_count, "teams": team_count}),
+                        json!({"name": "completed_evidence_team", "required": require_team, "passed": !require_team || team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
                     ],
                 }
             }
@@ -1053,7 +1155,7 @@ struct ArchitectureQuality {
     criteria: Vec<Value>,
 }
 
-fn architecture_quality(response: &str) -> ArchitectureQuality {
+fn architecture_quality(response: &str, checked_source_receipts: usize) -> ArchitectureQuality {
     let lowered = response.to_ascii_lowercase();
     let criteria = [
         (
@@ -1077,12 +1179,45 @@ fn architecture_quality(response: &str) -> ArchitectureQuality {
         ),
         (
             "risk_or_open_issue",
-            contains_any(&lowered, &["risk", "风险", "缺口", "待处理", "open issue"]),
+            contains_any(
+                &lowered,
+                &[
+                    "risk",
+                    "风险",
+                    "風險",
+                    "缺口",
+                    "待处理",
+                    "待處理",
+                    "open issue",
+                ],
+            ),
         ),
         ("source_path_evidence", source_path_count(response) >= 2),
         (
             "cited_source_paths_exist",
             cited_source_paths_exist(response),
+        ),
+        ("checked_source_receipts", checked_source_receipts >= 2),
+        (
+            "conclusive_evidence_backed_answer",
+            !contains_any(
+                &lowered,
+                &[
+                    "没有任何文件内容的读取证据",
+                    "缺少文件内容读取证据",
+                    "无法确认",
+                    "无法判断",
+                    "无法评估",
+                    "不能确认",
+                    "cannot confirm",
+                    "cannot verify",
+                    "unable to confirm",
+                    "unable to verify",
+                    "could not verify",
+                    "no source evidence",
+                    "without source evidence",
+                ],
+            ),
         ),
     ]
     .into_iter()
@@ -1094,8 +1229,126 @@ fn architecture_quality(response: &str) -> ArchitectureQuality {
         .count() as u64;
     ArchitectureQuality {
         score,
-        required: 7,
+        required: 9,
         criteria,
+    }
+}
+
+#[derive(Default)]
+struct ProjectedTeamHealth {
+    passed: bool,
+    agent_count: usize,
+    completed_agents: usize,
+    failed_agents: usize,
+    team_count: usize,
+    completed_teams: usize,
+    failed_teams: usize,
+}
+
+fn projected_team_health(projection: &Value) -> ProjectedTeamHealth {
+    let agents = projection
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let teams = projection
+        .get("teams")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let completed_agents = agents
+        .iter()
+        .filter(|agent| projected_status(agent) == Some("completed"))
+        .count();
+    let failed_agents = agents
+        .iter()
+        .filter(|agent| projected_status_is_failure(agent))
+        .count();
+    let completed_teams = teams
+        .iter()
+        .filter(|team| {
+            matches!(
+                projected_status(team),
+                Some("completed" | "terminal" | "passed")
+            )
+        })
+        .count();
+    let failed_teams = teams
+        .iter()
+        .filter(|team| projected_status_is_failure(team))
+        .count();
+    ProjectedTeamHealth {
+        passed: agents.len() >= 3
+            && completed_agents == agents.len()
+            && failed_agents == 0
+            && !teams.is_empty()
+            && completed_teams == teams.len()
+            && failed_teams == 0,
+        agent_count: agents.len(),
+        completed_agents,
+        failed_agents,
+        team_count: teams.len(),
+        completed_teams,
+        failed_teams,
+    }
+}
+
+fn projected_status(value: &Value) -> Option<&str> {
+    value
+        .get("status")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/detail/status").and_then(Value::as_str))
+}
+
+fn projected_status_is_failure(value: &Value) -> bool {
+    matches!(
+        projected_status(value),
+        Some("blocked" | "failed" | "cancelled" | "canceled")
+    )
+}
+
+fn checked_source_receipt_count(timeline: &Value, projections: &[Value]) -> usize {
+    let mut receipts = BTreeSet::new();
+    collect_checked_source_receipts(timeline, &mut receipts);
+    for projection in projections {
+        collect_checked_source_receipts(projection, &mut receipts);
+    }
+    receipts.len()
+}
+
+fn collect_checked_source_receipts(value: &Value, receipts: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_checked_source_receipts(value, receipts);
+            }
+        }
+        Value::Object(values) => {
+            let source_tool = values
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .is_some_and(|tool| {
+                    matches!(
+                        tool,
+                        "read_file" | "read_many" | "grep_search" | "grep_many"
+                    )
+                });
+            let succeeded = values.get("is_error").and_then(Value::as_bool) == Some(false);
+            if source_tool && succeeded {
+                if let Some(id) = values
+                    .get("evidence_id")
+                    .or_else(|| values.get("tool_call_id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty())
+                {
+                    receipts.insert(id.to_string());
+                }
+            }
+            for value in values.values() {
+                collect_checked_source_receipts(value, receipts);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -1503,18 +1756,65 @@ mod tests {
     fn team_acceptance_does_not_pass_without_a_real_projection_team_or_agents() {
         let answer =
             "runtime memory gateway event risk crates/runtime/src/lib.rs crates/memory/src/lib.rs";
+        let receipts = json!({"evidence": [
+            {"tool_name": "read_file", "is_error": false, "evidence_id": "read-1"},
+            {"tool_name": "grep_search", "is_error": false, "evidence_id": "read-2"}
+        ]});
         let result = LiveAcceptance::ArchitectureQuality { require_team: true }.evaluate(
             answer,
-            &Value::Null,
-            &json!({"agents": [], "teams": []}),
+            &receipts,
+            &[json!({"agents": [], "teams": []})],
         );
         assert!(!result.passed);
         let result = LiveAcceptance::ArchitectureQuality { require_team: true }.evaluate(
             answer,
-            &Value::Null,
-            &json!({"agents": [{}, {}], "teams": []}),
+            &receipts,
+            &[json!({
+                "agents": [
+                    {"status": "completed"},
+                    {"status": "completed"},
+                    {"status": "completed"}
+                ],
+                "teams": [{"status": "completed"}]
+            })],
         );
         assert!(result.passed);
+    }
+
+    #[test]
+    fn architecture_acceptance_rejects_failed_team_and_evidence_disclaimer() {
+        let answer = "runtime memory gateway canonical event risk crates/runtime/src/lib.rs crates/memory/src/lib.rs；但无法确认，因为没有任何文件内容的读取证据";
+        let result = LiveAcceptance::ArchitectureQuality { require_team: true }.evaluate(
+            answer,
+            &json!({"evidence": [
+                {"tool_name": "read_file", "is_error": false, "evidence_id": "read-1"},
+                {"tool_name": "grep_search", "is_error": false, "evidence_id": "read-2"}
+            ]}),
+            &[json!({
+                "agents": [
+                    {"status": "completed"},
+                    {"status": "failed"},
+                    {"status": "blocked"}
+                ],
+                "teams": [{"status": "failed"}]
+            })],
+        );
+        assert!(!result.passed);
+        assert!(result.quality.as_ref().is_some_and(|quality| {
+            quality.criteria.iter().any(|check| {
+                check["name"] == "conclusive_evidence_backed_answer" && check["passed"] == false
+            })
+        }));
+    }
+
+    #[test]
+    fn architecture_quality_accepts_traditional_chinese_risk_language() {
+        let quality = architecture_quality(
+            "runtime、memory、gateway 的 canonical event 邊界存在潛在風險；證據見 \
+             crates/runtime/src/lib.rs 與 crates/memory/src/lib.rs。",
+            2,
+        );
+        assert_eq!(quality.score, quality.required);
     }
 
     #[test]
@@ -1523,7 +1823,14 @@ mod tests {
         let result = LiveAcceptance::ArchitectureQuality {
             require_team: false,
         }
-        .evaluate(answer, &Value::Null, &json!({"agents": [], "teams": []}));
+        .evaluate(
+            answer,
+            &json!({"evidence": [
+                {"tool_name": "read_file", "is_error": false, "evidence_id": "read-1"},
+                {"tool_name": "grep_search", "is_error": false, "evidence_id": "read-2"}
+            ]}),
+            &[json!({"agents": [], "teams": []})],
+        );
         assert!(result.quality.as_ref().is_some_and(|quality| {
             quality.criteria.iter().any(|check| {
                 check["name"] == "cited_source_paths_exist" && check["passed"] == false
@@ -1551,13 +1858,13 @@ mod tests {
         let result = LiveAcceptance::RequiresToolEvidence.evaluate(
             "Cargo.toml",
             &json!({"events": []}),
-            &Value::Null,
+            &[],
         );
         assert!(!result.passed);
         let result = LiveAcceptance::RequiresToolEvidence.evaluate(
             "Cargo.toml",
             &json!({"events": [{"tool_name": "workspace.read"}]}),
-            &Value::Null,
+            &[],
         );
         assert!(result.passed);
     }
@@ -1567,7 +1874,7 @@ mod tests {
         let result = LiveAcceptance::RequiresToolEvidence.evaluate(
             "I read Cargo.toml",
             &json!({"events": [{"tool_calls": 0}]}),
-            &json!({"usage": [{"detail": {"tool_calls": 0}}]}),
+            &[json!({"usage": [{"detail": {"tool_calls": 0}}]})],
         );
         assert!(
             !result.passed,
@@ -1641,6 +1948,44 @@ mod tests {
         assert_eq!(metrics["model_rounds"], 2);
         assert_eq!(metrics["token_usage_records"], 3);
         assert_eq!(metrics["effective_models"], json!(["deepseek-v4-flash"]));
+    }
+
+    #[test]
+    fn live_metric_summary_uses_observed_scenario_values() {
+        let metrics = aggregate_scenario_metrics(&[
+            json!({"metrics": {
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_tokens": 3,
+                "total_tokens": 15,
+                "model_rounds": 1,
+                "tool_calls": 0,
+                "agent_count": 0,
+                "team_count": 0,
+                "wall_ms": 100,
+                "first_token_latency_ms": 40
+            }}),
+            json!({"metrics": {
+                "input_tokens": 20,
+                "output_tokens": 5,
+                "cache_tokens": 0,
+                "total_tokens": 25,
+                "model_rounds": 2,
+                "tool_calls": 3,
+                "agent_count": 4,
+                "team_count": 1,
+                "wall_ms": 300,
+                "first_token_latency_ms": 80
+            }}),
+        ]);
+
+        assert_eq!(metrics["total_tokens"], 40);
+        assert_eq!(metrics["model_rounds"], 3);
+        assert_eq!(metrics["tool_calls"], 3);
+        assert_eq!(metrics["max_agent_count"], 4);
+        assert_eq!(metrics["max_team_count"], 1);
+        assert_eq!(metrics["wall_ms"]["p95"], 300);
+        assert_eq!(metrics["first_token_latency_ms"]["min"], 40);
     }
 
     #[test]

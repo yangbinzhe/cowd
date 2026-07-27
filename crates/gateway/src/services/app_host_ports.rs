@@ -312,12 +312,27 @@ impl RuntimePort for GatewayAppHostBinding {
                         "runtime task id or objective is invalid".to_string(),
                     ));
                 }
+                let mission_id = match request.mission {
+                    RuntimeMissionSelectorV1::WorkspaceDefault => state
+                        .services
+                        .task
+                        .workspace_default_mission_id()
+                        .map_err(AppHostError::Unavailable)?,
+                    RuntimeMissionSelectorV1::MissionId { mission_id } => {
+                        if !valid_runtime_identity(&mission_id) {
+                            return Err(AppHostError::Denied(
+                                "runtime mission id is invalid".to_string(),
+                            ));
+                        }
+                        mission_id
+                    }
+                };
                 let task = state
                     .services
                     .task
                     .create(
                         request.task_id,
-                        request.mission_id,
+                        mission_id,
                         request.source_session_id,
                         request.source_turn_id,
                         request.objective,
@@ -347,12 +362,19 @@ impl RuntimePort for GatewayAppHostBinding {
 #[serde(deny_unknown_fields)]
 struct RuntimeStartGoalIntentV1 {
     task_id: String,
-    mission_id: String,
+    mission: RuntimeMissionSelectorV1,
     source_session_id: String,
     source_turn_id: String,
     objective: String,
     #[serde(default)]
     preemptive: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "selector", rename_all = "snake_case", deny_unknown_fields)]
+enum RuntimeMissionSelectorV1 {
+    WorkspaceDefault,
+    MissionId { mission_id: String },
 }
 
 fn valid_runtime_task_id(value: &str) -> bool {
@@ -361,6 +383,10 @@ fn valid_runtime_task_id(value: &str) -> bool {
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
         })
+}
+
+fn valid_runtime_identity(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
 
 #[async_trait]

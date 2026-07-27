@@ -38,6 +38,15 @@ impl EvolutionDiscoveryService {
 
     pub(crate) fn record_signal(&self, signal: EvolutionSignal) -> Result<EvolutionSignal, String> {
         validate_signal(&signal)?;
+        if let Some(existing) = self.signal(&signal.signal_id)? {
+            if existing == signal {
+                return Ok(existing);
+            }
+            return Err(format!(
+                "evolution signal idempotency conflict: {}",
+                signal.signal_id
+            ));
+        }
         let stream = signal_stream(&signal.signal_id);
         self.event_store
             .append_batch_if_revision(
@@ -716,5 +725,25 @@ mod tests {
         assert_eq!(discovery.list_diagnoses().expect("diagnoses").len(), 1);
         assert_eq!(discovery.list_missions().expect("missions").len(), 1);
         assert_eq!(discovery.list_proposals().expect("proposals").len(), 1);
+    }
+
+    #[test]
+    fn discovery_ledger_rejects_conflicting_signal_reuse() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = EvolutionDiscoveryService::new(Arc::clone(&events));
+        let recorded = discovery.record_signal(signal()).expect("record signal");
+        let mut conflicting = recorded.clone();
+        conflicting.summary = "a different observation".to_string();
+
+        let error = discovery
+            .record_signal(conflicting)
+            .expect_err("conflicting signal id must fail closed");
+        assert!(error.contains("evolution signal idempotency conflict"));
+        assert_eq!(
+            discovery
+                .signal(&recorded.signal_id)
+                .expect("signal lookup"),
+            Some(recorded)
+        );
     }
 }

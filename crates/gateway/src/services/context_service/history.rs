@@ -180,7 +180,12 @@ impl ContextService {
         limit: usize,
     ) -> Result<serde_json::Value, ContextServiceError> {
         let Some((total, stored_events)) = session
-            .stored_events_by_type_page(session_id, "ContextRecommendationAction", from_seq, limit)
+            .stored_domain_events_by_kind_page(
+                session_id,
+                "context.recommendation_action",
+                from_seq,
+                limit,
+            )
             .await
             .map_err(|error| {
                 ContextServiceError::Internal(format!(
@@ -196,8 +201,13 @@ impl ContextService {
         let event_count = stored_events.len();
         let mut grouped: HashMap<String, serde_json::Value> = HashMap::new();
         for event in stored_events {
-            let payload = serde_json::from_str::<serde_json::Value>(&event.event_json)
-                .unwrap_or_else(|_| serde_json::json!({}));
+            let payload = session::SessionDomainEvent::from_session_event(&event)
+                .map_err(|error| {
+                    ContextServiceError::Internal(format!(
+                        "failed to decode context recommendation event: {error}"
+                    ))
+                })?
+                .payload;
             let Some(recommendation) = payload
                 .get("recommendation")
                 .and_then(|value| value.as_str())

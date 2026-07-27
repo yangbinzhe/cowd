@@ -2421,21 +2421,6 @@ impl GatewayApiClient {
         .await
     }
 
-    pub async fn start_task(
-        &self,
-        objective: &str,
-        yolo_mode: bool,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            "/api/tasks/start",
-            serde_json::json!({
-                "objective": objective,
-                "yolo_mode": yolo_mode,
-            }),
-        )
-        .await
-    }
-
     pub async fn cancel_task(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
             &format!("/api/tasks/{}/cancel", url_encode(id)),
@@ -6613,32 +6598,6 @@ mod tests {
             .await
             .expect("json");
         assert_eq!(json["resolved"], true);
-        server.await.expect("server task");
-    }
-
-    #[tokio::test]
-    async fn start_task_posts_objective() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut buf = vec![0; 4096];
-            let n = socket.read(&mut buf).await.expect("read");
-            let req = String::from_utf8_lossy(&buf[..n]);
-            assert!(req.starts_with("POST /api/tasks/start HTTP/1.1"));
-            assert!(req.contains("\"objective\":\"ship tui\""));
-            assert!(req.contains("\"yolo_mode\":true"));
-            socket
-                .write_all(
-                    b"HTTP/1.1 201 Created\r\ncontent-type: application/json\r\ncontent-length: 15\r\n\r\n{\"id\":\"task-1\"}",
-                )
-                .await
-                .expect("write");
-        });
-
-        let client = GatewayApiClient::new(format!("http://{addr}"), None).expect("client");
-        let json = client.start_task("ship tui", true).await.expect("json");
-        assert_eq!(json["id"], "task-1");
         server.await.expect("server task");
     }
 

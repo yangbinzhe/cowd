@@ -451,6 +451,19 @@ fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelS
     }
 }
 
+fn unexposed_model_tool_names(
+    calls: &[ModelToolCall],
+    exposed_tool_ids: &BTreeSet<String>,
+) -> Vec<String> {
+    calls
+        .iter()
+        .filter(|call| !exposed_tool_ids.contains(&call.name))
+        .map(|call| call.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// An explicit user requirement to actually form a team is an acceptance
 /// constraint, not merely a prose preference. It takes precedence over a
 /// heuristic strategy recommendation: otherwise a correctly parsed user
@@ -4221,8 +4234,14 @@ where
                 *state = Some(exposure.clone());
             }
         }
-        self.api_client
-            .configure_tool_exposure(exposure.projection(0));
+        let exposure_projection = exposure.projection(0);
+        let exposed_tool_ids = exposure_projection
+            .bootstrap_ids
+            .iter()
+            .chain(exposure_projection.active_ids.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.api_client.configure_tool_exposure(exposure_projection);
 
         // Tool schemas are part of the request budget. Read their inventory
         // only after Runtime has made the exposure decision.
@@ -4629,6 +4648,17 @@ where
                 continue;
             }
 
+            let requested_tool_call_count = calls.len();
+            let unexposed_tool_names = unexposed_model_tool_names(&calls, &exposed_tool_ids);
+            let calls = if unexposed_tool_names.is_empty() {
+                calls
+            } else {
+                // Provider transports validate framing, while Runtime owns
+                // this request's exposure lease. Reject the whole mixed batch
+                // before graph planning so a native or compatibility call
+                // cannot execute a registered but currently hidden tool.
+                Vec::new()
+            };
             let mut blocks = Vec::new();
             if !thinking.is_empty() {
                 blocks.push(ContentBlock::Thinking {
@@ -4666,9 +4696,18 @@ where
             self.record_assistant_iteration(
                 self.session().message_count(),
                 &assistant_message,
-                calls.len(),
+                requested_tool_call_count,
             );
-            let classified = classify_model_step_intent(text, calls);
+            let classified = if unexposed_tool_names.is_empty() {
+                classify_model_step_intent(text, calls)
+            } else {
+                ModelStepIntent::Replan {
+                    reason: format!(
+                        "provider requested tool names outside this request's exposure lease: [{}]. Runtime rejected the complete batch without execution. Select only a native tool schema exposed in the next request, or return a final answer from retained evidence",
+                        unexposed_tool_names.join(", ")
+                    ),
+                }
+            };
             let intent = apply_explicit_team_requirement(
                 self.explicit_team_escalation,
                 user_input,
@@ -9537,10 +9576,11 @@ mod tests {
         is_runtime_team_orchestration_call, memory_project_id_for_session,
         model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
         provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        tool_batch_pattern, turn_strategy_event_kind_allowed, vision_user_message, ApiClient,
-        ApiRequest, AssistantEvent, CognitiveContextManager, ConversationRuntime, ModelStepIntent,
-        ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
-        ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
+        tool_batch_pattern, turn_strategy_event_kind_allowed, unexposed_model_tool_names,
+        vision_user_message, ApiClient, ApiRequest, AssistantEvent, CognitiveContextManager,
+        ConversationRuntime, ModelStepIntent, ModelToolCall, ProviderContextInventory,
+        RuntimeError, StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics,
+        TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -9567,6 +9607,7 @@ mod tests {
     };
     use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
     use model_protocol::usage::TokenUsage;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -9676,6 +9717,35 @@ mod tests {
         assert_eq!(calls[0].name, "runtime_orchestrate");
         let input: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
         assert_eq!(input["action"], "request_team");
+    }
+
+    #[test]
+    fn model_tool_calls_are_bounded_by_the_current_exposure_lease() {
+        let calls = vec![
+            ModelToolCall {
+                id: "read".to_string(),
+                name: "read_file".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "hidden".to_string(),
+                name: "shell".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "missing".to_string(),
+                name: "invented_tool".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            unexposed_model_tool_names(&calls, &BTreeSet::from(["read_file".to_string()])),
+            vec!["invented_tool".to_string(), "shell".to_string()]
+        );
     }
 
     #[test]

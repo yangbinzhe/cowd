@@ -1133,14 +1133,15 @@ impl RuntimeService {
         };
         self.bind_primary_ingress_projection(record, &graph_id)
             .await;
-        let summary_result = owned_runtime
-            .runtime_mut()?
-            .submit_ingress_turn(
-                content,
-                &runtime::permissions::SharedPrompter::none(),
-                ingress,
-            )
-            .await;
+        // The complete Runtime turn state machine is intentionally large. Keep
+        // it behind one heap allocation so Gateway worker stacks do not grow
+        // with every execution capability added to Runtime.
+        let summary_result = Box::pin(owned_runtime.runtime_mut()?.submit_ingress_turn(
+            content,
+            &runtime::permissions::SharedPrompter::none(),
+            ingress,
+        ))
+        .await;
         owned_runtime.restore().await;
         let summary = match summary_result {
             Ok(summary) => summary,

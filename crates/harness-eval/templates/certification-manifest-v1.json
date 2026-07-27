@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "id": "full-chain-v610",
+  "run_id": "replace-with-immutable-run-id",
+  "capability": "harness.terminal-certification",
+  "fixture": {
+    "id": "replace-with-real-scenario-fixture",
+    "path": "fixtures/certification-fixture-v1.json",
+    "sha256": "98d1a3422378f7b15b921020f77008f3b596e00d0cc03c4ea1e128ec59dc870d"
+  },
+  "seed": 610,
+  "command": {
+    "program": "replace-with-scenario-driver",
+    "args": [],
+    "cwd": null
+  },
+  "expected_events": [
+    "agent.terminal"
+  ],
+  "forbidden_events": [
+    "external.effect.duplicated"
+  ],
+  "evidence_paths": [
+    "observations/runtime-events.json",
+    "observations/gateway.log",
+    "observations/provider-trace.json",
+    "observations/tool-trace.json",
+    "observations/surface-receipt.json"
+  ],
+  "timeout_policy": {
+    "scenario_ms": 900000,
+    "source_default_ms": 30000
+  },
+  "failure_code": null,
+  "provider_requirement": "real",
+  "load_levels": [
+    1,
+    8,
+    32,
+    100
+  ],
+  "baseline_commit": "0000000000000000000000000000000000000000",
+  "pass_thresholds": {
+    "runtime-events-present": 1,
+    "provider-usage-observed": 1,
+    "tool-call-observed": 1,
+    "gateway-log-retained": 1
+  },
+  "sources": [
+    {
+      "id": "gateway-health",
+      "kind": "runtime_health",
+      "required": true,
+      "collector": {
+        "type": "http_json",
+        "url": "http://127.0.0.1:18640/healthz",
+        "token_env": null,
+        "timeout_ms": 30000
+      }
+    },
+    {
+      "id": "runtime-health",
+      "kind": "runtime_health",
+      "required": true,
+      "collector": {
+        "type": "http_json",
+        "url": "http://127.0.0.1:18640/api/runtime/status",
+        "token_env": "COWD_API_TOKEN",
+        "timeout_ms": 30000
+      }
+    },
+    {
+      "id": "evolution-health",
+      "kind": "runtime_health",
+      "required": true,
+      "collector": {
+        "type": "http_json",
+        "url": "http://127.0.0.1:18640/api/evolution/signals",
+        "token_env": "COWD_API_TOKEN",
+        "timeout_ms": 30000
+      }
+    },
+    {
+      "id": "runtime-events",
+      "kind": "runtime_events",
+      "required": true,
+      "collector": {
+        "type": "file",
+        "path": "observations/runtime-events.json"
+      }
+    },
+    {
+      "id": "database-state",
+      "kind": "database_state",
+      "required": true,
+      "collector": {
+        "type": "command",
+        "program": "sqlite3",
+        "args": [
+          "-json",
+          "observations/runtime.sqlite",
+          "SELECT stream_id AS execution_id, status FROM runtime_events ORDER BY commit_cursor DESC, transaction_index DESC LIMIT 1"
+        ],
+        "cwd": ".",
+        "timeout_ms": 30000
+      }
+    },
+    {
+      "id": "gateway-log",
+      "kind": "process_log",
+      "required": true,
+      "collector": {
+        "type": "file",
+        "path": "observations/gateway.log"
+      }
+    },
+    {
+      "id": "provider-trace",
+      "kind": "provider_trace",
+      "required": true,
+      "collector": {
+        "type": "file",
+        "path": "observations/provider-trace.json"
+      }
+    },
+    {
+      "id": "tool-trace",
+      "kind": "tool_trace",
+      "required": true,
+      "collector": {
+        "type": "file",
+        "path": "observations/tool-trace.json"
+      }
+    },
+    {
+      "id": "surface-receipt",
+      "kind": "surface_receipt",
+      "required": true,
+      "collector": {
+        "type": "file",
+        "path": "observations/surface-receipt.json"
+      }
+    }
+  ],
+  "checks": [
+    {
+      "id": "gateway-healthy",
+      "source_id": "gateway-health",
+      "required": true,
+      "selector": {
+        "type": "json_pointer",
+        "pointer": "/status"
+      },
+      "comparison": {
+        "type": "non_empty"
+      }
+    },
+    {
+      "id": "runtime-open",
+      "source_id": "runtime-health",
+      "required": true,
+      "selector": {
+        "type": "json_pointer",
+        "pointer": "/execution/lifecycle"
+      },
+      "comparison": {
+        "type": "equals",
+        "expected": "open"
+      }
+    },
+    {
+      "id": "evolution-projector-running",
+      "source_id": "evolution-health",
+      "required": true,
+      "selector": {
+        "type": "json_pointer",
+        "pointer": "/projector/worker_running"
+      },
+      "comparison": {
+        "type": "equals",
+        "expected": true
+      }
+    },
+    {
+      "id": "runtime-events-present",
+      "source_id": "runtime-events",
+      "required": true,
+      "selector": {
+        "type": "json_pointer_length",
+        "pointer": "/events"
+      },
+      "comparison": {
+        "type": "at_least",
+        "expected": 1
+      }
+    },
+    {
+      "id": "database-and-surface-identities-match",
+      "source_id": "surface-receipt",
+      "required": true,
+      "selector": {
+        "type": "json_pointer",
+        "pointer": "/execution_id"
+      },
+      "comparison": {
+        "type": "equals_observed",
+        "source_id": "database-state",
+        "selector": {
+          "type": "json_pointer",
+          "pointer": "/0/execution_id"
+        }
+      }
+    },
+    {
+      "id": "provider-usage-observed",
+      "source_id": "provider-trace",
+      "required": true,
+      "selector": {
+        "type": "json_pointer",
+        "pointer": "/usage/total_tokens"
+      },
+      "comparison": {
+        "type": "at_least",
+        "expected": 1
+      }
+    },
+    {
+      "id": "tool-call-observed",
+      "source_id": "tool-trace",
+      "required": true,
+      "selector": {
+        "type": "json_pointer_length",
+        "pointer": "/calls"
+      },
+      "comparison": {
+        "type": "at_least",
+        "expected": 1
+      }
+    },
+    {
+      "id": "gateway-log-retained",
+      "source_id": "gateway-log",
+      "required": true,
+      "selector": {
+        "type": "byte_length"
+      },
+      "comparison": {
+        "type": "at_least",
+        "expected": 1
+      }
+    }
+  ]
+}

@@ -600,10 +600,15 @@ const fn scope_owner(scope: RuntimeEventScope) -> &'static str {
 fn is_projector_output_only(batch: &CommittedEventBatch) -> bool {
     !batch.events.is_empty()
         && batch.events.iter().all(|event| {
-            event.scope == RuntimeEventScope::Evolution
-                && (event.stream_id.starts_with("evolution:")
-                    || event.stream_id == PROJECTOR_STREAM)
+            is_projector_checkpoint(event)
+                || (event.scope == RuntimeEventScope::Evolution
+                    && (event.stream_id.starts_with("evolution:")
+                        || event.stream_id == PROJECTOR_STREAM))
         })
+}
+
+fn is_projector_checkpoint(event: &DurableRuntimeEvent) -> bool {
+    event.kind.ends_with(".projector.checkpoint.v1")
 }
 
 fn projector_event(
@@ -741,5 +746,29 @@ mod tests {
         assert_eq!(restarted.health().expect("restart health").lag_commits, 0);
         assert_eq!(discovery.list_signals().expect("signals").len(), 3);
         assert_eq!(discovery.list_proposals().expect("proposals").len(), 3);
+    }
+
+    #[test]
+    fn projector_does_not_echo_another_projector_checkpoint() {
+        let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let discovery = Arc::new(EvolutionDiscoveryService::new(Arc::clone(&events)));
+        let projector = EvolutionSignalProjector::new(Arc::clone(&events), discovery);
+        events
+            .append(RuntimeEventInput {
+                stream_id: "knowledge-candidate-projector".to_string(),
+                scope: RuntimeEventScope::Recovery,
+                kind: "knowledge.candidate.projector.checkpoint.v1".to_string(),
+                status: Some("completed".to_string()),
+                actor: Some("runtime.knowledge_candidate_projector".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"source_cursor": 1}),
+            })
+            .expect("foreign projector checkpoint");
+
+        assert_eq!(projector.run_once(64).expect("projector pass"), 0);
+        assert!(events
+            .list_stream(PROJECTOR_STREAM)
+            .expect("projector stream")
+            .is_empty());
     }
 }

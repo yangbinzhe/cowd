@@ -640,8 +640,9 @@ struct StreamState {
     tool_calls: BTreeMap<u32, ToolCallState>,
     exposed_tool_names: BTreeSet<String>,
     // Hold only a possible provider tool-frame prefix for ordinary text. Once
-    // a frame begins, buffer it until it can be strictly validated against
-    // the current request's exposed tool contracts.
+    // a frame begins, buffer it until its structure can be validated. Runtime,
+    // which owns the per-request exposure lease, rejects unexposed names
+    // before any tool execution.
     dsml_prefix: String,
     dsml_frame: Option<String>,
 }
@@ -1983,7 +1984,6 @@ enum CompatToolFrameError {
     UnrecognizedMarker,
     Unterminated,
     InvalidAttributes,
-    UnknownTool,
     InvalidArguments,
     DuplicateParameter,
     EmptyCalls,
@@ -1997,7 +1997,6 @@ impl CompatToolFrameError {
             Self::UnrecognizedMarker => "unrecognized_marker",
             Self::Unterminated => "unterminated",
             Self::InvalidAttributes => "invalid_attributes",
-            Self::UnknownTool => "unknown_tool",
             Self::InvalidArguments => "invalid_arguments",
             Self::DuplicateParameter => "duplicate_parameter",
             Self::EmptyCalls => "empty_calls",
@@ -2012,7 +2011,6 @@ fn compatibility_tool_protocol_error(error: CompatToolFrameError) -> ApiError {
         CompatToolFrameError::UnrecognizedMarker
         | CompatToolFrameError::Unterminated
         | CompatToolFrameError::InvalidAttributes
-        | CompatToolFrameError::UnknownTool
         | CompatToolFrameError::InvalidArguments
         | CompatToolFrameError::DuplicateParameter
         | CompatToolFrameError::EmptyCalls
@@ -2035,7 +2033,7 @@ fn log_rejected_compat_tool_frame(model: &str, frame: &str, error: CompatToolFra
 
 fn parse_dsml_tool_calls(
     text: &str,
-    exposed_tool_names: &BTreeSet<String>,
+    _exposed_tool_names: &BTreeSet<String>,
 ) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
     let body = text
         .trim()
@@ -2061,9 +2059,6 @@ fn parse_dsml_tool_calls(
             .get("name")
             .ok_or(CompatToolFrameError::InvalidAttributes)?
             .clone();
-        if !exposed_tool_names.contains(&name) {
-            return Err(CompatToolFrameError::UnknownTool);
-        }
         let after_tag = &after_open[tag_end + 1..];
         let (parameters, after_close) = after_tag
             .split_once(DSML_INVOKE_CLOSE)
@@ -2147,7 +2142,7 @@ fn parse_compat_tool_calls(
 
 fn parse_fenced_tool_call(
     text: &str,
-    exposed_tool_names: &BTreeSet<String>,
+    _exposed_tool_names: &BTreeSet<String>,
 ) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
     let trimmed = text.trim();
     if let Some(body) = trimmed.strip_prefix(COMPAT_TOOL_USE_FENCE_OPEN) {
@@ -2159,9 +2154,6 @@ fn parse_fenced_tool_call(
             .split_once('\n')
             .ok_or(CompatToolFrameError::UnsupportedShape)?;
         let name = name.trim();
-        if !exposed_tool_names.contains(name) {
-            return Err(CompatToolFrameError::UnknownTool);
-        }
         let input = serde_json::from_str::<Value>(arguments.trim())
             .map_err(|_| CompatToolFrameError::InvalidArguments)?;
         if !input.is_object() {
@@ -2193,9 +2185,6 @@ fn parse_fenced_tool_call(
         .get("tool")
         .and_then(Value::as_str)
         .ok_or(CompatToolFrameError::UnsupportedShape)?;
-    if !exposed_tool_names.contains(name) {
-        return Err(CompatToolFrameError::UnknownTool);
-    }
     let input = object
         .get("arguments")
         .ok_or(CompatToolFrameError::UnsupportedShape)?
@@ -2318,7 +2307,7 @@ fn json_fence_claims_tool_protocol(frame: &str) -> bool {
 
 fn parse_tagged_tool_call(
     text: &str,
-    exposed_tool_names: &BTreeSet<String>,
+    _exposed_tool_names: &BTreeSet<String>,
 ) -> Result<Vec<DsmlToolCall>, CompatToolFrameError> {
     let mut body = text
         .trim()
@@ -2383,9 +2372,6 @@ fn parse_tagged_tool_call(
         body = remaining.trim();
     }
     let name = name.ok_or(CompatToolFrameError::UnsupportedShape)?;
-    if !exposed_tool_names.contains(&name) {
-        return Err(CompatToolFrameError::UnknownTool);
-    }
     Ok(vec![DsmlToolCall {
         id: "compat-tool-0".to_string(),
         name,
@@ -3178,7 +3164,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_dsml_parser_accepts_only_exposed_tools_and_typed_parameters() {
+    fn strict_dsml_parser_validates_structure_and_typed_parameters() {
         let exposed = std::collections::BTreeSet::from([
             "ListMcpResources".to_string(),
             "ReadMcpResource".to_string(),
@@ -3196,11 +3182,12 @@ mod tests {
             calls[1].input,
             json!({"uri":"file://workspace/Cargo.toml", "line": 12})
         );
-        assert!(parse_dsml_tool_calls(
+        let unavailable = parse_dsml_tool_calls(
             "<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"shell\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
             &exposed,
         )
-        .is_err());
+        .expect("transport parses a structurally valid call before Runtime exposure validation");
+        assert_eq!(unavailable[0].name, "shell");
         assert!(parse_dsml_tool_calls(
             "<tool_call><function=ReadMcpResource></tool_call>",
             &exposed,
@@ -3209,7 +3196,7 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_parser_accepts_only_exact_exposed_tool_frames() {
+    fn compatibility_parser_accepts_exact_frames_and_preserves_unexposed_names() {
         let exposed = std::collections::BTreeSet::from([
             "ToolSearch".to_string(),
             "workspace_snapshot".to_string(),
@@ -3242,11 +3229,12 @@ mod tests {
             json!({"path":"crates/memory", "include_files":true})
         );
 
-        assert!(parse_compat_tool_calls(
+        let unavailable = parse_compat_tool_calls(
             "```json\n{\"tool\":\"shell\",\"arguments\":{}}\n```",
             &exposed,
         )
-        .is_err());
+        .expect("Runtime owns the exposure rejection boundary");
+        assert_eq!(unavailable[0].name, "shell");
         assert!(parse_compat_tool_calls(
             "```json\n{\"tool\":\"ToolSearch\",\"arguments\":{},\"comment\":\"run it\"}\n```",
             &exposed,
@@ -3465,10 +3453,9 @@ mod tests {
     }
 
     #[test]
-    fn malformed_or_unexposed_dsml_fails_closed_without_text_delta() {
+    fn streaming_unexposed_dsml_is_preserved_for_runtime_rejection() {
         use super::{ChatCompletionChunk, ChunkChoice, ChunkDelta, StreamState};
-        use crate::error::ApiError;
-        use crate::types::{ContentBlockDelta, StreamEvent};
+        use crate::types::{ContentBlockDelta, OutputContentBlock, StreamEvent};
 
         let tool = ToolDefinition {
             name: "read_file".to_string(),
@@ -3498,19 +3485,21 @@ mod tests {
             StreamEvent::ContentBlockDelta(delta)
                 if matches!(&delta.delta, ContentBlockDelta::TextDelta { text } if text.contains("DSML"))
         )));
-        assert!(matches!(
-            state.finish(),
-            Err(ApiError::CompatibilityToolProtocol(
-                CompatibilityToolProtocolFailure::MalformedFrame
-            ))
-        ));
+        let terminal = state.finish().expect("structurally valid DSML frame");
+        assert!(terminal.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { name, .. }
+                    if name == "bash")
+        )));
     }
 
     #[test]
-    fn non_streaming_malformed_dsml_uses_the_same_fail_closed_boundary() {
+    fn non_streaming_unexposed_dsml_is_preserved_for_runtime_rejection() {
         use super::{
             normalize_chat_completion_response, ChatChoice, ChatCompletionResponse, ChatMessage,
         };
+        use crate::types::OutputContentBlock;
 
         let tool = ToolDefinition {
             name: "read_file".to_string(),
@@ -3536,11 +3525,10 @@ mod tests {
             usage: None,
         };
 
-        assert!(matches!(
-            normalize_chat_completion_response("deepseek-v4-flash", response, &[tool]),
-            Err(ApiError::CompatibilityToolProtocol(
-                CompatibilityToolProtocolFailure::MalformedFrame
-            ))
+        let response = normalize_chat_completion_response("deepseek-v4-flash", response, &[tool])
+            .expect("structurally valid DSML frame");
+        assert!(response.content.iter().any(
+            |block| matches!(block, OutputContentBlock::ToolUse { name, .. } if name == "bash")
         ));
     }
 

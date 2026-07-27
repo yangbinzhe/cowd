@@ -110,7 +110,7 @@ impl KnowledgeCandidateProjector {
             }
             for batch in batches {
                 scan_cursor = batch.commit_cursor;
-                if is_projector_checkpoint(&batch) {
+                if is_projector_checkpoint_only(&batch) {
                     continue;
                 }
                 for event in &batch.events {
@@ -436,12 +436,12 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn is_projector_checkpoint(batch: &crate::CommittedEventBatch) -> bool {
+fn is_projector_checkpoint_only(batch: &crate::CommittedEventBatch) -> bool {
     !batch.events.is_empty()
-        && batch.events.iter().all(|event| {
-            event.stream_id == PROJECTOR_STREAM
-                && event.kind == "knowledge.candidate.projector.checkpoint.v1"
-        })
+        && batch
+            .events
+            .iter()
+            .all(|event| event.kind.ends_with(".projector.checkpoint.v1"))
 }
 
 #[cfg(test)]
@@ -661,6 +661,30 @@ mod tests {
                 .state,
             KnowledgeCandidateState::Promoted
         );
+    }
+
+    #[tokio::test]
+    async fn projector_does_not_echo_another_projector_checkpoint() {
+        let (_root, events, _approvals, promotion) = fixture().await;
+        events
+            .append(RuntimeEventInput {
+                stream_id: "evolution-signal-projector".to_string(),
+                scope: RuntimeEventScope::Evolution,
+                kind: "evolution.signal.projector.checkpoint.v1".to_string(),
+                status: Some("completed".to_string()),
+                actor: Some("runtime.evolution_signal_projector".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"source_cursor": 1}),
+            })
+            .expect("foreign projector checkpoint");
+        let projector =
+            KnowledgeCandidateProjector::new(Arc::clone(&events), Arc::clone(&promotion));
+
+        assert_eq!(projector.run_once(64).await.expect("projector pass"), 0);
+        assert!(events
+            .list_stream(PROJECTOR_STREAM)
+            .expect("projector stream")
+            .is_empty());
     }
 
     #[tokio::test]

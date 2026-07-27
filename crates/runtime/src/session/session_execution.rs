@@ -1480,7 +1480,11 @@ mod tests {
             wake: Arc::new(tokio::sync::Notify::new()),
             test_store: Some(Arc::clone(&store)),
             worker_id: "worker-a".into(),
-            lease_ms: 5,
+            // Keep the router heartbeat out of the fault-injection window. The
+            // executor below shortens the lease to 5 ms after its durable
+            // commit, which deterministically simulates ownership changing
+            // before the router can acknowledge the receipt.
+            lease_ms: 100,
             max_attempts: 3,
         };
         let router_b = SessionInputRouter {

@@ -1,7 +1,8 @@
 use harness_eval::{
-    default_report_root, run_auto_strategy_paired, run_eval, run_paired_performance,
-    terminal_gate_report_with_report, write_auto_strategy_report, AutoStrategyPairedOptions,
-    HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions, PairedPerformanceOptions,
+    default_report_root, run_auto_strategy_paired, run_certification_manifest, run_eval,
+    run_paired_performance, terminal_gate_report_with_report, write_auto_strategy_report,
+    AutoStrategyPairedOptions, HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions,
+    PairedPerformanceOptions,
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -195,6 +196,25 @@ fn run() -> Result<(), String> {
             }
             return Ok(());
         }
+        Some("certify") => {
+            let manifest = required_option(&args[1..], "--manifest")?;
+            let output = required_option(&args[1..], "--output")?;
+            let report = run_certification_manifest(&manifest, &output)
+                .map_err(|error| format!("certification failed: {error}"))?;
+            println!(
+                "certification-report: {}",
+                PathBuf::from(&output)
+                    .join("certification-report.json")
+                    .display()
+            );
+            if report.status != "passed" {
+                return Err(format!(
+                    "certification gate failed with {} required source failures and {} required check failures",
+                    report.required_source_failures, report.required_check_failures
+                ));
+            }
+            return Ok(());
+        }
         _ => {}
     }
 
@@ -240,12 +260,21 @@ fn run() -> Result<(), String> {
             }
         }
     }
+    if record.status == "failed" {
+        return Err(format!(
+            "harness evaluation failed; see {}",
+            record
+                .report_path
+                .as_deref()
+                .unwrap_or("<report unavailable>")
+        ));
+    }
     Ok(())
 }
 
 fn print_help() {
     println!(
-        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--min-pairs 5] [--pairs 20] [--target-relative-ci-half-width-bp 500] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--min-pairs 5] [--pairs 20] [--target-relative-ci-half-width-bp 500] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]\n  harness-eval certify --manifest <path> --output <dir>"
     );
 }
 

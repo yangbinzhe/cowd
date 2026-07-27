@@ -2550,7 +2550,30 @@ fn confidence_for(understanding: &TaskUnderstanding, pattern: ExecutionPattern) 
 fn contains_many_scopes(prompt: &str) -> bool {
     let normalized = normalize(prompt);
     let count = [
-        "gateway", "runtime", "tui", "service", "crate", "agent", "context",
+        "gateway",
+        "runtime",
+        "memory",
+        "matrix",
+        "session",
+        "mission",
+        "task",
+        "team",
+        "agent",
+        "tool",
+        "provider",
+        "surface",
+        "connector",
+        "skill",
+        "mcp",
+        "reality",
+        "fact",
+        "eval",
+        "evolution",
+        "tui",
+        "webui",
+        "service",
+        "crate",
+        "context",
     ]
     .iter()
     .filter(|term| normalized.contains(**term))
@@ -3141,6 +3164,18 @@ mod tests {
         assert!(!decision.understanding.requests_multi_agent);
         assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
         assert_ne!(decision.pattern, ExecutionPattern::Collaborate);
+    }
+
+    #[test]
+    fn single_owner_multi_subsystem_review_keeps_strategic_execution_budget() {
+        let decision = decide_strategy(&StrategyInput::from_prompt(
+            "请单独完成复杂架构审查，不要启动团队：分别分析 runtime、memory、gateway 的职责边界。",
+        ));
+
+        assert!(decision.understanding.forbids_team);
+        assert!(!decision.understanding.requests_multi_agent);
+        assert_eq!(decision.understanding.complexity, TaskComplexity::Strategic);
+        assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
     }
 
     #[test]

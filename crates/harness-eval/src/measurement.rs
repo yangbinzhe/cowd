@@ -104,6 +104,21 @@ pub(crate) const METRIC_DEFINITIONS: &[MetricDefinition] = &[
         "runtime terminal projection",
         "harness-eval",
     ),
+    duration_metric(
+        "projection_lag_ms",
+        "runtime projection subscriber",
+        "harness-eval",
+    ),
+    duration_metric(
+        "evolution_sidepath_lag_ms",
+        "runtime evolution projector",
+        "harness-eval",
+    ),
+    duration_metric(
+        "cancellation_ms",
+        "runtime execution supervisor",
+        "harness-eval",
+    ),
     duration_metric("tool_prepare_ms", "runtime tooling", "harness-eval"),
     duration_metric("tool_queue_ms", "runtime resource manager", "harness-eval"),
     duration_metric("tool_run_ms", "runtime tooling", "harness-eval"),
@@ -126,6 +141,93 @@ pub(crate) const METRIC_DEFINITIONS: &[MetricDefinition] = &[
     duration_metric(
         "markdown_parse_ms",
         "webui markdown renderer",
+        "harness-eval",
+    ),
+    count_metric(
+        "input_tokens",
+        "runtime canonical node usage",
+        "harness-eval",
+    ),
+    count_metric(
+        "output_tokens",
+        "runtime canonical node usage",
+        "harness-eval",
+    ),
+    count_metric(
+        "cache_tokens",
+        "runtime canonical node usage",
+        "harness-eval",
+    ),
+    rate_metric(
+        "wall_tokens_per_second",
+        "runtime provider telemetry",
+        "harness-eval",
+    ),
+    rate_metric(
+        "active_tokens_per_second",
+        "runtime provider telemetry",
+        "harness-eval",
+    ),
+    count_metric(
+        "model_rounds",
+        "runtime execution projection",
+        "harness-eval",
+    ),
+    count_metric("tool_calls", "runtime execution projection", "harness-eval"),
+    count_metric(
+        "agent_count",
+        "runtime execution projection",
+        "harness-eval",
+    ),
+    count_metric("team_count", "runtime execution projection", "harness-eval"),
+    count_metric(
+        "execution_queue_depth",
+        "runtime execution supervisor health",
+        "harness-eval",
+    ),
+    count_metric(
+        "execution_restarts",
+        "runtime execution supervisor health",
+        "harness-eval",
+    ),
+    count_metric(
+        "execution_errors",
+        "runtime execution supervisor health",
+        "harness-eval",
+    ),
+    count_metric(
+        "forced_aborts",
+        "runtime execution supervisor health",
+        "harness-eval",
+    ),
+    count_metric(
+        "session_worker_restarts",
+        "gateway session worker health",
+        "harness-eval",
+    ),
+    count_metric(
+        "session_worker_errors",
+        "gateway session worker health",
+        "harness-eval",
+    ),
+    count_metric(
+        "registry_fallbacks",
+        "gateway storage/provider registry health",
+        "harness-eval",
+    ),
+    count_metric(
+        "subscriber_lag_events",
+        "gateway projection subscriber health",
+        "harness-eval",
+    ),
+    count_metric(
+        "evolution_projector_lag_commits",
+        "runtime evolution projector",
+        "harness-eval",
+    ),
+    count_metric(
+        "evolution_dead_letters",
+        "runtime evolution projector",
         "harness-eval",
     ),
 ];
@@ -182,6 +284,34 @@ const fn byte_metric(
     MetricDefinition {
         id,
         unit: "bytes",
+        clock: MeasurementClock::ProcessMonotonic,
+        producer,
+        consumer,
+    }
+}
+
+const fn count_metric(
+    id: &'static str,
+    producer: &'static str,
+    consumer: &'static str,
+) -> MetricDefinition {
+    MetricDefinition {
+        id,
+        unit: "count",
+        clock: MeasurementClock::SourceSequence,
+        producer,
+        consumer,
+    }
+}
+
+const fn rate_metric(
+    id: &'static str,
+    producer: &'static str,
+    consumer: &'static str,
+) -> MetricDefinition {
+    MetricDefinition {
+        id,
+        unit: "tokens_per_second",
         clock: MeasurementClock::ProcessMonotonic,
         producer,
         consumer,

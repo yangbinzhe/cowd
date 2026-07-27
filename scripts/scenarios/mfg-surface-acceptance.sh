@@ -464,10 +464,34 @@ TUI_B_PID="$(tmux -L "${TMUX_SOCKET}" list-panes -t "${SCENARIO_ID}-tui-b" -F '#
 record_stage "pause-tui-b"
 kill -STOP "${TUI_B_PID}"
 
-BURST_TASK_ID="$(authorized_curl -fsS -X POST "${BASE_URL}/api/tasks/start" \
+BURST_SOURCE_SESSION_ID="${SCENARIO_ID}-session-a"
+BURST_SOURCE_TURN_ID="turn-${SCENARIO_ID}-burst"
+BURST_TASK_ID="task-${SCENARIO_ID}-burst"
+BURST_MISSION_ID=""
+for _ in {1..120}; do
+  BURST_MISSION_ID="$(authorized_curl -fsS "${BASE_URL}/api/mission/projection" \
+    | jq -r '.mission.mission_id // empty')"
+  [[ -n "${BURST_MISSION_ID}" ]] && break
+  sleep 0.25
+done
+[[ -n "${BURST_MISSION_ID}" ]]
+authorized_curl -fsS -X POST "${BASE_URL}/api/tasks/start" \
   -H "content-type: application/json" \
-  -d '{"objective":"MFG live bounded multi-observer burst owner","yolo_mode":true}' \
-  | jq -er '.id')"
+  -d "$(jq -cn \
+    --arg task_id "${BURST_TASK_ID}" \
+    --arg mission_id "${BURST_MISSION_ID}" \
+    --arg source_session_id "${BURST_SOURCE_SESSION_ID}" \
+    --arg source_turn_id "${BURST_SOURCE_TURN_ID}" \
+    '{
+      task_id: $task_id,
+      mission_id: $mission_id,
+      source_session_id: $source_session_id,
+      source_turn_id: $source_turn_id,
+      objective: "MFG live bounded multi-observer burst owner",
+      yolo_mode: true
+    }')" \
+  | jq -e --arg task_id "${BURST_TASK_ID}" --arg mission_id "${BURST_MISSION_ID}" \
+    '.task_id == $task_id and .mission_id == $mission_id and .status == "running"' >/dev/null
 BURST_RESULTS_DIR="${ARTIFACT_DIR}/burst-requests"
 BURST_PACE_MS="${COWD_MFG_BURST_PACE_MS:-20}"
 [[ "${BURST_PACE_MS}" =~ ^[0-9]+$ ]] || {

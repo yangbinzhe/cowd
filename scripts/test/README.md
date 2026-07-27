@@ -50,6 +50,7 @@ scripts/validate.sh release
 
 ```bash
 scripts/validate.sh manual live-provider
+scripts/validate.sh manual certification
 scripts/validate.sh manual lark-live
 scripts/validate.sh manual memory-performance
 scripts/validate.sh manual postgres-contract
@@ -62,6 +63,10 @@ Memory、Matrix、Runtime、Session、Approval、Connector 和 Product App 存�
 每项必须真实执行且恰好有一个测试通过，禁止因环境缺失静默返回成功。这些入口不会
 读取用户生产数据库。TUI 生产验收使用真实 Gateway、受控 Provider 和 PTY，并把证据
 写入版本化报告目录。
+
+终态认证要求设置 `COWD_CERTIFICATION_MANIFEST`。该 manifest 必须引用场景运行后
+真实产生的 Runtime 事件、数据库状态、进程日志、Provider/Tool 轨迹和 Surface 回执；
+runner 会在比较预期前独立采集并固化原始字节与 SHA-256，缺少观测不得通过。
 
 ## 新测试准入
 

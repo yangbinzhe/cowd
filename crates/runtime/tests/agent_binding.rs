@@ -98,8 +98,14 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                         "graph:binding-test",
                     )
                     .expect("task graph identity");
-                harness_contract::execution::ExecutionIdentity::for_agent_node(
+                let team_identity = harness_contract::execution::ExecutionIdentity::for_team_node(
                     &graph_identity,
+                    "team:binding-test",
+                    "node:binding-test",
+                )
+                .expect("team identity");
+                harness_contract::execution::ExecutionIdentity::for_agent_node(
+                    &team_identity,
                     "run:binding-test",
                     "node:binding-test",
                 )

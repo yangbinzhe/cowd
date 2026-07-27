@@ -419,6 +419,7 @@ impl ExecutionCommitService {
         result: Option<ExecutionNodeResult>,
         domain_events: Vec<RuntimeTransactionEventInput>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        validate_executor_domain_events(&domain_events)?;
         let from = *graph
             .node_statuses
             .get(node_id)
@@ -545,6 +546,7 @@ impl ExecutionCommitService {
         edges: Vec<ExecutionEdge>,
         reason: String,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        validate_executor_domain_events(&domain_events)?;
         validate_replan(graph, &nodes)?;
         let from = *graph
             .node_statuses
@@ -1027,26 +1029,6 @@ impl ExecutionCommitService {
         {
             return Err(ExecutionCommitError::GraphStreamCollision(graph.id.clone()));
         }
-        if let Some(event) = domain_events.iter().find(|event| {
-            !matches!(
-                event.event.scope,
-                RuntimeEventScope::ExecutionNode
-                    | RuntimeEventScope::Goal
-                    | RuntimeEventScope::SessionInput
-                    | RuntimeEventScope::Relation
-                    | RuntimeEventScope::Team
-                    // Approval decisions are generated from a canonical
-                    // ExecutionGraph command and must commit atomically with
-                    // the node transition. Blocking this scope leaves a
-                    // graph approved in neither the graph nor the durable
-                    // approval projection.
-                    | RuntimeEventScope::Approval
-            )
-        }) {
-            return Err(ExecutionCommitError::ProtectedDomainScope(
-                event.event.scope.as_str().to_string(),
-            ));
-        }
         if let Some(event) = domain_events
             .iter()
             .find(|event| event.idempotency_key.is_none())
@@ -1116,6 +1098,30 @@ impl ExecutionCommitService {
             transaction,
         })
     }
+}
+
+fn validate_executor_domain_events(
+    domain_events: &[RuntimeTransactionEventInput],
+) -> Result<(), ExecutionCommitError> {
+    if let Some(event) = domain_events.iter().find(|event| {
+        !matches!(
+            event.event.scope,
+            RuntimeEventScope::ExecutionNode
+                | RuntimeEventScope::Goal
+                | RuntimeEventScope::SessionInput
+                | RuntimeEventScope::Relation
+                | RuntimeEventScope::Team
+                // Approval decisions are generated from a canonical
+                // ExecutionGraph command and must commit atomically with the
+                // node transition.
+                | RuntimeEventScope::Approval
+        )
+    }) {
+        return Err(ExecutionCommitError::ProtectedDomainScope(
+            event.event.scope.as_str().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn graph_identity_refs(graph: &ExecutionGraph) -> Vec<RuntimeEventRef> {

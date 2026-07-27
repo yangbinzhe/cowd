@@ -1077,7 +1077,7 @@ mod tests {
         );
         let memory = MemoryService::with_manager(Some(Arc::clone(&manager)));
         let matrix = MatrixService::new();
-        let growth = GrowthService::new();
+        let growth = GrowthService::new_for_config_home(&config_home);
         (config_home, manager, memory, matrix, growth)
     }
 

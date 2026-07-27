@@ -71,6 +71,10 @@ impl TaskService {
         Ok(self.port()?.mission_id_for_session(session_id))
     }
 
+    pub(crate) fn workspace_default_mission_id(&self) -> Result<String, String> {
+        Ok(self.port()?.workspace_default_mission_id().to_string())
+    }
+
     pub(crate) fn create(
         &self,
         task_id: String,

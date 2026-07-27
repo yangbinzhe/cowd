@@ -13,6 +13,9 @@ CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 LOG="$TMP_DIR/gateway.log"
 API_TOKEN="agent-graph-$$_credential"
+SESSION_ID="agent-graph-session-$$"
+TASK_ID="task-agent-graph-$$"
+TASK_TURN_ID="turn-agent-graph-$$"
 
 curl() {
   command curl -H "Authorization: Bearer $API_TOKEN" "$@"
@@ -39,6 +42,13 @@ fi
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
+providers:
+  scenario:
+    base_url: "http://127.0.0.1:1"
+    api_key: "agent-graph-provider-key"
+    protocol: "completions"
+    models:
+      - "claude-sonnet-4-6"
 permissions:
   defaultMode: "dontAsk"
 memory:
@@ -71,23 +81,39 @@ for _ in {1..80}; do
   sleep 0.25
 done
 
+curl -fsS -X POST "$BASE_URL/api/sessions/$SESSION_ID/ensure" \
+  -H 'content-type: application/json' \
+  --data '{"model":"claude-sonnet-4-6"}' \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("ok") is True and data.get("session_id") == sys.argv[1], data' "$SESSION_ID"
+MISSION_ID=""
+for _ in {1..120}; do
+  MISSION_ID="$(curl -fsS "$BASE_URL/api/mission/projection" \
+    | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("mission",{}).get("mission_id") or "")')"
+  [[ -n "$MISSION_ID" ]] && break
+  sleep 0.25
+done
+[[ -n "$MISSION_ID" ]]
 task_json="$(curl -fsS "$BASE_URL/api/tasks/start" \
   -H 'content-type: application/json' \
-  --data '{"objective":"multi-agent graph scenario","yolo_mode":true}')"
-task_id="$(printf '%s' "$task_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  --data "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"source_session_id\":\"$SESSION_ID\",\"source_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"multi-agent graph scenario\",\"yolo_mode\":true}")"
+task_id="$(printf '%s' "$task_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data["mission_id"] == sys.argv[1], data; print(data["task_id"])' "$MISSION_ID")"
+task_revision="$(printf '%s' "$task_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')"
 
 phase_json="$(curl -fsS "$BASE_URL/api/tasks/$task_id/phases" \
   -H 'content-type: application/json' \
-  --data '{"name":"agent-review","objective":"review graph projection","plan":["create graph"],"acceptance":["graph visible"],"test_commands":["curl agents runs"]}')"
-phase_id="$(printf '%s' "$phase_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["phases"][-1]["id"])')"
+  --data "{\"expected_revision\":$task_revision,\"name\":\"agent-review\",\"objective\":\"review graph projection\",\"plan\":[\"create graph\"],\"acceptance\":[\"graph visible\"],\"test_commands\":[\"curl agents runs\"]}")"
+phase_id="$(printf '%s' "$phase_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["phases"][-1]["phase_id"])')"
+task_revision="$(printf '%s' "$phase_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')"
 
-curl -fsS "$BASE_URL/api/tasks/$task_id/phases/$phase_id/artifacts" \
+artifact_json="$(curl -fsS "$BASE_URL/api/tasks/$task_id/phases/$phase_id/artifacts" \
   -H 'content-type: application/json' \
-  --data '{"kind":"test","label":"curl","value":"agent graph visible"}' >/dev/null
+  --data "{\"expected_revision\":$task_revision,\"kind\":\"test\",\"label\":\"curl\",\"value\":\"agent graph visible\"}")"
+task_revision="$(printf '%s' "$artifact_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')"
 
 curl -fsS "$BASE_URL/api/tasks/$task_id/phases/$phase_id/review" \
   -H 'content-type: application/json' \
-  --data '{"result":"accepted by agent graph scenario","completed":true}' >/dev/null
+  --data "{\"expected_revision\":$task_revision,\"result\":\"accepted by agent graph scenario\",\"completed\":true}" \
+  | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("status") in ("reviewing","completed"), data'
 
 graph_json="$(curl -fsS -X POST "$BASE_URL/api/tasks/$task_id/execution-graph" \
   -H 'content-type: application/json' \

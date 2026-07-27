@@ -14,6 +14,8 @@ CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 GATEWAY_LOG="$TMP_DIR/gateway.log"
 SESSION_ID="runtime-surface-session-$$"
+TASK_ID="task-runtime-surface-$$"
+TASK_TURN_ID="turn-runtime-surface-$$"
 OBSERVER_ID="runtime-surface:$$_writer"
 SCENARIO_API_KEY="${ANTHROPIC_API_KEY:-test-dummy-key-for-runtime-surface-scenario}"
 API_TOKEN="runtime-surface-$$_credential"
@@ -148,14 +150,24 @@ data=json.load(open(sys.argv[1]))
 assert data.get("ok") is True, data
 assert data.get("session_id") == sys.argv[2], data
 PY
+MISSION_ID=""
+for _ in {1..120}; do
+  MISSION_ID="$(curl -fsS "$BASE_URL/api/mission/projection" \
+    | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("mission",{}).get("mission_id") or "")')"
+  [[ -n "$MISSION_ID" ]] && break
+  sleep 0.25
+done
+[[ -n "$MISSION_ID" ]]
 curl -fsS "$BASE_URL/api/tasks/start" \
   -H 'content-type: application/json' \
-  -d '{"objective":"runtime surface scenario validates control plane","yolo_mode":true}' \
+  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"source_session_id\":\"$SESSION_ID\",\"source_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"runtime surface scenario validates control plane\",\"yolo_mode\":true}" \
   >"$TMP_DIR/start-task.json"
-python3 - "$TMP_DIR/start-task.json" <<'PY'
+python3 - "$TMP_DIR/start-task.json" "$TASK_ID" "$MISSION_ID" <<'PY'
 import json, sys
 data=json.load(open(sys.argv[1]))
 assert data.get("status") == "running", data
+assert data.get("task_id") == sys.argv[2], data
+assert data.get("mission_id") == sys.argv[3], data
 PY
 
 curl -fsS "$BASE_URL/api/runtime/control-plane" >"$TMP_DIR/control-plane.json"

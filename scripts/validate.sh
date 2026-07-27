@@ -34,6 +34,7 @@ Manual targets:
   agent-graph
   context-runtime
   context-runtime-lean-spike
+  certification
   lark-live
   live-provider
   memory-performance
@@ -263,6 +264,12 @@ run_manual() {
       ;;
     context-runtime-lean-spike)
       run_step manual_context_runtime_lean_spike bash scripts/manual/context-runtime-lean-spike.sh
+      ;;
+    certification)
+      : "${COWD_CERTIFICATION_MANIFEST:?set COWD_CERTIFICATION_MANIFEST to a completed observed-evidence manifest}"
+      run_step manual_certification cargo run -p harness-eval -- certify \
+        --manifest "$COWD_CERTIFICATION_MANIFEST" \
+        --output "$REPORT_DIR/certification"
       ;;
     lark-live)
       run_step manual_lark_live bash scripts/test/lark-live.sh
