@@ -3865,7 +3865,8 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(created_a.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(created_a["ok"], true);
-        assert_eq!(created_a["mission"]["kind"], "mission.runtime");
+        assert_eq!(created_a["receipt"]["status"], "accepted");
+        assert_eq!(created_a["saga"]["phase"], "finalized");
 
         let created_b = app
             .clone()
@@ -3887,18 +3888,21 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(created_b.status(), StatusCode::CREATED);
 
-        let dispatch = app
+        let background = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/mission/control/sessions/dispatch")
+                    .uri("/api/mission/control")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "max_commands": 20,
-                            "dispatch_mode": "mark_claimed_only",
-                            "allow_background": true
+                            "command_id": format!("mission-control-background-{suffix}"),
+                            "action": "background",
+                            "target": {
+                                "kind": "session",
+                                "session_id": session_b,
+                            }
                         })
                         .to_string(),
                     ))
@@ -3906,26 +3910,13 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        let dispatch: serde_json::Value =
-            serde_json::from_slice(&to_bytes(dispatch.into_body(), usize::MAX).await.unwrap())
+        let background: serde_json::Value =
+            serde_json::from_slice(&to_bytes(background.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(
-            dispatch["kind"],
-            "mission_control.session_dispatch_submission"
-        );
-        assert_eq!(dispatch["ok"], true);
-        assert_eq!(dispatch["result"]["status"], "scheduler_owned");
-        assert!(dispatch["result"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("Gateway scheduler")));
-        assert!(
-            dispatch["result"].get("claimed").is_none(),
-            "HTTP Mission Control must not become a second Session input claimant"
-        );
-        assert!(
-            dispatch["result"].get("receipts").is_none(),
-            "scheduler wake responses must not fabricate execution receipts"
-        );
+        assert_eq!(background["kind"], "mission_control.command_result");
+        assert_eq!(background["ok"], true);
+        assert_eq!(background["receipt"]["action"], "background");
+        assert_eq!(background["saga"]["phase"], "finalized");
 
         let control = app
             .oneshot(
@@ -3940,19 +3931,28 @@ pub(crate) mod tests {
         let control: serde_json::Value =
             serde_json::from_slice(&to_bytes(control.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(control["projection"]["kind"], "mission_control.projection");
-        assert!(control["projection"]["sessions"].as_array().unwrap().len() >= 2);
+        assert_eq!(
+            control["snapshot"]["projection"]["kind"],
+            "mission_control.projection"
+        );
         assert!(
-            control["projection"]["event_digest"]["total_recent_events"]
+            control["snapshot"]["projection"]["sessions"]
+                .as_array()
+                .unwrap()
+                .len()
+                >= 2
+        );
+        assert!(
+            control["snapshot"]["projection"]["event_digest"]["total_recent_events"]
                 .as_u64()
                 .unwrap_or_default()
                 > 0
         );
         assert_eq!(
-            control["projection"]["relations"]["kind"],
+            control["snapshot"]["projection"]["relations"]["kind"],
             "runtime.session_relations"
         );
-        assert!(control["projection"].get("stewards").is_none());
+        assert!(control["snapshot"]["projection"].get("stewards").is_none());
     }
 
     #[tokio::test]
@@ -3983,29 +3983,56 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(created.status(), StatusCode::CREATED);
         }
+        let control = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/mission/control")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control.status(), StatusCode::OK);
+        let control: serde_json::Value =
+            serde_json::from_slice(&to_bytes(control.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let mission_id = control["snapshot"]["projection"]["mission"]["mission_id"]
+            .as_str()
+            .expect("default Mission id")
+            .to_string();
 
         let team = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(format!("/api/mission/sessions/{session_a}/teams/runtime"))
+                    .uri("/api/mission/control")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "request_id": "mission-route-team",
-                            "team_id": "mission-route-team",
-                            "session_id": session_a,
-                            "selection_mode": "explicit",
-                            "template_selector": {
-                                "kind": "latest_stable",
-                                "template_id": "builtin/cowd/execute-review"
+                            "command_id": "mission-route-team-create",
+                            "action": "create",
+                            "target": {
+                                "kind": "team",
+                                "team_id": "mission-route-team"
                             },
-                            "objective": "research architecture and review implementation",
-                            "acceptance": ["summary", "evidence"],
-                            "permission_lease": "workspace-write",
-                            "model_lease": "default",
-                            "resource_scopes": ["write:crates/runtime"]
+                            "payload": {
+                                "request_id": "overridden-by-command-id",
+                                "team_id": "mission-route-team",
+                                "session_id": session_a,
+                                "mission_id": mission_id,
+                                "selection_mode": "explicit",
+                                "template_selector": {
+                                    "kind": "latest_stable",
+                                    "template_id": "builtin/cowd/execute-review"
+                                },
+                                "objective": "research architecture and review implementation",
+                                "acceptance": ["summary", "evidence"],
+                                "permission_lease": "workspace-write",
+                                "model_lease": "default",
+                                "resource_scopes": ["write:crates/runtime"]
+                            }
                         })
                         .to_string(),
                     ))
@@ -4023,11 +4050,10 @@ pub(crate) mod tests {
         );
         let team_json: serde_json::Value = serde_json::from_slice(&team_body).unwrap();
         assert_eq!(team_json["ok"], true);
-        assert!(team_json["team"]["graph_id"].as_str().is_some());
-        assert!(matches!(
-            team_json["status"].as_str(),
-            Some("completed" | "blocked" | "failed" | "running")
-        ));
+        assert_eq!(team_json["saga"]["phase"], "finalized");
+        assert!(team_json["receipt"]["result"]["graph_id"]
+            .as_str()
+            .is_some());
 
         let approval = app
             .clone()
@@ -4139,15 +4165,26 @@ pub(crate) mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/mission/relations")
+                    .uri("/api/mission/control")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
-                            "from_session_id": session_a.clone(),
-                            "to_session_id": session_b.clone(),
-                            "kind": "reviews",
-                            "summary": "A reviews B",
-                            "evidence_refs": ["trace:2"]
+                            "command_id": "mission-relation-link-test",
+                            "action": "link",
+                            "target": {
+                                "kind": "relation",
+                                "relation_id": "session-relation-test"
+                            },
+                            "actor": "gateway-test",
+                            "correlation_id": "mission-relation-link-test",
+                            "payload": {
+                                "from_session_id": session_a.clone(),
+                                "to_session_id": session_b.clone(),
+                                "kind": "reviews",
+                                "summary": "A reviews B",
+                                "evidence_refs": ["trace:2"]
+                            },
+                            "evidence_refs": []
                         })
                         .to_string(),
                     ))
@@ -4155,18 +4192,18 @@ pub(crate) mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(relation.status(), StatusCode::CREATED);
+        assert_eq!(relation.status(), StatusCode::OK);
         let relation_json: serde_json::Value =
             serde_json::from_slice(&to_bytes(relation.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert!(
-            relation_json["relations"]["relation_count"]
-                .as_u64()
-                .expect("relation count")
-                >= 1
+        assert_eq!(
+            relation_json["receipt"]["result"]["relation"]["from_session_id"],
+            session_a
         );
-        assert_eq!(relation_json["relation"]["from_session_id"], session_a);
-        assert_eq!(relation_json["relation"]["to_session_id"], session_b);
+        assert_eq!(
+            relation_json["receipt"]["result"]["relation"]["to_session_id"],
+            session_b
+        );
 
         let proxy = app
             .clone()

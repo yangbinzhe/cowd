@@ -175,6 +175,18 @@ impl GatewayServices {
         let runtime_services = runtime.runtime_services();
         let runtime_events = RuntimeEventService::from_runtime_services(runtime_services.as_ref());
         let task = TaskService::with_runtime(Arc::clone(&runtime_services));
+        let session = session_service.unwrap_or_else(|| {
+            Arc::new(SessionService::new(
+                Arc::clone(&runtime),
+                session_activation,
+                session_supervisor,
+            ))
+        });
+        let mission = MissionService::new().with_dependencies(
+            runtime::MissionRuntimePort::new(Arc::clone(&runtime_services)),
+            Arc::clone(&session),
+            runtime_events.clone(),
+        );
         let capacity = crate::gateway_capacity::GatewayCapacityController::new(
             crate::gateway_capacity::GatewayCapacityConfig::resolve(&capacity_config),
             Arc::clone(runtime_services.resource_manager()),
@@ -219,13 +231,7 @@ impl GatewayServices {
             runtime_events,
             surface: SurfaceService::with_host(surface_host),
             slash: SlashController::new(Some(command_host_runtime), task.clone()),
-            session: session_service.unwrap_or_else(|| {
-                Arc::new(SessionService::new(
-                    Arc::clone(&runtime),
-                    session_activation,
-                    session_supervisor,
-                ))
-            }),
+            session,
             task,
             memory,
             approval: ApprovalService::with_gate_and_ledger(approval_gate, approval_ledger)
@@ -246,8 +252,7 @@ impl GatewayServices {
             skill: SkillService::new(),
             agent: AgentService::new(),
             matrix,
-            mission: MissionService::new()
-                .with_runtime_port(runtime::MissionRuntimePort::new(runtime_services)),
+            mission,
             capacity,
             owner: "0.9.581 GatewayServices selected composition",
             boundary_status: "0620_final_boundary",

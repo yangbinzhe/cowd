@@ -11,7 +11,10 @@ use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionEdge, ExecutionGraph, ExecutionGraphCommand,
     ExecutionGraphProjection, ExecutionNodeSpec,
 };
-use harness_contract::mission::MissionStatus;
+use harness_contract::mission::{
+    MissionCommand, MissionCommandSagaRecord, MissionControlProjection, MissionControlSessionNode,
+    MissionStatus,
+};
 use harness_contract::reality::{EvidenceRef, RealityBoundary};
 use harness_contract::task::{TaskCreateCommand, TaskPhaseSpec, TaskStatus};
 use harness_contract::team::TeamInstantiationRequest;
@@ -19,13 +22,11 @@ use serde_json::{json, Value};
 
 use crate::{
     ApprovalDecisionCommand, CreateMissionScheduleRequest, ExecutionGraphHost,
-    MissionCommandInterpretation, MissionCommandInterpreter, MissionControlCommand,
-    MissionControlCommandReceipt, MissionControlProjection, MissionControlRuntime,
+    MissionCommandInterpretation, MissionCommandInterpreter, MissionControlRuntime,
     MissionProjection, MissionRuntime, MissionScheduleDispatchReport, MissionSchedulePolicy,
-    MissionSessionSnapshot, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeServices,
-    RuntimeTransactionEventInput, SessionProxy, SessionRelation, SessionRelationGraph,
-    SessionRelationKind, StartMissionSessionRequest, SubmitGlobalApprovalRequest, TaskAggregate,
-    TaskMutationResult, TeamProjection, UpdateMissionScheduleRequest,
+    RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeServices,
+    RuntimeTransactionEventInput, SessionProxy, SessionRelationGraph, SubmitGlobalApprovalRequest,
+    TaskAggregate, TaskMutationResult, TeamProjection, UpdateMissionScheduleRequest,
 };
 
 /// Runtime's sole surface-facing Mission boundary.
@@ -48,6 +49,10 @@ impl MissionRuntimePort {
         self.mission().default_mission_id()
     }
 
+    pub fn ensure_default_mission(&self) -> Result<(), String> {
+        self.mission().ensure_default_mission().map(|_| ())
+    }
+
     #[must_use]
     pub fn projection(&self) -> MissionProjection {
         self.mission().projection(
@@ -62,15 +67,72 @@ impl MissionRuntimePort {
     }
 
     #[must_use]
-    pub fn control_projection(&self) -> MissionControlProjection {
-        MissionControlRuntime::projection(&self.services)
+    pub fn control_projection(
+        &self,
+        sessions: Vec<MissionControlSessionNode>,
+        active_session_id: Option<String>,
+    ) -> Result<MissionControlProjection, String> {
+        self.mission().ensure_default_mission()?;
+        Ok(MissionControlRuntime::projection(
+            &self.services,
+            sessions,
+            active_session_id,
+        ))
     }
 
-    pub async fn execute_control(
+    pub fn reserve_command(
         &self,
-        command: MissionControlCommand,
-    ) -> MissionControlCommandReceipt {
-        MissionControlRuntime::execute(command, &self.services).await
+        command: MissionCommand,
+    ) -> Result<MissionCommandSagaRecord, String> {
+        crate::mission_command_router::reserve_mission_command(&self.services, command)
+    }
+
+    pub async fn execute_reserved_runtime_effect(
+        &self,
+        command_id: &str,
+    ) -> Result<MissionCommandSagaRecord, String> {
+        crate::mission_command_router::execute_reserved_runtime_effect(&self.services, command_id)
+            .await
+    }
+
+    pub fn commit_command_effect(
+        &self,
+        command_id: &str,
+        result: Value,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<MissionCommandSagaRecord, String> {
+        crate::mission_command_router::commit_mission_effect(
+            &self.services,
+            command_id,
+            result,
+            evidence_refs,
+        )
+    }
+
+    pub fn commit_command_receipt(
+        &self,
+        command_id: &str,
+    ) -> Result<MissionCommandSagaRecord, String> {
+        crate::mission_command_router::commit_mission_receipt(&self.services, command_id)
+    }
+
+    pub fn finalize_command(&self, command_id: &str) -> Result<MissionCommandSagaRecord, String> {
+        crate::mission_command_router::finalize_mission_command(&self.services, command_id)
+    }
+
+    pub fn reject_command(
+        &self,
+        command_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<MissionCommandSagaRecord, String> {
+        crate::mission_command_router::reject_mission_command(&self.services, command_id, reason)
+    }
+
+    pub fn command_saga(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<MissionCommandSagaRecord>, String> {
+        crate::mission_command_router::mission_command_saga(&self.services, command_id)
     }
 
     /// Submit an already interpreted command through the graph host. The
@@ -201,34 +263,30 @@ impl MissionRuntimePort {
         self.services.conflict_resolver().projection()
     }
 
-    pub fn start_session(
-        &self,
-        request: StartMissionSessionRequest,
-    ) -> Result<MissionSessionSnapshot, String> {
-        self.mission().start_session(request)
-    }
-
-    pub fn register_session(
-        &self,
-        request: StartMissionSessionRequest,
-    ) -> Result<MissionSessionSnapshot, String> {
-        self.mission().register_session(request)
-    }
-
-    pub fn session(&self, session_id: &str) -> Option<MissionSessionSnapshot> {
-        self.mission().get_session(session_id)
-    }
-
-    pub fn close_session(
-        &self,
-        session_id: &str,
-    ) -> Result<crate::MissionSessionStateReceipt, String> {
-        self.mission().close_session(session_id)
-    }
-
     #[must_use]
     pub fn mission_id_for_session(&self, session_id: &str) -> Option<String> {
         self.mission().mission_id_for_session(session_id)
+    }
+
+    pub fn ensure_session_membership(&self, session_id: &str) -> Result<Value, String> {
+        let mission = self.mission().ensure_default_mission()?;
+        let receipt =
+            self.mission()
+                .ensure_session_linked(&mission.mission_id, session_id, Vec::new())?;
+        Ok(serde_json::to_value(receipt).unwrap_or_default())
+    }
+
+    pub fn remove_session_membership(&self, session_id: &str) -> Result<Value, String> {
+        let Some(mission_id) = self.mission().mission_id_for_session(session_id) else {
+            return Ok(json!({"removed": false, "reason": "not_linked"}));
+        };
+        let Some(mission) = self.mission().aggregate(&mission_id) else {
+            return Ok(json!({"removed": false, "reason": "mission_missing"}));
+        };
+        let receipt =
+            self.mission()
+                .unlink_session(&mission_id, mission.revision, session_id, Vec::new())?;
+        Ok(serde_json::to_value(receipt).unwrap_or_default())
     }
 
     #[must_use]
@@ -242,16 +300,6 @@ impl MissionRuntimePort {
     }
 
     pub fn create_schedule(&self, request: CreateMissionScheduleRequest) -> Result<Value, String> {
-        if self
-            .mission()
-            .get_session(&request.target_session_id)
-            .is_none()
-        {
-            return Err(format!(
-                "mission target session not found: {}",
-                request.target_session_id
-            ));
-        }
         self.services
             .mission_schedules()
             .create(request, now_ms())
@@ -310,18 +358,6 @@ impl MissionRuntimePort {
             .approval_queue()
             .decide(principal, decision)
             .map(|receipt| serde_json::to_value(receipt).unwrap_or_default())
-    }
-
-    pub fn add_relation(
-        &self,
-        from_session_id: String,
-        to_session_id: String,
-        kind: SessionRelationKind,
-        summary: String,
-        evidence_refs: Vec<String>,
-    ) -> Result<SessionRelation, String> {
-        self.relations()
-            .add_relation(from_session_id, to_session_id, kind, summary, evidence_refs)
     }
 
     pub fn upsert_proxy(&self, proxy: SessionProxy) -> Result<SessionProxy, String> {
@@ -970,14 +1006,15 @@ mod tests {
         let services = RuntimeServices::builder(&home, &workspace)
             .build()
             .expect("runtime services");
+        let mission = services
+            .mission_runtime()
+            .ensure_default_mission()
+            .expect("default Mission");
+        let mission_id = mission.mission_id.clone();
         services
             .mission_runtime()
-            .register_session(crate::StartMissionSessionRequest {
-                title: "source session".to_string(),
-                session_id: Some("session-a".to_string()),
-            })
-            .expect("source Session presence");
-        let mission_id = services.mission_runtime().default_mission_id().to_string();
+            .link_session(&mission_id, mission.revision, "session-a", Vec::new())
+            .expect("source Session membership");
         let created = services
             .task_runtime_port()
             .create(TaskCreateCommand {
@@ -1005,13 +1042,14 @@ mod tests {
         let restarted = RuntimeServices::builder(&home, &workspace)
             .build()
             .expect("restarted Runtime");
+        let mission = restarted
+            .mission_runtime()
+            .aggregate(&mission_id)
+            .expect("restarted Mission");
         restarted
             .mission_runtime()
-            .register_session(crate::StartMissionSessionRequest {
-                title: "continuation session".to_string(),
-                session_id: Some("session-b".to_string()),
-            })
-            .expect("continuation Session presence");
+            .link_session(&mission_id, mission.revision, "session-b", Vec::new())
+            .expect("continuation Session membership");
         let loaded = restarted
             .task_runtime_port()
             .get("task-cross-session-restart")

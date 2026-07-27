@@ -1154,10 +1154,17 @@ async fn run_mission_source(
         mark_source_baseline_ready(&mut baseline_ready);
         return;
     }
-    let initial_projection = state.services.mission.projection();
-    let initial_cursor = mission_projection_cursor(&initial_projection).unwrap_or(cursor);
-    cursor = cursor.max(initial_cursor);
-    let mut previous_hash = hex_hash(&serde_json::to_vec(&initial_projection).unwrap_or_default());
+    let mut commits = state.services.mission.subscribe_projection_commits();
+    let initial_snapshot = match state.services.mission.materialized_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            queue_source_resync(&tx, &terminal, &entry, revision, &source, cursor, &error);
+            mark_source_baseline_ready(&mut baseline_ready);
+            return;
+        }
+    };
+    cursor = initial_snapshot.cursor;
+    let mut materialized_revision = initial_snapshot.revision;
     let baseline = envelope(
         &entry,
         revision,
@@ -1168,7 +1175,7 @@ async fn run_mission_source(
         DeliveryClass::SnapshotReconstructable,
         SourceHealth::Baseline,
         "mission_snapshot",
-        initial_projection,
+        serde_json::to_value(initial_snapshot).unwrap_or_default(),
     );
     queue_envelope(
         &tx,
@@ -1182,9 +1189,20 @@ async fn run_mission_source(
         return;
     }
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut authorization_check = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+    );
     loop {
-        interval.tick().await;
+        let committed = tokio::select! {
+            changed = commits.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                true
+            }
+            _ = authorization_check.tick() => false,
+        };
         if !mission_source_authorized(&state, &principal, &source.id) {
             queue_source_revoke(
                 &tx,
@@ -1196,14 +1214,54 @@ async fn run_mission_source(
             );
             return;
         }
-        let projection = state.services.mission.projection();
-        let next_cursor = mission_projection_cursor(&projection).unwrap_or(cursor);
-        let projection_hash = hex_hash(&serde_json::to_vec(&projection).unwrap_or_default());
-        if projection_hash == previous_hash {
+        if !committed {
             continue;
         }
-        previous_hash = projection_hash;
-        cursor = cursor.max(next_cursor);
+        let delta = match state
+            .services
+            .mission
+            .materialized_delta(cursor, Some(materialized_revision))
+            .await
+        {
+            Ok(delta) => delta,
+            Err(error) => {
+                queue_source_resync(&tx, &terminal, &entry, revision, &source, cursor, &error);
+                return;
+            }
+        };
+        if delta.needs_resync {
+            let snapshot = match state.services.mission.materialized_snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    queue_source_resync(&tx, &terminal, &entry, revision, &source, cursor, &error);
+                    return;
+                }
+            };
+            cursor = snapshot.cursor;
+            materialized_revision = snapshot.revision;
+            let update = envelope(
+                &entry,
+                revision,
+                "mission",
+                &source.id,
+                source.detail_scope,
+                Some(cursor),
+                DeliveryClass::SnapshotReconstructable,
+                SourceHealth::Baseline,
+                "mission_snapshot",
+                serde_json::to_value(snapshot).unwrap_or_default(),
+            );
+            queue_envelope(&tx, &terminal, &entry, update, Some((source.key(), cursor)));
+            continue;
+        }
+        if delta.to_cursor == cursor
+            && delta.revision == materialized_revision
+            && delta.changed_domains.is_empty()
+        {
+            continue;
+        }
+        cursor = delta.to_cursor;
+        materialized_revision = delta.revision;
         let update = envelope(
             &entry,
             revision,
@@ -1211,25 +1269,13 @@ async fn run_mission_source(
             &source.id,
             source.detail_scope,
             Some(cursor),
-            DeliveryClass::SnapshotReconstructable,
+            DeliveryClass::Durable,
             SourceHealth::Live,
-            "mission_snapshot",
-            projection,
+            "mission_delta",
+            serde_json::to_value(delta).unwrap_or_default(),
         );
         queue_envelope(&tx, &terminal, &entry, update, Some((source.key(), cursor)));
     }
-}
-
-fn mission_projection_cursor(projection: &serde_json::Value) -> Option<u64> {
-    projection
-        .pointer("/mission/events")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|events| {
-            events
-                .iter()
-                .filter_map(|event| event.get("sequence").and_then(serde_json::Value::as_u64))
-                .max()
-        })
 }
 
 fn mark_source_baseline_ready(sender: &mut Option<oneshot::Sender<()>>) {

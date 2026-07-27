@@ -598,6 +598,7 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub struct RuntimeEventStore {
     backend: Arc<dyn RuntimeEventStoreBackend>,
+    commit_signal: tokio::sync::watch::Sender<u64>,
 }
 
 impl RuntimeEventStore {
@@ -620,18 +621,31 @@ impl RuntimeEventStore {
 
     #[must_use]
     pub fn from_backend(backend: Arc<dyn RuntimeEventStoreBackend>) -> Self {
-        Self { backend }
+        let latest_cursor = backend
+            .all_events(1)
+            .ok()
+            .and_then(|events| events.first().map(|event| event.commit_cursor))
+            .unwrap_or_default();
+        let (commit_signal, _) = tokio::sync::watch::channel(latest_cursor);
+        Self {
+            backend,
+            commit_signal,
+        }
     }
 
     pub fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
-        self.backend.append(input)
+        let event = self.backend.append(input)?;
+        self.publish_commit(event.commit_cursor);
+        Ok(event)
     }
 
     pub fn append_transaction(
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        self.backend.append_transaction(request)
+        let receipt = self.backend.append_transaction(request)?;
+        self.publish_commit(receipt.commit_cursor);
+        Ok(receipt)
     }
 
     pub fn append_transaction_with_terminal(
@@ -639,8 +653,11 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: SessionTerminalInput,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        self.backend
-            .append_transaction_with_terminal(request, terminal)
+        let receipt = self
+            .backend
+            .append_transaction_with_terminal(request, terminal)?;
+        self.publish_commit(receipt.commit_cursor);
+        Ok(receipt)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -672,8 +689,11 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         lease: &crate::VerifiedDecisionLease,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        self.backend
-            .append_transaction_with_verified_decision_lease(request, lease)
+        let receipt = self
+            .backend
+            .append_transaction_with_verified_decision_lease(request, lease)?;
+        self.publish_commit(receipt.commit_cursor);
+        Ok(receipt)
     }
 
     pub fn append_batch_if_revision(
@@ -683,12 +703,25 @@ impl RuntimeEventStore {
         transaction_id: impl Into<String>,
         events: Vec<RuntimeTransactionEventInput>,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        self.backend.append_batch_if_revision(
+        let receipt = self.backend.append_batch_if_revision(
             stream_id.into(),
             expected_revision,
             transaction_id.into(),
             events,
-        )
+        )?;
+        self.publish_commit(receipt.commit_cursor);
+        Ok(receipt)
+    }
+
+    #[must_use]
+    pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.commit_signal.subscribe()
+    }
+
+    fn publish_commit(&self, cursor: u64) {
+        if cursor > *self.commit_signal.borrow() {
+            self.commit_signal.send_replace(cursor);
+        }
     }
 
     pub fn events_after_cursor(
@@ -909,7 +942,11 @@ impl RuntimeEventStore {
         &self,
         snapshot: &RuntimeEventStoreSnapshot,
     ) -> RuntimeEventStoreResult<()> {
-        self.backend.import_migration_snapshot(snapshot)
+        self.backend.import_migration_snapshot(snapshot)?;
+        if let Some(commit) = snapshot.commits.last() {
+            self.publish_commit(commit.commit_cursor);
+        }
+        Ok(())
     }
 }
 
@@ -4162,5 +4199,27 @@ mod tests {
             store.adopt_session_terminal_fence(&after_materialized),
             Err(RuntimeEventStoreError::InvalidTransaction(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn commit_subscription_wakes_after_a_new_durable_commit() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        let mut commits = store.subscribe_commits();
+        let event = store
+            .append(RuntimeEventInput {
+                stream_id: "commit-watch".to_string(),
+                scope: RuntimeEventScope::Mission,
+                kind: "mission.commit_watch.v1".to_string(),
+                status: Some("committed".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::Value::Null,
+            })
+            .expect("append");
+        tokio::time::timeout(std::time::Duration::from_secs(1), commits.changed())
+            .await
+            .expect("commit notification")
+            .expect("watch remains open");
+        assert_eq!(*commits.borrow(), event.commit_cursor);
     }
 }

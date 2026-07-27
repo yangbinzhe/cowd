@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Extension, Path, State as AxumState},
+    extract::{Extension, Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -9,12 +9,12 @@ use axum::{
 };
 
 use crate::services::{
-    AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,
-    DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,
-    StartMissionSessionHttpRequest, SubmitMissionApprovalHttpRequest,
-    UpdateMissionScheduleHttpRequest, UpsertMissionProxyHttpRequest,
+    CreateMissionScheduleHttpRequest, DecideMissionApprovalHttpRequest,
+    InterpretMissionCommandHttpRequest, StartMissionSessionHttpRequest,
+    SubmitMissionApprovalHttpRequest, UpdateMissionScheduleHttpRequest,
+    UpsertMissionProxyHttpRequest,
 };
-use session::SessionMissionOutboxOperation;
+use serde::Deserialize;
 
 use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 
@@ -25,12 +25,8 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(mission_control_handler).post(execute_mission_control_command_handler),
         )
         .route(
-            "/api/mission/control/command",
-            post(execute_mission_control_command_handler),
-        )
-        .route(
-            "/api/mission/control/sessions/dispatch",
-            post(dispatch_mission_sessions_handler),
+            "/api/mission/control/delta",
+            get(mission_control_delta_handler),
         )
         .route(
             "/api/mission/control/sessions/bridge",
@@ -110,10 +106,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(close_mission_session_handler),
         )
         .route(
-            "/api/mission/sessions/:id/teams/runtime",
-            post(start_mission_team_runtime_handler),
-        )
-        .route(
             "/api/mission/approvals",
             get(mission_approvals_handler).post(submit_mission_approval_handler),
         )
@@ -121,10 +113,7 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             "/api/mission/approvals/:id/decision",
             post(decide_mission_approval_handler),
         )
-        .route(
-            "/api/mission/relations",
-            get(mission_relations_handler).post(add_mission_relation_handler),
-        )
+        .route("/api/mission/relations", get(mission_relations_handler))
         .route("/api/mission/conflicts", get(mission_conflicts_handler))
         .route("/api/mission/proxies", post(upsert_mission_proxy_handler))
 }
@@ -149,6 +138,7 @@ async fn create_mission_schedule_handler(
         .services
         .mission
         .create_schedule(body)
+        .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }
@@ -202,37 +192,54 @@ async fn update_mission_schedule_handler(
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }
 
-async fn mission_control_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.services.mission.mission_control())
+async fn mission_control_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .mission_control()
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
 }
 
 async fn execute_mission_control_command_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<runtime::MissionControlCommand>,
-) -> impl IntoResponse {
-    Json(
-        state
-            .services
-            .mission
-            .execute_mission_control_command(body)
-            .await,
-    )
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(mut body): Json<harness_contract::mission::MissionCommand>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    if body.actor.trim().is_empty() {
+        body.actor = principal.0.claims().principal_id.clone();
+    }
+    state
+        .services
+        .mission
+        .execute_mission_control_command(body)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }
 
-async fn dispatch_mission_sessions_handler(
+#[derive(Debug, Deserialize)]
+struct MissionDeltaQuery {
+    #[serde(default)]
+    cursor: u64,
+    #[serde(default)]
+    revision: Option<u64>,
+}
+
+async fn mission_control_delta_handler(
     AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<runtime::SessionExecutionPolicy>,
-) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "envelope": state.services.mission.session_control_contract(),
-        "kind": "mission_control.session_dispatch_submission",
-        "ok": true,
-        "policy": body,
-        "result": {
-            "status": "scheduler_owned",
-            "message": "durable Session input is dispatched automatically by the Gateway scheduler"
-        }
-    }))
+    Query(query): Query<MissionDeltaQuery>,
+) -> Result<Json<runtime::MissionProjectionDelta>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .mission
+        .materialized_delta(query.cursor, query.revision)
+        .await
+        .map(Json)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))
 }
 
 async fn bridge_mission_session_handler(
@@ -362,6 +369,7 @@ async fn mission_session_detail_handler(
         .services
         .mission
         .session_detail(&id)
+        .await
         .map(Json)
         .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
 }
@@ -399,18 +407,6 @@ async fn decide_mission_approval_handler(
         })
 }
 
-async fn add_mission_relation_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(body): Json<AddMissionRelationHttpRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .mission
-        .add_relation(body)
-        .map(|value| (StatusCode::CREATED, Json(value)))
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
-}
-
 async fn upsert_mission_proxy_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(body): Json<UpsertMissionProxyHttpRequest>,
@@ -426,47 +422,20 @@ async fn upsert_mission_proxy_handler(
 async fn start_mission_session_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(mut body): Json<StartMissionSessionHttpRequest>,
+    Json(body): Json<StartMissionSessionHttpRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let session_id = body
-        .session_id
-        .clone()
-        .unwrap_or_else(|| format!("mission-{}", uuid::Uuid::new_v4()));
-    let model = state
-        .services
-        .system
-        .runtime_config(&state.workspace_root, &state.config_home)
-        .ok()
-        .and_then(|config| config.model().map(str::to_string))
-        .filter(|model| !model.trim().is_empty())
-        .unwrap_or_else(|| crate::DEFAULT_MODEL.to_string());
-    let mut request = crate::services::EnsureSessionRequest::new(
-        &session_id,
-        Some(model),
-        crate::services::SessionSource::MissionControl,
-    );
-    request.title = Some(body.title.clone());
-    request.owner_principal_id = Some(principal.0.claims().principal_id.clone());
-    request.metadata = serde_json::json!({"source": "mission_control"});
-    request.mission_operation = SessionMissionOutboxOperation::Start;
-    state
-        .services
-        .session
-        .ensure_surface_session(request)
-        .await
-        .map_err(|error| {
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to ensure Mission session: {error}"),
-            )
-        })?;
-    body.session_id = Some(session_id);
     state
         .services
         .mission
-        .start_session(body)
+        .start_session(body, principal.0.claims().principal_id.clone())
+        .await
+        .map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("failed to create Mission session: {error}"),
+            )
+        })
         .map(|value| (StatusCode::CREATED, Json(value)))
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }
 
 async fn switch_mission_session_handler(
@@ -495,18 +464,4 @@ async fn close_mission_session_handler(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     Ok(Json(state.services.mission.close_session(&id).await))
-}
-
-async fn start_mission_team_runtime_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(body): Json<harness_contract::team::TeamInstantiationRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .mission
-        .start_team_runtime(&id, body)
-        .await
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))
 }

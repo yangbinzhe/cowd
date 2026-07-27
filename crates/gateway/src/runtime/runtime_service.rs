@@ -1605,24 +1605,22 @@ impl RuntimeService {
                     )
                 }),
         );
-        carriers.extend(
-            runtime::MissionRuntimePort::new(Arc::clone(&self.runtime_services))
-                .projection()
-                .sessions
-                .into_iter()
-                .map(|snapshot| {
-                    let status = upgrade_mission_status(&snapshot.status);
-                    upgrade_carrier_record(
-                        "mission_session",
-                        snapshot.session_id.clone(),
-                        status,
-                        snapshot.updated_at_ms,
-                        None,
-                        Some(format!("mission://session/{}", snapshot.session_id)),
-                        &snapshot,
-                    )
-                }),
-        );
+        carriers.extend(self.sessions.list().into_iter().map(|session_id| {
+            let snapshot = serde_json::json!({
+                "session_id": session_id,
+                "status": "active",
+                "source": "gateway.hot_session_pool",
+            });
+            upgrade_carrier_record(
+                "session",
+                session_id.clone(),
+                runtime::UpgradeCarrierStatus::Running,
+                0,
+                None,
+                Some(format!("session://{session_id}")),
+                &snapshot,
+            )
+        }));
         carriers.sort_by(|left, right| {
             (&left.carrier_kind, &left.carrier_id).cmp(&(&right.carrier_kind, &right.carrier_id))
         });
@@ -3296,15 +3294,6 @@ fn upgrade_team_status(status: &str) -> runtime::UpgradeCarrierStatus {
     }
 }
 
-fn upgrade_mission_status(status: &runtime::MissionSessionStatus) -> runtime::UpgradeCarrierStatus {
-    match status {
-        runtime::MissionSessionStatus::Active => runtime::UpgradeCarrierStatus::Running,
-        runtime::MissionSessionStatus::Background => runtime::UpgradeCarrierStatus::Waiting,
-        runtime::MissionSessionStatus::Paused => runtime::UpgradeCarrierStatus::Paused,
-        runtime::MissionSessionStatus::Closed => runtime::UpgradeCarrierStatus::Completed,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3855,10 +3844,6 @@ mod tests {
         assert_eq!(
             upgrade_team_status("review_required"),
             runtime::UpgradeCarrierStatus::Waiting
-        );
-        assert_eq!(
-            upgrade_mission_status(&runtime::MissionSessionStatus::Paused),
-            runtime::UpgradeCarrierStatus::Paused
         );
     }
 

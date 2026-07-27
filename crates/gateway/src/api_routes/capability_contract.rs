@@ -286,6 +286,49 @@ fn gateway_openapi_document_from_contract(
         ("PatchLiveSubscriptionRequest", live_patch_request_schema()),
         ("LiveSubscription", live_subscription_schema()),
         ("LiveEnvelope", live_envelope_schema()),
+        ("EvidenceRef", evidence_ref_schema()),
+        ("MissionCommandTarget", mission_command_target_schema()),
+        ("MissionCommand", mission_command_schema()),
+        ("MissionCommandReceipt", mission_command_receipt_schema()),
+        ("MissionCommandSagaRecord", mission_command_saga_schema()),
+        (
+            "MissionWorkspaceProjection",
+            mission_workspace_projection_schema(),
+        ),
+        ("MissionControlSummary", mission_control_summary_schema()),
+        (
+            "MissionControlReadiness",
+            mission_control_readiness_schema(),
+        ),
+        (
+            "MissionControlSessionNode",
+            mission_control_session_node_schema(),
+        ),
+        ("MissionControlTaskNode", mission_control_task_node_schema()),
+        ("MissionControlTeamNode", mission_control_team_node_schema()),
+        (
+            "MissionControlAgentNode",
+            mission_control_agent_node_schema(),
+        ),
+        (
+            "MissionControlApprovalNode",
+            mission_control_approval_node_schema(),
+        ),
+        (
+            "MissionControlEventLine",
+            mission_control_event_line_schema(),
+        ),
+        (
+            "MissionControlProjection",
+            mission_control_projection_schema(),
+        ),
+        (
+            "MissionMaterializedSnapshot",
+            mission_materialized_snapshot_schema(),
+        ),
+        ("MissionProjectionDelta", mission_projection_delta_schema()),
+        ("MissionControlResponse", mission_control_response_schema()),
+        ("MissionCommandResponse", mission_command_response_schema()),
         ("Empty", json!({"type": "object", "maxProperties": 0})),
     ] {
         schemas.insert(name.to_string(), schema);
@@ -1150,6 +1193,443 @@ fn live_envelope_schema() -> Value {
     schema
 }
 
+fn evidence_ref_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["ref_type", "id", "boundary"],
+        "properties": {
+            "ref_type": {"type": "string"},
+            "id": {"type": "string"},
+            "source": {"type": ["string", "null"]},
+            "boundary": {"type": "string", "enum": ["observed", "inferred", "simulated", "hypothetical", "conflict"]},
+            "confidence_bp": {"type": ["integer", "null"], "minimum": 0, "maximum": 10000}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_command_target_schema() -> Value {
+    let variants = [
+        ("mission", "mission_id"),
+        ("session", "session_id"),
+        ("task", "task_id"),
+        ("graph", "graph_id"),
+        ("team", "team_id"),
+        ("agent", "agent_id"),
+        ("approval", "approval_id"),
+        ("relation", "relation_id"),
+    ]
+    .into_iter()
+    .map(|(kind, id)| {
+        let mut variant = json!({
+            "type": "object",
+            "required": ["kind", id],
+            "properties": {
+                "kind": {"type": "string", "const": kind}
+            },
+            "additionalProperties": false
+        });
+        variant["properties"]
+            .as_object_mut()
+            .expect("Mission target properties are an object")
+            .insert(id.to_string(), json!({"type": "string", "minLength": 1}));
+        variant
+    })
+    .collect::<Vec<_>>();
+    json!({"oneOf": variants, "discriminator": {"propertyName": "kind"}})
+}
+
+fn mission_command_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["command_id", "action", "target"],
+        "properties": {
+            "command_id": {"type": "string", "minLength": 1},
+            "action": {
+                "type": "string",
+                "enum": [
+                    "create", "activate", "background", "pause", "resume", "cancel",
+                    "close", "input", "continue", "branch", "approve", "reject",
+                    "replan", "link", "unlink"
+                ]
+            },
+            "target": {"$ref": "#/components/schemas/MissionCommandTarget"},
+            "actor": {"type": "string"},
+            "expected_revision": {"type": ["integer", "null"], "minimum": 0},
+            "correlation_id": {"type": "string"},
+            "payload": {},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_command_receipt_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "command_id", "action", "target", "accepted_revision", "status",
+            "evidence_refs", "result"
+        ],
+        "properties": {
+            "command_id": {"type": "string"},
+            "action": {
+                "type": "string",
+                "enum": [
+                    "create", "activate", "background", "pause", "resume", "cancel",
+                    "close", "input", "continue", "branch", "approve", "reject",
+                    "replan", "link", "unlink"
+                ]
+            },
+            "target": {"$ref": "#/components/schemas/MissionCommandTarget"},
+            "accepted_revision": {"type": "integer", "minimum": 0},
+            "status": {"type": "string"},
+            "reason": {"type": ["string", "null"]},
+            "evidence_refs": {"type": "array", "items": {"$ref": "#/components/schemas/EvidenceRef"}},
+            "result": {}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_command_saga_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "schema_version", "command", "phase", "revision",
+            "reserved_target_revision", "updated_at_ms"
+        ],
+        "properties": {
+            "schema_version": {"type": "integer", "minimum": 1},
+            "command": {"$ref": "#/components/schemas/MissionCommand"},
+            "phase": {
+                "type": "string",
+                "enum": [
+                    "reserved", "effect_committed", "receipt_committed",
+                    "finalized", "rejected", "reconciliation_required"
+                ]
+            },
+            "revision": {"type": "integer", "minimum": 1},
+            "reserved_target_revision": {"type": "integer", "minimum": 0},
+            "effect_result": {},
+            "receipt": {
+                "oneOf": [
+                    {"$ref": "#/components/schemas/MissionCommandReceipt"},
+                    {"type": "null"}
+                ]
+            },
+            "error": {"type": ["string", "null"]},
+            "updated_at_ms": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_workspace_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "workspace_id", "title", "session_count", "running_agent_count",
+            "pending_approval_count", "recovery_required_count"
+        ],
+        "properties": {
+            "workspace_id": {"type": "string"},
+            "title": {"type": "string"},
+            "active_session_id": {"type": ["string", "null"]},
+            "session_count": {"type": "integer", "minimum": 0},
+            "running_agent_count": {"type": "integer", "minimum": 0},
+            "pending_approval_count": {"type": "integer", "minimum": 0},
+            "recovery_required_count": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "session_count", "background_session_count", "paused_session_count",
+            "closed_session_count", "task_count", "team_count", "agent_count",
+            "pending_approval_count", "recovery_required_count"
+        ],
+        "properties": {
+            "session_count": {"type": "integer", "minimum": 0},
+            "active_session_id": {"type": ["string", "null"]},
+            "background_session_count": {"type": "integer", "minimum": 0},
+            "paused_session_count": {"type": "integer", "minimum": 0},
+            "closed_session_count": {"type": "integer", "minimum": 0},
+            "task_count": {"type": "integer", "minimum": 0},
+            "team_count": {"type": "integer", "minimum": 0},
+            "agent_count": {"type": "integer", "minimum": 0},
+            "pending_approval_count": {"type": "integer", "minimum": 0},
+            "recovery_required_count": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_readiness_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["kind", "ready_count", "blocked_count", "actions"],
+        "properties": {
+            "kind": {"type": "string"},
+            "ready_count": {"type": "integer", "minimum": 0},
+            "blocked_count": {"type": "integer", "minimum": 0},
+            "actions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "action", "available", "reason", "requires_approval",
+                        "target_count"
+                    ],
+                    "properties": {
+                        "action": {"type": "string"},
+                        "available": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "requires_approval": {"type": "boolean"},
+                        "policy_marker": {"type": ["string", "null"]},
+                        "target_count": {"type": "integer", "minimum": 0}
+                    },
+                    "additionalProperties": false
+                }
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_session_node_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "session_id", "title", "status", "lifecycle", "hydration", "active",
+            "attachment_count", "team_count", "agent_count", "created_at_ms", "updated_at_ms"
+        ],
+        "properties": {
+            "session_id": {"type": "string"},
+            "title": {"type": "string"},
+            "status": {"type": "string"},
+            "lifecycle": {"type": "string"},
+            "hydration": {"type": "string"},
+            "active": {"type": "boolean"},
+            "attachment_count": {"type": "integer", "minimum": 0},
+            "team_count": {"type": "integer", "minimum": 0},
+            "agent_count": {"type": "integer", "minimum": 0},
+            "created_at_ms": {"type": "integer", "minimum": 0},
+            "updated_at_ms": {"type": "integer", "minimum": 0},
+            "last_error": {"type": ["string", "null"]}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_task_node_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "task_id", "mission_id", "source_session_id", "objective", "status",
+            "revision", "phase_count", "graph_count", "failure_count",
+            "created_at_ms", "updated_at_ms"
+        ],
+        "properties": {
+            "task_id": {"type": "string"},
+            "mission_id": {"type": "string"},
+            "source_session_id": {"type": "string"},
+            "objective": {"type": "string"},
+            "status": {"type": "string"},
+            "revision": {"type": "integer", "minimum": 0},
+            "current_phase_id": {"type": ["string", "null"]},
+            "phase_count": {"type": "integer", "minimum": 0},
+            "graph_count": {"type": "integer", "minimum": 0},
+            "failure_count": {"type": "integer", "minimum": 0},
+            "blocker_reason": {"type": ["string", "null"]},
+            "created_at_ms": {"type": "integer", "minimum": 0},
+            "updated_at_ms": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_team_node_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["team_id", "graph_id", "agent_count", "detail"],
+        "properties": {
+            "team_id": {"type": "string"},
+            "graph_id": {"type": "string"},
+            "session_id": {"type": ["string", "null"]},
+            "status": {"type": ["string", "null"]},
+            "agent_count": {"type": "integer", "minimum": 0},
+            "detail": {"type": "object", "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_agent_node_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["agent_id", "detail"],
+        "properties": {
+            "agent_id": {"type": "string"},
+            "session_id": {"type": ["string", "null"]},
+            "status": {"type": ["string", "null"]},
+            "backend": {"type": ["string", "null"]},
+            "detail": {"type": "object", "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_approval_node_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["approval_id", "status", "detail"],
+        "properties": {
+            "approval_id": {"type": "string"},
+            "status": {"type": "string"},
+            "action": {"type": ["string", "null"]},
+            "source_session_id": {"type": ["string", "null"]},
+            "detail": {"type": "object", "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_event_line_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["event_id", "stream_id", "cursor", "transaction_index", "scope", "kind", "created_at_ms"],
+        "properties": {
+            "event_id": {"type": "string"},
+            "stream_id": {"type": "string"},
+            "cursor": {"type": "integer", "minimum": 0},
+            "transaction_index": {"type": "integer", "minimum": 0},
+            "scope": {"type": "string"},
+            "kind": {"type": "string"},
+            "status": {"type": ["string", "null"]},
+            "actor": {"type": ["string", "null"]},
+            "created_at_ms": {"type": "integer", "minimum": 0}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_projection_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "schema_version", "kind", "workspace", "summary", "control_readiness",
+            "mission", "sessions", "tasks", "teams", "agents", "approvals", "relations",
+            "execution_graphs", "conflicts", "evidence", "capabilities",
+            "event_digest", "health"
+        ],
+        "properties": {
+            "schema_version": {"type": "integer", "minimum": 1},
+            "kind": {"type": "string", "const": "mission_control.projection"},
+            "workspace": {"$ref": "#/components/schemas/MissionWorkspaceProjection"},
+            "summary": {"$ref": "#/components/schemas/MissionControlSummary"},
+            "control_readiness": {"$ref": "#/components/schemas/MissionControlReadiness"},
+            "mission": {},
+            "sessions": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlSessionNode"}},
+            "tasks": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlTaskNode"}},
+            "teams": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlTeamNode"}},
+            "agents": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlAgentNode"}},
+            "approvals": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlApprovalNode"}},
+            "relations": {},
+            "execution_graphs": {},
+            "conflicts": {},
+            "evidence": {},
+            "capabilities": {},
+            "event_digest": {
+                "type": "object",
+                "required": ["total_recent_events", "scope_counts", "latest_errors", "recovery_required", "latest"],
+                "properties": {
+                    "total_recent_events": {"type": "integer", "minimum": 0},
+                    "scope_counts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+                    "latest_errors": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlEventLine"}},
+                    "recovery_required": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlEventLine"}},
+                    "latest": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlEventLine"}}
+                },
+                "additionalProperties": false
+            },
+            "health": {}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_materialized_snapshot_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["schema_version", "kind", "cursor", "revision", "needs_resync", "projection"],
+        "properties": {
+            "schema_version": {"type": "integer", "minimum": 1},
+            "kind": {"type": "string", "const": "mission_control.materialized_snapshot"},
+            "cursor": {"type": "integer", "minimum": 0},
+            "revision": {"type": "integer", "minimum": 1},
+            "needs_resync": {"type": "boolean"},
+            "projection": {"$ref": "#/components/schemas/MissionControlProjection"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_projection_delta_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": [
+            "schema_version", "kind", "from_cursor", "to_cursor", "revision",
+            "needs_resync", "changed_domains", "events", "patch"
+        ],
+        "properties": {
+            "schema_version": {"type": "integer", "minimum": 1},
+            "kind": {"type": "string", "const": "mission_control.projection_delta"},
+            "from_cursor": {"type": "integer", "minimum": 0},
+            "from_revision": {"type": ["integer", "null"], "minimum": 1},
+            "to_cursor": {"type": "integer", "minimum": 0},
+            "revision": {"type": "integer", "minimum": 1},
+            "needs_resync": {"type": "boolean"},
+            "changed_domains": {"type": "array", "items": {"type": "string"}},
+            "events": {"type": "array", "items": {"$ref": "#/components/schemas/MissionControlEventLine"}},
+            "patch": {"type": "object", "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_control_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["ok", "snapshot"],
+        "properties": {
+            "envelope": {},
+            "ok": {"type": "boolean"},
+            "snapshot": {"$ref": "#/components/schemas/MissionMaterializedSnapshot"}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn mission_command_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["kind", "ok", "receipt", "saga", "snapshot"],
+        "properties": {
+            "envelope": {},
+            "kind": {"type": "string", "const": "mission_control.command_result"},
+            "ok": {"type": "boolean"},
+            "receipt": {"$ref": "#/components/schemas/MissionCommandReceipt"},
+            "saga": {"$ref": "#/components/schemas/MissionCommandSagaRecord"},
+            "snapshot": {"$ref": "#/components/schemas/MissionMaterializedSnapshot"}
+        },
+        "additionalProperties": false
+    })
+}
+
 fn execution_projection_entity_schema() -> Value {
     json!({
         "type": "object",
@@ -1867,7 +2347,7 @@ fn openapi_parameters(
             "in": "header",
             "required": policy == SessionWriterPolicy::Required,
             "description": if policy == SessionWriterPolicy::Conditional {
-                "Required when slash dispatch resolves to a mutating command with an authoritative session_id."
+                "Required when the operation resolves to a mutation of an authoritative Session."
             } else {
                 "Exact attached writer Surface identity. The same observer must own a compatible session lease."
             },
@@ -1881,6 +2361,22 @@ fn openapi_parameters(
             "required": false,
             "description": "Browser EventSource Surface binding. Required when x-cowd-observer-id cannot be sent.",
             "schema": {"type": "string", "maxLength": 128}
+        }));
+    }
+    if method == "GET" && path == "/api/mission/control/delta" {
+        params.push(json!({
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "description": "Last applied Runtime event commit cursor.",
+            "schema": {"type": "integer", "minimum": 0, "default": 0}
+        }));
+        params.push(json!({
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "description": "Last applied Mission materialized-view revision.",
+            "schema": {"type": "integer", "minimum": 1}
         }));
     }
     params

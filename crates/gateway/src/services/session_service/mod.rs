@@ -1246,7 +1246,11 @@ impl SessionService {
     pub(crate) async fn working_set_projection(
         &self,
     ) -> Result<SessionWorkingSetProjection, String> {
-        Ok(self.coordinator()?.working_set_projection().await)
+        match self.coordinator.as_ref() {
+            Some(coordinator) => Ok(coordinator.working_set_projection().await),
+            None if cfg!(test) => Ok(SessionWorkingSetProjection::default()),
+            None => Err("Session activation coordinator is unavailable".to_string()),
+        }
     }
 
     pub(crate) fn has_active_session(&self, session_id: &str) -> bool {

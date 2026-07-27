@@ -445,6 +445,21 @@ pub struct RuntimeEventReader {
 }
 
 impl RuntimeEventReader {
+    #[must_use]
+    pub fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.store.subscribe_commits()
+    }
+
+    pub fn events_after_cursor(
+        &self,
+        cursor: u64,
+        max_commits: usize,
+    ) -> Result<Vec<crate::CommittedEventBatch>, String> {
+        self.store
+            .events_after_cursor(cursor, max_commits)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn list_stream(&self, stream_id: &str) -> Result<Vec<DurableRuntimeEvent>, String> {
         self.store.list_stream(stream_id)
     }

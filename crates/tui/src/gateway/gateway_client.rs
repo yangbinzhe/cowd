@@ -1913,6 +1913,8 @@ impl GatewayApiClient {
                 detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
             })
             .await?;
+        let mut applied_cursor = None;
+        let mut applied_revision = None;
         while let Some(envelope) = source.recv().await {
             if envelope.source_kind != "mission" || envelope.source_id != mission_id {
                 return Err(GatewayApiError::Contract(
@@ -1931,12 +1933,68 @@ impl GatewayApiClient {
                 ));
             }
             if envelope.source_health == harness_contract::live::SourceHealth::ResyncRequired {
+                let snapshot = self.mission_control_snapshot().await?;
+                applied_cursor = Some(snapshot.cursor);
+                applied_revision = Some(snapshot.revision);
+                tx.send_wait(CowdEvent::MissionProjectionSnapshot {
+                    mission_id: mission_id.to_string(),
+                    snapshot,
+                })
+                .await
+                .map_err(|_| {
+                    GatewayApiError::Url("TUI Mission projection consumer closed".to_string())
+                })?;
                 continue;
             }
             if envelope.event == "mission_snapshot" {
+                let snapshot = serde_json::from_value::<
+                    harness_contract::mission::MissionMaterializedSnapshot,
+                >(envelope.payload)
+                .map_err(|error| {
+                    GatewayApiError::Contract(format!(
+                        "Gateway Mission snapshot contract is invalid: {error}"
+                    ))
+                })?;
+                applied_cursor = Some(snapshot.cursor);
+                applied_revision = Some(snapshot.revision);
                 tx.send_wait(CowdEvent::MissionProjectionSnapshot {
                     mission_id: mission_id.to_string(),
-                    projection: envelope.payload,
+                    snapshot,
+                })
+                .await
+                .map_err(|_| {
+                    GatewayApiError::Url("TUI Mission projection consumer closed".to_string())
+                })?;
+            } else if envelope.event == "mission_delta" {
+                let delta = serde_json::from_value::<
+                    harness_contract::mission::MissionProjectionDelta,
+                >(envelope.payload)
+                .map_err(|error| {
+                    GatewayApiError::Contract(format!(
+                        "Gateway Mission delta contract is invalid: {error}"
+                    ))
+                })?;
+                if applied_cursor != Some(delta.from_cursor)
+                    || applied_revision != delta.from_revision
+                {
+                    let snapshot = self.mission_control_snapshot().await?;
+                    applied_cursor = Some(snapshot.cursor);
+                    applied_revision = Some(snapshot.revision);
+                    tx.send_wait(CowdEvent::MissionProjectionSnapshot {
+                        mission_id: mission_id.to_string(),
+                        snapshot,
+                    })
+                    .await
+                    .map_err(|_| {
+                        GatewayApiError::Url("TUI Mission projection consumer closed".to_string())
+                    })?;
+                    continue;
+                }
+                applied_cursor = Some(delta.to_cursor);
+                applied_revision = Some(delta.revision);
+                tx.send_wait(CowdEvent::MissionProjectionDelta {
+                    mission_id: mission_id.to_string(),
+                    delta,
                 })
                 .await
                 .map_err(|_| {
@@ -2202,12 +2260,16 @@ impl GatewayApiClient {
         self.get_json("/api/mission/control").await
     }
 
-    pub async fn dispatch_mission_sessions(
+    async fn mission_control_snapshot(
         &self,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/control/sessions/dispatch", body)
-            .await
+    ) -> Result<harness_contract::mission::MissionMaterializedSnapshot, GatewayApiError> {
+        let value = self.mission_control().await?;
+        let snapshot = value.get("snapshot").cloned().unwrap_or(value);
+        serde_json::from_value(snapshot).map_err(|error| {
+            GatewayApiError::Contract(format!(
+                "Gateway Mission materialized snapshot contract is invalid: {error}"
+            ))
+        })
     }
 
     pub async fn tick_mission_schedules(
@@ -2245,19 +2307,11 @@ impl GatewayApiClient {
         self.post_json("/api/mission/approvals", body).await
     }
 
-    pub async fn start_mission_team_runtime(
+    pub async fn execute_mission_command(
         &self,
-        session_id: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            &format!(
-                "/api/mission/sessions/{}/teams/runtime",
-                url_encode(session_id)
-            ),
-            body,
-        )
-        .await
+        self.post_json("/api/mission/control", body).await
     }
 
     /// Read the Runtime-owned catalog of runnable Team template revisions.
@@ -2299,13 +2353,6 @@ impl GatewayApiClient {
             body,
         )
         .await
-    }
-
-    pub async fn add_mission_relation(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/relations", body).await
     }
 
     pub async fn upsert_mission_proxy(

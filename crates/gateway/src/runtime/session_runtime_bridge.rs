@@ -1562,28 +1562,12 @@ async fn materialize_mission_membership(
     record: session::SessionMissionOutboxRecord,
 ) {
     let outcome = match record.operation {
-        SessionMissionOutboxOperation::Register => mission
-            .register_session(runtime::StartMissionSessionRequest {
-                title: record.title.clone(),
-                session_id: Some(record.session_id.clone()),
-            })
+        SessionMissionOutboxOperation::Register | SessionMissionOutboxOperation::Start => mission
+            .ensure_session_membership(&record.session_id)
             .map(|_| ()),
-        SessionMissionOutboxOperation::Start => mission
-            .start_session(runtime::StartMissionSessionRequest {
-                title: record.title.clone(),
-                session_id: Some(record.session_id.clone()),
-            })
+        SessionMissionOutboxOperation::Close => mission
+            .remove_session_membership(&record.session_id)
             .map(|_| ()),
-        SessionMissionOutboxOperation::Close => {
-            if mission.session(&record.session_id).is_some() {
-                mission.close_session(&record.session_id).map(|_| ())
-            } else {
-                // A close may race a never-materialized register. There is no
-                // aggregate state to mutate, so the requested final state is
-                // already satisfied and must not poison the outbox.
-                Ok(())
-            }
-        }
     };
     match outcome {
         Ok(()) => {
@@ -3047,7 +3031,10 @@ mod tests {
 
         materialize_mission_membership(&session_service, &mission, "worker", claimed).await;
 
-        assert!(mission.session("mission-session").is_some());
+        assert_eq!(
+            mission.mission_id_for_session("mission-session"),
+            Some(mission.default_mission_id().to_string())
+        );
         assert_eq!(
             store
                 .get_session_mission_outbox("mission-register-1")
@@ -3113,13 +3100,12 @@ mod tests {
         materialize_mission_membership(&session_service, &mission, "worker-b", replay).await;
 
         let projection = mission.projection();
-        assert_eq!(projection.sessions.len(), 1);
         assert_eq!(
             projection
-                .events
-                .iter()
-                .filter(|event| event.event_type == "mission.presence.registered")
-                .count(),
+                .aggregate
+                .expect("default Mission aggregate")
+                .session_refs
+                .len(),
             1
         );
         assert_eq!(

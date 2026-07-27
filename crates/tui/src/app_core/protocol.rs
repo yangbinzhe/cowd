@@ -455,7 +455,11 @@ pub enum CowdEvent {
     /// physical Gateway live connection.
     MissionProjectionSnapshot {
         mission_id: String,
-        projection: serde_json::Value,
+        snapshot: harness_contract::mission::MissionMaterializedSnapshot,
+    },
+    MissionProjectionDelta {
+        mission_id: String,
+        delta: harness_contract::mission::MissionProjectionDelta,
     },
     ThinkingDelta {
         thinking: String,

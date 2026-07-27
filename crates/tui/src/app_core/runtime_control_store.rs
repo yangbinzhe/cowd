@@ -272,6 +272,15 @@ pub struct MissionSessionSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MissionControlActionSummary {
+    pub action: String,
+    pub available: bool,
+    pub reason: String,
+    pub requires_approval: bool,
+    pub target_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MissionControlSummary {
     pub mission_id: Option<String>,
     pub active_session_id: Option<String>,
@@ -280,6 +289,7 @@ pub struct MissionControlSummary {
     pub background_count: u64,
     pub paused_count: u64,
     pub closed_count: u64,
+    pub task_count: u64,
     pub team_count: u64,
     pub agent_count: u64,
     pub pending_approvals: u64,
@@ -292,10 +302,11 @@ pub struct MissionControlSummary {
     pub control_ready_count: u64,
     pub control_blocked_count: u64,
     pub control_requires_approval_count: u64,
+    pub control_actions: Vec<MissionControlActionSummary>,
     pub sessions: Vec<MissionSessionSummary>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuntimeControlSnapshot {
     pub gateway_running: bool,
     pub active_sessions: usize,
@@ -336,6 +347,7 @@ pub struct RuntimeControlSnapshot {
     pub reality_core: Option<RealityCoreSummary>,
     pub fact_flow: Option<FactFlowSummary>,
     pub mission_control: Option<MissionControlSummary>,
+    pub mission_materialized: Option<harness_contract::mission::MissionMaterializedSnapshot>,
     pub connector_degraded_reasons: Vec<String>,
     pub degraded_reasons: Vec<String>,
 }
@@ -417,6 +429,7 @@ impl RuntimeControlSnapshot {
             reality_core: app.gateway_reality_core.clone(),
             fact_flow: app.gateway_fact_flow.clone(),
             mission_control: app.gateway_mission_control.clone(),
+            mission_materialized: app.gateway_mission_materialized.clone(),
             connector_degraded_reasons: app.gateway_connector_degraded_reasons.clone(),
             degraded_reasons: app.gateway_degraded_reasons.clone(),
             ..Self::default()
@@ -471,6 +484,7 @@ impl RuntimeControlSnapshot {
         app.gateway_reality_core = self.reality_core.clone();
         app.gateway_fact_flow = self.fact_flow.clone();
         app.gateway_mission_control = self.mission_control.clone();
+        app.gateway_mission_materialized = self.mission_materialized.clone();
         app.gateway_connector_degraded_reasons = self.connector_degraded_reasons.clone();
         app.gateway_degraded_reasons = self.degraded_reasons.clone();
         // The account-wide Runtime snapshot can contain leases belonging to
@@ -890,118 +904,59 @@ impl RuntimeControlSnapshot {
     }
 
     pub fn ingest_mission_projection(&mut self, value: &serde_json::Value) {
-        let projection = value.get("projection").unwrap_or(value);
-        let mission = projection.get("mission").unwrap_or(projection);
-        let sessions = mission
-            .get("sessions")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(mission_session_from_json)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let mut active_count = 0;
-        let mut background_count = 0;
-        let mut paused_count = 0;
-        let mut closed_count = 0;
-        let mut team_count = 0;
-        let mut agent_count = 0;
-        for session in &sessions {
-            match session.status.as_str() {
-                "active" => active_count += 1,
-                "background" => background_count += 1,
-                "paused" => paused_count += 1,
-                "closed" => closed_count += 1,
-                _ => {}
-            }
-            team_count += session.team_count;
-            agent_count += session.agent_count;
+        let snapshot = value
+            .get("snapshot")
+            .cloned()
+            .unwrap_or_else(|| value.clone());
+        if let Ok(snapshot) = serde_json::from_value::<
+            harness_contract::mission::MissionMaterializedSnapshot,
+        >(snapshot)
+        {
+            self.ingest_mission_snapshot(snapshot);
         }
-        self.mission_control = Some(MissionControlSummary {
-            mission_id: mission
-                .get("mission_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-            active_session_id: mission
-                .get("active_session_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-            session_count: sessions.len() as u64,
-            active_count,
-            background_count,
-            paused_count,
-            closed_count,
-            team_count,
-            agent_count,
-            pending_approvals: mission
-                .pointer("/approval_projection/pending_count")
-                .or_else(|| projection.pointer("/approvals/pending_count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            relation_count: mission
-                .pointer("/relation_projection/relation_count")
-                .or_else(|| projection.pointer("/relations/relation_count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            execution_graph_count: mission
-                .pointer("/execution_graph_projection/count")
-                .or_else(|| projection.pointer("/execution_graphs/count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            conflict_count: mission
-                .pointer("/conflict_projection/count")
-                .or_else(|| projection.pointer("/conflicts/count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            evidence_count: mission
-                .pointer("/evidence_projection/count")
-                .or_else(|| projection.pointer("/evidence/count"))
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            capability_action_count: mission
-                .pointer("/capability_projection/action_contracts")
-                .or_else(|| projection.pointer("/capabilities/action_contracts"))
-                .and_then(serde_json::Value::as_array)
-                .map(|items| items.len() as u64)
-                .unwrap_or_default(),
-            event_count: mission
-                .get("events")
-                .and_then(serde_json::Value::as_array)
-                .map(|events| events.len() as u64)
-                .or_else(|| {
-                    projection
-                        .pointer("/event_digest/latest")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|events| events.len() as u64)
-                })
-                .unwrap_or_default(),
-            control_ready_count: projection
-                .pointer("/control_readiness/ready_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            control_blocked_count: projection
-                .pointer("/control_readiness/blocked_count")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or_default(),
-            control_requires_approval_count: projection
-                .pointer("/control_readiness/actions")
-                .and_then(serde_json::Value::as_array)
-                .map(|actions| {
-                    actions
-                        .iter()
-                        .filter(|action| {
-                            action
-                                .get("requires_approval")
-                                .and_then(serde_json::Value::as_bool)
-                                .unwrap_or(false)
-                        })
-                        .count() as u64
-                })
-                .unwrap_or_default(),
-            sessions,
-        });
+    }
+
+    pub fn ingest_mission_snapshot(
+        &mut self,
+        snapshot: harness_contract::mission::MissionMaterializedSnapshot,
+    ) {
+        self.mission_control = Some(mission_summary(&snapshot.projection));
+        self.mission_materialized = Some(snapshot);
+    }
+
+    pub fn ingest_mission_delta(
+        &mut self,
+        delta: &harness_contract::mission::MissionProjectionDelta,
+    ) -> bool {
+        let Some(current) = self.mission_materialized.as_mut() else {
+            return false;
+        };
+        if delta.needs_resync
+            || delta.from_cursor != current.cursor
+            || delta.from_revision != Some(current.revision)
+        {
+            return false;
+        }
+        let Ok(mut projection) = serde_json::to_value(&current.projection) else {
+            return false;
+        };
+        let (Some(target), Some(patch)) = (projection.as_object_mut(), delta.patch.as_object())
+        else {
+            return false;
+        };
+        for (key, value) in patch {
+            target.insert(key.clone(), value.clone());
+        }
+        let Ok(projection) = serde_json::from_value::<
+            harness_contract::mission::MissionControlProjection,
+        >(projection) else {
+            return false;
+        };
+        current.cursor = delta.to_cursor;
+        current.revision = delta.revision;
+        current.projection = projection;
+        self.mission_control = Some(mission_summary(&current.projection));
+        true
     }
 
     pub fn ingest_connector_accounts(&mut self, value: &serde_json::Value) {
@@ -1229,7 +1184,7 @@ impl RuntimeControlSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RuntimeControlLocalStore {
     snapshot: RuntimeControlSnapshot,
 }
@@ -1585,36 +1540,72 @@ fn reality_component_status(value: &serde_json::Value, component: &str) -> Strin
         .to_string()
 }
 
-fn mission_session_from_json(value: &serde_json::Value) -> Option<MissionSessionSummary> {
-    let session_id = value
-        .get("session_id")
-        .or_else(|| value.get("id"))
-        .and_then(serde_json::Value::as_str)?;
-    Some(MissionSessionSummary {
-        session_id: session_id.to_string(),
-        title: value
-            .get("title")
+fn mission_summary(
+    projection: &harness_contract::mission::MissionControlProjection,
+) -> MissionControlSummary {
+    let sessions = projection
+        .sessions
+        .iter()
+        .map(|session| MissionSessionSummary {
+            session_id: session.session_id.clone(),
+            title: session.title.clone(),
+            status: session.status.clone(),
+            team_count: session.team_count as u64,
+            agent_count: session.agent_count as u64,
+        })
+        .collect::<Vec<_>>();
+    MissionControlSummary {
+        mission_id: projection
+            .mission
+            .get("mission_id")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or(session_id)
-            .to_string(),
-        status: value
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
-        team_count: value
-            .get("active_team_ids")
-            .or_else(|| value.get("team_ids"))
+            .map(ToOwned::to_owned),
+        active_session_id: projection.workspace.active_session_id.clone(),
+        session_count: projection.summary.session_count as u64,
+        active_count: projection
+            .sessions
+            .iter()
+            .filter(|session| session.active)
+            .count() as u64,
+        background_count: projection.summary.background_session_count as u64,
+        paused_count: projection.summary.paused_session_count as u64,
+        closed_count: projection.summary.closed_session_count as u64,
+        task_count: projection.summary.task_count as u64,
+        team_count: projection.summary.team_count as u64,
+        agent_count: projection.summary.agent_count as u64,
+        pending_approvals: projection.summary.pending_approval_count as u64,
+        relation_count: structured_count(&projection.relations),
+        execution_graph_count: structured_count(&projection.execution_graphs),
+        conflict_count: structured_count(&projection.conflicts),
+        evidence_count: structured_count(&projection.evidence),
+        capability_action_count: projection
+            .capabilities
+            .get("action_contracts")
             .and_then(serde_json::Value::as_array)
-            .map(|items| items.len() as u64)
-            .unwrap_or_default(),
-        agent_count: value
-            .get("active_agent_ids")
-            .or_else(|| value.get("agent_ids"))
-            .and_then(serde_json::Value::as_array)
-            .map(|items| items.len() as u64)
-            .unwrap_or_default(),
-    })
+            .map_or(0, |items| items.len() as u64),
+        event_count: projection.event_digest.latest.len() as u64,
+        control_ready_count: projection.control_readiness.ready_count as u64,
+        control_blocked_count: projection.control_readiness.blocked_count as u64,
+        control_requires_approval_count: projection
+            .control_readiness
+            .actions
+            .iter()
+            .filter(|action| action.requires_approval)
+            .count() as u64,
+        control_actions: projection
+            .control_readiness
+            .actions
+            .iter()
+            .map(|action| MissionControlActionSummary {
+                action: action.action.clone(),
+                available: action.available,
+                reason: action.reason.clone(),
+                requires_approval: action.requires_approval,
+                target_count: action.target_count as u64,
+            })
+            .collect(),
+        sessions,
+    }
 }
 
 fn json_array_len(value: &serde_json::Value, key: &str) -> u64 {
@@ -2272,5 +2263,111 @@ mod tests {
 
         assert_eq!(app.gateway_lease_owner, None);
         assert_eq!(app.gateway_lease_mode.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn mission_delta_requires_an_exact_cursor_and_revision_chain() {
+        let mut snapshot = RuntimeControlSnapshot::default();
+        let materialized = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "kind": "mission_control.materialized_snapshot",
+            "cursor": 4,
+            "revision": 2,
+            "needs_resync": false,
+            "projection": {
+                "schema_version": 1,
+                "kind": "mission_control.projection",
+                "workspace": {
+                    "workspace_id": "workspace",
+                    "title": "Mission Control",
+                    "active_session_id": null,
+                    "session_count": 0,
+                    "running_agent_count": 0,
+                    "pending_approval_count": 0,
+                    "recovery_required_count": 0
+                },
+                "summary": {
+                    "session_count": 0,
+                    "active_session_id": null,
+                    "background_session_count": 0,
+                    "paused_session_count": 0,
+                    "closed_session_count": 0,
+                    "task_count": 0,
+                    "team_count": 0,
+                    "agent_count": 0,
+                    "pending_approval_count": 0,
+                    "recovery_required_count": 0
+                },
+                "control_readiness": {
+                    "kind": "mission_control.readiness",
+                    "ready_count": 0,
+                    "blocked_count": 0,
+                    "actions": []
+                },
+                "mission": {},
+                "sessions": [],
+                "tasks": [],
+                "teams": [],
+                "agents": [],
+                "approvals": [],
+                "relations": {},
+                "execution_graphs": {},
+                "conflicts": {},
+                "evidence": {},
+                "capabilities": {},
+                "event_digest": {
+                    "total_recent_events": 0,
+                    "scope_counts": {},
+                    "latest_errors": [],
+                    "recovery_required": [],
+                    "latest": []
+                },
+                "health": {}
+            }
+        }))
+        .expect("typed Mission snapshot");
+        snapshot.ingest_mission_snapshot(materialized);
+
+        let stale = harness_contract::mission::MissionProjectionDelta {
+            schema_version: 1,
+            kind: "mission_control.projection_delta".to_string(),
+            from_cursor: 3,
+            from_revision: Some(1),
+            to_cursor: 5,
+            revision: 3,
+            needs_resync: false,
+            changed_domains: Vec::new(),
+            events: Vec::new(),
+            patch: serde_json::json!({}),
+        };
+        assert!(!snapshot.ingest_mission_delta(&stale));
+        assert_eq!(snapshot.mission_materialized.as_ref().unwrap().cursor, 4);
+
+        let next = harness_contract::mission::MissionProjectionDelta {
+            from_cursor: 4,
+            from_revision: Some(2),
+            to_cursor: 5,
+            revision: 3,
+            patch: serde_json::json!({
+                "summary": {
+                    "session_count": 0,
+                    "active_session_id": null,
+                    "background_session_count": 0,
+                    "paused_session_count": 0,
+                    "closed_session_count": 0,
+                    "task_count": 0,
+                    "team_count": 1,
+                    "agent_count": 0,
+                    "pending_approval_count": 0,
+                    "recovery_required_count": 0
+                }
+            }),
+            ..stale
+        };
+        assert!(snapshot.ingest_mission_delta(&next));
+        let materialized = snapshot.mission_materialized.as_ref().unwrap();
+        assert_eq!(materialized.cursor, 5);
+        assert_eq!(materialized.revision, 3);
+        assert_eq!(materialized.projection.summary.team_count, 1);
     }
 }

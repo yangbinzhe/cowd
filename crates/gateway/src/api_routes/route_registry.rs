@@ -15,6 +15,7 @@ use harness_contract::{
     live::{
         CreateLiveSubscriptionRequest, LiveEnvelope, LiveSubscription, PatchLiveSubscriptionRequest,
     },
+    mission::{MissionCommand, MissionMaterializedSnapshot, MissionProjectionDelta},
     projection::{
         ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection,
         SessionEvidenceProjection, SessionExecutionIndexProjection,
@@ -235,6 +236,23 @@ fn live_stream_spec() -> TypedRouteSpec<(), (), LiveEnvelope> {
     TypedRouteSpec::new("GET", "/api/runtime/live/:id", "runtime_live_stream_get")
 }
 
+fn mission_control_snapshot_spec() -> TypedRouteSpec<(), (), MissionMaterializedSnapshot> {
+    TypedRouteSpec::new("GET", "/api/mission/control", "mission_control_get")
+}
+
+fn mission_control_command_spec() -> TypedRouteSpec<MissionCommand, (), MissionMaterializedSnapshot>
+{
+    TypedRouteSpec::new("POST", "/api/mission/control", "mission_control_command")
+}
+
+fn mission_control_delta_spec() -> TypedRouteSpec<(), (), MissionProjectionDelta> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/mission/control/delta",
+        "mission_control_delta_get",
+    )
+}
+
 pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
     vec![
         execution_projection_snapshot_spec().metadata(None, "ExecutionProjection", false),
@@ -293,6 +311,11 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         ),
         live_delete_spec().metadata(None, "Empty", false),
         live_stream_spec().metadata(None, "LiveEnvelope", true),
+        mission_control_snapshot_spec().metadata(None, "MissionControlResponse", false),
+        mission_control_command_spec()
+            .metadata(Some("MissionCommand"), "MissionCommandResponse", false)
+            .with_writer(SessionWriterPolicy::Conditional),
+        mission_control_delta_spec().metadata(None, "MissionProjectionDelta", false),
     ]
 }
 
@@ -368,5 +391,21 @@ mod tests {
         let live_stream = spec("runtime_live_stream_get");
         assert_eq!(live_stream.response_schema, "LiveEnvelope");
         assert!(live_stream.streaming);
+        assert_eq!(
+            spec("mission_control_get").response_schema,
+            "MissionControlResponse"
+        );
+        assert_eq!(
+            spec("mission_control_command").request_schema.as_deref(),
+            Some("MissionCommand")
+        );
+        assert_eq!(
+            spec("mission_control_command").session_writer,
+            SessionWriterPolicy::Conditional
+        );
+        assert_eq!(
+            spec("mission_control_delta_get").response_schema,
+            "MissionProjectionDelta"
+        );
     }
 }

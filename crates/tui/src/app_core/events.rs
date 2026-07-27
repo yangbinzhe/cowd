@@ -151,6 +151,7 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
             | CowdEvent::SessionStreamConnection { .. }
             | CowdEvent::ExecutionProjectionConnection { .. }
             | CowdEvent::MissionProjectionSnapshot { .. }
+            | CowdEvent::MissionProjectionDelta { .. }
             | CowdEvent::TurnError { .. }
             | CowdEvent::ResourceUploaded { .. }
             | CowdEvent::ResourceUploadFailed { .. }
@@ -307,17 +308,22 @@ fn retain_reliable_event(
             }
         }
         CowdEvent::MissionProjectionSnapshot { mission_id, .. } => {
-            if let Some(index) = queue.iter().position(|queued| {
-                matches!(
+            queue.retain(|queued| {
+                !matches!(
                     &queued.event,
                     CowdEvent::MissionProjectionSnapshot {
                         mission_id: queued_mission_id,
                         ..
+                    } | CowdEvent::MissionProjectionDelta {
+                        mission_id: queued_mission_id,
+                        ..
                     } if queued_mission_id == mission_id
                 )
-            }) {
-                queue.remove(index);
-            }
+            });
+        }
+        CowdEvent::MissionProjectionDelta { .. } => {
+            // Deltas are revision chained. Dropping an earlier delta would make
+            // the next envelope impossible to apply safely.
         }
         CowdEvent::ExecutionProjectionDelta { generation, delta } => {
             if let Some(index) = queue.iter().position(|queued| {
@@ -465,6 +471,24 @@ mod tests {
         }
     }
 
+    fn mission_delta(from: u64, to: u64) -> CowdEvent {
+        CowdEvent::MissionProjectionDelta {
+            mission_id: "mission-a".to_string(),
+            delta: harness_contract::mission::MissionProjectionDelta {
+                schema_version: 1,
+                kind: "mission_control.projection_delta".to_string(),
+                from_cursor: from,
+                from_revision: Some(from.saturating_add(1)),
+                to_cursor: to,
+                revision: to.saturating_add(1),
+                needs_resync: false,
+                changed_domains: vec!["mission".to_string()],
+                events: Vec::new(),
+                patch: serde_json::json!({}),
+            },
+        }
+    }
+
     #[test]
     fn event_channel_send_recv() {
         let (tx, mut rx) = cowd_event_channel();
@@ -567,6 +591,30 @@ mod tests {
             reliable.front().map(|queued| &queued.event),
             Some(CowdEvent::ExecutionProjectionDelta { generation: 7, delta })
                 if delta.target_cursor == 10_000
+        ));
+    }
+
+    #[test]
+    fn mission_deltas_remain_revision_ordered_when_the_primary_queue_is_full() {
+        let (tx, _rx) = cowd_event_channel();
+        for index in 0..EVENT_CHANNEL_CAPACITY {
+            tx.try_send(display_delta(index.to_string()))
+                .expect("capacity");
+        }
+        tx.send(mission_delta(0, 1)).expect("first delta");
+        tx.send(mission_delta(1, 2)).expect("second delta");
+
+        let reliable = tx.reliable.lock().expect("reliable queue");
+        assert_eq!(reliable.len(), 2);
+        assert!(matches!(
+            reliable.front().map(|queued| &queued.event),
+            Some(CowdEvent::MissionProjectionDelta { delta, .. })
+                if delta.from_cursor == 0 && delta.to_cursor == 1
+        ));
+        assert!(matches!(
+            reliable.back().map(|queued| &queued.event),
+            Some(CowdEvent::MissionProjectionDelta { delta, .. })
+                if delta.from_cursor == 1 && delta.to_cursor == 2
         ));
     }
 

@@ -52,10 +52,10 @@ pub(crate) use harness_eval_service::HarnessEvalServiceError;
 pub(crate) use matrix_service::MatrixService;
 pub(crate) use memory_service::MemoryService;
 pub(crate) use mission_service::{
-    AddMissionRelationHttpRequest, CreateMissionScheduleHttpRequest,
-    DecideMissionApprovalHttpRequest, InterpretMissionCommandHttpRequest,
-    StartMissionSessionHttpRequest, SubmitMissionApprovalHttpRequest,
-    UpdateMissionScheduleHttpRequest, UpsertMissionProxyHttpRequest,
+    CreateMissionScheduleHttpRequest, DecideMissionApprovalHttpRequest,
+    InterpretMissionCommandHttpRequest, StartMissionSessionHttpRequest,
+    SubmitMissionApprovalHttpRequest, UpdateMissionScheduleHttpRequest,
+    UpsertMissionProxyHttpRequest,
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
@@ -541,6 +541,9 @@ pub(crate) struct MissionService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
     runtime_port: Option<runtime::MissionRuntimePort>,
+    session_service: Option<Arc<SessionService>>,
+    runtime_events: Option<RuntimeEventService>,
+    projection_cache: Arc<tokio::sync::Mutex<Option<runtime::MissionMaterializedSnapshot>>>,
 }
 
 impl AgentService {

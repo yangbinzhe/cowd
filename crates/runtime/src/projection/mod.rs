@@ -2199,12 +2199,17 @@ mod tests {
         let services = RuntimeServices::in_memory().expect("runtime services");
         let mission = services
             .mission_runtime()
-            .register_session(crate::StartMissionSessionRequest {
-                title: "projection scope session".to_string(),
-                session_id: Some("session-a".to_string()),
-            })
+            .ensure_default_mission()
+            .expect("default Mission");
+        services
+            .mission_runtime()
+            .link_session(
+                &mission.mission_id,
+                mission.revision,
+                "session-a",
+                Vec::new(),
+            )
             .expect("mission membership registers");
-        assert_eq!(mission.session_id, "session-a");
         let mut graph = ExecutionGraph::new("session-scoped projection");
         let dispatch = harness_contract::turn::SessionDispatchCommand {
             command_id: "scope-dispatch".to_string(),
@@ -2288,13 +2293,13 @@ mod tests {
         assert_eq!(projection.session_id.as_deref(), Some("session-a"));
         assert_eq!(
             projection.mission_id.as_deref(),
-            Some(services.mission_runtime().mission_id())
+            Some(services.mission_runtime().default_mission_id())
         );
         assert_eq!(projection.goals.len(), 1);
         assert_eq!(projection.goals[0].id, format!("goal:{graph_id}"));
         assert!(projection.goals.iter().all(|goal| goal.id != "goal-b"));
 
-        let mission_id = services.mission_runtime().mission_id().to_string();
+        let mission_id = services.mission_runtime().default_mission_id().to_string();
         let denied = ProjectionQueryContext {
             principal: "scoped-reader".to_string(),
             workspace_id: services.workspace_key().to_string(),

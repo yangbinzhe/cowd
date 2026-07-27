@@ -1,6 +1,24 @@
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
+
+use chrono::DateTime;
+use harness_contract::{
+    mission::{
+        MissionCommand, MissionCommandAction, MissionCommandTarget, MissionControlEventLine,
+        MissionControlSessionNode, MissionMaterializedSnapshot, MissionProjectionDelta,
+        MISSION_CONTROL_SCHEMA_VERSION,
+    },
+    turn::{InputSourceKind, SessionInputEnvelope},
+};
 use serde::Deserialize;
 
-use super::{service_envelope, MissionService, ServiceEnvelope};
+use super::session_service::EnsureSessionOutcome;
+use super::{
+    service_envelope, EnsureSessionRequest, MissionService, RuntimeEventService, ServiceEnvelope,
+    SessionService, SessionSource,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,17 +93,6 @@ pub(crate) struct DecideMissionApprovalHttpRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AddMissionRelationHttpRequest {
-    pub(crate) from_session_id: String,
-    pub(crate) to_session_id: String,
-    pub(crate) kind: runtime::SessionRelationKind,
-    pub(crate) summary: String,
-    #[serde(default)]
-    pub(crate) evidence_refs: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct UpsertMissionProxyHttpRequest {
     pub(crate) session_id: String,
     pub(crate) summary: String,
@@ -116,13 +123,23 @@ impl MissionService {
     pub(crate) fn new() -> Self {
         Self {
             label: "mission",
-            owner: "0.9.380 Mission Runtime service boundary",
+            owner: "Gateway MissionApplicationService",
             runtime_port: None,
+            session_service: None,
+            runtime_events: None,
+            projection_cache: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
-    pub(crate) fn with_runtime_port(mut self, runtime_port: runtime::MissionRuntimePort) -> Self {
+    pub(crate) fn with_dependencies(
+        mut self,
+        runtime_port: runtime::MissionRuntimePort,
+        session_service: Arc<SessionService>,
+        runtime_events: RuntimeEventService,
+    ) -> Self {
         self.runtime_port = Some(runtime_port);
+        self.session_service = Some(session_service);
+        self.runtime_events = Some(runtime_events);
         self
     }
 
@@ -134,6 +151,30 @@ impl MissionService {
         self.runtime_port
             .as_ref()
             .expect("MissionService requires MissionRuntimePort")
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "MissionApplicationService is installed with the canonical SessionService"
+    )]
+    fn sessions(&self) -> &Arc<SessionService> {
+        self.session_service
+            .as_ref()
+            .expect("MissionApplicationService requires SessionService")
+    }
+
+    #[allow(
+        clippy::expect_used,
+        reason = "MissionApplicationService is installed with the Runtime event reader"
+    )]
+    fn events(&self) -> &RuntimeEventService {
+        self.runtime_events
+            .as_ref()
+            .expect("MissionApplicationService requires RuntimeEventService")
+    }
+
+    pub(crate) fn subscribe_projection_commits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.events().subscribe_commits()
     }
 
     pub(crate) fn envelope(&self, operation: &'static str) -> ServiceEnvelope {
@@ -187,31 +228,63 @@ impl MissionService {
         })
     }
 
-    pub(crate) fn mission_control(&self) -> serde_json::Value {
-        serde_json::json!({
+    pub(crate) async fn mission_control(&self) -> Result<serde_json::Value, String> {
+        let snapshot = self.materialized_snapshot().await?;
+        Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "ok": true,
-            "projection": self.runtime().control_projection(),
-        })
+            "snapshot": snapshot,
+        }))
     }
 
     pub(crate) async fn execute_mission_control_command(
         &self,
-        command: runtime::MissionControlCommand,
-    ) -> serde_json::Value {
-        let receipt = self.runtime().execute_control(command).await;
-        let ok = !matches!(
-            receipt.status,
-            runtime::MissionControlCommandStatus::Failed
-                | runtime::MissionControlCommandStatus::Rejected
-        );
-        serde_json::json!({
+        command: MissionCommand,
+    ) -> Result<serde_json::Value, String> {
+        let command_id = command.command_id.clone();
+        let reserved = self.runtime().reserve_command(command.clone())?;
+        let final_record = match reserved.phase {
+            harness_contract::mission::MissionCommandSagaPhase::Reserved => {
+                match self.execute_reserved_effect(&command).await {
+                    Ok((result, evidence_refs)) => {
+                        self.runtime()
+                            .commit_command_effect(&command_id, result, evidence_refs)?;
+                        self.runtime().commit_command_receipt(&command_id)?;
+                        self.runtime().finalize_command(&command_id)?
+                    }
+                    Err(error) => self.runtime().reject_command(&command_id, error)?,
+                }
+            }
+            harness_contract::mission::MissionCommandSagaPhase::EffectCommitted => {
+                self.runtime().commit_command_receipt(&command_id)?;
+                self.runtime().finalize_command(&command_id)?
+            }
+            harness_contract::mission::MissionCommandSagaPhase::ReceiptCommitted => {
+                self.runtime().finalize_command(&command_id)?
+            }
+            harness_contract::mission::MissionCommandSagaPhase::Finalized
+            | harness_contract::mission::MissionCommandSagaPhase::Rejected => reserved,
+            harness_contract::mission::MissionCommandSagaPhase::ReconciliationRequired => {
+                return Err(format!(
+                    "mission command {command_id} requires reconciliation before replay"
+                ));
+            }
+        };
+        let receipt = final_record.receipt.clone().ok_or_else(|| {
+            format!(
+                "mission command {} reached {:?} without a receipt",
+                final_record.command.command_id, final_record.phase
+            )
+        })?;
+        let snapshot = self.materialized_snapshot().await?;
+        Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
             "kind": "mission_control.command_result",
-            "ok": ok,
+            "ok": receipt.status == "accepted",
             "receipt": receipt,
-            "projection": self.runtime().control_projection(),
-        })
+            "saga": final_record,
+            "snapshot": snapshot,
+        }))
     }
 
     pub(crate) async fn interpret_mission_command(
@@ -247,8 +320,392 @@ impl MissionService {
                     .unwrap_or(true),
             "interpretation": interpretation,
             "execution": execution,
-            "projection": self.runtime().control_projection(),
+            "snapshot": self.materialized_snapshot().await.ok(),
         })
+    }
+
+    async fn execute_reserved_effect(
+        &self,
+        command: &MissionCommand,
+    ) -> Result<
+        (
+            serde_json::Value,
+            Vec<harness_contract::reality::EvidenceRef>,
+        ),
+        String,
+    > {
+        match (&command.target, command.action) {
+            (MissionCommandTarget::Session { session_id }, MissionCommandAction::Create) => {
+                let title = payload_text(&command.payload, "title")
+                    .unwrap_or("Mission session")
+                    .to_string();
+                let model = payload_text(&command.payload, "model").map(str::to_string);
+                let mut request =
+                    EnsureSessionRequest::new(session_id, model, SessionSource::MissionControl);
+                request.title = Some(title);
+                request.owner_principal_id =
+                    (!command.actor.trim().is_empty()).then(|| command.actor.clone());
+                request.metadata = serde_json::json!({
+                    "source": "mission_control",
+                    "command_id": command.command_id,
+                    "correlation_id": command.correlation_id,
+                });
+                request.mission_operation = session::SessionMissionOutboxOperation::Start;
+                let outcome = self.sessions().ensure_surface_session(request).await?;
+                Ok((
+                    ensure_session_value(&outcome),
+                    command.evidence_refs.clone(),
+                ))
+            }
+            (
+                MissionCommandTarget::Session { session_id },
+                MissionCommandAction::Activate | MissionCommandAction::Resume,
+            ) => {
+                let outcome = self
+                    .sessions()
+                    .activate_existing_session(EnsureSessionRequest::new(
+                        session_id,
+                        None,
+                        SessionSource::Internal,
+                    ))
+                    .await?;
+                Ok((
+                    ensure_session_value(&outcome),
+                    command.evidence_refs.clone(),
+                ))
+            }
+            (
+                MissionCommandTarget::Session { session_id },
+                MissionCommandAction::Background | MissionCommandAction::Pause,
+            ) => {
+                let unloaded = self.sessions().unload_runtime(session_id).await?;
+                Ok((
+                    serde_json::json!({"session_id": session_id, "unloaded": unloaded}),
+                    command.evidence_refs.clone(),
+                ))
+            }
+            (MissionCommandTarget::Session { session_id }, MissionCommandAction::Cancel) => {
+                let cancelled = self
+                    .sessions()
+                    .cancel_active_turns(session_id, "Mission control cancellation")?;
+                Ok((
+                    serde_json::json!({"session_id": session_id, "cancelled_turns": cancelled}),
+                    command.evidence_refs.clone(),
+                ))
+            }
+            (MissionCommandTarget::Session { session_id }, MissionCommandAction::Close) => {
+                let archived = self.sessions().archive_session(session_id).await?;
+                Ok((
+                    serde_json::json!({"session_id": session_id, "archived": archived}),
+                    command.evidence_refs.clone(),
+                ))
+            }
+            (
+                MissionCommandTarget::Session { session_id },
+                MissionCommandAction::Input
+                | MissionCommandAction::Continue
+                | MissionCommandAction::Replan,
+            ) => {
+                let content = payload_text(&command.payload, "content")
+                    .ok_or_else(|| "Session input requires payload.content".to_string())?;
+                let envelope =
+                    SessionInputEnvelope::text(session_id, InputSourceKind::Api, content)
+                        .with_idempotency_key(command.command_id.clone())
+                        .with_metadata(serde_json::json!({
+                            "mission_command_action": command.action,
+                            "correlation_id": command.correlation_id,
+                        }));
+                let admission = self.sessions().admit_input(envelope).await?;
+                Ok((
+                    serde_json::json!({
+                        "receipt": admission.receipt,
+                        "materialized": admission.materialized,
+                        "execution_graph_id": admission.execution_graph_id,
+                        "terminal_id": admission.terminal_id,
+                        "turn_id": admission.turn_id,
+                    }),
+                    command.evidence_refs.clone(),
+                ))
+            }
+            (MissionCommandTarget::Session { session_id }, MissionCommandAction::Branch) => {
+                let target_session_id = payload_text(&command.payload, "target_session_id")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("branch-{}", uuid::Uuid::new_v4()));
+                let title = payload_text(&command.payload, "title")
+                    .unwrap_or("Mission branch")
+                    .to_string();
+                let model = payload_text(&command.payload, "model")
+                    .unwrap_or(crate::DEFAULT_MODEL)
+                    .to_string();
+                let outcome = self
+                    .sessions()
+                    .branch_session(
+                        session_id,
+                        &target_session_id,
+                        command.command_id.clone(),
+                        title,
+                        model,
+                        command.actor.clone(),
+                    )
+                    .await?;
+                Ok((
+                    serde_json::json!({
+                        "session": ensure_session_value(&outcome.session),
+                        "operation_id": outcome.operation_id,
+                        "replayed": outcome.replayed,
+                        "copied_message_count": outcome.copied_message_count,
+                        "source_message_count": outcome.source_message_count,
+                    }),
+                    command.evidence_refs.clone(),
+                ))
+            }
+            (MissionCommandTarget::Team { team_id }, MissionCommandAction::Create) => {
+                let mut request: harness_contract::team::TeamInstantiationRequest =
+                    serde_json::from_value(command.payload.clone())
+                        .map_err(|error| format!("Team create payload is invalid: {error}"))?;
+                request.request_id = command.command_id.clone();
+                request.validate().map_err(|error| error.to_string())?;
+                if request.team_id != *team_id {
+                    return Err(format!(
+                        "Team command target {team_id} does not match payload {}",
+                        request.team_id
+                    ));
+                }
+                if !self
+                    .sessions()
+                    .session_exists(&request.session_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    return Err(format!("session {} not found", request.session_id));
+                }
+                let team = self.runtime().instantiate_team(request).await?;
+                Ok((
+                    serde_json::to_value(team).map_err(|error| error.to_string())?,
+                    command.evidence_refs.clone(),
+                ))
+            }
+            (MissionCommandTarget::Team { team_id }, MissionCommandAction::Cancel) => {
+                let receipt = self.runtime().cancel_team(team_id).await?;
+                Ok((receipt, command.evidence_refs.clone()))
+            }
+            (MissionCommandTarget::Approval { .. }, _) => Err(
+                "Approval commands require the authenticated approval decision endpoint"
+                    .to_string(),
+            ),
+            _ => {
+                let record = self
+                    .runtime()
+                    .execute_reserved_runtime_effect(&command.command_id)
+                    .await?;
+                Ok((
+                    record.effect_result.unwrap_or_default(),
+                    record.command.evidence_refs,
+                ))
+            }
+        }
+    }
+
+    pub(crate) async fn materialized_snapshot(
+        &self,
+    ) -> Result<MissionMaterializedSnapshot, String> {
+        // The default Mission is a durable aggregate. Ensure it before reading
+        // the event cursor so the returned snapshot never trails the commit
+        // performed while constructing its own projection.
+        self.runtime().ensure_default_mission()?;
+        let sessions = self.canonical_session_nodes().await?;
+        let active_session_id = sessions
+            .iter()
+            .filter(|session| session.active)
+            .max_by_key(|session| session.updated_at_ms)
+            .map(|session| session.session_id.clone());
+        let latest_cursor = self
+            .events()
+            .all_events(1)?
+            .first()
+            .map_or(0, |event| event.commit_cursor);
+        let mut cache = self.projection_cache.lock().await;
+        if let Some(snapshot) = cache.as_ref() {
+            if snapshot.cursor == latest_cursor
+                && snapshot.projection.sessions == sessions
+                && snapshot.projection.workspace.active_session_id == active_session_id
+            {
+                return Ok(snapshot.clone());
+            }
+        }
+        let revision = cache
+            .as_ref()
+            .map_or(1, |snapshot| snapshot.revision.saturating_add(1));
+        let projection = self
+            .runtime()
+            .control_projection(sessions, active_session_id)?;
+        let snapshot = MissionMaterializedSnapshot {
+            schema_version: MISSION_CONTROL_SCHEMA_VERSION,
+            kind: "mission_control.materialized_snapshot".to_string(),
+            cursor: latest_cursor,
+            revision,
+            needs_resync: false,
+            projection,
+        };
+        *cache = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    pub(crate) async fn materialized_delta(
+        &self,
+        from_cursor: u64,
+        from_revision: Option<u64>,
+    ) -> Result<MissionProjectionDelta, String> {
+        const MAX_COMMITS: usize = 256;
+        let snapshot = self.materialized_snapshot().await?;
+        if from_cursor == snapshot.cursor && from_revision == Some(snapshot.revision) {
+            return Ok(MissionProjectionDelta {
+                schema_version: MISSION_CONTROL_SCHEMA_VERSION,
+                kind: "mission_control.projection_delta".to_string(),
+                from_cursor,
+                from_revision,
+                to_cursor: snapshot.cursor,
+                revision: snapshot.revision,
+                needs_resync: false,
+                changed_domains: Vec::new(),
+                events: Vec::new(),
+                patch: serde_json::json!({}),
+            });
+        }
+        if from_cursor > snapshot.cursor {
+            return Ok(resync_delta(from_cursor, from_revision, &snapshot));
+        }
+        let batches = self
+            .events()
+            .events_after_cursor(from_cursor, MAX_COMMITS)?;
+        let reached_cursor = batches
+            .last()
+            .map_or(from_cursor, |batch| batch.commit_cursor);
+        if batches.len() == MAX_COMMITS && reached_cursor < snapshot.cursor {
+            return Ok(resync_delta(from_cursor, from_revision, &snapshot));
+        }
+        let mut domains = BTreeSet::new();
+        let mut events = Vec::new();
+        for batch in batches {
+            for event in batch.events {
+                domains.insert(event_domain(&event));
+                events.push(event_line(event));
+            }
+        }
+        if !events.is_empty() {
+            domains.insert("event_digest".to_string());
+        }
+        if domains.is_empty() {
+            domains.insert("sessions".to_string());
+        }
+        let changed_domains = domains.into_iter().collect::<Vec<_>>();
+        let patch = projection_patch(&snapshot.projection, &changed_domains);
+        Ok(MissionProjectionDelta {
+            schema_version: MISSION_CONTROL_SCHEMA_VERSION,
+            kind: "mission_control.projection_delta".to_string(),
+            from_cursor,
+            from_revision,
+            to_cursor: snapshot.cursor,
+            revision: snapshot.revision,
+            needs_resync: false,
+            changed_domains,
+            events,
+            patch,
+        })
+    }
+
+    async fn canonical_session_nodes(&self) -> Result<Vec<MissionControlSessionNode>, String> {
+        let stored = self
+            .sessions()
+            .list_stored_sessions()
+            .await
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        let presence = self
+            .sessions()
+            .presence_snapshots()
+            .await
+            .into_iter()
+            .map(|snapshot| (snapshot.session_id.clone(), snapshot))
+            .collect::<HashMap<_, _>>();
+        let working_set = self.sessions().working_set_projection().await?;
+        let hydration = working_set
+            .entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.session_id,
+                    (
+                        format!("{:?}", entry.status).to_lowercase(),
+                        entry.last_error,
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let teams = self.runtime().team_projection_json();
+        let mut team_counts = HashMap::<String, usize>::new();
+        let mut agent_counts = HashMap::<String, usize>::new();
+        if let Some(items) = teams.get("teams").and_then(serde_json::Value::as_array) {
+            for team in items {
+                if let Some(session_id) = team.get("session_id").and_then(serde_json::Value::as_str)
+                {
+                    *team_counts.entry(session_id.to_string()).or_default() += 1;
+                    *agent_counts.entry(session_id.to_string()).or_default() += team
+                        .get("tasks")
+                        .and_then(serde_json::Value::as_array)
+                        .map_or(0, Vec::len);
+                }
+            }
+        }
+        let active = self
+            .sessions()
+            .list_active_session_ids()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut nodes = stored
+            .into_iter()
+            .map(|record| {
+                let lifecycle = presence.get(&record.session_id);
+                let (hydration, last_error) = hydration
+                    .get(&record.session_id)
+                    .cloned()
+                    .unwrap_or_else(|| ("unloaded".to_string(), None));
+                let metadata = record
+                    .metadata_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+                let title = metadata
+                    .as_ref()
+                    .and_then(|value| value.get("title"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or(record.session_id.as_str())
+                    .to_string();
+                MissionControlSessionNode {
+                    session_id: record.session_id.clone(),
+                    title,
+                    status: record.status,
+                    lifecycle: lifecycle
+                        .map(|snapshot| snapshot.state.as_str().to_string())
+                        .unwrap_or_else(|| "detached".to_string()),
+                    hydration,
+                    active: active.contains(&record.session_id),
+                    attachment_count: lifecycle.map_or(0, |snapshot| snapshot.attachments.len()),
+                    team_count: team_counts.get(&record.session_id).copied().unwrap_or(0),
+                    agent_count: agent_counts.get(&record.session_id).copied().unwrap_or(0),
+                    created_at_ms: parse_timestamp_ms(&record.created_at),
+                    updated_at_ms: parse_timestamp_ms(&record.last_activity),
+                    last_error,
+                }
+            })
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| {
+            (
+                std::cmp::Reverse(node.updated_at_ms),
+                node.session_id.clone(),
+            )
+        });
+        Ok(nodes)
     }
 
     pub(crate) fn team_execution_plan(&self, team_id: &str) -> Result<serde_json::Value, String> {
@@ -286,13 +743,19 @@ impl MissionService {
         &self,
         team_id: &str,
     ) -> Result<serde_json::Value, String> {
-        let receipt = self.runtime().cancel_team(team_id).await?;
-        Ok(serde_json::json!({
-            "envelope": self.session_control_contract(),
-            "kind": "mission_control.team_cancel",
-            "ok": true,
-            "receipt": receipt,
-        }))
+        self.execute_mission_control_command(MissionCommand {
+            command_id: format!("mission-team-cancel-{}", uuid::Uuid::new_v4()),
+            action: MissionCommandAction::Cancel,
+            target: MissionCommandTarget::Team {
+                team_id: team_id.to_string(),
+            },
+            actor: "gateway_mission_team_route".to_string(),
+            expected_revision: None,
+            correlation_id: String::new(),
+            payload: serde_json::Value::Null,
+            evidence_refs: Vec::new(),
+        })
+        .await
     }
 
     pub(crate) fn agent_mission_events(&self, agent_id: &str) -> serde_json::Value {
@@ -342,25 +805,25 @@ impl MissionService {
         })
     }
 
-    pub(crate) fn start_session(
+    pub(crate) async fn start_session(
         &self,
         request: StartMissionSessionHttpRequest,
+        actor: String,
     ) -> Result<serde_json::Value, String> {
-        let session_id = request.session_id.ok_or_else(|| {
-            "Mission session IDs must be allocated by the unified session boundary".to_string()
-        })?;
-        let session = self
-            .runtime()
-            .start_session(runtime::StartMissionSessionRequest {
-                title: request.title,
-                session_id: Some(session_id),
-            })?;
-        Ok(serde_json::json!({
-            "envelope": self.session_control_contract(),
-            "ok": true,
-            "session": session,
-            "mission": self.runtime().projection(),
-        }))
+        let session_id = request
+            .session_id
+            .unwrap_or_else(|| format!("mission-{}", uuid::Uuid::new_v4()));
+        self.execute_mission_control_command(MissionCommand {
+            command_id: format!("mission-session-create-{}", uuid::Uuid::new_v4()),
+            action: MissionCommandAction::Create,
+            target: MissionCommandTarget::Session { session_id },
+            actor,
+            expected_revision: Some(0),
+            correlation_id: String::new(),
+            payload: serde_json::json!({"title": request.title}),
+            evidence_refs: Vec::new(),
+        })
+        .await
     }
 
     pub(crate) fn schedules(&self) -> serde_json::Value {
@@ -372,10 +835,21 @@ impl MissionService {
         })
     }
 
-    pub(crate) fn create_schedule(
+    pub(crate) async fn create_schedule(
         &self,
         request: CreateMissionScheduleHttpRequest,
     ) -> Result<serde_json::Value, String> {
+        if !self
+            .sessions()
+            .session_exists(&request.target_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "mission target session not found: {}",
+                request.target_session_id
+            ));
+        }
         let schedule = self
             .runtime()
             .create_schedule(runtime::CreateMissionScheduleRequest {
@@ -448,10 +922,15 @@ impl MissionService {
         }))
     }
 
-    pub(crate) fn session_detail(&self, session_id: &str) -> Result<serde_json::Value, String> {
+    pub(crate) async fn session_detail(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, String> {
         let session = self
-            .runtime()
-            .session(session_id)
+            .sessions()
+            .stored_session(session_id)
+            .await
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("mission session not found: {session_id}"))?;
         Ok(serde_json::json!({
             "envelope": self.session_control_contract(),
@@ -462,61 +941,23 @@ impl MissionService {
     }
 
     pub(crate) async fn switch_session(&self, session_id: &str) -> serde_json::Value {
-        self.session_transition_command(session_id, runtime::MissionControlAction::SwitchSession)
+        self.session_transition_command(session_id, MissionCommandAction::Activate)
             .await
     }
 
     pub(crate) async fn background_session(&self, session_id: &str) -> serde_json::Value {
-        self.session_transition_command(
-            session_id,
-            runtime::MissionControlAction::BackgroundSession,
-        )
-        .await
+        self.session_transition_command(session_id, MissionCommandAction::Background)
+            .await
     }
 
     pub(crate) async fn pause_session(&self, session_id: &str) -> serde_json::Value {
-        self.session_transition_command(session_id, runtime::MissionControlAction::PauseSession)
+        self.session_transition_command(session_id, MissionCommandAction::Pause)
             .await
     }
 
     pub(crate) async fn close_session(&self, session_id: &str) -> serde_json::Value {
-        self.session_transition_command(session_id, runtime::MissionControlAction::CloseSession)
+        self.session_transition_command(session_id, MissionCommandAction::Close)
             .await
-    }
-
-    pub(crate) async fn start_team_runtime(
-        &self,
-        session_id: &str,
-        request: harness_contract::team::TeamInstantiationRequest,
-    ) -> Result<serde_json::Value, String> {
-        if self.runtime().session(session_id).is_none() {
-            return Err(format!("mission session not found: {session_id}"));
-        }
-        request.validate().map_err(|error| error.to_string())?;
-        if request.session_id != session_id {
-            return Err(format!(
-                "Team request session `{}` does not match mission route session `{session_id}`",
-                request.session_id
-            ));
-        }
-        let request_projection = serde_json::json!({
-            "request_id": request.request_id,
-            "team_id": request.team_id,
-            "selection_mode": request.selection_mode,
-            "template_selector": request.template_selector,
-            "model_lease": request.model_lease,
-            "permission_lease": request.permission_lease,
-            "resource_scopes": request.resource_scopes,
-        });
-        let team = self.runtime().instantiate_team(request).await?;
-        Ok(serde_json::json!({
-            "envelope": self.session_control_contract(),
-            "ok": true,
-            "status": team.status,
-            "team": team,
-            "requested_team": request_projection,
-            "mission": self.runtime().projection(),
-        }))
     }
 
     pub(crate) fn submit_approval(
@@ -566,25 +1007,6 @@ impl MissionService {
         }))
     }
 
-    pub(crate) fn add_relation(
-        &self,
-        request: AddMissionRelationHttpRequest,
-    ) -> Result<serde_json::Value, String> {
-        let relation = self.runtime().add_relation(
-            request.from_session_id,
-            request.to_session_id,
-            request.kind,
-            request.summary,
-            request.evidence_refs,
-        )?;
-        Ok(serde_json::json!({
-            "envelope": self.relation_command_contract(),
-            "ok": true,
-            "relation": relation,
-            "relations": self.runtime().relations_projection(),
-        }))
-    }
-
     pub(crate) fn upsert_proxy(
         &self,
         request: UpsertMissionProxyHttpRequest,
@@ -611,18 +1033,155 @@ impl MissionService {
     async fn session_transition_command(
         &self,
         session_id: &str,
-        action: runtime::MissionControlAction,
+        action: MissionCommandAction,
     ) -> serde_json::Value {
-        self.execute_mission_control_command(runtime::MissionControlCommand {
-            target: runtime::MissionControlCommandTarget::Session {
+        self.execute_mission_control_command(MissionCommand {
+            command_id: format!("mission-session-command-{}", uuid::Uuid::new_v4()),
+            target: MissionCommandTarget::Session {
                 session_id: session_id.to_string(),
             },
             action,
-            actor: Some("gateway_mission_session_route".to_string()),
+            actor: "gateway_mission_session_route".to_string(),
+            expected_revision: None,
+            correlation_id: String::new(),
             payload: serde_json::Value::Null,
             evidence_refs: Vec::new(),
         })
         .await
+        .unwrap_or_else(|error| {
+            serde_json::json!({
+                "envelope": self.session_control_contract(),
+                "kind": "mission_control.command_result",
+                "ok": false,
+                "error": error,
+            })
+        })
+    }
+}
+
+fn ensure_session_value(outcome: &EnsureSessionOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": outcome.session_id,
+        "model": outcome.model,
+        "created": outcome.created,
+        "restored": outcome.restored,
+        "record": outcome.record,
+    })
+}
+
+fn payload_text<'a>(payload: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_timestamp_ms(value: &str) -> u64 {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.timestamp_millis().max(0) as u64)
+        .unwrap_or_default()
+}
+
+fn event_domain(event: &runtime::DurableRuntimeEvent) -> String {
+    let kind = event.kind.as_str();
+    if kind.starts_with("mission.") {
+        "mission"
+    } else if kind.starts_with("task.") {
+        "tasks"
+    } else if kind.starts_with("team.") {
+        "teams"
+    } else if kind.starts_with("agent.") {
+        "agents"
+    } else if kind.starts_with("approval.") {
+        "approvals"
+    } else if kind.starts_with("relation.")
+        || kind.starts_with("session_relation.")
+        || kind.starts_with("session.relation.")
+        || kind.starts_with("session.proxy.")
+    {
+        "relations"
+    } else if kind.starts_with("conflict.") {
+        "conflicts"
+    } else if kind.starts_with("evidence.") {
+        "evidence"
+    } else if kind.starts_with("execution.") || kind.starts_with("graph.") {
+        "execution_graphs"
+    } else if matches!(event.scope, runtime::RuntimeEventScope::Session) {
+        "sessions"
+    } else {
+        "event_digest"
+    }
+    .to_string()
+}
+
+fn event_line(event: runtime::DurableRuntimeEvent) -> MissionControlEventLine {
+    MissionControlEventLine {
+        event_id: event.event_id,
+        stream_id: event.stream_id,
+        cursor: event.commit_cursor,
+        transaction_index: event.transaction_index,
+        scope: format!("{:?}", event.scope).to_lowercase(),
+        kind: event.kind,
+        status: event.status,
+        actor: event.actor,
+        created_at_ms: event.created_at_ms,
+    }
+}
+
+fn projection_patch(
+    projection: &runtime::MissionControlProjection,
+    changed_domains: &[String],
+) -> serde_json::Value {
+    let mut patch = serde_json::Map::new();
+    for domain in changed_domains {
+        let value = match domain.as_str() {
+            "mission" => projection.mission.clone(),
+            "sessions" => serde_json::to_value(&projection.sessions).unwrap_or_default(),
+            "tasks" => serde_json::to_value(&projection.tasks).unwrap_or_default(),
+            "teams" => serde_json::to_value(&projection.teams).unwrap_or_default(),
+            "agents" => serde_json::to_value(&projection.agents).unwrap_or_default(),
+            "approvals" => serde_json::to_value(&projection.approvals).unwrap_or_default(),
+            "relations" => projection.relations.clone(),
+            "conflicts" => projection.conflicts.clone(),
+            "evidence" => projection.evidence.clone(),
+            "execution_graphs" => projection.execution_graphs.clone(),
+            "event_digest" => serde_json::to_value(&projection.event_digest).unwrap_or_default(),
+            _ => continue,
+        };
+        patch.insert(domain.clone(), value);
+    }
+    patch.insert(
+        "workspace".to_string(),
+        serde_json::to_value(&projection.workspace).unwrap_or_default(),
+    );
+    patch.insert(
+        "summary".to_string(),
+        serde_json::to_value(&projection.summary).unwrap_or_default(),
+    );
+    patch.insert(
+        "control_readiness".to_string(),
+        serde_json::to_value(&projection.control_readiness).unwrap_or_default(),
+    );
+    serde_json::Value::Object(patch)
+}
+
+fn resync_delta(
+    from_cursor: u64,
+    from_revision: Option<u64>,
+    snapshot: &MissionMaterializedSnapshot,
+) -> MissionProjectionDelta {
+    MissionProjectionDelta {
+        schema_version: MISSION_CONTROL_SCHEMA_VERSION,
+        kind: "mission_control.projection_delta".to_string(),
+        from_cursor,
+        from_revision,
+        to_cursor: snapshot.cursor,
+        revision: snapshot.revision,
+        needs_resync: true,
+        changed_domains: Vec::new(),
+        events: Vec::new(),
+        patch: serde_json::json!({}),
     }
 }
 
@@ -631,44 +1190,64 @@ mod tests {
     use super::*;
 
     fn scoped_mission_service() -> MissionService {
-        MissionService::new().with_runtime_port(runtime::MissionRuntimePort::new(
-            runtime::RuntimeServices::in_memory().expect("workspace-scoped runtime services"),
-        ))
+        scoped_mission_service_with_runtime().0
+    }
+
+    fn scoped_mission_service_with_runtime() -> (MissionService, Arc<runtime::RuntimeServices>) {
+        let runtime_services =
+            runtime::RuntimeServices::in_memory().expect("workspace-scoped runtime services");
+        let store =
+            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("Session store"));
+        let repository = Arc::new(
+            crate::services::session_service::repository::SessionRepository::new(
+                Arc::new(crate::gateway::HotSessionPool::new()),
+                Some(store),
+                crate::event_bus::SessionProjectionHub::new(),
+            ),
+        );
+        let sessions = Arc::new(SessionService::for_tests(
+            repository,
+            Arc::new(crate::services::session_service::presence::SessionPresenceLedger::new()),
+        ));
+        (
+            MissionService::new().with_dependencies(
+                runtime::MissionRuntimePort::new(Arc::clone(&runtime_services)),
+                sessions,
+                RuntimeEventService::from_runtime_services(&runtime_services),
+            ),
+            runtime_services,
+        )
     }
 
     #[tokio::test]
     async fn mission_service_projects_runtime_control_surfaces() {
         let service = scoped_mission_service();
-        let session_id = format!("mission-service-test-{}", uuid::Uuid::new_v4());
-        let started = service
-            .start_session(StartMissionSessionHttpRequest {
-                title: "verify mission service".to_string(),
-                session_id: Some(session_id.clone()),
+        let mission_id = format!("mission-service-test-{}", uuid::Uuid::new_v4());
+        let result = service
+            .execute_mission_control_command(MissionCommand {
+                command_id: format!("command-{}", uuid::Uuid::new_v4()),
+                action: MissionCommandAction::Create,
+                target: MissionCommandTarget::Mission {
+                    mission_id: mission_id.clone(),
+                },
+                actor: "test".to_string(),
+                expected_revision: Some(0),
+                correlation_id: "mission-service-test".to_string(),
+                payload: serde_json::json!({"objective": "verify Mission application saga"}),
+                evidence_refs: Vec::new(),
             })
-            .expect("start session");
+            .await
+            .expect("Mission command");
 
-        assert_eq!(started["ok"], true);
-        assert_eq!(started["envelope"]["service"], "mission");
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["saga"]["phase"], "finalized");
         assert_eq!(
-            started["session"]["session_id"].as_str(),
-            Some(session_id.as_str())
+            result["snapshot"]["projection"]["kind"],
+            "mission_control.projection"
         );
-        assert!(started["mission"]["sessions"]
-            .as_array()
-            .expect("mission sessions")
-            .iter()
-            .any(|session| session["session_id"].as_str() == Some(session_id.as_str())));
-        let detail = service.session_detail(&session_id).expect("session detail");
-        assert_eq!(
-            detail["session"]["session_id"].as_str(),
-            Some(session_id.as_str())
-        );
-
-        let background = service.background_session(&session_id).await;
-        assert_eq!(background["receipt"]["status"], "executed");
         let projection = service.projection();
         assert_eq!(projection["mission"]["kind"], "mission.runtime");
-        assert_eq!(projection["mission"]["schema_version"], 3);
+        assert_eq!(projection["mission"]["schema_version"], 5);
         assert_eq!(
             projection["mission"]["conflict_projection"]["kind"],
             "runtime.conflicts"
@@ -692,68 +1271,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mission_service_creates_a_runner_owned_team_graph() {
+    async fn mission_materialized_delta_uses_cursor_and_revision() {
         let service = scoped_mission_service();
-        let session_id = format!("mission-task-outcome-{}", uuid::Uuid::new_v4());
-        service
-            .start_session(StartMissionSessionHttpRequest {
-                title: "task outcome".to_string(),
-                session_id: Some(session_id.clone()),
-            })
-            .expect("session");
-        let started = service
-            .start_team_runtime(
-                &session_id,
-                team_request(
-                    &session_id,
-                    service.runtime().default_mission_id(),
-                    "answer one delegated question",
-                ),
-            )
+        let snapshot = service.materialized_snapshot().await.expect("snapshot");
+        let delta = service
+            .materialized_delta(snapshot.cursor, Some(snapshot.revision))
             .await
-            .expect("team");
-        assert_eq!(started["ok"], true);
-        assert!(started["team"]["graph_id"].as_str().is_some());
-        assert!(started["mission"]["team_projection"]["teams"]
-            .as_array()
-            .is_some_and(|teams| !teams.is_empty()));
+            .expect("delta");
+        assert!(!delta.needs_resync);
+        assert!(delta.changed_domains.is_empty());
     }
 
-    fn team_request(
-        session_id: &str,
-        mission_id: &str,
-        objective: &str,
-    ) -> harness_contract::team::TeamInstantiationRequest {
-        harness_contract::team::TeamInstantiationRequest {
-            request_id: "mission-team-request".to_string(),
-            team_id: "mission-team".to_string(),
-            session_id: session_id.to_string(),
-            mission_id: mission_id.to_string(),
-            parent_execution: None,
-            selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
-            strategy_binding: None,
-            template_selector: harness_contract::team::TeamTemplateSelector::LatestStable {
-                template_id: harness_contract::team::TeamTemplateDefinitionId::new(
-                    harness_contract::agent::DefinitionScope::Builtin,
-                    "cowd/direct-executor",
-                )
-                .expect("builtin Team template"),
+    #[tokio::test]
+    async fn gateway_mission_saga_resumes_after_effect_commit_without_repeating_external_effect() {
+        let service = scoped_mission_service();
+        let command = MissionCommand {
+            command_id: format!("mission-saga-command-{}", uuid::Uuid::new_v4()),
+            action: MissionCommandAction::Pause,
+            target: MissionCommandTarget::Session {
+                session_id: "session-external-effect".to_string(),
             },
-            objective: objective.to_string(),
-            acceptance: vec!["summary".to_string(), "evidence".to_string()],
-            risk: None,
-            role_binding_overrides: Vec::new(),
-            cardinality_overrides: Vec::new(),
-            focus_partition_plans: Vec::new(),
-            permission_lease: "read_only".to_string(),
-            model_lease: "default".to_string(),
-            budget_lease: None,
-            managed_invocation: None,
-            resource_scopes: vec![
-                "read:crates/runtime".to_string(),
-                "session:mission".to_string(),
-            ],
+            actor: "test".to_string(),
+            expected_revision: None,
+            correlation_id: "mission-saga-resume".to_string(),
+            payload: serde_json::Value::Null,
+            evidence_refs: Vec::new(),
+        };
+        service
+            .runtime()
+            .reserve_command(command.clone())
+            .expect("reserve");
+        service
+            .runtime()
+            .commit_command_effect(
+                &command.command_id,
+                serde_json::json!({"unloaded": true}),
+                Vec::new(),
+            )
+            .expect("effect commit");
+
+        let resumed = service
+            .execute_mission_control_command(command)
+            .await
+            .expect("resume");
+        assert_eq!(resumed["saga"]["phase"], "finalized");
+        assert_eq!(resumed["receipt"]["result"]["unloaded"], true);
+    }
+
+    #[tokio::test]
+    async fn mission_materialized_delta_requests_resync_after_a_ten_thousand_commit_gap() {
+        let service = scoped_mission_service();
+        let initial = service.materialized_snapshot().await.expect("initial");
+        for index in 0..10_000_u64 {
+            service
+                .events()
+                .append_fixture(runtime::RuntimeEventInput {
+                    stream_id: "mission-delta-load".to_string(),
+                    scope: runtime::RuntimeEventScope::Mission,
+                    kind: "mission.load.fixture.v1".to_string(),
+                    status: Some("committed".to_string()),
+                    actor: Some("test".to_string()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"index": index}),
+                })
+                .expect("append load event");
         }
+
+        let delta = service
+            .materialized_delta(initial.cursor, Some(initial.revision))
+            .await
+            .expect("bounded delta");
+        assert!(delta.needs_resync);
+        assert!(delta.events.is_empty());
+        assert!(delta.to_cursor > initial.cursor);
     }
 
     #[test]

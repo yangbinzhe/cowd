@@ -700,21 +700,6 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
     );
     let collaboration = runtime::CollaborationTemplateMatcher.decide(objective, &strategy);
     let session_id = format!("mission-eval-session-{}", uuid::Uuid::new_v4());
-    let mission = runtime::MissionRuntime::new();
-    let session = match mission.start_session(runtime::StartMissionSessionRequest {
-        title: "Mission runtime collaboration closure".to_string(),
-        session_id: Some(session_id.clone()),
-    }) {
-        Ok(session) => session,
-        Err(error) => {
-            return mission_runtime_collaboration_failure(
-                started,
-                objective,
-                "start_mission_session",
-                error,
-            );
-        }
-    };
     let team_id = format!("harness-eval-team-{}", uuid::Uuid::new_v4());
     let capability = runtime::resolve_agent_capability(runtime::AgentCapabilityRequest {
         role_id: "executor".to_string(),
@@ -755,7 +740,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         harness_contract::team::TeamInstantiationRequest {
             request_id: format!("harness-eval-request-{team_id}"),
             team_id: team_id.clone(),
-            session_id: session.session_id.clone(),
+            session_id: session_id.clone(),
             mission_id: runtime_services
                 .mission_runtime()
                 .default_mission_id()
@@ -790,8 +775,8 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
         }
     };
     let relation = match runtime_services.session_relations().add_relation(
-        &session.session_id,
-        format!("{}-review", session.session_id),
+        &session_id,
+        format!("{session_id}-review"),
         runtime::SessionRelationKind::ConflictsWith,
         "review lane disputes unbounded execution",
         vec![format!("execution_graph:{}", team_plan.graph.id)],
@@ -819,7 +804,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             ],
         });
     let conflict_count = runtime_services.conflict_resolver().receipts().len() as u64;
-    let projection = mission.projection(
+    let projection = runtime_services.mission_runtime().projection(
         runtime_services.session_relations(),
         runtime_services.agent_runtime(),
         runtime_services.team_runtime(),
@@ -918,7 +903,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             "permission_mode": format!("{:?}", capability.permission_mode),
         },
         "sessions": {
-            "session_id": session.session_id,
+            "session_id": session_id,
             "dispatch_model": "execution_graph_session_handoff",
             "dispatch_lifecycle_owner": "runtime.session_execution",
             "relation_id": relation.relation_id,

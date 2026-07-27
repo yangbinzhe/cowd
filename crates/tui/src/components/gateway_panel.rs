@@ -1126,9 +1126,12 @@ impl Component for GatewayPanel {
                     ),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("Teams/Agents: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("Tasks/Teams/Agents: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        format!("{} / {}", mission.team_count, mission.agent_count),
+                        format!(
+                            "{} / {} / {}",
+                            mission.task_count, mission.team_count, mission.agent_count
+                        ),
                         Style::default().fg(Color::Yellow),
                     ),
                     Span::styled(
@@ -1178,6 +1181,33 @@ impl Component for GatewayPanel {
                         }),
                     ),
                 ]));
+                for action in &mission.control_actions {
+                    let marker = if action.available { "+" } else { "-" };
+                    let approval = if action.requires_approval {
+                        " · approval"
+                    } else {
+                        ""
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{marker} {:18}", action.action),
+                            Style::default().fg(if action.available {
+                                Color::Green
+                            } else {
+                                Color::Yellow
+                            }),
+                        ),
+                        Span::styled(
+                            format!(
+                                "{} · targets {}{}",
+                                compact_text(&action.reason, 54),
+                                action.target_count,
+                                approval
+                            ),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
                 if let Some(active) = mission.active_session_id.as_ref() {
                     lines.push(Line::from(vec![
                         Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
@@ -2467,6 +2497,7 @@ mod tests {
             background_count: 1,
             paused_count: 0,
             closed_count: 0,
+            task_count: 3,
             team_count: 1,
             agent_count: 2,
             pending_approvals: 3,
@@ -2479,6 +2510,22 @@ mod tests {
             control_ready_count: 4,
             control_blocked_count: 1,
             control_requires_approval_count: 1,
+            control_actions: vec![
+                crate::runtime_control_store::MissionControlActionSummary {
+                    action: "team.create".to_string(),
+                    available: true,
+                    reason: "canonical Session is available for a Team".to_string(),
+                    requires_approval: false,
+                    target_count: 1,
+                },
+                crate::runtime_control_store::MissionControlActionSummary {
+                    action: "approval.decide".to_string(),
+                    available: false,
+                    reason: "no pending approval request".to_string(),
+                    requires_approval: true,
+                    target_count: 0,
+                },
+            ],
             sessions: vec![MissionSessionSummary {
                 session_id: "mission-a".to_string(),
                 title: "Primary mission control task".to_string(),
@@ -2510,6 +2557,13 @@ mod tests {
         assert!(
             joined.contains("4 ready, 1 blocked, 1 approval-gated"),
             "Should show mission control readiness, got: {joined}"
+        );
+        assert!(
+            joined.contains("team.create")
+                && joined.contains("canonical Session is available")
+                && joined.contains("approval.decide")
+                && joined.contains("no pending approval request"),
+            "Should show owner-provided command readiness and reasons, got: {joined}"
         );
     }
 

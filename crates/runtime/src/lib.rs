@@ -519,6 +519,14 @@ pub use governed_tool_plan::{
     GovernedExecutionBatch, GovernedExecutionBatchMode, GovernedToolCompiler,
     GovernedToolExecutionMode, GovernedToolPlan, GovernedToolPlanTask,
 };
+pub use harness_contract::mission::{
+    MissionCommand, MissionCommandAction, MissionCommandReceipt, MissionCommandSagaPhase,
+    MissionCommandSagaRecord, MissionCommandTarget, MissionControlActionReadiness,
+    MissionControlAgentNode, MissionControlApprovalNode, MissionControlEventDigest,
+    MissionControlEventLine, MissionControlProjection, MissionControlReadiness,
+    MissionControlSessionNode, MissionControlSummary, MissionControlTeamNode,
+    MissionMaterializedSnapshot, MissionProjectionDelta, MissionWorkspaceProjection,
+};
 pub use harness_contract::turn::{
     InputRelationKind, InputRelationProposal, SessionDispatchAction, SessionDispatchCommand,
     SessionDispatchReceipt, SessionHandoff, SessionResultPacket,
@@ -549,19 +557,14 @@ pub use mission_command_interpreter::{
     MissionCommandExecutionReceipt, MissionCommandInterpretRequest, MissionCommandInterpretation,
     MissionCommandInterpreter, MissionCommandTargetKind, MissionInterpretedCommand,
 };
-pub use mission_command_router::execute_mission_command;
-pub use mission_control::{
-    MissionControlAction, MissionControlAgentNode, MissionControlApprovalNode,
-    MissionControlCommand, MissionControlCommandReceipt, MissionControlCommandStatus,
-    MissionControlCommandTarget, MissionControlEventDigest, MissionControlEventLine,
-    MissionControlProjection, MissionControlRuntime, MissionControlSessionNode,
-    MissionControlSummary, MissionControlTeamNode, MissionWorkspace,
+pub use mission_command_router::{
+    commit_mission_effect, commit_mission_receipt, execute_mission_command,
+    execute_reserved_runtime_effect, finalize_mission_command, mission_command_saga,
+    reject_mission_command, reserve_mission_command,
 };
+pub use mission_control::MissionControlRuntime;
 pub use mission_evidence::{MissionEvidenceBus, MissionEvidenceRef};
-pub use mission_runtime::{
-    MissionEvent, MissionProjection, MissionRuntime, MissionSessionSnapshot,
-    MissionSessionStateReceipt, MissionSessionStatus, StartMissionSessionRequest,
-};
+pub use mission_runtime::{MissionProjection, MissionRuntime};
 pub use mission_runtime_port::{MissionRuntimePort, TaskRuntimePort};
 pub use mission_schedule::{
     CreateMissionScheduleRequest, MissionScheduleDispatchReport, MissionScheduleStore,

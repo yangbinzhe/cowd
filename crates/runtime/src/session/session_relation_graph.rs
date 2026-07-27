@@ -120,9 +120,32 @@ impl SessionRelationGraph {
         summary: impl Into<String>,
         evidence_refs: Vec<String>,
     ) -> Result<SessionRelation, String> {
+        self.add_relation_with_id(
+            format!("session-relation-{}", uuid::Uuid::new_v4()),
+            from_session_id,
+            to_session_id,
+            kind,
+            summary,
+            evidence_refs,
+        )
+    }
+
+    pub fn add_relation_with_id(
+        &self,
+        relation_id: impl Into<String>,
+        from_session_id: impl Into<String>,
+        to_session_id: impl Into<String>,
+        kind: SessionRelationKind,
+        summary: impl Into<String>,
+        evidence_refs: Vec<String>,
+    ) -> Result<SessionRelation, String> {
+        let relation_id = relation_id.into();
         let from_session_id = from_session_id.into();
         let to_session_id = to_session_id.into();
         let summary = summary.into();
+        if relation_id.trim().is_empty() {
+            return Err("relation_id must not be empty".to_string());
+        }
         if from_session_id.trim().is_empty() || to_session_id.trim().is_empty() {
             return Err("relation session ids must not be empty".to_string());
         }
@@ -130,7 +153,7 @@ impl SessionRelationGraph {
             return Err("relation summary must not be empty".to_string());
         }
         let relation = SessionRelation {
-            relation_id: format!("session-relation-{}", uuid::Uuid::new_v4()),
+            relation_id,
             from_session_id,
             to_session_id,
             kind,
@@ -138,11 +161,43 @@ impl SessionRelationGraph {
             evidence_refs,
             created_at_ms: now_ms(),
         };
+        if let Some(existing) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .relations
+            .get(&relation.relation_id)
+            .cloned()
+        {
+            let same_payload = existing.from_session_id == relation.from_session_id
+                && existing.to_session_id == relation.to_session_id
+                && existing.kind == relation.kind
+                && existing.summary == relation.summary
+                && existing.evidence_refs == relation.evidence_refs;
+            return same_payload.then_some(existing).ok_or_else(|| {
+                format!(
+                    "relation {} already exists with another payload",
+                    relation.relation_id
+                )
+            });
+        }
         self.mutate("session.relation.added.v1", |state| {
             state
                 .relations
                 .insert(relation.relation_id.clone(), relation.clone());
             Ok(relation.clone())
+        })
+    }
+
+    pub fn remove_relation(&self, relation_id: &str) -> Result<SessionRelation, String> {
+        if relation_id.trim().is_empty() {
+            return Err("relation_id must not be empty".to_string());
+        }
+        self.mutate("session.relation.removed.v1", |state| {
+            state
+                .relations
+                .remove(relation_id)
+                .ok_or_else(|| format!("relation not found: {relation_id}"))
         })
     }
 
@@ -374,5 +429,30 @@ mod tests {
         assert_eq!(receipt.status, "unresolved_session");
         assert!(receipt.resolved_session_id.is_none());
         assert_eq!(receipt.resolved_agent_id.as_deref(), Some("agent-reviewer"));
+    }
+
+    #[test]
+    fn stable_relation_id_is_idempotent_and_can_be_removed() {
+        let graph = SessionRelationGraph::new();
+        let create = || {
+            graph.add_relation_with_id(
+                "relation-stable",
+                "session-a",
+                "session-b",
+                SessionRelationKind::DependsOn,
+                "A depends on B",
+                vec!["evidence:stable".to_string()],
+            )
+        };
+        let first = create().expect("first relation");
+        let replay = create().expect("idempotent replay");
+        assert_eq!(replay, first);
+        assert_eq!(graph.projection()["relation_count"], 1);
+
+        let removed = graph
+            .remove_relation("relation-stable")
+            .expect("remove relation");
+        assert_eq!(removed, first);
+        assert_eq!(graph.projection()["relation_count"], 0);
     }
 }

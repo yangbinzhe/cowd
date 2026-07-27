@@ -26,6 +26,18 @@ impl RuntimeEventService {
         self.reader.list_stream(stream_id)
     }
 
+    pub(crate) fn events_after_cursor(
+        &self,
+        cursor: u64,
+        max_commits: usize,
+    ) -> Result<Vec<runtime::CommittedEventBatch>, String> {
+        self.reader.events_after_cursor(cursor, max_commits)
+    }
+
+    pub(crate) fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.reader.subscribe_commits()
+    }
+
     pub(crate) fn list_scope(
         &self,
         scope: runtime::RuntimeEventScope,

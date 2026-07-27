@@ -1,4 +1,8 @@
-//! Runtime-owned Mission aggregates plus a separate Session presence projection.
+//! Runtime-owned Mission aggregates.
+//!
+//! Canonical Session lifecycle, working-set state, presence, branching and
+//! input admission are owned by Gateway SessionService. Mission stores only
+//! typed Session references and never mirrors Session state.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -16,68 +20,12 @@ use crate::{
     TeamRuntime,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MissionSessionStatus {
-    Active,
-    Background,
-    Paused,
-    Closed,
-}
-
-impl MissionSessionStatus {
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Background => "background",
-            Self::Paused => "paused",
-            Self::Closed => "closed",
-        }
-    }
-}
-
-/// Presentation-only Session membership. Canonical Session lifecycle remains
-/// in the Session domain and canonical Mission state stores only typed refs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MissionSessionSnapshot {
-    pub session_id: String,
-    pub title: String,
-    pub status: MissionSessionStatus,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-    pub active_team_ids: Vec<String>,
-    pub active_agent_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MissionEvent {
-    pub sequence: u64,
-    pub event_type: String,
-    pub message: String,
-    pub session_id: Option<String>,
-    pub emitted_at_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MissionSessionStateReceipt {
-    pub command: String,
-    pub status: String,
-    pub message: String,
-    pub session_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionProjection {
     pub kind: String,
     pub schema_version: u32,
     pub mission_id: Option<String>,
     pub aggregate: Option<MissionAggregate>,
-    /// Transitional Surface presence projection. It is deliberately outside
-    /// `MissionAggregate`; V607 moves its owner to Gateway Session presence.
-    pub active_session_id: Option<String>,
-    pub sessions: Vec<MissionSessionSnapshot>,
-    pub events: Vec<MissionEvent>,
     pub team_projection: serde_json::Value,
     pub agent_projection: serde_json::Value,
     pub approval_projection: serde_json::Value,
@@ -91,26 +39,6 @@ pub struct MissionProjection {
     pub recovery_projection: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StartMissionSessionRequest {
-    pub title: String,
-    pub session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct MissionPresenceState {
-    active_session_id: Option<String>,
-    sessions: BTreeMap<String, MissionSessionSnapshot>,
-    events: Vec<MissionEvent>,
-    next_sequence: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MissionPresenceEvent {
-    event: MissionEvent,
-    state: MissionPresenceState,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MissionAggregateEvent {
     event_kind: String,
@@ -121,11 +49,9 @@ struct MissionAggregateEvent {
 #[derive(Debug)]
 pub struct MissionRuntime {
     missions: Mutex<BTreeMap<String, MissionAggregate>>,
-    presence: Mutex<MissionPresenceState>,
     event_store: Option<Arc<RuntimeEventStore>>,
     workspace_id: String,
     default_mission_id: String,
-    presence_stream_id: Option<String>,
 }
 
 impl Default for MissionRuntime {
@@ -134,11 +60,9 @@ impl Default for MissionRuntime {
         let default_mission_id = deterministic_default_mission_id(&workspace_id);
         Self {
             missions: Mutex::new(BTreeMap::new()),
-            presence: Mutex::new(MissionPresenceState::default()),
             event_store: None,
             workspace_id,
             default_mission_id,
-            presence_stream_id: None,
         }
     }
 }
@@ -156,15 +80,11 @@ impl MissionRuntime {
         let workspace_id = workspace_id.into();
         let default_mission_id = deterministic_default_mission_id(&workspace_id);
         let missions = load_missions(&event_store, &workspace_id)?;
-        let presence_stream_id = format!("mission-presence:{workspace_id}");
-        let presence = load_presence(&event_store, &presence_stream_id)?;
         Ok(Self {
             missions: Mutex::new(missions),
-            presence: Mutex::new(presence),
             event_store: Some(event_store),
             workspace_id,
             default_mission_id,
-            presence_stream_id: Some(presence_stream_id),
         })
     }
 
@@ -453,6 +373,60 @@ impl MissionRuntime {
         )
     }
 
+    pub fn unlink_graph(
+        &self,
+        mission_id: &str,
+        expected_revision: u64,
+        graph_id: &str,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<MissionMutationReceipt, String> {
+        self.unlink_entity(
+            mission_id,
+            expected_revision,
+            graph_id,
+            evidence_refs,
+            "mission.graph.unlinked",
+            "graph",
+            |aggregate| &mut aggregate.graph_refs,
+        )
+    }
+
+    pub fn unlink_team_run(
+        &self,
+        mission_id: &str,
+        expected_revision: u64,
+        team_run_id: &str,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<MissionMutationReceipt, String> {
+        self.unlink_entity(
+            mission_id,
+            expected_revision,
+            team_run_id,
+            evidence_refs,
+            "mission.team_run.unlinked",
+            "team_run",
+            |aggregate| &mut aggregate.team_run_refs,
+        )
+    }
+
+    pub fn unlink_agent_run(
+        &self,
+        mission_id: &str,
+        expected_revision: u64,
+        agent_run_id: &str,
+        evidence_refs: Vec<EvidenceRef>,
+    ) -> Result<MissionMutationReceipt, String> {
+        self.unlink_entity(
+            mission_id,
+            expected_revision,
+            agent_run_id,
+            evidence_refs,
+            "mission.agent_run.unlinked",
+            "agent_run",
+            |aggregate| &mut aggregate.agent_run_refs,
+        )
+    }
+
     pub fn update_strategy_ref(
         &self,
         mission_id: &str,
@@ -498,165 +472,6 @@ impl MissionRuntime {
         )
     }
 
-    pub fn start_session(
-        &self,
-        request: StartMissionSessionRequest,
-    ) -> Result<MissionSessionSnapshot, String> {
-        self.upsert_presence(request, true)
-    }
-
-    pub fn register_session(
-        &self,
-        request: StartMissionSessionRequest,
-    ) -> Result<MissionSessionSnapshot, String> {
-        self.upsert_presence(request, false)
-    }
-
-    fn upsert_presence(
-        &self,
-        request: StartMissionSessionRequest,
-        activate: bool,
-    ) -> Result<MissionSessionSnapshot, String> {
-        validate_required("session title", &request.title)?;
-        let session_id = request
-            .session_id
-            .unwrap_or_else(|| format!("mission-session-{}", uuid::Uuid::new_v4()));
-        let now = now_ms();
-        let snapshot = {
-            let mut state = self
-                .presence
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let target_status = if activate {
-                MissionSessionStatus::Active
-            } else if let Some(existing) = state.sessions.get(&session_id) {
-                existing.status.clone()
-            } else if state.active_session_id.is_none() {
-                MissionSessionStatus::Active
-            } else {
-                MissionSessionStatus::Background
-            };
-            if let Some(existing) = state.sessions.get(&session_id) {
-                if existing.title == request.title
-                    && existing.status == target_status
-                    && (!activate
-                        || state.active_session_id.as_deref() == Some(session_id.as_str()))
-                {
-                    return Ok(existing.clone());
-                }
-            }
-            if activate {
-                if let Some(active_id) = state.active_session_id.clone() {
-                    if let Some(active) = state.sessions.get_mut(&active_id) {
-                        active.status = MissionSessionStatus::Background;
-                        active.updated_at_ms = now;
-                    }
-                }
-            }
-            let status = target_status;
-            let snapshot = state
-                .sessions
-                .entry(session_id.clone())
-                .and_modify(|existing| {
-                    existing.title.clone_from(&request.title);
-                    existing.status = status.clone();
-                    existing.updated_at_ms = now;
-                })
-                .or_insert_with(|| MissionSessionSnapshot {
-                    session_id: session_id.clone(),
-                    title: request.title,
-                    status: status.clone(),
-                    created_at_ms: now,
-                    updated_at_ms: now,
-                    active_team_ids: Vec::new(),
-                    active_agent_ids: Vec::new(),
-                })
-                .clone();
-            if status == MissionSessionStatus::Active {
-                state.active_session_id = Some(session_id.clone());
-            }
-            state.push_event(
-                if activate {
-                    "mission.presence.activated"
-                } else {
-                    "mission.presence.registered"
-                },
-                "session presence linked to mission",
-                Some(session_id.clone()),
-            );
-            self.commit_presence(&mut state)?;
-            snapshot
-        };
-        Ok(snapshot)
-    }
-
-    pub fn switch_session(&self, session_id: &str) -> Result<MissionSessionStateReceipt, String> {
-        self.with_session(session_id, "switch_session", |state, session| {
-            if session.status == MissionSessionStatus::Active
-                && state.active_session_id.as_deref() == Some(session.session_id.as_str())
-            {
-                return None;
-            }
-            if let Some(active_id) = state.active_session_id.clone() {
-                if active_id != session.session_id {
-                    if let Some(active) = state.sessions.get_mut(&active_id) {
-                        active.status = MissionSessionStatus::Background;
-                        active.updated_at_ms = now_ms();
-                    }
-                }
-            }
-            session.status = MissionSessionStatus::Active;
-            session.updated_at_ms = now_ms();
-            state.active_session_id = Some(session.session_id.clone());
-            state.push_event(
-                "mission.presence.activated",
-                "active session presence switched",
-                Some(session.session_id.clone()),
-            );
-            Some("active session switched".to_string())
-        })
-    }
-
-    pub fn pause_session(&self, session_id: &str) -> Result<MissionSessionStateReceipt, String> {
-        self.transition_session(
-            session_id,
-            "pause_session",
-            MissionSessionStatus::Paused,
-            "session presence paused",
-        )
-    }
-
-    pub fn background_session(
-        &self,
-        session_id: &str,
-    ) -> Result<MissionSessionStateReceipt, String> {
-        self.transition_session(
-            session_id,
-            "background_session",
-            MissionSessionStatus::Background,
-            "session presence moved to background",
-        )
-    }
-
-    pub fn close_session(&self, session_id: &str) -> Result<MissionSessionStateReceipt, String> {
-        self.transition_session(
-            session_id,
-            "close_session",
-            MissionSessionStatus::Closed,
-            "session presence closed",
-        )
-    }
-
-    #[must_use]
-    pub fn get_session(&self, session_id: &str) -> Option<MissionSessionSnapshot> {
-        self.presence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sessions
-            .get(session_id)
-            .cloned()
-    }
-
     #[must_use]
     pub fn mission_id_for_session(&self, session_id: &str) -> Option<String> {
         self.missions
@@ -670,31 +485,6 @@ impl MissionRuntime {
                     .any(|reference| reference.id == session_id)
             })
             .map(|mission| mission.mission_id.clone())
-    }
-
-    #[must_use]
-    pub fn mission_id(&self) -> &str {
-        self.default_mission_id()
-    }
-
-    #[must_use]
-    pub fn list_sessions(&self) -> Vec<MissionSessionSnapshot> {
-        self.presence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sessions
-            .values()
-            .cloned()
-            .collect()
-    }
-
-    #[must_use]
-    pub fn events(&self) -> Vec<MissionEvent> {
-        self.presence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .events
-            .clone()
     }
 
     pub fn revision(&self) -> Result<u64, String> {
@@ -713,38 +503,14 @@ impl MissionRuntime {
         mission_evidence: &MissionEvidenceBus,
         schedule_projection: serde_json::Value,
     ) -> MissionProjection {
-        let state = self
-            .presence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let aggregate = self.aggregate(self.default_mission_id());
-        let teams = team_runtime.list().unwrap_or_default();
-        let agents = agent_runtime.list();
-        let mut sessions = state.sessions.values().cloned().collect::<Vec<_>>();
-        for session in &mut sessions {
-            session.active_team_ids = teams
-                .iter()
-                .filter(|team| team.session_id == session.session_id && team.status == "running")
-                .map(|team| team.team_id.clone())
-                .collect();
-            session.active_agent_ids = agents
-                .iter()
-                .filter(|agent| {
-                    agent.session_id == session.session_id && !agent.status.is_terminal()
-                })
-                .map(|agent| agent.agent_id.clone())
-                .collect();
-        }
         MissionProjection {
             kind: "mission.runtime".to_string(),
-            schema_version: 4,
+            schema_version: 5,
             mission_id: aggregate
                 .as_ref()
                 .map(|aggregate| aggregate.mission_id.clone()),
             aggregate,
-            active_session_id: state.active_session_id.clone(),
-            sessions,
-            events: state.events.clone(),
             team_projection: team_runtime.projection_json(),
             agent_projection: serde_json::json!({
                 "kind": "runtime.agents",
@@ -757,7 +523,7 @@ impl MissionRuntime {
             evidence_projection: mission_evidence.projection(),
             schedule_projection,
             capability_projection: serde_json::json!(RuntimeCapabilityCatalog::current()),
-            health_projection: mission_health_projection(&state),
+            health_projection: mission_health_projection(),
             recovery_projection: mission_recovery_projection(),
         }
     }
@@ -945,152 +711,6 @@ impl MissionRuntime {
             evidence_refs,
         })
     }
-
-    fn transition_session(
-        &self,
-        session_id: &str,
-        command: &str,
-        status: MissionSessionStatus,
-        message: &str,
-    ) -> Result<MissionSessionStateReceipt, String> {
-        self.with_session(session_id, command, |state, session| {
-            if session.status == status
-                && (!matches!(
-                    status,
-                    MissionSessionStatus::Closed | MissionSessionStatus::Background
-                ) || state.active_session_id.as_deref() != Some(session_id))
-            {
-                return None;
-            }
-            session.status = status.clone();
-            session.updated_at_ms = now_ms();
-            if matches!(
-                status,
-                MissionSessionStatus::Closed | MissionSessionStatus::Background
-            ) && state.active_session_id.as_deref() == Some(session_id)
-            {
-                state.active_session_id = None;
-            }
-            state.push_event(
-                format!("mission.presence.{}", status.as_str()),
-                message,
-                Some(session.session_id.clone()),
-            );
-            Some(message.to_string())
-        })
-    }
-
-    fn with_session(
-        &self,
-        session_id: &str,
-        command: &str,
-        update: impl FnOnce(&mut MissionPresenceState, &mut MissionSessionSnapshot) -> Option<String>,
-    ) -> Result<MissionSessionStateReceipt, String> {
-        let mut state = self
-            .presence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut session = state
-            .sessions
-            .remove(session_id)
-            .ok_or_else(|| format!("mission session presence not found: {session_id}"))?;
-        if session.status == MissionSessionStatus::Closed && command != "close_session" {
-            state.sessions.insert(session_id.to_string(), session);
-            return Ok(MissionSessionStateReceipt {
-                command: command.to_string(),
-                status: "noop".to_string(),
-                message: "session presence is already closed".to_string(),
-                session_id: Some(session_id.to_string()),
-            });
-        }
-        let Some(message) = update(&mut state, &mut session) else {
-            state.sessions.insert(session_id.to_string(), session);
-            return Ok(MissionSessionStateReceipt {
-                command: command.to_string(),
-                status: "noop".to_string(),
-                message: "session presence already satisfies the requested state".to_string(),
-                session_id: Some(session_id.to_string()),
-            });
-        };
-        state.sessions.insert(session_id.to_string(), session);
-        self.commit_presence(&mut state)?;
-        Ok(MissionSessionStateReceipt {
-            command: command.to_string(),
-            status: "accepted".to_string(),
-            message,
-            session_id: Some(session_id.to_string()),
-        })
-    }
-
-    fn commit_presence(&self, state: &mut MissionPresenceState) -> Result<(), String> {
-        let (Some(event_store), Some(stream_id)) = (&self.event_store, &self.presence_stream_id)
-        else {
-            return Ok(());
-        };
-        let revision = event_store
-            .stream_revision(stream_id)
-            .map_err(|error| error.to_string())?;
-        let event = state
-            .events
-            .last()
-            .cloned()
-            .ok_or_else(|| "mission presence mutation has no event".to_string())?;
-        let payload = serde_json::to_value(MissionPresenceEvent {
-            event: event.clone(),
-            state: state.clone(),
-        })
-        .map_err(|error| error.to_string())?;
-        let mut refs = vec![RuntimeEventRef {
-            kind: "workspace".to_string(),
-            id: self.workspace_id.clone(),
-        }];
-        if let Some(session_id) = &event.session_id {
-            refs.push(RuntimeEventRef {
-                kind: "session".to_string(),
-                id: session_id.clone(),
-            });
-        }
-        if let Err(error) = event_store
-            .append_batch_if_revision(
-                stream_id.clone(),
-                revision,
-                format!("mission-presence:{stream_id}:{}", event.sequence),
-                vec![RuntimeEventInput {
-                    stream_id: stream_id.clone(),
-                    scope: RuntimeEventScope::Mission,
-                    kind: format!("{}.v1", event.event_type),
-                    status: Some("committed".to_string()),
-                    actor: Some("mission_presence".to_string()),
-                    refs,
-                    payload,
-                }
-                .into()],
-            )
-            .map_err(|error| error.to_string())
-        {
-            *state = load_presence(event_store, stream_id)?;
-            return Err(error);
-        }
-        Ok(())
-    }
-}
-
-impl MissionPresenceState {
-    fn push_event(
-        &mut self,
-        event_type: impl Into<String>,
-        message: impl Into<String>,
-        session_id: Option<String>,
-    ) {
-        self.events.push(MissionEvent {
-            sequence: self.next_sequence,
-            event_type: event_type.into(),
-            message: message.into(),
-            session_id,
-            emitted_at_ms: now_ms(),
-        });
-        self.next_sequence = self.next_sequence.saturating_add(1);
-    }
 }
 
 fn append_aggregate_event(
@@ -1200,25 +820,6 @@ fn load_mission(
         .map(|event| event.map(|event| event.aggregate))
 }
 
-fn load_presence(
-    event_store: &RuntimeEventStore,
-    stream_id: &str,
-) -> Result<MissionPresenceState, String> {
-    event_store
-        .list_stream(stream_id)?
-        .into_iter()
-        .rev()
-        .find_map(|event| {
-            event
-                .kind
-                .starts_with("mission.presence.")
-                .then(|| serde_json::from_value::<MissionPresenceEvent>(event.payload))
-        })
-        .transpose()
-        .map_err(|error| error.to_string())
-        .map(|event| event.map_or_else(MissionPresenceState::default, |event| event.state))
-}
-
 fn initial_aggregate(
     mission_id: String,
     workspace_id: String,
@@ -1310,14 +911,14 @@ fn mission_execution_graph_projection(team_runtime: &TeamRuntime) -> serde_json:
     })
 }
 
-fn mission_health_projection(state: &MissionPresenceState) -> serde_json::Value {
+fn mission_health_projection() -> serde_json::Value {
     serde_json::json!({
         "kind": "runtime.mission_health",
         "ok": true,
         "status": "ready",
         "degraded_reasons": [],
-        "session_count": state.sessions.len(),
-        "event_count": state.events.len(),
+        "session_owner": "gateway.session_service",
+        "aggregate_owner": "runtime.mission",
     })
 }
 
@@ -1337,18 +938,6 @@ mod tests {
     #[test]
     fn one_mission_links_all_owned_execution_entities() {
         let runtime = MissionRuntime::new();
-        runtime
-            .register_session(StartMissionSessionRequest {
-                title: "session a".to_string(),
-                session_id: Some("session-a".to_string()),
-            })
-            .expect("session a");
-        runtime
-            .register_session(StartMissionSessionRequest {
-                title: "session b".to_string(),
-                session_id: Some("session-b".to_string()),
-            })
-            .expect("session b");
         assert!(runtime.aggregates().is_empty());
         let mission = runtime.ensure_default_mission().expect("default mission");
         runtime
@@ -1436,16 +1025,10 @@ mod tests {
     }
 
     #[test]
-    fn event_sourced_aggregate_and_presence_rebuild_independently() {
+    fn event_sourced_aggregate_rebuilds_without_session_shadow_state() {
         let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
         let runtime = MissionRuntime::event_sourced(Arc::clone(&event_store), "workspace-a")
             .expect("mission runtime");
-        runtime
-            .register_session(StartMissionSessionRequest {
-                title: "durable".to_string(),
-                session_id: Some("session-durable".to_string()),
-            })
-            .expect("register");
         assert!(runtime.aggregates().is_empty());
         let mission = runtime.ensure_default_mission().expect("mission");
         let event = event_store
@@ -1506,7 +1089,11 @@ mod tests {
         assert_eq!(rebuilt_mission.revision, mission.revision + 1);
         assert_eq!(rebuilt_mission.team_run_refs[0].id, "team-run-durable");
         assert_eq!(rebuilt_mission.agent_run_refs[0].id, "agent-run-durable");
-        assert!(rebuilt.get_session("session-durable").is_some());
+        assert!(event_store
+            .all_events(100)
+            .expect("events")
+            .iter()
+            .all(|event| !event.kind.starts_with("mission.presence.")));
     }
 
     #[test]

@@ -12,9 +12,8 @@ use runtime::eval_gate::{
 };
 use runtime::{
     ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, AutonomyProfileId,
-    CollaborationTemplateId, MissionRuntime, RuntimeEventInput, RuntimeEventScope,
-    RuntimeEventStore, StartMissionSessionRequest, StewardActionRequest, StewardActionStatus,
-    StewardAgent,
+    CollaborationTemplateId, RuntimeEventInput, RuntimeEventScope, RuntimeEventStore,
+    StewardActionRequest, StewardActionStatus, StewardAgent,
 };
 use serde::Serialize;
 
@@ -34,13 +33,7 @@ struct MissionHarnessEvalReport {
 
 #[test]
 fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
-    let mission = MissionRuntime::new();
-    let session = mission
-        .start_session(StartMissionSessionRequest {
-            title: "Mission Harness quick eval".to_string(),
-            session_id: Some(format!("mission-eval-{}", uuid::Uuid::new_v4())),
-        })
-        .expect("mission session starts");
+    let session_id = format!("mission-eval-{}", uuid::Uuid::new_v4());
 
     let prompt = "implement mission harness event store, approval governance, and team review";
     let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
@@ -51,7 +44,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
         .submit(runtime::SubmitGlobalApprovalRequest {
             source: ApprovalSource {
                 kind: ApprovalSourceKind::Session,
-                session_id: Some(session.session_id.clone()),
+                session_id: Some(session_id.clone()),
                 agent_id: None,
                 team_id: Some(team_id.clone()),
                 mission_id: Some("mission-eval".to_string()),
@@ -75,7 +68,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
                 profile_id: AutonomyProfileId::Stewarded,
                 source: ApprovalSource {
                     kind: ApprovalSourceKind::Steward,
-                    session_id: Some(session.session_id.clone()),
+                    session_id: Some(session_id.clone()),
                     agent_id: None,
                     team_id: Some(team_id.clone()),
                     mission_id: Some("mission-eval".to_string()),
@@ -101,7 +94,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
     let event_store = RuntimeEventStore::open_in_memory().expect("event store opens");
     event_store
         .append(RuntimeEventInput {
-            stream_id: format!("session:{}", session.session_id),
+            stream_id: format!("session:{session_id}"),
             scope: RuntimeEventScope::Session,
             kind: "mission_harness.eval.completed".to_string(),
             status: Some("completed".to_string()),
@@ -116,7 +109,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
         .expect("event appends");
     assert_eq!(
         event_store
-            .list_stream(&format!("session:{}", session.session_id))
+            .list_stream(&format!("session:{session_id}"))
             .expect("stream")
             .len(),
         1
@@ -154,7 +147,7 @@ fn mission_harness_quick_eval_covers_core_runtime_loop_and_writes_report() {
             CapabilityResult {
                 capability: "mission_session",
                 status: "passed",
-                evidence: session.session_id,
+                evidence: session_id,
             },
             CapabilityResult {
                 capability: "team_runtime",

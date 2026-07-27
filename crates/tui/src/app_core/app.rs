@@ -436,6 +436,9 @@ pub struct App {
     pub gateway_fact_flow: Option<FactFlowSummary>,
     /// Mission Runtime global control summary observed through Gateway projection API.
     pub gateway_mission_control: Option<MissionControlSummary>,
+    /// Typed Mission materialized view used to apply cursor/revision deltas.
+    pub gateway_mission_materialized:
+        Option<harness_contract::mission::MissionMaterializedSnapshot>,
     /// Connector-specific degraded reasons observed through the Gateway API API.
     pub gateway_connector_degraded_reasons: Vec<String>,
     /// Degraded Gateway API/control reasons collected during snapshot refresh.
@@ -803,6 +806,7 @@ impl App {
             gateway_reality_core: None,
             gateway_fact_flow: None,
             gateway_mission_control: None,
+            gateway_mission_materialized: None,
             gateway_connector_degraded_reasons: Vec::new(),
             gateway_degraded_reasons: Vec::new(),
             gateway_lease_owner: None,
@@ -3905,10 +3909,25 @@ impl App {
                 }
                 self.mark_dirty();
             }
-            CowdEvent::MissionProjectionSnapshot { projection, .. } => {
+            CowdEvent::MissionProjectionSnapshot {
+                snapshot: materialized,
+                ..
+            } => {
                 let mut snapshot =
                     crate::runtime_control_store::RuntimeControlSnapshot::from_app(self);
-                snapshot.ingest_mission_projection(&projection);
+                snapshot.ingest_mission_snapshot(materialized);
+                snapshot.apply_to_app(self);
+                self.mark_dirty();
+            }
+            CowdEvent::MissionProjectionDelta { delta, .. } => {
+                let mut snapshot =
+                    crate::runtime_control_store::RuntimeControlSnapshot::from_app(self);
+                if !snapshot.ingest_mission_delta(&delta) {
+                    self.add_system_notice(
+                        SystemNoticeKind::Warning,
+                        "Mission projection delta requires a fresh snapshot",
+                    );
+                }
                 snapshot.apply_to_app(self);
                 self.mark_dirty();
             }
