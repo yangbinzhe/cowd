@@ -1,5 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod evolution_test_support;
+
 use std::{
     fs,
     sync::Arc,
@@ -8,6 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use evolution_test_support::HumanAuthority;
 use harness_contract::{
     agent::{
         AgentCapability, AgentCapabilityContract, AgentCognitivePolicy, AgentDefinitionId,
@@ -17,6 +20,7 @@ use harness_contract::{
         RevisionSelector,
     },
     evaluation::{EvaluationContract, EvaluationMetricSpec},
+    reality::EvidenceRef,
     security::{
         DecisionLeaseClaims, PrincipalAssurance, PrincipalClaims, PrincipalKind,
         SignedDecisionLease, SignedPrincipalEnvelope,
@@ -80,7 +84,7 @@ impl EvolutionEvalRunner for EligibleRunner {
                 },
             ],
             source_run_refs: vec!["agent-run:paired".to_string()],
-            evidence_refs: vec!["evidence:paired".to_string()],
+            evidence_refs: vec![EvidenceRef::new("evaluation", "paired")],
             created_at_ms: 1,
         })
     }
@@ -237,9 +241,38 @@ fn human_lease(review: &ReleaseChangeReview) -> (VerifiedPrincipal, VerifiedDeci
 #[tokio::test]
 async fn stable_requires_approved_canary_and_eligible_observation_before_human_promotion() {
     let (_root, services, definition_id) = services();
+    let signal = services
+        .record_evolution_signal(runtime::EvolutionSignal::eval_failure(
+            "stable-review",
+            vec![EvidenceRef::new("agent_run", "baseline")],
+        ))
+        .expect("signal");
+    let proposal = services
+        .create_evolution_lifecycle(vec![signal.signal_id])
+        .expect("proposal")
+        .proposal;
+    let authority = HumanAuthority::new();
+    let proposal_digest = services
+        .evolution_proposal_decision_digest(&proposal.proposal_id, "approved")
+        .expect("proposal digest");
+    let proposal_lease = authority.lease_for_expectation(DecisionLeaseExpectation::new(
+        format!("evolution-proposal:{}", proposal.proposal_id),
+        "proposal.decision.approved",
+        format!("evolution.proposal:{}", proposal.proposal_id),
+        proposal_digest,
+    ));
+    services
+        .decide_evolution_proposal(
+            authority.principal(),
+            &proposal_lease,
+            &proposal.proposal_id,
+            "approved",
+        )
+        .expect("proposal approved");
     let candidate = services
         .register_evolution_candidate(EvolutionCandidateIntent {
             candidate_id: "candidate-stable-v2".to_string(),
+            proposal_id: proposal.proposal_id,
             subject: EvolutionCandidateSubject::AgentDefinition {
                 revision_ref: harness_contract::agent::AgentDefinitionRevisionRef::new(
                     definition_id.clone(),
@@ -248,7 +281,7 @@ async fn stable_requires_approved_canary_and_eligible_observation_before_human_p
                 .expect("revision"),
             },
             baseline_revision: 1,
-            source_evidence_refs: vec!["evidence:baseline".to_string()],
+            source_evidence_refs: vec![EvidenceRef::new("agent_run", "baseline")],
             canary_policy: CanaryRolloutPolicy {
                 traffic_basis_points: 10_000,
                 minimum_samples: 1,
@@ -288,7 +321,7 @@ async fn stable_requires_approved_canary_and_eligible_observation_before_human_p
             canary_assignment_id: canary.assignment_id,
             generation: canary.generation,
             source_run_refs: vec!["agent-run:canary-1".to_string()],
-            evidence_refs: vec!["evidence:canary-1".to_string()],
+            evidence_refs: vec![EvidenceRef::new("canary_evaluation", "canary-1")],
             sample_count: 1,
             minimum_samples: 1,
             observed_duration_ms: 1,

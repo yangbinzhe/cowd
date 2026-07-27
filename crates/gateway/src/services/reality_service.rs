@@ -1151,11 +1151,11 @@ fn fact_flow_stages(
         }));
         for evidence in &event.evidence_refs {
             stages.push(serde_json::json!({
-                "stage_id": format!("evidence:{}:{}", event.id, evidence.reference),
+                "stage_id": format!("evidence:{}:{}", event.id, evidence.reference()),
                 "kind": "evidence",
                 "status": "attached",
                 "summary": evidence.summary,
-                "source_ref": evidence.reference,
+                "source_ref": evidence.reference(),
                 "target_ref": event.id,
                 "evidence_refs": [evidence],
                 "decision": null,

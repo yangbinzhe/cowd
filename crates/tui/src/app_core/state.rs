@@ -3062,12 +3062,15 @@ impl TuiState {
             KeyCode::Char('v') => {
                 self.queue_gateway_api(
                     move |client| async move {
-                        let signals = client.evolution_signals().await?;
-                        let diagnoses = client.evolution_diagnoses().await?;
-                        let missions = client.evolution_missions_summary().await?;
-                        let proposals = client.evolution_proposals().await?;
-                        let candidates = client.evolution_candidates().await?;
-                        let reviews = client.evolution_reviews().await?;
+                        let (signals, diagnoses, missions, proposals, candidates, reviews) =
+                            tokio::try_join!(
+                                client.evolution_signals(),
+                                client.evolution_diagnoses(),
+                                client.evolution_missions_summary(),
+                                client.evolution_proposals(),
+                                client.evolution_candidates(),
+                                client.evolution_reviews(),
+                            )?;
                         Ok(serde_json::json!({
                             "kind": "evolution.overview",
                             "signals": signals,

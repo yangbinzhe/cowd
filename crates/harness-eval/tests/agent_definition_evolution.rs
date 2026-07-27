@@ -164,9 +164,12 @@ fn observation(
         succeeded: candidate,
         acceptance_total: 1,
         acceptance_satisfied: 1,
-        evidence_refs: vec![format!(
-            "evidence:{candidate_id}:{}:{sample_index}",
-            if candidate { "candidate" } else { "baseline" }
+        evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+            "evaluation",
+            format!(
+                "{candidate_id}:{}:{sample_index}",
+                if candidate { "candidate" } else { "baseline" }
+            ),
         )],
         input_tokens: 10,
         output_tokens: 10,
@@ -180,6 +183,7 @@ fn candidate() -> EvolutionGovernanceCandidate {
         .expect("definition id");
     EvolutionGovernanceCandidate {
         candidate_id: "workspace/cowd/eval-agent@2".to_string(),
+        proposal_id: "proposal-eval-agent-v2".to_string(),
         subject: EvolutionCandidateSubject::AgentDefinition {
             revision_ref: AgentDefinitionRevisionRef::new(definition_id, 2).expect("revision"),
         },
@@ -189,7 +193,9 @@ fn candidate() -> EvolutionGovernanceCandidate {
             "task_success",
         ),
         evaluation_policy_floor: EvaluationPolicyFloor::default(),
-        source_evidence_refs: vec!["source:baseline".to_string()],
+        source_evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+            "source", "baseline",
+        )],
         canary_policy: CanaryRolloutPolicy::default(),
         lifecycle: EvolutionCandidateLifecycle::Draft,
         comparison_report_ref: None,

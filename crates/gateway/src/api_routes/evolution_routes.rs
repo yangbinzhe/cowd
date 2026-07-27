@@ -11,14 +11,12 @@ use axum::{
     Json, Router,
 };
 
+use super::{
+    api_error, issue_human_decision_lease, AppState, AuthenticatedPrincipal, ErrorResponse,
+};
 use crate::services::{
     EvolutionProposalCreateRequest, EvolutionProposalDecisionRequest, EvolutionServiceError,
     EvolutionSignalCreateRequest,
-};
-use sha2::{Digest, Sha256};
-
-use super::{
-    api_error, issue_human_decision_lease, AppState, AuthenticatedPrincipal, ErrorResponse,
 };
 
 fn require_evolution_release_principal(
@@ -32,46 +30,6 @@ fn require_evolution_release_principal(
         StatusCode::FORBIDDEN,
         "evolution_release_human_interactive_capability_required",
     ))
-}
-
-/// The discovery proposal decision is not a release decision. It consumes a
-/// short-lived broker lease before changing the proposal's own local status;
-/// Definition rollout remains exclusively in Runtime's typed review service.
-fn consume_evolution_decision_lease(
-    state: &AppState,
-    principal: &AuthenticatedPrincipal,
-    review_id: impl Into<String>,
-    action: impl Into<String>,
-    scope: impl Into<String>,
-    evidence: &serde_json::Value,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let verified = issue_evolution_decision_lease(
-        state,
-        principal,
-        review_id,
-        action,
-        scope,
-        evidence_digest(evidence)?,
-    )?;
-    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "runtime_decision_lease_store_unavailable",
-        )
-    })?;
-    runtime
-        .runtime_services()
-        .consume_verified_decision_lease(verified)
-        .map_err(|error| {
-            if error.contains("already been consumed") {
-                api_error(StatusCode::CONFLICT, "decision_lease_already_consumed")
-            } else {
-                api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "runtime_decision_lease_store_unavailable",
-                )
-            }
-        })
 }
 
 /// Issue and verify a one-time lease without consuming it. Typed Runtime
@@ -121,18 +79,6 @@ fn issue_evolution_decision_lease(
         )
         .map_err(|_| api_error(StatusCode::FORBIDDEN, "decision_lease_verification_failed"))?;
     Ok(verified)
-}
-
-fn evidence_digest(
-    evidence: &serde_json::Value,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    let evidence_bytes = serde_json::to_vec(evidence).map_err(|_| {
-        api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "evolution_decision_evidence_serialization_failed",
-        )
-    })?;
-    Ok(format!("sha256:{:x}", Sha256::digest(evidence_bytes)))
 }
 
 fn runtime_services(
@@ -248,10 +194,11 @@ pub(super) fn router() -> Router<Arc<AppState>> {
 async fn evolution_missions_summary_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .mission_summary(&state.config_home)
+        .mission_summary(&runtime)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -260,10 +207,11 @@ async fn evolution_mission_detail_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .mission_detail(&state.config_home, &id)
+        .mission_detail(&runtime, &id)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -271,10 +219,11 @@ async fn evolution_mission_detail_handler(
 async fn evolution_signals_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .signals(&state.config_home)
+        .signals(&runtime)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -283,10 +232,11 @@ async fn evolution_signal_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<EvolutionSignalCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .create_signal(&state.config_home, request)
+        .create_signal(&runtime, request)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -294,10 +244,11 @@ async fn evolution_signal_create_handler(
 async fn evolution_proposals_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .proposals(&state.config_home)
+        .proposals(&runtime)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -305,10 +256,11 @@ async fn evolution_proposals_handler(
 async fn evolution_diagnoses_handler(
     AxumState(state): AxumState<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .diagnoses(&state.config_home)
+        .diagnoses(&runtime)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -317,10 +269,11 @@ async fn evolution_diagnosis_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<EvolutionProposalCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .create_diagnosis(&state.config_home, request)
+        .create_diagnosis(&runtime, request)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -329,10 +282,11 @@ async fn evolution_proposal_create_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Json(request): Json<EvolutionProposalCreateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .create_proposal(&state.config_home, request)
+        .create_proposal(&runtime, request)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -341,10 +295,11 @@ async fn evolution_proposal_detail_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .proposal_detail(&state.config_home, &id)
+        .proposal_detail(&runtime, &id)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -353,10 +308,11 @@ async fn evolution_chain_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     state
         .services
         .evolution
-        .chain(&state.config_home, &id)
+        .chain(&runtime, &id)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -367,35 +323,47 @@ async fn evolution_proposal_decision_handler(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<EvolutionProposalDecisionRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let proposal = state
-        .services
-        .evolution
-        .proposal_model(&state.config_home, &id)
-        .map_err(evolution_error)?;
-    consume_evolution_decision_lease(
+    let services = runtime_services(&state)?;
+    let decision = request.decision.trim();
+    if !matches!(decision, "approved" | "rejected" | "archived") {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "decision must be approved, rejected, or archived",
+        ));
+    }
+    let digest = services
+        .evolution_proposal_decision_digest(&id, decision)
+        .map_err(runtime_evolution_error)?;
+    let lease = issue_evolution_decision_lease(
         &state,
         &principal,
         format!("evolution-proposal:{id}"),
-        format!("proposal.decision.{}", request.decision.trim()),
+        format!("proposal.decision.{decision}"),
         format!("evolution.proposal:{id}"),
-        &serde_json::json!({"proposal": proposal, "decision": request.decision}),
+        digest,
     )?;
-    state
-        .services
-        .evolution
-        .decide_proposal(&state.config_home, &id, request)
-        .map(Json)
-        .map_err(evolution_error)
+    services
+        .decide_evolution_proposal(&principal.0, &lease, &id, decision)
+        .map(|proposal| {
+            Json(serde_json::json!({
+                "kind": "evolution.proposal_decision",
+                "owner": "runtime",
+                "proposal": proposal,
+                "mainline_modified": false,
+            }))
+        })
+        .map_err(runtime_evolution_error)
 }
 
 async fn evolution_skill_draft_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
     let proposal = state
         .services
         .evolution
-        .proposal_model(&state.config_home, &id)
+        .proposal_model(&runtime, &id)
         .map_err(evolution_error)?;
     Ok(Json(state.services.skill.evolution_skill_draft(&proposal)))
 }
@@ -420,9 +388,10 @@ async fn evolution_candidates_handler(
 #[serde(deny_unknown_fields)]
 struct EvolutionCandidateRegistrationRequest {
     candidate_id: String,
+    proposal_id: String,
     subject: runtime::EvolutionCandidateSubject,
     baseline_revision: u64,
-    source_evidence_refs: Vec<String>,
+    source_evidence_refs: Vec<harness_contract::reality::EvidenceRef>,
     #[serde(default)]
     canary_policy: runtime::CanaryRolloutPolicy,
 }
@@ -435,6 +404,7 @@ async fn evolution_candidate_create_handler(
     services
         .register_evolution_candidate(runtime::EvolutionCandidateIntent {
             candidate_id: request.candidate_id,
+            proposal_id: request.proposal_id,
             subject: request.subject,
             baseline_revision: request.baseline_revision,
             source_evidence_refs: request.source_evidence_refs,
@@ -525,10 +495,10 @@ struct EvolutionReleaseChangeRequest {
     action: runtime::ReleaseChangeAction,
     selector: Option<harness_contract::agent::RevisionSelector>,
     candidate_id: Option<String>,
-    evidence_refs: Vec<String>,
+    evidence_refs: Vec<harness_contract::reality::EvidenceRef>,
 }
 
-/// Human-initiated pointer, rollback, initial-stable, and Canary-stop actions
+/// Human-initiated pointer, rollback, and Canary-stop actions
 /// all enter Runtime as pending reviews. This endpoint cannot decide or
 /// materialize a release; it only queues an auditable request.
 async fn evolution_release_change_request_handler(
@@ -648,7 +618,7 @@ async fn evolution_evaluation_policy_reviews_handler(
 struct EvaluationPolicyChangeRequest {
     request_id: String,
     next_policy: harness_contract::evaluation::EvaluationPolicyFloor,
-    evidence_refs: Vec<String>,
+    evidence_refs: Vec<harness_contract::reality::EvidenceRef>,
 }
 
 async fn evolution_evaluation_policy_change_request_handler(

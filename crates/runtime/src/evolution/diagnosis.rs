@@ -1,9 +1,4 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
-};
-
+use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -45,14 +40,29 @@ pub struct EvolutionDiagnosis {
     pub affected_owner: String,
     pub affected_files_or_modules: Vec<String>,
     pub symptoms: Vec<String>,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
     pub source_signal_ids: Vec<String>,
+    pub competing_hypotheses: Vec<EvolutionHypothesis>,
     pub impact: String,
     pub recurrence: usize,
     pub recommended_candidate_kind: String,
     pub acceptance_gates: Vec<String>,
     pub risk_boundaries: Vec<String>,
     pub created_at_ms: u128,
+}
+
+/// One falsifiable explanation retained with a diagnosis.
+///
+/// Competing explanations are first-class so a proposal cannot turn one
+/// plausible narrative into an unchallenged causal claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvolutionHypothesis {
+    pub hypothesis_id: String,
+    pub statement: String,
+    pub supporting_evidence: Vec<EvidenceRef>,
+    pub contradicting_evidence: Vec<EvidenceRef>,
+    pub unknowns: Vec<String>,
+    pub falsification_experiment: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,6 +102,7 @@ impl EvolutionDiagnosisEngine {
             symptoms,
             evidence_refs,
             source_signal_ids,
+            competing_hypotheses: hypotheses_for(&root_cause_kind, signals),
             impact: impact_for(&root_cause_kind, signals),
             recurrence,
             recommended_candidate_kind: recommended_candidate_kind(&root_cause_kind).to_string(),
@@ -107,60 +118,52 @@ impl EvolutionDiagnosisEngine {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct EvolutionDiagnosisStore {
-    path: PathBuf,
-}
-
-impl EvolutionDiagnosisStore {
-    #[must_use]
-    pub fn new(root: impl AsRef<Path>) -> Self {
-        Self {
-            path: root.as_ref().join("diagnoses.jsonl"),
-        }
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn append(&self, diagnosis: &EvolutionDiagnosis) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|error| error.to_string())?;
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(diagnosis).map_err(|error| error.to_string())?
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    pub fn list(&self) -> Result<Vec<EvolutionDiagnosis>, String> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = fs::File::open(&self.path).map_err(|error| error.to_string())?;
-        let mut diagnoses = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|error| error.to_string())?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            diagnoses.push(
-                serde_json::from_str::<EvolutionDiagnosis>(&line)
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        diagnoses.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
-        Ok(diagnoses)
-    }
+fn hypotheses_for(
+    root_cause: &EvolutionRootCauseKind,
+    signals: &[EvolutionSignal],
+) -> Vec<EvolutionHypothesis> {
+    let evidence = signals
+        .iter()
+        .flat_map(|signal| signal.evidence_refs.clone())
+        .collect::<Vec<_>>();
+    vec![
+        EvolutionHypothesis {
+            hypothesis_id: format!("primary:{}", root_cause.as_str()),
+            statement: format!(
+                "The recurring symptoms are caused by {}",
+                root_cause.as_str()
+            ),
+            supporting_evidence: evidence,
+            contradicting_evidence: Vec::new(),
+            unknowns: vec![
+                "Whether the same failure reproduces under an isolated baseline".to_string(),
+                "Whether an upstream provider, tool, or data dependency explains the symptoms"
+                    .to_string(),
+            ],
+            falsification_experiment:
+                "Run the same bounded scenario against the current baseline and one isolated candidate; reject this hypothesis if the symptom does not reproduce or the candidate does not improve it."
+                    .to_string(),
+        },
+        EvolutionHypothesis {
+            hypothesis_id: "alternative:transient_external_condition".to_string(),
+            statement:
+                "The symptoms are transient or caused by an external dependency rather than the proposed owner"
+                    .to_string(),
+            supporting_evidence: Vec::new(),
+            contradicting_evidence: signals
+                .iter()
+                .filter(|signal| signal.severity == EvolutionSignalSeverity::Critical)
+                .flat_map(|signal| signal.evidence_refs.clone())
+                .collect(),
+            unknowns: vec![
+                "External dependency health at the exact source-event time".to_string(),
+                "Cross-run recurrence outside the affected owner".to_string(),
+            ],
+            falsification_experiment:
+                "Replay the frozen scenario with external dependencies held constant; reject this alternative when the failure remains attributable to the same owner."
+                    .to_string(),
+        },
+    ]
 }
 
 fn dominant_root_cause(signals: &[EvolutionSignal]) -> EvolutionRootCauseKind {
@@ -319,8 +322,11 @@ mod tests {
 
     #[test]
     fn diagnosis_classifies_memory_noise_and_sets_gates() {
-        let signal =
-            EvolutionSignal::memory_noise("runtime", "session-1", vec!["memory:noise".into()]);
+        let signal = EvolutionSignal::memory_noise(
+            "runtime",
+            "session-1",
+            vec![EvidenceRef::new("memory", "memory:noise")],
+        );
         let diagnosis = EvolutionDiagnosisEngine::diagnose(&[signal]);
 
         assert_eq!(
@@ -333,5 +339,10 @@ mod tests {
             .iter()
             .any(|gate| gate.contains("memory recall contamination")));
         assert_eq!(diagnosis.recurrence, 1);
+        assert_eq!(diagnosis.competing_hypotheses.len(), 2);
+        assert!(diagnosis
+            .competing_hypotheses
+            .iter()
+            .all(|hypothesis| !hypothesis.falsification_experiment.is_empty()));
     }
 }

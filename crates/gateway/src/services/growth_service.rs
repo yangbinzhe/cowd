@@ -612,8 +612,8 @@ fn growth_memory_assertion_fingerprint(
         .map(|reference| {
             format!(
                 "{}:{}:{}",
-                normalize_memory_text(&reference.kind),
-                normalize_memory_text(&reference.reference),
+                normalize_memory_text(reference.kind()),
+                normalize_memory_text(reference.reference()),
                 normalize_memory_text(&reference.summary)
             )
         })

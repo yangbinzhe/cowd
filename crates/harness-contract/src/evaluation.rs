@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::definition::validate_reference;
 use crate::agent::ValidationError;
+use crate::reality::EvidenceRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -211,7 +212,7 @@ pub struct EvaluationScenarioObservation {
     pub succeeded: bool,
     pub acceptance_total: u32,
     pub acceptance_satisfied: u32,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub tool_calls: u64,

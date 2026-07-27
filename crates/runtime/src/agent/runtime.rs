@@ -787,7 +787,6 @@ impl AgentRuntime {
         terminal.failure = returned.failure.clone();
         let evaluation =
             AgentRunEvaluation::from_terminal(&packet, &returned, terminal.updated_at_ms);
-        let evolution_trigger = evaluation.clone();
         let refresh_canary_observation = evaluation.as_ref().is_some_and(|evaluation| {
             evaluation.release_channel == Some(harness_contract::agent::ReleaseChannel::Canary)
         });
@@ -812,48 +811,6 @@ impl AgentRuntime {
                         error = %error,
                         "failed to refresh replayable Canary observation"
                     );
-                }
-            }
-        }
-        if packet
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.evaluation.as_ref())
-            .is_none()
-        {
-            if let (Some(services), Some(evaluation)) = (self.services(), evolution_trigger) {
-                let execution_supervisor = Arc::clone(services.execution_supervisor());
-                if let Err(error) = execution_supervisor
-                    .spawn_owned("evolution_observer", async move {
-                        match services.consider_agent_evolution(&evaluation) {
-                            Ok(Some(candidate)) => {
-                                match services
-                                    .evaluate_evolution_candidate(&candidate.candidate_id)
-                                    .await
-                                {
-                                    Ok(evaluated)
-                                        if evaluated.lifecycle
-                                            == crate::EvolutionCandidateLifecycle::EvaluatedEligible =>
-                                    {
-                                        if let Err(error) = services
-                                            .request_evolution_canary_review(&candidate.candidate_id)
-                                        {
-                                            tracing::warn!(candidate_id = %candidate.candidate_id, error = %error, "automatic evolution candidate could not enter human Canary review");
-                                        }
-                                    }
-                                    Ok(_) => {}
-                                    Err(error) => tracing::warn!(candidate_id = %candidate.candidate_id, error = %error, "automatic evolution candidate evaluation failed"),
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                tracing::warn!(evaluation_id = %evaluation.evaluation_id, error = %error, "automatic Agent evolution planning failed")
-                            }
-                        }
-                    })
-                    .await
-                {
-                    tracing::warn!(%error, "Runtime execution supervisor rejected evolution observer");
                 }
             }
         }

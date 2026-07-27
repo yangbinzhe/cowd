@@ -3,6 +3,7 @@
 mod evolution_test_support;
 
 use evolution_test_support::{fixture, register_and_evaluate, HumanAuthority, CANDIDATE_ID};
+use harness_contract::reality::EvidenceRef;
 use runtime::{
     ReleaseChangeAction, ReleaseChangeRequest, ReleaseChangeReviewDecision,
     ReleaseChangeReviewStatus,
@@ -18,27 +19,27 @@ async fn release_generation_fence_rejects_a_stale_canary_review_without_partial_
         .expect("pending canary review");
     let authority = HumanAuthority::new();
 
-    let initial_stable = fixture
+    let pointer_review = fixture
         .services
         .request_evolution_release_change(ReleaseChangeRequest {
-            request_id: "publish-stable-before-stale-canary".to_string(),
+            request_id: "advance-generation-before-stale-canary".to_string(),
             subject: candidate.subject.clone(),
-            action: ReleaseChangeAction::PublishInitialStable,
+            action: ReleaseChangeAction::SetDefaultLatest,
             selector: None,
             candidate_id: None,
-            evidence_refs: vec!["audit:initial-stable".to_string()],
+            evidence_refs: vec![EvidenceRef::new("audit", "advance-generation")],
         })
-        .expect("initial stable review");
+        .expect("pointer review");
     fixture
         .services
         .decide_evolution_release_review(
             authority.principal(),
-            &authority.lease_for(&initial_stable),
-            &initial_stable.review_id,
+            &authority.lease_for(&pointer_review),
+            &pointer_review.review_id,
             ReleaseChangeReviewDecision::Approve,
             "advance release generation through a separate reviewed action".to_string(),
         )
-        .expect("initial stable decision");
+        .expect("pointer decision");
 
     assert!(fixture
         .services

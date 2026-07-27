@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures::FutureExt;
 use harness_contract::agent::{
     AgentEvaluationBinding, AgentReleaseBinding, AgentTaskIntent, AgentTaskPacket,
-    AgentTerminalStatus, DefinitionScope, ReleaseChannel, RevisionLifecycle, RevisionSelector,
+    AgentTerminalStatus, ReleaseChannel, RevisionSelector,
 };
 use harness_contract::context::ContextBudgetLeaseRef;
 use harness_contract::evaluation::{EvaluationScenarioObservation, EvaluationScenarioSpec};
@@ -891,6 +891,7 @@ impl RuntimeServicesBuilder {
             .map_err(RuntimeServicesError::AgentRuntime)?;
         services.materialize_evolution_release_assignments()?;
         services.knowledge_candidate_projector.start();
+        services.evolution_signal_projector.start();
         services
             .team_runtime()
             .import_legacy_state_file(&legacy_team_state_path)
@@ -930,6 +931,8 @@ pub struct RuntimeServices {
     execution_supervisor: Arc<crate::RuntimeExecutionSupervisor>,
     approval_queue: Arc<ApprovalQueue>,
     evolution_governance: Arc<crate::EvolutionGovernanceService>,
+    evolution_discovery: Arc<crate::evolution::EvolutionDiscoveryService>,
+    evolution_signal_projector: Arc<crate::evolution::EvolutionSignalProjector>,
     mission_evidence: Arc<MissionEvidenceBus>,
     conflict_resolver: Arc<ConflictArbiter>,
     resource_manager: Arc<ExecutionResourceManager>,
@@ -1059,6 +1062,7 @@ impl RuntimeServices {
             .map_err(RuntimeServicesError::AgentRuntime)?;
         services.materialize_evolution_release_assignments()?;
         services.knowledge_candidate_projector.start();
+        services.evolution_signal_projector.start();
         Ok(services)
     }
 
@@ -1119,6 +1123,13 @@ impl RuntimeServices {
         let evolution_governance = Arc::new(crate::EvolutionGovernanceService::new(
             Arc::clone(&event_store),
             Arc::clone(&approval_queue),
+        ));
+        let evolution_discovery = Arc::new(crate::evolution::EvolutionDiscoveryService::new(
+            Arc::clone(&event_store),
+        ));
+        let evolution_signal_projector = Arc::new(crate::evolution::EvolutionSignalProjector::new(
+            Arc::clone(&event_store),
+            Arc::clone(&evolution_discovery),
         ));
         install_builtin_executors(
             &executor_registry,
@@ -1244,6 +1255,8 @@ impl RuntimeServices {
             execution_supervisor,
             approval_queue,
             evolution_governance,
+            evolution_discovery,
+            evolution_signal_projector,
             mission_evidence,
             conflict_resolver,
             resource_manager,
@@ -1375,6 +1388,7 @@ impl RuntimeServices {
 
     /// Stop accepting detached maintenance and await every retained task.
     pub async fn shutdown_maintenance(&self) {
+        self.evolution_signal_projector.shutdown().await;
         self.knowledge_candidate_projector.shutdown().await;
         self.maintenance_supervisor.shutdown_and_drain().await;
     }
@@ -1837,149 +1851,6 @@ impl RuntimeServices {
         self.agent_runtime.self_models()
     }
 
-    /// Convert repeated, attributable Agent failures into an immutable
-    /// Definition revision and governed Draft candidate. This never changes a
-    /// release pointer and never grants its own review approval.
-    pub fn consider_agent_evolution(
-        &self,
-        trigger: &crate::AgentRunEvaluation,
-    ) -> Result<Option<crate::EvolutionGovernanceCandidate>, RuntimeServicesError> {
-        if trigger.is_success() {
-            return Ok(None);
-        }
-        let definition_id =
-            harness_contract::agent::AgentDefinitionId::try_from(trigger.definition_id.as_str())
-                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        if definition_id.scope() == DefinitionScope::Builtin {
-            return Ok(None);
-        }
-        let relevant = self
-            .agent_runtime
-            .evaluations()
-            .into_iter()
-            .filter(|evaluation| {
-                evaluation.definition_id == trigger.definition_id
-                    && evaluation.definition_revision == trigger.definition_revision
-                    && evaluation.environment_fingerprint == trigger.environment_fingerprint
-            })
-            .collect::<Vec<_>>();
-        let failures = relevant
-            .iter()
-            .filter(|evaluation| !evaluation.is_success())
-            .collect::<Vec<_>>();
-        if relevant.len() < 3 || failures.len() < 2 {
-            return Ok(None);
-        }
-        let success_count = relevant.len().saturating_sub(failures.len());
-        if success_count.saturating_mul(1_000) / relevant.len() >= 700 {
-            return Ok(None);
-        }
-        if self
-            .evolution_governance
-            .list_candidates()
-            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?
-            .into_iter()
-            .any(|candidate| {
-                candidate.baseline_revision == trigger.definition_revision
-                    && matches!(
-                        &candidate.subject,
-                        crate::EvolutionCandidateSubject::AgentDefinition { revision_ref }
-                            if revision_ref.definition_id == definition_id
-                    )
-                    && !matches!(
-                        candidate.lifecycle,
-                        crate::EvolutionCandidateLifecycle::Withdrawn
-                            | crate::EvolutionCandidateLifecycle::Superseded
-                            | crate::EvolutionCandidateLifecycle::Archived
-                    )
-            })
-        {
-            return Ok(None);
-        }
-
-        let baseline_ref = harness_contract::agent::AgentDefinitionRevisionRef::new(
-            definition_id.clone(),
-            trigger.definition_revision,
-        )
-        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        let baseline = self
-            .definition_registry
-            .agents()
-            .read_revision(&baseline_ref)
-            .map_err(DefinitionRegistryError::Agent)?;
-        let next_revision = self
-            .definition_registry
-            .agents()
-            .list_revisions(&definition_id)
-            .map_err(DefinitionRegistryError::Agent)?
-            .into_iter()
-            .map(|stored| stored.revision.revision_ref.revision)
-            .max()
-            .unwrap_or(trigger.definition_revision)
-            .saturating_add(1);
-        let mut failure_patterns = failures
-            .iter()
-            .filter_map(|evaluation| evaluation.failure.as_deref())
-            .map(|failure| failure.split_whitespace().collect::<Vec<_>>().join(" "))
-            .filter(|failure| !failure.is_empty())
-            .collect::<Vec<_>>();
-        failure_patterns.sort();
-        failure_patterns.dedup();
-        failure_patterns.truncate(8);
-        let mut instructions = baseline.agent_markdown.trim_end().to_string();
-        instructions.push_str("\n\n## Runtime-generated improvement candidate\n\n");
-        instructions.push_str(
-            "This revision is an unelevated candidate. Preserve the established role and contracts, while explicitly preventing the recurring failures below. Require evidence before claiming completion and surface unresolved constraints instead of fabricating success.\n",
-        );
-        for pattern in &failure_patterns {
-            instructions.push_str("- ");
-            instructions.push_str(&pattern.chars().take(500).collect::<String>());
-            instructions.push('\n');
-        }
-        if failure_patterns.is_empty() {
-            instructions.push_str("- Repeated terminal failures lacked a structured failure message; preserve diagnostic evidence and report the unresolved cause.\n");
-        }
-        let mut manifest = baseline.revision.manifest;
-        manifest.revision = next_revision;
-        manifest.lifecycle = RevisionLifecycle::Published;
-        manifest.instructions_digest = format!("{:x}", Sha256::digest(instructions.as_bytes()));
-        let stored = self
-            .definition_registry
-            .agents()
-            .store_revision(manifest, &instructions)
-            .map_err(DefinitionRegistryError::Agent)?;
-        let evidence_refs = failures
-            .iter()
-            .rev()
-            .take(10)
-            .map(|evaluation| evaluation.evaluation_id.clone())
-            .collect::<Vec<_>>();
-        let candidate_seed = format!(
-            "{}:{}:{}:{}",
-            definition_id.as_str(),
-            trigger.definition_revision,
-            next_revision,
-            trigger.environment_fingerprint
-        );
-        let candidate_id = format!(
-            "auto-agent-{}",
-            format!("{:x}", Sha256::digest(candidate_seed.as_bytes()))
-                .chars()
-                .take(20)
-                .collect::<String>()
-        );
-        self.register_evolution_candidate(crate::EvolutionCandidateIntent {
-            candidate_id,
-            subject: crate::EvolutionCandidateSubject::AgentDefinition {
-                revision_ref: stored.revision.revision_ref,
-            },
-            baseline_revision: trigger.definition_revision,
-            source_evidence_refs: evidence_refs,
-            canary_policy: crate::CanaryRolloutPolicy::default(),
-        })
-        .map(Some)
-    }
-
     /// Recompute all active Canary observations from the canonical terminal
     /// Agent evidence. The method is intentionally idempotent and does not
     /// authorize Stable promotion; it only refreshes the evidence consumed by
@@ -2015,6 +1886,118 @@ impl RuntimeServices {
     /// Runtime is the single owner of evolution candidates, evaluation
     /// eligibility and release-change review projections. Gateway and
     /// surfaces consume this service rather than keeping a second registry.
+    pub fn record_evolution_signal(
+        &self,
+        signal: crate::EvolutionSignal,
+    ) -> Result<crate::EvolutionSignal, RuntimeServicesError> {
+        self.evolution_discovery
+            .record_signal(signal)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_signals(&self) -> Result<Vec<crate::EvolutionSignal>, RuntimeServicesError> {
+        self.evolution_discovery
+            .list_signals()
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn create_evolution_diagnosis(
+        &self,
+        signal_ids: Vec<String>,
+    ) -> Result<crate::EvolutionDiagnosis, RuntimeServicesError> {
+        self.evolution_discovery
+            .create_diagnosis(signal_ids)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_diagnoses(
+        &self,
+    ) -> Result<Vec<crate::EvolutionDiagnosis>, RuntimeServicesError> {
+        self.evolution_discovery
+            .list_diagnoses()
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_diagnosis(
+        &self,
+        diagnosis_id: &str,
+    ) -> Result<Option<crate::EvolutionDiagnosis>, RuntimeServicesError> {
+        self.evolution_discovery
+            .diagnosis(diagnosis_id)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn create_evolution_lifecycle(
+        &self,
+        signal_ids: Vec<String>,
+    ) -> Result<crate::EvolutionLifecycleDraft, RuntimeServicesError> {
+        self.evolution_discovery
+            .create_lifecycle(signal_ids)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_missions(&self) -> Result<Vec<crate::EvolutionMission>, RuntimeServicesError> {
+        self.evolution_discovery
+            .list_missions()
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_mission(
+        &self,
+        mission_id: &str,
+    ) -> Result<Option<crate::EvolutionMission>, RuntimeServicesError> {
+        self.evolution_discovery
+            .mission(mission_id)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_proposals(
+        &self,
+    ) -> Result<Vec<crate::EvolutionProposal>, RuntimeServicesError> {
+        self.evolution_discovery
+            .list_proposals()
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<Option<crate::EvolutionProposal>, RuntimeServicesError> {
+        self.evolution_discovery
+            .proposal(proposal_id)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_proposal_decision_digest(
+        &self,
+        proposal_id: &str,
+        decision: &str,
+    ) -> Result<String, RuntimeServicesError> {
+        self.evolution_discovery
+            .proposal_decision_digest(proposal_id, decision)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn decide_evolution_proposal(
+        &self,
+        principal: &crate::VerifiedPrincipal,
+        lease: &crate::VerifiedDecisionLease,
+        proposal_id: &str,
+        decision: &str,
+    ) -> Result<crate::EvolutionProposal, RuntimeServicesError> {
+        self.evolution_discovery
+            .decide_proposal(principal, lease, proposal_id, decision)
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
+    pub fn evolution_projector_health(
+        &self,
+    ) -> Result<crate::EvolutionProjectorHealth, RuntimeServicesError> {
+        self.evolution_signal_projector
+            .health()
+            .map_err(RuntimeServicesError::Invariant)
+    }
+
     pub fn evolution_candidate(
         &self,
         candidate_id: &str,
@@ -2185,6 +2168,18 @@ impl RuntimeServices {
         &self,
         intent: crate::EvolutionCandidateIntent,
     ) -> Result<crate::EvolutionGovernanceCandidate, RuntimeServicesError> {
+        let proposal = self
+            .evolution_discovery
+            .proposal(&intent.proposal_id)
+            .map_err(RuntimeServicesError::Invariant)?
+            .ok_or_else(|| {
+                RuntimeServicesError::Invariant("evolution proposal not found".to_string())
+            })?;
+        if proposal.status != "approved" {
+            return Err(RuntimeServicesError::Invariant(
+                "evolution proposal must be approved before candidate registration".to_string(),
+            ));
+        }
         let evaluation_contract = match &intent.subject {
             crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
                 if intent.baseline_revision >= revision_ref.revision {
@@ -2248,16 +2243,23 @@ impl RuntimeServices {
                 baseline.revision.manifest.evaluation.clone()
             }
         };
-        self.evolution_governance
+        let proposal_id = intent.proposal_id;
+        let candidate = self
+            .evolution_governance
             .register_candidate(crate::EvolutionCandidateRegistration {
                 candidate_id: intent.candidate_id,
+                proposal_id: proposal_id.clone(),
                 subject: intent.subject,
                 baseline_revision: intent.baseline_revision,
                 evaluation_contract,
                 source_evidence_refs: intent.source_evidence_refs,
                 canary_policy: intent.canary_policy,
             })
-            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        self.evolution_discovery
+            .link_candidate(&proposal_id, &candidate.candidate_id)
+            .map_err(RuntimeServicesError::Invariant)?;
+        Ok(candidate)
     }
 
     /// Run a registered candidate through the composition-root evaluator and
@@ -2272,13 +2274,44 @@ impl RuntimeServices {
             .evolution_governance
             .candidate(candidate_id)
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        let runner = self.evolution_eval_runner.as_ref().ok_or_else(|| {
-            RuntimeServicesError::Invariant("evolution_evaluator_not_configured".to_string())
-        })?;
-        let report = runner
-            .evaluate(&candidate)
-            .await
-            .map_err(RuntimeServicesError::Invariant)?;
+        let proposal = self
+            .evolution_discovery
+            .proposal(&candidate.proposal_id)
+            .map_err(RuntimeServicesError::Invariant)?
+            .ok_or_else(|| {
+                RuntimeServicesError::Invariant(
+                    "evolution candidate proposal was not found".to_string(),
+                )
+            })?;
+        if proposal.status != "approved"
+            || !proposal
+                .candidate_ids
+                .iter()
+                .any(|linked| linked == candidate_id)
+        {
+            return Err(RuntimeServicesError::Invariant(
+                "evolution candidate must be linked to its approved proposal before evaluation"
+                    .to_string(),
+            ));
+        }
+        let Some(runner) = self.evolution_eval_runner.as_ref() else {
+            return self
+                .evolution_governance
+                .record_evaluation_blocked(candidate_id, "evolution_evaluator_not_configured")
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()));
+        };
+        let report = match runner.evaluate(&candidate).await {
+            Ok(report) => report,
+            Err(error) => {
+                return self
+                    .evolution_governance
+                    .record_evaluation_blocked(
+                        candidate_id,
+                        &format!("evolution_evaluator_failed:{error}"),
+                    )
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()));
+            }
+        };
         if report.candidate_id != candidate.candidate_id
             || report.evaluation_contract_digest != candidate.evaluation_contract_digest()
         {
@@ -3845,10 +3878,9 @@ fn scenario_observation(
         .evidence_refs
         .iter()
         .filter(|evidence| evidence.is_durable())
-        .map(|evidence| evidence.evidence_ref.id().to_string())
+        .map(|evidence| evidence.evidence_ref.clone())
         .collect::<Vec<_>>();
-    evidence_refs.sort();
-    evidence_refs.dedup();
+    dedupe_evolution_evidence(&mut evidence_refs);
     EvaluationScenarioObservation {
         scenario_ref: scenario.scenario_ref.clone(),
         definition_revision: packet
@@ -3934,17 +3966,17 @@ fn team_scenario_observation(
             result
                 .evidence_refs
                 .iter()
-                .map(|evidence| evidence.evidence_ref.id().to_string())
+                .map(|evidence| evidence.evidence_ref.clone())
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    evidence_refs.extend(
-        matched
-            .iter()
-            .flat_map(|evaluation| evaluation.evidence_refs.clone()),
-    );
-    evidence_refs.sort();
-    evidence_refs.dedup();
+    evidence_refs.extend(matched.iter().flat_map(|evaluation| {
+        evaluation.evidence_refs.iter().map(|reference| {
+            harness_contract::reality::EvidenceRef::new("agent_run_evidence", reference.clone())
+                .with_source(evaluation.evaluation_id.clone())
+        })
+    }));
+    dedupe_evolution_evidence(&mut evidence_refs);
     let succeeded = projection.status == "completed" && projection.terminal_result.is_some();
     EvaluationScenarioObservation {
         scenario_ref: scenario.scenario_ref.clone(),
@@ -3967,6 +3999,12 @@ fn team_scenario_observation(
         tool_calls: matched.iter().map(|evaluation| evaluation.tool_calls).sum(),
         elapsed_ms,
     }
+}
+
+fn dedupe_evolution_evidence(evidence_refs: &mut Vec<harness_contract::reality::EvidenceRef>) {
+    evidence_refs
+        .sort_by(|left, right| (&left.ref_type, &left.id).cmp(&(&right.ref_type, &right.id)));
+    evidence_refs.dedup_by(|left, right| left.ref_type == right.ref_type && left.id == right.id);
 }
 
 fn install_builtin_executors(
@@ -4902,132 +4940,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_agent_failures_generate_one_governed_candidate_without_self_promotion() {
-        let temp = tempfile::tempdir().expect("temporary root");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace");
-        let services = RuntimeServices::builder(temp.path().join("home"), &workspace)
-            .build()
-            .expect("runtime services");
-        let definition_id = AgentDefinitionId::new(DefinitionScope::Workspace, "cowd/learner")
-            .expect("definition id");
-        let instructions = "# Learner\n\nSolve the task and preserve evidence.\n";
-        services
-            .definition_registry()
-            .agents()
-            .store_revision(
-                AgentDefinitionManifest {
-                    api_version: "cowd.agent/v1".to_string(),
-                    definition_id: definition_id.clone(),
-                    revision: 1,
-                    name: "Learner".to_string(),
-                    description: "Learns from attributable failures".to_string(),
-                    lifecycle: RevisionLifecycle::Published,
-                    executor: AgentExecutorPolicy::CowdNative,
-                    model_policy: AgentModelPolicy {
-                        profile: "coding".to_string(),
-                        allowed_models: vec!["test-model".to_string()],
-                        fallback_allowed: true,
-                    },
-                    cognitive_policy: AgentCognitivePolicy {
-                        context_profile: "sub_agent".to_string(),
-                        read_scopes: vec![CognitiveReadScope::Session],
-                        write_mode: CognitiveWriteMode::CandidateOnly,
-                        team_working_state_visible: true,
-                    },
-                    capability_contract: AgentCapabilityContract {
-                        capability_ceiling: vec![AgentCapability::Read],
-                        skill_refs: Vec::new(),
-                        approval_required_for: Vec::new(),
-                    },
-                    output_contract: AgentOutputContract::reviewable(),
-                    evaluation: AgentEvaluationContract::single_release_gate(
-                        "learner",
-                        "task_success",
-                    ),
-                    instructions_digest: format!("{:x}", Sha256::digest(instructions.as_bytes())),
-                },
-                instructions,
-            )
-            .expect("baseline revision");
-
-        let evaluation = |index: u64| crate::AgentRunEvaluation {
-            evaluation_id: format!("evaluation-{index}"),
-            run_id: format!("run-{index}"),
-            agent_instance_id: format!("agent-{index}"),
-            definition_id: definition_id.as_str().to_string(),
-            definition_revision: 1,
-            binding_digest: "binding-digest".to_string(),
-            release_assignment_id: None,
-            release_generation: None,
-            release_channel: Some(ReleaseChannel::Stable),
-            task_id: format!("coding-task-{index}"),
-            task_domain: "coding".to_string(),
-            complexity: "medium".to_string(),
-            role_slot_id: "worker".to_string(),
-            model: "test-model".to_string(),
-            provider: "test-provider".to_string(),
-            granted_capabilities: vec!["read".to_string()],
-            allowed_tools: Vec::new(),
-            allowed_skills: Vec::new(),
-            memory_reality_fingerprint: "memory-fingerprint".to_string(),
-            team_id: None,
-            environment_fingerprint: "environment-fingerprint".to_string(),
-            terminal_status: AgentTerminalStatus::Failed,
-            acceptance: vec!["task_success".to_string()],
-            outcome: String::new(),
-            failure: Some("repeated evidence validation failure".to_string()),
-            input_tokens: 10,
-            output_tokens: 2,
-            tool_calls: 1,
-            evidence_refs: vec![format!("evidence-{index}")],
-            created_at_ms: index,
-        };
-        for index in 1..=3 {
-            let evaluation = evaluation(index);
-            services
-                .event_store
-                .append(RuntimeEventInput {
-                    stream_id: format!("agent-evaluation:run-{index}"),
-                    scope: RuntimeEventScope::Evolution,
-                    kind: "agent.run_evaluated".to_string(),
-                    status: Some("failed".to_string()),
-                    actor: Some("test".to_string()),
-                    refs: Vec::new(),
-                    payload: serde_json::json!({"evaluation": evaluation}),
-                })
-                .expect("evaluation event");
-        }
-        let trigger = evaluation(3);
-        let candidate = services
-            .consider_agent_evolution(&trigger)
-            .expect("planner")
-            .expect("candidate");
-        assert_eq!(
-            candidate.lifecycle,
-            crate::EvolutionCandidateLifecycle::Draft
-        );
-        let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = candidate.subject
-        else {
-            panic!("expected Agent Definition candidate");
-        };
-        assert_eq!(revision_ref.revision, 2);
-        let revision = services
-            .definition_registry()
-            .agents()
-            .read_revision(&revision_ref)
-            .expect("candidate revision");
-        assert!(revision
-            .agent_markdown
-            .contains("repeated evidence validation failure"));
-        assert!(services.evolution_release_reviews().unwrap().is_empty());
-        assert!(services
-            .consider_agent_evolution(&trigger)
-            .expect("idempotent planner")
-            .is_none());
-    }
-
-    #[test]
     fn active_canary_routes_new_bindings_and_stop_reverts_to_stable() {
         let temp = tempfile::tempdir().expect("temporary root");
         let workspace = temp.path().join("workspace");
@@ -5107,14 +5019,49 @@ mod tests {
                 content_digest: baseline.revision.content_digest.clone(),
             })
             .expect("baseline stable");
+        let signal = services
+            .record_evolution_signal(crate::EvolutionSignal::eval_failure(
+                "canary-fixture",
+                vec![harness_contract::reality::EvidenceRef::new(
+                    "agent_run",
+                    "baseline",
+                )],
+            ))
+            .expect("signal");
+        let proposal = services
+            .create_evolution_lifecycle(vec![signal.signal_id])
+            .expect("proposal")
+            .proposal;
+        let principal = crate::security::test_human_interactive_principal();
+        let digest = services
+            .evolution_proposal_decision_digest(&proposal.proposal_id, "approved")
+            .expect("proposal digest");
+        let proposal_lease = crate::security::test_verified_decision_lease(
+            &format!("evolution-proposal:{}", proposal.proposal_id),
+            "proposal.decision.approved",
+            &format!("evolution.proposal:{}", proposal.proposal_id),
+            &digest,
+        );
+        services
+            .decide_evolution_proposal(
+                &principal,
+                &proposal_lease,
+                &proposal.proposal_id,
+                "approved",
+            )
+            .expect("proposal approved");
         let candidate = services
             .register_evolution_candidate(crate::EvolutionCandidateIntent {
                 candidate_id: "candidate-canary-v2".to_string(),
+                proposal_id: proposal.proposal_id,
                 subject: crate::EvolutionCandidateSubject::AgentDefinition {
                     revision_ref: candidate_revision.revision.revision_ref.clone(),
                 },
                 baseline_revision: 1,
-                source_evidence_refs: vec!["agent-run:baseline".to_string()],
+                source_evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                    "agent_run",
+                    "baseline",
+                )],
                 canary_policy: crate::CanaryRolloutPolicy {
                     traffic_basis_points: 10_000,
                     minimum_samples: 1,
@@ -5163,14 +5110,16 @@ mod tests {
                     },
                 ],
                 source_run_refs: vec!["eval:paired".to_string()],
-                evidence_refs: vec!["evidence:paired".to_string()],
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                    "evaluation",
+                    "paired",
+                )],
                 created_at_ms: 1,
             })
             .expect("eligible comparison");
         let review = services
             .request_evolution_canary_review(&candidate.candidate_id)
             .expect("canary review");
-        let principal = crate::security::test_human_interactive_principal();
         let lease = crate::security::test_verified_decision_lease(
             &review.review_id,
             review.action_key(),
@@ -5215,7 +5164,9 @@ mod tests {
                 action: crate::ReleaseChangeAction::StopCanary,
                 selector: None,
                 candidate_id: Some(candidate.candidate_id.clone()),
-                evidence_refs: vec!["incident:fixture".to_string()],
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                    "incident", "fixture",
+                )],
             })
             .expect("stop review");
         let stop_lease = crate::security::test_verified_decision_lease(

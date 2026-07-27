@@ -492,6 +492,46 @@ impl GatewayPanel {
                     .and_then(|value| value.get("reviews"))
                     .and_then(serde_json::Value::as_array)
                     .map_or(0, Vec::len);
+                let candidate_items = payload
+                    .get("candidates")
+                    .and_then(|value| value.get("candidates"))
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let evaluation_blocked = candidate_items
+                    .iter()
+                    .filter(|candidate| {
+                        candidate
+                            .get("lifecycle")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("evaluation_blocked")
+                    })
+                    .count();
+                let evaluated_eligible = candidate_items
+                    .iter()
+                    .filter(|candidate| {
+                        candidate
+                            .get("lifecycle")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("evaluated_eligible")
+                    })
+                    .count();
+                let projector = payload
+                    .get("signals")
+                    .and_then(|value| value.get("projector"))
+                    .unwrap_or(&serde_json::Value::Null);
+                let projector_lag = projector
+                    .get("lag_commits")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let projector_dead_letters = projector
+                    .get("dead_letter_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let projector_running = projector
+                    .get("worker_running")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
                 self.pending_release_review_ids = pending_review_ids(
                     payload
                         .get("reviews")
@@ -501,18 +541,12 @@ impl GatewayPanel {
                     &mut self.selected_release_review_index,
                     self.pending_release_review_ids.len(),
                 );
-                let active_capability_count = payload
-                    .get("active_capabilities")
-                    .and_then(|value| value.get("active_count"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
-                let capability_count = payload
-                    .get("active_capabilities")
-                    .and_then(|value| value.get("count"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default();
                 self.evolution_status = Some(
-                    if signals
+                    if projector_dead_letters > 0 || !projector_running || evaluation_blocked > 0 {
+                        "degraded".to_string()
+                    } else if projector_lag > 0 {
+                        "lagging".to_string()
+                    } else if signals
                         + diagnoses
                         + missions
                         + proposals
@@ -526,7 +560,7 @@ impl GatewayPanel {
                     },
                 );
                 self.evolution_summary = Some(format!(
-                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} release_reviews={reviews} pending_release={} active={active_capability_count}/{capability_count}",
+                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} eligible={evaluated_eligible} eval_blocked={evaluation_blocked} release_reviews={reviews} pending_release={} projector=running:{projector_running}/lag:{projector_lag}/dead:{projector_dead_letters}",
                     self.pending_release_review_ids.len(),
                 ));
                 self.action_status = Some("evolution.overview succeeded".to_string());
@@ -774,6 +808,8 @@ impl Component for GatewayPanel {
         if let Some(summary) = &self.evolution_summary {
             let color = match self.evolution_status.as_deref() {
                 Some("active") => Color::Magenta,
+                Some("lagging") => Color::Yellow,
+                Some("degraded") => Color::Red,
                 Some("empty") => Color::DarkGray,
                 Some("unavailable") => Color::Yellow,
                 _ => Color::Cyan,
@@ -2089,17 +2125,26 @@ mod tests {
     }
 
     #[test]
-    fn evolution_overview_summary_includes_active_capabilities() {
+    fn evolution_overview_summary_includes_runtime_projector_and_candidate_state() {
         let mut panel = GatewayPanel::new();
         panel.record_evolution_overview(Ok(serde_json::json!({
             "kind": "evolution.overview",
-            "signals": {"count": 1},
+            "signals": {
+                "count": 1,
+                "projector": {
+                    "lag_commits": 0,
+                    "dead_letter_count": 0,
+                    "worker_running": true
+                }
+            },
             "diagnoses": {"count": 1},
             "missions": {"count": 1},
             "proposals": {"count": 1},
-            "candidates": {"count": 1},
+            "candidates": {"candidates": [
+                {"candidate_id": "candidate-1", "lifecycle": "evaluated_eligible"}
+            ]},
             "sandbox_evals": {"count": 1},
-            "active_capabilities": {"count": 2, "active_count": 1}
+            "reviews": {"reviews": []},
         })));
 
         assert_eq!(panel.evolution_status.as_deref(), Some("active"));
@@ -2107,7 +2152,7 @@ mod tests {
             .evolution_summary
             .as_deref()
             .unwrap_or_default()
-            .contains("active=1/2"));
+            .contains("eligible=1"));
     }
 
     #[test]
@@ -2115,7 +2160,14 @@ mod tests {
         let mut panel = GatewayPanel::new();
         panel.record_evolution_overview(Ok(serde_json::json!({
             "kind": "evolution.overview",
-            "signals": {"count": 0},
+            "signals": {
+                "count": 0,
+                "projector": {
+                    "lag_commits": 0,
+                    "dead_letter_count": 0,
+                    "worker_running": true
+                }
+            },
             "diagnoses": {"count": 0},
             "missions": {"count": 0},
             "proposals": {"count": 0},

@@ -1,12 +1,13 @@
 pub mod candidate_kind;
 pub mod capability_goal;
 pub mod diagnosis;
+pub(crate) mod discovery;
 pub mod governance;
 pub mod lifecycle;
 pub mod mission;
 pub mod planner;
+pub(crate) mod projector;
 pub mod signal;
-pub mod signal_bridge;
 pub mod triage;
 
 pub use candidate_kind::{
@@ -14,8 +15,9 @@ pub use candidate_kind::{
 };
 pub use capability_goal::EvolutionCapabilityGoal;
 pub use diagnosis::{
-    EvolutionDiagnosis, EvolutionDiagnosisEngine, EvolutionDiagnosisStore, EvolutionRootCauseKind,
+    EvolutionDiagnosis, EvolutionDiagnosisEngine, EvolutionHypothesis, EvolutionRootCauseKind,
 };
+pub(crate) use discovery::EvolutionDiscoveryService;
 pub(crate) use governance::EvolutionCandidateRegistration;
 pub use governance::{
     CanaryObservationReport, CanaryRolloutPolicy, EvaluationDirection,
@@ -27,14 +29,15 @@ pub use governance::{
     ReleaseChangeReviewDecision, ReleaseChangeReviewStatus,
 };
 pub use lifecycle::{EvolutionLifecycleDraft, EvolutionLifecycleService};
-pub use mission::{EvolutionMission, EvolutionMissionStatus, EvolutionMissionStore};
+pub use mission::{EvolutionMission, EvolutionMissionStatus};
 pub use planner::{
     EvolutionPlanDraft, EvolutionProposal, EvolutionProposalKind, EvolutionProposalRisk,
-    EvolutionProposalStore, EvolutionSkillDraft,
+    EvolutionSkillDraft,
 };
+pub use projector::EvolutionProjectorHealth;
+pub(crate) use projector::EvolutionSignalProjector;
 pub use signal::{
     EvolutionSignal, EvolutionSignalInput, EvolutionSignalSeverity, EvolutionSignalSource,
-    EvolutionSignalStore, EvolutionSignalType,
+    EvolutionSignalType,
 };
-pub use signal_bridge::{signal_from_intervention, EvolutionSignalCollector};
 pub use triage::{EvolutionTriageCluster, EvolutionTriageService};

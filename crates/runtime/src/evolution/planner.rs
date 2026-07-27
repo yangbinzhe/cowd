@@ -1,9 +1,4 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
-};
-
+use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -39,6 +34,8 @@ pub struct EvolutionProposal {
     #[serde(default)]
     pub goal_ids: Vec<String>,
     #[serde(default)]
+    pub candidate_ids: Vec<String>,
+    #[serde(default)]
     pub diagnosis_id: Option<String>,
     #[serde(default)]
     pub root_cause_kind: Option<EvolutionRootCauseKind>,
@@ -47,7 +44,7 @@ pub struct EvolutionProposal {
     #[serde(default)]
     pub candidate_scope: Vec<String>,
     pub problem_statement: String,
-    pub current_evidence: Vec<String>,
+    pub current_evidence: Vec<EvidenceRef>,
     pub target_improvement: String,
     pub expected_benefit: String,
     pub risk: EvolutionProposalRisk,
@@ -71,7 +68,7 @@ pub struct EvolutionSkillDraft {
     pub version: String,
     pub source_proposal_id: String,
     pub permissions_note: String,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
     pub rollback_note: String,
     pub markdown: String,
 }
@@ -124,6 +121,7 @@ impl EvolutionProposal {
             kind,
             mission_id: None,
             goal_ids: Vec::new(),
+            candidate_ids: Vec::new(),
             diagnosis_id: Some(diagnosis.diagnosis_id.clone()),
             root_cause_kind: Some(diagnosis.root_cause_kind.clone()),
             target_owner: diagnosis.affected_owner.clone(),
@@ -176,7 +174,7 @@ impl EvolutionProposal {
             ),
             self.current_evidence
                 .iter()
-                .map(|item| format!("- {item}"))
+                .map(|item| format!("- {}:{}", item.ref_type, item.id))
                 .collect::<Vec<_>>()
                 .join("\n"),
             self.acceptance_gates
@@ -196,87 +194,6 @@ impl EvolutionProposal {
             rollback_note: self.rollback_strategy.clone(),
             markdown,
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct EvolutionProposalStore {
-    path: PathBuf,
-}
-
-impl EvolutionProposalStore {
-    #[must_use]
-    pub fn new(root: impl AsRef<Path>) -> Self {
-        Self {
-            path: root.as_ref().join("proposals.jsonl"),
-        }
-    }
-
-    pub fn append(&self, proposal: &EvolutionProposal) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .map_err(|error| error.to_string())?;
-        writeln!(
-            file,
-            "{}",
-            serde_json::to_string(proposal).map_err(|error| error.to_string())?
-        )
-        .map_err(|error| error.to_string())
-    }
-
-    pub fn list(&self) -> Result<Vec<EvolutionProposal>, String> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let file = fs::File::open(&self.path).map_err(|error| error.to_string())?;
-        let mut proposals = Vec::new();
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|error| error.to_string())?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            proposals.push(
-                serde_json::from_str::<EvolutionProposal>(&line)
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        proposals.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
-        Ok(proposals)
-    }
-
-    pub fn update_status(
-        &self,
-        proposal_id: &str,
-        status: &str,
-    ) -> Result<EvolutionProposal, String> {
-        let mut proposals = self.list()?;
-        let Some(proposal) = proposals
-            .iter_mut()
-            .find(|proposal| proposal.proposal_id == proposal_id)
-        else {
-            return Err("evolution proposal not found".to_string());
-        };
-        proposal.status = status.to_string();
-        let updated = proposal.clone();
-        proposals.sort_by(|left, right| left.created_at_ms.cmp(&right.created_at_ms));
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        let mut file = fs::File::create(&self.path).map_err(|error| error.to_string())?;
-        for proposal in &proposals {
-            writeln!(
-                file,
-                "{}",
-                serde_json::to_string(proposal).map_err(|error| error.to_string())?
-            )
-            .map_err(|error| error.to_string())?;
-        }
-        Ok(updated)
     }
 }
 
@@ -378,7 +295,7 @@ mod tests {
         let signal = EvolutionSignal::memory_noise(
             "runtime",
             "session-1",
-            vec!["memory:packet:noise".to_string()],
+            vec![EvidenceRef::new("memory", "packet:noise")],
         );
         let proposal = EvolutionProposal::from_signals(&[signal]);
         assert_eq!(

@@ -4,6 +4,7 @@
 //! traces into structured learning records that later policy layers may inspect.
 
 use crate::core::{ExecutionPattern, TaskComplexity, TaskRisk};
+use crate::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,8 +130,7 @@ pub enum GrowthMemoryCandidateKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrowthEvidenceRef {
-    pub kind: String,
-    pub reference: String,
+    pub evidence: EvidenceRef,
     pub summary: String,
 }
 
@@ -142,10 +142,19 @@ impl GrowthEvidenceRef {
         summary: impl Into<String>,
     ) -> Self {
         Self {
-            kind: kind.into(),
-            reference: reference.into(),
+            evidence: EvidenceRef::new(kind, reference),
             summary: summary.into(),
         }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> &str {
+        &self.evidence.ref_type
+    }
+
+    #[must_use]
+    pub fn reference(&self) -> &str {
+        &self.evidence.id
     }
 }
 

@@ -13,6 +13,7 @@ use harness_contract::agent::{
     RevisionSelector,
 };
 use harness_contract::evaluation::EvaluationContract;
+use harness_contract::reality::EvidenceRef;
 use runtime::agent::definition::{
     AgentDefinitionResolver, AgentDefinitionStore, ScopedDefinitionLayout,
 };
@@ -138,29 +139,8 @@ async fn pin_and_rollback_are_both_applied_only_through_typed_runtime_reviews() 
             fixture.definition_id.clone(),
             1,
         )
-        .expect("initial stable revision"),
+        .expect("baseline revision"),
     };
-    let initial = fixture
-        .services
-        .request_evolution_release_change(ReleaseChangeRequest {
-            request_id: "publish-revision-one".to_string(),
-            subject: subject.clone(),
-            action: ReleaseChangeAction::PublishInitialStable,
-            selector: None,
-            candidate_id: None,
-            evidence_refs: vec!["audit:publish-r1".to_string()],
-        })
-        .expect("initial stable review");
-    fixture
-        .services
-        .decide_evolution_release_review(
-            authority.principal(),
-            &authority.lease_for(&initial),
-            &initial.review_id,
-            ReleaseChangeReviewDecision::Approve,
-            "publish first stable revision".to_string(),
-        )
-        .expect("initial stable decision");
 
     let pin = fixture
         .services
@@ -170,7 +150,7 @@ async fn pin_and_rollback_are_both_applied_only_through_typed_runtime_reviews() 
             action: ReleaseChangeAction::SetDefaultExact,
             selector: Some(RevisionSelector::ExactApprovedRevision { revision: 1 }),
             candidate_id: None,
-            evidence_refs: vec!["operator:pin-r1".to_string()],
+            evidence_refs: vec![EvidenceRef::new("operator", "pin-r1")],
         })
         .expect("exact pointer review");
     fixture
@@ -242,7 +222,7 @@ async fn pin_and_rollback_are_both_applied_only_through_typed_runtime_reviews() 
             action: ReleaseChangeAction::Rollback,
             selector: Some(RevisionSelector::ExactApprovedRevision { revision: 1 }),
             candidate_id: None,
-            evidence_refs: vec!["incident:rollback-r1".to_string()],
+            evidence_refs: vec![EvidenceRef::new("incident", "rollback-r1")],
         })
         .expect("rollback review");
     fixture

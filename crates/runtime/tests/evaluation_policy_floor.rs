@@ -102,7 +102,10 @@ fn policy_floor_can_only_change_through_its_own_human_review_and_verified_lease(
         .request_evolution_evaluation_policy_change(EvaluationPolicyChangeIntent {
             request_id: "raise-minimum-samples".to_string(),
             next_policy: next.clone(),
-            evidence_refs: vec!["audit:policy-rationale".to_string()],
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                "audit",
+                "policy-rationale",
+            )],
         })
         .expect("policy review");
 
@@ -163,7 +166,10 @@ async fn raised_policy_floor_rejects_a_definition_candidate_with_a_weaker_baseli
         .request_evolution_evaluation_policy_change(EvaluationPolicyChangeIntent {
             request_id: "reject-weaker-agent-contract".to_string(),
             next_policy: next,
-            evidence_refs: vec!["audit:raised-floor".to_string()],
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                "audit",
+                "raised-floor",
+            )],
         })
         .expect("policy review");
     let authority = evolution_test_support::HumanAuthority::new();

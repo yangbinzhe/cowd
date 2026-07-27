@@ -14,9 +14,11 @@ use harness_contract::{
         AgentCapability, AgentCapabilityContract, AgentCognitivePolicy, AgentDefinitionId,
         AgentDefinitionManifest, AgentDefinitionRevisionRef, AgentExecutorPolicy, AgentModelPolicy,
         AgentOutputContract, CognitiveReadScope, CognitiveWriteMode, DefinitionScope,
+        ReleaseAssignment, ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel,
         RevisionLifecycle,
     },
     evaluation::EvaluationContract,
+    reality::EvidenceRef,
     security::{
         DecisionLeaseClaims, PrincipalAssurance, PrincipalClaims, PrincipalKind,
         SignedDecisionLease, SignedPrincipalEnvelope,
@@ -27,6 +29,7 @@ use ring::{
     signature::{Ed25519KeyPair, KeyPair},
 };
 use runtime::{
+    agent::definition::{AgentDefinitionStore, RegisteredAgentDefinitionLayout},
     CanaryObservationReport, CanaryRolloutPolicy, DecisionLeaseExpectation,
     EvolutionCandidateIntent, EvolutionCandidateSubject, EvolutionComparisonDimension,
     EvolutionComparisonReportV2, EvolutionEvalRunner, ReleaseChangeReview, RuntimeServices,
@@ -52,6 +55,34 @@ pub fn fixture() -> EvolutionFixture {
     for revision in 1..=3 {
         write_published_agent_revision(&workspace, &definition_id, revision);
     }
+    let storage = storage::StorageRegistry::default_for_config_home(root.path())
+        .with_workspace(&workspace)
+        .expect("storage registry");
+    let definition_store = AgentDefinitionStore::new(
+        RegisteredAgentDefinitionLayout::from_storage_layout(
+            &storage.layout,
+            root.path().join("runtime").join("builtin-definitions"),
+            &workspace,
+        )
+        .expect("definition layout"),
+    );
+    let baseline_ref =
+        AgentDefinitionRevisionRef::new(definition_id.clone(), 1).expect("baseline revision ref");
+    let baseline = definition_store
+        .read_revision(&baseline_ref)
+        .expect("baseline revision");
+    definition_store
+        .record_release_assignment(&ReleaseAssignment {
+            scope: DefinitionScope::Workspace,
+            revision_ref: baseline.revision.revision_ref,
+            channel: ReleaseChannel::Stable,
+            status: ReleaseAssignmentStatus::Active,
+            authorization: ReleaseAuthorization::HumanApproval {
+                approval_ref: "fixture:baseline-stable".to_string(),
+            },
+            content_digest: baseline.revision.content_digest,
+        })
+        .expect("baseline stable assignment");
     let services = RuntimeServices::builder(root.path(), &workspace)
         .evolution_eval_runner(Arc::new(EligibleEvalRunner))
         .build()
@@ -83,15 +114,54 @@ pub async fn try_register_and_evaluate(
     let candidate_ref =
         AgentDefinitionRevisionRef::new(fixture.definition_id.clone(), candidate_revision)
             .map_err(|error| error.to_string())?;
+    let signal = fixture
+        .services
+        .record_evolution_signal(runtime::EvolutionSignal::eval_failure(
+            format!("{candidate_id}:baseline"),
+            vec![EvidenceRef::new(
+                "agent_run",
+                format!("{candidate_id}:baseline"),
+            )],
+        ))
+        .map_err(|error| error.to_string())?;
+    let proposal = fixture
+        .services
+        .create_evolution_lifecycle(vec![signal.signal_id])
+        .map_err(|error| error.to_string())?
+        .proposal;
+    let authority = HumanAuthority::new();
+    let digest = fixture
+        .services
+        .evolution_proposal_decision_digest(&proposal.proposal_id, "approved")
+        .map_err(|error| error.to_string())?;
+    let lease = authority.lease_for_expectation(DecisionLeaseExpectation::new(
+        format!("evolution-proposal:{}", proposal.proposal_id),
+        "proposal.decision.approved",
+        format!("evolution.proposal:{}", proposal.proposal_id),
+        digest,
+    ));
+    fixture
+        .services
+        .decide_evolution_proposal(
+            authority.principal(),
+            &lease,
+            &proposal.proposal_id,
+            "approved",
+        )
+        .map_err(|error| error.to_string())?;
     fixture
         .services
         .register_evolution_candidate(EvolutionCandidateIntent {
             candidate_id: candidate_id.to_string(),
+            proposal_id: proposal.proposal_id,
             subject: EvolutionCandidateSubject::AgentDefinition {
                 revision_ref: candidate_ref,
             },
             baseline_revision,
-            source_evidence_refs: vec![format!("run:{candidate_id}:baseline")],
+            source_evidence_refs: vec![EvidenceRef::new(
+                "agent_run",
+                format!("{candidate_id}:baseline"),
+            )],
             canary_policy: CanaryRolloutPolicy {
                 traffic_basis_points: 10_000,
                 minimum_samples: 2,
@@ -117,7 +187,10 @@ pub fn qualified_observation(
         canary_assignment_id: assignment.assignment_id.clone(),
         generation: assignment.generation,
         source_run_refs: vec![format!("agent-run:{candidate_id}:1")],
-        evidence_refs: vec![format!("evidence:{candidate_id}:canary")],
+        evidence_refs: vec![EvidenceRef::new(
+            "canary_evaluation",
+            format!("{candidate_id}:canary"),
+        )],
         sample_count: 2,
         minimum_samples: 2,
         observed_duration_ms: 1,
@@ -267,7 +340,10 @@ impl EvolutionEvalRunner for EligibleEvalRunner {
             evaluation_contract_digest: candidate.evaluation_contract_digest(),
             dimensions,
             source_run_refs: vec![format!("paired-run:{}", candidate.candidate_id)],
-            evidence_refs: vec![format!("paired-evidence:{}", candidate.candidate_id)],
+            evidence_refs: vec![EvidenceRef::new(
+                "paired_evaluation",
+                candidate.candidate_id.clone(),
+            )],
             created_at_ms: now_ms(),
         })
     }

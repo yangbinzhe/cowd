@@ -5,7 +5,7 @@
 //! evidence through Runtime's dependency-inverted port.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -16,6 +16,7 @@ use harness_contract::evaluation::{
     EvaluationContract, EvaluationMetricDirection, EvaluationMetricSource,
     EvaluationScenarioObservation, EvaluationScenarioSpec,
 };
+use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 
 use crate::report_store::now_ms;
@@ -29,7 +30,7 @@ pub struct EvolutionClosureReport {
     pub release_mutation_count: usize,
     pub runtime_port_implemented: bool,
     pub status: String,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
 }
 
 /// Supplies paired workloads for a concrete Agent or Team definition revision.
@@ -218,12 +219,16 @@ fn comparison_from_observations(
     }
     let contract: &EvaluationContract = &candidate.evaluation_contract;
     let mut source_run_refs = BTreeSet::new();
-    let mut evidence_refs = BTreeSet::new();
+    let mut evidence_refs = BTreeMap::new();
     for (baseline, proposed) in paired {
         source_run_refs.insert(baseline.run_ref.clone());
         source_run_refs.insert(proposed.run_ref.clone());
-        evidence_refs.extend(baseline.evidence_refs.iter().cloned());
-        evidence_refs.extend(proposed.evidence_refs.iter().cloned());
+        for evidence in baseline.evidence_refs.iter().chain(&proposed.evidence_refs) {
+            evidence_refs.insert(
+                (evidence.ref_type.clone(), evidence.id.clone()),
+                evidence.clone(),
+            );
+        }
     }
     let prepared = contract
         .metrics
@@ -333,7 +338,7 @@ fn comparison_from_observations(
         evaluation_contract_digest: candidate.evaluation_contract_digest(),
         dimensions,
         source_run_refs: source_run_refs.into_iter().collect(),
-        evidence_refs: evidence_refs.into_iter().collect(),
+        evidence_refs: evidence_refs.into_values().collect(),
         created_at_ms: now_ms().min(u128::from(u64::MAX)) as u64,
     })
 }
@@ -524,7 +529,7 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
                 release_mutation_count: 0,
                 runtime_port_implemented: true,
                 status: "failed".to_string(),
-                evidence_refs: vec![format!("candidate_error:{error}")],
+                evidence_refs: vec![EvidenceRef::new("candidate_error", error)],
             };
         }
     };
@@ -552,7 +557,7 @@ pub fn evaluate_evolution_closure() -> EvolutionClosureReport {
             release_mutation_count: 0,
             runtime_port_implemented: true,
             status: "failed".to_string(),
-            evidence_refs: vec![format!("evaluation_error:{error}")],
+            evidence_refs: vec![EvidenceRef::new("evaluation_error", error)],
         },
     }
 }
@@ -600,7 +605,7 @@ impl DefinitionEvolutionWorkload for ClosureWorkload {
                 },
             ],
             source_run_refs: vec!["harness-eval:closure:paired-workload".to_string()],
-            evidence_refs: vec!["harness-eval:closure:report".to_string()],
+            evidence_refs: vec![EvidenceRef::new("harness_eval", "closure:report")],
             created_at_ms: 1,
         })
     }
@@ -636,7 +641,8 @@ fn closure_candidate() -> Result<runtime::EvolutionGovernanceCandidate, String> 
             ],
         },
         evaluation_policy_floor: harness_contract::evaluation::EvaluationPolicyFloor::default(),
-        source_evidence_refs: vec!["harness-eval:closure:source".to_string()],
+        proposal_id: "proposal-agent-v2".to_string(),
+        source_evidence_refs: vec![EvidenceRef::new("harness_eval", "closure:source")],
         canary_policy: runtime::CanaryRolloutPolicy::default(),
         lifecycle: runtime::EvolutionCandidateLifecycle::Draft,
         comparison_report_ref: None,

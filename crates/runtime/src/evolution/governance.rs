@@ -11,6 +11,7 @@ use harness_contract::{
     agent::{AgentDefinitionId, AgentDefinitionRevisionRef, RevisionSelector},
     core::TaskRisk,
     evaluation::{EvaluationContract, EvaluationMetricDirection, EvaluationPolicyFloor},
+    reality::EvidenceRef,
     team::{TeamTemplateDefinitionId, TeamTemplateRevisionRef},
 };
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,7 @@ impl EvolutionCandidateSubject {
 pub enum EvolutionCandidateLifecycle {
     Draft,
     Validated,
+    EvaluationBlocked,
     EvaluatedEligible,
     EvaluatedIneligible,
     Withdrawn,
@@ -97,6 +99,7 @@ pub enum EvolutionCandidateLifecycle {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvolutionGovernanceCandidate {
     pub candidate_id: String,
+    pub proposal_id: String,
     pub subject: EvolutionCandidateSubject,
     pub baseline_revision: u64,
     /// Immutable baseline contract resolved by Runtime before the candidate
@@ -108,7 +111,7 @@ pub struct EvolutionGovernanceCandidate {
     /// checks the currently active floor.
     #[serde(default)]
     pub evaluation_policy_floor: EvaluationPolicyFloor,
-    pub source_evidence_refs: Vec<String>,
+    pub source_evidence_refs: Vec<EvidenceRef>,
     /// Immutable rollout policy copied to any approved Canary assignment.
     /// A candidate cannot widen traffic or relax observation thresholds after
     /// it is registered.
@@ -139,9 +142,10 @@ impl EvolutionGovernanceCandidate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvolutionCandidateIntent {
     pub candidate_id: String,
+    pub proposal_id: String,
     pub subject: EvolutionCandidateSubject,
     pub baseline_revision: u64,
-    pub source_evidence_refs: Vec<String>,
+    pub source_evidence_refs: Vec<EvidenceRef>,
     #[serde(default)]
     pub canary_policy: CanaryRolloutPolicy,
 }
@@ -153,10 +157,11 @@ pub struct EvolutionCandidateIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EvolutionCandidateRegistration {
     pub candidate_id: String,
+    pub proposal_id: String,
     pub subject: EvolutionCandidateSubject,
     pub baseline_revision: u64,
     pub evaluation_contract: EvaluationContract,
-    pub source_evidence_refs: Vec<String>,
+    pub source_evidence_refs: Vec<EvidenceRef>,
     pub canary_policy: CanaryRolloutPolicy,
 }
 
@@ -213,7 +218,7 @@ pub struct CanaryObservationReport {
     pub canary_assignment_id: String,
     pub generation: u64,
     pub source_run_refs: Vec<String>,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
     pub sample_count: u32,
     pub minimum_samples: u32,
     pub observed_duration_ms: u64,
@@ -313,7 +318,7 @@ pub struct EvolutionComparisonReportV2 {
     pub evaluation_contract_digest: String,
     pub dimensions: Vec<EvolutionComparisonDimension>,
     pub source_run_refs: Vec<String>,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
     pub created_at_ms: u64,
 }
 
@@ -356,7 +361,6 @@ pub trait EvolutionEvalRunner: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseChangeAction {
-    PublishInitialStable,
     PromoteCanary,
     PromoteStable,
     SetDefaultLatest,
@@ -368,7 +372,6 @@ pub enum ReleaseChangeAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseChangeReviewClass {
-    InitialStable,
     Canary,
     Stable,
     Pointer,
@@ -425,7 +428,7 @@ pub struct ReleaseChangeRequest {
     /// `StopCanary` must name the candidate whose Canary assignment is being
     /// stopped so an unrelated revision cannot cancel it.
     pub candidate_id: Option<String>,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
 }
 
 /// A policy change is deliberately separate from an Agent/Team candidate.
@@ -436,7 +439,7 @@ pub struct ReleaseChangeRequest {
 pub struct EvaluationPolicyChangeIntent {
     pub request_id: String,
     pub next_policy: EvaluationPolicyFloor,
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,9 +562,17 @@ impl EvolutionGovernanceService {
         candidate: EvolutionGovernanceCandidate,
     ) -> Result<EvolutionGovernanceCandidate, EvolutionGovernanceError> {
         candidate.canary_policy.validate()?;
-        if candidate.candidate_id.trim().is_empty() || candidate.source_evidence_refs.is_empty() {
+        if candidate.candidate_id.trim().is_empty()
+            || candidate.proposal_id.trim().is_empty()
+            || candidate.source_evidence_refs.is_empty()
+            || candidate
+                .source_evidence_refs
+                .iter()
+                .any(|evidence| !evidence.boundary.can_be_authoritative())
+        {
             return Err(EvolutionGovernanceError::Store(
-                "candidate id, immutable evaluation contract and evidence are required".to_string(),
+                "candidate id, proposal id, immutable evaluation contract, and authoritative evidence are required"
+                    .to_string(),
             ));
         }
         candidate
@@ -581,7 +592,7 @@ impl EvolutionGovernanceService {
                 vec![event(
                     candidate_stream(&candidate.candidate_id),
                     "evolution.candidate.created",
-                    Some("draft"),
+                    Some("validated"),
                     vec![subject_ref(&candidate.subject)],
                     serde_json::json!({"candidate": candidate}),
                 )],
@@ -597,16 +608,33 @@ impl EvolutionGovernanceService {
         &self,
         registration: EvolutionCandidateRegistration,
     ) -> Result<EvolutionGovernanceCandidate, EvolutionGovernanceError> {
+        if let Ok(existing) = self.candidate(&registration.candidate_id) {
+            let same_registration = existing.proposal_id == registration.proposal_id
+                && existing.subject == registration.subject
+                && existing.baseline_revision == registration.baseline_revision
+                && existing.evaluation_contract == registration.evaluation_contract
+                && existing.source_evidence_refs == registration.source_evidence_refs
+                && existing.canary_policy == registration.canary_policy;
+            return if same_registration {
+                Ok(existing)
+            } else {
+                Err(EvolutionGovernanceError::Store(format!(
+                    "evolution candidate `{}` is already registered with different immutable inputs",
+                    registration.candidate_id
+                )))
+            };
+        }
         let now = now_ms();
         self.create_candidate(EvolutionGovernanceCandidate {
             candidate_id: registration.candidate_id,
+            proposal_id: registration.proposal_id,
             subject: registration.subject,
             baseline_revision: registration.baseline_revision,
             evaluation_contract: registration.evaluation_contract,
             evaluation_policy_floor: self.evaluation_policy_floor(),
             source_evidence_refs: registration.source_evidence_refs,
             canary_policy: registration.canary_policy,
-            lifecycle: EvolutionCandidateLifecycle::Draft,
+            lifecycle: EvolutionCandidateLifecycle::Validated,
             comparison_report_ref: None,
             comparison_report_digest: None,
             canary_review_ref: None,
@@ -769,7 +797,7 @@ impl EvolutionGovernanceService {
                 review.next_policy.revision
             ),
             risk: TaskRisk::High,
-            evidence_refs: intent.evidence_refs,
+            evidence_refs: approval_evidence_refs(&intent.evidence_refs),
             timeout_policy: ApprovalTimeoutPolicy::Pending,
             status: GlobalApprovalStatus::Pending,
             created_at_ms: now_ms(),
@@ -1014,6 +1042,43 @@ impl EvolutionGovernanceService {
         self.candidate(&candidate.candidate_id)
     }
 
+    pub(crate) fn record_evaluation_blocked(
+        &self,
+        candidate_id: &str,
+        reason: &str,
+    ) -> Result<EvolutionGovernanceCandidate, EvolutionGovernanceError> {
+        let candidate = self.candidate(candidate_id)?;
+        if matches!(
+            candidate.lifecycle,
+            EvolutionCandidateLifecycle::EvaluatedEligible
+                | EvolutionCandidateLifecycle::EvaluatedIneligible
+        ) {
+            return Ok(candidate);
+        }
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(EvolutionGovernanceError::Store(
+                "evaluation blocked reason is required".to_string(),
+            ));
+        }
+        let stream = candidate_stream(candidate_id);
+        self.event_store
+            .append_batch_if_revision(
+                stream.clone(),
+                self.stream_revision(&stream)?,
+                format!("evolution-evaluation-blocked:{candidate_id}:{reason}"),
+                vec![event(
+                    stream,
+                    "evolution.candidate.evaluation_blocked.v1",
+                    Some("evaluation_blocked"),
+                    vec![subject_ref(&candidate.subject)],
+                    serde_json::json!({"reason": reason}),
+                )],
+            )
+            .map_err(|error| EvolutionGovernanceError::Store(error.to_string()))?;
+        self.candidate(candidate_id)
+    }
+
     pub(crate) fn request_canary_review(
         &self,
         candidate_id: &str,
@@ -1070,7 +1135,7 @@ impl EvolutionGovernanceService {
             action: release_action_key(ReleaseChangeAction::PromoteCanary).to_string(),
             summary: format!("Promote {} to Canary", candidate.subject.subject_ref()),
             risk: TaskRisk::High,
-            evidence_refs: candidate.source_evidence_refs.clone(),
+            evidence_refs: approval_evidence_refs(&candidate.source_evidence_refs),
             timeout_policy: ApprovalTimeoutPolicy::Pending,
             status: GlobalApprovalStatus::Pending,
             created_at_ms: now_ms(),
@@ -1226,10 +1291,18 @@ impl EvolutionGovernanceService {
             source_run_refs.dedup();
             let mut evidence_refs = matching
                 .iter()
-                .flat_map(|evaluation| evaluation.evidence_refs.iter().cloned())
+                .flat_map(|evaluation| {
+                    evaluation.evidence_refs.iter().map(|reference| {
+                        EvidenceRef::new("agent_run_evidence", reference.clone())
+                            .with_source(evaluation.evaluation_id.clone())
+                    })
+                })
                 .collect::<Vec<_>>();
-            evidence_refs.sort();
-            evidence_refs.dedup();
+            evidence_refs.sort_by(|left, right| {
+                (&left.ref_type, &left.id).cmp(&(&right.ref_type, &right.id))
+            });
+            evidence_refs
+                .dedup_by(|left, right| left.ref_type == right.ref_type && left.id == right.id);
             let observation = CanaryObservationReport {
                 report_id: format!(
                     "canary-observation:{}:{}",
@@ -1363,9 +1436,6 @@ impl EvolutionGovernanceService {
             review_id: review_id.clone(),
             approval_id: format!("approval:{review_id}"),
             class: match request.action {
-                ReleaseChangeAction::PublishInitialStable => {
-                    ReleaseChangeReviewClass::InitialStable
-                }
                 ReleaseChangeAction::Rollback => ReleaseChangeReviewClass::Rollback,
                 ReleaseChangeAction::SetDefaultLatest
                 | ReleaseChangeAction::SetDefaultExact
@@ -1394,7 +1464,10 @@ impl EvolutionGovernanceService {
             status: ReleaseChangeReviewStatus::Pending,
             created_at_ms: now_ms(),
         };
-        self.append_manual_review_with_approval(&review, request.evidence_refs)?;
+        self.append_manual_review_with_approval(
+            &review,
+            approval_evidence_refs(&request.evidence_refs),
+        )?;
         Ok(review)
     }
 
@@ -1418,7 +1491,7 @@ impl EvolutionGovernanceService {
             action: release_action_key(review.action).to_string(),
             summary: format!("Promote {} to Stable", candidate.subject.subject_ref()),
             risk: TaskRisk::High,
-            evidence_refs: candidate.source_evidence_refs.clone(),
+            evidence_refs: approval_evidence_refs(&candidate.source_evidence_refs),
             timeout_policy: ApprovalTimeoutPolicy::Pending,
             status: GlobalApprovalStatus::Pending,
             created_at_ms: now_ms(),
@@ -2082,6 +2155,12 @@ fn materialize_candidate(
                     current.updated_at_ms = event.created_at_ms;
                 }
             }
+            "evolution.candidate.evaluation_blocked.v1" => {
+                if let Some(current) = candidate.as_mut() {
+                    current.lifecycle = EvolutionCandidateLifecycle::EvaluationBlocked;
+                    current.updated_at_ms = event.created_at_ms;
+                }
+            }
             "evolution.candidate.canary_review_linked" => {
                 if let Some(current) = candidate.as_mut() {
                     current.canary_review_ref = event
@@ -2242,9 +2321,15 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+fn approval_evidence_refs(evidence_refs: &[EvidenceRef]) -> Vec<String> {
+    evidence_refs
+        .iter()
+        .map(|evidence| format!("{}:{}", evidence.ref_type, evidence.id))
+        .collect()
+}
+
 fn release_action_key(action: ReleaseChangeAction) -> &'static str {
     match action {
-        ReleaseChangeAction::PublishInitialStable => "evolution.release.publish_initial_stable",
         ReleaseChangeAction::PromoteCanary => "evolution.release.promote_canary",
         ReleaseChangeAction::PromoteStable => "evolution.release.promote_stable",
         ReleaseChangeAction::SetDefaultLatest => "evolution.release.set_default_latest",
@@ -2279,10 +2364,10 @@ fn validate_release_change_request(
                 ));
             }
         }
-        ReleaseChangeAction::SetDefaultLatest | ReleaseChangeAction::PublishInitialStable => {
+        ReleaseChangeAction::SetDefaultLatest => {
             if request.selector.is_some() {
                 return Err(EvolutionGovernanceError::InvalidReleaseChangeRequest(
-                    "latest and initial-stable changes do not accept a selector".to_string(),
+                    "latest changes do not accept a selector".to_string(),
                 ));
             }
         }
@@ -2300,9 +2385,6 @@ fn validate_release_change_request(
 
 fn release_change_summary(review: &ReleaseChangeReview) -> String {
     match review.action {
-        ReleaseChangeAction::PublishInitialStable => {
-            format!("Publish {} as initial Stable", review.subject.subject_ref())
-        }
         ReleaseChangeAction::SetDefaultLatest => {
             format!(
                 "Set {} default to latest approved Stable",
@@ -2351,6 +2433,7 @@ mod tests {
     fn candidate() -> EvolutionGovernanceCandidate {
         EvolutionGovernanceCandidate {
             candidate_id: "agent-candidate-v2".to_string(),
+            proposal_id: "proposal-agent-v2".to_string(),
             subject: EvolutionCandidateSubject::AgentDefinition {
                 revision_ref: AgentDefinitionRevisionRef::new(
                     AgentDefinitionId::new(DefinitionScope::Workspace, "cowd/researcher").unwrap(),
@@ -2397,7 +2480,7 @@ mod tests {
                 ],
             },
             evaluation_policy_floor: EvaluationPolicyFloor::default(),
-            source_evidence_refs: vec!["run:baseline-1".to_string()],
+            source_evidence_refs: vec![EvidenceRef::new("agent_run", "baseline-1")],
             canary_policy: CanaryRolloutPolicy {
                 traffic_basis_points: 1_000,
                 minimum_samples: 10,
@@ -2451,7 +2534,7 @@ mod tests {
                 },
             ],
             source_run_refs: vec!["eval:paired-1".to_string()],
-            evidence_refs: vec!["evidence:paired-1".to_string()],
+            evidence_refs: vec![EvidenceRef::new("evaluation", "paired-1")],
             created_at_ms: now_ms(),
         }
     }
@@ -2500,6 +2583,36 @@ mod tests {
     }
 
     #[test]
+    fn candidate_registration_is_idempotent_but_rejects_immutable_identity_conflicts() {
+        let service = service();
+        let candidate = candidate();
+        let registration = EvolutionCandidateRegistration {
+            candidate_id: candidate.candidate_id,
+            proposal_id: candidate.proposal_id,
+            subject: candidate.subject,
+            baseline_revision: candidate.baseline_revision,
+            evaluation_contract: candidate.evaluation_contract,
+            source_evidence_refs: candidate.source_evidence_refs,
+            canary_policy: candidate.canary_policy,
+        };
+        let first = service
+            .register_candidate(registration.clone())
+            .expect("first registration");
+        let replay = service
+            .register_candidate(registration.clone())
+            .expect("idempotent replay");
+        assert_eq!(first, replay);
+
+        let mut conflicting = registration;
+        conflicting.proposal_id = "proposal-agent-v3".to_string();
+        assert!(matches!(
+            service.register_candidate(conflicting),
+            Err(EvolutionGovernanceError::Store(message))
+                if message.contains("different immutable inputs")
+        ));
+    }
+
+    #[test]
     fn comparison_cannot_omit_or_duplicate_runtime_protected_dimensions() {
         let service = service();
         service.create_candidate(candidate()).expect("candidate");
@@ -2544,7 +2657,7 @@ mod tests {
             .request_evaluation_policy_change(EvaluationPolicyChangeIntent {
                 request_id: "raise-minimum-samples".to_string(),
                 next_policy: next_policy.clone(),
-                evidence_refs: vec!["audit:evaluation-policy-2026-07".to_string()],
+                evidence_refs: vec![EvidenceRef::new("audit", "evaluation-policy-2026-07")],
             })
             .expect("policy review");
         assert_eq!(service.evaluation_policy_floor().revision, 1);
@@ -2587,7 +2700,7 @@ mod tests {
             service.request_evaluation_policy_change(EvaluationPolicyChangeIntent {
                 request_id: "invalid-policy-jump".to_string(),
                 next_policy: skipped,
-                evidence_refs: vec!["audit:invalid".to_string()],
+                evidence_refs: vec![EvidenceRef::new("audit", "invalid")],
             }),
             Err(EvolutionGovernanceError::InvalidReleaseChangeRequest(_))
         ));
@@ -2598,7 +2711,7 @@ mod tests {
             .request_evaluation_policy_change(EvaluationPolicyChangeIntent {
                 request_id: "policy-denied-with-wrong-lease".to_string(),
                 next_policy,
-                evidence_refs: vec!["audit:policy".to_string()],
+                evidence_refs: vec![EvidenceRef::new("audit", "policy")],
             })
             .expect("review");
         let principal = crate::security::test_human_interactive_principal();
@@ -2698,7 +2811,7 @@ mod tests {
             canary_assignment_id: canary.assignment_id.clone(),
             generation: canary.generation,
             source_run_refs: vec!["agent-run:canary-1".to_string()],
-            evidence_refs: vec!["eval:canary-window".to_string()],
+            evidence_refs: vec![EvidenceRef::new("evaluation", "canary-window")],
             sample_count: 40,
             minimum_samples: 10,
             observed_duration_ms: 120_000,
@@ -2763,7 +2876,7 @@ mod tests {
                 canary_assignment_id: canary.assignment_id.clone(),
                 generation: canary.generation,
                 source_run_refs: vec!["agent-run:canary-stop".to_string()],
-                evidence_refs: vec!["eval:canary-stop".to_string()],
+                evidence_refs: vec![EvidenceRef::new("evaluation", "canary-stop")],
                 sample_count: 20,
                 minimum_samples: 10,
                 observed_duration_ms: 120_000,
@@ -2783,7 +2896,7 @@ mod tests {
                 action: ReleaseChangeAction::StopCanary,
                 selector: None,
                 candidate_id: Some(candidate.candidate_id.clone()),
-                evidence_refs: vec!["incident:canary-regression".to_string()],
+                evidence_refs: vec![EvidenceRef::new("incident", "canary-regression")],
             })
             .expect("stop review");
         let stop_lease = crate::security::test_verified_decision_lease(
@@ -3005,7 +3118,7 @@ mod tests {
                 action: ReleaseChangeAction::StopCanary,
                 selector: None,
                 candidate_id: Some(candidate.candidate_id.clone()),
-                evidence_refs: vec!["incident:team-canary".to_string()],
+                evidence_refs: vec![EvidenceRef::new("incident", "team-canary")],
             })
             .expect("stop review");
         let stop_lease = crate::security::test_verified_decision_lease(
@@ -3044,7 +3157,7 @@ mod tests {
                 action: ReleaseChangeAction::SetDefaultExact,
                 selector: None,
                 candidate_id: None,
-                evidence_refs: vec!["audit:pointer".to_string()],
+                evidence_refs: vec![EvidenceRef::new("audit", "pointer")],
             }),
             Err(EvolutionGovernanceError::InvalidReleaseChangeRequest(_))
         ));
@@ -3055,7 +3168,7 @@ mod tests {
                 action: ReleaseChangeAction::Rollback,
                 selector: Some(RevisionSelector::ExactApprovedRevision { revision: 1 }),
                 candidate_id: None,
-                evidence_refs: vec!["incident:rollback".to_string()],
+                evidence_refs: vec![EvidenceRef::new("incident", "rollback")],
             })
             .expect("rollback review");
         assert_eq!(review.class, ReleaseChangeReviewClass::Rollback);

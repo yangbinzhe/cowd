@@ -372,8 +372,7 @@ impl RuntimeDefinitionRegistry {
                             content_digest: stored.revision.content_digest,
                         })?
                     }
-                    ReleaseChangeAction::PromoteStable
-                    | ReleaseChangeAction::PublishInitialStable => {
+                    ReleaseChangeAction::PromoteStable => {
                         self.agents.record_release_assignment(&ReleaseAssignment {
                             scope: revision_ref.definition_id.scope(),
                             revision_ref: revision_ref.clone(),
@@ -445,8 +444,7 @@ impl RuntimeDefinitionRegistry {
                                 content_digest: stored.revision.content_digest,
                             })?
                     }
-                    ReleaseChangeAction::PromoteStable
-                    | ReleaseChangeAction::PublishInitialStable => {
+                    ReleaseChangeAction::PromoteStable => {
                         self.teams
                             .record_release_assignment(&TeamReleaseAssignment {
                                 scope: revision_ref.template_id.scope(),
