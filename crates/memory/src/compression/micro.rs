@@ -56,7 +56,7 @@ impl MicroCompactor {
             last_seen.insert(
                 (
                     tool_name,
-                    receipt.access.evidence_ref.0.id,
+                    receipt.access.evidence_ref.id,
                     receipt.access.sha256,
                 ),
                 index,
@@ -72,15 +72,15 @@ impl MicroCompactor {
             };
             let key = (
                 message.tool_name.clone().unwrap_or_default(),
-                receipt.access.evidence_ref.0.id.clone(),
+                receipt.access.evidence_ref.id.clone(),
                 receipt.access.sha256.clone(),
             );
             if last_seen.get(&key).is_some_and(|last| *last > index) {
                 let mut duplicate_receipt = receipt;
                 duplicate_receipt.preview = format!(
                     "[duplicate durable evidence: {}:{}; retrieve canonical raw by ref]",
-                    duplicate_receipt.access.evidence_ref.0.ref_type,
-                    duplicate_receipt.access.evidence_ref.0.id
+                    duplicate_receipt.access.evidence_ref.ref_type,
+                    duplicate_receipt.access.evidence_ref.id
                 );
                 let replaced = message.replace_with_canonical_raw_receipt(&duplicate_receipt);
                 debug_assert!(replaced);
@@ -126,7 +126,7 @@ impl MicroCompressor {
 mod tests {
     use super::*;
     use crate::types::{CanonicalRawEvidence, Message};
-    use harness_contract::{context::EvidenceAccessRef, core::EvidenceRef};
+    use harness_contract::{context::EvidenceAccessRef, reality::EvidenceRef};
 
     fn durable_message(id: &str, hash: &str, preview: &str) -> Message {
         let mut message = Message::tool_result(id, "read_file", preview);

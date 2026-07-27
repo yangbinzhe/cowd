@@ -17,6 +17,7 @@ use harness_contract::knowledge::{
     KnowledgeGovernanceLevel, KnowledgeNamespace, KnowledgeObjectState, KnowledgePack,
     KnowledgePackKind, KnowledgeTurnReport, KnowledgeUsageSignal,
 };
+use harness_contract::reality::EvidenceRef;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -200,7 +201,7 @@ pub struct KnowledgeChunk {
     pub ordinal: usize,
     pub title: String,
     pub text: String,
-    pub evidence_ref: KernelRef,
+    pub evidence_ref: EvidenceRef,
     pub token_estimate: u64,
 }
 
@@ -232,7 +233,7 @@ pub struct KnowledgeMatrixBridgeFact {
     pub summary: String,
     pub source_ref: String,
     pub confidence: f32,
-    pub evidence_refs: Vec<KernelRef>,
+    pub evidence_refs: Vec<EvidenceRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1337,8 +1338,8 @@ fn make_chunk(
         ordinal,
         title: title.to_string(),
         text: text.trim().to_string(),
-        evidence_ref: KernelRef::new("knowledge_chunk", chunk_id)
-            .with_label(source.clone().unwrap_or_else(|| title.to_string())),
+        evidence_ref: EvidenceRef::new("knowledge_chunk", chunk_id)
+            .with_source(source.clone().unwrap_or_else(|| title.to_string())),
         token_estimate: estimate_tokens(text),
     }
 }

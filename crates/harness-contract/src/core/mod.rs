@@ -282,9 +282,6 @@ pub struct AgentRef(pub KernelRef);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRef(pub KernelRef);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvidenceRef(pub KernelRef);
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KernelEvent {
     pub event_id: String,

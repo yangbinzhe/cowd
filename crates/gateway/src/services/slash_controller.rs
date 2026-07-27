@@ -6,10 +6,7 @@ use crate::command::slash::{
 };
 
 use crate::runtime_service::RuntimeService;
-use harness_contract::{
-    reality::{EvidenceRef, RealityBoundary},
-    task::TaskStatus,
-};
+use harness_contract::{reality::EvidenceRef, task::TaskStatus};
 
 use super::{ServiceEnvelope, TaskService};
 
@@ -324,7 +321,6 @@ fn command_evidence(session_id: &str, turn_id: &str, operation: &str) -> Vec<Evi
     vec![EvidenceRef::new(
         "slash_command",
         format!("slash://sessions/{session_id}/turns/{turn_id}?operation={operation}"),
-        RealityBoundary::Observed,
     )]
 }
 

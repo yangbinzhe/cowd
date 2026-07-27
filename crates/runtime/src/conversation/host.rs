@@ -117,6 +117,9 @@ where
     /// Immutable primary or delegated Binding used for Fact/Matrix context
     /// assembly. Surface callers cannot supply this directly.
     pub reality_binding: Option<harness_contract::agent::AgentBindingSnapshot>,
+    /// Exact delegated execution identity. Root surface turns derive a
+    /// session-turn identity from the active turn at checkpoint time.
+    pub execution_identity: Option<harness_contract::execution::ExecutionIdentity>,
     /// Optional runtime-owned parent graph/node for nested agent turns.
     /// Surface-originated turns leave this empty.
     pub execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
@@ -168,6 +171,7 @@ where
             config.memory_team_id,
             config.memory_read_scopes,
         )
+        .with_checkpoint_identity(services.workspace_key(), config.execution_identity)
         .with_maintenance_supervisor(services.maintenance_supervisor())
         .with_tool_execution_plane(Arc::clone(services.tool_execution_plane()));
         if root_provider_owner {
@@ -6601,7 +6605,7 @@ fn predecessor_goal_observations(
             let materialized_evidence = result
                 .evidence_refs
                 .iter()
-                .map(|reference| reference.evidence_ref.0.id.clone())
+                .map(|reference| reference.evidence_ref.id.clone())
                 .filter(|reference| !reference.trim().is_empty())
                 .collect::<BTreeSet<_>>();
             observation.evidence_refs = materialized_evidence
@@ -9137,6 +9141,7 @@ mod tests {
             memory_team_id: None,
             memory_read_scopes: Vec::new(),
             reality_binding: None,
+            execution_identity: None,
             execution_parent: None,
         })
         .expect("standard host")

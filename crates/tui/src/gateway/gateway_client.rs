@@ -2204,6 +2204,10 @@ impl GatewayApiClient {
         self.get_json("/api/memory/status").await
     }
 
+    pub async fn memory_knowledge_candidates(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json("/api/memory/knowledge/candidates").await
+    }
+
     pub async fn reality_status(&self) -> Result<serde_json::Value, GatewayApiError> {
         self.get_json("/api/reality/status").await
     }

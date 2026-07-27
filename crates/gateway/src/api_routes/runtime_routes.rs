@@ -904,7 +904,6 @@ async fn record_upgrade_disposition(
                                 harness_contract::reality::EvidenceRef::new(
                                     "upgrade_result",
                                     reference,
-                                    harness_contract::reality::RealityBoundary::Observed,
                                 )
                                 .with_source("gateway.upgrade")
                             })

@@ -6,14 +6,22 @@
 )]
 
 use chrono::Utc;
+use harness_contract::{
+    core::TaskRisk,
+    execution::ExecutionIdentity,
+    knowledge::{KnowledgeAuthority, KnowledgeCandidateScope, KnowledgeLineage, KnowledgeNovelty},
+    reality::EvidenceRef,
+    security::{PrincipalAssurance, PrincipalClaims, PrincipalKind},
+};
 use memory::{
     AgentVisibility, CognitiveContextManager, FactChecker, MemoryCategory, MemoryConfig,
     MemoryEntry, MemoryLayer, MemoryScope, MemorySource, MemoryTurnContext, Priority,
 };
 use memory::{DocumentCategory, DocumentContent, DocumentIngestor};
 use runtime::{
-    L4CandidateLifecycle, L4PromotionCandidate, L4PromotionService, RuntimeEventInput,
-    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    ApprovalDecisionCommand, ApprovalQueue, L4CandidateLifecycle, L4PromotionCandidate,
+    L4PromotionService, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    VerifiedPrincipal,
 };
 use session::{SessionRecord, UnifiedSessionStore};
 use std::sync::Arc;
@@ -279,28 +287,83 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         .expect("session memories load");
     assert!(associated.contains(&document_memory_id.to_string()));
 
-    let l4_promotion =
-        L4PromotionService::new(Arc::clone(&execution_events), Some(Arc::clone(&memory)));
+    let approval_queue = Arc::new(ApprovalQueue::new(Arc::clone(&execution_events)));
+    let l4_promotion = L4PromotionService::new(
+        Arc::clone(&execution_events),
+        Arc::clone(&approval_queue),
+        Some(Arc::clone(&memory)),
+    );
+    let execution_identity = ExecutionIdentity::for_task_graph(
+        "agent-reviewer",
+        "cowd-full-capability-eval",
+        "mission-full-capability-eval",
+        "task-full-capability-eval",
+        session_id,
+        "turn-full-capability-eval",
+        "graph-full-capability-eval",
+    )
+    .expect("review task graph identity");
     let reviewer_candidate = L4PromotionCandidate {
         candidate_id: "candidate-full-capability-review".to_string(),
-        team_id: "team-full-capability-eval".to_string(),
-        graph_id: "graph-full-capability-eval".to_string(),
-        lineage_ref: format!("session:{session_id}"),
+        execution_identity,
+        scope: KnowledgeCandidateScope::Workspace("cowd-full-capability-eval".to_string()),
         title: "Reviewer accepted full capability eval".to_string(),
-        content: format!(
+        claim: format!(
             "review={} fact_check_consistent={} structured_ref={}",
             review["id"].as_str().unwrap(),
             fact_result.is_consistent,
             "structured-evidence:shortage-risk-packet"
         ),
-        scope: MemoryScope::Project("cowd-full-capability-eval".to_string()),
-        source_evidence_refs: agent_evidence
+        evidence_refs: agent_evidence
             .iter()
-            .map(|evidence| format!("evidence:{}", evidence["id"].as_str().unwrap()))
+            .map(|evidence| {
+                EvidenceRef::new(
+                    "agent_evidence",
+                    evidence["id"].as_str().unwrap().to_string(),
+                )
+            })
             .collect(),
-        priority: Priority::High,
+        authority: KnowledgeAuthority::WorkspaceVerified,
+        lineage: KnowledgeLineage::default(),
+        novelty: KnowledgeNovelty::New,
+        risk: TaskRisk::Medium,
         tags: vec!["review".to_string(), "full-capability".to_string()],
+        producer: "runtime.full_capability_eval".to_string(),
+        producer_version: env!("CARGO_PKG_VERSION").to_string(),
+        created_at_ms: Utc::now().timestamp_millis().max(0) as u64,
     };
+    let pending = l4_promotion
+        .govern(reviewer_candidate.clone())
+        .await
+        .expect("workspace candidate enters governance");
+    assert_eq!(
+        pending.state,
+        L4CandidateLifecycle::AwaitingApproval,
+        "workspace knowledge must not bypass human approval"
+    );
+    let principal = VerifiedPrincipal::from_test_claims(PrincipalClaims {
+        principal_id: "human:full-capability-reviewer".to_string(),
+        kind: PrincipalKind::Human,
+        scopes: vec!["workspace".to_string()],
+        capabilities: vec!["approval.respond".to_string()],
+        assurance: PrincipalAssurance::HumanInteractive,
+        issuer: "runtime-test".to_string(),
+        issued_at_ms: 1,
+        expires_at_ms: None,
+        credential_fingerprint: "runtime-test".to_string(),
+        credential_epoch: 1,
+        profile_revision: 1,
+    });
+    approval_queue
+        .decide(
+            &principal,
+            ApprovalDecisionCommand {
+                approval_id: pending.approval_id.expect("knowledge approval id"),
+                approved: true,
+                reason: "verified full capability evidence".to_string(),
+            },
+        )
+        .expect("knowledge approval succeeds");
     let reviewer_memory = l4_promotion
         .validate_and_promote(reviewer_candidate.clone())
         .await
@@ -313,6 +376,8 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         vec![
             L4CandidateLifecycle::Proposed,
             L4CandidateLifecycle::Validated,
+            L4CandidateLifecycle::AwaitingApproval,
+            L4CandidateLifecycle::Approved,
             L4CandidateLifecycle::Promoted,
         ]
     );

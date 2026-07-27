@@ -325,7 +325,6 @@ impl RuntimePort for GatewayAppHostBinding {
                         vec![harness_contract::reality::EvidenceRef::new(
                             "app_intent",
                             format!("app://{}/requests/{}", context.surface, context.request_id),
-                            harness_contract::reality::RealityBoundary::Observed,
                         )],
                     )
                     .map_err(AppHostError::Unavailable)?;

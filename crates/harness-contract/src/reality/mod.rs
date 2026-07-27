@@ -88,7 +88,7 @@ impl RecallSourceKind {
 
 /// Stable evidence pointer shared by runtime, gateway, memory, matrix, and UI
 /// projections.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EvidenceRef {
     pub ref_type: String,
     pub id: String,
@@ -100,18 +100,26 @@ pub struct EvidenceRef {
 }
 
 impl EvidenceRef {
-    pub fn new(
-        ref_type: impl Into<String>,
-        id: impl Into<String>,
-        boundary: RealityBoundary,
-    ) -> Self {
+    /// Construct an observed evidence reference.
+    ///
+    /// Observed is the safe default for existing durable tool, artifact, and
+    /// runtime receipts. Inferred or simulated evidence must opt in through
+    /// [`Self::with_boundary`] so non-authoritative material cannot be
+    /// promoted accidentally.
+    pub fn new(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             ref_type: ref_type.into(),
             id: id.into(),
             source: None,
-            boundary,
+            boundary: RealityBoundary::Observed,
             confidence_bp: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_boundary(mut self, boundary: RealityBoundary) -> Self {
+        self.boundary = boundary;
+        self
     }
 
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
@@ -122,6 +130,16 @@ impl EvidenceRef {
     pub fn with_confidence_bp(mut self, confidence_bp: u16) -> Self {
         self.confidence_bp = Some(confidence_bp.min(10_000));
         self
+    }
+
+    #[must_use]
+    pub fn durable(id: impl Into<String>) -> Self {
+        Self::new("durable_evidence", id).with_source("runtime.artifact")
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
     }
 }
 

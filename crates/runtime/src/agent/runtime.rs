@@ -9,7 +9,7 @@ use harness_contract::agent::{
 };
 use harness_contract::execution::ExecutionIdentity;
 use harness_contract::execution_graph::{ExecutionEdgeKind, ExecutionNodeKind};
-use harness_contract::reality::{EvidenceRef, RealityBoundary};
+use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 
 use crate::execution_core::graph::executors::{AgentTaskBackend, AgentTaskBackendResolver};
@@ -523,7 +523,6 @@ impl AgentRuntime {
                 vec![EvidenceRef::new(
                     "agent_run",
                     format!("agent-run://{}", packet.run_id()),
-                    RealityBoundary::Observed,
                 )],
             )?;
         }
@@ -1310,6 +1309,13 @@ impl AgentRuntime {
             receipt: receipt.clone(),
             returned: returned.clone(),
         };
+        let candidate_event = returned
+            .as_ref()
+            .and_then(|returned| {
+                crate::knowledge_candidate_projector::agent_terminal_candidate(&snapshot, returned)
+            })
+            .map(crate::knowledge_candidate_projector::candidate_proposal_event)
+            .transpose()?;
         let agent_event = RuntimeEventInput {
             stream_id: stream_id.clone(),
             scope: RuntimeEventScope::Agent,
@@ -1325,11 +1331,76 @@ impl AgentRuntime {
                 .event_store
                 .stream_revision(&evaluation_stream)
                 .map_err(|error| error.to_string())?;
+            let mut expected_streams = vec![
+                ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: snapshot.revision.saturating_sub(1),
+                },
+                ExpectedStreamRevision {
+                    stream_id: evaluation_stream.clone(),
+                    expected_revision: evaluation_revision,
+                },
+            ];
+            let mut events = vec![
+                agent_event.into(),
+                RuntimeEventInput {
+                    stream_id: evaluation_stream,
+                    scope: RuntimeEventScope::Evolution,
+                    kind: "agent.run_evaluated".to_string(),
+                    status: Some(if evaluation.is_success() {
+                        "completed".to_string()
+                    } else {
+                        "failed".to_string()
+                    }),
+                    actor: Some("runtime.agent_evaluation".to_string()),
+                    refs: vec![
+                        RuntimeEventRef {
+                            kind: "run".to_string(),
+                            id: evaluation.run_id.clone(),
+                        },
+                        RuntimeEventRef {
+                            kind: "agent_definition".to_string(),
+                            id: format!(
+                                "{}@{}",
+                                evaluation.definition_id, evaluation.definition_revision
+                            ),
+                        },
+                        RuntimeEventRef {
+                            kind: "binding".to_string(),
+                            id: evaluation.binding_digest.clone(),
+                        },
+                    ],
+                    payload: serde_json::json!({"evaluation": evaluation}),
+                }
+                .into(),
+            ];
+            if let Some(candidate_event) = candidate_event {
+                expected_streams.push(ExpectedStreamRevision {
+                    stream_id: candidate_event.event.stream_id.clone(),
+                    expected_revision: self
+                        .event_store
+                        .stream_revision(&candidate_event.event.stream_id)
+                        .map_err(|error| error.to_string())?,
+                });
+                events.push(candidate_event);
+            }
             self.event_store
                 .append_transaction(AppendTransactionRequest {
                     transaction_id: format!(
                         "agent-terminal-evaluation:{}:{}",
                         snapshot.run_id, evaluation.evaluation_id
+                    ),
+                    expected_streams,
+                    events,
+                })
+                .map_err(|error| error.to_string())?;
+        } else if let Some(candidate_event) = candidate_event {
+            let candidate_stream = candidate_event.event.stream_id.clone();
+            self.event_store
+                .append_transaction(AppendTransactionRequest {
+                    transaction_id: format!(
+                        "agent-terminal-knowledge:{}:{}",
+                        snapshot.run_id, snapshot.revision
                     ),
                     expected_streams: vec![
                         ExpectedStreamRevision {
@@ -1337,43 +1408,14 @@ impl AgentRuntime {
                             expected_revision: snapshot.revision.saturating_sub(1),
                         },
                         ExpectedStreamRevision {
-                            stream_id: evaluation_stream.clone(),
-                            expected_revision: evaluation_revision,
+                            stream_id: candidate_stream.clone(),
+                            expected_revision: self
+                                .event_store
+                                .stream_revision(&candidate_stream)
+                                .map_err(|error| error.to_string())?,
                         },
                     ],
-                    events: vec![
-                        agent_event.into(),
-                        RuntimeEventInput {
-                            stream_id: evaluation_stream,
-                            scope: RuntimeEventScope::Evolution,
-                            kind: "agent.run_evaluated".to_string(),
-                            status: Some(if evaluation.is_success() {
-                                "completed".to_string()
-                            } else {
-                                "failed".to_string()
-                            }),
-                            actor: Some("runtime.agent_evaluation".to_string()),
-                            refs: vec![
-                                RuntimeEventRef {
-                                    kind: "run".to_string(),
-                                    id: evaluation.run_id.clone(),
-                                },
-                                RuntimeEventRef {
-                                    kind: "agent_definition".to_string(),
-                                    id: format!(
-                                        "{}@{}",
-                                        evaluation.definition_id, evaluation.definition_revision
-                                    ),
-                                },
-                                RuntimeEventRef {
-                                    kind: "binding".to_string(),
-                                    id: evaluation.binding_digest.clone(),
-                                },
-                            ],
-                            payload: serde_json::json!({"evaluation": evaluation}),
-                        }
-                        .into(),
-                    ],
+                    events: vec![agent_event.into(), candidate_event],
                 })
                 .map_err(|error| error.to_string())?;
         } else {

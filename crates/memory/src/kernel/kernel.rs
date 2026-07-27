@@ -629,8 +629,13 @@ impl MemoryKernel {
                 .evidence_refs
                 .iter()
                 .map(|evidence| {
-                    let label = evidence.0.label.as_deref().unwrap_or("source");
-                    format!("- {}:{} ({label})", evidence.0.ref_type, evidence.0.id)
+                    let source = evidence.source.as_deref().unwrap_or("source");
+                    format!(
+                        "- {}:{} ({source}; {})",
+                        evidence.ref_type,
+                        evidence.id,
+                        evidence.boundary.as_str()
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -1953,7 +1958,7 @@ mod tests {
         SessionResumeCursor, SessionSemanticCheckpoint,
     };
     use crate::types::{AgentVisibility, MemoryCategory};
-    use harness_contract::core::EvidenceRef;
+    use harness_contract::reality::EvidenceRef;
 
     fn memory_entry(
         title: &str,
@@ -2138,8 +2143,15 @@ mod tests {
         let kernel = MemoryKernel::new(Arc::clone(&manager));
         let context = MemoryTurnContext::new("session-idempotent", "primary");
         let checkpoint = SessionSemanticCheckpoint {
-            schema_version: 2,
+            schema_version: crate::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id: "checkpoint-idempotent".to_string(),
+            execution_identity: harness_contract::execution::ExecutionIdentity::for_session_turn(
+                "primary",
+                "workspace-idempotent",
+                "session-idempotent",
+                "turn-idempotent",
+            )
+            .unwrap(),
             session_id: "session-idempotent".to_string(),
             agent_id: "primary".to_string(),
             project_id: None,

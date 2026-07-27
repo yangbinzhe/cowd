@@ -8,10 +8,7 @@ use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind,
     ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
 };
-use harness_contract::{
-    context::EvidenceAccessRef,
-    core::{EvidenceRef, KernelRef},
-};
+use harness_contract::{context::EvidenceAccessRef, reality::EvidenceRef};
 
 use super::*;
 use crate::execution_core::RuntimeCompileTarget;
@@ -519,7 +516,7 @@ impl NodeExecutor for EvidenceExecutor {
             .as_ref()
             .map(|id| {
                 vec![EvidenceAccessRef::durable(
-                    EvidenceRef(KernelRef::new("evidence", id)),
+                    EvidenceRef::new("evidence", id),
                     format!("sha:{id}"),
                     1,
                     "text/plain",

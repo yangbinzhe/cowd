@@ -108,7 +108,7 @@ impl ToolOutputSandbox {
             tool_call_id,
             output,
             threshold_min_lines,
-            &evidence.access.evidence_ref.0.id,
+            &evidence.access.evidence_ref.id,
             &evidence.access.sha256,
             &evidence.access.retrieval_selector,
         )
@@ -399,7 +399,7 @@ fn extract_keywords(text: &str, top_n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::{context::EvidenceAccessRef, core::EvidenceRef};
+    use harness_contract::{context::EvidenceAccessRef, reality::EvidenceRef};
 
     fn receipt(id: &str, output: &str) -> CanonicalRawEvidence {
         CanonicalRawEvidence::new(

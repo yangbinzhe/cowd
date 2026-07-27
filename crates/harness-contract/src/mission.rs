@@ -470,11 +470,7 @@ mod tests {
             expected_revision: Some(7),
             correlation_id: "corr-1".to_string(),
             payload: serde_json::json!({"reason": "new evidence"}),
-            evidence_refs: vec![EvidenceRef::new(
-                "mission_command",
-                "evidence:1",
-                crate::reality::RealityBoundary::Observed,
-            )],
+            evidence_refs: vec![EvidenceRef::new("mission_command", "evidence:1")],
         };
         let value = serde_json::to_value(command).expect("command serializes");
         assert!(value.get("session_history").is_none());

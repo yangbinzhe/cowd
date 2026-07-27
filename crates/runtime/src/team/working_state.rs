@@ -309,7 +309,7 @@ pub(crate) fn terminal_working_state_event(
                 .map(|reference| {
                     format!(
                         "evidence:{}:{}",
-                        reference.evidence_ref.0.ref_type, reference.evidence_ref.0.id
+                        reference.evidence_ref.ref_type, reference.evidence_ref.id
                     )
                 })
                 .collect::<Vec<_>>()

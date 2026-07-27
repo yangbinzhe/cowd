@@ -4,10 +4,10 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, State as AxumState},
+    extract::{Extension, Path, Query, State as AxumState},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, patch},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use memory::types::{
@@ -19,7 +19,7 @@ use memory::{
 };
 use serde::Deserialize;
 
-use super::{api_error, AppState, ErrorResponse};
+use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -57,6 +57,18 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route(
             "/api/memory/knowledge/maintenance",
             get(memory_knowledge_maintenance_handler),
+        )
+        .route(
+            "/api/memory/knowledge/candidates",
+            get(memory_knowledge_candidates_handler),
+        )
+        .route(
+            "/api/memory/knowledge/candidates/:id",
+            get(memory_knowledge_candidate_handler),
+        )
+        .route(
+            "/api/memory/knowledge/candidates/:id/rollback",
+            post(rollback_memory_knowledge_candidate_handler),
         )
         .route("/api/memory/clusters", get(memory_clusters_handler))
         .route("/api/memory/lifecycle/:id", get(memory_lifecycle_handler))
@@ -366,6 +378,87 @@ async fn memory_knowledge_maintenance_handler(
             .cloned()
             .unwrap_or_else(|| serde_json::json!({})),
     }))
+}
+
+fn knowledge_runtime_services(
+    state: &AppState,
+) -> Result<Arc<runtime::RuntimeServices>, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.runtime_services())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "runtime knowledge governance is unavailable",
+            )
+        })
+}
+
+async fn memory_knowledge_candidates_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = knowledge_runtime_services(&state)?;
+    let candidates = runtime
+        .l4_promotion_service()
+        .list()
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    Ok(Json(serde_json::json!({
+        "kind": "knowledge.candidate.collection",
+        "total": candidates.len(),
+        "candidates": candidates,
+    })))
+}
+
+async fn memory_knowledge_candidate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(candidate_id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = knowledge_runtime_services(&state)?;
+    runtime
+        .l4_promotion_service()
+        .get(&candidate_id)
+        .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?
+        .map(Json)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "knowledge candidate not found"))
+}
+
+#[derive(Debug, Deserialize)]
+struct KnowledgeCandidateRollbackRequest {
+    reason: String,
+}
+
+async fn rollback_memory_knowledge_candidate_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Path(candidate_id): Path<String>,
+    Json(request): Json<KnowledgeCandidateRollbackRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if !principal.0.is_human_interactive()
+        || !principal.0.has_capability("runtime.maintenance.manage")
+    {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "knowledge rollback requires an interactive runtime maintainer",
+        ));
+    }
+    let runtime = knowledge_runtime_services(&state)?;
+    let projection = runtime
+        .l4_promotion_service()
+        .rollback(&candidate_id, &request.reason)
+        .await
+        .map_err(|error| {
+            let status = if error.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if error.contains("only a promoted") || error.contains("requires a reason") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            api_error(status, error)
+        })?;
+    Ok(Json(projection))
 }
 
 async fn performance_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

@@ -26,7 +26,7 @@ pub fn audit_projection(
 #[cfg(test)]
 mod tests {
     use harness_contract::context::{EvidenceAccessRef, EvidenceContentKind};
-    use harness_contract::core::EvidenceRef;
+    use harness_contract::reality::EvidenceRef;
 
     use super::*;
 

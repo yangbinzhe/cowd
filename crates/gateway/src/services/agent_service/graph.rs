@@ -44,7 +44,6 @@ impl AgentService {
                 vec![harness_contract::reality::EvidenceRef::new(
                     "gateway_command",
                     format!("register-graph:{task_id}"),
-                    harness_contract::reality::RealityBoundary::Observed,
                 )
                 .with_source("gateway.agent_service")],
             )

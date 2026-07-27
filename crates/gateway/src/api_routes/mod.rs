@@ -1833,7 +1833,6 @@ pub(crate) mod tests {
             vec![harness_contract::reality::EvidenceRef::new(
                 "test_fixture",
                 format!("test://tasks/{task_id}"),
-                harness_contract::reality::RealityBoundary::Observed,
             )],
         )
         .expect("seed canonical Runtime task")
@@ -12512,7 +12511,6 @@ providers:
                 vec![harness_contract::reality::EvidenceRef::new(
                     "test_fixture",
                     "test://tasks/task-resume-context/artifacts/1",
-                    harness_contract::reality::RealityBoundary::Observed,
                 )],
             )
             .unwrap();
@@ -15871,7 +15869,7 @@ providers:
             ))
             .await
             .unwrap();
-        let evidence_ref = harness_contract::core::EvidenceRef::new("tool", "tool-1");
+        let evidence_ref = harness_contract::reality::EvidenceRef::new("tool", "tool-1");
         let projection = harness_contract::context::EvidenceAuditProjection {
             evidence_ref: evidence_ref.clone(),
             content_kind: harness_contract::context::EvidenceContentKind::Text,

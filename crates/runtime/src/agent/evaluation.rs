@@ -123,7 +123,7 @@ impl AgentRunEvaluation {
             evidence_refs: returned
                 .evidence_refs
                 .iter()
-                .map(|reference| reference.evidence_ref.0.id.clone())
+                .map(|reference| reference.evidence_ref.id.clone())
                 .collect(),
             created_at_ms,
         })

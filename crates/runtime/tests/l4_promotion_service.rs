@@ -2,8 +2,14 @@
 
 use std::sync::Arc;
 
+use harness_contract::{
+    core::TaskRisk,
+    execution::ExecutionIdentity,
+    knowledge::{KnowledgeAuthority, KnowledgeCandidateScope, KnowledgeLineage, KnowledgeNovelty},
+    reality::EvidenceRef,
+};
 use memory::config::{BudgetConfig, StoreConfig};
-use memory::{CognitiveContextManager, MemoryConfig, MemoryLayer, MemoryScope, Priority};
+use memory::{CognitiveContextManager, MemoryConfig, MemoryLayer};
 use runtime::{L4PromotionCandidate, RuntimeServices};
 
 async fn services_with_memory() -> (
@@ -41,18 +47,35 @@ async fn services_with_memory() -> (
 }
 
 fn candidate() -> L4PromotionCandidate {
+    let graph = ExecutionIdentity::for_task_graph(
+        "agent-l4-service",
+        "workspace-l4-service",
+        "mission-l4-service",
+        "task-l4-service",
+        "session-l4-service",
+        "turn-l4-service",
+        "graph-l4-service",
+    )
+    .expect("task graph identity");
+    let execution_identity =
+        ExecutionIdentity::for_agent_node(&graph, "agent-l4-service", "verify")
+            .expect("agent identity");
     L4PromotionCandidate {
         candidate_id: "candidate-l4-service".to_string(),
-        team_id: "team-l4-service".to_string(),
-        graph_id: "team-graph:team-l4-service".to_string(),
-        lineage_ref: "team-graph:team-l4-service:verify".to_string(),
+        execution_identity,
+        scope: KnowledgeCandidateScope::AgentPrivate("agent-l4-service".to_string()),
         title: "Verified architecture decision".to_string(),
-        content: "Use the reviewed Runtime Team instantiation path for durable Team work."
+        claim: "Use the reviewed Runtime Team instantiation path for durable Team work."
             .to_string(),
-        scope: MemoryScope::TeamRun("team-l4-service".to_string()),
-        source_evidence_refs: vec!["evidence:review:1".to_string()],
-        priority: Priority::High,
+        evidence_refs: vec![EvidenceRef::new("review", "evidence:review:1")],
+        authority: KnowledgeAuthority::AgentObservation,
+        lineage: KnowledgeLineage::default(),
+        novelty: KnowledgeNovelty::New,
+        risk: TaskRisk::Low,
         tags: vec!["decision".to_string()],
+        producer: "runtime.test".to_string(),
+        producer_version: env!("CARGO_PKG_VERSION").to_string(),
+        created_at_ms: 1,
     }
 }
 

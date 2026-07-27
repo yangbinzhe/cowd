@@ -22,7 +22,7 @@ use harness_contract::context::ContextBudgetLeaseRef;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
 };
-use harness_contract::reality::{EvidenceRef, RealityBoundary};
+use harness_contract::reality::EvidenceRef;
 use harness_contract::task::{TaskCreateCommand, TaskExecutionPolicy, TaskPhaseSpec, TaskSpec};
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, RolePartitionPolicy,
@@ -341,7 +341,6 @@ impl TeamInstantiationService {
                             role.role_id,
                             slot + 1
                         ),
-                        RealityBoundary::Observed,
                     )],
                 });
                 let graph_identity =

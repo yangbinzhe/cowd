@@ -58,7 +58,7 @@ impl KnowledgeComplianceRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_contract::core::KernelRef;
+    use harness_contract::reality::EvidenceRef;
 
     #[test]
     fn blocking_warning_becomes_hard_gate() {
@@ -68,7 +68,7 @@ mod tests {
             rule_id: Some("r1".to_string()),
             level: KnowledgeGovernanceLevel::Blocking,
             summary: "must stop on missing safety evidence".to_string(),
-            evidence_refs: vec![KernelRef::new("test", "e1")],
+            evidence_refs: vec![EvidenceRef::new("test", "e1")],
         }]);
 
         assert_eq!(decision.action, KnowledgeComplianceAction::Block);

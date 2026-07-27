@@ -8,10 +8,10 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use harness_contract::core::{EvidenceRef, KernelRef};
+use harness_contract::reality::EvidenceRef;
 use memory::compression::session::{
     CheckpointFactKind, CheckpointTokenStats, CompactionSourceRange, SessionCheckpointFact,
-    SessionResumeCursor, SessionSemanticCheckpoint,
+    SessionResumeCursor, SessionSemanticCheckpoint, SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
 };
 use memory::config::{BudgetConfig, StoreConfig};
 use memory::{
@@ -192,12 +192,18 @@ async fn checkpoint_compaction_promotes_only_reviewed_candidates() {
     existing.scope = MemoryScope::Task("task-checkpoint".to_string());
     manager.remember(existing).await.unwrap();
 
-    let evidence_ref = EvidenceRef(
-        KernelRef::new("session-message", "session-checkpoint:0").with_label("source message"),
-    );
+    let evidence_ref =
+        EvidenceRef::new("session-message", "session-checkpoint:0").with_source("source message");
     let checkpoint = SessionSemanticCheckpoint {
-        schema_version: 2,
+        schema_version: SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
         checkpoint_id: "checkpoint-review".to_string(),
+        execution_identity: harness_contract::execution::ExecutionIdentity::for_session_turn(
+            "agent-primary",
+            "workspace-checkpoint",
+            "session-checkpoint",
+            "turn-checkpoint",
+        )
+        .unwrap(),
         session_id: "session-checkpoint".to_string(),
         agent_id: "agent-primary".to_string(),
         project_id: ctx.project_id.clone(),

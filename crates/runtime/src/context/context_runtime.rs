@@ -2354,7 +2354,7 @@ mod tests {
             active_pack_ids: vec!["pack-a".to_string()],
             blocked_namespaces: vec!["global/noisy".to_string()],
             compliance_warnings: Vec::new(),
-            evidence_refs: vec![harness_contract::core::KernelRef::new(
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
                 "knowledge_pack",
                 "pack-a",
             )],
@@ -2421,7 +2421,7 @@ mod tests {
             active_pack_ids: vec!["pack-a".to_string()],
             blocked_namespaces: vec!["global/noisy".to_string()],
             compliance_warnings: Vec::new(),
-            evidence_refs: vec![harness_contract::core::KernelRef::new(
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
                 "knowledge_pack",
                 "pack-a",
             )],

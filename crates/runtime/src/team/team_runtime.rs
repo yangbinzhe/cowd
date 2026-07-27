@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use harness_contract::{
-    reality::{EvidenceRef, RealityBoundary},
+    reality::EvidenceRef,
     team::{TeamInstantiationRequest, TeamTemplateRevisionRef},
 };
 
@@ -108,7 +108,6 @@ impl TeamRuntime {
             vec![EvidenceRef::new(
                 "team_run",
                 format!("team-run://{team_id}?graph={}", registered.id),
-                RealityBoundary::Observed,
             )],
         )?;
         self.execution
@@ -169,7 +168,6 @@ impl TeamRuntime {
             vec![EvidenceRef::new(
                 "team_run",
                 format!("team-run://{team_id}?graph={}", registered.id),
-                RealityBoundary::Observed,
             )],
         )?;
         Ok(registered.id)
@@ -228,7 +226,6 @@ impl TeamRuntime {
                 vec![EvidenceRef::new(
                     "execution_graph",
                     format!("execution-graph://{graph_id}?revision={graph_revision}"),
-                    RealityBoundary::Observed,
                 )],
             )?;
         }

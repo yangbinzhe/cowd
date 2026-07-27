@@ -696,7 +696,7 @@ impl SessionInputRouter {
             .node_results
             .values()
             .flat_map(|result| result.evidence_refs.iter())
-            .map(|reference| reference.evidence_ref.0.id.clone())
+            .map(|reference| reference.evidence_ref.id.clone())
             .collect::<Vec<_>>();
         evidence_refs.push(format!("runtime-commit:{commit_cursor}"));
         evidence_refs.sort();
@@ -1649,7 +1649,7 @@ mod tests {
                 scope: Vec::new(),
                 context_lens: Vec::new(),
                 evidence_refs: vec![harness_contract::context::EvidenceAccessRef::durable(
-                    harness_contract::core::EvidenceRef::new("tool", "raw-1"),
+                    harness_contract::reality::EvidenceRef::new("tool", "raw-1"),
                     "sha256:abc",
                     3,
                     "text/plain",

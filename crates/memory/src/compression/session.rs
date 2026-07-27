@@ -16,7 +16,7 @@ use fact_kernel::{
     Confidence, EvidenceId, ExtractionMethod, FactCandidate, FactCandidateId, FactExtractionBatch,
     FactExtractionTokenUsage, FactExtractionTrigger, FactScope, FactSource, SourceKind,
 };
-use harness_contract::core::EvidenceRef;
+use harness_contract::{execution::ExecutionIdentity, reality::EvidenceRef};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -179,6 +179,7 @@ impl CheckpointFactKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCheckpointBuildContext {
     pub checkpoint_id: String,
+    pub execution_identity: ExecutionIdentity,
     pub session_id: String,
     pub agent_id: String,
     pub project_id: Option<String>,
@@ -194,10 +195,32 @@ impl SessionCheckpointBuildContext {
         agent_id: impl Into<String>,
         source_range: CompactionSourceRange,
     ) -> Self {
+        let session_id = session_id.into();
+        let agent_id = agent_id.into();
+        let identity_session = if session_id.trim().is_empty() {
+            "standalone-session".to_string()
+        } else {
+            session_id.clone()
+        };
+        let identity_agent = if agent_id.trim().is_empty() {
+            "standalone-agent".to_string()
+        } else {
+            agent_id.clone()
+        };
+        let execution_identity = ExecutionIdentity::for_session_turn(
+            identity_agent,
+            format!("standalone-workspace:{identity_session}"),
+            identity_session,
+            "standalone-checkpoint",
+        )
+        .unwrap_or_else(|error| {
+            unreachable!("sanitized standalone checkpoint identity must be valid: {error}")
+        });
         Self {
             checkpoint_id: format!("checkpoint-{}", uuid::Uuid::new_v4()),
-            session_id: session_id.into(),
-            agent_id: agent_id.into(),
+            execution_identity,
+            session_id,
+            agent_id,
             project_id: None,
             task_id: None,
             team_id: None,
@@ -217,6 +240,12 @@ impl SessionCheckpointBuildContext {
     #[must_use]
     pub fn with_checkpoint_id(mut self, checkpoint_id: impl Into<String>) -> Self {
         self.checkpoint_id = checkpoint_id.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_execution_identity(mut self, execution_identity: ExecutionIdentity) -> Self {
+        self.execution_identity = execution_identity;
         self
     }
 
@@ -264,6 +293,7 @@ pub struct SessionSemanticCheckpoint {
     #[serde(default = "legacy_session_checkpoint_schema_version")]
     pub schema_version: u32,
     pub checkpoint_id: String,
+    pub execution_identity: ExecutionIdentity,
     pub session_id: String,
     pub agent_id: String,
     pub project_id: Option<String>,
@@ -294,7 +324,7 @@ pub struct SessionSemanticCheckpoint {
 /// Highest semantic checkpoint schema this build can restore without dropping
 /// fields. Gateway rejects newer snapshots rather than injecting a partial
 /// reconstruction into a resumed model request.
-pub const SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 
 const fn legacy_session_checkpoint_schema_version() -> u32 {
     1
@@ -402,6 +432,7 @@ impl SessionCheckpointFact {
         .with_payload(json!({
             "schema_version": checkpoint.schema_version,
             "checkpoint_id": checkpoint.checkpoint_id,
+            "execution_identity": checkpoint.execution_identity,
             "session_id": checkpoint.session_id,
             "agent_id": checkpoint.agent_id,
             "project_id": checkpoint.project_id,
@@ -430,7 +461,7 @@ impl SessionCheckpointFact {
 }
 
 fn evidence_id_from_ref(reference: &EvidenceRef) -> EvidenceId {
-    EvidenceId::from_string(format!("{}:{}", reference.0.ref_type, reference.0.id))
+    EvidenceId::from_string(format!("{}:{}", reference.ref_type, reference.id))
 }
 
 impl SessionCompactor {
@@ -710,6 +741,7 @@ impl SessionCompactor {
         Ok(SessionSemanticCheckpoint {
             schema_version: SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id: build_context.checkpoint_id,
+            execution_identity: build_context.execution_identity,
             session_id: build_context.session_id,
             agent_id: build_context.agent_id,
             project_id: build_context.project_id,
@@ -1469,7 +1501,6 @@ impl SessionCompressor {
 mod tests {
     use super::*;
     use crate::types::{Message, MessageRole};
-    use harness_contract::core::KernelRef;
 
     fn msg(role: MessageRole, content: &str) -> Message {
         Message {
@@ -1587,12 +1618,18 @@ mod tests {
 
     #[test]
     fn semantic_checkpoint_exports_fact_extraction_batch_with_stable_scope() {
-        let evidence_ref = EvidenceRef(
-            KernelRef::new("session-message", "session-a:0").with_label("source message"),
-        );
+        let evidence_ref =
+            EvidenceRef::new("session-message", "session-a:0").with_source("source message");
         let checkpoint = SessionSemanticCheckpoint {
             schema_version: SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id: "checkpoint-a".to_string(),
+            execution_identity: ExecutionIdentity::for_session_turn(
+                "agent-a",
+                "workspace-a",
+                "session-a",
+                "turn-a",
+            )
+            .unwrap(),
             session_id: "session-a".to_string(),
             agent_id: "agent-a".to_string(),
             project_id: Some("project-a".to_string()),

@@ -1,6 +1,6 @@
 use super::*;
 use harness_contract::context::{EvidenceAccessRef, EvidenceAuditProjection, EvidenceContentKind};
-use harness_contract::core::EvidenceRef;
+use harness_contract::reality::EvidenceRef;
 
 const DEFAULT_EVIDENCE_SNIPPET_BYTES: usize = 4 * 1024;
 const MAX_EVIDENCE_SNIPPET_BYTES: usize = 16 * 1024;
@@ -535,7 +535,7 @@ mod tests {
             ArtifactWriteDescriptor, EvidenceAccessRef, EvidenceAuditProjection,
             EvidenceContentKind,
         },
-        core::EvidenceRef,
+        reality::EvidenceRef,
     };
     use session::{SessionDomainEvent, SessionDomainScope, SessionRecord, UnifiedSessionStore};
     use sha2::Digest;

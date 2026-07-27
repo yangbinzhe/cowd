@@ -2,7 +2,7 @@ pub mod projection;
 pub mod raw;
 
 use harness_contract::context::EvidenceContentKind;
-use harness_contract::core::EvidenceRef;
+use harness_contract::reality::EvidenceRef;
 use serde::{Deserialize, Serialize};
 
 use crate::context_ledger::estimate_text_tokens;

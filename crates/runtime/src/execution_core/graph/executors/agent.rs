@@ -185,16 +185,15 @@ impl NodeExecutor for AgentTaskExecutor {
                         .cloned(),
                 );
                 upstream_changes.extend(predecessor.evidence_refs.iter().filter_map(|evidence| {
-                    (evidence.evidence_ref.0.ref_type == "runtime_change")
-                        .then(|| evidence.evidence_ref.0.id.clone())
+                    (evidence.evidence_ref.ref_type == "runtime_change")
+                        .then(|| evidence.evidence_ref.id.clone())
                 }));
             }
             packet.evidence_refs.sort_by(|left, right| {
                 left.evidence_ref
-                    .0
                     .ref_type
-                    .cmp(&right.evidence_ref.0.ref_type)
-                    .then_with(|| left.evidence_ref.0.id.cmp(&right.evidence_ref.0.id))
+                    .cmp(&right.evidence_ref.ref_type)
+                    .then_with(|| left.evidence_ref.id.cmp(&right.evidence_ref.id))
             });
             packet
                 .evidence_refs

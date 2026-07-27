@@ -11,7 +11,7 @@ pub use harness_contract::task::{
     TaskPhase, TaskPhaseArtifact, TaskPhaseStatus, TaskPhaseTerminalReceipt, TaskSpec, TaskStatus,
 };
 use harness_contract::{
-    reality::{EvidenceRef, RealityBoundary},
+    reality::EvidenceRef,
     task::{TaskCreateCommand, TaskPhaseSpec},
 };
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
@@ -1099,7 +1099,7 @@ fn now_ms() -> u64 {
 
 #[must_use]
 pub fn synthetic_evidence(ref_type: &str, id: impl Into<String>) -> EvidenceRef {
-    EvidenceRef::new(ref_type, id, RealityBoundary::Observed).with_source("runtime.task")
+    EvidenceRef::new(ref_type, id).with_source("runtime.task")
 }
 
 #[cfg(test)]

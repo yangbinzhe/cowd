@@ -253,6 +253,17 @@ pub struct RealityCoreSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KnowledgeCandidateSummary {
+    pub candidate_id: String,
+    pub title: String,
+    pub scope: String,
+    pub state: String,
+    pub novelty: String,
+    pub approval_id: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FactFlowSummary {
     pub source: String,
     pub session_id: Option<String>,
@@ -328,6 +339,7 @@ pub struct RuntimeControlSnapshot {
     pub memory_context_envelope_compression: Option<String>,
     pub memory_context_envelope_used_ratio: Option<u64>,
     pub memory_context_envelope_checkpoint: Option<String>,
+    pub knowledge_candidates: Vec<KnowledgeCandidateSummary>,
     pub cross_plane_grants_active: Option<u64>,
     pub cross_plane_actions_24h: Option<u64>,
     pub connector_accounts: Vec<ConnectorAccountSummary>,
@@ -410,6 +422,7 @@ impl RuntimeControlSnapshot {
             memory_context_envelope_compression: app.memory_context_envelope_compression.clone(),
             memory_context_envelope_used_ratio: app.memory_context_envelope_used_ratio,
             memory_context_envelope_checkpoint: app.memory_context_envelope_checkpoint.clone(),
+            knowledge_candidates: app.gateway_knowledge_candidates.clone(),
             cross_plane_grants_active: app.gateway_cross_plane_grants_active,
             cross_plane_actions_24h: app.gateway_cross_plane_actions_24h,
             connector_accounts: app.gateway_connector_accounts.clone(),
@@ -465,6 +478,7 @@ impl RuntimeControlSnapshot {
         app.memory_context_envelope_compression = self.memory_context_envelope_compression.clone();
         app.memory_context_envelope_used_ratio = self.memory_context_envelope_used_ratio;
         app.memory_context_envelope_checkpoint = self.memory_context_envelope_checkpoint.clone();
+        app.gateway_knowledge_candidates = self.knowledge_candidates.clone();
         app.gateway_cross_plane_grants_active = self.cross_plane_grants_active;
         app.gateway_cross_plane_actions_24h = self.cross_plane_actions_24h;
         app.gateway_connector_accounts = self.connector_accounts.clone();
@@ -654,6 +668,19 @@ impl RuntimeControlSnapshot {
         {
             self.degrade(format!("memory background extraction failed: {error}"));
         }
+    }
+
+    pub fn ingest_knowledge_candidates(&mut self, value: &serde_json::Value) {
+        self.knowledge_candidates = value
+            .get("candidates")
+            .and_then(serde_json::Value::as_array)
+            .map(|candidates| {
+                candidates
+                    .iter()
+                    .filter_map(knowledge_candidate_summary_from_json)
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     pub fn ingest_cross_plane_summary(&mut self, value: &serde_json::Value) {
@@ -1354,6 +1381,56 @@ fn task_summary_from_json(value: &serde_json::Value) -> Option<TaskSummary> {
     })
 }
 
+fn knowledge_candidate_summary_from_json(
+    value: &serde_json::Value,
+) -> Option<KnowledgeCandidateSummary> {
+    let candidate = value.get("candidate")?;
+    let candidate_id = candidate
+        .get("candidate_id")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let scope = candidate
+        .get("scope")
+        .map(|scope| {
+            let kind = scope
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            scope
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| kind.to_string(), |id| format!("{kind}:{id}"))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(KnowledgeCandidateSummary {
+        candidate_id,
+        title: candidate
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Untitled knowledge candidate")
+            .to_string(),
+        scope,
+        state: value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        novelty: candidate
+            .get("novelty")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        approval_id: value
+            .get("approval_id")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        reason: value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
 fn approval_summary_from_json(value: &serde_json::Value) -> Option<ApprovalSummary> {
     let id = value
         .get("id")
@@ -2008,6 +2085,10 @@ pub async fn refresh_runtime_control_snapshot(
     match projection.memory_status().await {
         Ok(value) => snapshot.ingest_memory_status(&value),
         Err(err) => snapshot.degrade(format!("memory Gateway API unavailable: {err}")),
+    }
+    match projection.memory_knowledge_candidates().await {
+        Ok(value) => snapshot.ingest_knowledge_candidates(&value),
+        Err(err) => snapshot.degrade(format!("knowledge candidate projection unavailable: {err}")),
     }
     let (reality_status, reality_flow, reality_boundaries) = tokio::join!(
         projection.reality_status(),

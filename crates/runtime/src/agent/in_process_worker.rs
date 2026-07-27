@@ -270,6 +270,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             memory_team_id: binding.data_lease.team_id.clone(),
             memory_read_scopes: binding.data_lease.read_scopes.clone(),
             reality_binding: Some(binding.clone()),
+            execution_identity: Some(packet.assignment.execution_identity.clone()),
             execution_parent: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: packet.graph_id().to_string(),
                 node_id: packet.node_id().to_string(),
@@ -1508,10 +1509,9 @@ fn agent_evidence_refs(
     refs.extend(audits.iter().filter_map(|audit| audit.access.clone()));
     refs.sort_by(|left, right| {
         left.evidence_ref
-            .0
             .ref_type
-            .cmp(&right.evidence_ref.0.ref_type)
-            .then_with(|| left.evidence_ref.0.id.cmp(&right.evidence_ref.0.id))
+            .cmp(&right.evidence_ref.ref_type)
+            .then_with(|| left.evidence_ref.id.cmp(&right.evidence_ref.id))
     });
     refs.dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
     refs
@@ -1637,10 +1637,10 @@ fn packet_upstream_change_receipts(
         })
         .chain(packet.evidence_refs.iter().filter_map(|evidence| {
             (crate::agent_result_validator::is_materialized_durable_evidence(evidence)
-                && evidence.evidence_ref.0.ref_type == "runtime_change")
+                && evidence.evidence_ref.ref_type == "runtime_change")
                 .then(|| {
                     serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(
-                        &evidence.evidence_ref.0.id,
+                        &evidence.evidence_ref.id,
                     )
                     .ok()
                 })
@@ -2782,7 +2782,7 @@ mod tests {
         assert_eq!(
             agent_evidence_refs(&packet, &audits)
                 .into_iter()
-                .map(|reference| reference.evidence_ref.0.id)
+                .map(|reference| reference.evidence_ref.id)
                 .collect::<Vec<_>>(),
             vec!["tool-1".to_string(), "frame".to_string()]
         );

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use harness_contract::context::{
     ArtifactRef, ArtifactWriteDescriptor, EvidenceAccessRef, EvidenceDurability,
 };
-use harness_contract::core::EvidenceRef;
+use harness_contract::reality::EvidenceRef;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -147,7 +147,7 @@ impl SessionPortRawEvidenceStore {
         event.refs.push(crate::RuntimeSessionEventRef {
             ref_type: "evidence".to_string(),
             id: evidence_ref.id().to_string(),
-            label: Some(evidence_ref.0.ref_type.clone()),
+            label: Some(evidence_ref.ref_type.clone()),
         });
         if let Err(error) = self.journal.append_event(&event).await {
             let _ = self.artifacts.unpin(&artifact, &pin_owner);

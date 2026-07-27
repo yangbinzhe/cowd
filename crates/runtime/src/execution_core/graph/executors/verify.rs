@@ -111,7 +111,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                     available.insert(result_ref.clone());
                 }
                 for item in &result.evidence_refs {
-                    available.insert(item.evidence_ref.0.id.clone());
+                    available.insert(item.evidence_ref.id.clone());
                     available.insert(item.retrieval_selector.clone());
                     available.insert(item.sha256.clone());
                     evidence.push(item.clone());
@@ -146,8 +146,8 @@ impl NodeExecutor for VerifyNodeExecutor {
                         })
                         .map(|reference| {
                             (
-                                reference.evidence_ref.0.ref_type.clone(),
-                                reference.evidence_ref.0.id.clone(),
+                                reference.evidence_ref.ref_type.clone(),
+                                reference.evidence_ref.id.clone(),
                             )
                         })
                         .collect::<BTreeSet<_>>();
@@ -155,8 +155,8 @@ impl NodeExecutor for VerifyNodeExecutor {
                         produced_team_evidence(result, &packet.evidence_refs, &upstream_evidence);
                     let completed_acceptance = packet.acceptance.iter().all(|criterion| {
                         result.evidence_refs.iter().any(|reference| {
-                            reference.evidence_ref.0.ref_type == "runtime_acceptance"
-                                && reference.evidence_ref.0.id
+                            reference.evidence_ref.ref_type == "runtime_acceptance"
+                                && reference.evidence_ref.id
                                     == crate::execution_core::graph::executors::agent::acceptance_marker_id(
                                         predecessor_id,
                                         criterion,
@@ -210,8 +210,8 @@ impl NodeExecutor for VerifyNodeExecutor {
                         && !upstream_evidence.is_empty()
                         && upstream_evidence.iter().any(|(ref_type, id)| {
                             result.evidence_refs.iter().any(|reference| {
-                                reference.evidence_ref.0.ref_type == ref_type.as_str()
-                                    && reference.evidence_ref.0.id == id.as_str()
+                                reference.evidence_ref.ref_type == ref_type.as_str()
+                                    && reference.evidence_ref.id == id.as_str()
                             })
                         });
                     let evidence_satisfied =
@@ -261,8 +261,8 @@ impl NodeExecutor for VerifyNodeExecutor {
                     }
                     for criterion in &packet.acceptance {
                         if result.evidence_refs.iter().any(|reference| {
-                            reference.evidence_ref.0.ref_type == "runtime_acceptance"
-                                && reference.evidence_ref.0.id
+                            reference.evidence_ref.ref_type == "runtime_acceptance"
+                                && reference.evidence_ref.id
                                     == crate::execution_core::graph::executors::agent::acceptance_marker_id(
                                         predecessor_id,
                                         criterion,
@@ -372,8 +372,8 @@ fn produced_team_evidence(
                     .iter()
                     .any(|input| input.evidence_ref == reference.evidence_ref)
                     && !upstream_evidence.contains(&(
-                        reference.evidence_ref.0.ref_type.clone(),
-                        reference.evidence_ref.0.id.clone(),
+                        reference.evidence_ref.ref_type.clone(),
+                        reference.evidence_ref.id.clone(),
                     ))))
     })
 }
@@ -383,13 +383,13 @@ mod tests {
     use super::*;
     use crate::execution_core::graph::ExecutionCommitService;
     use crate::RuntimeEventStore;
-    use harness_contract::core::{EvidenceRef, KernelRef};
     use harness_contract::execution_graph::{ExecutionEdge, ExecutionGraph, ExecutionNodeKind};
+    use harness_contract::reality::EvidenceRef;
     use std::sync::Arc;
 
     fn evidence(id: &str) -> EvidenceAccessRef {
         EvidenceAccessRef::durable(
-            EvidenceRef(KernelRef::new("evidence", id)),
+            EvidenceRef::new("evidence", id),
             "sha",
             1,
             "text/plain",
@@ -473,8 +473,8 @@ mod tests {
     fn team_verification_accepts_fresh_scoped_read_with_same_evidence_ref() {
         let shared = evidence("same-content");
         let upstream = BTreeSet::from([(
-            shared.evidence_ref.0.ref_type.clone(),
-            shared.evidence_ref.0.id.clone(),
+            shared.evidence_ref.ref_type.clone(),
+            shared.evidence_ref.id.clone(),
         )]);
         let mut result = ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,

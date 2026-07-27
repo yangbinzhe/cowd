@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
-use crate::core::EvidenceRef;
+use crate::reality::EvidenceRef;
 
 /// Convert a non-content execution marker into a strongly typed handoff
 /// reference. The result is intentionally unavailable for retrieval; callers

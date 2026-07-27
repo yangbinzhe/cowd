@@ -15,7 +15,7 @@ use harness_contract::mission::{
     MissionCommand, MissionCommandSagaRecord, MissionControlProjection, MissionControlSessionNode,
     MissionStatus,
 };
-use harness_contract::reality::{EvidenceRef, RealityBoundary};
+use harness_contract::reality::EvidenceRef;
 use harness_contract::task::{TaskCreateCommand, TaskPhaseSpec, TaskStatus};
 use harness_contract::team::TeamInstantiationRequest;
 use serde_json::{json, Value};
@@ -868,10 +868,7 @@ impl TaskRuntimePort {
         self.missions
             .ensure_session_linked(mission_id, session_id, evidence_refs.to_vec())?;
         let mut task_evidence = evidence_refs.to_vec();
-        task_evidence.push(
-            EvidenceRef::new("task", task_id, RealityBoundary::Observed)
-                .with_source("runtime.task"),
-        );
+        task_evidence.push(EvidenceRef::new("task", task_id).with_source("runtime.task"));
         self.missions
             .ensure_task_linked(mission_id, task_id, task_evidence)
             .map(|_| ())
@@ -1026,7 +1023,6 @@ mod tests {
                 evidence_refs: vec![EvidenceRef::new(
                     "test_fixture",
                     "test://task/cross-session-restart",
-                    RealityBoundary::Observed,
                 )],
             })
             .expect("create canonical Task");

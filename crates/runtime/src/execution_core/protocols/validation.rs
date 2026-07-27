@@ -212,8 +212,8 @@ pub fn validate_protocol_request(
     }
     for (index, evidence) in request.evidence_refs.iter().enumerate() {
         if !evidence.is_durable()
-            || evidence.evidence_ref.0.ref_type.trim().is_empty()
-            || evidence.evidence_ref.0.id.trim().is_empty()
+            || evidence.evidence_ref.ref_type.trim().is_empty()
+            || evidence.evidence_ref.id.trim().is_empty()
             || evidence.sha256.trim().is_empty()
             || evidence.retrieval_selector.trim().is_empty()
             || evidence.visibility_scope.trim().is_empty()

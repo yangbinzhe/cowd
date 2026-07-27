@@ -147,6 +147,26 @@ impl ExecutionIdentity {
         Self::checked(wire)
     }
 
+    /// Recover the canonical task-graph lineage from one of its Agent or Team
+    /// nodes. This is used by terminal projectors that must create a new
+    /// governed child identity without copying private identity fields.
+    pub fn task_graph_lineage(&self) -> Result<Self, ExecutionIdentityError> {
+        if !matches!(
+            self.kind,
+            ExecutionIdentityKind::TaskGraph
+                | ExecutionIdentityKind::AgentNode
+                | ExecutionIdentityKind::TeamNode
+        ) {
+            return Err(ExecutionIdentityError::InvalidLineage);
+        }
+        let mut wire = ExecutionIdentityWire::from(self.clone());
+        wire.kind = ExecutionIdentityKind::TaskGraph;
+        wire.team_run_id = None;
+        wire.agent_run_id = None;
+        wire.node_id = None;
+        Self::checked(wire)
+    }
+
     pub fn for_managed_invocation(
         principal_id: impl Into<String>,
         workspace_id: impl Into<String>,

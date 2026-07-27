@@ -366,6 +366,8 @@ pub struct App {
     pub memory_context_envelope_compression: Option<String>,
     pub memory_context_envelope_used_ratio: Option<u64>,
     pub memory_context_envelope_checkpoint: Option<String>,
+    /// Governed Runtime-to-Memory knowledge candidates.
+    pub gateway_knowledge_candidates: Vec<crate::runtime_control_store::KnowledgeCandidateSummary>,
 
     /// Reputation score of the currently selected agent (if any).
     pub selected_agent_reputation: Option<f64>,
@@ -771,6 +773,7 @@ impl App {
             memory_context_envelope_compression: None,
             memory_context_envelope_used_ratio: None,
             memory_context_envelope_checkpoint: None,
+            gateway_knowledge_candidates: Vec::new(),
 
             selected_agent_reputation: None,
             mcp_count: 0,

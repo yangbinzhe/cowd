@@ -1,41 +1,32 @@
-//! Governed promotion of durable Team knowledge into Memory L4.
+//! Governed promotion of terminal Runtime knowledge into Memory L4.
 //!
-//! Team execution writes collaboration semantics to `TeamWorkingState` only.
-//! This service is the explicit second step that validates a candidate,
-//! records its lifecycle, and asks memory to persist the promoted artifact.
+//! Agent and Team execution emit immutable [`KnowledgeCandidate`] events.
+//! This service is the only component allowed to validate those candidates,
+//! route approvals, and write promoted content to Memory L4.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use harness_contract::{
+    core::TaskRisk,
+    knowledge::{
+        KnowledgeAuthority, KnowledgeCandidate, KnowledgeCandidateScope, KnowledgeCandidateState,
+        KnowledgeNovelty,
+    },
+};
 use memory::{L4PromotionCommand, MemoryScope, Priority};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::runtime_event_store::RuntimeTransactionEventInput;
-use crate::{RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore};
+use crate::{
+    ApprovalQueue, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, GlobalApprovalStatus,
+    RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
+    SubmitGlobalApprovalRequest,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum L4CandidateLifecycle {
-    Proposed,
-    Validated,
-    Promoted,
-    Rejected,
-    Superseded,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct L4PromotionCandidate {
-    pub candidate_id: String,
-    pub team_id: String,
-    pub graph_id: String,
-    pub lineage_ref: String,
-    pub title: String,
-    pub content: String,
-    pub scope: MemoryScope,
-    pub source_evidence_refs: Vec<String>,
-    pub priority: Priority,
-    pub tags: Vec<String>,
-}
+pub type L4PromotionCandidate = KnowledgeCandidate;
+pub type L4CandidateLifecycle = KnowledgeCandidateState;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct L4PromotionReceipt {
@@ -43,12 +34,25 @@ pub struct L4PromotionReceipt {
     pub promotion_receipt: String,
     pub content_digest: String,
     pub memory_id: String,
-    pub lifecycle: L4CandidateLifecycle,
+    pub lifecycle: KnowledgeCandidateState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeCandidateProjection {
+    pub candidate: KnowledgeCandidate,
+    pub state: KnowledgeCandidateState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<L4PromotionReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct L4PromotionService {
     event_store: Arc<RuntimeEventStore>,
+    approval_queue: Arc<ApprovalQueue>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
 }
 
@@ -56,36 +60,255 @@ impl L4PromotionService {
     #[must_use]
     pub fn new(
         event_store: Arc<RuntimeEventStore>,
+        approval_queue: Arc<ApprovalQueue>,
         memory_manager: Option<Arc<memory::CognitiveContextManager>>,
     ) -> Self {
         Self {
             event_store,
+            approval_queue,
             memory_manager,
         }
     }
 
-    pub fn propose(&self, candidate: &L4PromotionCandidate) -> Result<(), String> {
-        validate_candidate(candidate)?;
-        self.append_lifecycle(candidate, L4CandidateLifecycle::Proposed, None, None)
+    /// Apply governance to one immutable candidate.
+    ///
+    /// Agent-private, low-risk observations can be promoted automatically.
+    /// Team/workspace/global, conflicting, or high-risk candidates use the
+    /// existing Runtime approval queue and remain pending until its durable
+    /// decision is observed by the candidate projector.
+    pub async fn govern(
+        &self,
+        mut candidate: KnowledgeCandidate,
+    ) -> Result<KnowledgeCandidateProjection, String> {
+        candidate.validate()?;
+        if let Some(existing) = self.get(&candidate.candidate_id)? {
+            if existing.state == KnowledgeCandidateState::Promoted
+                || existing.state == KnowledgeCandidateState::RolledBack
+                || existing.state == KnowledgeCandidateState::Rejected
+                || existing.state == KnowledgeCandidateState::Superseded
+            {
+                return Ok(existing);
+            }
+            if existing.candidate != candidate {
+                return Err(format!(
+                    "knowledge candidate idempotency conflict: {}",
+                    candidate.candidate_id
+                ));
+            }
+        } else {
+            candidate.novelty = self.classify_novelty(&candidate)?;
+            self.append_state(
+                &candidate,
+                KnowledgeCandidateState::Proposed,
+                None,
+                None,
+                None,
+            )?;
+        }
+
+        let current = self
+            .get(&candidate.candidate_id)?
+            .ok_or_else(|| "candidate proposal was not persisted".to_string())?;
+        candidate = current.candidate;
+        if candidate.novelty == KnowledgeNovelty::Duplicate {
+            self.append_state(
+                &candidate,
+                KnowledgeCandidateState::Superseded,
+                None,
+                None,
+                Some("an identical promoted claim already exists"),
+            )?;
+            return self.require_projection(&candidate.candidate_id);
+        }
+        self.validate_authority(&candidate)?;
+        self.append_state(
+            &candidate,
+            KnowledgeCandidateState::Validated,
+            None,
+            None,
+            None,
+        )?;
+
+        if requires_approval(&candidate) {
+            let approval_id = knowledge_approval_id(&candidate.candidate_id);
+            let approval = self.approval_queue.submit_scoped(
+                approval_id.clone(),
+                SubmitGlobalApprovalRequest {
+                    source: approval_source(&candidate),
+                    action: "knowledge.promote_l4".to_string(),
+                    summary: format!(
+                        "Promote {} knowledge candidate `{}`: {}",
+                        candidate.scope.key(),
+                        candidate.candidate_id,
+                        candidate.title
+                    ),
+                    risk: candidate.risk,
+                    evidence_refs: candidate
+                        .evidence_refs
+                        .iter()
+                        .map(|reference| format!("{}:{}", reference.ref_type, reference.id))
+                        .collect(),
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+            )?;
+            match approval.status {
+                GlobalApprovalStatus::Pending => {
+                    self.append_state(
+                        &candidate,
+                        KnowledgeCandidateState::AwaitingApproval,
+                        Some(&approval_id),
+                        None,
+                        None,
+                    )?;
+                    return self.require_projection(&candidate.candidate_id);
+                }
+                GlobalApprovalStatus::Denied | GlobalApprovalStatus::TimedOut => {
+                    self.append_state(
+                        &candidate,
+                        KnowledgeCandidateState::Rejected,
+                        Some(&approval_id),
+                        None,
+                        Some("knowledge promotion approval was denied or timed out"),
+                    )?;
+                    return self.require_projection(&candidate.candidate_id);
+                }
+                GlobalApprovalStatus::Approved => {
+                    self.append_state(
+                        &candidate,
+                        KnowledgeCandidateState::Approved,
+                        Some(&approval_id),
+                        None,
+                        None,
+                    )?;
+                }
+            }
+        }
+
+        if self.memory_manager.is_none() {
+            self.append_state(
+                &candidate,
+                KnowledgeCandidateState::Blocked,
+                None,
+                None,
+                Some("L4 promotion requires a configured Memory manager"),
+            )?;
+            return self.require_projection(&candidate.candidate_id);
+        }
+        self.promote(candidate).await
     }
 
+    /// Compatibility name for trusted Runtime tests and explicit private
+    /// promotion callers. It still applies the complete governance policy.
     pub async fn validate_and_promote(
         &self,
-        candidate: L4PromotionCandidate,
+        candidate: KnowledgeCandidate,
     ) -> Result<L4PromotionReceipt, String> {
-        validate_candidate(&candidate)?;
-        if let Some(receipt) = self.existing_promoted_receipt(&candidate)? {
-            return Ok(receipt);
+        let projection = self.govern(candidate).await?;
+        projection.receipt.ok_or_else(|| {
+            format!(
+                "knowledge candidate `{}` is {:?}, not promoted",
+                projection.candidate.candidate_id, projection.state
+            )
+        })
+    }
+
+    pub fn lifecycle(
+        &self,
+        candidate: &KnowledgeCandidate,
+    ) -> Result<Vec<KnowledgeCandidateState>, String> {
+        self.event_store
+            .list_stream(&candidate_stream_id(&candidate.candidate_id))?
+            .into_iter()
+            .filter(|event| event.kind == "knowledge.candidate.lifecycle.v1")
+            .map(|event| {
+                serde_json::from_value(
+                    event
+                        .payload
+                        .get("state")
+                        .cloned()
+                        .ok_or_else(|| "candidate lifecycle event lacks state".to_string())?,
+                )
+                .map_err(|error| format!("decode candidate lifecycle: {error}"))
+            })
+            .collect()
+    }
+
+    pub fn get(&self, candidate_id: &str) -> Result<Option<KnowledgeCandidateProjection>, String> {
+        self.event_store
+            .list_stream(&candidate_stream_id(candidate_id))?
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == "knowledge.candidate.lifecycle.v1")
+            .map(|event| {
+                serde_json::from_value(event.payload)
+                    .map_err(|error| format!("decode candidate projection: {error}"))
+            })
+            .transpose()
+    }
+
+    pub fn list(&self) -> Result<Vec<KnowledgeCandidateProjection>, String> {
+        let mut latest = BTreeMap::<String, KnowledgeCandidateProjection>::new();
+        for event in self
+            .event_store
+            .list_scope(RuntimeEventScope::Knowledge, 100_000)?
+        {
+            if event.kind != "knowledge.candidate.lifecycle.v1" {
+                continue;
+            }
+            let projection = serde_json::from_value::<KnowledgeCandidateProjection>(event.payload)
+                .map_err(|error| format!("decode candidate projection: {error}"))?;
+            latest.insert(projection.candidate.candidate_id.clone(), projection);
         }
-        if self.has_terminal_rejection(&candidate)? {
-            return Err(format!(
-                "L4 candidate `{}` has a terminal rejected/superseded lifecycle and cannot be promoted",
-                candidate.candidate_id
-            ));
+        Ok(latest.into_values().collect())
+    }
+
+    pub async fn rollback(
+        &self,
+        candidate_id: &str,
+        reason: &str,
+    ) -> Result<KnowledgeCandidateProjection, String> {
+        if reason.trim().is_empty() {
+            return Err("knowledge rollback requires a reason".to_string());
         }
-        self.propose(&candidate)?;
-        self.append_lifecycle(&candidate, L4CandidateLifecycle::Validated, None, None)?;
-        let content_digest = format!("{:x}", Sha256::digest(candidate.content.as_bytes()));
+        let projection = self.require_projection(candidate_id)?;
+        if projection.state == KnowledgeCandidateState::RolledBack {
+            return Ok(projection);
+        }
+        if projection.state != KnowledgeCandidateState::Promoted {
+            return Err("only a promoted knowledge candidate can be rolled back".to_string());
+        }
+        let receipt = projection
+            .receipt
+            .as_ref()
+            .ok_or_else(|| "promoted candidate lacks its memory receipt".to_string())?;
+        let manager = self
+            .memory_manager
+            .as_ref()
+            .ok_or_else(|| "knowledge rollback requires a configured Memory manager".to_string())?;
+        manager
+            .delete_entry(&receipt.memory_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.append_state(
+            &projection.candidate,
+            KnowledgeCandidateState::RolledBack,
+            projection.approval_id.as_deref(),
+            projection.receipt.as_ref(),
+            Some(reason),
+        )?;
+        self.require_projection(candidate_id)
+    }
+
+    async fn promote(
+        &self,
+        candidate: KnowledgeCandidate,
+    ) -> Result<KnowledgeCandidateProjection, String> {
+        if let Some(existing) = self.get(&candidate.candidate_id)? {
+            if existing.state == KnowledgeCandidateState::Promoted {
+                return Ok(existing);
+            }
+        }
+        let content_digest = digest(&candidate.claim);
         let promotion_receipt = format!(
             "l4-promotion:{}:{}",
             candidate.candidate_id,
@@ -100,12 +323,16 @@ impl L4PromotionService {
             .promote_l4(L4PromotionCommand {
                 candidate_id: candidate.candidate_id.clone(),
                 promotion_receipt: promotion_receipt.clone(),
-                lineage_ref: candidate.lineage_ref.clone(),
-                source_evidence_refs: candidate.source_evidence_refs.clone(),
-                scope: candidate.scope.clone(),
+                lineage_ref: lineage_ref(&candidate),
+                source_evidence_refs: candidate
+                    .evidence_refs
+                    .iter()
+                    .map(|reference| format!("{}:{}", reference.ref_type, reference.id))
+                    .collect(),
+                scope: memory_scope(&candidate.scope),
                 title: candidate.title.clone(),
-                content: candidate.content.clone(),
-                priority: candidate.priority,
+                content: candidate.claim.clone(),
+                priority: priority(candidate.risk),
                 tags: candidate.tags.clone(),
             })
             .await
@@ -115,72 +342,66 @@ impl L4PromotionService {
             promotion_receipt,
             content_digest,
             memory_id: memory_id.to_string(),
-            lifecycle: L4CandidateLifecycle::Promoted,
+            lifecycle: KnowledgeCandidateState::Promoted,
         };
-        self.append_lifecycle(
+        let approval_id = self
+            .get(&candidate.candidate_id)?
+            .and_then(|projection| projection.approval_id);
+        self.append_state(
             &candidate,
-            L4CandidateLifecycle::Promoted,
+            KnowledgeCandidateState::Promoted,
+            approval_id.as_deref(),
             Some(&receipt),
             None,
         )?;
-        Ok(receipt)
+        self.require_projection(&candidate.candidate_id)
     }
 
-    pub fn reject(&self, candidate: &L4PromotionCandidate, reason: &str) -> Result<(), String> {
-        validate_candidate(candidate)?;
-        if reason.trim().is_empty() {
-            return Err("L4 rejection requires a reason".to_string());
+    fn classify_novelty(&self, candidate: &KnowledgeCandidate) -> Result<KnowledgeNovelty, String> {
+        let title = normalize(&candidate.title);
+        let claim = normalize(&candidate.claim);
+        for existing in self.list()? {
+            if existing.state != KnowledgeCandidateState::Promoted
+                || existing.candidate.scope != candidate.scope
+            {
+                continue;
+            }
+            if normalize(&existing.candidate.claim) == claim {
+                return Ok(KnowledgeNovelty::Duplicate);
+            }
+            if normalize(&existing.candidate.title) == title {
+                return Ok(KnowledgeNovelty::Conflicts);
+            }
         }
-        self.append_lifecycle(
-            candidate,
-            L4CandidateLifecycle::Rejected,
-            None,
-            Some(reason),
-        )
+        Ok(candidate.novelty)
     }
 
-    /// Read the durable lifecycle for one candidate without exposing the
-    /// EventStore to callers. This is the inspectable proof that a promoted
-    /// L4 entry passed the governed proposal/validation path.
-    pub fn lifecycle(
-        &self,
-        candidate: &L4PromotionCandidate,
-    ) -> Result<Vec<L4CandidateLifecycle>, String> {
-        let stream_id = format!("team-l4-candidate:{}", candidate.team_id);
-        self.event_store
-            .list_stream(&stream_id)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .filter(|event| {
-                event.kind == "team.l4_candidate.lifecycle.v1"
-                    && event
-                        .payload
-                        .pointer("/candidate/candidate_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(candidate.candidate_id.as_str())
-            })
-            .map(|event| {
-                serde_json::from_value(
-                    event
-                        .payload
-                        .get("lifecycle")
-                        .cloned()
-                        .ok_or_else(|| "L4 lifecycle event lacks lifecycle state".to_string())?,
-                )
-                .map_err(|error| format!("decode L4 lifecycle state: {error}"))
-            })
-            .collect()
+    fn validate_authority(&self, candidate: &KnowledgeCandidate) -> Result<(), String> {
+        if matches!(candidate.scope, KnowledgeCandidateScope::Team(_))
+            && candidate.authority.rank() < KnowledgeAuthority::TeamSynthesis.rank()
+        {
+            return Err("team knowledge requires team-synthesis authority".to_string());
+        }
+        if matches!(
+            candidate.scope,
+            KnowledgeCandidateScope::Workspace(_) | KnowledgeCandidateScope::Global
+        ) && candidate.authority.rank() < KnowledgeAuthority::WorkspaceVerified.rank()
+        {
+            return Err("workspace/global knowledge requires verified authority".to_string());
+        }
+        Ok(())
     }
 
-    fn append_lifecycle(
+    fn append_state(
         &self,
-        candidate: &L4PromotionCandidate,
-        lifecycle: L4CandidateLifecycle,
+        candidate: &KnowledgeCandidate,
+        state: KnowledgeCandidateState,
+        approval_id: Option<&str>,
         receipt: Option<&L4PromotionReceipt>,
         reason: Option<&str>,
     ) -> Result<(), String> {
-        let stream_id = format!("team-l4-candidate:{}", candidate.team_id);
-        let key = format!("{}:{lifecycle:?}", candidate.candidate_id).to_ascii_lowercase();
+        let stream_id = candidate_stream_id(&candidate.candidate_id);
+        let key = format!("{:?}", state).to_ascii_lowercase();
         if self
             .event_store
             .event_by_idempotency_key(&stream_id, &key)
@@ -193,34 +414,28 @@ impl L4PromotionService {
             .event_store
             .stream_revision(&stream_id)
             .map_err(|error| error.to_string())?;
+        let projection = KnowledgeCandidateProjection {
+            candidate: candidate.clone(),
+            state,
+            approval_id: approval_id.map(str::to_owned),
+            receipt: receipt.cloned(),
+            reason: reason.map(str::to_owned),
+        };
         self.event_store
             .append_batch_if_revision(
                 stream_id.clone(),
                 revision,
-                format!("team-l4-candidate:{}:{key}", candidate.candidate_id),
+                format!("knowledge-candidate:{}:{key}", candidate.candidate_id),
                 vec![RuntimeTransactionEventInput {
                     event: RuntimeEventInput {
                         stream_id,
-                        scope: RuntimeEventScope::Team,
-                        kind: "team.l4_candidate.lifecycle.v1".to_string(),
-                        status: Some(format!("{lifecycle:?}").to_ascii_lowercase()),
+                        scope: RuntimeEventScope::Knowledge,
+                        kind: "knowledge.candidate.lifecycle.v1".to_string(),
+                        status: Some(key.clone()),
                         actor: Some("runtime.l4_promotion_service".to_string()),
-                        refs: vec![
-                            RuntimeEventRef {
-                                kind: "team".to_string(),
-                                id: candidate.team_id.clone(),
-                            },
-                            RuntimeEventRef {
-                                kind: "execution_graph".to_string(),
-                                id: candidate.graph_id.clone(),
-                            },
-                        ],
-                        payload: serde_json::json!({
-                            "candidate": candidate,
-                            "lifecycle": lifecycle,
-                            "receipt": receipt,
-                            "reason": reason,
-                        }),
+                        refs: candidate_event_refs(candidate),
+                        payload: serde_json::to_value(projection)
+                            .map_err(|error| error.to_string())?,
                     },
                     idempotency_key: Some(key),
                     schema_version: 1,
@@ -230,95 +445,125 @@ impl L4PromotionService {
         Ok(())
     }
 
-    fn existing_promoted_receipt(
+    fn require_projection(
         &self,
-        candidate: &L4PromotionCandidate,
-    ) -> Result<Option<L4PromotionReceipt>, String> {
-        let stream_id = format!("team-l4-candidate:{}", candidate.team_id);
-        let events = self
-            .event_store
-            .list_stream(&stream_id)
-            .map_err(|error| error.to_string())?;
-        for event in events.into_iter().rev() {
-            if event.kind != "team.l4_candidate.lifecycle.v1" {
-                continue;
-            }
-            let Some(event_candidate_id) = event
-                .payload
-                .pointer("/candidate/candidate_id")
-                .and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            if event_candidate_id != candidate.candidate_id {
-                continue;
-            }
-            if event.payload.get("lifecycle")
-                == Some(&serde_json::json!(L4CandidateLifecycle::Promoted))
-            {
-                return serde_json::from_value(event.payload.get("receipt").cloned().ok_or_else(
-                    || "promoted L4 candidate is missing its durable receipt".to_string(),
-                )?)
-                .map(Some)
-                .map_err(|error| format!("decode promoted L4 receipt: {error}"));
-            }
-        }
-        Ok(None)
-    }
-
-    fn has_terminal_rejection(&self, candidate: &L4PromotionCandidate) -> Result<bool, String> {
-        let stream_id = format!("team-l4-candidate:{}", candidate.team_id);
-        let events = self
-            .event_store
-            .list_stream(&stream_id)
-            .map_err(|error| error.to_string())?;
-        Ok(events.into_iter().any(|event| {
-            event.kind == "team.l4_candidate.lifecycle.v1"
-                && event
-                    .payload
-                    .pointer("/candidate/candidate_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(candidate.candidate_id.as_str())
-                && matches!(
-                    event.payload.get("lifecycle"),
-                    Some(value)
-                        if value == &serde_json::json!(L4CandidateLifecycle::Rejected)
-                            || value == &serde_json::json!(L4CandidateLifecycle::Superseded)
-                )
-        }))
+        candidate_id: &str,
+    ) -> Result<KnowledgeCandidateProjection, String> {
+        self.get(candidate_id)?
+            .ok_or_else(|| format!("knowledge candidate not found: {candidate_id}"))
     }
 }
 
-fn validate_candidate(candidate: &L4PromotionCandidate) -> Result<(), String> {
-    for (field, value) in [
-        ("candidate_id", &candidate.candidate_id),
-        ("team_id", &candidate.team_id),
-        ("graph_id", &candidate.graph_id),
-        ("lineage_ref", &candidate.lineage_ref),
-        ("title", &candidate.title),
-        ("content", &candidate.content),
+fn requires_approval(candidate: &KnowledgeCandidate) -> bool {
+    candidate.scope.requires_approval()
+        || matches!(candidate.risk, TaskRisk::High | TaskRisk::Critical)
+        || candidate.novelty == KnowledgeNovelty::Conflicts
+}
+
+fn approval_source(candidate: &KnowledgeCandidate) -> ApprovalSource {
+    let identity = &candidate.execution_identity;
+    let kind = match candidate.scope {
+        KnowledgeCandidateScope::AgentPrivate(_) => ApprovalSourceKind::Agent,
+        KnowledgeCandidateScope::Team(_) => ApprovalSourceKind::Team,
+        KnowledgeCandidateScope::Workspace(_) | KnowledgeCandidateScope::Global => {
+            ApprovalSourceKind::Mission
+        }
+    };
+    ApprovalSource {
+        kind,
+        session_id: identity.session_id().map(str::to_owned),
+        agent_id: identity.agent_run_id().map(str::to_owned),
+        team_id: identity.team_run_id().map(str::to_owned),
+        mission_id: identity.mission_id().map(str::to_owned),
+        resource_ref: Some(format!("knowledge-candidate:{}", candidate.candidate_id)),
+        review_ref: None,
+        application: None,
+    }
+}
+
+fn candidate_event_refs(candidate: &KnowledgeCandidate) -> Vec<RuntimeEventRef> {
+    let identity = &candidate.execution_identity;
+    let mut refs = vec![
+        RuntimeEventRef {
+            kind: "principal".to_string(),
+            id: identity.principal_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "workspace".to_string(),
+            id: identity.workspace_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "knowledge_scope".to_string(),
+            id: candidate.scope.key(),
+        },
+    ];
+    for (kind, id) in [
+        ("mission", identity.mission_id()),
+        ("task", identity.task_id()),
+        ("session", identity.session_id()),
+        ("turn", identity.turn_id()),
+        ("execution_graph", identity.graph_id()),
+        ("team_run", identity.team_run_id()),
+        ("agent_run", identity.agent_run_id()),
+        ("execution_node", identity.node_id()),
     ] {
-        if value.trim().is_empty() {
-            return Err(format!("L4 candidate {field} must not be empty"));
+        if let Some(id) = id {
+            refs.push(RuntimeEventRef {
+                kind: kind.to_string(),
+                id: id.to_string(),
+            });
         }
     }
-    if candidate.source_evidence_refs.is_empty()
-        || candidate
-            .source_evidence_refs
-            .iter()
-            .any(|reference| reference.trim().is_empty())
-    {
-        return Err("L4 candidate requires source evidence references".to_string());
+    refs
+}
+
+fn memory_scope(scope: &KnowledgeCandidateScope) -> MemoryScope {
+    match scope {
+        KnowledgeCandidateScope::AgentPrivate(id) => MemoryScope::AgentInstance(id.clone()),
+        KnowledgeCandidateScope::Team(id) => MemoryScope::TeamRun(id.clone()),
+        KnowledgeCandidateScope::Workspace(id) => MemoryScope::Project(id.clone()),
+        KnowledgeCandidateScope::Global => MemoryScope::Global,
     }
-    if candidate.tags.iter().any(|tag| {
-        let normalized = tag.to_ascii_lowercase();
-        normalized.contains("progress")
-            || normalized.contains("draft")
-            || normalized.contains("heartbeat")
-    }) {
-        return Err(
-            "L4 candidate cannot promote progress, draft, or heartbeat content".to_string(),
-        );
+}
+
+fn priority(risk: TaskRisk) -> Priority {
+    match risk {
+        TaskRisk::Low => Priority::Normal,
+        TaskRisk::Medium => Priority::High,
+        TaskRisk::High | TaskRisk::Critical => Priority::Critical,
     }
-    Ok(())
+}
+
+fn lineage_ref(candidate: &KnowledgeCandidate) -> String {
+    let parents = candidate.lineage.parent_candidate_ids.join(",");
+    format!(
+        "execution:{}:{}:{}:{}:parents={parents}",
+        candidate.execution_identity.workspace_id(),
+        candidate
+            .execution_identity
+            .mission_id()
+            .unwrap_or("unbound"),
+        candidate.execution_identity.task_id().unwrap_or("unbound"),
+        candidate.execution_identity.graph_id().unwrap_or("unbound"),
+    )
+}
+
+fn candidate_stream_id(candidate_id: &str) -> String {
+    format!("knowledge-candidate:{candidate_id}")
+}
+
+fn knowledge_approval_id(candidate_id: &str) -> String {
+    format!("knowledge-approval:{candidate_id}")
+}
+
+fn normalize(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }

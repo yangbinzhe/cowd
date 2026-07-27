@@ -10,7 +10,7 @@ use harness_contract::mission::{
     MissionCommand, MissionCommandAction, MissionCommandReceipt, MissionCommandSagaPhase,
     MissionCommandSagaRecord, MissionCommandTarget, MissionStatus,
 };
-use harness_contract::reality::{EvidenceRef, RealityBoundary};
+use harness_contract::reality::EvidenceRef;
 
 use crate::runtime_event_store::RuntimeTransactionEventInput;
 use crate::{
@@ -361,8 +361,7 @@ async fn execute_runtime_effect(
             )?;
             let mut evidence_refs = command.evidence_refs.clone();
             evidence_refs.extend(relation.evidence_refs.iter().map(|id| {
-                EvidenceRef::new("session_relation", id, RealityBoundary::Observed)
-                    .with_source("runtime.mission_command")
+                EvidenceRef::new("session_relation", id).with_source("runtime.mission_command")
             }));
             Ok((
                 serde_json::json!({ "relation": relation }),

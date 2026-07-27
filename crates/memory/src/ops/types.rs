@@ -493,8 +493,8 @@ impl CanonicalRawEvidence {
     pub fn is_durable(&self) -> bool {
         self.schema_version == Self::SCHEMA_VERSION
             && self.access.is_durable()
-            && !self.access.evidence_ref.0.ref_type.trim().is_empty()
-            && !self.access.evidence_ref.0.id.trim().is_empty()
+            && !self.access.evidence_ref.ref_type.trim().is_empty()
+            && !self.access.evidence_ref.id.trim().is_empty()
             && !self.access.sha256.trim().is_empty()
     }
 }
@@ -742,7 +742,7 @@ fn default_search_mode() -> String {
 #[cfg(test)]
 mod fact_kernel_bridge_tests {
     use super::*;
-    use harness_contract::core::EvidenceRef;
+    use harness_contract::reality::EvidenceRef;
 
     fn sample_entry() -> MemoryEntry {
         let now = Utc::now();

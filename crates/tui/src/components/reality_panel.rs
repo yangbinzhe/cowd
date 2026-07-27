@@ -8,12 +8,15 @@ use ratatui::{
 
 use crate::app::App;
 use crate::components::{Component, EventResult, RenderContext};
-use crate::runtime_control_store::{FactFlowSummary, RealityCoreSummary, StructuredDataSummary};
+use crate::runtime_control_store::{
+    FactFlowSummary, KnowledgeCandidateSummary, RealityCoreSummary, StructuredDataSummary,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RealityView {
     Overview,
     Samples,
+    Candidates,
 }
 
 pub struct RealityPanel {
@@ -22,6 +25,7 @@ pub struct RealityPanel {
     structured: Option<StructuredDataSummary>,
     memory_status: Option<String>,
     memory_entries: usize,
+    knowledge_candidates: Vec<KnowledgeCandidateSummary>,
     view: RealityView,
     scroll: usize,
     focused_backlink_target: Option<String>,
@@ -37,6 +41,7 @@ impl RealityPanel {
             structured: None,
             memory_status: None,
             memory_entries: 0,
+            knowledge_candidates: Vec::new(),
             view: RealityView::Overview,
             scroll: 0,
             focused_backlink_target: None,
@@ -51,6 +56,7 @@ impl RealityPanel {
         self.structured = app.gateway_structured_data.clone();
         self.memory_status = app.memory_status.clone();
         self.memory_entries = app.memory_entries.len();
+        self.knowledge_candidates = app.gateway_knowledge_candidates.clone();
     }
 
     pub fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
@@ -138,7 +144,7 @@ impl Component for RealityPanel {
             ),
         ]));
         lines.push(Line::from(Span::styled(
-            "Keys: 1 overview  2 samples  j/k scroll",
+            "Keys: 1 overview  2 samples  3 candidates  j/k scroll",
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::raw(""));
@@ -206,6 +212,49 @@ impl Component for RealityPanel {
                 sample_section(&mut lines, "Evidence", &structured.sample_evidence);
                 sample_section(&mut lines, "Watermarks", &structured.sample_watermarks);
             }
+            RealityView::Candidates => {
+                lines.push(kv(
+                    "Candidates",
+                    &format!(
+                        "{} total · {} awaiting approval · {} promoted · {} rolled back",
+                        self.knowledge_candidates.len(),
+                        candidate_count(&self.knowledge_candidates, "awaiting_approval"),
+                        candidate_count(&self.knowledge_candidates, "promoted"),
+                        candidate_count(&self.knowledge_candidates, "rolled_back"),
+                    ),
+                ));
+                if self.knowledge_candidates.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        "No governed knowledge candidates.",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                } else {
+                    for candidate in &self.knowledge_candidates {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("[{}] ", candidate.state),
+                                Style::default().fg(status_color(&candidate.state)),
+                            ),
+                            Span::styled(
+                                candidate.title.clone(),
+                                Style::default().fg(Color::White),
+                            ),
+                        ]));
+                        lines.push(kv(
+                            "  Scope",
+                            &format!(
+                                "{} · novelty {} · approval {}",
+                                candidate.scope,
+                                candidate.novelty,
+                                candidate.approval_id.as_deref().unwrap_or("none")
+                            ),
+                        ));
+                        if let Some(reason) = candidate.reason.as_deref() {
+                            lines.push(kv("  Reason", reason));
+                        }
+                    }
+                }
+            }
         }
 
         let viewport = usize::from(area.height.saturating_sub(2));
@@ -239,6 +288,11 @@ impl Component for RealityPanel {
                 }
                 KeyCode::Char('2') => {
                     self.view = RealityView::Samples;
+                    self.scroll = 0;
+                    EventResult::Consumed
+                }
+                KeyCode::Char('3') => {
+                    self.view = RealityView::Candidates;
                     self.scroll = 0;
                     EventResult::Consumed
                 }
@@ -306,11 +360,19 @@ fn fallback(value: &str, default: &str) -> String {
     }
 }
 
+fn candidate_count(candidates: &[KnowledgeCandidateSummary], state: &str) -> usize {
+    candidates
+        .iter()
+        .filter(|candidate| candidate.state == state)
+        .count()
+}
+
 fn status_color(status: &str) -> Color {
     match status {
-        "ready" | "healthy" | "available" => Color::Green,
-        "degraded" | "attention" => Color::Yellow,
-        "failed" | "blocked" => Color::Red,
+        "ready" | "healthy" | "available" | "promoted" | "approved" => Color::Green,
+        "degraded" | "attention" | "awaiting_approval" | "validated" => Color::Yellow,
+        "failed" | "blocked" | "rejected" | "conflicts" => Color::Red,
+        "rolled_back" | "superseded" => Color::DarkGray,
         _ => Color::White,
     }
 }

@@ -890,6 +890,7 @@ impl RuntimeServicesBuilder {
             .block_unrecoverable_replayed_runs()
             .map_err(RuntimeServicesError::AgentRuntime)?;
         services.materialize_evolution_release_assignments()?;
+        services.knowledge_candidate_projector.start();
         services
             .team_runtime()
             .import_legacy_state_file(&legacy_team_state_path)
@@ -921,6 +922,7 @@ pub struct RuntimeServices {
     agent_runtime: Arc<AgentRuntime>,
     team_runtime: Arc<TeamRuntime>,
     l4_promotion_service: Arc<crate::L4PromotionService>,
+    knowledge_candidate_projector: Arc<crate::KnowledgeCandidateProjector>,
     verify_executor: Arc<VerifyNodeExecutor>,
     synthesize_executor: Arc<SynthesizeNodeExecutor>,
     graph_state_store: ExecutionGraphStateStore,
@@ -1056,6 +1058,7 @@ impl RuntimeServices {
             .block_unrecoverable_replayed_runs()
             .map_err(RuntimeServicesError::AgentRuntime)?;
         services.materialize_evolution_release_assignments()?;
+        services.knowledge_candidate_projector.start();
         Ok(services)
     }
 
@@ -1174,7 +1177,12 @@ impl RuntimeServices {
         ));
         let l4_promotion_service = Arc::new(crate::L4PromotionService::new(
             Arc::clone(&event_store),
+            Arc::clone(&approval_queue),
             memory_manager.clone(),
+        ));
+        let knowledge_candidate_projector = Arc::new(crate::KnowledgeCandidateProjector::new(
+            Arc::clone(&event_store),
+            Arc::clone(&l4_promotion_service),
         ));
         let gate_store = Arc::clone(&event_store);
         let gate_workspace = workspace_key.clone();
@@ -1228,6 +1236,7 @@ impl RuntimeServices {
             agent_runtime,
             team_runtime,
             l4_promotion_service,
+            knowledge_candidate_projector,
             verify_executor,
             synthesize_executor,
             graph_state_store,
@@ -1366,6 +1375,7 @@ impl RuntimeServices {
 
     /// Stop accepting detached maintenance and await every retained task.
     pub async fn shutdown_maintenance(&self) {
+        self.knowledge_candidate_projector.shutdown().await;
         self.maintenance_supervisor.shutdown_and_drain().await;
     }
 
@@ -1402,6 +1412,11 @@ impl RuntimeServices {
     #[must_use]
     pub fn l4_promotion_service(&self) -> &Arc<crate::L4PromotionService> {
         &self.l4_promotion_service
+    }
+
+    #[must_use]
+    pub fn knowledge_candidate_projector(&self) -> &Arc<crate::KnowledgeCandidateProjector> {
+        &self.knowledge_candidate_projector
     }
 
     /// Runtime-owned read port for Fact and Matrix context. Each call requires
@@ -3387,7 +3402,7 @@ impl RuntimeServices {
                 .node_results
                 .values()
                 .flat_map(|result| result.evidence_refs.iter())
-                .map(|reference| reference.evidence_ref.0.id.clone())
+                .map(|reference| reference.evidence_ref.id.clone())
                 .collect::<Vec<_>>();
             evidence_refs.push(format!("execution-graph:{graph_id}@{}", graph.revision));
             evidence_refs.sort();
@@ -4197,7 +4212,6 @@ mod tests {
                 evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
                     "test_fixture",
                     "test://task/startup-recovery",
-                    harness_contract::reality::RealityBoundary::Observed,
                 )],
             })
             .expect("commit Task without running its Runtime port");

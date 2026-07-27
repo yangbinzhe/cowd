@@ -452,6 +452,17 @@ impl ExecutionCommitService {
         ) {
             events.push(working_state);
         }
+        if let Some(candidate) = crate::knowledge_candidate_projector::team_terminal_candidate(
+            &next,
+            node_id,
+            to,
+            next.node_results.get(node_id),
+        ) {
+            events.push(
+                crate::knowledge_candidate_projector::candidate_proposal_event(candidate)
+                    .map_err(ExecutionCommitError::InvalidCommand)?,
+            );
+        }
         self.append_graph_event(&next, graph.revision, transaction_id, graph_event, events)
     }
 
@@ -566,6 +577,17 @@ impl ExecutionCommitService {
             next.node_results.get(node_id),
         ) {
             events.push(working_state);
+        }
+        if let Some(candidate) = crate::knowledge_candidate_projector::team_terminal_candidate(
+            &next,
+            node_id,
+            to,
+            next.node_results.get(node_id),
+        ) {
+            events.push(
+                crate::knowledge_candidate_projector::candidate_proposal_event(candidate)
+                    .map_err(ExecutionCommitError::InvalidCommand)?,
+            );
         }
         self.append_graph_event(
             &next,

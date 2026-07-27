@@ -1,7 +1,7 @@
 //! Context epoch and prompt assembly for Cowd AI work kernel.
 
-pub use crate::core::EvidenceRef;
 use crate::core::{AiKernelError, AiKernelResult, KernelRef};
+pub use crate::reality::EvidenceRef;
 use crate::tool::ToolExposureProjection;
 use serde::{Deserialize, Serialize};
 
@@ -954,23 +954,6 @@ pub struct ContextLedgerProjection {
     pub calibrated_input_tokens: Option<u64>,
 }
 
-impl EvidenceRef {
-    #[must_use]
-    pub fn new(ref_type: impl Into<String>, id: impl Into<String>) -> Self {
-        Self(KernelRef::new(ref_type, id))
-    }
-
-    #[must_use]
-    pub fn durable(id: impl Into<String>) -> Self {
-        Self::new("durable_evidence", id)
-    }
-
-    #[must_use]
-    pub fn id(&self) -> &str {
-        &self.0.id
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ContextEpochBuilder {
     identity: ContextIdentity,
@@ -1296,7 +1279,7 @@ mod tests {
         );
 
         assert_eq!(observation.raw_ref, raw_ref);
-        assert_eq!(observation.raw_ref.0.ref_type, "durable_evidence");
+        assert_eq!(observation.raw_ref.ref_type, "durable_evidence");
         assert_eq!(
             observation.model_summary,
             "cargo test completed successfully"

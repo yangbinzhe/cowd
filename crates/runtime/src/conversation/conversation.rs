@@ -54,7 +54,6 @@ use harness_contract::{
         EvidenceAccessRef, EvidenceAuditProjection, EvidenceRef, StablePrefixMetrics,
         ToolExposureMetrics, ToolObservation,
     },
-    core::KernelRef,
     knowledge::KnowledgeTurnReport,
     skill::{AgentSkillProfile, SkillCapabilityProfile},
     strategy::{
@@ -1610,6 +1609,8 @@ pub struct ConversationRuntime<C, T> {
     session_tracer: Option<SessionTracer>,
     /// Optional cognitive memory manager – `None` when memory is disabled.
     memory_manager: Option<Arc<CognitiveContextManager>>,
+    checkpoint_workspace_id: String,
+    execution_identity: Option<harness_contract::execution::ExecutionIdentity>,
     /// Runtime-owned owner for post-turn maintenance tasks.
     maintenance_supervisor:
         Option<Arc<crate::execution_core::services::RuntimeMaintenanceSupervisor>>,
@@ -1931,6 +1932,8 @@ where
             hook_progress_reporter: Arc::new(std::sync::Mutex::new(None)),
             session_tracer: None,
             memory_manager,
+            checkpoint_workspace_id: "runtime-workspace".to_string(),
+            execution_identity: None,
             maintenance_supervisor: None,
             memory_status,
             reality_recall: None,
@@ -3669,6 +3672,20 @@ where
         self.memory_definition_lineage_id = definition_lineage_id;
         self.memory_team_id = team_id;
         self.memory_read_scopes = read_scopes;
+        self
+    }
+
+    /// Bind semantic checkpoints to the same canonical execution identity as
+    /// the active Agent node. Root surface turns provide only the workspace
+    /// basis and receive a session-turn identity when compaction is planned.
+    #[must_use]
+    pub fn with_checkpoint_identity(
+        mut self,
+        workspace_id: impl Into<String>,
+        execution_identity: Option<harness_contract::execution::ExecutionIdentity>,
+    ) -> Self {
+        self.checkpoint_workspace_id = workspace_id.into();
+        self.execution_identity = execution_identity;
         self
     }
 
@@ -6296,12 +6313,33 @@ where
                 plan.source_message_end,
                 plan.existing_summary.as_deref(),
             );
+            let execution_identity = match self.execution_identity.clone() {
+                Some(identity) => identity,
+                None => {
+                    let turn_id = self.session_input_stream.active_turn_id().map_or_else(
+                        || format!("checkpoint-turn:{checkpoint_id}"),
+                        |id| id.to_string(),
+                    );
+                    harness_contract::execution::ExecutionIdentity::for_session_turn(
+                        self.memory_agent_id.clone(),
+                        self.checkpoint_workspace_id.clone(),
+                        original_session.session_id.clone(),
+                        turn_id,
+                    )
+                    .map_err(|error| {
+                        RuntimeError::new(format!(
+                            "semantic checkpoint execution identity is invalid: {error}"
+                        ))
+                    })?
+                }
+            };
             let build_context = SessionCheckpointBuildContext::new(
                 original_session.session_id.clone(),
                 ctx.agent_id.clone(),
                 source_range,
             )
             .with_checkpoint_id(checkpoint_id)
+            .with_execution_identity(execution_identity)
             .with_project_id(ctx.project_id.clone())
             .with_task_id(ctx.task_id.clone())
             .with_team_id(ctx.team_id.clone());
@@ -6355,17 +6393,17 @@ where
                 checkpoint.token_stats.before,
                 checkpoint.token_stats.after,
             )
-            .with_evidence_ref(EvidenceRef(
-                KernelRef::new("checkpoint", checkpoint.checkpoint_id.clone())
-                    .with_label("semantic_compaction_checkpoint"),
-            ))
-            .with_evidence_ref(EvidenceRef(
-                KernelRef::new(
+            .with_evidence_ref(
+                EvidenceRef::new("checkpoint", checkpoint.checkpoint_id.clone())
+                    .with_source("semantic_compaction_checkpoint"),
+            )
+            .with_evidence_ref(
+                EvidenceRef::new(
                     "fact-extraction",
                     fact_extraction_decision.mode.as_str().to_string(),
                 )
-                .with_label(fact_extraction_event.evidence_label()),
-            ));
+                .with_source(fact_extraction_event.evidence_label()),
+            );
             receipt
                 .retained_artifact_ids
                 .push(format!("checkpoint:{}", checkpoint.checkpoint_id));
@@ -6377,7 +6415,7 @@ where
                 receipt.evidence_refs.push(evidence.clone());
                 receipt
                     .dropped_artifact_ids
-                    .push(format!("{}:{}", evidence.0.ref_type, evidence.0.id));
+                    .push(format!("{}:{}", evidence.ref_type, evidence.id));
             }
             receipt
         });
@@ -6418,26 +6456,26 @@ where
                         "fact-review:{}",
                         memory_receipt.fact_review.batch_id.as_str()
                     ));
-                    receipt_mut.evidence_refs.push(EvidenceRef(
-                        KernelRef::new(
+                    receipt_mut.evidence_refs.push(
+                        EvidenceRef::new(
                             "fact-review",
                             memory_receipt.fact_review.batch_id.as_str().to_string(),
                         )
-                        .with_label(format!(
+                        .with_source(format!(
                             "promoted={} held={} rejected={} conflicts={}",
                             memory_receipt.fact_review.promoted.len(),
                             memory_receipt.fact_review.held.len(),
                             memory_receipt.fact_review.rejected.len(),
                             memory_receipt.fact_review.conflicts.len()
                         )),
-                    ));
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(%error, "semantic compaction fact projection deferred");
-                    receipt_mut.evidence_refs.push(EvidenceRef(
-                        KernelRef::new("memory", "semantic_checkpoint_fact_projection_deferred")
-                            .with_label(error.to_string()),
-                    ));
+                    receipt_mut.evidence_refs.push(
+                        EvidenceRef::new("memory", "semantic_checkpoint_fact_projection_deferred")
+                            .with_source(error.to_string()),
+                    );
                 }
             }
         }
@@ -8930,10 +8968,8 @@ fn source_message_evidence_refs(
         .enumerate()
         .map(|(offset, message)| {
             let index = start + offset;
-            EvidenceRef(
-                KernelRef::new("session-message", format!("{session_id}:{index}"))
-                    .with_label(message_index_label(message)),
-            )
+            EvidenceRef::new("session-message", format!("{session_id}:{index}"))
+                .with_source(message_index_label(message))
         })
         .collect()
 }
@@ -9558,7 +9594,7 @@ mod tests {
             "read_file",
             &output,
             false,
-            &harness_contract::core::EvidenceRef::new("tool", "small-exact-read"),
+            &harness_contract::reality::EvidenceRef::new("tool", "small-exact-read"),
             None,
         );
 
@@ -11036,7 +11072,7 @@ mod tests {
         );
         let session_id = runtime.session().session_id;
         let access = harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::core::EvidenceRef::new("tool", evidence_id),
+            harness_contract::reality::EvidenceRef::new("tool", evidence_id),
             "sha256:test",
             output.len() as u64,
             "text/plain; charset=utf-8",
@@ -12211,8 +12247,17 @@ mod tests {
                 3,
                 None,
                 memory::compression::session::SessionSemanticCheckpoint {
-                    schema_version: 2,
+                    schema_version:
+                        memory::compression::session::SESSION_SEMANTIC_CHECKPOINT_SCHEMA_VERSION,
                     checkpoint_id: "checkpoint-failure".to_string(),
+                    execution_identity:
+                        harness_contract::execution::ExecutionIdentity::for_session_turn(
+                            "primary",
+                            "workspace-failure",
+                            "missing-session",
+                            "turn-failure",
+                        )
+                        .unwrap(),
                     session_id: "missing-session".to_string(),
                     agent_id: "primary".to_string(),
                     project_id: None,
@@ -12270,7 +12315,7 @@ mod tests {
             active_pack_ids: vec!["pack-domain-default".to_string()],
             blocked_namespaces: vec!["project:irrelevant not relevant to intent".to_string()],
             compliance_warnings: Vec::new(),
-            evidence_refs: vec![harness_contract::core::KernelRef::new(
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
                 "knowledge_chunk",
                 "chunk-1",
             )],

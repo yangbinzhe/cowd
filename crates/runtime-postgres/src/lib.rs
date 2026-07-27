@@ -3144,7 +3144,6 @@ mod tests {
                 evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
                     "test_fixture",
                     "test://runtime-postgres/composed-task",
-                    harness_contract::reality::RealityBoundary::Observed,
                 )],
             })
             .expect("canonical Task outbox reaches PostgreSQL event backend");
@@ -3174,7 +3173,6 @@ mod tests {
                 evidence_refs: vec![EvidenceRef::new(
                     "test_fixture",
                     "test://runtime-postgres/task-migration",
-                    RealityBoundary::Observed,
                 )],
             })
             .expect("source task starts")

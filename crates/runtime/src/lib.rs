@@ -202,6 +202,8 @@ pub mod governed_tool_plan;
 pub mod input_classifier;
 #[path = "agent/intent_planner.rs"]
 pub mod intent_planner;
+#[path = "recovery/knowledge_candidate_projector.rs"]
+pub mod knowledge_candidate_projector;
 #[path = "infrastructure/lane_completion.rs"]
 pub mod lane_completion;
 #[path = "session/mission_command_interpreter.rs"]
@@ -531,6 +533,7 @@ pub use harness_contract::turn::{
     InputRelationKind, InputRelationProposal, SessionDispatchAction, SessionDispatchCommand,
     SessionDispatchReceipt, SessionHandoff, SessionResultPacket,
 };
+pub use knowledge_candidate_projector::KnowledgeCandidateProjector;
 pub use mcp::{
     mcp_server_signature, mcp_tool_name, mcp_tool_prefix, normalize_name_for_mcp,
     scoped_mcp_config_hash, unwrap_ccr_proxy_url,
@@ -712,7 +715,8 @@ pub use task::{
 pub use team_agent_selector::AgentSelector;
 pub use team_instantiation::{ResolvedRoleSlot, TeamInstantiation, TeamInstantiationService};
 pub use team_l4_promotion::{
-    L4CandidateLifecycle, L4PromotionCandidate, L4PromotionReceipt, L4PromotionService,
+    KnowledgeCandidateProjection, L4CandidateLifecycle, L4PromotionCandidate, L4PromotionReceipt,
+    L4PromotionService,
 };
 pub use team_legacy_import::LegacyTeamImportReport;
 pub use team_profile_migration::LegacyTeamProfileMigrationReport;
