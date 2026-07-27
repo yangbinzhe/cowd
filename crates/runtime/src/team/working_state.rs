@@ -259,7 +259,7 @@ pub(crate) fn terminal_working_state_event(
         return None;
     }
     let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()?;
-    let team_id = packet.team_id.as_deref()?.trim();
+    let team_id = packet.team_id()?.trim();
     if team_id.is_empty() {
         return None;
     }
@@ -358,6 +358,63 @@ pub(crate) fn terminal_working_state_event(
         confidence_milli,
         graph_revision: graph.revision,
     };
+    let identity = &packet.assignment.execution_identity;
+    let mut event_refs = vec![
+        RuntimeEventRef {
+            kind: "principal".to_string(),
+            id: identity.principal_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "workspace".to_string(),
+            id: identity.workspace_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "mission".to_string(),
+            id: packet.mission_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "task".to_string(),
+            id: packet.task_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "session".to_string(),
+            id: packet.session_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "execution_graph".to_string(),
+            id: graph.id.clone(),
+        },
+        RuntimeEventRef {
+            kind: "execution_node".to_string(),
+            id: node_id.to_string(),
+        },
+        RuntimeEventRef {
+            kind: "agent_instance".to_string(),
+            id: binding.instance.instance_id.clone(),
+        },
+        RuntimeEventRef {
+            kind: "agent_run".to_string(),
+            id: packet.run_id().to_string(),
+        },
+    ];
+    if let Some(turn_id) = identity.turn_id() {
+        event_refs.push(RuntimeEventRef {
+            kind: "turn".to_string(),
+            id: turn_id.to_string(),
+        });
+    }
+    if let Some(team_run_id) = packet.team_id() {
+        event_refs.push(RuntimeEventRef {
+            kind: "team_run".to_string(),
+            id: team_run_id.to_string(),
+        });
+    }
+    event_refs.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    event_refs.dedup_by(|left, right| left.kind == right.kind && left.id == right.id);
     Some(RuntimeTransactionEventInput {
         event: RuntimeEventInput {
             stream_id: format!("team-working-state:{team_id}"),
@@ -365,20 +422,7 @@ pub(crate) fn terminal_working_state_event(
             kind: "team.working_state.appended.v1".to_string(),
             status: Some("committed".to_string()),
             actor: Some("execution_commit_service".to_string()),
-            refs: vec![
-                RuntimeEventRef {
-                    kind: "execution_graph".to_string(),
-                    id: graph.id.clone(),
-                },
-                RuntimeEventRef {
-                    kind: "execution_node".to_string(),
-                    id: node_id.to_string(),
-                },
-                RuntimeEventRef {
-                    kind: "agent_instance".to_string(),
-                    id: binding.instance.instance_id.clone(),
-                },
-            ],
+            refs: event_refs,
             payload: serde_json::to_value(entry).ok()?,
         },
         idempotency_key: Some(format!(

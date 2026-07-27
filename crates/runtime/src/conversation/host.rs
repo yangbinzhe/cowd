@@ -4707,10 +4707,23 @@ fn agent_proposal_nodes(
         selected_agent_id: None,
         definition_ref: None,
         granted_capabilities: Vec::new(),
+        principal_id: state
+            .ingress
+            .as_ref()
+            .map(|ingress| ingress.claim_owner.clone())
+            .unwrap_or_else(|| "runtime.conversation".to_string()),
+        source_turn_id: state
+            .ingress
+            .as_ref()
+            .map(|ingress| ingress.turn_id.clone())
+            .unwrap_or_else(|| state.goal_id.clone()),
         run_id: format!("agent-run:{}", agent_node.id),
         task_id: agent_node.id.clone(),
         session_id: state.session_id.clone(),
-        mission_id: None,
+        mission_id: services
+            .mission_runtime()
+            .mission_id_for_session(&state.session_id)
+            .unwrap_or_else(|| services.mission_runtime().default_mission_id().to_string()),
         team_id: None,
         graph_id: ticket.graph_id.clone(),
         node_id: agent_node.id.clone(),
@@ -6515,7 +6528,7 @@ fn predecessor_goal_observations(
                         &node.payload_ref,
                     )
                     .ok()
-                    .is_some_and(|packet| packet.team_id.is_some())
+                    .is_some_and(|packet| packet.team_id().is_some())
                     {
                         "runtime.team_agent_result"
                     } else {
@@ -8896,14 +8909,14 @@ mod tests {
             packet: harness_contract::agent::AgentTaskPacket,
             selection: crate::AgentModelSelection,
         ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
-            let evidence_id = format!("materialized:{}", packet.node_id);
+            let evidence_id = format!("materialized:{}", packet.node_id());
             let evidence = harness_contract::context::EvidenceAccessRef::durable(
                 harness_contract::context::EvidenceRef::new("tool", evidence_id),
                 "a".repeat(64),
                 1,
                 "application/json",
                 "artifact://art_conversation_host_packet",
-                format!("session:{}", packet.session_id),
+                format!("session:{}", packet.session_id()),
             );
             let mut evidence_refs = packet.evidence_refs.clone();
             evidence_refs.push(evidence);
@@ -8929,14 +8942,14 @@ mod tests {
                 .map(|receipt| receipt.path.clone())
                 .collect();
             Ok(harness_contract::agent::AgentReturnPacket {
-                run_id: packet.run_id,
-                agent_id: packet.agent_id,
-                task_id: packet.task_id,
-                session_id: packet.session_id,
-                mission_id: packet.mission_id,
-                team_id: packet.team_id,
-                graph_id: packet.graph_id,
-                node_id: packet.node_id,
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                session_id: packet.session_id().to_string(),
+                mission_id: packet.mission_id().to_string(),
+                team_id: packet.team_id().map(ToString::to_string),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: harness_contract::agent::AgentTerminalStatus::Completed,

@@ -1280,8 +1280,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     }
     let profile_id = profile_manager.active_id();
-    let task_kernel = Arc::clone(&selected_storage.task_kernel);
-
     // Spawn background session cleanup (idle/expired session reaper)
     let lifecycle_config = SessionLifecycleConfig {
         idle_timeout: Some(Duration::from_secs(300)),
@@ -1358,6 +1356,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             .provider_registry(Arc::clone(&provider_registry))
             .tool_execution_host(runtime_tool_host)
             .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
+            .task_aggregate_service(Arc::clone(&selected_storage.task_service))
             .artifact_store(Arc::clone(&selected_storage.artifact_store))
             .reality_recall_port(Arc::new(
                 runtime::RealityRecallPort::with_fact_and_matrix_store(
@@ -1506,7 +1505,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let services = crate::services::GatewayServices::new_with_bound_session_and_storage(
         Arc::clone(&runtime_service),
         Arc::clone(&session_service),
-        task_kernel.clone(),
         surface_host.clone(),
         cognitive.clone(),
         approval_gate.clone(),

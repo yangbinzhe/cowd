@@ -36,12 +36,13 @@ pub fn validate_agent_return(
     task: &AgentTaskPacket,
     returned: &AgentReturnPacket,
 ) -> Result<(), AgentResultValidationError> {
-    if returned.run_id != task.run_id
-        || returned.agent_id != task.agent_id
-        || returned.task_id != task.task_id
-        || returned.session_id != task.session_id
-        || returned.graph_id != task.graph_id
-        || returned.node_id != task.node_id
+    if returned.run_id != task.run_id()
+        || returned.agent_id != task.agent_id()
+        || returned.task_id != task.task_id()
+        || returned.session_id != task.session_id()
+        || returned.mission_id != task.mission_id()
+        || returned.graph_id != task.graph_id()
+        || returned.node_id != task.node_id()
         || returned.attempt != task.attempt
         || returned.expected_graph_revision != task.expected_graph_revision
     {
@@ -51,7 +52,7 @@ pub fn validate_agent_return(
         return Err(AgentResultValidationError::MissingOutcome);
     }
     if returned.status == AgentTerminalStatus::Completed {
-        if task.team_id.is_some() {
+        if task.team_id().is_some() {
             let requirements = task
                 .constraints
                 .iter()
@@ -160,14 +161,17 @@ mod tests {
 
     fn team_task() -> AgentTaskPacket {
         AgentTaskPacket {
-            run_id: "run".to_string(),
-            agent_id: "agent".to_string(),
-            task_id: "task".to_string(),
-            session_id: "session".to_string(),
-            mission_id: None,
-            team_id: Some("team".to_string()),
-            graph_id: "graph".to_string(),
-            node_id: "node".to_string(),
+            assignment: crate::test_support::agent_assignment(
+                None,
+                "agent",
+                "run",
+                "task",
+                "session",
+                "mission",
+                Some("team"),
+                "graph",
+                "node",
+            ),
             attempt: 1,
             expected_graph_revision: 0,
             objective: "inspect".to_string(),
@@ -198,14 +202,14 @@ mod tests {
 
     fn team_return(task: &AgentTaskPacket) -> AgentReturnPacket {
         AgentReturnPacket {
-            run_id: task.run_id.clone(),
-            agent_id: task.agent_id.clone(),
-            task_id: task.task_id.clone(),
-            session_id: task.session_id.clone(),
-            mission_id: None,
-            team_id: task.team_id.clone(),
-            graph_id: task.graph_id.clone(),
-            node_id: task.node_id.clone(),
+            run_id: task.run_id().to_string(),
+            agent_id: task.agent_id().to_string(),
+            task_id: task.task_id().to_string(),
+            session_id: task.session_id().to_string(),
+            mission_id: task.mission_id().to_string(),
+            team_id: task.team_id().map(ToString::to_string),
+            graph_id: task.graph_id().to_string(),
+            node_id: task.node_id().to_string(),
             attempt: task.attempt,
             expected_graph_revision: task.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
@@ -264,6 +268,17 @@ mod tests {
             Err(AgentResultValidationError::AcceptanceMismatch)
         );
         assert_eq!(validate_agent_return(&task, &team_return(&task)), Ok(()));
+    }
+
+    #[test]
+    fn return_cannot_change_the_canonical_mission_binding() {
+        let task = team_task();
+        let mut returned = team_return(&task);
+        returned.mission_id = "another-mission".to_string();
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::BindingMismatch)
+        );
     }
 
     #[test]

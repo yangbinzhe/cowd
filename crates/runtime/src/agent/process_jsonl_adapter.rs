@@ -114,7 +114,7 @@ impl AgentRuntimeBackend for ProcessJsonlAdapter {
             .specs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&packet.agent_id)
+            .get(packet.agent_id())
             .cloned()
             .ok_or_else(|| "no ProcessJsonl spec is registered for this agent".to_string())?;
         let registry = Arc::clone(&self.registry);
@@ -221,10 +221,10 @@ fn execute_child(
             .active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if processes.contains_key(&packet.run_id) {
+        if processes.contains_key(packet.run_id()) {
             return Err("ProcessJsonl run is already active".into());
         }
-        processes.insert(packet.run_id.clone(), Arc::clone(&active));
+        processes.insert(packet.run_id().to_string(), Arc::clone(&active));
     }
 
     let result = read_process_result(stdout, packet);
@@ -238,7 +238,7 @@ fn execute_child(
         .active
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(&packet.run_id);
+        .remove(packet.run_id());
 
     let status = exit_status?;
     if !status.success() {
@@ -291,8 +291,8 @@ fn read_process_result(
             .map_err(|error| format!("malformed ProcessJsonl envelope: {error}"))?;
         if envelope.protocol_version != 1
             || envelope.sequence != expected_sequence
-            || envelope.run_id != packet.run_id
-            || envelope.agent_id != packet.agent_id
+            || envelope.run_id != packet.run_id()
+            || envelope.agent_id != packet.agent_id()
         {
             return Err("ProcessJsonl envelope binding or sequence is invalid".into());
         }
@@ -316,14 +316,17 @@ mod tests {
 
     fn task() -> AgentTaskPacket {
         AgentTaskPacket {
-            run_id: "process-run-1".into(),
-            agent_id: "process-agent-1".into(),
-            task_id: "process-task-1".into(),
-            session_id: "process-session-1".into(),
-            mission_id: None,
-            team_id: None,
-            graph_id: "process-graph-1".into(),
-            node_id: "process-node-1".into(),
+            assignment: crate::test_support::agent_assignment(
+                None,
+                "process-agent-1",
+                "process-run-1",
+                "process-task-1",
+                "process-session-1",
+                "process-mission-1",
+                None,
+                "process-graph-1",
+                "process-node-1",
+            ),
             attempt: 1,
             expected_graph_revision: 1,
             objective: "wait for cancellation".into(),
@@ -354,7 +357,7 @@ mod tests {
         let adapter = ProcessJsonlAdapter::new();
         let packet = task();
         adapter.register(
-            packet.agent_id.clone(),
+            packet.agent_id().to_string(),
             ProcessJsonlSpec {
                 command: "sh".into(),
                 args: vec!["-c".into(), "exec sleep 30".into()],
@@ -382,7 +385,7 @@ mod tests {
                 .active
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains_key(&packet.run_id)
+                .contains_key(packet.run_id())
             {
                 break;
             }
@@ -391,15 +394,15 @@ mod tests {
         let receipt = adapter
             .command(
                 &AgentRunHandle {
-                    run_id: packet.run_id.clone(),
-                    agent_id: packet.agent_id.clone(),
+                    run_id: packet.run_id().to_string(),
+                    agent_id: packet.agent_id().to_string(),
                     backend: AgentBackendKind::ProcessJsonl,
                     revision: 1,
                     status: harness_contract::agent::AgentStatus::Running,
                 },
                 &AgentCommandRequest {
                     command_id: "cancel-process-1".into(),
-                    agent_id: packet.agent_id.clone(),
+                    agent_id: packet.agent_id().to_string(),
                     expected_revision: 1,
                     command: AgentCommand::Cancel,
                     input: None,

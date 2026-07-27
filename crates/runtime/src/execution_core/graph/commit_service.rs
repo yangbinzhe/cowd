@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{
     apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionGraph,
-    ExecutionGraphCommand, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
-    ExecutionTransitionError,
+    ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
+    ExecutionNodeStatus, ExecutionTransitionError,
 };
 use harness_contract::tool::{ToolEffectDescriptor, ToolEffectKind, ToolIdempotency};
 use serde_json::json;
@@ -1060,7 +1061,7 @@ impl ExecutionCommitService {
                 kind: graph_event.kind().to_string(),
                 status: graph_status(graph).map(str::to_string),
                 actor: Some("execution_commit_service".to_string()),
-                refs: Vec::new(),
+                refs: graph_identity_refs(graph),
                 payload: serde_json::to_value(&graph_event)?,
             },
             idempotency_key: Some(format!("{}:revision:{}", graph.id, graph.revision)),
@@ -1093,6 +1094,70 @@ impl ExecutionCommitService {
             transaction,
         })
     }
+}
+
+fn graph_identity_refs(graph: &ExecutionGraph) -> Vec<RuntimeEventRef> {
+    let mut refs = vec![RuntimeEventRef {
+        kind: "execution_graph".to_string(),
+        id: graph.id.clone(),
+    }];
+    for packet in graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        .filter_map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok())
+    {
+        let identity = &packet.assignment.execution_identity;
+        refs.extend([
+            RuntimeEventRef {
+                kind: "principal".to_string(),
+                id: identity.principal_id().to_string(),
+            },
+            RuntimeEventRef {
+                kind: "workspace".to_string(),
+                id: identity.workspace_id().to_string(),
+            },
+            RuntimeEventRef {
+                kind: "mission".to_string(),
+                id: packet.mission_id().to_string(),
+            },
+            RuntimeEventRef {
+                kind: "task".to_string(),
+                id: packet.task_id().to_string(),
+            },
+            RuntimeEventRef {
+                kind: "session".to_string(),
+                id: packet.session_id().to_string(),
+            },
+            RuntimeEventRef {
+                kind: "agent_run".to_string(),
+                id: packet.run_id().to_string(),
+            },
+            RuntimeEventRef {
+                kind: "execution_node".to_string(),
+                id: packet.node_id().to_string(),
+            },
+        ]);
+        if let Some(turn_id) = identity.turn_id() {
+            refs.push(RuntimeEventRef {
+                kind: "turn".to_string(),
+                id: turn_id.to_string(),
+            });
+        }
+        if let Some(team_run_id) = packet.team_id() {
+            refs.push(RuntimeEventRef {
+                kind: "team_run".to_string(),
+                id: team_run_id.to_string(),
+            });
+        }
+    }
+    refs.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    refs.dedup_by(|left, right| left.kind == right.kind && left.id == right.id);
+    refs
 }
 
 fn tool_effect_refs(request: &crate::RuntimeToolExecutionRequest) -> Vec<RuntimeEventRef> {
@@ -1325,6 +1390,7 @@ fn graph_status(graph: &ExecutionGraph) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_contract::context::ContextBudgetLeaseRef;
     use harness_contract::tool::{
         ToolApprovalClass, ToolEffectKind, ToolIdempotency, ToolPermissionMode,
     };
@@ -1372,6 +1438,78 @@ mod tests {
             spawns_process: false,
             mutates_packages: false,
             mutates_system: false,
+        }
+    }
+
+    fn agent_task_graph() -> ExecutionGraph {
+        let packet = AgentTaskPacket {
+            assignment: crate::test_support::agent_assignment(
+                None,
+                "agent-instance",
+                "agent-run",
+                "task",
+                "session",
+                "mission",
+                Some("team-run"),
+                "graph",
+                "agent-node",
+            ),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: "verify canonical reverse lineage".to_string(),
+            acceptance: Vec::new(),
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_lease: "read_only".to_string(),
+            model_lease: "fast".to_string(),
+            budget_lease: ContextBudgetLeaseRef::new("budget", "agent-instance", "agent", 1_000, 1),
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: "agent-task-idempotency".to_string(),
+        };
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent",
+            serde_json::to_string(&packet).expect("serialize Agent task packet"),
+        );
+        node.id = "agent-node".to_string();
+        node.idempotency_key = "agent-node-idempotency".to_string();
+        let mut graph = ExecutionGraph::new("lineage");
+        graph.id = "graph".to_string();
+        graph
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        graph.nodes.push(node);
+        graph
+    }
+
+    #[test]
+    fn graph_events_expose_complete_execution_identity_reverse_refs() {
+        let refs = graph_identity_refs(&agent_task_graph());
+        let pairs = refs
+            .iter()
+            .map(|reference| (reference.kind.as_str(), reference.id.as_str()))
+            .collect::<BTreeSet<_>>();
+        for expected in [
+            ("execution_graph", "graph"),
+            ("principal", "test.principal"),
+            ("workspace", "test-workspace"),
+            ("mission", "mission"),
+            ("task", "task"),
+            ("session", "session"),
+            ("turn", "test-turn"),
+            ("team_run", "team-run"),
+            ("agent_run", "agent-run"),
+            ("execution_node", "agent-node"),
+        ] {
+            assert!(
+                pairs.contains(&expected),
+                "missing reverse lineage ref {expected:?}: {pairs:?}"
+            );
         }
     }
 

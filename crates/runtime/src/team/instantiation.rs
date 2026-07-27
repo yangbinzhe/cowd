@@ -22,6 +22,8 @@ use harness_contract::context::ContextBudgetLeaseRef;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
 };
+use harness_contract::reality::{EvidenceRef, RealityBoundary};
+use harness_contract::task::{TaskCreateCommand, TaskExecutionPolicy, TaskPhaseSpec, TaskSpec};
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, RolePartitionPolicy,
     TeamAcceptanceCheck, TeamAcceptanceRequirement, TeamInstantiationRequest,
@@ -66,6 +68,7 @@ pub struct RoleCardinalityResolution {
 #[derive(Debug, Clone)]
 pub struct TeamInstantiation {
     pub graph: ExecutionGraph,
+    pub task_commands: Vec<TaskCreateCommand>,
     pub template_ref: harness_contract::team::TeamTemplateRevisionRef,
     pub template_digest: String,
     /// Immutable Runtime authorization used for this graph's Template
@@ -81,6 +84,7 @@ pub struct TeamInstantiationService {
     binding_compiler: AgentBindingCompiler,
     resources: Arc<ExecutionResourceManager>,
     evolution_governance: Arc<EvolutionGovernanceService>,
+    workspace_id: String,
 }
 
 impl TeamInstantiationService {
@@ -89,12 +93,14 @@ impl TeamInstantiationService {
         registry: Arc<RuntimeDefinitionRegistry>,
         resources: Arc<ExecutionResourceManager>,
         evolution_governance: Arc<EvolutionGovernanceService>,
+        workspace_id: impl Into<String>,
     ) -> Self {
         Self {
             binding_compiler: AgentBindingCompiler::new(Arc::clone(&registry)),
             registry,
             resources,
             evolution_governance,
+            workspace_id: workspace_id.into(),
         }
     }
 
@@ -171,6 +177,7 @@ impl TeamInstantiationService {
         let mut slots_by_role = BTreeMap::<String, Vec<(String, String)>>::new();
         let mut role_slots = Vec::new();
         let mut cardinality_resolutions = Vec::new();
+        let mut task_commands = Vec::new();
         for role in &manifest.roles {
             let override_ = binding_overrides.get(&role.role_id);
             let (definition_ref, grant_ceiling) = resolved_role_binding(role, override_)?;
@@ -226,6 +233,8 @@ impl TeamInstantiationService {
                     selected_agent_id: Some(definition_ref.definition_id.as_str().to_string()),
                     definition_ref: Some(definition_ref.clone()),
                     granted_capabilities: grant_ceiling.clone(),
+                    principal_id: "runtime.team".to_string(),
+                    source_turn_id: request.request_id.clone(),
                     run_id,
                     task_id,
                     session_id: request.session_id.clone(),
@@ -306,9 +315,62 @@ impl TeamInstantiationService {
                     managed_invocation: request.managed_invocation.clone(),
                     idempotency_key: format!("team:{}:{}:{}", request.team_id, role.role_id, slot + 1),
                 };
+                task_commands.push(TaskCreateCommand {
+                    task_id: intent.task_id.clone(),
+                    mission_id: intent.mission_id.clone(),
+                    source_session_id: intent.session_id.clone(),
+                    source_turn_id: intent.source_turn_id.clone(),
+                    spec: TaskSpec {
+                        objective: intent.objective.clone(),
+                        phases: vec![TaskPhaseSpec {
+                            name: format!("{}:{}", role.role_id, focus_partition.focus_id),
+                            objective: intent.objective.clone(),
+                            dependency_refs: Vec::new(),
+                            plan: Vec::new(),
+                            acceptance: intent.acceptance.clone(),
+                            test_commands: Vec::new(),
+                        }],
+                        execution_policy: TaskExecutionPolicy::default(),
+                    },
+                    evidence_refs: vec![EvidenceRef::new(
+                        "team_request",
+                        format!(
+                            "team://{}/requests/{}/roles/{}/{}",
+                            request.team_id,
+                            request.request_id,
+                            role.role_id,
+                            slot + 1
+                        ),
+                        RealityBoundary::Observed,
+                    )],
+                });
+                let graph_identity =
+                    harness_contract::execution::ExecutionIdentity::for_task_graph(
+                        intent.principal_id.clone(),
+                        self.workspace_id.clone(),
+                        intent.mission_id.clone(),
+                        intent.task_id.clone(),
+                        intent.session_id.clone(),
+                        intent.source_turn_id.clone(),
+                        intent.graph_id.clone(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                let team_identity = harness_contract::execution::ExecutionIdentity::for_team_node(
+                    &graph_identity,
+                    &request.team_id,
+                    &graph.id,
+                )
+                .map_err(|error| error.to_string())?;
+                let execution_identity =
+                    harness_contract::execution::ExecutionIdentity::for_agent_node(
+                        &team_identity,
+                        &intent.run_id,
+                        &intent.node_id,
+                    )
+                    .map_err(|error| error.to_string())?;
                 let packet = self
                     .binding_compiler
-                    .compile_task_intent(intent, None)
+                    .compile_task_intent(intent, None, execution_identity)
                     .map_err(|error| {
                         format!(
                             "compile Team role `{}` slot {} Binding: {error}",
@@ -404,6 +466,7 @@ impl TeamInstantiationService {
 
         Ok(TeamInstantiation {
             graph,
+            task_commands,
             template_ref: template.revision.revision_ref,
             template_digest: template.revision.content_digest,
             release_assignment,
@@ -473,7 +536,7 @@ impl TeamInstantiationService {
             "{}|{}|{}|{}",
             request.session_id,
             request.team_id,
-            request.mission_id.as_deref().unwrap_or("direct"),
+            request.mission_id,
             request
                 .parent_execution
                 .as_ref()

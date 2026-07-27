@@ -756,7 +756,10 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             request_id: format!("harness-eval-request-{team_id}"),
             team_id: team_id.clone(),
             session_id: session.session_id.clone(),
-            mission_id: None,
+            mission_id: runtime_services
+                .mission_runtime()
+                .default_mission_id()
+                .to_string(),
             parent_execution: None,
             selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
             strategy_binding: None,

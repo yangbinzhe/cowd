@@ -17,7 +17,6 @@ use crate::session_runtime_data_port::SessionInputJournalKind;
 use harness_contract::{
     context::ContextTurnReport,
     projection::{ExecutionLiveState, ExecutionLiveStatus, SessionExecutionIndexProjection},
-    task::{TaskId, TaskTurnBinding},
     turn::{
         InputPayloadKind, InputRoutingDecision, InputRoutingReason, InputSourceKind,
         SessionInputEnvelope, SessionInputId, SessionInputProjection, SessionInputReceipt,
@@ -452,7 +451,6 @@ pub(crate) struct RuntimeService {
     projection_hub: Arc<SessionProjectionHub>,
     started_at: Instant,
     turns: Arc<Mutex<BTreeMap<String, TurnReceipt>>>,
-    turn_bindings: Arc<Mutex<BTreeMap<String, TaskTurnBinding>>>,
     active_turns: Arc<ActiveTurnRegistry>,
     session_inputs: Arc<Mutex<BTreeMap<String, runtime::SessionInputStream>>>,
     session_event_buses: Arc<Mutex<BTreeMap<String, runtime::CowdEventBus>>>,
@@ -542,7 +540,6 @@ impl RuntimeService {
             projection_hub,
             started_at,
             turns: Arc::new(Mutex::new(BTreeMap::new())),
-            turn_bindings: Arc::new(Mutex::new(BTreeMap::new())),
             active_turns: Arc::new(ActiveTurnRegistry::new()),
             session_inputs: Arc::new(Mutex::new(BTreeMap::new())),
             session_event_buses: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1450,7 +1447,6 @@ impl RuntimeService {
         let snapshot = self.snapshot().await;
         let leases = self.lease_registry.list().await;
         let turns = self.turns_snapshot();
-        let turn_bindings = self.turn_bindings_snapshot();
         serde_json::json!({
             "ok": true,
             "kind": "gateway_runtime_snapshot",
@@ -1465,7 +1461,6 @@ impl RuntimeService {
             },
             "lifecycle": self.session_data.presence_snapshots().await,
             "turns": turns,
-            "turn_bindings": turn_bindings,
             "transport": {
                 "control": "gateway_http",
                 "projection": "http_optional",
@@ -1610,17 +1605,8 @@ impl RuntimeService {
                 }),
         );
         carriers.extend(
-            self.runtime_services
-                .mission_runtime()
-                .projection(
-                    self.runtime_services.session_relations(),
-                    self.runtime_services.agent_runtime(),
-                    self.runtime_services.team_runtime(),
-                    self.runtime_services.approval_queue(),
-                    self.runtime_services.conflict_resolver(),
-                    self.runtime_services.mission_evidence(),
-                    self.runtime_services.mission_schedules().projection(),
-                )
+            runtime::MissionRuntimePort::new(Arc::clone(&self.runtime_services))
+                .projection()
                 .sessions
                 .into_iter()
                 .map(|snapshot| {
@@ -1667,7 +1653,6 @@ impl RuntimeService {
         serde_json::json!({
             "ok": true,
             "turns": self.turns_snapshot(),
-            "turn_bindings": self.turn_bindings_snapshot(),
         })
     }
 
@@ -1801,7 +1786,6 @@ impl RuntimeService {
         receipt
             .events
             .push(TurnEvent::new(input.turn_id.clone(), status));
-        self.record_turn_binding(input);
         self.turns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1811,15 +1795,6 @@ impl RuntimeService {
 
     fn turns_snapshot(&self) -> Vec<TurnReceipt> {
         self.turns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .cloned()
-            .collect()
-    }
-
-    fn turn_bindings_snapshot(&self) -> Vec<TaskTurnBinding> {
-        self.turn_bindings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
@@ -2892,29 +2867,11 @@ impl RuntimeService {
         receipt
             .events
             .push(TurnEvent::new(input.turn_id.clone(), TurnStatus::Running));
-        self.record_turn_binding(&input);
         self.turns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(input.turn_id.to_string(), receipt.clone());
         receipt
-    }
-
-    fn record_turn_binding(&self, input: &TurnInput) {
-        let Some(task_id) = input
-            .task_id
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-        else {
-            return;
-        };
-        let mut binding =
-            TaskTurnBinding::new(TaskId::from_string(task_id.clone()), input.turn_id.clone());
-        binding.session_id = input.session_id.clone();
-        self.turn_bindings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(input.turn_id.to_string(), binding);
     }
 
     fn finish_turn(
@@ -4095,12 +4052,9 @@ mod tests {
         assert_eq!(completed.events[1].status, TurnStatus::Completed);
 
         let snapshot = service.turns_value();
-        assert_eq!(snapshot["turn_bindings"][0]["task_id"], "task-turn");
-        assert_eq!(
-            snapshot["turn_bindings"][0]["turn_id"],
-            running.turn_id.to_string()
-        );
-        assert_eq!(snapshot["turn_bindings"][0]["session_id"], "session-turn");
+        assert_eq!(snapshot["turns"][0]["task_id"], "task-turn");
+        assert_eq!(snapshot["turns"][0]["turn_id"], running.turn_id.to_string());
+        assert_eq!(snapshot["turns"][0]["session_id"], "session-turn");
     }
 
     #[test]

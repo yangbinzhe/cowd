@@ -5,7 +5,11 @@ use crate::command::slash::{
     CommandDefinition, CommandProjection, CommandRegistry, CommandSurface,
 };
 
-use crate::{runtime_service::RuntimeService, task_kernel::TaskStatus};
+use crate::runtime_service::RuntimeService;
+use harness_contract::{
+    reality::{EvidenceRef, RealityBoundary},
+    task::TaskStatus,
+};
 
 use super::{ServiceEnvelope, TaskService};
 
@@ -239,8 +243,18 @@ impl SlashController {
                 objective,
                 yolo_mode,
             } => {
-                let task = self.task.start_goal(objective, yolo_mode)?;
-                self.task.record_lifecycle_event(&task, "task.started")?;
+                let session_id = required_session_id(args)?;
+                let turn_id = command_turn_id(args);
+                let task_id = format!("task-{}", uuid::Uuid::new_v4());
+                let task = self.task.create(
+                    task_id,
+                    self.task.mission_id_for_session(session_id)?,
+                    session_id.to_string(),
+                    turn_id.clone(),
+                    objective,
+                    yolo_mode,
+                    command_evidence(session_id, &turn_id, "start"),
+                )?;
                 Ok(serde_json::json!({
                     "dispatch": "task_service",
                     "operation": "start",
@@ -248,13 +262,19 @@ impl SlashController {
                 }))
             }
             TaskCommand::Cancel { id } => {
+                let session_id = required_session_id(args)?;
+                let turn_id = command_turn_id(args);
+                let current = self
+                    .task
+                    .get(&id)?
+                    .ok_or_else(|| format!("task not found: {id}"))?;
                 let task = self.task.transition(
                     &id,
+                    current.revision,
                     TaskStatus::Cancelled,
-                    None,
-                    "cancelled by slash command",
+                    command_evidence(session_id, &turn_id, "cancel"),
+                    "cancelled by slash command".to_string(),
                 )?;
-                self.task.record_lifecycle_event(&task, "task.cancelled")?;
                 Ok(serde_json::json!({
                     "dispatch": "task_service",
                     "operation": "cancel",
@@ -262,13 +282,19 @@ impl SlashController {
                 }))
             }
             TaskCommand::Complete { id } => {
+                let session_id = required_session_id(args)?;
+                let turn_id = command_turn_id(args);
+                let current = self
+                    .task
+                    .get(&id)?
+                    .ok_or_else(|| format!("task not found: {id}"))?;
                 let task = self.task.transition(
                     &id,
+                    current.revision,
                     TaskStatus::Completed,
-                    None,
-                    "completed by slash command",
+                    command_evidence(session_id, &turn_id, "complete"),
+                    "completed by slash command".to_string(),
                 )?;
-                self.task.record_lifecycle_event(&task, "task.completed")?;
                 Ok(serde_json::json!({
                     "dispatch": "task_service",
                     "operation": "complete",
@@ -277,6 +303,29 @@ impl SlashController {
             }
         }
     }
+}
+
+fn required_session_id(args: &serde_json::Value) -> Result<&str, String> {
+    args.get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|session_id| !session_id.trim().is_empty())
+        .ok_or_else(|| "task mutation requires an authoritative session_id".to_string())
+}
+
+fn command_turn_id(args: &serde_json::Value) -> String {
+    args.get("turn_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|turn_id| !turn_id.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("slash-turn-{}", uuid::Uuid::new_v4()))
+}
+
+fn command_evidence(session_id: &str, turn_id: &str, operation: &str) -> Vec<EvidenceRef> {
+    vec![EvidenceRef::new(
+        "slash_command",
+        format!("slash://sessions/{session_id}/turns/{turn_id}?operation={operation}"),
+        RealityBoundary::Observed,
+    )]
 }
 
 enum TaskCommand {

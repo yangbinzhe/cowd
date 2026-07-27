@@ -177,7 +177,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .map(|definition| definition.name.clone())
             .filter(|tool| packet_allowed_tools.contains(tool))
             .filter(|tool| {
-                packet.team_id.is_none()
+                packet.team_id().is_none()
                     || delegated_tool_supports_bounded_scope(host.as_ref(), tool)
             })
             .collect::<BTreeSet<_>>();
@@ -185,15 +185,12 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
             host,
             allowed_tools: allowed_tools.clone(),
-            session_id: packet.session_id.clone(),
+            session_id: packet.session_id().to_string(),
             model_lease: selection.model.clone(),
-            execution_id: packet.graph_id.clone(),
-            node_id: packet.node_id.clone(),
+            execution_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
             workspace_root: services.workspace_root().to_path_buf(),
-            resource_scopes: packet
-                .team_id
-                .as_ref()
-                .map(|_| packet.resource_scopes.clone()),
+            resource_scopes: packet.team_id().map(|_| packet.resource_scopes.clone()),
             managed_invocation: packet.managed_invocation.clone(),
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
@@ -204,8 +201,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let progress_reporter_stop = Arc::new(AtomicBool::new(false));
         let reporter_stop = Arc::clone(&progress_reporter_stop);
         let progress_runtime = Arc::clone(services.agent_runtime());
-        let progress_agent_id = packet.agent_id.clone();
-        let progress_run_id = packet.run_id.clone();
+        let progress_agent_id = packet.agent_id().to_string();
+        let progress_run_id = packet.run_id().to_string();
         let progress_reporter = std::thread::spawn(move || {
             let mut saw_model_output = false;
             while !reporter_stop.load(Ordering::SeqCst) {
@@ -232,7 +229,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // An in-process role is a child execution of the parent session, not
         // an unrelated surface session. Keep the canonical session/model
         // binding available to tool and orchestration contracts.
-        child_session.session_id = packet.session_id.clone();
+        child_session.session_id = packet.session_id().to_string();
         child_session.model = Some(selection.model.clone());
         let child_session_id = child_session.session_id.clone();
         // RuntimeServices owns the inspected Skill snapshot. The Binding's
@@ -274,8 +271,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             memory_read_scopes: binding.data_lease.read_scopes.clone(),
             reality_binding: Some(binding.clone()),
             execution_parent: Some(harness_contract::execution_graph::ExecutionParentBinding {
-                execution_id: packet.graph_id.clone(),
-                node_id: packet.node_id.clone(),
+                execution_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
             }),
         });
         let mut runtime = match host {
@@ -308,7 +305,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(
-                packet.run_id.clone(),
+                packet.run_id().to_string(),
                 ActiveInProcessRun {
                     cancellation: cancellation.clone(),
                     session_id: child_session_id,
@@ -319,7 +316,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             );
         let active_run_cleanup = ActiveRunCleanup {
             worker: self,
-            run_id: packet.run_id.clone(),
+            run_id: packet.run_id().to_string(),
             completion: Arc::clone(&completion),
             completed: Arc::clone(&completed),
         };
@@ -327,13 +324,13 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&packet.run_id)
+            .remove(packet.run_id())
         {
             cancellation.cancel();
         }
         runtime.install_turn_control(cancellation, crate::HookAbortSignal::default());
         let _ = services.agent_runtime().record_progress(
-            &packet.agent_id,
+            packet.agent_id(),
             "agent.execution.started",
             "provider-backed child execution admitted",
         );
@@ -405,21 +402,21 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             })
             .collect::<Vec<_>>();
         let _ = services.agent_runtime().record_progress(
-            &packet.agent_id,
+            packet.agent_id(),
             "agent.acceptance.evaluated",
             &format!("accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}"),
         );
         let (status, failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
         Ok(AgentReturnPacket {
-            run_id: packet.run_id,
-            agent_id: packet.agent_id,
-            task_id: packet.task_id,
-            session_id: packet.session_id,
-            mission_id: packet.mission_id,
-            team_id: packet.team_id,
-            graph_id: packet.graph_id,
-            node_id: packet.node_id,
+            run_id: packet.run_id().to_string(),
+            agent_id: packet.agent_id().to_string(),
+            task_id: packet.task_id().to_string(),
+            session_id: packet.session_id().to_string(),
+            mission_id: packet.mission_id().to_string(),
+            team_id: packet.team_id().map(str::to_owned),
+            graph_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
             status,
@@ -1912,14 +1909,17 @@ mod tests {
         evidence_refs: Vec<harness_contract::context::EvidenceAccessRef>,
     ) -> AgentTaskPacket {
         AgentTaskPacket {
-            run_id: "run".into(),
-            agent_id: "agent".into(),
-            task_id: "task".into(),
-            session_id: "session".into(),
-            mission_id: None,
-            team_id: Some("team".into()),
-            graph_id: "graph".into(),
-            node_id: "node".into(),
+            assignment: crate::test_support::agent_assignment(
+                None,
+                "agent",
+                "run",
+                "task",
+                "session",
+                "mission",
+                Some("team"),
+                "graph",
+                "node",
+            ),
             attempt: 1,
             expected_graph_revision: 0,
             objective: "review".into(),
@@ -2732,14 +2732,9 @@ mod tests {
     #[test]
     fn durable_audits_are_promoted_to_agent_evidence_refs() {
         let packet = AgentTaskPacket {
-            run_id: "run".into(),
-            agent_id: "agent".into(),
-            task_id: "task".into(),
-            session_id: "session".into(),
-            mission_id: None,
-            team_id: None,
-            graph_id: "graph".into(),
-            node_id: "node".into(),
+            assignment: crate::test_support::agent_assignment(
+                None, "agent", "run", "task", "session", "mission", None, "graph", "node",
+            ),
             attempt: 1,
             expected_graph_revision: 0,
             objective: "inspect".into(),
@@ -2971,14 +2966,17 @@ mod tests {
     #[test]
     fn delegated_prompt_rejects_simulated_tool_markup() {
         let mut packet = AgentTaskPacket {
-            run_id: "run".into(),
-            agent_id: "agent".into(),
-            task_id: "task".into(),
-            session_id: "session".into(),
-            mission_id: None,
-            team_id: Some("team".into()),
-            graph_id: "graph".into(),
-            node_id: "node".into(),
+            assignment: crate::test_support::agent_assignment(
+                None,
+                "agent",
+                "run",
+                "task",
+                "session",
+                "mission",
+                Some("team"),
+                "graph",
+                "node",
+            ),
             attempt: 1,
             expected_graph_revision: 0,
             objective: "inspect source".into(),

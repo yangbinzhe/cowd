@@ -532,7 +532,7 @@ impl StorageRegistry {
             owner: "storage".to_string(),
             migration: "blob_root_registered_since_0.9.295".to_string(),
         }));
-        endpoints.sort_by(|left, right| left.logical_id().cmp(&right.logical_id()));
+        endpoints.sort_by_key(StorageEndpoint::logical_id);
         Self { layout, endpoints }
     }
 
@@ -577,8 +577,7 @@ impl StorageRegistry {
             )));
         }
         self.endpoints.push(endpoint);
-        self.endpoints
-            .sort_by(|left, right| left.logical_id().cmp(&right.logical_id()));
+        self.endpoints.sort_by_key(StorageEndpoint::logical_id);
         Ok(())
     }
 
@@ -589,8 +588,7 @@ impl StorageRegistry {
             return self.register_endpoint(endpoint);
         };
         self.endpoints[index] = endpoint;
-        self.endpoints
-            .sort_by(|left, right| left.logical_id().cmp(&right.logical_id()));
+        self.endpoints.sort_by_key(StorageEndpoint::logical_id);
         Ok(())
     }
 
@@ -733,6 +731,20 @@ impl StorageRegistry {
             workspace_root.join(".cowd").join("definitions"),
             "runtime",
             "workspace_definition_endpoint_since_0.9.565",
+        ))?;
+        self.register_endpoint(StorageEndpoint::sqlite(
+            StorageDomainId::Tasks,
+            scope.clone(),
+            self.layout
+                .root
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("runtime")
+                .join("workspaces")
+                .join(&key)
+                .join("tasks.sqlite"),
+            "runtime",
+            "workspace_task_endpoint_since_0.9.605",
         ))?;
         self.register_endpoint(StorageEndpoint::sqlite(
             StorageDomainId::RuntimeEvents,
@@ -1388,6 +1400,10 @@ mod tests {
             .as_handle()
             .path
             .ends_with(".cowd/storage/resource-directory.sqlite"));
+        let tasks = registry
+            .endpoint_in_scope(&StorageDomainId::Tasks, &workspace_scope)
+            .unwrap();
+        assert!(tasks.as_handle().path.ends_with("tasks.sqlite"));
         let mfg_scope = StorageScope::App {
             app_id: "mfg".to_string(),
         };

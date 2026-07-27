@@ -217,6 +217,8 @@ impl<'a> ProtocolGraphBuilder<'a> {
             selected_agent_id: None,
             definition_ref: None,
             granted_capabilities: Vec::new(),
+            principal_id: self.request.principal_id.clone(),
+            source_turn_id: self.request.source_turn_id.clone(),
             run_id: format!("{}:run:{role_label}", self.graph.id),
             task_id: format!("{}:task:{role_label}", self.graph.id),
             session_id: self.request.session_id.clone(),

@@ -126,7 +126,7 @@ impl NodeExecutor for AgentTaskExecutor {
                 node_id: ticket.node_id.clone(),
                 reason: format!("persistent AgentTaskPacket is invalid: {error}"),
             })?;
-        if packet.team_id.is_some() {
+        if packet.team_id().is_some() {
             let state_store = self
                 .state_store
                 .read()
@@ -273,10 +273,10 @@ impl NodeExecutor for AgentTaskExecutor {
             harness_contract::context::EvidenceAccessRef::unavailable(
                 harness_contract::context::EvidenceRef::new(
                     "runtime_acceptance",
-                    acceptance_marker_id(&packet.node_id, criterion),
+                    acceptance_marker_id(packet.node_id(), criterion),
                 ),
                 "application/vnd.cowd.runtime-acceptance+json",
-                format!("execution-node:{}", packet.node_id),
+                format!("execution-node:{}", packet.node_id()),
             )
         }));
         evidence_refs.extend(
@@ -288,7 +288,7 @@ impl NodeExecutor for AgentTaskExecutor {
                     Some(harness_contract::context::EvidenceAccessRef::unavailable(
                         harness_contract::context::EvidenceRef::new("runtime_change", encoded),
                         "application/vnd.cowd.runtime-change+json",
-                        format!("execution-node:{}", packet.node_id),
+                        format!("execution-node:{}", packet.node_id()),
                     ))
                 }),
         );
@@ -404,12 +404,12 @@ fn execution_status_for_agent_terminal(
 
 fn validate_packet(packet: &AgentTaskPacket) -> Result<(), String> {
     if [
-        packet.run_id.as_str(),
-        packet.agent_id.as_str(),
-        packet.task_id.as_str(),
-        packet.session_id.as_str(),
-        packet.graph_id.as_str(),
-        packet.node_id.as_str(),
+        packet.run_id(),
+        packet.agent_id(),
+        packet.task_id(),
+        packet.session_id(),
+        packet.graph_id(),
+        packet.node_id(),
         packet.objective.as_str(),
         packet.idempotency_key.as_str(),
     ]
@@ -429,14 +429,17 @@ mod tests {
 
     fn task() -> AgentTaskPacket {
         AgentTaskPacket {
-            run_id: "run-1".into(),
-            agent_id: "agent-1".into(),
-            task_id: "task-1".into(),
-            session_id: "session-1".into(),
-            mission_id: None,
-            team_id: None,
-            graph_id: "graph-1".into(),
-            node_id: "node-1".into(),
+            assignment: crate::test_support::agent_assignment(
+                None,
+                "agent-1",
+                "run-1",
+                "task-1",
+                "session-1",
+                "mission-1",
+                None,
+                "graph-1",
+                "node-1",
+            ),
             attempt: 1,
             expected_graph_revision: 2,
             objective: "inspect".into(),
@@ -458,14 +461,14 @@ mod tests {
 
     fn returned(task: &AgentTaskPacket) -> AgentReturnPacket {
         AgentReturnPacket {
-            run_id: task.run_id.clone(),
-            agent_id: task.agent_id.clone(),
-            task_id: task.task_id.clone(),
-            session_id: task.session_id.clone(),
-            mission_id: None,
+            run_id: task.run_id().to_string(),
+            agent_id: task.agent_id().to_string(),
+            task_id: task.task_id().to_string(),
+            session_id: task.session_id().to_string(),
+            mission_id: task.mission_id().to_string(),
             team_id: None,
-            graph_id: task.graph_id.clone(),
-            node_id: task.node_id.clone(),
+            graph_id: task.graph_id().to_string(),
+            node_id: task.node_id().to_string(),
             attempt: task.attempt,
             expected_graph_revision: task.expected_graph_revision,
             status: AgentTerminalStatus::Completed,

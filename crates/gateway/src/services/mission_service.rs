@@ -704,7 +704,11 @@ mod tests {
         let started = service
             .start_team_runtime(
                 &session_id,
-                team_request(&session_id, "answer one delegated question"),
+                team_request(
+                    &session_id,
+                    service.runtime().default_mission_id(),
+                    "answer one delegated question",
+                ),
             )
             .await
             .expect("team");
@@ -717,13 +721,14 @@ mod tests {
 
     fn team_request(
         session_id: &str,
+        mission_id: &str,
         objective: &str,
     ) -> harness_contract::team::TeamInstantiationRequest {
         harness_contract::team::TeamInstantiationRequest {
             request_id: "mission-team-request".to_string(),
             team_id: "mission-team".to_string(),
             session_id: session_id.to_string(),
-            mission_id: None,
+            mission_id: mission_id.to_string(),
             parent_execution: None,
             selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
             strategy_binding: None,

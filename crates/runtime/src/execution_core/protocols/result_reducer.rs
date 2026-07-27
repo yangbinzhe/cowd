@@ -65,14 +65,14 @@ impl SynthesizeBackend for ProtocolResultReducer {
                 .map_err(|_| format!("protocol node {} is not an AgentTask packet", node.id))?;
             let returned = self
                 .agents
-                .terminal_return(&packet.agent_id)
+                .terminal_return(packet.agent_id())
                 .ok_or_else(|| {
                     format!(
                         "protocol binding missing terminal AgentRuntime result for {}",
-                        packet.agent_id
+                        packet.agent_id()
                     )
                 })?;
-            if returned.run_id != packet.run_id
+            if returned.run_id != packet.run_id()
                 || returned.graph_id != graph.id
                 || returned.node_id != node.id
                 || returned.attempt != packet.attempt
@@ -80,7 +80,7 @@ impl SynthesizeBackend for ProtocolResultReducer {
             {
                 return Err(format!(
                     "protocol result binding mismatch for {}",
-                    packet.agent_id
+                    packet.agent_id()
                 ));
             }
             usage.input_tokens = usage.input_tokens.saturating_add(returned.input_tokens);

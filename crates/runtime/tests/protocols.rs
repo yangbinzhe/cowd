@@ -18,7 +18,10 @@ fn request(protocol: ProtocolId, graph_id: &str) -> ProtocolCompileRequest {
     let mut request = ProtocolCompileRequest::new(
         ProtocolRef::new(protocol, 1),
         graph_id,
+        "test.principal",
+        "test-mission",
         "protocol-session",
+        "protocol-turn",
         "Produce a bounded, evidence-backed decision.",
     );
     request.context_refs = vec!["context:current-turn".to_string()];

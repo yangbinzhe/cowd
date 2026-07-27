@@ -7,7 +7,6 @@ use super::*;
 use crate::runtime_service::RuntimeService;
 #[cfg(test)]
 use crate::services::session_service::repository::SessionRepository;
-use crate::task_kernel::TaskKernel;
 
 pub(crate) type ServiceRegistry = GatewayServices;
 
@@ -18,7 +17,6 @@ impl GatewayServices {
             crate::services::session_service::activation::SessionActivationCoordinator,
         >,
         session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
@@ -28,7 +26,6 @@ impl GatewayServices {
             runtime,
             session_activation,
             session_supervisor,
-            task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
@@ -43,7 +40,6 @@ impl GatewayServices {
             crate::services::session_service::activation::SessionActivationCoordinator,
         >,
         session_supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
@@ -52,7 +48,6 @@ impl GatewayServices {
     ) -> Self {
         Self::new_with_session_activation(
             runtime,
-            task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
@@ -67,7 +62,6 @@ impl GatewayServices {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_session_activation(
         runtime: Arc<RuntimeService>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
@@ -81,7 +75,6 @@ impl GatewayServices {
     ) -> Self {
         Self::new_with_session_activation_inner(
             runtime,
-            task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
@@ -98,7 +91,6 @@ impl GatewayServices {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_session_activation_and_storage(
         runtime: Arc<RuntimeService>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
@@ -113,7 +105,6 @@ impl GatewayServices {
     ) -> Self {
         Self::new_with_session_activation_inner(
             runtime,
-            task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
@@ -131,7 +122,6 @@ impl GatewayServices {
     pub(crate) fn new_with_bound_session_and_storage(
         runtime: Arc<RuntimeService>,
         session: Arc<SessionService>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
@@ -146,7 +136,6 @@ impl GatewayServices {
     ) -> Self {
         Self::new_with_session_activation_inner(
             runtime,
-            task_kernel,
             surface_host,
             memory_manager,
             approval_gate,
@@ -167,7 +156,6 @@ impl GatewayServices {
     )]
     fn new_with_session_activation_inner(
         runtime: Arc<RuntimeService>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Arc<crate::surface_host::SurfaceHost>,
         memory_manager: Option<Arc<GatewayMemoryManager>>,
         approval_gate: Arc<SmartApprovalGate>,
@@ -186,7 +174,7 @@ impl GatewayServices {
         let command_host_runtime = Arc::clone(&runtime);
         let runtime_services = runtime.runtime_services();
         let runtime_events = RuntimeEventService::from_runtime_services(runtime_services.as_ref());
-        let task = TaskService::with_kernel_and_runtime(task_kernel, Arc::clone(&runtime_services));
+        let task = TaskService::with_runtime(Arc::clone(&runtime_services));
         let capacity = crate::gateway_capacity::GatewayCapacityController::new(
             crate::gateway_capacity::GatewayCapacityConfig::resolve(&capacity_config),
             Arc::clone(runtime_services.resource_manager()),
@@ -419,9 +407,9 @@ impl GatewayServices {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_kernels_for_tests(
+    pub(crate) fn with_runtime_for_tests(
         session_repository: Arc<SessionRepository>,
-        task_kernel: Arc<TaskKernel>,
+        runtime_services: Arc<runtime::RuntimeServices>,
     ) -> Self {
         let presence_ledger =
             Arc::new(crate::services::session_service::presence::SessionPresenceLedger::new());
@@ -430,14 +418,17 @@ impl GatewayServices {
                 session_repository,
                 presence_ledger,
             )),
-            task: TaskService::with_kernel(task_kernel),
+            task: TaskService::with_runtime(runtime_services),
             ..Self::baseline()
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_task_kernel_for_tests(mut self, task_kernel: Arc<TaskKernel>) -> Self {
-        self.task = TaskService::with_kernel(task_kernel);
+    pub(crate) fn with_task_runtime_for_tests(
+        mut self,
+        runtime_services: Arc<runtime::RuntimeServices>,
+    ) -> Self {
+        self.task = TaskService::with_runtime(runtime_services);
         self
     }
 

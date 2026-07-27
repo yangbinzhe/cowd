@@ -277,8 +277,10 @@ impl ProtocolSpec {
 pub struct ProtocolCompileRequest {
     pub protocol: ProtocolRef,
     pub graph_id: String,
+    pub principal_id: String,
+    pub source_turn_id: String,
     pub session_id: String,
-    pub mission_id: Option<String>,
+    pub mission_id: String,
     pub team_id: Option<String>,
     pub objective: String,
     #[serde(default)]
@@ -308,14 +310,19 @@ impl ProtocolCompileRequest {
     pub fn new(
         protocol: ProtocolRef,
         graph_id: impl Into<String>,
+        principal_id: impl Into<String>,
+        mission_id: impl Into<String>,
         session_id: impl Into<String>,
+        source_turn_id: impl Into<String>,
         objective: impl Into<String>,
     ) -> Self {
         Self {
             protocol,
             graph_id: graph_id.into(),
+            principal_id: principal_id.into(),
+            source_turn_id: source_turn_id.into(),
             session_id: session_id.into(),
-            mission_id: None,
+            mission_id: mission_id.into(),
             team_id: None,
             objective: objective.into(),
             parent_execution: None,

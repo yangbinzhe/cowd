@@ -14,6 +14,7 @@ use harness_contract::agent::{
 };
 use harness_contract::context::ContextBudgetLeaseRef;
 use harness_contract::evaluation::{EvaluationScenarioObservation, EvaluationScenarioSpec};
+use harness_contract::execution::ExecutionIdentity;
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeStatus,
 };
@@ -40,13 +41,15 @@ use super::protocols::ProtocolResultReducer;
 use crate::agent::binding::request_for_intent;
 use crate::agent::definition::ExplicitTomlAgentImport;
 use crate::runtime_event_store::RuntimeEventStoreError;
+#[cfg(any(test, feature = "test-fixtures"))]
+use crate::RuntimeEventInput;
 use crate::{
     AgentBindingCompiler, AgentBindingRequest, AgentDefinitionDraftReceipt, AgentRuntime,
     AgentRuntimeResolver, ApprovalQueue, CompiledAgentBinding, ConflictArbiter,
     DefinitionRegistryError, DurableRuntimeEvent, InProcessAgentWorker,
     ManagedAgentRuntimeDispatchReport, MissionEvidenceBus, MissionRuntime, MissionScheduleStore,
-    ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventInput,
-    RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
+    ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry, RuntimeEventReplayer,
+    RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
     RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, SessionInputRouter,
     SessionRelationGraph, TeamResultReducer, TeamRuntime,
 };
@@ -81,6 +84,8 @@ pub enum RuntimeServicesError {
     EmptyRoot,
     #[error("mission runtime initialization failed: {0}")]
     Mission(String),
+    #[error("task runtime initialization failed: {0}")]
+    Task(String),
     #[error("agent runtime initialization failed: {0}")]
     AgentRuntime(String),
     #[error("session input router was concurrently installed")]
@@ -132,6 +137,7 @@ pub struct RuntimeServicesBuilder {
     cowd_home: PathBuf,
     workspace_root: PathBuf,
     runtime_event_store: Option<Arc<RuntimeEventStore>>,
+    task_aggregate_service: Option<Arc<crate::TaskAggregateService>>,
     builtin_definitions_root: Option<PathBuf>,
     resource_quotas: Vec<(ExecutionResourceKind, ResourceQuota)>,
     provider_registry: Arc<crate::ProviderRegistry>,
@@ -629,46 +635,6 @@ impl SessionTerminalDeliveryPort {
     }
 }
 
-/// The only task-lifecycle families that the Gateway task projection may
-/// persist.  Arbitrary caller supplied runtime event kinds are intentionally
-/// not accepted at this boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskLifecycleKind {
-    Started,
-    PhaseStarted,
-    PhaseArtifactRecorded,
-    PhaseReviewed,
-    Cancelled,
-    Completed,
-    FailureRecorded,
-    Blocked,
-    AssignmentTerminalObserved,
-}
-
-impl TaskLifecycleKind {
-    #[must_use]
-    pub const fn event_kind(self) -> &'static str {
-        match self {
-            Self::Started => "task.started",
-            Self::PhaseStarted => "task.phase.started",
-            Self::PhaseArtifactRecorded => "task.phase.artifact.recorded",
-            Self::PhaseReviewed => "task.phase.reviewed",
-            Self::Cancelled => "task.cancelled",
-            Self::Completed => "task.completed",
-            Self::FailureRecorded => "task.failure.recorded",
-            Self::Blocked => "task.blocked",
-            Self::AssignmentTerminalObserved => "task.assignment_terminal_observed",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskLifecycleEvent {
-    pub task_id: String,
-    pub kind: TaskLifecycleKind,
-    pub payload: serde_json::Value,
-}
-
 impl RuntimeServicesBuilder {
     #[must_use]
     pub fn resource_quotas(
@@ -784,6 +750,14 @@ impl RuntimeServicesBuilder {
         self
     }
 
+    /// Install the selected durable Task aggregate backend. Runtime owns Task
+    /// lifecycle semantics; the launcher may only select its physical store.
+    #[must_use]
+    pub fn task_aggregate_service(mut self, service: Arc<crate::TaskAggregateService>) -> Self {
+        self.task_aggregate_service = Some(service);
+        self
+    }
+
     pub fn build(self) -> Result<Arc<RuntimeServices>, RuntimeServicesError> {
         if self.cowd_home.as_os_str().is_empty() || self.workspace_root.as_os_str().is_empty() {
             return Err(RuntimeServicesError::EmptyRoot);
@@ -834,6 +808,19 @@ impl RuntimeServicesBuilder {
                 storage_registry.layout.blobs.clone(),
             ))
         });
+        let task_aggregate_service = match self.task_aggregate_service {
+            Some(service) => service,
+            None => {
+                let task_scope = storage::StorageScope::workspace_for_root(&workspace_root);
+                let task_handle = storage_registry
+                    .endpoint_in_scope(&storage::StorageDomainId::Tasks, &task_scope)?
+                    .as_handle();
+                Arc::new(
+                    crate::TaskAggregateService::open_storage_handle(&task_handle)
+                        .map_err(RuntimeServicesError::Task)?,
+                )
+            }
+        };
         let resource_state_root = std::env::temp_dir()
             .join("cowd-runtime-resource-locks")
             .join(&workspace_key);
@@ -864,8 +851,13 @@ impl RuntimeServicesBuilder {
             self.skill_catalog,
             self.mission_schedule_policy,
             definition_registry,
+            task_aggregate_service,
             None,
         )?);
+        services
+            .task_runtime_port()
+            .recover()
+            .map_err(RuntimeServicesError::Task)?;
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
             .agent_runtime
@@ -929,6 +921,7 @@ pub struct RuntimeServices {
     definition_registry: Arc<RuntimeDefinitionRegistry>,
     cross_plane: Arc<CrossPlaneRuntimeService>,
     mission_runtime: Arc<MissionRuntime>,
+    task_aggregate_service: Arc<crate::TaskAggregateService>,
     mission_schedules: Arc<MissionScheduleStore>,
     managed_agents: Arc<crate::ManagedAgentDispatcher>,
     mission_schedule_policy: Arc<RwLock<crate::MissionSchedulePolicy>>,
@@ -964,6 +957,7 @@ impl RuntimeServices {
             cowd_home: cowd_home.into(),
             workspace_root: workspace_root.into(),
             runtime_event_store: None,
+            task_aggregate_service: None,
             builtin_definitions_root: None,
             resource_quotas: default_resource_quotas(),
             provider_registry: Arc::new(crate::ProviderRegistry::empty()),
@@ -996,6 +990,14 @@ impl RuntimeServices {
             definition_root.join("builtin"),
             &workspace_root,
         )?);
+        let task_scope = storage::StorageScope::workspace_for_root(&workspace_root);
+        let task_handle = storage_registry
+            .endpoint_in_scope(&storage::StorageDomainId::Tasks, &task_scope)?
+            .as_handle();
+        let task_aggregate_service = Arc::new(
+            crate::TaskAggregateService::open_storage_handle(&task_handle)
+                .map_err(RuntimeServicesError::Task)?,
+        );
         let services = Arc::new(Self::assemble(
             config_home,
             workspace_root,
@@ -1021,6 +1023,7 @@ impl RuntimeServices {
             crate::RuntimeSkillCatalog::default(),
             crate::MissionSchedulePolicy::default(),
             definition_registry,
+            task_aggregate_service,
             Some(ephemeral_root),
         )?);
         services.agent_runtime.bind_services(Arc::clone(&services));
@@ -1059,6 +1062,7 @@ impl RuntimeServices {
         skill_catalog: crate::RuntimeSkillCatalog,
         mission_schedule_policy: crate::MissionSchedulePolicy,
         definition_registry: Arc<RuntimeDefinitionRegistry>,
+        task_aggregate_service: Arc<crate::TaskAggregateService>,
         ephemeral_root: Option<tempfile::TempDir>,
     ) -> Result<Self, RuntimeServicesError> {
         let executor_registry = Arc::new(NodeExecutorRegistry::new());
@@ -1127,6 +1131,17 @@ impl RuntimeServices {
             workspace_key.clone(),
             workspace_root.clone(),
         ));
+        let mission_runtime = Arc::new(
+            MissionRuntime::event_sourced(Arc::clone(&event_store), workspace_key.clone())
+                .map_err(RuntimeServicesError::Mission)?,
+        );
+        let task_runtime_port = crate::TaskRuntimePort::from_components(
+            Arc::clone(&task_aggregate_service),
+            Arc::clone(&mission_runtime),
+            Arc::clone(&event_store),
+            graph_state_store.clone(),
+            commit_service.clone(),
+        );
         let team_runtime = Arc::new(TeamRuntime::new(
             Arc::clone(&graph_runner),
             graph_state_store.clone(),
@@ -1135,6 +1150,9 @@ impl RuntimeServices {
             Arc::clone(&definition_registry),
             Arc::clone(&resource_manager),
             Arc::clone(&evolution_governance),
+            workspace_key.clone(),
+            task_runtime_port,
+            Arc::clone(&mission_runtime),
         ));
         let l4_promotion_service = Arc::new(crate::L4PromotionService::new(
             Arc::clone(&event_store),
@@ -1162,9 +1180,6 @@ impl RuntimeServices {
             Arc::clone(&mission_evidence),
             Arc::clone(&event_store),
         ));
-        let mission_runtime =
-            MissionRuntime::event_sourced(Arc::clone(&event_store), workspace_key.clone())
-                .map_err(RuntimeServicesError::Mission)?;
         let mission_schedules = Arc::new(
             MissionScheduleStore::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
@@ -1213,7 +1228,8 @@ impl RuntimeServices {
             worktree_leases,
             definition_registry,
             cross_plane: Arc::new(CrossPlaneRuntimeService::open(Arc::clone(&event_store))?),
-            mission_runtime: Arc::new(mission_runtime),
+            mission_runtime,
+            task_aggregate_service,
             mission_schedules,
             managed_agents,
             mission_schedule_policy: Arc::new(RwLock::new(mission_schedule_policy)),
@@ -1468,6 +1484,7 @@ impl RuntimeServices {
         &self,
         intent: AgentTaskIntent,
     ) -> Result<AgentTaskPacket, RuntimeServicesError> {
+        let execution_identity = self.prepare_agent_task_intent(&intent)?;
         let selected = intent
             .selected_agent_id
             .as_deref()
@@ -1477,8 +1494,64 @@ impl RuntimeServices {
         let compiled = self.compile_agent_binding(request)?;
         compiled
             .snapshot
-            .compile_task_packet(intent)
+            .compile_task_packet(intent, execution_identity)
             .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))
+    }
+
+    fn prepare_agent_task_intent(
+        &self,
+        intent: &AgentTaskIntent,
+    ) -> Result<ExecutionIdentity, RuntimeServicesError> {
+        let task_port = crate::TaskRuntimePort::new(self);
+        match task_port
+            .get(&intent.task_id)
+            .map_err(RuntimeServicesError::Task)?
+        {
+            Some(task)
+                if task.mission_id == intent.mission_id
+                    && task.source_session_id == intent.session_id
+                    && task.source_turn_id == intent.source_turn_id => {}
+            Some(_) => {
+                return Err(RuntimeServicesError::Invariant(format!(
+                    "Agent task `{}` conflicts with its canonical Task aggregate lineage",
+                    intent.task_id
+                )));
+            }
+            None => {
+                let mut spec = harness_contract::task::TaskSpec::new(intent.objective.clone());
+                spec.execution_policy.max_failures_before_block = 3;
+                task_port
+                    .create(harness_contract::task::TaskCreateCommand {
+                        task_id: intent.task_id.clone(),
+                        mission_id: intent.mission_id.clone(),
+                        source_session_id: intent.session_id.clone(),
+                        source_turn_id: intent.source_turn_id.clone(),
+                        spec,
+                        evidence_refs: Vec::new(),
+                    })
+                    .map_err(RuntimeServicesError::Task)?;
+            }
+        }
+        let graph_identity = ExecutionIdentity::for_task_graph(
+            intent.principal_id.clone(),
+            self.workspace_key.clone(),
+            intent.mission_id.clone(),
+            intent.task_id.clone(),
+            intent.session_id.clone(),
+            intent.source_turn_id.clone(),
+            intent.graph_id.clone(),
+        )
+        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let parent_identity = if let Some(team_id) = &intent.team_id {
+            ExecutionIdentity::for_team_node(&graph_identity, team_id, &intent.node_id)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?
+        } else {
+            graph_identity
+        };
+        let execution_identity =
+            ExecutionIdentity::for_agent_node(&parent_identity, &intent.run_id, &intent.node_id)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        Ok(execution_identity)
     }
 
     /// Validate release provenance immediately before a compiled Agent packet
@@ -1673,168 +1746,6 @@ impl RuntimeServices {
                 consumed_at_ms,
             )
             .map_err(|error| error.to_string())
-    }
-
-    /// Persist a task lifecycle transition through the Runtime-owned task
-    /// writer.  Gateway supplies task projection data but cannot choose an
-    /// arbitrary ledger scope, actor or event family.
-    pub fn record_task_lifecycle(
-        &self,
-        event: TaskLifecycleEvent,
-    ) -> Result<DurableRuntimeEvent, String> {
-        if event.task_id.trim().is_empty() {
-            return Err("task lifecycle event requires task_id".to_string());
-        }
-        self.event_store.append(RuntimeEventInput {
-            stream_id: event.task_id,
-            scope: RuntimeEventScope::Task,
-            kind: event.kind.event_kind().to_string(),
-            status: None,
-            actor: Some("gateway-task-command".to_string()),
-            refs: Vec::new(),
-            payload: event.payload,
-        })
-    }
-
-    pub fn record_task_lifecycle_once(
-        &self,
-        event: TaskLifecycleEvent,
-        idempotency_key: &str,
-    ) -> Result<DurableRuntimeEvent, String> {
-        use crate::runtime_event_store::{
-            AppendTransactionRequest, ExpectedStreamRevision, RuntimeTransactionEventInput,
-        };
-
-        let idempotency_key = idempotency_key.trim();
-        if event.task_id.trim().is_empty() || idempotency_key.is_empty() {
-            return Err(
-                "idempotent task lifecycle event requires task_id and idempotency_key".to_string(),
-            );
-        }
-        if let Some(receipt) = self
-            .event_store
-            .event_by_idempotency_key(&event.task_id, idempotency_key)
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(receipt);
-        }
-        let expected_revision = self
-            .event_store
-            .stream_revision(&event.task_id)
-            .map_err(|error| error.to_string())?;
-        let transaction_id = format!(
-            "runtime-task-lifecycle-{:x}",
-            Sha256::digest(format!("{}:{idempotency_key}", event.task_id).as_bytes())
-        );
-        self.event_store
-            .append_transaction(AppendTransactionRequest {
-                transaction_id,
-                expected_streams: vec![ExpectedStreamRevision {
-                    stream_id: event.task_id.clone(),
-                    expected_revision,
-                }],
-                events: vec![RuntimeTransactionEventInput {
-                    event: RuntimeEventInput {
-                        stream_id: event.task_id.clone(),
-                        scope: RuntimeEventScope::Task,
-                        kind: event.kind.event_kind().to_string(),
-                        status: None,
-                        actor: Some("gateway-task-command".to_string()),
-                        refs: Vec::new(),
-                        payload: event.payload,
-                    },
-                    idempotency_key: Some(idempotency_key.to_string()),
-                    schema_version: 1,
-                }],
-            })
-            .map_err(|error| error.to_string())?;
-        self.event_store
-            .event_by_idempotency_key(&event.task_id, idempotency_key)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| {
-                "task lifecycle transaction committed without a readable event".to_string()
-            })
-    }
-
-    pub fn task_lifecycle_receipt(
-        &self,
-        task_id: &str,
-        correlation_id: &str,
-    ) -> Result<Option<DurableRuntimeEvent>, String> {
-        let correlation_id = correlation_id.trim();
-        if task_id.trim().is_empty() || correlation_id.is_empty() {
-            return Ok(None);
-        }
-        let receipt = self
-            .event_store
-            .list_stream(task_id)?
-            .into_iter()
-            .rev()
-            .find(|event| {
-                event.kind == TaskLifecycleKind::Completed.event_kind()
-                    && event
-                        .payload
-                        .get("correlation_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(correlation_id)
-            });
-        Ok(receipt)
-    }
-
-    pub fn latest_task_terminal_receipt(
-        &self,
-        task_id: &str,
-    ) -> Result<Option<DurableRuntimeEvent>, String> {
-        if task_id.trim().is_empty() {
-            return Ok(None);
-        }
-        self.event_store
-            .list_stream(task_id)
-            .map(|events| {
-                events.into_iter().rev().find(|event| {
-                    event.kind != TaskLifecycleKind::AssignmentTerminalObserved.event_kind()
-                        && event
-                            .payload
-                            .get("status")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|status| {
-                                matches!(status, "completed" | "cancelled" | "failed" | "blocked")
-                            })
-                })
-            })
-            .map_err(|error| error.to_string())
-    }
-
-    pub fn record_task_terminal_observation(
-        &self,
-        task_id: &str,
-        terminal_status: &str,
-        source_receipt_ref: &str,
-        correlation_id: &str,
-    ) -> Result<DurableRuntimeEvent, String> {
-        if !matches!(
-            terminal_status,
-            "completed" | "cancelled" | "failed" | "blocked"
-        ) {
-            return Err(format!(
-                "task terminal observation rejected non-terminal status {terminal_status}"
-            ));
-        }
-        let event = TaskLifecycleEvent {
-            task_id: task_id.to_string(),
-            kind: TaskLifecycleKind::AssignmentTerminalObserved,
-            payload: serde_json::json!({
-                "task_id": task_id,
-                "status": terminal_status,
-                "source_receipt_ref": source_receipt_ref,
-                "correlation_id": correlation_id,
-                "observed_for": "application.assignment.complete",
-            }),
-        };
-        self.record_task_lifecycle_once(
-            event,
-            &format!("task-assignment-terminal-observed:{correlation_id}"),
-        )
     }
 
     /// Runtime-owned startup migration command.  Gateway may trigger the
@@ -2507,6 +2418,7 @@ impl RuntimeServices {
             &baseline_ref,
             "baseline",
             sample_index,
+            self.mission_runtime.default_mission_id(),
         );
         let candidate_request = evolution_team_request(
             &candidate,
@@ -2514,6 +2426,7 @@ impl RuntimeServices {
             revision_ref,
             "candidate",
             sample_index,
+            self.mission_runtime.default_mission_id(),
         );
         let started = Instant::now();
         let baseline = self
@@ -2594,44 +2507,48 @@ impl RuntimeServices {
             None => compiler.compile_resolved(request, resolved, None),
         }
         .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
+        let intent = AgentTaskIntent {
+            selected_agent_id: None,
+            definition_ref: Some(revision_ref),
+            granted_capabilities: Vec::new(),
+            principal_id: "runtime.evolution_eval".to_string(),
+            source_turn_id: format!("{}:{side}:{sample_index}", scenario.scenario_ref),
+            run_id: run_id.clone(),
+            task_id: task_id.clone(),
+            session_id,
+            mission_id: self.mission_runtime.default_mission_id().to_string(),
+            team_id: None,
+            graph_id: format!("evolution-eval-graph:{}", candidate.candidate_id),
+            node_id: format!("{}:{}", scenario.scenario_ref, side),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: scenario.objective.clone(),
+            acceptance: scenario.acceptance.clone(),
+            constraints: vec![
+                "evolution_evaluation:isolation_required".to_string(),
+                format!("evaluation_scenario:{}", scenario.scenario_ref),
+            ],
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: scenario.allowed_tools.clone(),
+            allowed_skills: scenario.allowed_skills.clone(),
+            permission_lease: scenario.permission_lease.clone(),
+            model_lease: scenario.model_lease.clone(),
+            budget_lease: ContextBudgetLeaseRef::new(
+                format!("evolution-eval-budget:{run_id}"),
+                run_id.clone(),
+                "evolution_evaluation",
+                65_536,
+                1,
+            ),
+            managed_invocation: None,
+            idempotency_key: format!("evolution-eval:{}", run_id),
+        };
+        let execution_identity = self.prepare_agent_task_intent(&intent)?;
         compiled
             .snapshot
-            .compile_task_packet(AgentTaskIntent {
-                selected_agent_id: None,
-                definition_ref: Some(revision_ref),
-                granted_capabilities: Vec::new(),
-                run_id: run_id.clone(),
-                task_id: task_id.clone(),
-                session_id,
-                mission_id: None,
-                team_id: None,
-                graph_id: format!("evolution-eval-graph:{}", candidate.candidate_id),
-                node_id: format!("{}:{}", scenario.scenario_ref, side),
-                attempt: 1,
-                expected_graph_revision: 0,
-                objective: scenario.objective.clone(),
-                acceptance: scenario.acceptance.clone(),
-                constraints: vec![
-                    "evolution_evaluation:isolation_required".to_string(),
-                    format!("evaluation_scenario:{}", scenario.scenario_ref),
-                ],
-                context_refs: Vec::new(),
-                evidence_refs: Vec::new(),
-                resource_scopes: Vec::new(),
-                allowed_tools: scenario.allowed_tools.clone(),
-                allowed_skills: scenario.allowed_skills.clone(),
-                permission_lease: scenario.permission_lease.clone(),
-                model_lease: scenario.model_lease.clone(),
-                budget_lease: ContextBudgetLeaseRef::new(
-                    format!("evolution-eval-budget:{run_id}"),
-                    run_id.clone(),
-                    "evolution_evaluation",
-                    65_536,
-                    1,
-                ),
-                managed_invocation: None,
-                idempotency_key: format!("evolution-eval:{}", run_id),
-            })
+            .compile_task_packet(intent, execution_identity)
             .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))
     }
 
@@ -3036,6 +2953,18 @@ impl RuntimeServices {
     pub fn mission_runtime(&self) -> &Arc<MissionRuntime> {
         &self.mission_runtime
     }
+
+    /// Canonical durable Task aggregate owned by Runtime.
+    #[must_use]
+    pub fn task_aggregate_service(&self) -> &Arc<crate::TaskAggregateService> {
+        &self.task_aggregate_service
+    }
+
+    #[must_use]
+    pub fn task_runtime_port(&self) -> crate::TaskRuntimePort {
+        crate::TaskRuntimePort::new(self)
+    }
+
     pub fn mission_schedules(&self) -> &Arc<MissionScheduleStore> {
         &self.mission_schedules
     }
@@ -3295,63 +3224,70 @@ impl RuntimeServices {
                     .compile(request)
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
                 let execution_ref = run_id.clone();
+                let intent = AgentTaskIntent {
+                    selected_agent_id: None,
+                    definition_ref: Some(compiled.snapshot.definition_ref.clone()),
+                    granted_capabilities: Vec::new(),
+                    principal_id: dispatcher_id.to_string(),
+                    source_turn_id: invocation.invocation_id.clone(),
+                    run_id: run_id.clone(),
+                    task_id,
+                    session_id: definition.session_id.clone(),
+                    mission_id: self
+                        .mission_runtime
+                        .mission_id_for_session(&definition.session_id)
+                        .unwrap_or_else(|| self.mission_runtime.default_mission_id().to_string()),
+                    team_id: None,
+                    graph_id: format!("managed-agent:{}", invocation.invocation_id),
+                    node_id: format!(
+                        "managed-agent:{}:attempt:{}",
+                        invocation.invocation_id, invocation.attempt_no
+                    ),
+                    attempt: u32::from(invocation.attempt_no),
+                    expected_graph_revision: 0,
+                    objective: definition.objective.clone(),
+                    acceptance: definition.acceptance.clone(),
+                    constraints: vec![
+                        format!(
+                            "managed_agent:{}@{}",
+                            definition.managed_agent_id, definition.revision
+                        ),
+                        format!("managed_invocation:{}", invocation.invocation_id),
+                        format!("managed_fence:{}", invocation.fence_generation),
+                    ],
+                    context_refs: Vec::new(),
+                    evidence_refs: Vec::new(),
+                    resource_scopes: definition.resource_scopes.clone(),
+                    allowed_tools: definition.allowed_tool_contract_refs.clone(),
+                    allowed_skills: definition.allowed_skill_refs.clone(),
+                    permission_lease: definition.permission_lease.clone(),
+                    model_lease: definition.model_lease.clone(),
+                    budget_lease: ContextBudgetLeaseRef::new(
+                        format!("managed-budget:{run_id}"),
+                        run_id.clone(),
+                        "managed_agent",
+                        65_536,
+                        1,
+                    ),
+                    managed_invocation: Some(
+                        harness_contract::managed_agent::ManagedAgentInvocationFence {
+                            managed_agent_id: definition.managed_agent_id.clone(),
+                            definition_revision: definition.revision,
+                            invocation_id: invocation.invocation_id.clone(),
+                            attempt_no: invocation.attempt_no,
+                            fence_generation: invocation.fence_generation,
+                            dispatcher_id: dispatcher_id.to_string(),
+                        },
+                    ),
+                    idempotency_key: format!(
+                        "managed-agent:{}:{}",
+                        invocation.invocation_id, invocation.attempt_no
+                    ),
+                };
+                let execution_identity = self.prepare_agent_task_intent(&intent)?;
                 let packet = compiled
                     .snapshot
-                    .compile_task_packet(AgentTaskIntent {
-                        selected_agent_id: None,
-                        definition_ref: Some(compiled.snapshot.definition_ref.clone()),
-                        granted_capabilities: Vec::new(),
-                        run_id: run_id.clone(),
-                        task_id,
-                        session_id: definition.session_id.clone(),
-                        mission_id: None,
-                        team_id: None,
-                        graph_id: format!("managed-agent:{}", invocation.invocation_id),
-                        node_id: format!(
-                            "managed-agent:{}:attempt:{}",
-                            invocation.invocation_id, invocation.attempt_no
-                        ),
-                        attempt: u32::from(invocation.attempt_no),
-                        expected_graph_revision: 0,
-                        objective: definition.objective.clone(),
-                        acceptance: definition.acceptance.clone(),
-                        constraints: vec![
-                            format!(
-                                "managed_agent:{}@{}",
-                                definition.managed_agent_id, definition.revision
-                            ),
-                            format!("managed_invocation:{}", invocation.invocation_id),
-                            format!("managed_fence:{}", invocation.fence_generation),
-                        ],
-                        context_refs: Vec::new(),
-                        evidence_refs: Vec::new(),
-                        resource_scopes: definition.resource_scopes.clone(),
-                        allowed_tools: definition.allowed_tool_contract_refs.clone(),
-                        allowed_skills: definition.allowed_skill_refs.clone(),
-                        permission_lease: definition.permission_lease.clone(),
-                        model_lease: definition.model_lease.clone(),
-                        budget_lease: ContextBudgetLeaseRef::new(
-                            format!("managed-budget:{run_id}"),
-                            run_id.clone(),
-                            "managed_agent",
-                            65_536,
-                            1,
-                        ),
-                        managed_invocation: Some(
-                            harness_contract::managed_agent::ManagedAgentInvocationFence {
-                                managed_agent_id: definition.managed_agent_id.clone(),
-                                definition_revision: definition.revision,
-                                invocation_id: invocation.invocation_id.clone(),
-                                attempt_no: invocation.attempt_no,
-                                fence_generation: invocation.fence_generation,
-                                dispatcher_id: dispatcher_id.to_string(),
-                            },
-                        ),
-                        idempotency_key: format!(
-                            "managed-agent:{}:{}",
-                            invocation.invocation_id, invocation.attempt_no
-                        ),
-                    })
+                    .compile_task_packet(intent, execution_identity)
                     .map_err(|error| RuntimeServicesError::AgentRuntime(error.to_string()))?;
                 let returned = self
                     .agent_runtime
@@ -3413,7 +3349,12 @@ impl RuntimeServices {
                         ),
                         team_id: execution_ref.clone(),
                         session_id: definition.session_id.clone(),
-                        mission_id: None,
+                        mission_id: self
+                            .mission_runtime
+                            .mission_id_for_session(&definition.session_id)
+                            .unwrap_or_else(|| {
+                                self.mission_runtime.default_mission_id().to_string()
+                            }),
                         parent_execution: None,
                         selection_mode: TeamSelectionMode::Explicit,
                         strategy_binding: None,
@@ -3636,7 +3577,7 @@ fn scenario_observation(
             .as_ref()
             .map(|binding| binding.definition_ref.revision)
             .unwrap_or_default(),
-        run_ref: format!("agent-run:{}", packet.run_id),
+        run_ref: format!("agent-run:{}", packet.run_id()),
         succeeded: returned.status == AgentTerminalStatus::Completed,
         acceptance_total: scenario.acceptance.len().min(u32::MAX as usize) as u32,
         acceptance_satisfied,
@@ -3654,6 +3595,7 @@ fn evolution_team_request(
     revision_ref: &TeamTemplateRevisionRef,
     side: &str,
     sample_index: u32,
+    mission_id: &str,
 ) -> TeamInstantiationRequest {
     let identity = format!(
         "evolution-eval:{}:{}:{}:{}:{}",
@@ -3663,7 +3605,7 @@ fn evolution_team_request(
         request_id: format!("{identity}:request"),
         team_id: format!("{identity}:team"),
         session_id: format!("evolution-eval:{}", candidate.candidate_id),
-        mission_id: None,
+        mission_id: mission_id.to_string(),
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
         strategy_binding: None,
@@ -3959,6 +3901,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn startup_recovers_task_outbox_and_mission_membership_after_commit_crash() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let first = RuntimeServices::builder(&home, &workspace)
+            .build()
+            .expect("first runtime");
+        let mission_id = first.mission_runtime().default_mission_id().to_string();
+        first
+            .task_aggregate_service()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "task-startup-recovery".to_string(),
+                mission_id: mission_id.clone(),
+                source_session_id: "session-startup-recovery".to_string(),
+                source_turn_id: "turn-startup-recovery".to_string(),
+                spec: harness_contract::task::TaskSpec::new("recover committed task side effects"),
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                    "test_fixture",
+                    "test://task/startup-recovery",
+                    harness_contract::reality::RealityBoundary::Observed,
+                )],
+            })
+            .expect("commit Task without running its Runtime port");
+        assert!(first
+            .event_reader()
+            .list_stream("task:task-startup-recovery")
+            .expect("task event stream")
+            .is_empty());
+        assert_eq!(
+            first
+                .task_aggregate_service()
+                .pending_outbox(None, 10)
+                .expect("pending outbox")
+                .len(),
+            1
+        );
+        drop(first);
+
+        let recovered = RuntimeServices::builder(&home, &workspace)
+            .build()
+            .expect("recovered runtime");
+        assert_eq!(
+            recovered
+                .task_aggregate_service()
+                .pending_outbox(None, 10)
+                .expect("drained outbox")
+                .len(),
+            0
+        );
+        assert_eq!(
+            recovered
+                .event_reader()
+                .list_stream("task:task-startup-recovery")
+                .expect("projected Task event")
+                .len(),
+            1
+        );
+        let mission = recovered
+            .mission_runtime()
+            .aggregate(&mission_id)
+            .expect("recovered Mission");
+        assert!(mission
+            .session_refs
+            .iter()
+            .any(|reference| reference.id == "session-startup-recovery"));
+        assert!(mission
+            .task_refs
+            .iter()
+            .any(|reference| reference.id == "task-startup-recovery"));
+    }
+
     #[tokio::test]
     async fn maintenance_supervisor_serializes_owner_tasks_and_drains_them() {
         let supervisor = Arc::new(RuntimeMaintenanceSupervisor::new());
@@ -4144,29 +4159,75 @@ mod tests {
     }
 
     #[test]
-    fn task_completion_lifecycle_receipt_is_idempotent_by_correlation_key() {
+    fn task_terminal_observation_is_idempotent_without_becoming_a_task_writer() {
         let services = RuntimeServices::in_memory().expect("in-memory runtime services");
-        let event = TaskLifecycleEvent {
-            task_id: "task-completion-1".to_string(),
-            kind: TaskLifecycleKind::Completed,
-            payload: serde_json::json!({
-                "task_id": "task-completion-1",
-                "status": "completed",
-                "correlation_id": "correlation-1"
-            }),
-        };
         let first = services
-            .record_task_lifecycle_once(event.clone(), "task-completed:correlation-1")
-            .expect("first completion event");
+            .task_runtime_port()
+            .record_assignment_terminal_observation(
+                "task-completion-1",
+                "completed",
+                "runtime-event://source",
+                "correlation-1",
+            )
+            .expect("first observation");
         let replay = services
-            .record_task_lifecycle_once(event, "task-completed:correlation-1")
-            .expect("idempotent completion replay");
+            .task_runtime_port()
+            .record_assignment_terminal_observation(
+                "task-completion-1",
+                "completed",
+                "runtime-event://source",
+                "correlation-1",
+            )
+            .expect("idempotent observation replay");
         assert_eq!(first.event_id, replay.event_id);
         assert_eq!(first.commit_cursor, replay.commit_cursor);
+        assert_eq!(first.scope, RuntimeEventScope::Relation);
+        assert_eq!(
+            first.kind,
+            "application.assignment.task_terminal_observed.v1"
+        );
         assert_eq!(
             services
                 .event_store
-                .list_stream("task-completion-1")
+                .list_stream("task-observation:task-completion-1")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_task_terminal_observation_replays_the_committed_receipt() {
+        let services =
+            std::sync::Arc::new(RuntimeServices::in_memory().expect("in-memory runtime services"));
+        let workers = (0..16)
+            .map(|_| {
+                let services = std::sync::Arc::clone(&services);
+                std::thread::spawn(move || {
+                    services
+                        .task_runtime_port()
+                        .record_assignment_terminal_observation(
+                            "task-completion-race",
+                            "completed",
+                            "runtime-event://source-race",
+                            "correlation-race",
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let receipts = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker join").expect("observation"))
+            .collect::<Vec<_>>();
+        let first_event_id = receipts[0].event_id.clone();
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt.event_id == first_event_id));
+        assert_eq!(
+            services
+                .event_store
+                .list_stream("task-observation:task-completion-race")
                 .unwrap()
                 .len(),
             1
@@ -4258,23 +4319,23 @@ mod tests {
             evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
                 harness_contract::context::EvidenceRef::new(
                     "tool",
-                    format!("materialized:{}", packet.node_id),
+                    format!("materialized:{}", packet.node_id()),
                 ),
                 "a".repeat(64),
                 1,
                 "application/json",
                 "artifact://art_runtime_services_packet",
-                format!("session:{}", packet.session_id),
+                format!("session:{}", packet.session_id()),
             ));
             Ok(AgentReturnPacket {
-                run_id: packet.run_id,
-                agent_id: packet.agent_id,
-                task_id: packet.task_id,
-                session_id: packet.session_id,
-                mission_id: packet.mission_id,
-                team_id: packet.team_id,
-                graph_id: packet.graph_id,
-                node_id: packet.node_id,
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                session_id: packet.session_id().to_string(),
+                mission_id: packet.mission_id().to_string(),
+                team_id: packet.team_id().map(ToString::to_string),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
@@ -4327,23 +4388,23 @@ mod tests {
             evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
                 harness_contract::context::EvidenceRef::new(
                     "tool",
-                    format!("materialized:{}", packet.node_id),
+                    format!("materialized:{}", packet.node_id()),
                 ),
                 "a".repeat(64),
                 1,
                 "application/json",
                 "artifact://art_runtime_services_shared",
-                format!("session:{}", packet.session_id),
+                format!("session:{}", packet.session_id()),
             ));
             Ok(AgentReturnPacket {
-                run_id: packet.run_id,
-                agent_id: packet.agent_id,
-                task_id: packet.task_id,
-                session_id: packet.session_id,
-                mission_id: packet.mission_id,
-                team_id: packet.team_id,
-                graph_id: packet.graph_id,
-                node_id: packet.node_id,
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                session_id: packet.session_id().to_string(),
+                mission_id: packet.mission_id().to_string(),
+                team_id: packet.team_id().map(ToString::to_string),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
@@ -5345,10 +5406,12 @@ mod tests {
             selected_agent_id: None,
             definition_ref: None,
             granted_capabilities: Vec::new(),
+            principal_id: "test".to_string(),
+            source_turn_id: "agent-runtime-turn".to_string(),
             run_id: "agent-runtime-run".into(),
             task_id: "agent-runtime-task".into(),
             session_id: "agent-runtime-session".into(),
-            mission_id: None,
+            mission_id: services.mission_runtime().default_mission_id().to_string(),
             team_id: None,
             graph_id: graph.id.clone(),
             node_id: "agent-runtime-node".into(),
@@ -5395,12 +5458,12 @@ mod tests {
         assert_eq!(report.completed, 1);
         let graph = services.graph_state_store().load(&report.graph_id).unwrap();
         assert_eq!(
-            graph.node_statuses.get(&packet.node_id),
+            graph.node_statuses.get(packet.node_id()),
             Some(&ExecutionNodeStatus::Completed)
         );
         let agent = services
             .agent_runtime()
-            .get(&packet.agent_id)
+            .get(packet.agent_id())
             .expect("agent projection");
         assert_eq!(
             agent.status,
@@ -5411,9 +5474,9 @@ mod tests {
             binding.definition_ref.definition_id.as_str(),
             "builtin/cowd/direct"
         );
-        assert_eq!(binding.data_lease.session_id, packet.session_id);
-        assert_eq!(binding.data_lease.task_id, packet.task_id);
-        assert_eq!(services.agent_runtime().events(&packet.agent_id).len(), 3);
+        assert_eq!(binding.data_lease.session_id, packet.session_id());
+        assert_eq!(binding.data_lease.task_id, packet.task_id());
+        assert_eq!(services.agent_runtime().events(packet.agent_id()).len(), 3);
     }
 
     #[tokio::test]
@@ -5457,10 +5520,12 @@ mod tests {
                 selected_agent_id: Some("builtin/cowd/direct".to_string()),
                 definition_ref: None,
                 granted_capabilities: Vec::new(),
+                principal_id: "test".to_string(),
+                source_turn_id: format!("binding-turn-{index}"),
                 run_id: format!("binding-run-{index}"),
                 task_id: format!("binding-task-{index}"),
                 session_id: "binding-session".to_string(),
-                mission_id: None,
+                mission_id: services.mission_runtime().default_mission_id().to_string(),
                 team_id: Some("binding-team".to_string()),
                 graph_id: graph.id.clone(),
                 node_id: node_id.clone(),
@@ -5589,6 +5654,7 @@ mod tests {
                 "cowd/execute-review",
                 "independently analyse and review the runtime boundary",
                 "fast",
+                services.mission_runtime().default_mission_id(),
             ))
             .await
             .expect("team execution");
@@ -5738,6 +5804,7 @@ mod tests {
                     "cowd/parallel-research-synthesis",
                     "compare three independent architecture choices",
                     "fast",
+                    services.mission_runtime().default_mission_id(),
                 )
             })
             .await
@@ -5753,12 +5820,13 @@ mod tests {
         template_id: &str,
         objective: &str,
         model_lease: &str,
+        mission_id: &str,
     ) -> TeamInstantiationRequest {
         TeamInstantiationRequest {
             request_id: format!("test-request-{team_id}"),
             team_id: team_id.to_string(),
             session_id: session_id.to_string(),
-            mission_id: None,
+            mission_id: mission_id.to_string(),
             parent_execution: None,
             selection_mode: TeamSelectionMode::Explicit,
             strategy_binding: None,

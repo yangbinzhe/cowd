@@ -5,6 +5,7 @@
 
 use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
 use crate::core::{ExecutionPattern, TaskRisk};
+use crate::execution::{ExecutionIdentity, ExecutionIdentityKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -52,10 +53,12 @@ pub struct AgentTaskIntent {
     /// "all capabilities".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub granted_capabilities: Vec<AgentCapability>,
+    pub principal_id: String,
+    pub source_turn_id: String,
     pub run_id: String,
     pub task_id: String,
     pub session_id: String,
-    pub mission_id: Option<String>,
+    pub mission_id: String,
     pub team_id: Option<String>,
     pub graph_id: String,
     pub node_id: String,
@@ -87,15 +90,132 @@ pub struct AgentTaskIntent {
 /// components create [`AgentTaskIntent`]; only Runtime binding compilation can
 /// produce this packet for a new graph node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentTaskPacket {
+#[serde(try_from = "AgentAssignmentWire", into = "AgentAssignmentWire")]
+pub struct AgentAssignment {
+    pub execution_identity: ExecutionIdentity,
+    pub definition_ref: AgentDefinitionRevisionRef,
+    pub instance_id: String,
     pub run_id: String,
-    pub agent_id: String,
+    pub role_id: String,
     pub task_id: String,
     pub session_id: String,
-    pub mission_id: Option<String>,
-    pub team_id: Option<String>,
+    pub mission_id: String,
+    pub team_run_id: Option<String>,
     pub graph_id: String,
     pub node_id: String,
+    pub scope_refs: Vec<String>,
+    pub capability_policy: Vec<AgentCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentAssignmentWire {
+    execution_identity: ExecutionIdentity,
+    definition_ref: AgentDefinitionRevisionRef,
+    instance_id: String,
+    run_id: String,
+    role_id: String,
+    task_id: String,
+    session_id: String,
+    mission_id: String,
+    team_run_id: Option<String>,
+    graph_id: String,
+    node_id: String,
+    scope_refs: Vec<String>,
+    capability_policy: Vec<AgentCapability>,
+}
+
+impl AgentAssignment {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.definition_ref.validate()?;
+        self.execution_identity
+            .validate()
+            .map_err(|error| ValidationError::InvalidContract {
+                message: error.to_string(),
+            })?;
+        if self.execution_identity.kind() != ExecutionIdentityKind::AgentNode {
+            return Err(ValidationError::InvalidContract {
+                message: "Agent assignment requires an agent-node execution identity".to_string(),
+            });
+        }
+        for (field, value) in [
+            ("assignment.instance_id", self.instance_id.as_str()),
+            ("assignment.run_id", self.run_id.as_str()),
+            ("assignment.role_id", self.role_id.as_str()),
+            ("assignment.task_id", self.task_id.as_str()),
+            ("assignment.session_id", self.session_id.as_str()),
+            ("assignment.mission_id", self.mission_id.as_str()),
+            ("assignment.graph_id", self.graph_id.as_str()),
+            ("assignment.node_id", self.node_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ValidationError::MissingField {
+                    field: field.to_string(),
+                });
+            }
+        }
+        if self.execution_identity.task_id() != Some(self.task_id.as_str())
+            || self.execution_identity.mission_id() != Some(self.mission_id.as_str())
+            || self.execution_identity.session_id() != Some(self.session_id.as_str())
+            || self.execution_identity.graph_id() != Some(self.graph_id.as_str())
+            || self.execution_identity.agent_run_id() != Some(self.run_id.as_str())
+            || self.execution_identity.node_id() != Some(self.node_id.as_str())
+            || self.execution_identity.team_run_id() != self.team_run_id.as_deref()
+        {
+            return Err(ValidationError::InvalidContract {
+                message: "Agent assignment duplicates conflicting execution lineage".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<AgentAssignmentWire> for AgentAssignment {
+    type Error = ValidationError;
+
+    fn try_from(value: AgentAssignmentWire) -> Result<Self, Self::Error> {
+        let assignment = Self {
+            execution_identity: value.execution_identity,
+            definition_ref: value.definition_ref,
+            instance_id: value.instance_id,
+            run_id: value.run_id,
+            role_id: value.role_id,
+            task_id: value.task_id,
+            session_id: value.session_id,
+            mission_id: value.mission_id,
+            team_run_id: value.team_run_id,
+            graph_id: value.graph_id,
+            node_id: value.node_id,
+            scope_refs: value.scope_refs,
+            capability_policy: value.capability_policy,
+        };
+        assignment.validate()?;
+        Ok(assignment)
+    }
+}
+
+impl From<AgentAssignment> for AgentAssignmentWire {
+    fn from(value: AgentAssignment) -> Self {
+        Self {
+            execution_identity: value.execution_identity,
+            definition_ref: value.definition_ref,
+            instance_id: value.instance_id,
+            run_id: value.run_id,
+            role_id: value.role_id,
+            task_id: value.task_id,
+            session_id: value.session_id,
+            mission_id: value.mission_id,
+            team_run_id: value.team_run_id,
+            graph_id: value.graph_id,
+            node_id: value.node_id,
+            scope_refs: value.scope_refs,
+            capability_policy: value.capability_policy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentTaskPacket {
+    pub assignment: AgentAssignment,
     pub attempt: u32,
     pub expected_graph_revision: u64,
     pub objective: String,
@@ -123,13 +243,55 @@ pub struct AgentTaskPacket {
     pub idempotency_key: String,
 }
 
+impl AgentTaskPacket {
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        self.assignment.run_id.as_str()
+    }
+
+    #[must_use]
+    pub fn agent_id(&self) -> &str {
+        self.assignment.instance_id.as_str()
+    }
+
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        self.assignment.task_id.as_str()
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        self.assignment.session_id.as_str()
+    }
+
+    #[must_use]
+    pub fn mission_id(&self) -> &str {
+        self.assignment.mission_id.as_str()
+    }
+
+    #[must_use]
+    pub fn team_id(&self) -> Option<&str> {
+        self.assignment.team_run_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn graph_id(&self) -> &str {
+        self.assignment.graph_id.as_str()
+    }
+
+    #[must_use]
+    pub fn node_id(&self) -> &str {
+        self.assignment.node_id.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentReturnPacket {
     pub run_id: String,
     pub agent_id: String,
     pub task_id: String,
     pub session_id: String,
-    pub mission_id: Option<String>,
+    pub mission_id: String,
     pub team_id: Option<String>,
     pub graph_id: String,
     pub node_id: String,
@@ -571,8 +733,8 @@ mod tests {
     }
 
     #[test]
-    fn agent_return_change_wire_is_rolling_compatible() {
-        let legacy = serde_json::json!({
+    fn agent_return_requires_canonical_mission_and_keeps_additive_change_receipts() {
+        let mut wire = serde_json::json!({
             "run_id": "run",
             "agent_id": "agent",
             "task_id": "task",
@@ -598,8 +760,10 @@ mod tests {
             "tool_calls": 1,
             "failure": null
         });
+        assert!(serde_json::from_value::<AgentReturnPacket>(wire.clone()).is_err());
+        wire["mission_id"] = serde_json::json!("mission");
         let mut returned: AgentReturnPacket =
-            serde_json::from_value(legacy).expect("legacy change hints remain readable");
+            serde_json::from_value(wire).expect("canonical Agent result remains readable");
         assert_eq!(returned.changes, vec!["src/lib.rs"]);
         assert!(returned.runtime_change_receipts.is_empty());
 
@@ -614,5 +778,43 @@ mod tests {
         )
         .expect("decode additive receipt");
         assert_eq!(round_trip, returned);
+    }
+
+    #[test]
+    fn assignment_deserialization_rejects_conflicting_duplicate_lineage() {
+        let graph = ExecutionIdentity::for_task_graph(
+            "principal",
+            "workspace",
+            "mission",
+            "task",
+            "session",
+            "turn",
+            "graph",
+        )
+        .expect("graph identity");
+        let assignment = AgentAssignment {
+            execution_identity: ExecutionIdentity::for_agent_node(&graph, "run", "node")
+                .expect("agent identity"),
+            definition_ref: AgentDefinitionRevisionRef::new(
+                AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/test")
+                    .expect("definition id"),
+                1,
+            )
+            .expect("definition ref"),
+            instance_id: "agent".to_string(),
+            run_id: "run".to_string(),
+            role_id: "worker".to_string(),
+            task_id: "task".to_string(),
+            session_id: "session".to_string(),
+            mission_id: "mission".to_string(),
+            team_run_id: None,
+            graph_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            scope_refs: Vec::new(),
+            capability_policy: Vec::new(),
+        };
+        let mut wire = serde_json::to_value(assignment).expect("serialize assignment");
+        wire["mission_id"] = serde_json::json!("another-mission");
+        assert!(serde_json::from_value::<AgentAssignment>(wire).is_err());
     }
 }

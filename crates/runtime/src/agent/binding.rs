@@ -342,12 +342,13 @@ impl AgentBindingCompiler {
         &self,
         intent: AgentTaskIntent,
         catalog_entry: Option<AgentCatalogEntry>,
+        execution_identity: harness_contract::execution::ExecutionIdentity,
     ) -> Result<AgentTaskPacket, AgentBindingError> {
         let request = request_for_intent(&intent, catalog_entry)?;
         let compiled = self.compile(request)?;
         compiled
             .snapshot
-            .compile_task_packet(intent)
+            .compile_task_packet(intent, execution_identity)
             .map_err(|error| AgentBindingError::InvalidBinding(error.to_string()))
     }
 }

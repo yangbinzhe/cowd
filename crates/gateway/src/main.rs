@@ -82,8 +82,6 @@ mod storage_cutover;
 #[path = "core/suggestions.rs"]
 mod suggestions;
 mod surface_host;
-#[path = "kernel/task_kernel.rs"]
-mod task_kernel;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
 
@@ -2004,7 +2002,7 @@ fn format_startup_banner_with_task(
     model: &str,
     yolo_mode: bool,
     session_id: &str,
-    task: Option<&task_kernel::TaskRecord>,
+    task: Option<&runtime::TaskAggregate>,
 ) -> String {
     const VALUE_WIDTH: usize = 59;
 
@@ -2022,7 +2020,7 @@ fn format_startup_banner_with_task(
         |context| context.git_summary.headline(),
     );
     let task_row = task.map_or_else(String::new, |task| {
-        let short_id: String = task.id.chars().take(8).collect();
+        let short_id: String = task.task_id.chars().take(8).collect();
         let objective = truncate_for_banner(&task.objective, 40);
         let mut rows = startup_banner_row(
             "task",
@@ -2083,15 +2081,15 @@ fn truncate_for_banner(value: &str, max_chars: usize) -> String {
 }
 
 fn current_task_phase_for_display(
-    task: &task_kernel::TaskRecord,
-) -> Option<&task_kernel::TaskPhaseRecord> {
-    task.current_phase
+    task: &runtime::TaskAggregate,
+) -> Option<&harness_contract::task::TaskPhase> {
+    task.current_phase_id
         .as_deref()
         .and_then(|phase| {
             task.phases
                 .iter()
                 .rev()
-                .find(|candidate| candidate.name == phase)
+                .find(|candidate| candidate.phase_id == phase)
         })
         .or_else(|| task.phases.last())
 }
@@ -3701,8 +3699,9 @@ mod tests {
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;
     use crate::runtime_factory::create_runtime_entry_with_bootstrap_state;
-    use crate::task_kernel::{
-        TaskPhaseArtifact, TaskPhaseRecord, TaskPhaseStatus, TaskRecord, TaskStatus,
+    use harness_contract::task::{
+        TaskAggregate, TaskExecutionPolicy, TaskPhase, TaskPhaseArtifact, TaskPhaseStatus,
+        TaskStatus,
     };
     use model_protocol::oauth::{save_oauth_credentials, OAuthConfig, OAuthTokenSet};
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
@@ -5283,15 +5282,22 @@ mod tests {
 
     #[test]
     fn startup_banner_shows_yolo_task_summary() {
-        let task = TaskRecord {
-            id: "task-abcdef123456".to_string(),
+        let task = TaskAggregate {
+            task_id: "task-abcdef123456".to_string(),
+            mission_id: "mission-test".to_string(),
+            source_session_id: "session-yolo-test".to_string(),
+            source_turn_id: "turn-yolo-test".to_string(),
             objective: "complete v0.8.10 enterprise AI framework".to_string(),
             status: TaskStatus::Running,
-            current_phase: Some("tui-cockpit".to_string()),
-            phases: vec![TaskPhaseRecord {
-                id: "phase-1".to_string(),
+            revision: 2,
+            current_phase_id: Some("phase-1".to_string()),
+            phases: vec![TaskPhase {
+                phase_id: "phase-1".to_string(),
                 name: "tui-cockpit".to_string(),
                 objective: "surface durable task state in TUI".to_string(),
+                status: TaskPhaseStatus::Completed,
+                revision: 2,
+                dependency_refs: Vec::new(),
                 plan: Vec::new(),
                 acceptance: Vec::new(),
                 test_commands: Vec::new(),
@@ -5302,18 +5308,20 @@ mod tests {
                     created_at_ms: 1,
                 }],
                 review_result: Some("accepted".to_string()),
-                status: TaskPhaseStatus::Completed,
+                terminal_receipt: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
             }],
-            yolo_mode: true,
+            execution_policy: TaskExecutionPolicy {
+                yolo_mode: true,
+                max_failures_before_block: 3,
+            },
             failure_count: 0,
             blocker_reason: None,
+            strategy_ref: None,
+            graph_refs: Vec::new(),
             created_at_ms: 1,
             updated_at_ms: 1,
-            audit: Vec::new(),
-            execution_graph: None,
-            strategy: None,
         };
 
         let banner = format_startup_banner_with_task(

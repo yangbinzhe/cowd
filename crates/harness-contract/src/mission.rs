@@ -6,6 +6,69 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::reality::EvidenceRef;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissionStatus {
+    Draft,
+    Active,
+    Paused,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl MissionStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Cancelled | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MissionEntityRef {
+    pub id: String,
+    pub linked_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionAggregate {
+    pub mission_id: String,
+    pub workspace_id: String,
+    pub objective: String,
+    pub status: MissionStatus,
+    pub revision: u64,
+    pub strategy_ref: Option<String>,
+    pub session_refs: Vec<MissionEntityRef>,
+    pub task_refs: Vec<MissionEntityRef>,
+    pub graph_refs: Vec<MissionEntityRef>,
+    pub team_run_refs: Vec<MissionEntityRef>,
+    pub agent_run_refs: Vec<MissionEntityRef>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionMutationReceipt {
+    pub mission_id: String,
+    pub accepted_revision: u64,
+    pub status: MissionStatus,
+    pub evidence_refs: Vec<EvidenceRef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScheduleTrigger {
@@ -103,7 +166,7 @@ pub struct MissionCommand {
     #[serde(default)]
     pub payload: Value,
     #[serde(default)]
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,7 +179,7 @@ pub struct MissionCommandReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default)]
-    pub evidence_refs: Vec<String>,
+    pub evidence_refs: Vec<EvidenceRef>,
     #[serde(default)]
     pub result: Value,
 }
@@ -157,7 +220,11 @@ mod tests {
             expected_revision: Some(7),
             correlation_id: "corr-1".to_string(),
             payload: serde_json::json!({"reason": "new evidence"}),
-            evidence_refs: vec!["evidence:1".to_string()],
+            evidence_refs: vec![EvidenceRef::new(
+                "mission_command",
+                "evidence:1",
+                crate::reality::RealityBoundary::Observed,
+            )],
         };
         let value = serde_json::to_value(command).expect("command serializes");
         assert!(value.get("session_history").is_none());

@@ -112,7 +112,6 @@ pub fn runtime_module_map() -> Vec<RuntimeModuleDescriptor> {
         RuntimeModuleDescriptor::public("mission_runtime_port", Mission, "runtime", true),
         RuntimeModuleDescriptor::public("mission_schedule", Mission, "runtime", true),
         RuntimeModuleDescriptor::public("task", Mission, "runtime", false),
-        RuntimeModuleDescriptor::public("task_packet", Mission, "runtime", false),
         RuntimeModuleDescriptor::public("session_execution", Session, "runtime", true),
         RuntimeModuleDescriptor::public("session_input", Session, "runtime", true),
         RuntimeModuleDescriptor::public("input_classifier", Session, "runtime", false),

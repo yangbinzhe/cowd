@@ -17,8 +17,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
+use harness_contract::{
+    reality::{EvidenceRef, RealityBoundary},
+    task::{TaskCreateCommand, TaskPhaseSpec, TaskSpec},
+};
 use postgres::Row;
-use runtime::task::{TaskKernel, TaskRecord, TaskStoreBackend, TaskStoreSnapshot};
+use runtime::task::{
+    validate_backend_mutation, validate_task_aggregate_for_backend, TaskAggregate,
+    TaskAggregateService, TaskEvidenceOutboxRecord, TaskMutation, TaskMutationResult,
+    TaskStoreBackend, TaskStoreSnapshot,
+};
 use runtime::{
     AppendTransactionReceipt, AppendTransactionRequest, CommittedEventBatch,
     CommittedStreamRevision, DurableRuntimeEvent, ExpectedStreamRevision,
@@ -165,25 +174,56 @@ const RUNTIME_EVENT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSp
     statements: &[
         "ALTER TABLE runtime_session_outbox ADD COLUMN IF NOT EXISTS input_sequence BIGINT",
     ],
+}, PostgresMigrationSpec {
+    id: "runtime_event.0005.event-reference-index",
+    domain: RUNTIME_EVENT_DOMAIN,
+    version: 5,
+    description: "index durable event references for reverse lineage queries",
+    statements: &[
+        "CREATE INDEX IF NOT EXISTS idx_runtime_events_refs_gin
+            ON runtime_events USING GIN (refs jsonb_path_ops)",
+    ],
 }];
 
-const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
-    id: "runtime_task.0001.initial",
-    domain: TASK_DOMAIN,
-    version: 1,
-    description: "create durable task control-plane records",
-    statements: &[
-        "CREATE TABLE IF NOT EXISTS runtime_tasks (
+const TASK_MIGRATIONS: &[PostgresMigrationSpec] = &[
+    PostgresMigrationSpec {
+        id: "runtime_task.0001.initial",
+        domain: TASK_DOMAIN,
+        version: 1,
+        description: "create durable task control-plane records",
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS runtime_tasks (
             task_id TEXT PRIMARY KEY,
             status TEXT NOT NULL,
             created_at_ms BIGINT NOT NULL,
             updated_at_ms BIGINT NOT NULL,
             record_json JSONB NOT NULL
         )",
-        "CREATE INDEX IF NOT EXISTS idx_runtime_tasks_status_created
+            "CREATE INDEX IF NOT EXISTS idx_runtime_tasks_status_created
             ON runtime_tasks(status, created_at_ms DESC, task_id DESC)",
-    ],
-}];
+        ],
+    },
+    PostgresMigrationSpec {
+        id: "runtime_task.0002.evidence-outbox",
+        domain: TASK_DOMAIN,
+        version: 2,
+        description: "commit canonical task revisions with a durable evidence outbox",
+        statements: &[
+            "CREATE TABLE IF NOT EXISTS runtime_task_evidence_outbox (
+                outbox_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES runtime_tasks(task_id) ON DELETE CASCADE,
+                revision BIGINT NOT NULL,
+                event_kind TEXT NOT NULL,
+                created_at_ms BIGINT NOT NULL,
+                projected_at_ms BIGINT,
+                record_json JSONB NOT NULL,
+                UNIQUE(task_id, revision)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_runtime_task_evidence_outbox_pending
+                ON runtime_task_evidence_outbox(projected_at_ms, created_at_ms, outbox_id)",
+        ],
+    },
+];
 
 const ARTIFACT_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
     id: "runtime_artifact.0001.initial",
@@ -561,6 +601,42 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         if session_id.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let ref_filter = serde_json::json!([{"kind": "session", "id": session_id}]);
+        let direct_refs = {
+            let mut connection = self
+                .executor
+                .checkout_runtime()
+                .map_err(|error| error.to_string())?;
+            let limit = to_i64(limit as u64, "limit").map_err(|error| error.to_string())?;
+            let rows = match after_position {
+                Some((cursor, transaction_index)) => pg(connection.query(
+                    &format!(
+                        "SELECT {EVENT_COLUMNS} FROM runtime_events
+                         WHERE refs @> $1
+                           AND (commit_cursor > $2
+                                OR (commit_cursor = $2 AND transaction_index > $3))
+                         ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $4"
+                    ),
+                    &[
+                        &ref_filter,
+                        &to_i64(cursor, "after cursor").map_err(|error| error.to_string())?,
+                        &i64::from(transaction_index),
+                        &limit,
+                    ],
+                )),
+                None => pg(connection.query(
+                    &format!(
+                        "SELECT {EVENT_COLUMNS} FROM runtime_events
+                         WHERE refs @> $1
+                         ORDER BY commit_cursor ASC, transaction_index ASC LIMIT $2"
+                    ),
+                    &[&ref_filter, &limit],
+                )),
+            }
+            .and_then(rows_to_events)
+            .map_err(|error| error.to_string())?;
+            rows
+        };
         let terminal_requests =
             RuntimeEventStoreBackend::list_scope(self, RuntimeEventScope::SessionInput, 10_000)?
                 .into_iter()
@@ -575,7 +651,8 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
             .filter(|reference| reference.kind == "execution_graph")
             .map(|reference| reference.id.clone())
             .collect::<BTreeSet<_>>();
-        let mut related = terminal_requests;
+        let mut related = direct_refs;
+        related.extend(terminal_requests);
         let mut pending = graph_ids.into_iter().collect::<VecDeque<_>>();
         let mut visited = BTreeSet::new();
         while let Some(graph_id) = pending.pop_front() {
@@ -2039,13 +2116,13 @@ impl PostgresTaskStore {
     }
 
     #[must_use]
-    pub fn into_task_kernel(self) -> TaskKernel {
-        TaskKernel::from_backend(Arc::new(self))
+    pub fn into_task_service(self) -> TaskAggregateService {
+        TaskAggregateService::from_backend(Arc::new(self))
     }
 }
 
 impl TaskStoreBackend for PostgresTaskStore {
-    fn list(&self) -> Result<Vec<TaskRecord>, String> {
+    fn list(&self) -> Result<Vec<TaskAggregate>, String> {
         let mut connection = self
             .executor
             .checkout_runtime()
@@ -2059,7 +2136,7 @@ impl TaskStoreBackend for PostgresTaskStore {
         rows.iter().map(task_record_from_row).collect()
     }
 
-    fn get(&self, task_id: &str) -> Result<Option<TaskRecord>, String> {
+    fn get(&self, task_id: &str) -> Result<Option<TaskAggregate>, String> {
         let mut connection = self
             .executor
             .checkout_runtime()
@@ -2074,7 +2151,7 @@ impl TaskStoreBackend for PostgresTaskStore {
             .transpose()
     }
 
-    fn current(&self) -> Result<Option<TaskRecord>, String> {
+    fn current(&self) -> Result<Option<TaskAggregate>, String> {
         let mut connection = self
             .executor
             .checkout_runtime()
@@ -2082,7 +2159,7 @@ impl TaskStoreBackend for PostgresTaskStore {
         connection
             .query_opt(
                 "SELECT record_json FROM runtime_tasks
-                 WHERE status IN ('pending', 'running', 'reviewing')
+                 WHERE status IN ('pending', 'running', 'reviewing', 'blocked')
                  ORDER BY created_at_ms DESC, task_id DESC LIMIT 1",
                 &[],
             )
@@ -2091,11 +2168,12 @@ impl TaskStoreBackend for PostgresTaskStore {
             .transpose()
     }
 
-    fn update_task(
+    fn mutate_task(
         &self,
         task_id: &str,
-        updater: &mut dyn FnMut(Option<TaskRecord>) -> Result<TaskRecord, String>,
-    ) -> Result<TaskRecord, String> {
+        mutation: &TaskMutation,
+        updater: &mut dyn FnMut(Option<TaskAggregate>) -> Result<TaskAggregate, String>,
+    ) -> Result<TaskMutationResult, String> {
         if task_id.trim().is_empty() {
             return Err("task id is required".to_string());
         }
@@ -2121,8 +2199,38 @@ impl TaskStoreBackend for PostgresTaskStore {
             .map_err(|error| error.to_string())?
             .map(|row| task_record_from_row(&row))
             .transpose()?;
-        let next = updater(current)?;
-        validate_task_update(task_id, &next)?;
+        let next = updater(current.clone())?;
+        if current.as_ref() == Some(&next) {
+            validate_task_aggregate_for_backend(&next)?;
+            let revision = task_time_i64(next.revision, "revision")?;
+            let row = transaction
+                .query_opt(
+                    "SELECT record_json FROM runtime_task_evidence_outbox
+                     WHERE task_id=$1 AND revision=$2",
+                    &[&task_id, &revision],
+                )
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!(
+                        "idempotent task replay `{task_id}` revision {} has no durable outbox",
+                        next.revision
+                    )
+                })?;
+            let outbox = task_outbox_from_row(&row)?;
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(TaskMutationResult::from_backend_commit(
+                next,
+                mutation,
+                Some(outbox),
+            ));
+        }
+        let outbox = validate_backend_mutation(task_id, current.as_ref(), &next, mutation)?;
+        if outbox.is_none() {
+            transaction.commit().map_err(|error| error.to_string())?;
+            return Ok(TaskMutationResult::from_backend_commit(
+                next, mutation, None,
+            ));
+        }
         let record_json = serde_json::to_value(&next).map_err(|error| error.to_string())?;
         transaction
             .execute(
@@ -2135,7 +2243,7 @@ impl TaskStoreBackend for PostgresTaskStore {
                     updated_at_ms=EXCLUDED.updated_at_ms,
                     record_json=EXCLUDED.record_json",
                 &[
-                    &next.id,
+                    &next.task_id,
                     &next.status.as_str(),
                     &task_time_i64(next.created_at_ms, "created_at_ms")?,
                     &task_time_i64(next.updated_at_ms, "updated_at_ms")?,
@@ -2143,8 +2251,111 @@ impl TaskStoreBackend for PostgresTaskStore {
                 ],
             )
             .map_err(|error| error.to_string())?;
+        let outbox = outbox.ok_or_else(|| {
+            format!("task `{task_id}` changed without a durable evidence outbox record")
+        })?;
+        let outbox_json = serde_json::to_value(&outbox).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "INSERT INTO runtime_task_evidence_outbox
+                    (outbox_id, task_id, revision, event_kind, created_at_ms, record_json)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &outbox.outbox_id,
+                    &outbox.task_id,
+                    &task_time_i64(outbox.revision, "revision")?,
+                    &outbox.event_kind,
+                    &task_time_i64(outbox.created_at_ms, "created_at_ms")?,
+                    &outbox_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
-        Ok(next)
+        Ok(TaskMutationResult::from_backend_commit(
+            next,
+            mutation,
+            Some(outbox),
+        ))
+    }
+
+    fn pending_outbox(
+        &self,
+        task_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TaskEvidenceOutboxRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        let limit = i64::try_from(limit.min(i64::MAX as usize)).unwrap_or(i64::MAX);
+        let rows = if let Some(task_id) = task_id {
+            connection
+                .query(
+                    "SELECT record_json FROM runtime_task_evidence_outbox
+                     WHERE projected_at_ms IS NULL AND task_id=$1
+                     ORDER BY revision ASC LIMIT $2",
+                    &[&task_id, &limit],
+                )
+                .map_err(|error| error.to_string())?
+        } else {
+            connection
+                .query(
+                    "SELECT record_json FROM runtime_task_evidence_outbox
+                     WHERE projected_at_ms IS NULL
+                     ORDER BY created_at_ms ASC, outbox_id ASC LIMIT $1",
+                    &[&limit],
+                )
+                .map_err(|error| error.to_string())?
+        };
+        rows.iter().map(task_outbox_from_row).collect()
+    }
+
+    fn list_outbox(&self) -> Result<Vec<TaskEvidenceOutboxRecord>, String> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        let rows = connection
+            .query(
+                "SELECT record_json FROM runtime_task_evidence_outbox
+                 ORDER BY created_at_ms ASC, outbox_id ASC",
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        rows.iter().map(task_outbox_from_row).collect()
+    }
+
+    fn mark_outbox_projected(&self, outbox_id: &str, projected_at_ms: u64) -> Result<(), String> {
+        let mut connection = self
+            .executor
+            .checkout_runtime()
+            .map_err(|error| error.to_string())?;
+        let mut transaction = connection
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        let row = transaction
+            .query_opt(
+                "SELECT record_json FROM runtime_task_evidence_outbox
+                 WHERE outbox_id=$1 FOR UPDATE",
+                &[&outbox_id],
+            )
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("task evidence outbox `{outbox_id}` not found"))?;
+        let mut record = task_outbox_from_row(&row)?;
+        record.projected_at_ms = Some(projected_at_ms);
+        let record_json = serde_json::to_value(&record).map_err(|error| error.to_string())?;
+        transaction
+            .execute(
+                "UPDATE runtime_task_evidence_outbox
+                 SET projected_at_ms=$2, record_json=$3 WHERE outbox_id=$1",
+                &[
+                    &outbox_id,
+                    &task_time_i64(projected_at_ms, "projected_at_ms")?,
+                    &record_json,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())
     }
 
     fn import_migration_snapshot(&self, snapshot: &TaskStoreSnapshot) -> Result<(), String> {
@@ -2157,13 +2368,20 @@ impl TaskStoreBackend for PostgresTaskStore {
             .transaction()
             .map_err(|error| error.to_string())?;
         transaction
-            .batch_execute("LOCK TABLE runtime_tasks IN EXCLUSIVE MODE")
+            .batch_execute(
+                "LOCK TABLE runtime_tasks IN EXCLUSIVE MODE;
+                 LOCK TABLE runtime_task_evidence_outbox IN EXCLUSIVE MODE",
+            )
             .map_err(|error| error.to_string())?;
-        let existing: i64 = transaction
+        let existing_tasks: i64 = transaction
             .query_one("SELECT COUNT(*) FROM runtime_tasks", &[])
             .map_err(|error| error.to_string())?
             .get(0);
-        if existing != 0 {
+        let existing_outbox: i64 = transaction
+            .query_one("SELECT COUNT(*) FROM runtime_task_evidence_outbox", &[])
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if existing_tasks != 0 || existing_outbox != 0 {
             return Err("task migration target must be empty".to_string());
         }
         for task in &snapshot.tasks {
@@ -2174,10 +2392,33 @@ impl TaskStoreBackend for PostgresTaskStore {
                         (task_id, status, created_at_ms, updated_at_ms, record_json)
                      VALUES ($1, $2, $3, $4, $5)",
                     &[
-                        &task.id,
+                        &task.task_id,
                         &task.status.as_str(),
                         &task_time_i64(task.created_at_ms, "created_at_ms")?,
                         &task_time_i64(task.updated_at_ms, "updated_at_ms")?,
+                        &record_json,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        for record in &snapshot.outbox {
+            let record_json = serde_json::to_value(record).map_err(|error| error.to_string())?;
+            transaction
+                .execute(
+                    "INSERT INTO runtime_task_evidence_outbox
+                        (outbox_id, task_id, revision, event_kind, created_at_ms,
+                         projected_at_ms, record_json)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    &[
+                        &record.outbox_id,
+                        &record.task_id,
+                        &task_time_i64(record.revision, "revision")?,
+                        &record.event_kind,
+                        &task_time_i64(record.created_at_ms, "created_at_ms")?,
+                        &record
+                            .projected_at_ms
+                            .map(|value| task_time_i64(value, "projected_at_ms"))
+                            .transpose()?,
                         &record_json,
                     ],
                 )
@@ -2189,9 +2430,9 @@ impl TaskStoreBackend for PostgresTaskStore {
 
 /// Copy a quiesced Task control plane exactly once, prove canonical digest
 /// equality, then atomically write a backend-neutral cutover manifest.
-pub fn copy_quiesced_task_kernel(
-    source: &TaskKernel,
-    target: &TaskKernel,
+pub fn copy_quiesced_task_service(
+    source: &TaskAggregateService,
+    target: &TaskAggregateService,
     manifest_path: impl AsRef<Path>,
 ) -> Result<TaskMigrationManifest, String> {
     let snapshot = source.export_migration_snapshot()?;
@@ -2213,16 +2454,14 @@ pub fn copy_quiesced_task_kernel(
     Ok(manifest)
 }
 
-fn task_record_from_row(row: &Row) -> Result<TaskRecord, String> {
+fn task_record_from_row(row: &Row) -> Result<TaskAggregate, String> {
     let record_json: Value = row.try_get(0).map_err(|error| error.to_string())?;
     serde_json::from_value(record_json).map_err(|error| error.to_string())
 }
 
-fn validate_task_update(task_id: &str, task: &TaskRecord) -> Result<(), String> {
-    if task.id.trim().is_empty() || task.id != task_id {
-        return Err("task backend updater returned a record for another task id".to_string());
-    }
-    Ok(())
+fn task_outbox_from_row(row: &Row) -> Result<TaskEvidenceOutboxRecord, String> {
+    let record_json: Value = row.try_get(0).map_err(|error| error.to_string())?;
+    serde_json::from_value(record_json).map_err(|error| error.to_string())
 }
 
 fn task_time_i64(value: u64, field: &str) -> Result<i64, String> {
@@ -2542,7 +2781,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use runtime::{RuntimeServices, TaskLifecycleEvent, TaskLifecycleKind};
+    use runtime::RuntimeServices;
     use storage::StaticSecretRefResolver;
 
     use super::*;
@@ -2891,19 +3130,30 @@ mod tests {
             .runtime_event_store(reopened)
             .build()
             .expect("RuntimeServices composes PostgreSQL event backend");
+        let mission_id = services.mission_runtime().default_mission_id().to_string();
         services
-            .record_task_lifecycle(TaskLifecycleEvent {
-                task_id: "task:postgres-composed".to_string(),
-                kind: TaskLifecycleKind::Started,
-                payload: serde_json::json!({"source": "runtime-postgres"}),
+            .task_runtime_port()
+            .create(harness_contract::task::TaskCreateCommand {
+                task_id: "postgres-composed".to_string(),
+                mission_id,
+                source_session_id: "session:postgres-composed".to_string(),
+                source_turn_id: "turn:postgres-composed".to_string(),
+                spec: harness_contract::task::TaskSpec::new(
+                    "prove canonical Task outbox reaches PostgreSQL event store",
+                ),
+                evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                    "test_fixture",
+                    "test://runtime-postgres/composed-task",
+                    harness_contract::reality::RealityBoundary::Observed,
+                )],
             })
-            .expect("Runtime lifecycle write reaches PostgreSQL backend");
+            .expect("canonical Task outbox reaches PostgreSQL event backend");
         assert!(services
             .event_reader()
             .list_stream("task:postgres-composed")
             .expect("read composed event")
             .iter()
-            .any(|event| event.kind == "task.started"));
+            .any(|event| event.kind == "task.created"));
     }
 
     #[test]
@@ -2913,28 +3163,48 @@ mod tests {
             std::env::var("COWD_TEST_POSTGRES_URL").expect("COWD_TEST_POSTGRES_URL is required");
         let temp = tempfile::tempdir().expect("temporary task migration root");
         let source_path = temp.path().join("source-tasks.db");
-        let source = TaskKernel::open(source_path).expect("SQLite task source opens");
+        let source = TaskAggregateService::open(source_path).expect("SQLite task source opens");
         let source_task = source
-            .start_goal_idempotent("task-pg-migration", "Migrate the task control plane", true)
-            .expect("source task starts");
+            .create(TaskCreateCommand {
+                task_id: "task-pg-migration".to_string(),
+                mission_id: "mission-pg-migration".to_string(),
+                source_session_id: "session-pg-migration".to_string(),
+                source_turn_id: "turn-pg-migration".to_string(),
+                spec: TaskSpec::new("Migrate the task control plane"),
+                evidence_refs: vec![EvidenceRef::new(
+                    "test_fixture",
+                    "test://runtime-postgres/task-migration",
+                    RealityBoundary::Observed,
+                )],
+            })
+            .expect("source task starts")
+            .aggregate;
         let phase = source
             .start_phase(
-                &source_task.id,
-                "postgres-verification",
-                "prove target preserves the task record",
-                vec!["copy task snapshot".to_string()],
-                vec!["digest equality".to_string()],
-                vec!["real PostgreSQL task test".to_string()],
+                &source_task.task_id,
+                source_task.revision,
+                TaskPhaseSpec {
+                    name: "postgres-verification".to_string(),
+                    objective: "prove target preserves the task record".to_string(),
+                    dependency_refs: Vec::new(),
+                    plan: vec!["copy task snapshot".to_string()],
+                    acceptance: vec!["digest equality".to_string()],
+                    test_commands: vec!["real PostgreSQL task test".to_string()],
+                },
+                Vec::new(),
             )
-            .expect("source phase starts");
-        let phase_id = phase.phases.last().expect("phase exists").id.clone();
+            .expect("source phase starts")
+            .aggregate;
+        let phase_id = phase.phases.last().expect("phase exists").phase_id.clone();
         source
             .record_phase_artifact(
-                &source_task.id,
+                &source_task.task_id,
+                phase.revision,
                 &phase_id,
                 "evidence",
                 "migration",
                 "source snapshot is canonical",
+                Vec::new(),
             )
             .expect("source artifact persists");
 
@@ -2949,9 +3219,9 @@ mod tests {
         )
         .expect("postgres task store opens");
         let executor = pg_store.executor().clone();
-        let target = Arc::new(pg_store.into_task_kernel());
+        let target = Arc::new(pg_store.into_task_service());
         let manifest_path = temp.path().join("task-migration-manifest.json");
-        let manifest = copy_quiesced_task_kernel(&source, target.as_ref(), &manifest_path)
+        let manifest = copy_quiesced_task_service(&source, target.as_ref(), &manifest_path)
             .expect("quiesced SQLite to PostgreSQL copy succeeds");
         assert_eq!(manifest.source_digest, manifest.target_digest);
         assert_eq!(manifest.task_count, 1);
@@ -2976,11 +3246,14 @@ mod tests {
                 let target = Arc::clone(&target);
                 thread::spawn(move || {
                     barrier.wait();
-                    target.start_goal_idempotent(
-                        "task-pg-concurrent",
-                        "one governed concurrent task",
-                        true,
-                    )
+                    target.create(TaskCreateCommand {
+                        task_id: "task-pg-concurrent".to_string(),
+                        mission_id: "mission-pg-concurrent".to_string(),
+                        source_session_id: "session-pg-concurrent".to_string(),
+                        source_turn_id: "turn-pg-concurrent".to_string(),
+                        spec: TaskSpec::new("one governed concurrent task"),
+                        evidence_refs: Vec::new(),
+                    })
                 })
             })
             .collect::<Vec<_>>();
@@ -2988,16 +3261,29 @@ mod tests {
             .into_iter()
             .map(|worker| worker.join().expect("task worker joins"))
             .collect::<Vec<_>>();
-        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 2);
+        let receipts = results
+            .into_iter()
+            .map(|result| result.expect("concurrent create replays canonical receipt"))
+            .collect::<Vec<_>>();
+        assert_eq!(receipts[0].receipt, receipts[1].receipt);
+        assert_eq!(receipts[0].outbox, receipts[1].outbox);
         let concurrent = target
             .list()
             .expect("target task list")
             .into_iter()
-            .find(|task| task.id == "task-pg-concurrent")
+            .find(|task| task.task_id == "task-pg-concurrent")
             .expect("one concurrent task persists");
         assert_eq!(concurrent.objective, "one governed concurrent task");
         assert!(target
-            .start_goal_idempotent("task-pg-concurrent", "a conflicting objective", true,)
+            .create(TaskCreateCommand {
+                task_id: "task-pg-concurrent".to_string(),
+                mission_id: "mission-pg-concurrent".to_string(),
+                source_session_id: "session-pg-concurrent".to_string(),
+                source_turn_id: "turn-pg-concurrent".to_string(),
+                spec: TaskSpec::new("a conflicting objective"),
+                evidence_refs: Vec::new(),
+            })
             .is_err());
 
         let reopened_resolver = StaticSecretRefResolver::new([("task.pg".to_string(), url)]);
@@ -3010,19 +3296,19 @@ mod tests {
             &reopened_resolver,
         )
         .expect("postgres task store reopens")
-        .into_task_kernel();
+        .into_task_service();
         let restored = reopened
             .list()
             .expect("reopened task list")
             .into_iter()
-            .find(|task| task.id == source_task.id)
+            .find(|task| task.task_id == source_task.task_id)
             .expect("migrated task survives reopen");
         assert!(restored
             .phases
             .iter()
-            .any(|candidate| candidate.id == phase_id && !candidate.artifacts.is_empty()));
+            .any(|candidate| candidate.phase_id == phase_id && !candidate.artifacts.is_empty()));
         assert!(
-            copy_quiesced_task_kernel(&source, &reopened, temp.path().join("rejected.json"))
+            copy_quiesced_task_service(&source, &reopened, temp.path().join("rejected.json"))
                 .is_err()
         );
         assert!(executor.health().metrics.checkout_count > 0);

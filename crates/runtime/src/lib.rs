@@ -178,6 +178,9 @@ pub mod cross_plane_policy;
 pub mod definition_registry;
 #[path = "session/history.rs"]
 mod session_history;
+#[cfg(test)]
+#[path = "agent/test_support.rs"]
+mod test_support;
 pub use definition_registry::AgentDefinitionDraftReceipt;
 #[path = "infrastructure/eval_gate.rs"]
 pub mod eval_gate;
@@ -268,8 +271,6 @@ pub mod summary_compression;
 pub mod surface_contract;
 #[path = "mission/task.rs"]
 pub mod task;
-#[path = "mission/task_packet.rs"]
-pub mod task_packet;
 #[path = "team/agent_selector.rs"]
 pub mod team_agent_selector;
 #[path = "team/agent_task.rs"]
@@ -434,10 +435,9 @@ pub use execution_core::{
     RuntimeExecutionActionHint, RuntimeExecutionDecision, RuntimeExecutionPatternCandidate,
     RuntimeExecutionPatternSpec, RuntimeExecutionReportSpec, RuntimeServices,
     RuntimeServicesBuilder, RuntimeServicesError, SessionTerminalDeliveryPort,
-    StrategyDecisionEngine, StrategyLease, StrategyResourceHealth, TaskLifecycleEvent,
-    TaskLifecycleKind, ToolIntentDependency, ToolIntentDependencyKind, ToolIntentGraph,
-    ToolIntentNode, TurnStrategyActualOutcome, TurnStrategyDecisionState,
-    TurnStrategyDecisionStatus,
+    StrategyDecisionEngine, StrategyLease, StrategyResourceHealth, ToolIntentDependency,
+    ToolIntentDependencyKind, ToolIntentGraph, ToolIntentNode, TurnStrategyActualOutcome,
+    TurnStrategyDecisionState, TurnStrategyDecisionStatus,
 };
 pub use file_ops::{
     edit_file, glob_search, grep_search, read_file, write_file, EditFileOutput, GlobSearchOutput,
@@ -561,7 +561,7 @@ pub use mission_runtime::{
     MissionEvent, MissionProjection, MissionRuntime, MissionSessionSnapshot,
     MissionSessionStateReceipt, MissionSessionStatus, StartMissionSessionRequest,
 };
-pub use mission_runtime_port::MissionRuntimePort;
+pub use mission_runtime_port::{MissionRuntimePort, TaskRuntimePort};
 pub use mission_schedule::{
     CreateMissionScheduleRequest, MissionScheduleDispatchReport, MissionScheduleStore,
     MissionScheduleTickReport, UpdateMissionScheduleRequest,
@@ -699,8 +699,11 @@ pub use stale_branch::{
 pub use steward_agent::{
     StewardActionRequest, StewardActionStatus, StewardAgent, StewardDecisionRecord,
 };
-pub use task_packet::{
-    validate_packet, TaskPacket, TaskPacketValidationError, TaskScope, ValidatedPacket,
+pub use task::{
+    TaskAggregate, TaskAggregateService, TaskCommandOutcome, TaskEvidenceOutboxRecord,
+    TaskExecutionPolicy, TaskGraphRef, TaskMutation, TaskMutationResult, TaskPhase,
+    TaskPhaseArtifact, TaskPhaseStatus, TaskPhaseTerminalReceipt, TaskSpec,
+    TaskStatus as MissionTaskStatus, TaskStoreBackend, TaskStoreSnapshot,
 };
 pub use team_agent_selector::AgentSelector;
 pub use team_instantiation::{ResolvedRoleSlot, TeamInstantiation, TeamInstantiationService};

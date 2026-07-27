@@ -32,7 +32,6 @@ impl GatewayBoundaryPolicy {
             ],
             forbidden_route_dependencies: [
                 "SessionKernel",
-                "TaskKernel",
                 "UnifiedSessionStore",
                 "SmartApprovalGate",
                 "ContextRuntimeKernel",

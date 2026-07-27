@@ -5,14 +5,18 @@
 
 use std::sync::Arc;
 
-use harness_contract::team::{TeamInstantiationRequest, TeamTemplateRevisionRef};
+use harness_contract::{
+    reality::{EvidenceRef, RealityBoundary},
+    team::{TeamInstantiationRequest, TeamTemplateRevisionRef},
+};
 
 use crate::execution_core::graph::ExecutionResourceManager;
 
 use crate::{
     AgentRuntime, EvolutionGovernanceService, ExecutionGraphRunner, ExecutionGraphStateStore,
-    LegacyTeamImportReport, LegacyTeamProfileMigrationReport, RuntimeDefinitionRegistry,
-    RuntimeEventStore, TeamProjection, TeamProjectionReader,
+    LegacyTeamImportReport, LegacyTeamProfileMigrationReport, MissionRuntime,
+    RuntimeDefinitionRegistry, RuntimeEventStore, TaskRuntimePort, TeamProjection,
+    TeamProjectionReader,
 };
 
 pub struct TeamRuntime {
@@ -20,9 +24,18 @@ pub struct TeamRuntime {
     instantiation: crate::TeamInstantiationService,
     projection: TeamProjectionReader,
     event_store: Arc<RuntimeEventStore>,
+    tasks: TaskRuntimePort,
+    missions: Arc<MissionRuntime>,
 }
 
 impl TeamRuntime {
+    #[must_use]
+    pub fn mission_id_for_session_or_default(&self, session_id: &str) -> String {
+        self.missions
+            .mission_id_for_session(session_id)
+            .unwrap_or_else(|| self.missions.default_mission_id().to_string())
+    }
+
     #[must_use]
     pub fn new(
         runner: Arc<ExecutionGraphRunner>,
@@ -32,6 +45,9 @@ impl TeamRuntime {
         definition_registry: Arc<RuntimeDefinitionRegistry>,
         resources: Arc<ExecutionResourceManager>,
         evolution_governance: Arc<EvolutionGovernanceService>,
+        workspace_id: impl Into<String>,
+        tasks: TaskRuntimePort,
+        missions: Arc<MissionRuntime>,
     ) -> Self {
         Self {
             runner,
@@ -39,9 +55,12 @@ impl TeamRuntime {
                 definition_registry,
                 resources,
                 evolution_governance,
+                workspace_id,
             ),
             projection: TeamProjectionReader::new(graphs, agents),
             event_store,
+            tasks,
+            missions,
         }
     }
 
@@ -52,6 +71,12 @@ impl TeamRuntime {
         &self,
         request: TeamInstantiationRequest,
     ) -> Result<crate::TeamInstantiation, String> {
+        if request.mission_id == self.missions.default_mission_id() {
+            self.missions.ensure_default_mission()?;
+        }
+        if self.missions.aggregate(&request.mission_id).is_none() {
+            return Err(format!("Team mission not found: {}", request.mission_id));
+        }
         self.instantiation.instantiate(request)
     }
 
@@ -62,11 +87,32 @@ impl TeamRuntime {
         &self,
         request: TeamInstantiationRequest,
     ) -> Result<TeamProjection, String> {
+        let mission_id = request.mission_id.clone();
+        let team_id = request.team_id.clone();
         let instantiated = self.plan(request)?;
         self.instantiation.validate_release(&instantiated)?;
         let graph_id = instantiated.graph.id.clone();
+        let registered = self
+            .runner
+            .register(instantiated.graph)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.admit_tasks(
+            &instantiated.task_commands,
+            &registered.id,
+            registered.revision,
+        )?;
+        self.tasks.link_mission_team_run(
+            &mission_id,
+            &team_id,
+            vec![EvidenceRef::new(
+                "team_run",
+                format!("team-run://{team_id}?graph={}", registered.id),
+                RealityBoundary::Observed,
+            )],
+        )?;
         self.runner
-            .start(instantiated.graph)
+            .run_until_quiescent(&registered.id)
             .await
             .map_err(|error| error.to_string())?;
         self.projection.project(&graph_id)
@@ -93,11 +139,43 @@ impl TeamRuntime {
                 .instantiate_evaluation_baseline(request, allowed_tools)?,
         };
         let graph_id = instantiated.graph.id.clone();
+        let registered = self
+            .runner
+            .register(instantiated.graph)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.admit_tasks(
+            &instantiated.task_commands,
+            &registered.id,
+            registered.revision,
+        )?;
         self.runner
-            .start(instantiated.graph)
+            .run_until_quiescent(&registered.id)
             .await
             .map_err(|error| error.to_string())?;
         self.projection.project(&graph_id)
+    }
+
+    fn admit_tasks(
+        &self,
+        commands: &[harness_contract::task::TaskCreateCommand],
+        graph_id: &str,
+        graph_revision: u64,
+    ) -> Result<(), String> {
+        for command in commands {
+            let task = self.tasks.create(command.clone())?;
+            self.tasks.link_existing_graph(
+                &task.task_id,
+                graph_id,
+                graph_revision,
+                vec![EvidenceRef::new(
+                    "execution_graph",
+                    format!("execution-graph://{graph_id}?revision={graph_revision}"),
+                    RealityBoundary::Observed,
+                )],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn project(&self, graph_id: &str) -> Result<TeamProjection, String> {

@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use storage::{SqliteExecutor, StorageHandle};
 use thiserror::Error;
 
-const STORE_SCHEMA_VERSION: i64 = 4;
+const STORE_SCHEMA_VERSION: i64 = 5;
 const EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
@@ -1260,6 +1260,7 @@ impl SqliteRuntimeEventStore {
         if session_id.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let mut related = self.events_for_ref("session", session_id, after_position, limit)?;
         let terminal_requests = self
             .list_scope(RuntimeEventScope::SessionInput, 10_000)?
             .into_iter()
@@ -1278,7 +1279,7 @@ impl SqliteRuntimeEventStore {
             .filter(|reference| reference.kind == "execution_graph")
             .map(|reference| reference.id.clone())
             .collect::<BTreeSet<_>>();
-        let mut related = terminal_requests;
+        related.extend(terminal_requests);
         let mut pending = graph_ids.into_iter().collect::<VecDeque<_>>();
         let mut visited = BTreeSet::new();
         while let Some(graph_id) = pending.pop_front() {
@@ -1319,6 +1320,40 @@ impl SqliteRuntimeEventStore {
             })
             .take(limit)
             .collect())
+    }
+
+    fn events_for_ref(
+        &self,
+        ref_kind: &str,
+        ref_id: &str,
+        after_position: Option<(u64, u32)>,
+        limit: usize,
+    ) -> Result<Vec<DurableRuntimeEvent>, String> {
+        if ref_kind.trim().is_empty() || ref_id.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (after_cursor, after_index) = after_position.unwrap_or_default();
+        self.query_events(
+            &format!(
+                "{} WHERE event_id IN (
+                    SELECT event_id FROM runtime_event_refs
+                    WHERE ref_kind = ?1 AND ref_id = ?2
+                )
+                AND (?3 = 0 OR commit_cursor > ?3
+                     OR (commit_cursor = ?3 AND transaction_index > ?4))
+                ORDER BY commit_cursor ASC, transaction_index ASC
+                LIMIT ?5",
+                event_select()
+            ),
+            params![
+                ref_kind,
+                ref_id,
+                after_cursor as i64,
+                after_index as i64,
+                limit as i64
+            ],
+        )
+        .map_err(|error| error.to_string())
     }
 
     pub fn list_scope(
@@ -2224,6 +2259,7 @@ fn import_sqlite_migration_snapshot(
         "runtime_events",
         "runtime_transaction_streams",
         "runtime_stream_heads",
+        "runtime_event_refs",
         "runtime_session_outbox",
         "runtime_consumed_decision_leases",
     ] {
@@ -2272,6 +2308,7 @@ fn import_sqlite_migration_snapshot(
                 event.idempotency_key,
             ],
         )?;
+        insert_event_refs(&tx, &event.event_id, &event.refs)?;
     }
     for stream in &snapshot.transaction_streams {
         tx.execute(
@@ -2587,6 +2624,13 @@ fn create_current_tables(tx: &Transaction<'_>) -> RuntimeEventStoreResult<()> {
             stream_id TEXT PRIMARY KEY,
             revision INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS runtime_event_refs (
+            event_id TEXT NOT NULL,
+            ref_kind TEXT NOT NULL,
+            ref_id TEXT NOT NULL,
+            PRIMARY KEY(event_id, ref_kind, ref_id),
+            FOREIGN KEY(event_id) REFERENCES runtime_events(event_id) ON DELETE CASCADE
+        );
         CREATE TABLE IF NOT EXISTS runtime_session_outbox (
             terminal_id TEXT PRIMARY KEY,
             message_id TEXT NOT NULL UNIQUE,
@@ -2763,9 +2807,24 @@ fn migrate_legacy_runtime_events(tx: &Transaction<'_>) -> RuntimeEventStoreResul
             ON runtime_events(stream_id, idempotency_key) WHERE idempotency_key IS NOT NULL;
          CREATE INDEX IF NOT EXISTS idx_runtime_commits_cursor
             ON runtime_commits(commit_cursor);
+         CREATE INDEX IF NOT EXISTS idx_runtime_event_refs_lookup
+            ON runtime_event_refs(ref_kind, ref_id, event_id);
          CREATE INDEX IF NOT EXISTS idx_runtime_consumed_decision_leases_review
             ON runtime_consumed_decision_leases(review_id, action);",
     )?;
+    let existing_refs = {
+        let mut statement = tx.prepare("SELECT event_id, refs FROM runtime_events")?;
+        let refs = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        refs
+    };
+    for (event_id, refs) in existing_refs {
+        let refs = serde_json::from_str::<Vec<RuntimeEventRef>>(&refs)?;
+        insert_event_refs(tx, &event_id, &refs)?;
+    }
     Ok(())
 }
 
@@ -2775,6 +2834,7 @@ fn validate_schema(conn: &Connection) -> RuntimeEventStoreResult<()> {
         "runtime_commits",
         "runtime_transaction_streams",
         "runtime_stream_heads",
+        "runtime_event_refs",
         "runtime_session_outbox",
         "runtime_consumed_decision_leases",
     ] {
@@ -2885,6 +2945,7 @@ fn append_transaction_in_tx(
                 input.idempotency_key,
             ],
         )?;
+        insert_event_refs(tx, &event_id, &input.event.refs)?;
         event_ids.push(event_id);
     }
 
@@ -3188,6 +3249,21 @@ fn load_receipt(
     })
 }
 
+fn insert_event_refs(
+    tx: &Transaction<'_>,
+    event_id: &str,
+    refs: &[RuntimeEventRef],
+) -> RuntimeEventStoreResult<()> {
+    for reference in refs {
+        tx.execute(
+            "INSERT OR IGNORE INTO runtime_event_refs(event_id, ref_kind, ref_id)
+             VALUES (?1, ?2, ?3)",
+            params![event_id, reference.kind, reference.id],
+        )?;
+    }
+    Ok(())
+}
+
 fn load_transaction_events(
     conn: &Connection,
     transaction_id: &str,
@@ -3477,6 +3553,12 @@ mod tests {
             id: graph_id.to_string(),
         }];
         store.append(terminal).unwrap();
+        let mut task = input("task:task-a", RuntimeEventScope::Task, "task.created");
+        task.refs = vec![RuntimeEventRef {
+            kind: "session".to_string(),
+            id: "session-a".to_string(),
+        }];
+        store.append(task).unwrap();
 
         let related = store
             .execution_events_for_session("session-a", None, 20)
@@ -3494,6 +3576,9 @@ mod tests {
         assert!(related
             .iter()
             .any(|event| event.kind == "runtime.session.terminal_requested"));
+        assert!(related
+            .iter()
+            .any(|event| event.stream_id == "task:task-a" && event.kind == "task.created"));
         assert!(store
             .execution_events_for_session("session-b", None, 20)
             .unwrap()

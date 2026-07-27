@@ -9,6 +9,7 @@ use harness_contract::agent::{AgentCommand, AgentCommandRequest, AgentInput};
 use harness_contract::mission::{
     MissionCommand, MissionCommandAction, MissionCommandReceipt, MissionCommandTarget,
 };
+use harness_contract::reality::{EvidenceRef, RealityBoundary};
 use harness_contract::turn::{SessionDispatchAction, SessionHandoff};
 
 use crate::runtime_event_store::RuntimeTransactionEventInput;
@@ -85,7 +86,7 @@ pub async fn execute_mission_command(
 async fn execute(
     services: &RuntimeServices,
     command: &MissionCommand,
-) -> Result<(serde_json::Value, Vec<String>), String> {
+) -> Result<(serde_json::Value, Vec<EvidenceRef>), String> {
     match (&command.target, command.action) {
         (MissionCommandTarget::Session { session_id }, MissionCommandAction::Activate) => {
             let receipt = services.mission_runtime().switch_session(session_id)?;
@@ -154,9 +155,13 @@ async fn execute(
                 relation.evidence_refs,
             )?;
             let mut evidence_refs = command.evidence_refs.clone();
-            evidence_refs.extend(relation.evidence_refs.clone());
-            evidence_refs.sort();
-            evidence_refs.dedup();
+            evidence_refs.extend(relation.evidence_refs.iter().map(|id| {
+                EvidenceRef::new("session_relation", id, RealityBoundary::Observed)
+                    .with_source("runtime.mission_command")
+            }));
+            evidence_refs.sort_by(|left, right| left.id.cmp(&right.id));
+            evidence_refs
+                .dedup_by(|left, right| left.ref_type == right.ref_type && left.id == right.id);
             Ok((serde_json::json!({ "relation": relation }), evidence_refs))
         }
         _ => Err(format!(
@@ -170,7 +175,7 @@ async fn submit_session_handoff(
     services: &RuntimeServices,
     command: &MissionCommand,
     target_session_id: &str,
-) -> Result<(serde_json::Value, Vec<String>), String> {
+) -> Result<(serde_json::Value, Vec<EvidenceRef>), String> {
     let mut handoff: SessionHandoff =
         serde_json::from_value(command.payload.clone()).map_err(|error| {
             format!("session input/replan requires SessionHandoff payload: {error}")
@@ -187,7 +192,7 @@ async fn submit_session_handoff(
     for reference in &command.evidence_refs {
         let reference = harness_contract::turn::opaque_session_evidence_ref(
             &handoff.source_session_id,
-            reference,
+            &reference.id,
         );
         if !handoff.evidence_refs.contains(&reference) {
             handoff.evidence_refs.push(reference);
@@ -222,7 +227,7 @@ async fn command_agent(
     services: &RuntimeServices,
     command: &MissionCommand,
     agent_id: &str,
-) -> Result<(serde_json::Value, Vec<String>), String> {
+) -> Result<(serde_json::Value, Vec<EvidenceRef>), String> {
     let snapshot = services
         .agent_runtime()
         .get(agent_id)
@@ -327,9 +332,9 @@ fn persist_receipt(
                     refs: command
                         .evidence_refs
                         .iter()
-                        .map(|id| RuntimeEventRef {
+                        .map(|reference| RuntimeEventRef {
                             kind: "evidence".to_string(),
-                            id: id.clone(),
+                            id: reference.id.clone(),
                         })
                         .collect(),
                     payload: serde_json::to_value(receipt).map_err(|error| error.to_string())?,
@@ -389,7 +394,11 @@ mod tests {
             expected_revision: Some(revision),
             correlation_id: "correlation-command".to_string(),
             payload: serde_json::Value::Null,
-            evidence_refs: vec!["evidence:test".to_string()],
+            evidence_refs: vec![harness_contract::reality::EvidenceRef::new(
+                "test_fixture",
+                "test://mission-command/evidence",
+                harness_contract::reality::RealityBoundary::Observed,
+            )],
         };
         let first = execute_mission_command(&services, command.clone()).await;
         assert_eq!(first.status, "accepted");
@@ -413,7 +422,7 @@ mod tests {
                     session_id: "session-command-target".to_string(),
                 },
                 actor: "test".to_string(),
-                expected_revision: Some(revision),
+                expected_revision: Some(revision.saturating_sub(1)),
                 correlation_id: "correlation-stale".to_string(),
                 payload: serde_json::Value::Null,
                 evidence_refs: Vec::new(),

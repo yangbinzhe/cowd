@@ -92,7 +92,9 @@ pub fn compile_orchestration(
             request_id: request_id.to_string(),
             team_id: team_id.clone(),
             session_id: request.session_id.clone().unwrap_or_default(),
-            mission_id: None,
+            mission_id: team_runtime.mission_id_for_session_or_default(
+                request.session_id.as_deref().unwrap_or_default(),
+            ),
             parent_execution: parent_execution.clone(),
             selection_mode,
             strategy_binding: request.strategy_binding.clone(),

@@ -39,12 +39,12 @@ fn services_with_provider() -> Arc<RuntimeServices> {
         .expect("runtime")
 }
 
-fn request() -> TeamInstantiationRequest {
+fn request(mission_id: &str) -> TeamInstantiationRequest {
     TeamInstantiationRequest {
         request_id: "working-state-commit".to_string(),
         team_id: "team:working-state-commit".to_string(),
         session_id: "session:working-state-commit".to_string(),
-        mission_id: None,
+        mission_id: mission_id.to_string(),
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
         strategy_binding: None,
@@ -91,23 +91,23 @@ impl AgentRuntimeBackend for CompletedBackend {
         evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
             harness_contract::context::EvidenceRef::new(
                 "tool",
-                format!("materialized:{}", packet.node_id),
+                format!("materialized:{}", packet.node_id()),
             ),
             "a".repeat(64),
             1,
             "application/json",
             "artifact://art_team_working_state",
-            format!("session:{}", packet.session_id),
+            format!("session:{}", packet.session_id()),
         ));
         Ok(AgentReturnPacket {
-            run_id: packet.run_id,
-            agent_id: packet.agent_id,
-            task_id: packet.task_id,
-            session_id: packet.session_id,
-            mission_id: packet.mission_id,
-            team_id: packet.team_id,
-            graph_id: packet.graph_id,
-            node_id: packet.node_id,
+            run_id: packet.run_id().to_string(),
+            agent_id: packet.agent_id().to_string(),
+            task_id: packet.task_id().to_string(),
+            session_id: packet.session_id().to_string(),
+            mission_id: packet.mission_id().to_string(),
+            team_id: packet.team_id().map(ToString::to_string),
+            graph_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
@@ -144,7 +144,7 @@ async fn terminal_graph_transition_commits_exactly_one_replayable_team_working_s
         .register_backend(Arc::new(CompletedBackend));
     let projection = services
         .team_runtime()
-        .instantiate(request())
+        .instantiate(request(services.mission_runtime().default_mission_id()))
         .await
         .expect("team completion");
     assert_eq!(projection.status, "completed");
@@ -160,6 +160,35 @@ async fn terminal_graph_transition_commits_exactly_one_replayable_team_working_s
     assert!(state.entries[0]
         .boundary
         .contains("no raw chain-of-thought"));
+    let expected_refs = [
+        ("principal", "runtime.team"),
+        ("mission", services.mission_runtime().default_mission_id()),
+        ("task", "team:working-state-commit:task:executor:1"),
+        ("session", "session:working-state-commit"),
+        ("turn", "working-state-commit"),
+        ("team_run", "team:working-state-commit"),
+    ];
+    for stream_id in [
+        projection.graph_id.as_str(),
+        "team-working-state:team:working-state-commit",
+    ] {
+        let event = services
+            .event_reader()
+            .list_stream(stream_id)
+            .expect("lineage event stream")
+            .into_iter()
+            .last()
+            .expect("lineage event");
+        for (kind, id) in expected_refs {
+            assert!(
+                event
+                    .refs
+                    .iter()
+                    .any(|reference| reference.kind == kind && reference.id == id),
+                "{stream_id} must retain {kind}:{id}"
+            );
+        }
+    }
     assert_eq!(
         services
             .team_runtime()

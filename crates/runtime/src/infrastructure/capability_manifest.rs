@@ -1405,11 +1405,16 @@ mod tests {
         );
         assert_eq!(
             router["backend_capabilities"]["owner"],
-            "runtime.provider_usage"
+            "runtime.conversation"
         );
-        assert!(router["backend_capabilities"]["intents"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item == "deep")));
+        assert_eq!(
+            router["backend_capabilities"]["task_text_affects_order"],
+            false
+        );
+        assert_eq!(
+            router["backend_capabilities"]["ordering"],
+            serde_json::json!(["configured_primary", "configured_fallbacks"])
+        );
 
         let contract = runtime_capabilities_response_with_detail(
             "需要模型主动选择团队和并行工具",

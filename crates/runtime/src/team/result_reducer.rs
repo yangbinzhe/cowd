@@ -68,14 +68,14 @@ impl SynthesizeBackend for TeamResultReducer {
                 .map_err(|_| format!("team node {} is not an AgentTask packet", node.id))?;
             let returned = self
                 .agents
-                .terminal_return(&packet.agent_id)
+                .terminal_return(packet.agent_id())
                 .ok_or_else(|| {
                     format!(
                         "team binding missing terminal AgentRuntime result for {}",
-                        packet.agent_id
+                        packet.agent_id()
                     )
                 })?;
-            if returned.run_id != packet.run_id
+            if returned.run_id != packet.run_id()
                 || returned.graph_id != graph.id
                 || returned.node_id != node.id
                 || returned.attempt != packet.attempt
@@ -83,7 +83,7 @@ impl SynthesizeBackend for TeamResultReducer {
             {
                 return Err(format!(
                     "team result binding mismatch for {}",
-                    packet.agent_id
+                    packet.agent_id()
                 ));
             }
             usage.input_tokens = usage.input_tokens.saturating_add(returned.input_tokens);
@@ -97,17 +97,20 @@ impl SynthesizeBackend for TeamResultReducer {
             match returned.status {
                 AgentTerminalStatus::Completed => {
                     if terminal_agent_nodes.contains(&node.id) {
-                        summaries.push(format!("## {}\n{}", packet.agent_id, returned.outcome));
+                        summaries.push(format!("## {}\n{}", packet.agent_id(), returned.outcome));
                     } else {
-                        supporting_outputs
-                            .push(format!("## {}\n{}", packet.agent_id, returned.outcome));
+                        supporting_outputs.push(format!(
+                            "## {}\n{}",
+                            packet.agent_id(),
+                            returned.outcome
+                        ));
                     }
                 }
                 AgentTerminalStatus::Failed
                 | AgentTerminalStatus::Cancelled
                 | AgentTerminalStatus::Blocked => blockers.push(format!(
                     "{}: {}",
-                    packet.agent_id,
+                    packet.agent_id(),
                     returned
                         .failure
                         .unwrap_or_else(|| "no terminal outcome".into())

@@ -124,7 +124,23 @@ mod tests {
     use crate::{DiffScope, LaneBlocker};
 
     fn test_output() -> AgentOutput {
+        let graph_identity = harness_contract::execution::ExecutionIdentity::for_task_graph(
+            "principal-test",
+            "workspace-test",
+            "mission-test",
+            "task-test",
+            "session-test",
+            "turn-test",
+            "graph-test",
+        )
+        .expect("graph identity");
         AgentOutput {
+            execution_identity: harness_contract::execution::ExecutionIdentity::for_agent_node(
+                &graph_identity,
+                "run-test",
+                "node-test",
+            )
+            .expect("agent identity"),
             run_id: "run-test".to_string(),
             agent_id: "test-lane-1".to_string(),
             task_id: "task-test".to_string(),

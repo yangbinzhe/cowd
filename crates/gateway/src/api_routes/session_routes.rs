@@ -312,9 +312,7 @@ pub(super) async fn authorize_session_access(
         .iter()
         .any(|scope| scope == &format!("session:{session_id}"));
     let mission_id = state.services.runtime.as_ref().and_then(|runtime| {
-        runtime
-            .runtime_services()
-            .mission_runtime()
+        runtime::MissionRuntimePort::new(runtime.runtime_services())
             .mission_id_for_session(session_id)
     });
     let explicit_mission = mission_id.as_ref().is_some_and(|mission_id| {
@@ -358,9 +356,7 @@ async fn session_record_access_authorized(
         .iter()
         .any(|scope| scope == &format!("session:{}", record.session_id));
     let mission_id = state.services.runtime.as_ref().and_then(|runtime| {
-        runtime
-            .runtime_services()
-            .mission_runtime()
+        runtime::MissionRuntimePort::new(runtime.runtime_services())
             .mission_id_for_session(&record.session_id)
     });
     let explicit_mission = mission_id.as_ref().is_some_and(|mission_id| {

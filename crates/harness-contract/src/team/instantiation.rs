@@ -211,8 +211,7 @@ pub struct TeamInstantiationRequest {
     pub request_id: String,
     pub team_id: String,
     pub session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mission_id: Option<String>,
+    pub mission_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
     pub selection_mode: TeamSelectionMode,
@@ -248,6 +247,7 @@ impl TeamInstantiationRequest {
             ("team.request_id", &self.request_id),
             ("team.team_id", &self.team_id),
             ("team.session_id", &self.session_id),
+            ("team.mission_id", &self.mission_id),
             ("team.objective", &self.objective),
             ("team.permission_lease", &self.permission_lease),
             ("team.model_lease", &self.model_lease),
@@ -578,7 +578,7 @@ mod tests {
             request_id: "request-1".to_string(),
             team_id: "team-1".to_string(),
             session_id: "session-1".to_string(),
-            mission_id: None,
+            mission_id: "mission-1".to_string(),
             parent_execution: None,
             selection_mode: TeamSelectionMode::Explicit,
             strategy_binding: None,

@@ -714,8 +714,11 @@ impl AgentBindingSnapshot {
     pub fn compile_task_packet(
         &self,
         intent: AgentTaskIntent,
+        execution_identity: crate::execution::ExecutionIdentity,
     ) -> Result<AgentTaskPacket, ValidationError> {
         self.validate()?;
+        validate_reference("task.principal_id", &intent.principal_id)?;
+        validate_reference("task.source_turn_id", &intent.source_turn_id)?;
         validate_reference("task.run_id", &intent.run_id)?;
         validate_reference("task.task_id", &intent.task_id)?;
         validate_reference("task.session_id", &intent.session_id)?;
@@ -730,18 +733,40 @@ impl AgentBindingSnapshot {
                 message: "Binding data lease does not match task identity".to_string(),
             });
         }
+        if execution_identity.principal_id() != intent.principal_id
+            || execution_identity.session_id() != Some(intent.session_id.as_str())
+            || execution_identity.turn_id() != Some(intent.source_turn_id.as_str())
+        {
+            return Err(ValidationError::InvalidContract {
+                message: "Execution identity principal or source turn does not match task intent"
+                    .to_string(),
+            });
+        }
         if let Some(managed_invocation) = &intent.managed_invocation {
             managed_invocation.validate()?;
         }
-        Ok(AgentTaskPacket {
+        let assignment = super::AgentAssignment {
+            execution_identity,
+            definition_ref: self.definition_ref.clone(),
+            instance_id: self.instance.instance_id.clone(),
             run_id: intent.run_id,
-            agent_id: self.instance.instance_id.clone(),
+            role_id: self
+                .instance
+                .role_slot_id
+                .clone()
+                .unwrap_or_else(|| "agent".to_string()),
             task_id: intent.task_id,
             session_id: intent.session_id,
             mission_id: intent.mission_id,
-            team_id: intent.team_id,
+            team_run_id: intent.team_id,
             graph_id: intent.graph_id,
             node_id: intent.node_id,
+            scope_refs: intent.resource_scopes.clone(),
+            capability_policy: self.effective_capabilities.clone(),
+        };
+        assignment.validate()?;
+        Ok(AgentTaskPacket {
+            assignment,
             attempt: intent.attempt,
             expected_graph_revision: intent.expected_graph_revision,
             objective: intent.objective,

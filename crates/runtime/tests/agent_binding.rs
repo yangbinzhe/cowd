@@ -50,41 +50,64 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
         .contains(&AgentCapability::Search));
     snapshot.validate().expect("persistable binding snapshot");
     let packet = snapshot
-        .compile_task_packet(AgentTaskIntent {
-            selected_agent_id: None,
-            definition_ref: Some(snapshot.definition_ref.clone()),
-            granted_capabilities: Vec::new(),
-            run_id: "run:binding-test".to_string(),
-            task_id: "task:binding-test".to_string(),
-            session_id: "session:binding-test".to_string(),
-            mission_id: None,
-            team_id: Some("team:binding-test".to_string()),
-            graph_id: "graph:binding-test".to_string(),
-            node_id: "node:binding-test".to_string(),
-            attempt: 1,
-            expected_graph_revision: 0,
-            objective: "Inspect only leased facts and Matrix snapshots.".to_string(),
-            acceptance: vec!["evidence".to_string()],
-            constraints: Vec::new(),
-            context_refs: Vec::new(),
-            evidence_refs: Vec::new(),
-            resource_scopes: Vec::new(),
-            allowed_tools: Vec::new(),
-            allowed_skills: Vec::new(),
-            permission_lease: "read_only".to_string(),
-            model_lease: "default".to_string(),
-            budget_lease: ContextBudgetLeaseRef::new(
-                "lease:binding-test",
-                "run:binding-test",
-                "agent_task",
-                4096,
-                1,
-            ),
-            managed_invocation: None,
-            idempotency_key: "binding-test:1".to_string(),
-        })
+        .compile_task_packet(
+            AgentTaskIntent {
+                selected_agent_id: None,
+                definition_ref: Some(snapshot.definition_ref.clone()),
+                granted_capabilities: Vec::new(),
+                principal_id: "test.principal".to_string(),
+                source_turn_id: "turn:binding-test".to_string(),
+                run_id: "run:binding-test".to_string(),
+                task_id: "task:binding-test".to_string(),
+                session_id: "session:binding-test".to_string(),
+                mission_id: "mission:binding-test".to_string(),
+                team_id: Some("team:binding-test".to_string()),
+                graph_id: "graph:binding-test".to_string(),
+                node_id: "node:binding-test".to_string(),
+                attempt: 1,
+                expected_graph_revision: 0,
+                objective: "Inspect only leased facts and Matrix snapshots.".to_string(),
+                acceptance: vec!["evidence".to_string()],
+                constraints: Vec::new(),
+                context_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                resource_scopes: Vec::new(),
+                allowed_tools: Vec::new(),
+                allowed_skills: Vec::new(),
+                permission_lease: "read_only".to_string(),
+                model_lease: "default".to_string(),
+                budget_lease: ContextBudgetLeaseRef::new(
+                    "lease:binding-test",
+                    "run:binding-test",
+                    "agent_task",
+                    4096,
+                    1,
+                ),
+                managed_invocation: None,
+                idempotency_key: "binding-test:1".to_string(),
+            },
+            {
+                let graph_identity =
+                    harness_contract::execution::ExecutionIdentity::for_task_graph(
+                        "test.principal",
+                        "test-workspace",
+                        "mission:binding-test",
+                        "task:binding-test",
+                        "session:binding-test",
+                        "turn:binding-test",
+                        "graph:binding-test",
+                    )
+                    .expect("task graph identity");
+                harness_contract::execution::ExecutionIdentity::for_agent_node(
+                    &graph_identity,
+                    "run:binding-test",
+                    "node:binding-test",
+                )
+                .expect("agent identity")
+            },
+        )
         .expect("only a compiled binding may produce an executable packet");
-    assert_eq!(packet.agent_id, "instance:binding-test");
+    assert_eq!(packet.agent_id(), "instance:binding-test");
     assert_eq!(
         packet.binding.expect("binding packet").binding_digest,
         snapshot.binding_digest

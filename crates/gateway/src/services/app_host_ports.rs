@@ -315,10 +315,22 @@ impl RuntimePort for GatewayAppHostBinding {
                 let task = state
                     .services
                     .task
-                    .start_goal_idempotent(&request.task_id, request.objective, request.preemptive)
+                    .create(
+                        request.task_id,
+                        request.mission_id,
+                        request.source_session_id,
+                        request.source_turn_id,
+                        request.objective,
+                        request.preemptive,
+                        vec![harness_contract::reality::EvidenceRef::new(
+                            "app_intent",
+                            format!("app://{}/requests/{}", context.surface, context.request_id),
+                            harness_contract::reality::RealityBoundary::Observed,
+                        )],
+                    )
                     .map_err(AppHostError::Unavailable)?;
                 Ok(HostReceipt {
-                    id: format!("runtime:start-goal:{}", task.id),
+                    id: format!("runtime:start-goal:{}", task.task_id),
                     status: task.status.as_str().to_string(),
                     replayed: false,
                     payload: serde_json::json!({
@@ -336,6 +348,9 @@ impl RuntimePort for GatewayAppHostBinding {
 #[serde(deny_unknown_fields)]
 struct RuntimeStartGoalIntentV1 {
     task_id: String,
+    mission_id: String,
+    source_session_id: String,
+    source_turn_id: String,
     objective: String,
     #[serde(default)]
     preemptive: bool,
@@ -1175,7 +1190,7 @@ impl WorkContextPort for GatewayAppHostBinding {
                     .list_records()
                     .map_err(AppHostError::Unavailable)?
                     .into_iter()
-                    .any(|task| task.id == task_id);
+                    .any(|task| task.task_id == task_id);
                 Ok(HostReceipt {
                     id: format!("work-context:task-exists:{}", context.request_id),
                     status: "completed".to_string(),
@@ -1379,7 +1394,7 @@ async fn observe_task_terminal(
         .list_records()
         .map_err(AppHostError::Unavailable)?
         .into_iter()
-        .find(|task| task.id == task_id);
+        .find(|task| task.task_id == task_id);
     let Some(task) = task else {
         return Ok(None);
     };
@@ -1387,7 +1402,7 @@ async fn observe_task_terminal(
         let projection = state
             .services
             .task
-            .execution_graph(&task.id)
+            .execution_graph(&task.task_id)
             .await
             .map_err(AppHostError::Unavailable)?;
         let Some(projection) = projection else {
@@ -1401,7 +1416,7 @@ async fn observe_task_terminal(
             return Ok(None);
         }
         return Ok(Some(WorkContextTaskTerminal {
-            task_id: task.id,
+            task_id: task.task_id,
             workflow_node_id: Some(node_id.to_string()),
             terminal_status: format!("{:?}", node.status).to_ascii_lowercase(),
             source_receipt_ref: node.result_ref.clone().unwrap_or_else(|| {
@@ -1415,7 +1430,7 @@ async fn observe_task_terminal(
     let receipt = state
         .services
         .task
-        .latest_terminal_runtime_receipt(&task.id)
+        .latest_terminal_runtime_receipt(&task.task_id)
         .map_err(AppHostError::Unavailable)?;
     if let Some(receipt) = receipt {
         let terminal_status = receipt
@@ -1428,7 +1443,7 @@ async fn observe_task_terminal(
                 )
             })?;
         return Ok(Some(WorkContextTaskTerminal {
-            task_id: task.id,
+            task_id: task.task_id,
             workflow_node_id: None,
             terminal_status: terminal_status.to_string(),
             source_receipt_ref: format!(
@@ -1439,12 +1454,12 @@ async fn observe_task_terminal(
     }
     if matches!(
         task.status,
-        crate::task_kernel::TaskStatus::Completed
-            | crate::task_kernel::TaskStatus::Blocked
-            | crate::task_kernel::TaskStatus::Cancelled
-            | crate::task_kernel::TaskStatus::Failed
+        harness_contract::task::TaskStatus::Completed
+            | harness_contract::task::TaskStatus::Blocked
+            | harness_contract::task::TaskStatus::Cancelled
+            | harness_contract::task::TaskStatus::Failed
     ) {
-        let task_id = task.id;
+        let task_id = task.task_id;
         let terminal_status = task.status.as_str().to_string();
         return Ok(Some(WorkContextTaskTerminal {
             task_id: task_id.clone(),

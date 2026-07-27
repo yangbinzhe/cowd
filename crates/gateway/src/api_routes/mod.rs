@@ -37,8 +37,6 @@ use crate::gateway::HotSessionPool;
 use crate::services::session_service::repository::SessionRepository;
 use crate::services::GatewayServices;
 #[cfg(test)]
-use crate::task_kernel::TaskKernel;
-#[cfg(test)]
 use memory::cognitive::CognitiveContextManager;
 #[cfg(test)]
 use memory::types::{
@@ -1118,7 +1116,6 @@ pub mod test_support {
             let presence_ledger = Arc::new(SessionPresenceLedger::with_store(Arc::clone(
                 &session_store,
             )));
-            let task_kernel = Arc::clone(&selected_storage.task_kernel);
             let session_runtime_port =
                 crate::session_runtime_data_port::GatewaySessionRuntimePort::new();
             let provider_registry = Arc::new(runtime::ProviderRegistry::empty());
@@ -1126,6 +1123,7 @@ pub mod test_support {
                 .provider_registry(Arc::clone(&provider_registry))
                 .runtime_event_store(Arc::clone(&selected_storage.runtime_event_store))
                 .artifact_store(Arc::clone(&selected_storage.artifact_store))
+                .task_aggregate_service(Arc::clone(&selected_storage.task_service))
                 .session_query_port(session_runtime_port.clone())
                 .session_ingress_port(session_runtime_port.clone())
                 .session_journal_port(session_runtime_port.clone())
@@ -1179,7 +1177,6 @@ pub mod test_support {
             let services = Arc::new(GatewayServices::new_with_bound_session_and_storage(
                 runtime,
                 session_service,
-                task_kernel,
                 Arc::new(crate::surface_host::SurfaceHost::baseline()?),
                 None,
                 approval_gate,
@@ -1818,20 +1815,37 @@ pub(crate) mod tests {
         )
     }
 
-    fn test_task_kernel() -> Arc<TaskKernel> {
-        let path =
-            std::env::temp_dir().join(format!("cowd-api-task-{}.json", uuid::Uuid::new_v4()));
-        Arc::new(TaskKernel::open(path).expect("task kernel should open"))
+    fn seed_test_task(
+        task: &crate::services::TaskService,
+        task_id: &str,
+        objective: &str,
+        yolo_mode: bool,
+    ) -> runtime::TaskAggregate {
+        let session_id = "test-session";
+        task.create(
+            task_id.to_string(),
+            task.mission_id_for_session(session_id)
+                .expect("Runtime-backed TaskService"),
+            session_id.to_string(),
+            format!("test-turn-{task_id}"),
+            objective.to_string(),
+            yolo_mode,
+            vec![harness_contract::reality::EvidenceRef::new(
+                "test_fixture",
+                format!("test://tasks/{task_id}"),
+                harness_contract::reality::RealityBoundary::Observed,
+            )],
+        )
+        .expect("seed canonical Runtime task")
+        .aggregate
     }
 
     fn test_services(
         session_repository: Arc<SessionRepository>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
     ) -> Arc<crate::services::GatewayServices> {
         test_services_for_workspace(
             session_repository,
-            task_kernel,
             surface_host,
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         )
@@ -1839,13 +1853,11 @@ pub(crate) mod tests {
 
     fn test_services_for_workspace(
         session_repository: Arc<SessionRepository>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
         tool_workspace_root: PathBuf,
     ) -> Arc<crate::services::GatewayServices> {
         test_services_for_workspace_with_config_home(
             session_repository,
-            task_kernel,
             surface_host,
             tool_workspace_root,
             isolated_test_config_home(),
@@ -1854,7 +1866,6 @@ pub(crate) mod tests {
 
     fn test_services_for_workspace_with_config_home(
         session_repository: Arc<SessionRepository>,
-        task_kernel: Arc<TaskKernel>,
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
         tool_workspace_root: PathBuf,
         config_home: PathBuf,
@@ -1916,7 +1927,6 @@ pub(crate) mod tests {
             runtime,
             session_activation,
             crate::session_runtime_bridge::SessionWorkerSupervisor::for_tests(),
-            task_kernel,
             surface_host.unwrap_or_else(|| {
                 Arc::new(
                     crate::surface_host::SurfaceHost::baseline()
@@ -1943,7 +1953,6 @@ pub(crate) mod tests {
         );
         let session_repository =
             test_session_repository(sessions.clone(), Some(session_store), event_bus.clone());
-        let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -1954,7 +1963,7 @@ pub(crate) mod tests {
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_repository, task_kernel, None),
+            services: test_services(session_repository, None),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
@@ -1984,7 +1993,6 @@ pub(crate) mod tests {
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
-        let task_kernel = test_task_kernel();
         let config_home = isolated_test_config_home_with_config(&config);
         Arc::new(AppState {
             tool_registry: tools,
@@ -1996,12 +2004,7 @@ pub(crate) mod tests {
             config_home,
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services_for_workspace(
-                session_repository,
-                task_kernel,
-                surface_host,
-                workspace_root,
-            ),
+            services: test_services_for_workspace(session_repository, surface_host, workspace_root),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
@@ -2030,7 +2033,6 @@ pub(crate) mod tests {
         let event_bus = SessionProjectionHub::new();
         let session_repository =
             test_session_repository(sessions.clone(), Some(store.clone()), event_bus.clone());
-        let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -2041,7 +2043,7 @@ pub(crate) mod tests {
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_repository, task_kernel, None),
+            services: test_services(session_repository, None),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
@@ -2057,7 +2059,6 @@ pub(crate) mod tests {
         let event_bus = SessionProjectionHub::new();
         let session_repository =
             test_session_repository(sessions.clone(), Some(store.clone()), event_bus.clone());
-        let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -2070,7 +2071,6 @@ pub(crate) mod tests {
             profile_manager: test_profile_manager(),
             services: test_services_for_workspace_with_config_home(
                 session_repository,
-                task_kernel,
                 None,
                 workspace_root,
                 config_home.clone(),
@@ -2099,7 +2099,7 @@ pub(crate) mod tests {
 
     fn test_state_with_memory(memory_manager: Arc<CognitiveContextManager>) -> Arc<AppState> {
         let tools = Arc::new(ToolCatalog::builtin());
-        let task_kernel = test_task_kernel();
+        let task_runtime = runtime::RuntimeServices::in_memory().expect("test task runtime");
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -2112,7 +2112,7 @@ pub(crate) mod tests {
             profile_manager: test_profile_manager(),
             services: Arc::new(
                 crate::services::GatewayServices::with_memory_for_tests(memory_manager)
-                    .with_task_kernel_for_tests(task_kernel),
+                    .with_task_runtime_for_tests(task_runtime),
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
@@ -2124,7 +2124,7 @@ pub(crate) mod tests {
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
         let tools = Arc::new(ToolCatalog::builtin());
-        let task_kernel = test_task_kernel();
+        let task_runtime = runtime::RuntimeServices::in_memory().expect("test task runtime");
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -2137,7 +2137,7 @@ pub(crate) mod tests {
             profile_manager: test_profile_manager(),
             services: Arc::new(
                 crate::services::GatewayServices::with_memory_for_tests(memory_manager)
-                    .with_task_kernel_for_tests(task_kernel),
+                    .with_task_runtime_for_tests(task_runtime),
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
@@ -2154,7 +2154,7 @@ pub(crate) mod tests {
 
     fn test_state_with_approval_gate(gate: Arc<SmartApprovalGate>) -> Arc<AppState> {
         let tools = Arc::new(ToolCatalog::builtin());
-        let task_kernel = test_task_kernel();
+        let task_runtime = runtime::RuntimeServices::in_memory().expect("test task runtime");
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -2167,7 +2167,7 @@ pub(crate) mod tests {
             profile_manager: test_profile_manager(),
             services: Arc::new(
                 crate::services::GatewayServices::with_approval_for_tests(gate)
-                    .with_task_kernel_for_tests(task_kernel),
+                    .with_task_runtime_for_tests(task_runtime),
             ),
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
@@ -2184,7 +2184,6 @@ pub(crate) mod tests {
         );
         let session_repository =
             test_session_repository(sessions.clone(), Some(store), event_bus.clone());
-        let task_kernel = test_task_kernel();
         Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -2197,7 +2196,6 @@ pub(crate) mod tests {
             profile_manager: test_profile_manager(),
             services: test_services_for_workspace_with_config_home(
                 session_repository,
-                task_kernel,
                 None,
                 workspace_root,
                 config_home,
@@ -4189,7 +4187,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn mission_projection_exposes_durable_mission_events() {
+    async fn mission_projection_exposes_durable_presence_events_without_creating_a_mission() {
         let _guard = mission_route_lock().lock().await;
         let app = api_router(test_state());
         let session_id = format!("runtime-events-session-{}", uuid::Uuid::new_v4());
@@ -4227,12 +4225,13 @@ pub(crate) mod tests {
             serde_json::from_slice(&to_bytes(events.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(events_json["mission"]["kind"], "mission.runtime");
+        assert!(events_json["mission"]["aggregate"].is_null());
         assert!(events_json["events"]
             .as_array()
             .or_else(|| events_json["mission"]["events"].as_array())
             .expect("events")
             .iter()
-            .any(|event| event["event_type"].as_str() == Some("mission.session.started")));
+            .any(|event| event["event_type"].as_str() == Some("mission.presence.activated")));
     }
 
     #[tokio::test]
@@ -6418,15 +6417,12 @@ pub(crate) mod tests {
             "reconciliation_rules": ["dedup_key_unique"],
             "quality_rules": ["deviation_non_negative"]
         });
-        state
-            .services
-            .task
-            .start_goal_idempotent(
-                "gateway-external-assignment-task",
-                "External APP assignment task fixture".to_string(),
-                false,
-            )
-            .expect("seed runtime task for external assignment");
+        seed_test_task(
+            &state.services.task,
+            "gateway-external-assignment-task",
+            "External APP assignment task fixture",
+            false,
+        );
         let assignment_surface = state.services.surface.clone();
         let incident_task_service = state.services.task.clone();
         let app = api_router(state);
@@ -6741,7 +6737,7 @@ pub(crate) mod tests {
             .list_records()
             .expect("list Runtime tasks")
             .iter()
-            .any(|task| task.id == incident_task_id));
+            .any(|task| task.task_id == incident_task_id));
         let external_analysis = app
             .clone()
             .oneshot(
@@ -8499,7 +8495,14 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn task_execution_graph_is_committed_and_projected() {
-        let app = api_router(test_state());
+        let state = test_state();
+        let source_session_id = "session-task-execution-graph";
+        let mission_id = state
+            .services
+            .task
+            .mission_id_for_session(source_session_id)
+            .expect("Runtime-backed TaskService");
+        let app = api_router(state);
         let started = app
             .clone()
             .oneshot(
@@ -8509,6 +8512,10 @@ pub(crate) mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "task_id": "task-execution-graph",
+                            "mission_id": mission_id,
+                            "source_session_id": source_session_id,
+                            "source_turn_id": "turn-task-execution-graph",
                             "objective": "coordinate multi agent",
                             "yolo_mode": true
                         })
@@ -8521,7 +8528,7 @@ pub(crate) mod tests {
         assert_eq!(started.status(), StatusCode::CREATED);
         let body = to_bytes(started.into_body(), usize::MAX).await.unwrap();
         let task: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let task_id = task["id"].as_str().unwrap();
+        let task_id = task["task_id"].as_str().unwrap();
 
         let runs = app
             .clone()
@@ -8612,9 +8619,25 @@ pub(crate) mod tests {
             .as_ref()
             .expect("runtime service")
             .runtime_services();
+        let graph_identity = harness_contract::execution::ExecutionIdentity::for_task_graph(
+            "principal-route",
+            services.workspace_key(),
+            "mission-route",
+            "task-route",
+            "session-route",
+            "turn-route",
+            "graph-route",
+        )
+        .expect("graph identity");
         services
             .agent_runtime()
             .restore_verified_run(runtime::AgentRunSnapshot {
+                execution_identity: harness_contract::execution::ExecutionIdentity::for_agent_node(
+                    &graph_identity,
+                    format!("run-{agent_id}"),
+                    "node-route",
+                )
+                .expect("agent identity"),
                 run_id: format!("run-{agent_id}"),
                 agent_id: agent_id.clone(),
                 task_id: "task-route".to_string(),
@@ -8694,9 +8717,25 @@ pub(crate) mod tests {
             .as_ref()
             .expect("runtime service")
             .runtime_services();
+        let graph_identity = harness_contract::execution::ExecutionIdentity::for_task_graph(
+            "principal-command",
+            services.workspace_key(),
+            "mission-command",
+            "task-command",
+            "session-command",
+            "turn-command",
+            "graph-command",
+        )
+        .expect("graph identity");
         services
             .agent_runtime()
             .restore_verified_run(runtime::AgentRunSnapshot {
+                execution_identity: harness_contract::execution::ExecutionIdentity::for_agent_node(
+                    &graph_identity,
+                    format!("run-{agent_id}"),
+                    "node-command",
+                )
+                .expect("agent identity"),
                 run_id: format!("run-{agent_id}"),
                 agent_id: agent_id.clone(),
                 task_id: "task-command".to_string(),
@@ -10995,11 +11034,12 @@ runtime:
         std::fs::create_dir_all(&config_home).unwrap();
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let state = test_state_with_store_and_workspace(store, workspace, config_home);
-        state
-            .services
-            .task
-            .start_goal("control plane smoke task", true)
-            .unwrap();
+        seed_test_task(
+            &state.services.task,
+            "control-plane-smoke-task",
+            "control plane smoke task",
+            true,
+        );
         let app = api_router(state);
         let response = app
             .oneshot(
@@ -11805,11 +11845,12 @@ providers:
         std::fs::create_dir_all(&config_home).unwrap();
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         let state = test_state_with_store_and_workspace(store, workspace, config_home);
-        state
-            .services
-            .task
-            .start_goal("trace control plane", false)
-            .unwrap();
+        seed_test_task(
+            &state.services.task,
+            "control-plane-trace-task",
+            "trace control plane",
+            false,
+        );
         let Json(json) = runtime_routes::get_runtime_control_plane(AxumState(state)).await;
         assert_eq!(json["kind"], "runtime_control_plane");
         assert_eq!(json["status"], "attention");
@@ -12404,23 +12445,30 @@ providers:
 
     #[test]
     fn task_resume_context_packet_summarizes_current_task() {
-        let path = std::env::temp_dir().join(format!(
-            "cowd-api-task-packet-{}.json",
-            uuid::Uuid::new_v4()
-        ));
-        let kernel = TaskKernel::open(path.clone()).unwrap();
-        let task = kernel.start_goal("ship context runtime", true).unwrap();
-        let phase_id = task.phases[0].id.clone();
-        kernel
+        let runtime_services = runtime::RuntimeServices::in_memory().expect("test task runtime");
+        let service = crate::services::TaskService::with_runtime(runtime_services);
+        let task = seed_test_task(
+            &service,
+            "task-resume-context",
+            "ship context runtime",
+            true,
+        );
+        let phase_id = task.phases[0].phase_id.clone();
+        let task = service
             .record_phase_artifact(
-                &task.id,
+                &task.task_id,
+                task.revision,
                 &phase_id,
-                "evidence",
-                "test",
-                "cargo test -p runtime context_runtime",
+                "evidence".to_string(),
+                "test".to_string(),
+                "cargo test -p runtime context_runtime".to_string(),
+                vec![harness_contract::reality::EvidenceRef::new(
+                    "test_fixture",
+                    "test://tasks/task-resume-context/artifacts/1",
+                    harness_contract::reality::RealityBoundary::Observed,
+                )],
             )
             .unwrap();
-        let task = kernel.current().unwrap().unwrap();
 
         let packet = message_routes::task_resume_context_packet("session-task", &task);
 
@@ -12433,8 +12481,7 @@ providers:
         assert!(packet
             .recent_decisions
             .iter()
-            .any(|event| event.contains("artifact")));
-        let _ = std::fs::remove_file(path);
+            .any(|event| event.contains("phase=implementation")));
     }
 
     #[tokio::test]
@@ -15841,7 +15888,14 @@ providers:
 
     #[tokio::test]
     async fn task_api_starts_reports_and_blocks_after_repeated_failures() {
-        let app = api_router(test_state());
+        let state = test_state();
+        let source_session_id = "session-task-failure";
+        let mission_id = state
+            .services
+            .task
+            .mission_id_for_session(source_session_id)
+            .expect("Runtime-backed TaskService");
+        let app = api_router(state);
         let start_response = app
             .clone()
             .oneshot(
@@ -15851,6 +15905,10 @@ providers:
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "task_id": "task-failure",
+                            "mission_id": mission_id,
+                            "source_session_id": source_session_id,
+                            "source_turn_id": "turn-task-failure",
                             "objective": "finish v0.8.10",
                             "yolo_mode": true,
                         })
@@ -15865,9 +15923,10 @@ providers:
             .await
             .unwrap();
         let started: serde_json::Value = serde_json::from_slice(&start_body).unwrap();
-        let task_id = started["id"].as_str().expect("task id").to_string();
+        let task_id = started["task_id"].as_str().expect("task id").to_string();
+        let mut expected_revision = started["revision"].as_u64().expect("task revision");
         assert_eq!(started["status"], "running");
-        assert_eq!(started["yolo_mode"], true);
+        assert_eq!(started["execution_policy"]["yolo_mode"], true);
 
         for reason in ["first", "second", "external input required"] {
             let response = app
@@ -15878,13 +15937,20 @@ providers:
                         .uri(format!("/api/tasks/{task_id}/failure"))
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            serde_json::json!({ "reason": reason }).to_string(),
+                            serde_json::json!({
+                                "expected_revision": expected_revision,
+                                "reason": reason
+                            })
+                            .to_string(),
                         ))
                         .unwrap(),
                 )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let task: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            expected_revision = task["revision"].as_u64().expect("updated task revision");
         }
 
         let status_response = app
@@ -15911,7 +15977,14 @@ providers:
     #[tokio::test]
     async fn task_api_records_phase_artifacts_and_review() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
-        let app = api_router(test_state_with_store(store));
+        let state = test_state_with_store(store);
+        let source_session_id = "session-task-phase";
+        let mission_id = state
+            .services
+            .task
+            .mission_id_for_session(source_session_id)
+            .expect("Runtime-backed TaskService");
+        let app = api_router(state);
         let start_response = app
             .clone()
             .oneshot(
@@ -15921,6 +15994,10 @@ providers:
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "task_id": "task-phase",
+                            "mission_id": mission_id,
+                            "source_session_id": source_session_id,
+                            "source_turn_id": "turn-task-phase",
                             "objective": "ship task phase",
                             "yolo_mode": true,
                         })
@@ -15935,7 +16012,16 @@ providers:
             .await
             .unwrap();
         let started: serde_json::Value = serde_json::from_slice(&start_body).unwrap();
-        let task_id = started["id"].as_str().unwrap().to_string();
+        let task_id = started["task_id"].as_str().unwrap().to_string();
+        let start_revision = started["revision"].as_u64().expect("task revision");
+        assert_eq!(
+            started["command_receipt"]["accepted_revision"],
+            start_revision
+        );
+        assert_eq!(started["command_receipt"]["task_id"], task_id);
+        assert!(started["command_receipt"]["outbox_id"]
+            .as_str()
+            .is_some_and(|outbox_id| !outbox_id.is_empty()));
 
         let phase_response = app
             .clone()
@@ -15946,11 +16032,12 @@ providers:
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "expected_revision": start_revision,
                             "name": "browser-e2e",
                             "objective": "cover WebUI task panel",
                             "plan": ["add playwright spec"],
                             "acceptance": ["2 e2e tests pass"],
-                            "test_commands": ["cargo test -p gateway task_kernel -- --nocapture"],
+                            "test_commands": ["cargo test -p gateway runtime_task -- --nocapture"],
                         })
                         .to_string(),
                     ))
@@ -15963,11 +16050,14 @@ providers:
             .await
             .unwrap();
         let phase_json: serde_json::Value = serde_json::from_slice(&phase_body).unwrap();
-        let phase_id = phase_json["phases"].as_array().unwrap().last().unwrap()["id"]
+        let phase_id = phase_json["phases"].as_array().unwrap().last().unwrap()["phase_id"]
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(phase_json["current_phase"], "browser-e2e");
+        let phase_revision = phase_json["revision"]
+            .as_u64()
+            .expect("phase task revision");
+        assert_eq!(phase_json["current_phase_id"], phase_id);
 
         let artifact_response = app
             .clone()
@@ -15978,6 +16068,7 @@ providers:
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "expected_revision": phase_revision,
                             "kind": "test",
                             "label": "playwright",
                             "value": "2 passed",
@@ -15989,6 +16080,13 @@ providers:
             .await
             .unwrap();
         assert_eq!(artifact_response.status(), StatusCode::OK);
+        let artifact_body = to_bytes(artifact_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let artifact_json: serde_json::Value = serde_json::from_slice(&artifact_body).unwrap();
+        let artifact_revision = artifact_json["revision"]
+            .as_u64()
+            .expect("artifact task revision");
 
         let review_response = app
             .clone()
@@ -15999,6 +16097,7 @@ providers:
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
+                            "expected_revision": artifact_revision,
                             "result": "accepted",
                             "completed": true,
                         })
@@ -16017,7 +16116,7 @@ providers:
             .as_array()
             .unwrap()
             .iter()
-            .find(|phase| phase["id"] == phase_id)
+            .find(|phase| phase["phase_id"] == phase_id)
             .unwrap();
         assert_eq!(reviewed_phase["status"], "completed");
         assert_eq!(reviewed_phase["review_result"], "accepted");
@@ -16027,7 +16126,7 @@ providers:
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/runtime/timeline?session_id={task_id}&limit=10"
+                        "/api/runtime/timeline?session_id={source_session_id}&limit=10"
                     ))
                     .body(Body::empty())
                     .unwrap(),
@@ -16043,19 +16142,25 @@ providers:
             .as_array()
             .unwrap()
             .iter()
+            .filter(|event| event["scope"] == "task")
             .map(|event| event["kind"].as_str().unwrap_or_default())
             .collect::<Vec<_>>();
         assert_eq!(
             kinds,
             vec![
-                "task.started",
+                "task.created",
                 "task.phase.started",
                 "task.phase.artifact.recorded",
                 "task.phase.reviewed",
             ]
         );
-        assert_eq!(timeline_json["events"][0]["scope"], "task");
-        assert_eq!(timeline_json["events"][3]["payload"]["status"], "reviewing");
+        let reviewed = timeline_json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["kind"] == "task.phase.reviewed")
+            .expect("reviewed task event");
+        assert_eq!(reviewed["payload"]["status"], "reviewing");
     }
 
     #[tokio::test]
@@ -16749,7 +16854,6 @@ providers:
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
-        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -16760,7 +16864,7 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_repository, task_kernel, None),
+            services: test_services(session_repository, None),
             session_lease_registry: None,
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
@@ -16784,7 +16888,6 @@ providers:
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
-        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -16795,7 +16898,7 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_repository, task_kernel, None),
+            services: test_services(session_repository, None),
             session_lease_registry: None,
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
@@ -16819,7 +16922,6 @@ providers:
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
-        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -16830,7 +16932,7 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_repository, task_kernel, None),
+            services: test_services(session_repository, None),
             session_lease_registry: None,
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
@@ -16856,7 +16958,6 @@ providers:
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
-        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -16867,7 +16968,7 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_repository, task_kernel, None),
+            services: test_services(session_repository, None),
             session_lease_registry: None,
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
@@ -16893,7 +16994,6 @@ providers:
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
-        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -16904,7 +17004,7 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_repository, task_kernel, None),
+            services: test_services(session_repository, None),
             session_lease_registry: None,
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });
@@ -16937,7 +17037,6 @@ providers:
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
-        let task_kernel = test_task_kernel();
         let state = Arc::new(AppState {
             tool_registry: tools,
             config: None,
@@ -16948,7 +17047,7 @@ providers:
             config_home: isolated_test_config_home(),
             profile_id: "default".to_string(),
             profile_manager: test_profile_manager(),
-            services: test_services(session_repository, task_kernel, None),
+            services: test_services(session_repository, None),
             session_lease_registry: None,
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         });

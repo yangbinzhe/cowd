@@ -897,7 +897,18 @@ async fn record_upgrade_disposition(
                         expected_revision: None,
                         correlation_id: format!("upgrade:{}", request.carrier_id),
                         payload: Value::Null,
-                        evidence_refs: request.result_refs.clone(),
+                        evidence_refs: request
+                            .result_refs
+                            .iter()
+                            .map(|reference| {
+                                harness_contract::reality::EvidenceRef::new(
+                                    "upgrade_result",
+                                    reference,
+                                    harness_contract::reality::RealityBoundary::Observed,
+                                )
+                                .with_source("gateway.upgrade")
+                            })
+                            .collect(),
                     },
                 )
                 .await;

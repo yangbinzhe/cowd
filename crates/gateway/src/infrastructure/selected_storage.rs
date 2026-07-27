@@ -16,8 +16,6 @@ use storage::{
 };
 use surface::SurfaceMessageLedger;
 
-use crate::task_kernel::TaskKernel;
-
 #[derive(Clone)]
 pub(crate) struct SelectedStorageTopology {
     pub(crate) backend: runtime::StorageBackendSelection,
@@ -29,7 +27,7 @@ pub(crate) struct SelectedStorageTopology {
     pub(crate) knowledge_store: Arc<dyn KnowledgeStore>,
     pub(crate) knowledge_fabric: KnowledgeFabric,
     pub(crate) runtime_event_store: Arc<runtime::RuntimeEventStore>,
-    pub(crate) task_kernel: Arc<TaskKernel>,
+    pub(crate) task_service: Arc<runtime::TaskAggregateService>,
     pub(crate) fact_ledger: Arc<dyn FactLedger>,
     pub(crate) matrix_store: Arc<dyn MatrixStore>,
     pub(crate) approval_ledger: approval::SharedApprovalHistoryLedger,
@@ -149,8 +147,9 @@ impl SelectedStorageTopology {
         let runtime_event_store = Arc::new(
             runtime::RuntimeEventStore::try_open(&runtime_endpoint.path).map_err(stringify)?,
         );
-        let task_kernel = Arc::new(
-            TaskKernel::open_storage_handle(&task_endpoint.as_handle()).map_err(stringify)?,
+        let task_service = Arc::new(
+            runtime::TaskAggregateService::open_storage_handle(&task_endpoint.as_handle())
+                .map_err(stringify)?,
         );
         let fact_ledger: Arc<dyn FactLedger> = Arc::new(
             fact_sqlite::SqliteFactLedger::open_with_legacy_growth(
@@ -193,7 +192,7 @@ impl SelectedStorageTopology {
             knowledge_store,
             knowledge_fabric,
             runtime_event_store,
-            task_kernel,
+            task_service,
             fact_ledger,
             matrix_store,
             approval_ledger,
@@ -256,11 +255,11 @@ impl SelectedStorageTopology {
                 .map_err(stringify)?
                 .into_runtime_event_store(),
         );
-        let task_kernel = Arc::new(TaskKernel::from_runtime_kernel(
+        let task_service = Arc::new(
             runtime_postgres::PostgresTaskStore::new(executor.clone())
                 .map_err(stringify)?
-                .into_task_kernel(),
-        ));
+                .into_task_service(),
+        );
         let fact_ledger: Arc<dyn FactLedger> =
             Arc::new(fact_postgres::PostgresFactLedger::new(executor.clone()).map_err(stringify)?);
         let matrix_store: Arc<dyn MatrixStore> = Arc::new(
@@ -292,7 +291,7 @@ impl SelectedStorageTopology {
             knowledge_store,
             knowledge_fabric,
             runtime_event_store,
-            task_kernel,
+            task_service,
             fact_ledger,
             matrix_store,
             approval_ledger,

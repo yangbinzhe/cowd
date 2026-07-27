@@ -36,7 +36,18 @@ impl AgentService {
         edges: Vec<ExecutionEdge>,
     ) -> Result<ExecutionGraphProjection, String> {
         task_service
-            .register_execution_graph(task_id, objective, nodes, edges)
+            .register_execution_graph(
+                task_id,
+                objective,
+                nodes,
+                edges,
+                vec![harness_contract::reality::EvidenceRef::new(
+                    "gateway_command",
+                    format!("register-graph:{task_id}"),
+                    harness_contract::reality::RealityBoundary::Observed,
+                )
+                .with_source("gateway.agent_service")],
+            )
             .await
     }
 }

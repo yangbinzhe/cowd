@@ -41,12 +41,12 @@ fn services_with_provider() -> Arc<RuntimeServices> {
         .expect("runtime services")
 }
 
-fn request(template_id: &str) -> TeamInstantiationRequest {
+fn request(template_id: &str, mission_id: &str) -> TeamInstantiationRequest {
     TeamInstantiationRequest {
         request_id: "team-instantiation-test".to_string(),
         team_id: "team-instantiation-test".to_string(),
         session_id: "session-team-instantiation".to_string(),
-        mission_id: None,
+        mission_id: mission_id.to_string(),
         parent_execution: None,
         selection_mode: TeamSelectionMode::Explicit,
         strategy_binding: None,
@@ -74,7 +74,10 @@ fn request(template_id: &str) -> TeamInstantiationRequest {
 #[test]
 fn explicit_template_creates_bound_non_overlapping_role_slots() {
     let services = RuntimeServices::in_memory().expect("runtime services");
-    let mut request = request("cowd/parallel-research-synthesis");
+    let mut request = request(
+        "cowd/parallel-research-synthesis",
+        services.mission_runtime().default_mission_id(),
+    );
     request.cardinality_overrides = vec![TeamRoleCardinalityOverride {
         role_id: "researcher".to_string(),
         cardinality: RoleCardinalityPolicy::Fixed { count: 3 },
@@ -168,8 +171,11 @@ fn explicit_template_creates_bound_non_overlapping_role_slots() {
         }
         let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
             .expect("AgentTask packet must decode");
-        let binding = packet.binding.expect("AgentTask must carry its Binding");
-        let search_required = packet.node_id.contains(":researcher:");
+        let search_required = packet.node_id().contains(":researcher:");
+        let binding = packet
+            .binding
+            .as_ref()
+            .expect("AgentTask must carry its Binding");
         !packet.allowed_tools.is_empty()
             && packet.allowed_tools == binding.tool_contract_refs
             && packet.allowed_tools.iter().any(|tool| tool == "read_file")
@@ -184,7 +190,10 @@ fn explicit_template_creates_bound_non_overlapping_role_slots() {
 #[test]
 fn builtin_template_default_pointer_resolves_the_verified_stable_release() {
     let services = RuntimeServices::in_memory().expect("runtime services");
-    let mut request = request("cowd/parallel-research-synthesis");
+    let mut request = request(
+        "cowd/parallel-research-synthesis",
+        services.mission_runtime().default_mission_id(),
+    );
     request.template_selector = TeamTemplateSelector::Default {
         template_id: TeamTemplateDefinitionId::new(
             DefinitionScope::Builtin,
@@ -225,23 +234,23 @@ impl AgentRuntimeBackend for CompletedBackend {
         evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
             harness_contract::context::EvidenceRef::new(
                 "tool",
-                format!("materialized:{}", packet.node_id),
+                format!("materialized:{}", packet.node_id()),
             ),
             "a".repeat(64),
             1,
             "application/json",
             "artifact://art_team_instantiation",
-            format!("session:{}", packet.session_id),
+            format!("session:{}", packet.session_id()),
         ));
         Ok(AgentReturnPacket {
-            run_id: packet.run_id,
-            agent_id: packet.agent_id,
-            task_id: packet.task_id,
-            session_id: packet.session_id,
-            mission_id: packet.mission_id,
-            team_id: packet.team_id,
-            graph_id: packet.graph_id,
-            node_id: packet.node_id,
+            run_id: packet.run_id().to_string(),
+            agent_id: packet.agent_id().to_string(),
+            task_id: packet.task_id().to_string(),
+            session_id: packet.session_id().to_string(),
+            mission_id: packet.mission_id().to_string(),
+            team_id: packet.team_id().map(ToString::to_string),
+            graph_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
             status: AgentTerminalStatus::Completed,
@@ -278,10 +287,52 @@ async fn terminal_role_transition_commits_team_working_state_with_graph() {
         .register_backend(Arc::new(CompletedBackend));
     let projection = services
         .team_runtime()
-        .instantiate(request("cowd/direct-executor"))
+        .instantiate(request(
+            "cowd/direct-executor",
+            services.mission_runtime().default_mission_id(),
+        ))
         .await
         .expect("team execution");
     assert_eq!(projection.status, "completed", "{projection:?}");
+    let tasks = services
+        .task_runtime_port()
+        .list()
+        .expect("canonical Team tasks");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(
+        tasks[0].mission_id,
+        services.mission_runtime().default_mission_id()
+    );
+    assert_eq!(tasks[0].source_session_id, "session-team-instantiation");
+    assert_eq!(tasks[0].source_turn_id, "team-instantiation-test");
+    assert_eq!(tasks[0].graph_refs.len(), 1);
+    assert_eq!(tasks[0].graph_refs[0].graph_id, projection.graph_id);
+    assert!(
+        tasks[0].graph_refs[0].revision > 0,
+        "Task must retain the registered graph revision instead of a placeholder"
+    );
+    let mission = services
+        .mission_runtime()
+        .aggregate(services.mission_runtime().default_mission_id())
+        .expect("Team execution must materialize its Mission aggregate");
+    assert!(
+        mission
+            .team_run_refs
+            .iter()
+            .any(|reference| reference.id == "team-instantiation-test"),
+        "normal Team execution must link its run into the canonical Mission"
+    );
+    assert_eq!(
+        mission.agent_run_refs.len(),
+        1,
+        "the Team's Agent execution must link its run into the same Mission"
+    );
+    assert!(
+        mission.agent_run_refs[0]
+            .id
+            .starts_with("team-instantiation-test:run:"),
+        "Mission must retain the canonical Agent run identity"
+    );
 
     let state = services
         .team_runtime()

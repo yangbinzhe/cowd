@@ -615,7 +615,8 @@ fn team_id(graph: &ExecutionGraph) -> Option<String> {
 
 fn task_packet_or_intent(payload: &str) -> Option<(Vec<String>, Option<String>)> {
     if let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(payload) {
-        return Some((packet.constraints, packet.team_id));
+        let team_id = packet.team_id().map(str::to_owned);
+        return Some((packet.constraints, team_id));
     }
     serde_json::from_str::<AgentTaskIntent>(payload)
         .ok()
@@ -932,14 +933,14 @@ mod tests {
                 .lock()
                 .expect("objectives")
                 .push(packet.objective.clone());
-            let evidence_id = format!("materialized:{}", packet.node_id);
+            let evidence_id = format!("materialized:{}", packet.node_id());
             let evidence = harness_contract::context::EvidenceAccessRef::durable(
                 harness_contract::context::EvidenceRef::new("tool", evidence_id),
                 "a".repeat(64),
                 1,
                 "application/json",
                 "artifact://art_orchestration_packet",
-                format!("session:{}", packet.session_id),
+                format!("session:{}", packet.session_id()),
             );
             let mut evidence_refs = packet.evidence_refs.clone();
             evidence_refs.push(evidence);
@@ -965,14 +966,14 @@ mod tests {
                 .map(|receipt| receipt.path.clone())
                 .collect();
             Ok(AgentReturnPacket {
-                run_id: packet.run_id,
-                agent_id: packet.agent_id,
-                task_id: packet.task_id,
-                session_id: packet.session_id,
-                mission_id: packet.mission_id,
-                team_id: packet.team_id,
-                graph_id: packet.graph_id,
-                node_id: packet.node_id,
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                session_id: packet.session_id().to_string(),
+                mission_id: packet.mission_id().to_string(),
+                team_id: packet.team_id().map(ToString::to_string),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,

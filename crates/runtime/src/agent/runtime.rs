@@ -7,7 +7,9 @@ use harness_contract::agent::{
     AgentCommandRequest, AgentInput, AgentLifecycleEvent, AgentReturnPacket, AgentStatus,
     AgentTaskPacket, AgentTerminalStatus, RevisionSelector,
 };
+use harness_contract::execution::ExecutionIdentity;
 use harness_contract::execution_graph::{ExecutionEdgeKind, ExecutionNodeKind};
+use harness_contract::reality::{EvidenceRef, RealityBoundary};
 use serde::{Deserialize, Serialize};
 
 use crate::execution_core::graph::executors::{AgentTaskBackend, AgentTaskBackendResolver};
@@ -28,6 +30,7 @@ use crate::agent_run_handle::{AgentBackendCapabilities, AgentBackendKind, AgentR
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRunSnapshot {
+    pub execution_identity: ExecutionIdentity,
     pub run_id: String,
     pub agent_id: String,
     pub task_id: String,
@@ -435,34 +438,45 @@ impl AgentRuntime {
     }
 
     pub async fn execute_task(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String> {
-        if let Some(existing) = self.get(&packet.agent_id) {
-            if existing.run_id == packet.run_id && existing.status.is_terminal() {
+        if let Some(existing) = self.get(packet.agent_id()) {
+            if existing.run_id == packet.run_id() && existing.status.is_terminal() {
                 return self
                     .records
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&packet.agent_id)
+                    .get(packet.agent_id())
                     .and_then(|record| record.returned.clone())
                     .ok_or_else(|| {
                         "terminal AgentRuntime state lacks a canonical return packet".to_string()
                     });
             }
-            if existing.run_id != packet.run_id && !existing.status.is_terminal() {
+            if existing.run_id != packet.run_id() && !existing.status.is_terminal() {
                 return Err(format!(
                     "agent {} already owns an active run",
-                    packet.agent_id
+                    packet.agent_id()
                 ));
             }
         }
         let packet = self.attach_predecessor_context(packet).await?;
         let packet = self.ensure_runtime_binding(packet)?;
+        if let Some(services) = self.services() {
+            services.task_runtime_port().link_mission_agent_run(
+                packet.mission_id(),
+                packet.run_id(),
+                vec![EvidenceRef::new(
+                    "agent_run",
+                    format!("agent-run://{}", packet.run_id()),
+                    RealityBoundary::Observed,
+                )],
+            )?;
+        }
         let backend_kind = backend_from_packet(&packet);
         ensure_team_backend_trusted(&packet, backend_kind)?;
         if self
             .pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&packet.agent_id)
+            .remove(packet.agent_id())
         {
             let returned = cancelled_return(
                 &packet,
@@ -470,12 +484,13 @@ impl AgentRuntime {
             );
             self.persist_snapshot(
                 AgentRunSnapshot {
-                    run_id: packet.run_id.clone(),
-                    agent_id: packet.agent_id.clone(),
-                    task_id: packet.task_id.clone(),
-                    session_id: packet.session_id.clone(),
-                    graph_id: packet.graph_id.clone(),
-                    node_id: packet.node_id.clone(),
+                    execution_identity: packet.assignment.execution_identity.clone(),
+                    run_id: packet.run_id().to_string(),
+                    agent_id: packet.agent_id().to_string(),
+                    task_id: packet.task_id().to_string(),
+                    session_id: packet.session_id().to_string(),
+                    graph_id: packet.graph_id().to_string(),
+                    node_id: packet.node_id().to_string(),
                     attempt: packet.attempt,
                     expected_graph_revision: packet.expected_graph_revision,
                     backend: backend_kind,
@@ -502,12 +517,13 @@ impl AgentRuntime {
                 let returned = blocked_return(&packet, failure.clone());
                 self.persist_snapshot(
                     AgentRunSnapshot {
-                        run_id: packet.run_id.clone(),
-                        agent_id: packet.agent_id.clone(),
-                        task_id: packet.task_id.clone(),
-                        session_id: packet.session_id.clone(),
-                        graph_id: packet.graph_id.clone(),
-                        node_id: packet.node_id.clone(),
+                        execution_identity: packet.assignment.execution_identity.clone(),
+                        run_id: packet.run_id().to_string(),
+                        agent_id: packet.agent_id().to_string(),
+                        task_id: packet.task_id().to_string(),
+                        session_id: packet.session_id().to_string(),
+                        graph_id: packet.graph_id().to_string(),
+                        node_id: packet.node_id().to_string(),
                         attempt: packet.attempt,
                         expected_graph_revision: packet.expected_graph_revision,
                         backend: backend_kind,
@@ -547,12 +563,13 @@ impl AgentRuntime {
             let returned = blocked_return(&packet, failure.clone());
             self.persist_snapshot(
                 AgentRunSnapshot {
-                    run_id: packet.run_id.clone(),
-                    agent_id: packet.agent_id.clone(),
-                    task_id: packet.task_id.clone(),
-                    session_id: packet.session_id.clone(),
-                    graph_id: packet.graph_id.clone(),
-                    node_id: packet.node_id.clone(),
+                    execution_identity: packet.assignment.execution_identity.clone(),
+                    run_id: packet.run_id().to_string(),
+                    agent_id: packet.agent_id().to_string(),
+                    task_id: packet.task_id().to_string(),
+                    session_id: packet.session_id().to_string(),
+                    graph_id: packet.graph_id().to_string(),
+                    node_id: packet.node_id().to_string(),
                     attempt: packet.attempt,
                     expected_graph_revision: packet.expected_graph_revision,
                     backend: backend_kind,
@@ -573,12 +590,13 @@ impl AgentRuntime {
             return Ok(returned);
         }
         let snapshot = AgentRunSnapshot {
-            run_id: packet.run_id.clone(),
-            agent_id: packet.agent_id.clone(),
-            task_id: packet.task_id.clone(),
-            session_id: packet.session_id.clone(),
-            graph_id: packet.graph_id.clone(),
-            node_id: packet.node_id.clone(),
+            execution_identity: packet.assignment.execution_identity.clone(),
+            run_id: packet.run_id().to_string(),
+            agent_id: packet.agent_id().to_string(),
+            task_id: packet.task_id().to_string(),
+            session_id: packet.session_id().to_string(),
+            graph_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
             backend: backend_kind,
@@ -596,14 +614,17 @@ impl AgentRuntime {
             .pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&packet.agent_id)
+            .remove(packet.agent_id())
         {
             let returned = cancelled_return(
                 &packet,
                 "agent cancelled after prepare and before backend admission".to_string(),
             );
-            let mut cancelled = self.get(&packet.agent_id).ok_or_else(|| {
-                format!("prepared agent projection `{}` is missing", packet.agent_id)
+            let mut cancelled = self.get(packet.agent_id()).ok_or_else(|| {
+                format!(
+                    "prepared agent projection `{}` is missing",
+                    packet.agent_id()
+                )
             })?;
             cancelled.status = AgentStatus::Cancelled;
             cancelled.updated_at_ms = now_ms();
@@ -617,9 +638,12 @@ impl AgentRuntime {
             )?;
             return Ok(returned);
         }
-        let mut running = self
-            .get(&packet.agent_id)
-            .ok_or_else(|| format!("prepared agent projection `{}` is missing", packet.agent_id))?;
+        let mut running = self.get(packet.agent_id()).ok_or_else(|| {
+            format!(
+                "prepared agent projection `{}` is missing",
+                packet.agent_id()
+            )
+        })?;
         if running.status == AgentStatus::Cancelled {
             let returned = cancelled_return(
                 &packet,
@@ -663,10 +687,10 @@ impl AgentRuntime {
             .pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&packet.agent_id);
+            .remove(packet.agent_id());
         if cancellation_requested
             || self
-                .get(&packet.agent_id)
+                .get(packet.agent_id())
                 .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled)
         {
             returned.status = AgentTerminalStatus::Cancelled;
@@ -696,9 +720,12 @@ impl AgentRuntime {
                 returned.runtime_observed_resource_scopes.clone();
             returned = failed;
         }
-        let mut terminal = self
-            .get(&packet.agent_id)
-            .ok_or_else(|| format!("running agent projection `{}` is missing", packet.agent_id))?;
+        let mut terminal = self.get(packet.agent_id()).ok_or_else(|| {
+            format!(
+                "running agent projection `{}` is missing",
+                packet.agent_id()
+            )
+        })?;
         terminal.status = terminal_status(returned.status);
         terminal.updated_at_ms = now_ms();
         terminal.failure = returned.failure.clone();
@@ -724,8 +751,8 @@ impl AgentRuntime {
                     // rebuilt before any Stable-review request, so do not
                     // turn a completed user task into a false failure here.
                     tracing::warn!(
-                        agent_id = %packet.agent_id,
-                        run_id = %packet.run_id,
+                        agent_id = %packet.agent_id(),
+                        run_id = %packet.run_id(),
                         error = %error,
                         "failed to refresh replayable Canary observation"
                     );
@@ -821,19 +848,23 @@ impl AgentRuntime {
     /// intentionally rejects an unbound payload rather than selecting a
     /// default Definition during execution or recovery.
     fn ensure_runtime_binding(&self, packet: AgentTaskPacket) -> Result<AgentTaskPacket, String> {
+        packet
+            .assignment
+            .validate()
+            .map_err(|error| error.to_string())?;
         let binding = packet.binding.as_ref().ok_or_else(|| {
             "unbound AgentTaskPacket is not executable; compile AgentTaskIntent before graph registration"
                 .to_string()
         })?;
         binding.validate().map_err(|error| error.to_string())?;
-        if packet.agent_id != binding.instance.instance_id {
+        if packet.agent_id() != binding.instance.instance_id {
             return Err(
                 "AgentTaskPacket agent_id must equal its Binding instance identity".to_string(),
             );
         }
-        if binding.data_lease.session_id != packet.session_id
-            || binding.data_lease.task_id != packet.task_id
-            || binding.data_lease.team_id != packet.team_id
+        if binding.data_lease.session_id != packet.session_id()
+            || binding.data_lease.task_id != packet.task_id()
+            || binding.data_lease.team_id.as_deref() != packet.team_id()
         {
             return Err("AgentTaskPacket binding data lease does not match task identity".into());
         }
@@ -906,7 +937,7 @@ impl AgentRuntime {
         };
         let Ok(graph) = services
             .graph_state_store()
-            .load_async(packet.graph_id.clone())
+            .load_async(packet.graph_id().to_string())
             .await
         else {
             // Isolated AgentRuntime tests and external adapters may execute
@@ -917,7 +948,7 @@ impl AgentRuntime {
             .edges
             .iter()
             .filter(|edge| {
-                edge.to == packet.node_id
+                edge.to == packet.node_id()
                     && matches!(
                         edge.kind,
                         ExecutionEdgeKind::DependsOn
@@ -948,14 +979,14 @@ impl AgentRuntime {
                     )
                 })?;
             let returned = self
-                .terminal_return(&predecessor_packet.agent_id)
+                .terminal_return(predecessor_packet.agent_id())
                 .ok_or_else(|| {
                     format!(
                         "completed predecessor {} has no AgentRuntime terminal return",
                         predecessor.id
                     )
                 })?;
-            if returned.run_id != predecessor_packet.run_id
+            if returned.run_id != predecessor_packet.run_id()
                 || returned.graph_id != graph.id
                 || returned.node_id != predecessor.id
                 || returned.attempt != predecessor_packet.attempt
@@ -963,7 +994,7 @@ impl AgentRuntime {
             {
                 return Err(format!(
                     "predecessor AgentRuntime binding mismatch for {}",
-                    predecessor_packet.agent_id
+                    predecessor_packet.agent_id()
                 ));
             }
             let role = predecessor_packet
@@ -974,7 +1005,7 @@ impl AgentRuntime {
                         .strip_prefix("team_role:")
                         .or_else(|| constraint.strip_prefix("protocol_role:"))
                 })
-                .unwrap_or(predecessor_packet.agent_id.as_str());
+                .unwrap_or(predecessor_packet.agent_id());
             let available = remaining.saturating_sub(96);
             if available == 0 {
                 break;
@@ -1156,6 +1187,7 @@ impl AgentRuntime {
         returned: Option<AgentReturnPacket>,
         evaluation: Option<AgentRunEvaluation>,
     ) -> Result<AgentCommandReceipt, String> {
+        validate_snapshot_identity(&snapshot)?;
         let _lifecycle_guard = self
             .lifecycle_lock
             .lock()
@@ -1168,6 +1200,12 @@ impl AgentRuntime {
             .and_then(|record| record.snapshot.clone());
         match current {
             Some(current) if current.run_id == snapshot.run_id => {
+                if current.execution_identity != snapshot.execution_identity {
+                    return Err(format!(
+                        "Agent {} attempted to change immutable execution identity",
+                        snapshot.agent_id
+                    ));
+                }
                 if current.status.is_terminal() && !snapshot.status.is_terminal() {
                     return Err(format!(
                         "Agent lifecycle cannot regress terminal {:?} to {:?}",
@@ -1212,20 +1250,7 @@ impl AgentRuntime {
             kind: kind.into(),
             status: Some(message.into()),
             actor: Some("agent_runtime".into()),
-            refs: vec![
-                RuntimeEventRef {
-                    kind: "run".into(),
-                    id: snapshot.run_id.clone(),
-                },
-                RuntimeEventRef {
-                    kind: "graph".into(),
-                    id: snapshot.graph_id.clone(),
-                },
-                RuntimeEventRef {
-                    kind: "node".into(),
-                    id: snapshot.node_id.clone(),
-                },
-            ],
+            refs: snapshot_identity_refs(&snapshot),
             payload: serde_json::to_value(payload).map_err(|error| error.to_string())?,
         };
         if let Some(evaluation) = evaluation {
@@ -1358,21 +1383,21 @@ impl AgentTaskBackend for AgentRuntime {
         self.pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(packet.agent_id.clone());
-        let Some(snapshot) = self.get(&packet.agent_id) else {
+            .insert(packet.agent_id().to_string());
+        let Some(snapshot) = self.get(packet.agent_id()) else {
             return Ok(());
         };
         if snapshot.status.is_terminal() {
             self.pending_cancellations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&packet.agent_id);
+                .remove(packet.agent_id());
             return Ok(());
         }
         let receipt = self
             .command(AgentCommandRequest {
-                command_id: format!("graph-cancel:{}:{}", packet.graph_id, packet.node_id),
-                agent_id: packet.agent_id.clone(),
+                command_id: format!("graph-cancel:{}:{}", packet.graph_id(), packet.node_id()),
+                agent_id: packet.agent_id().to_string(),
                 expected_revision: snapshot.revision,
                 command: AgentCommand::Cancel,
                 input: None,
@@ -1381,18 +1406,19 @@ impl AgentTaskBackend for AgentRuntime {
         if receipt.accepted
             || receipt.reject_reason == Some(AgentCommandRejectReason::Terminal)
             || self
-                .get(&packet.agent_id)
+                .get(packet.agent_id())
                 .is_some_and(|snapshot| snapshot.status == AgentStatus::Cancelled)
         {
             self.pending_cancellations
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&packet.agent_id);
+                .remove(packet.agent_id());
             Ok(())
         } else {
             Err(format!(
                 "AgentRuntime cancel rejected for {}: {}",
-                packet.agent_id, receipt.message
+                packet.agent_id(),
+                receipt.message
             ))
         }
     }
@@ -1401,7 +1427,7 @@ impl AgentTaskBackend for AgentRuntime {
         self.pending_cancellations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&packet.agent_id);
+            .remove(packet.agent_id());
     }
 }
 
@@ -1434,8 +1460,69 @@ fn legacy_import_stream_id(source_id: &str) -> String {
     format!("agent-migration:{source_id}")
 }
 
+fn validate_snapshot_identity(snapshot: &AgentRunSnapshot) -> Result<(), String> {
+    snapshot
+        .execution_identity
+        .validate()
+        .map_err(|error| error.to_string())?;
+    if snapshot.execution_identity.kind()
+        != harness_contract::execution::ExecutionIdentityKind::AgentNode
+        || snapshot.execution_identity.task_id() != Some(snapshot.task_id.as_str())
+        || snapshot.execution_identity.session_id() != Some(snapshot.session_id.as_str())
+        || snapshot.execution_identity.graph_id() != Some(snapshot.graph_id.as_str())
+        || snapshot.execution_identity.agent_run_id() != Some(snapshot.run_id.as_str())
+        || snapshot.execution_identity.node_id() != Some(snapshot.node_id.as_str())
+    {
+        return Err(format!(
+            "Agent {} snapshot conflicts with its canonical execution identity",
+            snapshot.agent_id
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_identity_refs(snapshot: &AgentRunSnapshot) -> Vec<RuntimeEventRef> {
+    let identity = &snapshot.execution_identity;
+    let mut refs = vec![
+        RuntimeEventRef {
+            kind: "principal".to_string(),
+            id: identity.principal_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "workspace".to_string(),
+            id: identity.workspace_id().to_string(),
+        },
+        RuntimeEventRef {
+            kind: "agent_instance".to_string(),
+            id: snapshot.agent_id.clone(),
+        },
+        RuntimeEventRef {
+            kind: "agent_run".to_string(),
+            id: snapshot.run_id.clone(),
+        },
+    ];
+    for (kind, id) in [
+        ("mission", identity.mission_id()),
+        ("task", identity.task_id()),
+        ("session", identity.session_id()),
+        ("turn", identity.turn_id()),
+        ("execution_graph", identity.graph_id()),
+        ("team_run", identity.team_run_id()),
+        ("node", identity.node_id()),
+    ] {
+        if let Some(id) = id {
+            refs.push(RuntimeEventRef {
+                kind: kind.to_string(),
+                id: id.to_string(),
+            });
+        }
+    }
+    refs
+}
+
 fn validate_legacy_record(record: &LegacyAgentStateRecord) -> Result<(), String> {
     let snapshot = &record.snapshot;
+    validate_snapshot_identity(snapshot)?;
     if record.source_ref.trim().is_empty()
         || [
             snapshot.run_id.as_str(),
@@ -1461,6 +1548,7 @@ fn validate_legacy_record(record: &LegacyAgentStateRecord) -> Result<(), String>
             || returned.agent_id != snapshot.agent_id
             || returned.task_id != snapshot.task_id
             || returned.session_id != snapshot.session_id
+            || snapshot.execution_identity.mission_id() != Some(returned.mission_id.as_str())
             || returned.graph_id != snapshot.graph_id
             || returned.node_id != snapshot.node_id
             || returned.attempt != snapshot.attempt
@@ -1494,7 +1582,7 @@ fn ensure_team_backend_trusted(
     packet: &AgentTaskPacket,
     backend_kind: AgentBackendKind,
 ) -> Result<(), String> {
-    if packet.team_id.is_some() && backend_kind != AgentBackendKind::InProcess {
+    if packet.team_id().is_some() && backend_kind != AgentBackendKind::InProcess {
         Err(
             "Team acceptance/evidence/change receipts require the Cowd-native in-process Runtime backend"
                 .to_string(),
@@ -1636,14 +1724,14 @@ fn return_packet(
     failure: Option<String>,
 ) -> AgentReturnPacket {
     AgentReturnPacket {
-        run_id: packet.run_id.clone(),
-        agent_id: packet.agent_id.clone(),
-        task_id: packet.task_id.clone(),
-        session_id: packet.session_id.clone(),
-        mission_id: packet.mission_id.clone(),
-        team_id: packet.team_id.clone(),
-        graph_id: packet.graph_id.clone(),
-        node_id: packet.node_id.clone(),
+        run_id: packet.run_id().to_string(),
+        agent_id: packet.agent_id().to_string(),
+        task_id: packet.task_id().to_string(),
+        session_id: packet.session_id().to_string(),
+        mission_id: packet.mission_id().to_string(),
+        team_id: packet.team_id().map(str::to_owned),
+        graph_id: packet.graph_id().to_string(),
+        node_id: packet.node_id().to_string(),
         attempt: packet.attempt,
         expected_graph_revision: packet.expected_graph_revision,
         status,
@@ -1701,14 +1789,14 @@ mod tests {
             selection: AgentModelSelection,
         ) -> Result<AgentReturnPacket, String> {
             Ok(AgentReturnPacket {
-                run_id: packet.run_id,
-                agent_id: packet.agent_id,
-                task_id: packet.task_id,
-                session_id: packet.session_id,
-                mission_id: packet.mission_id,
-                team_id: packet.team_id,
-                graph_id: packet.graph_id,
-                node_id: packet.node_id,
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                session_id: packet.session_id().to_string(),
+                mission_id: packet.mission_id().to_string(),
+                team_id: packet.team_id().map(ToString::to_string),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 status: AgentTerminalStatus::Completed,
@@ -1802,15 +1890,19 @@ mod tests {
     fn task(agent_id: &str) -> AgentTaskPacket {
         let binding = test_binding(agent_id);
         let instance_id = binding.instance.instance_id.clone();
+        let definition_ref = binding.definition_ref.clone();
         AgentTaskPacket {
-            run_id: format!("run-{agent_id}"),
-            agent_id: instance_id.clone(),
-            task_id: "task-1".into(),
-            session_id: "session-1".into(),
-            mission_id: None,
-            team_id: None,
-            graph_id: "graph-1".into(),
-            node_id: "node-1".into(),
+            assignment: crate::test_support::agent_assignment(
+                Some(definition_ref),
+                &instance_id,
+                &format!("run-{agent_id}"),
+                "task-1",
+                "session-1",
+                "mission-1",
+                None,
+                "graph-1",
+                "node-1",
+            ),
             attempt: 1,
             expected_graph_revision: 1,
             objective: "verify lifecycle".into(),
@@ -1830,10 +1922,30 @@ mod tests {
         }
     }
 
+    fn team_task(agent_id: &str, team_run_id: &str) -> AgentTaskPacket {
+        let mut packet = task(agent_id);
+        let definition_ref = packet.assignment.definition_ref.clone();
+        packet.assignment = crate::test_support::agent_assignment(
+            Some(definition_ref),
+            packet.agent_id(),
+            packet.run_id(),
+            packet.task_id(),
+            packet.session_id(),
+            packet.mission_id(),
+            Some(team_run_id),
+            packet.graph_id(),
+            packet.node_id(),
+        );
+        if let Some(binding) = packet.binding.as_mut() {
+            binding.data_lease.team_id = Some(team_run_id.to_string());
+            binding.data_lease.team_working_state_visible = true;
+        }
+        packet
+    }
+
     #[test]
     fn process_backend_cannot_mint_team_acceptance_or_change_receipts() {
-        let mut packet = task("external-team");
-        packet.team_id = Some("team-1".to_string());
+        let mut packet = team_task("external-team", "team-1");
         packet.binding.as_mut().expect("binding").executor =
             harness_contract::agent::AgentExecutorPolicy::ProcessJsonl {
                 command_ref: "external/worker".to_string(),
@@ -1862,13 +1974,13 @@ mod tests {
         assert_eq!(returned.status, AgentTerminalStatus::Cancelled);
         assert_eq!(
             runtime
-                .get(&packet.agent_id)
+                .get(packet.agent_id())
                 .expect("cancelled projection")
                 .status,
             AgentStatus::Cancelled
         );
         assert!(runtime
-            .events(&packet.agent_id)
+            .events(packet.agent_id())
             .iter()
             .any(|event| event.status == AgentStatus::Cancelled));
     }
@@ -1878,9 +1990,7 @@ mod tests {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
         let runtime = AgentRuntime::new(store, configured_registry());
         runtime.register_backend(Arc::new(CompletedBackend));
-        let mut packet = task("invalid-acceptance");
-        packet.team_id = Some("team-1".to_string());
-        packet.binding.as_mut().expect("binding").data_lease.team_id = packet.team_id.clone();
+        let mut packet = team_task("invalid-acceptance", "team-1");
         packet.acceptance = vec!["evidence".to_string()];
         packet.constraints.push(format!(
             "team_acceptance_contract:{}",
@@ -1907,13 +2017,13 @@ mod tests {
         assert_eq!(returned.output_tokens, 2);
         assert_eq!(
             runtime
-                .get(&packet.agent_id)
+                .get(packet.agent_id())
                 .expect("terminal projection")
                 .status,
             AgentStatus::Failed
         );
         assert!(runtime
-            .events(&packet.agent_id)
+            .events(packet.agent_id())
             .iter()
             .any(|event| event.status == AgentStatus::Failed));
     }
@@ -1927,7 +2037,7 @@ mod tests {
         runtime
             .persist_snapshot(prepared, "agent.prepared", "prepared", None, None)
             .expect("prepare");
-        let stale_prepared = runtime.get(&packet.agent_id).expect("prepared projection");
+        let stale_prepared = runtime.get(packet.agent_id()).expect("prepared projection");
         let mut cancelled = stale_prepared.clone();
         cancelled.status = AgentStatus::Cancelled;
         runtime
@@ -1940,19 +2050,20 @@ mod tests {
             .persist_snapshot(stale_running, "agent.running", "running", None, None)
             .is_err());
         assert_eq!(
-            runtime.get(&packet.agent_id).expect("terminal").status,
+            runtime.get(packet.agent_id()).expect("terminal").status,
             AgentStatus::Cancelled
         );
     }
 
     fn legacy_snapshot(packet: &AgentTaskPacket, status: AgentStatus) -> AgentRunSnapshot {
         AgentRunSnapshot {
-            run_id: packet.run_id.clone(),
-            agent_id: packet.agent_id.clone(),
-            task_id: packet.task_id.clone(),
-            session_id: packet.session_id.clone(),
-            graph_id: packet.graph_id.clone(),
-            node_id: packet.node_id.clone(),
+            execution_identity: packet.assignment.execution_identity.clone(),
+            run_id: packet.run_id().to_string(),
+            agent_id: packet.agent_id().to_string(),
+            task_id: packet.task_id().to_string(),
+            session_id: packet.session_id().to_string(),
+            graph_id: packet.graph_id().to_string(),
+            node_id: packet.node_id().to_string(),
             attempt: packet.attempt,
             expected_graph_revision: packet.expected_graph_revision,
             backend: AgentBackendKind::InProcess,
@@ -1998,10 +2109,13 @@ mod tests {
             .expect("import succeeds");
         assert!(!report.duplicate);
         assert_eq!(report.imported_agent_ids.len(), 2);
-        assert_eq!(report.blocked_agent_ids, vec![active.agent_id.clone()]);
+        assert_eq!(
+            report.blocked_agent_ids,
+            vec![active.agent_id().to_string()]
+        );
         assert_eq!(
             runtime
-                .get(&active.agent_id)
+                .get(active.agent_id())
                 .expect("active projection")
                 .status,
             AgentStatus::Blocked
@@ -2017,7 +2131,7 @@ mod tests {
         let replayed = AgentRuntime::new(Arc::clone(&store), configured_registry());
         assert_eq!(
             replayed
-                .get(&completed.agent_id)
+                .get(completed.agent_id())
                 .expect("terminal replay")
                 .status,
             AgentStatus::Completed
@@ -2036,7 +2150,7 @@ mod tests {
         let valid = task("legacy-valid");
         let mut invalid_snapshot = legacy_snapshot(&task("legacy-invalid"), AgentStatus::Running);
         invalid_snapshot.graph_id.clear();
-        let error = runtime
+        runtime
             .import_legacy_state_records(
                 "bad-upgrade-manifest",
                 vec![
@@ -2053,8 +2167,7 @@ mod tests {
                 ],
             )
             .expect_err("unbound records are rejected");
-        assert!(error.contains("canonical binding"));
-        assert!(runtime.get(&valid.agent_id).is_none());
+        assert!(runtime.get(valid.agent_id()).is_none());
         assert!(store
             .list_stream(&legacy_import_stream_id("bad-upgrade-manifest"))
             .expect("marker stream")
@@ -2071,10 +2184,36 @@ mod tests {
         let returned = runtime.execute_task(packet.clone()).await.expect("run");
         assert_eq!(returned.status, AgentTerminalStatus::Completed);
         assert_eq!(
-            runtime.get(&packet.agent_id).unwrap().status,
+            runtime.get(packet.agent_id()).unwrap().status,
             AgentStatus::Completed
         );
-        assert_eq!(runtime.events(&packet.agent_id).len(), 3);
+        assert_eq!(runtime.events(packet.agent_id()).len(), 3);
+        let terminal = store
+            .list_stream(&agent_stream_id(packet.agent_id()))
+            .expect("agent event stream")
+            .into_iter()
+            .last()
+            .expect("terminal agent event");
+        for (kind, id) in [
+            ("principal", "test.principal"),
+            ("workspace", "test-workspace"),
+            ("mission", packet.mission_id()),
+            ("task", packet.task_id()),
+            ("session", packet.session_id()),
+            ("turn", "test-turn"),
+            ("execution_graph", packet.graph_id()),
+            ("agent_instance", packet.agent_id()),
+            ("agent_run", packet.run_id()),
+            ("node", packet.node_id()),
+        ] {
+            assert!(
+                terminal
+                    .refs
+                    .iter()
+                    .any(|reference| reference.kind == kind && reference.id == id),
+                "terminal Agent event must retain {kind}:{id}"
+            );
+        }
         let evaluations = runtime.evaluations();
         assert_eq!(evaluations.len(), 1);
         assert_eq!(evaluations[0].definition_revision, 1);
@@ -2085,15 +2224,15 @@ mod tests {
             .await
             .expect("replay result");
         assert_eq!(replayed_return, returned);
-        assert_eq!(runtime.events(&packet.agent_id).len(), 3);
+        assert_eq!(runtime.events(packet.agent_id()).len(), 3);
 
         let restored = AgentRuntime::new(store, configured_registry());
         assert_eq!(restored.evaluations().len(), 1);
         assert_eq!(restored.self_models()[0].run_count, 1);
-        let snapshot = restored.get(&packet.agent_id).expect("replayed snapshot");
+        let snapshot = restored.get(packet.agent_id()).expect("replayed snapshot");
         assert_eq!(snapshot.status, AgentStatus::Completed);
-        assert_eq!(snapshot.graph_id, packet.graph_id);
-        assert_eq!(snapshot.node_id, packet.node_id);
+        assert_eq!(snapshot.graph_id, packet.graph_id());
+        assert_eq!(snapshot.node_id, packet.node_id());
         assert_eq!(
             restored
                 .execute_task(packet)
@@ -2101,6 +2240,19 @@ mod tests {
                 .expect("restored return"),
             returned
         );
+    }
+
+    #[test]
+    fn team_agent_snapshot_refs_preserve_the_team_lineage() {
+        let packet = team_task("team-lineage", "team-run-1");
+        let snapshot = legacy_snapshot(&packet, AgentStatus::Running);
+        let refs = snapshot_identity_refs(&snapshot);
+        assert!(refs
+            .iter()
+            .any(|reference| reference.kind == "team_run" && reference.id == "team-run-1"));
+        assert!(refs.iter().any(|reference| {
+            reference.kind == "agent_instance" && reference.id == packet.agent_id()
+        }));
     }
 
     #[tokio::test]
@@ -2113,12 +2265,13 @@ mod tests {
         let packet = task("agent-command");
         runtime
             .restore_verified_run(AgentRunSnapshot {
-                run_id: packet.run_id.clone(),
-                agent_id: packet.agent_id.clone(),
-                task_id: packet.task_id.clone(),
-                session_id: packet.session_id.clone(),
-                graph_id: packet.graph_id.clone(),
-                node_id: packet.node_id.clone(),
+                execution_identity: packet.assignment.execution_identity.clone(),
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                session_id: packet.session_id().to_string(),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 backend: AgentBackendKind::InProcess,
@@ -2132,10 +2285,10 @@ mod tests {
                 failure: None,
             })
             .expect("restore");
-        let revision = runtime.get(&packet.agent_id).unwrap().revision;
+        let revision = runtime.get(packet.agent_id()).unwrap().revision;
         let command = AgentCommandRequest {
             command_id: "command-1".into(),
-            agent_id: packet.agent_id.clone(),
+            agent_id: packet.agent_id().to_string(),
             expected_revision: revision,
             command: AgentCommand::Interrupt,
             input: None,
@@ -2144,7 +2297,7 @@ mod tests {
         let duplicate = runtime.command(command).await;
         assert!(first.accepted);
         assert_eq!(first, duplicate);
-        assert_eq!(runtime.events(&packet.agent_id).len(), 2);
+        assert_eq!(runtime.events(packet.agent_id()).len(), 2);
     }
 
     #[test]
@@ -2160,7 +2313,7 @@ mod tests {
 
         runtime
             .record_progress(
-                &packet.agent_id,
+                packet.agent_id(),
                 "agent.provider.first_output",
                 "provider emitted the first output",
             )
@@ -2168,12 +2321,12 @@ mod tests {
 
         assert_eq!(
             runtime
-                .get(&packet.agent_id)
+                .get(packet.agent_id())
                 .expect("agent projection")
                 .status,
             AgentStatus::Running
         );
-        let events = runtime.events(&packet.agent_id);
+        let events = runtime.events(packet.agent_id());
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, "agent.provider.first_output");
     }
@@ -2190,10 +2343,10 @@ mod tests {
             .await
             .expect("blocked return");
         assert_eq!(returned.status, AgentTerminalStatus::Blocked);
-        let snapshot = runtime.get(&packet.agent_id).expect("blocked snapshot");
+        let snapshot = runtime.get(packet.agent_id()).expect("blocked snapshot");
         assert_eq!(snapshot.status, AgentStatus::Blocked);
         assert!(snapshot.failure.is_some());
-        assert_eq!(runtime.events(&packet.agent_id).len(), 1);
+        assert_eq!(runtime.events(packet.agent_id()).len(), 1);
     }
 
     #[test]
@@ -2205,12 +2358,13 @@ mod tests {
         let packet = task("agent-recovery");
         runtime
             .restore_verified_run(AgentRunSnapshot {
-                run_id: packet.run_id.clone(),
-                agent_id: packet.agent_id.clone(),
-                task_id: packet.task_id.clone(),
-                session_id: packet.session_id.clone(),
-                graph_id: packet.graph_id.clone(),
-                node_id: packet.node_id.clone(),
+                execution_identity: packet.assignment.execution_identity.clone(),
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                session_id: packet.session_id().to_string(),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
                 attempt: packet.attempt,
                 expected_graph_revision: packet.expected_graph_revision,
                 backend: AgentBackendKind::ProcessJsonl,
@@ -2227,9 +2381,9 @@ mod tests {
 
         assert_eq!(
             runtime.block_unrecoverable_replayed_runs().expect("block"),
-            vec![packet.agent_id.clone()]
+            vec![packet.agent_id().to_string()]
         );
-        let snapshot = runtime.get(&packet.agent_id).expect("blocked run");
+        let snapshot = runtime.get(packet.agent_id()).expect("blocked run");
         assert_eq!(snapshot.status, AgentStatus::Blocked);
         assert!(snapshot
             .failure

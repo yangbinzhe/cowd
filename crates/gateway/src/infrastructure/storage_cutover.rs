@@ -312,16 +312,20 @@ impl CutoverContext {
             ));
         }
         {
-            let source = source.task_kernel.runtime_kernel();
-            let target = target.task_kernel.runtime_kernel();
+            let source = Arc::clone(&source.task_service);
+            let target = Arc::clone(&target.task_service);
             let path = detail_root.join("task.json");
             jobs.push((
                 "runtime_task",
                 tokio::task::spawn_blocking(move || {
                     record(
                         "runtime_task",
-                        runtime_postgres::copy_quiesced_task_kernel(&source, &target, path)
-                            .map_err(stringify)?,
+                        runtime_postgres::copy_quiesced_task_service(
+                            source.as_ref(),
+                            target.as_ref(),
+                            path,
+                        )
+                        .map_err(stringify)?,
                     )
                 }),
             ));

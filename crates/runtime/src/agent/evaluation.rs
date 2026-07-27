@@ -79,7 +79,7 @@ impl AgentRunEvaluation {
         let environment_fingerprint = digest_json(&serde_json::json!({
             "provider": returned.provider,
             "model": returned.model,
-            "team_id": packet.team_id,
+            "team_id": packet.team_id(),
             "permission_lease": packet.permission_lease,
             "tool_contract_refs": binding.tool_contract_refs,
             "skill_refs": binding.skill_refs,
@@ -87,10 +87,11 @@ impl AgentRunEvaluation {
         Some(Self {
             evaluation_id: format!(
                 "agent-run-evaluation:{}:{}",
-                packet.run_id, binding.binding_digest
+                packet.run_id(),
+                binding.binding_digest
             ),
-            run_id: packet.run_id.clone(),
-            agent_instance_id: packet.agent_id.clone(),
+            run_id: packet.run_id().to_string(),
+            agent_instance_id: packet.agent_id().to_string(),
             definition_id: binding.definition_ref.definition_id.as_str().to_string(),
             definition_revision: binding.definition_ref.revision,
             binding_digest: binding.binding_digest.clone(),
@@ -100,7 +101,7 @@ impl AgentRunEvaluation {
                 .map(|release| release.assignment_id.clone()),
             release_generation: binding.release.as_ref().map(|release| release.generation),
             release_channel: binding.release.as_ref().map(|release| release.channel),
-            task_id: packet.task_id.clone(),
+            task_id: packet.task_id().to_string(),
             task_domain: task_domain(packet),
             complexity: task_complexity(packet),
             role_slot_id: binding.instance.role_slot_id.clone().unwrap_or_default(),
@@ -110,7 +111,7 @@ impl AgentRunEvaluation {
             allowed_tools,
             allowed_skills,
             memory_reality_fingerprint,
-            team_id: packet.team_id.clone(),
+            team_id: packet.team_id().map(str::to_owned),
             environment_fingerprint,
             terminal_status: returned.status,
             acceptance: packet.acceptance.clone(),
@@ -233,7 +234,7 @@ pub fn project_self_models(
 
 fn task_domain(packet: &AgentTaskPacket) -> String {
     packet
-        .task_id
+        .task_id()
         .split([':', '/', '-'])
         .find(|part| !part.trim().is_empty())
         .unwrap_or("general")
@@ -244,7 +245,7 @@ fn task_complexity(packet: &AgentTaskPacket) -> String {
     let score = packet.acceptance.len()
         + packet.constraints.len()
         + packet.context_refs.len()
-        + usize::from(packet.team_id.is_some());
+        + usize::from(packet.team_id().is_some());
     match score {
         0..=2 => "low",
         3..=6 => "medium",

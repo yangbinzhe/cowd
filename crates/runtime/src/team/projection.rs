@@ -66,7 +66,7 @@ impl TeamProjectionReader {
     fn project_graph(&self, graph: ExecutionGraph) -> Result<TeamProjection, String> {
         let mut tasks = Vec::new();
         let mut team_id = None;
-        let mut session_id = None;
+        let mut session_id: Option<String> = None;
         for node in graph
             .nodes
             .iter()
@@ -75,8 +75,8 @@ impl TeamProjectionReader {
             let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
                 .map_err(|error| format!("invalid team AgentTask packet {}: {error}", node.id))?;
             let packet_team = packet
-                .team_id
-                .clone()
+                .team_id()
+                .map(str::to_owned)
                 .ok_or_else(|| format!("AgentTask {} is not bound to a team", node.id))?;
             if let Some(existing) = &team_id {
                 if existing != &packet_team {
@@ -89,21 +89,21 @@ impl TeamProjectionReader {
                 team_id = Some(packet_team);
             }
             if let Some(existing) = &session_id {
-                if existing != &packet.session_id {
+                if existing.as_str() != packet.session_id() {
                     return Err(format!(
                         "graph {} contains multiple team session identities",
                         graph.id
                     ));
                 }
             } else {
-                session_id = Some(packet.session_id.clone());
+                session_id = Some(packet.session_id().to_string());
             }
-            let returned = self.agents.terminal_return(&packet.agent_id);
+            let returned = self.agents.terminal_return(packet.agent_id());
             tasks.push(TeamTaskTrace {
-                task_id: packet.task_id,
+                task_id: packet.task_id().to_string(),
                 role_id: node.id.rsplit(':').next().unwrap_or_default().to_string(),
-                agent_id: packet.agent_id,
-                run_id: packet.run_id,
+                agent_id: packet.agent_id().to_string(),
+                run_id: packet.run_id().to_string(),
                 node_id: node.id.clone(),
                 status: graph
                     .node_statuses

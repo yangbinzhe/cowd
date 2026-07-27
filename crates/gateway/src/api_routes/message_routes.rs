@@ -3,7 +3,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::task_kernel::TaskRecord;
 use axum::{
     extract::{Extension, Path, Query, State as AxumState},
     http::{HeaderMap, StatusCode},
@@ -14,7 +13,7 @@ use axum::{
 use harness_contract::turn::{
     InputRoutingDecision, InputSourceKind, SessionInputEnvelope, SessionInputId, TurnId,
 };
-use runtime::{ContextProfile, ResumeContextPacket, ResumeContextSource};
+use runtime::{ContextProfile, ResumeContextPacket, ResumeContextSource, TaskAggregate};
 use serde::Deserialize;
 
 use super::{
@@ -100,12 +99,12 @@ fn current_time_ms() -> u64 {
 
 pub(super) fn task_resume_context_packet(
     session_id: &str,
-    task: &TaskRecord,
+    task: &TaskAggregate,
 ) -> ResumeContextPacket {
-    let current_phase = task.current_phase.as_ref().and_then(|phase_ref| {
+    let current_phase = task.current_phase_id.as_ref().and_then(|phase_ref| {
         task.phases
             .iter()
-            .find(|phase| &phase.id == phase_ref || &phase.name == phase_ref)
+            .find(|phase| &phase.phase_id == phase_ref || &phase.name == phase_ref)
     });
     let phase_summary = current_phase.map(|phase| {
         format!(
@@ -118,9 +117,9 @@ pub(super) fn task_resume_context_packet(
     });
     let active_task = Some(format!(
         "id={} status={} yolo={} objective={}{}",
-        task.id,
+        task.task_id,
         task.status.as_str(),
-        task.yolo_mode,
+        task.execution_policy.yolo_mode,
         task.objective,
         phase_summary
             .as_ref()
@@ -128,11 +127,18 @@ pub(super) fn task_resume_context_packet(
             .unwrap_or_default()
     ));
     let recent_decisions = task
-        .audit
+        .phases
         .iter()
         .rev()
         .take(5)
-        .map(|event| format!("{}: {}", event.event_type, event.message))
+        .map(|phase| {
+            format!(
+                "phase={} status={} revision={}",
+                phase.name,
+                phase.status.as_str(),
+                phase.revision
+            )
+        })
         .collect::<Vec<_>>();
     let mut blockers = Vec::new();
     if let Some(reason) = task

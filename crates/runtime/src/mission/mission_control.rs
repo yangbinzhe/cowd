@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{MissionEvent, MissionProjection, MissionSessionSnapshot, RuntimeServices};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionWorkspace {
     pub workspace_id: String,
     pub title: String,
@@ -89,7 +89,7 @@ pub struct MissionControlEventLine {
     pub created_at_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MissionControlProjection {
     pub kind: String,
     pub workspace: MissionWorkspace,
@@ -286,7 +286,7 @@ fn build_projection(services: &RuntimeServices) -> MissionControlProjection {
         event_digest.recovery_required.len(),
     );
     let workspace = MissionWorkspace {
-        workspace_id: "mission-control:default".to_string(),
+        workspace_id: services.workspace_key().to_string(),
         title: "Mission Control".to_string(),
         active_session_id: mission.active_session_id.clone(),
         session_count: summary.session_count,
@@ -806,7 +806,18 @@ fn translate_command(
         expected_revision,
         correlation_id: format!("mission-control:{command_id}"),
         payload,
-        evidence_refs: command.evidence_refs.clone(),
+        evidence_refs: command
+            .evidence_refs
+            .iter()
+            .map(|reference| {
+                harness_contract::reality::EvidenceRef::new(
+                    "mission_control",
+                    reference,
+                    harness_contract::reality::RealityBoundary::Observed,
+                )
+                .with_source("runtime.mission_control")
+            })
+            .collect(),
     })
 }
 

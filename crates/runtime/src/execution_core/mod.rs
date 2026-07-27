@@ -65,7 +65,7 @@ pub use services::RuntimeFixtureEventPort;
 pub use services::{
     ExecutionStartupRecoveryError, ExecutionStartupRecoveryRecord, ExecutionStartupRecoveryReport,
     RuntimeEventReader, RuntimeServices, RuntimeServicesBuilder, RuntimeServicesError,
-    SessionTerminalDeliveryPort, TaskLifecycleEvent, TaskLifecycleKind,
+    SessionTerminalDeliveryPort,
 };
 pub use strategy_decision::{
     action_selection_report_for_decision, build_runtime_action_selection_report,

@@ -500,7 +500,7 @@ impl SessionWorkerSupervisor {
             delivery_factory,
             WorkerSupervisorConfig::default(),
         );
-        let mission_runtime = Arc::clone(runtime_service.runtime_services().mission_runtime());
+        let mission_runtime = runtime::MissionRuntimePort::new(runtime_service.runtime_services());
         let workspace_key = runtime_service
             .runtime_services()
             .workspace_key()
@@ -508,7 +508,7 @@ impl SessionWorkerSupervisor {
         let mission_states = Arc::clone(&states);
         let mission_factory: WorkerFactory = Arc::new(move |shutdown, ready| {
             let session_service = Arc::clone(&mission_service);
-            let mission_runtime = Arc::clone(&mission_runtime);
+            let mission_runtime = mission_runtime.clone();
             let workspace_key = workspace_key.clone();
             let reporter = WorkerBackendReporter {
                 name: "mission_membership",
@@ -1502,7 +1502,7 @@ fn finish_reconciliation_backend_round(
 
 async fn run_mission_membership_worker(
     session_service: Arc<SessionService>,
-    mission: Arc<runtime::MissionRuntime>,
+    mission: runtime::MissionRuntimePort,
     workspace_key: String,
     reporter: WorkerBackendReporter,
     mut shutdown: watch::Receiver<bool>,
@@ -1557,7 +1557,7 @@ async fn run_mission_membership_worker(
 
 async fn materialize_mission_membership(
     session_service: &SessionService,
-    mission: &runtime::MissionRuntime,
+    mission: &runtime::MissionRuntimePort,
     worker_id: &str,
     record: session::SessionMissionOutboxRecord,
 ) {
@@ -1575,7 +1575,7 @@ async fn materialize_mission_membership(
             })
             .map(|_| ()),
         SessionMissionOutboxOperation::Close => {
-            if mission.get_session(&record.session_id).is_some() {
+            if mission.session(&record.session_id).is_some() {
                 mission.close_session(&record.session_id).map(|_| ())
             } else {
                 // A close may race a never-materialized register. There is no
@@ -3042,17 +3042,12 @@ mod tests {
             .unwrap()
             .pop()
             .unwrap();
-        let mission = Arc::new(
-            runtime::MissionRuntime::event_sourced(
-                Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap()),
-                "workspace-a",
-            )
-            .unwrap(),
-        );
+        let mission =
+            runtime::MissionRuntimePort::new(runtime::RuntimeServices::in_memory().unwrap());
 
         materialize_mission_membership(&session_service, &mission, "worker", claimed).await;
 
-        assert!(mission.get_session("mission-session").is_some());
+        assert!(mission.session("mission-session").is_some());
         assert_eq!(
             store
                 .get_session_mission_outbox("mission-register-1")
@@ -3097,13 +3092,8 @@ mod tests {
             .await
             .unwrap();
         let session_service = test_session_service(Arc::clone(&store), SessionProjectionHub::new());
-        let mission = Arc::new(
-            runtime::MissionRuntime::event_sourced(
-                Arc::new(runtime::RuntimeEventStore::try_open_in_memory().unwrap()),
-                "workspace-a",
-            )
-            .unwrap(),
-        );
+        let mission =
+            runtime::MissionRuntimePort::new(runtime::RuntimeServices::in_memory().unwrap());
         let first = session_service
             .claim_mission_work("workspace-a", "worker-a", 100, 50, 10)
             .await
@@ -3122,12 +3112,13 @@ mod tests {
             .unwrap();
         materialize_mission_membership(&session_service, &mission, "worker-b", replay).await;
 
-        assert_eq!(mission.list_sessions().len(), 1);
+        let projection = mission.projection();
+        assert_eq!(projection.sessions.len(), 1);
         assert_eq!(
-            mission
-                .events()
+            projection
+                .events
                 .iter()
-                .filter(|event| event.event_type == "mission.session.registered")
+                .filter(|event| event.event_type == "mission.presence.registered")
                 .count(),
             1
         );
