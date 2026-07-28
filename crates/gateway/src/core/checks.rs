@@ -409,7 +409,6 @@ pub(crate) fn check_system_health(
 }
 
 pub(crate) fn check_enterprise_readiness(
-    cwd: &Path,
     config: Result<&runtime::RuntimeConfig, &runtime::ConfigError>,
 ) -> DiagnosticCheck {
     let mut details = Vec::new();
@@ -435,24 +434,10 @@ pub(crate) fn check_enterprise_readiness(
 
     match config {
         Ok(runtime_config) => {
-            let webui_index = cwd.join("webui").join("index.html");
-            let webui_modules = [
-                "api.js",
-                "boot.js",
-                "commands.js",
-                "messages.js",
-                "panels.js",
-                "sessions.js",
-                "state.js",
-                "ui.js",
-                "workspace.js",
-            ];
-            let missing_webui_modules = webui_modules
-                .iter()
-                .filter(|name| !cwd.join("webui").join(name).exists())
-                .copied()
-                .collect::<Vec<_>>();
-            let webui_ok = webui_index.exists() && missing_webui_modules.is_empty();
+            let static_webui = crate::gateway_static::resolve_static_webui_source(
+                runtime_config.gateway().webui_dir.as_deref(),
+            );
+            let webui_ok = static_webui.available;
             push_component(
                 "webui",
                 if webui_ok {
@@ -461,13 +446,30 @@ pub(crate) fn check_enterprise_readiness(
                     DiagnosticLevel::Warn
                 },
                 if webui_ok {
-                    "static WebUI assets are present".to_string()
+                    "configured static WebUI is ready".to_string()
                 } else {
-                    "static WebUI assets are incomplete from this cwd".to_string()
+                    "gateway.webui_dir is not configured with an index.html".to_string()
                 },
                 Map::from_iter([
-                    ("index_present".to_string(), json!(webui_index.exists())),
-                    ("missing_modules".to_string(), json!(missing_webui_modules)),
+                    ("config_key".to_string(), json!(static_webui.config_key)),
+                    (
+                        "configured_path".to_string(),
+                        json!(static_webui
+                            .configured_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())),
+                    ),
+                    (
+                        "index_path".to_string(),
+                        json!(static_webui
+                            .index_path
+                            .as_ref()
+                            .map(|path| path.display().to_string())),
+                    ),
+                    (
+                        "runtime_status".to_string(),
+                        json!(static_webui.status.as_str()),
+                    ),
                 ]),
             );
 
@@ -617,4 +619,43 @@ pub(crate) fn check_enterprise_readiness(
         ("component_warnings".to_string(), json!(warn_count)),
         ("component_failures".to_string(), json!(fail_count)),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn enterprise_webui_readiness_uses_the_configured_vite_bundle() {
+        let root = tempfile::tempdir().expect("create test root");
+        let workspace = root.path().join("workspace");
+        let config_home = root.path().join("config");
+        let webui = root.path().join("webui-dist");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        fs::create_dir_all(&config_home).expect("create config home");
+        fs::create_dir_all(&webui).expect("create webui");
+        fs::write(
+            webui.join("index.html"),
+            r#"<script type="module" src="./assets/app/index.dev-hash.js"></script>"#,
+        )
+        .expect("write Vite index");
+        fs::write(
+            config_home.join("config.yaml"),
+            format!("gateway:\n  webui_dir: {}\n", webui.display()),
+        )
+        .expect("write config");
+
+        let config = ConfigLoader::new(&workspace, &config_home)
+            .load()
+            .expect("load config");
+        let report = check_enterprise_readiness(Ok(&config)).json_value();
+        let webui_report = &report["components"]["webui"];
+
+        assert_eq!(webui_report["status"], "ok");
+        assert_eq!(webui_report["runtime_status"], "ready");
+        assert_eq!(webui_report["configured_path"], webui.display().to_string());
+        assert!(webui_report.get("missing_modules").is_none());
+    }
 }
