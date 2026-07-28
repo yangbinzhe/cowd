@@ -971,7 +971,7 @@ pub mod test_support {
     };
     use tools::ToolCatalog;
 
-    use super::{api_router, AppState};
+    use super::{api_router, live_routes, AppState};
     use crate::{
         event_bus::SessionProjectionHub,
         gateway::HotSessionPool,
