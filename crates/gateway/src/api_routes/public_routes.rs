@@ -16,7 +16,7 @@ use super::capability_contract::{
 use super::{
     authenticated_human_principal_for_surface, cookie_value, issue_web_session,
     validate_surface_capability_request, web_session_principal, AppState, ErrorResponse,
-    WEB_SESSION_COOKIE,
+    WEB_SESSION_COOKIE, WEB_SESSION_TTL_SECONDS,
 };
 
 pub(super) fn router() -> Router<Arc<AppState>> {
@@ -189,7 +189,7 @@ async fn login_handler(
                 )
             })?;
             let cookie = HeaderValue::from_str(&format!(
-                "{WEB_SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800"
+                "{WEB_SESSION_COOKIE}={session}; HttpOnly; SameSite=Strict; Path=/api; Max-Age={WEB_SESSION_TTL_SECONDS}"
             ))
             .map_err(|error| {
                 (
@@ -206,6 +206,7 @@ async fn login_handler(
                     "success": true,
                     "auth_required": true,
                     "session_kind": "broker_signed_http_only_cookie",
+                    "expires_in_seconds": WEB_SESSION_TTL_SECONDS,
                     "surface_id": surface_id,
                     "entitlement": entitlement,
                 })),

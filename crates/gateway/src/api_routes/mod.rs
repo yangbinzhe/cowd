@@ -202,6 +202,8 @@ pub(super) async fn require_session_writer_admission(
 pub(crate) struct AuthenticatedPrincipal(pub(crate) runtime::VerifiedPrincipal);
 
 pub(super) const WEB_SESSION_COOKIE: &str = "cowd_web_session";
+pub(super) const WEB_SESSION_TTL_SECONDS: u64 = 24 * 60 * 60;
+const WEB_SESSION_TTL_MS: u64 = WEB_SESSION_TTL_SECONDS * 1_000;
 
 /// Stable audit principal derived only from the verified Gateway credential.
 ///
@@ -584,7 +586,7 @@ pub(super) fn authenticated_human_principal_for_surface(
     }
 }
 
-/// Mint a short-lived browser session from a local human credential. The
+/// Mint a bounded browser session from a local human credential. The
 /// browser receives only a broker-signed principal envelope, never the raw
 /// credential. Gateway has no signing key and verifies this envelope again on
 /// every protected request.
@@ -606,7 +608,7 @@ pub(super) fn issue_web_session(
                 credential,
                 surface_id,
                 requested_capabilities,
-                Some(5 * 60 * 1_000),
+                Some(WEB_SESSION_TTL_MS),
             )
             .map_err(|error| error.to_string())?;
         let lifecycle = client
@@ -636,7 +638,7 @@ pub(super) fn issue_web_session(
                     credential,
                     surface_id,
                     requested_capabilities.clone(),
-                    Some(5 * 60 * 1_000),
+                    Some(WEB_SESSION_TTL_MS),
                 )
                 .map_err(|error| error.to_string())?;
             let lifecycle = client
@@ -662,7 +664,7 @@ pub(super) fn issue_web_session(
             config_home.join("auth-broker"),
             credential,
             requested_capabilities.clone(),
-            Some(5 * 60 * 1_000),
+            Some(WEB_SESSION_TTL_MS),
         )
         .map_err(|error| error.to_string())?;
         verify_human_envelope(&envelope, &public_key, 0)?;
@@ -748,7 +750,7 @@ pub(super) fn web_session_principal(
             config_home.join("auth-broker"),
             test_credential.ok_or_else(|| "test_browser_session_credential_missing".to_string())?,
             test_human_capabilities(),
-            Some(5 * 60 * 1_000),
+            Some(WEB_SESSION_TTL_MS),
         )
         .map_err(|error| error.to_string())?;
         verify_human_envelope(&envelope, &public_key, 0)

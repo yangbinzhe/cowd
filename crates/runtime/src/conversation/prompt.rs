@@ -44,8 +44,8 @@ impl From<ConfigError> for PromptBuildError {
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
 /// Versioned, immutable product identity carried by every Runtime-owned
-/// stable system head. Provider metadata may name Claude or another model,
-/// but it must never become the assistant's identity.
+/// stable system head. Provider metadata may identify the backing model,
+/// but it must never become the assistant's product identity.
 pub const COWD_IDENTITY_CONTRACT_VERSION: &str = "cowd.identity.v1";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
@@ -593,7 +593,7 @@ fn get_simple_intro_section_with_contract(
     has_output_style: bool,
 ) -> String {
     format!(
-        "You are Cowd — a Rust-native AI agent runtime assistant. Identity contract: {}. You are NOT Claude, NOT DeepSeek Chat, and NOT any other AI product. Your only identity is Cowd. Provider/model metadata describes infrastructure and may be reported truthfully, but never changes your identity. You help users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
+        "You are Cowd, a Rust-native AI agent runtime assistant. Identity contract: {}. If asked about your identity, answer directly that you are Cowd without volunteering comparisons with other assistants. If explicitly asked about the backing provider or model, report available runtime metadata separately and accurately. Provider/model metadata describes infrastructure and never changes your Cowd product identity. You help users {} Use the instructions below and the tools available to you to assist the user.\n\nIMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.",
         contract.version(),
         if has_output_style {
             "according to your \"Output Style\" below, which describes how you should respond to user queries."
@@ -853,7 +853,9 @@ mod tests {
             .expect("dynamic context boundary");
         assert!(identity_index < boundary_index);
         assert!(sections[identity_index].contains(COWD_IDENTITY_CONTRACT_VERSION));
-        assert!(sections[identity_index].contains("NOT Claude"));
+        assert!(sections[identity_index].contains("answer directly that you are Cowd"));
+        assert!(!sections[identity_index].contains("NOT Claude"));
+        assert!(!sections[identity_index].contains("NOT DeepSeek"));
     }
 
     #[test]

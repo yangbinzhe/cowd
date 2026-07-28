@@ -346,7 +346,7 @@ async fn task_slash_dispatch_executes_the_gateway_owned_task_service() {
 }
 
 #[tokio::test]
-async fn webui_login_uses_a_short_lived_http_only_cookie_not_a_browser_token() {
+async fn webui_login_uses_a_one_day_http_only_cookie_not_a_browser_token() {
     let harness = GatewayTestHarness::in_memory_with_auth_token("gateway-test-token")
         .expect("authenticated gateway test harness");
     let login = harness
@@ -371,11 +371,14 @@ async fn webui_login_uses_a_short_lived_http_only_cookie_not_a_browser_token() {
         .to_string();
     assert!(cookie.contains("cowd_web_session="));
     assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("Max-Age=86400"));
     assert!(!cookie.contains("gateway-test-token"));
     let body = to_bytes(login.into_body(), usize::MAX)
         .await
         .expect("login body");
     assert!(!String::from_utf8_lossy(&body).contains("gateway-test-token"));
+    let login_body: serde_json::Value = serde_json::from_slice(&body).expect("login response JSON");
+    assert_eq!(login_body["expires_in_seconds"], 86_400);
 
     let browser_session = cookie.split(';').next().expect("cookie pair");
     let accepted = harness
