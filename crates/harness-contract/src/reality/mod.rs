@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Boundary assigned to a fact, memory, or recall candidate before it can be
 /// used as authoritative reality context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RealityBoundary {
     Observed,
@@ -53,7 +53,9 @@ impl ClaimSupportState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceCompleteness {
     #[default]
@@ -177,7 +179,7 @@ impl RecallSourceKind {
 
 /// Stable evidence pointer shared by runtime, gateway, memory, matrix, and UI
 /// projections.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EvidenceRef {
     pub ref_type: String,
     pub id: String,

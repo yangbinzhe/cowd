@@ -462,6 +462,11 @@ pub struct App {
     /// an older non-terminal snapshot can otherwise reopen a completed turn
     /// and make a passive Surface reject the next execution's deltas.
     terminal_correlations: VecDeque<(String, String)>,
+    /// Durable ingress identities that may later become the active execution.
+    /// Session input projections own queue state; this set only lets a
+    /// subsequent live event prove that its already-committed execution has
+    /// started even when an intermediate phase envelope was coalesced.
+    committed_ingress_correlations: BTreeSet<(String, String)>,
 
     pub msg_version: u64,
     /// Non-transcript UI revision (composer, focus, modal/search selection).
@@ -820,6 +825,7 @@ impl App {
             turn_interaction: TurnInteractionState::default(),
             streaming_received: false,
             terminal_correlations: VecDeque::new(),
+            committed_ingress_correlations: BTreeSet::new(),
 
             msg_version: 0,
             render_version: 0,
@@ -2288,6 +2294,75 @@ impl App {
         true
     }
 
+    /// A non-queued Runtime phase is the canonical fact that an admitted
+    /// execution has actually started. A durable user message alone may still
+    /// represent a queued follow-up, so it cannot replace a running turn. Once
+    /// Runtime starts that follow-up, however, every observing Surface must
+    /// atomically leave the previous execution before accepting live deltas.
+    fn adopt_started_execution_correlation(
+        &mut self,
+        correlation: &crate::protocol::GatewayEventCorrelation,
+    ) -> bool {
+        if correlation.session_id != self.session_id
+            || correlation.execution_id.is_none()
+            || correlation.turn_id.is_none()
+        {
+            return self.adopt_live_correlation(correlation);
+        }
+        if self.current_execution_id.as_deref() != correlation.execution_id.as_deref()
+            || self.current_turn_id.as_deref() != correlation.turn_id.as_deref()
+        {
+            if let Some(previous_execution_id) = self.current_execution_id.clone() {
+                if let Some(previous_turn_id) = self.current_turn_id.clone() {
+                    self.record_terminal_correlation(&crate::protocol::GatewayEventCorrelation {
+                        session_id: self.session_id.clone(),
+                        execution_id: Some(previous_execution_id.clone()),
+                        turn_id: Some(previous_turn_id),
+                        ..crate::protocol::GatewayEventCorrelation::default()
+                    });
+                }
+                self.invalidate_execution_projection(&previous_execution_id);
+            } else {
+                self.reset_live_execution_facts();
+            }
+            self.current_execution_id = correlation.execution_id.clone();
+            self.current_turn_id = correlation.turn_id.clone();
+            if let Some(execution_id) = correlation.execution_id.as_deref() {
+                self.turn_interaction.ingress_accepted(execution_id);
+            }
+        }
+        self.adopt_live_correlation(correlation)
+    }
+
+    fn adopt_active_execution_correlation(
+        &mut self,
+        correlation: &crate::protocol::GatewayEventCorrelation,
+    ) -> bool {
+        let incoming_is_committed = correlation
+            .execution_id
+            .as_deref()
+            .zip(correlation.turn_id.as_deref())
+            .is_some_and(|(execution_id, turn_id)| {
+                self.committed_ingress_correlations
+                    .contains(&(execution_id.to_string(), turn_id.to_string()))
+            });
+        let incoming_differs = self.current_execution_id.as_deref()
+            != correlation.execution_id.as_deref()
+            || self.current_turn_id.as_deref() != correlation.turn_id.as_deref();
+        let current_is_terminal = self
+            .current_execution_id
+            .as_deref()
+            .is_some_and(|execution_id| self.execution_is_terminalized(execution_id))
+            || self
+                .current_execution_status
+                .is_some_and(harness_contract::projection::ExecutionLiveStatus::is_terminal);
+        let incoming_is_live = !self.correlation_is_terminalized(correlation);
+        if incoming_differs && incoming_is_live && (incoming_is_committed || current_is_terminal) {
+            return self.adopt_started_execution_correlation(correlation);
+        }
+        self.adopt_live_correlation(correlation)
+    }
+
     fn correlated_tool_instance_key(
         &self,
         correlation: &crate::protocol::GatewayEventCorrelation,
@@ -2347,6 +2422,13 @@ impl App {
                 };
                 let incoming_execution = correlation.execution_id.clone();
                 let incoming_turn = correlation.turn_id.clone();
+                if let Some(identity) = incoming_execution
+                    .as_ref()
+                    .zip(incoming_turn.as_ref())
+                    .map(|(execution_id, turn_id)| (execution_id.clone(), turn_id.clone()))
+                {
+                    self.committed_ingress_correlations.insert(identity);
+                }
                 let selects_visible_execution = self.current_execution_id.is_none()
                     || self.current_execution_id.as_deref() == incoming_execution.as_deref()
                     || !self.turn_is_active()
@@ -2417,7 +2499,7 @@ impl App {
                 end_bytes,
                 stream_revision,
             } => {
-                if !self.adopt_live_correlation(&correlation) {
+                if !self.adopt_active_execution_correlation(&correlation) {
                     self.add_system_notice(
                         SystemNoticeKind::Warning,
                         "Ignored an assistant delta without the current session/execution/turn identity",
@@ -2512,7 +2594,7 @@ impl App {
                 correlation,
                 thinking,
             } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     self.apply_event(CowdEvent::ThinkingDelta { thinking });
                 }
             }
@@ -2522,7 +2604,7 @@ impl App {
                 name,
                 preview,
             } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     let id = self.correlated_tool_instance_key(&correlation, &id);
                     self.apply_event(CowdEvent::ToolStart { id, name, preview });
                 }
@@ -2533,7 +2615,7 @@ impl App {
                 name,
                 progress,
             } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     let id = self.correlated_tool_instance_key(&correlation, &id);
                     self.apply_event(CowdEvent::ToolProgress { id, name, progress });
                 }
@@ -2545,7 +2627,7 @@ impl App {
                 summary,
                 exit_code,
             } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     let id = self.correlated_tool_instance_key(&correlation, &id);
                     self.apply_event(CowdEvent::ToolComplete {
                         id,
@@ -2563,7 +2645,13 @@ impl App {
                 if self.correlation_is_terminalized(&correlation) && !status.is_terminal() {
                     return;
                 }
-                if !self.adopt_live_correlation(&correlation) {
+                let adopted = if status == harness_contract::projection::ExecutionLiveStatus::Queued
+                {
+                    self.adopt_live_correlation(&correlation)
+                } else {
+                    self.adopt_started_execution_correlation(&correlation)
+                };
+                if !adopted {
                     return;
                 }
                 self.current_execution_status = Some(status);
@@ -2578,7 +2666,7 @@ impl App {
                 context_window_source,
                 packed_input_tokens,
             } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     self.apply_event(CowdEvent::ProviderAttempt {
                         model,
                         models_tried,
@@ -2592,12 +2680,12 @@ impl App {
                 correlation,
                 envelope,
             } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     self.apply_event(CowdEvent::ContextEnvelope { envelope });
                 }
             }
             GatewaySessionEvent::ContextWindow { correlation, value } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     self.apply_event(CowdEvent::ContextWindow(value));
                 }
             }
@@ -2608,7 +2696,7 @@ impl App {
                 cache_create,
                 cache_read,
             } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     self.apply_event(CowdEvent::TokenUsage {
                         input,
                         output,
@@ -2621,7 +2709,7 @@ impl App {
                 correlation,
                 telemetry,
             } => {
-                if self.adopt_live_correlation(&correlation) {
+                if self.adopt_active_execution_correlation(&correlation) {
                     self.apply_event(CowdEvent::RunModelTelemetry { telemetry });
                 }
             }
@@ -2682,6 +2770,14 @@ impl App {
                     }
                 }
                 self.record_terminal_correlation(&correlation);
+                if let Some(identity) = correlation
+                    .execution_id
+                    .as_ref()
+                    .zip(correlation.turn_id.as_ref())
+                    .map(|(execution_id, turn_id)| (execution_id.clone(), turn_id.clone()))
+                {
+                    self.committed_ingress_correlations.remove(&identity);
+                }
                 if let Some(message_id) = correlation.message_id.as_deref() {
                     if let Some(usage) = token_usage.as_ref() {
                         self.record_durable_message_usage(message_id, usage);
@@ -4121,20 +4217,27 @@ impl App {
             } => {
                 self.effective_model = Some(model);
                 self.model_source = Some("runtime.provider_attempt.model".to_string());
-                self.context_used_tokens = Some(packed_input_tokens);
-                self.context_window_tokens = Some(context_window_tokens);
-                self.context_remaining_tokens =
-                    Some(context_window_tokens.saturating_sub(packed_input_tokens));
-                self.context_usage_percent_bp = (context_window_tokens > 0).then(|| {
-                    packed_input_tokens
-                        .saturating_mul(10_000)
-                        .saturating_div(context_window_tokens)
-                        .min(10_000) as u16
-                });
-                self.context_usage_source = Some(format!(
-                    "runtime.provider_attempt.request_budget:{context_window_source}"
-                ));
-                self.context_window = context_window_tokens;
+                // ProviderAttempt is a pre-request estimate delivered on a
+                // separate event stream. It may arrive after the canonical
+                // terminal projection, so it must never replace observed
+                // provider usage for the same turn. TurnStarted resets these
+                // fields before the next request can install a new estimate.
+                if self.context_usage_source.as_deref() != Some("provider_actual") {
+                    self.context_used_tokens = Some(packed_input_tokens);
+                    self.context_window_tokens = Some(context_window_tokens);
+                    self.context_remaining_tokens =
+                        Some(context_window_tokens.saturating_sub(packed_input_tokens));
+                    self.context_usage_percent_bp = (context_window_tokens > 0).then(|| {
+                        packed_input_tokens
+                            .saturating_mul(10_000)
+                            .saturating_div(context_window_tokens)
+                            .min(10_000) as u16
+                    });
+                    self.context_usage_source = Some(format!(
+                        "runtime.provider_attempt.request_budget:{context_window_source}"
+                    ));
+                    self.context_window = context_window_tokens;
+                }
                 self.msg_version = self.msg_version.wrapping_add(1);
             }
             CowdEvent::ContextEnvelope { envelope } => {
@@ -4480,10 +4583,13 @@ mod tests {
         use harness_contract::projection::{ExecutionProjection, ProjectionCommandAvailability};
 
         let projection = |revision: u64, objective: &str| ExecutionProjection {
-            schema_version: 1,
+            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "execution-monotonic".to_string(),
             revision,
             cursor: revision,
+            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+            authorization_revision: 1,
+            redaction_revision: "redaction-1".to_string(),
             session_id: Some("session-monotonic".to_string()),
             mission_id: None,
             strategy: None,
@@ -4496,6 +4602,8 @@ mod tests {
             teams: Vec::new(),
             relations: Vec::new(),
             approvals: Vec::new(),
+            admissions: Vec::new(),
+            outcomes: Vec::new(),
             interventions: Vec::new(),
             usage: Vec::new(),
             context: Vec::new(),
@@ -4553,10 +4661,13 @@ mod tests {
         app.token_count = 66_000;
 
         assert!(app.apply_execution_projection(ExecutionProjection {
-            schema_version: 1,
+            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "execution-new".to_string(),
             revision: 1,
             cursor: 1,
+            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+            authorization_revision: 1,
+            redaction_revision: "redaction-1".to_string(),
             session_id: Some("session-live-missing".to_string()),
             mission_id: None,
             strategy: None,
@@ -4569,6 +4680,8 @@ mod tests {
             teams: Vec::new(),
             relations: Vec::new(),
             approvals: Vec::new(),
+            admissions: Vec::new(),
+            outcomes: Vec::new(),
             interventions: Vec::new(),
             usage: Vec::new(),
             context: Vec::new(),
@@ -4587,6 +4700,64 @@ mod tests {
         assert!(app.context_window_tokens.is_none());
         assert!(app.current_run_metrics.is_none());
         assert_eq!(app.token_count, 0);
+    }
+
+    #[test]
+    fn delayed_provider_attempt_cannot_replace_observed_projection_context_usage() {
+        use harness_contract::projection::{
+            ContextUsageProjection, ExecutionLiveState, ExecutionLiveStatus,
+        };
+
+        let mut app = App::new("requested-model", "session-context-authority");
+        app.install_execution_live_facts(
+            "execution-context-authority",
+            &ExecutionLiveState {
+                revision: 8,
+                status: ExecutionLiveStatus::Complete,
+                status_detail: None,
+                turn_id: Some("turn-context-authority".to_string()),
+                started_at_ms: 1,
+                updated_at_ms: 2,
+                last_progress_at_ms: 2,
+                context_usage: Some(ContextUsageProjection {
+                    model: Some("observed-model".to_string()),
+                    window_tokens: Some(16_384),
+                    window_source: Some("configured".to_string()),
+                    input_tokens: Some(188),
+                    input_source: Some("provider_actual".to_string()),
+                    remaining_tokens: Some(16_196),
+                    usage_percent_bp: Some(114),
+                    request_sequence: Some(5),
+                    components: Vec::new(),
+                }),
+                metrics: harness_contract::projection::RunMetricsProjection {
+                    input_tokens: 188,
+                    output_tokens: 19,
+                    total_tokens: 207,
+                    ..Default::default()
+                },
+                output_preview: None,
+                output_preview_start_bytes: 0,
+                output_bytes: 0,
+                terminal_ref: Some("terminal-context-authority".to_string()),
+                error: None,
+            },
+            None,
+        );
+
+        app.apply_event(CowdEvent::ProviderAttempt {
+            model: "observed-model".to_string(),
+            models_tried: vec!["observed-model".to_string()],
+            context_window_tokens: 16_384,
+            context_window_source: "configured".to_string(),
+            packed_input_tokens: 5_536,
+        });
+
+        assert_eq!(app.context_used_tokens, Some(188));
+        assert_eq!(app.context_remaining_tokens, Some(16_196));
+        assert_eq!(app.context_usage_percent_bp, Some(114));
+        assert_eq!(app.context_usage_source.as_deref(), Some("provider_actual"));
+        assert_eq!(app.current_run_metrics.as_ref().unwrap().total_tokens, 207);
     }
 
     #[test]
@@ -5567,6 +5738,204 @@ mod tests {
                 ..
             } if message_id == "message-queued"
         )));
+    }
+
+    #[test]
+    fn started_followup_replaces_stale_finalizing_correlation_for_observers() {
+        let mut app = App::new("test", "sess");
+        app.turn_interaction.ingress_accepted("execution-old");
+        app.current_execution_id = Some("execution-old".to_string());
+        app.current_turn_id = Some("turn-old".to_string());
+        app.current_execution_status =
+            Some(harness_contract::projection::ExecutionLiveStatus::Finalizing);
+
+        let mut admitted = correlation("execution-new", "turn-new");
+        admitted.message_id = Some("message-new".to_string());
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::UserMessageCommitted {
+                correlation: admitted,
+                content: "new observer turn".to_string(),
+                sequence: 8,
+                created_at_ms: 9,
+            },
+        });
+        assert_eq!(
+            app.current_execution_id.as_deref(),
+            Some("execution-old"),
+            "durable admission alone may still be queued and cannot steal an active turn"
+        );
+
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::ExecutionPhase {
+                correlation: correlation("execution-new", "turn-new"),
+                status: harness_contract::projection::ExecutionLiveStatus::PreparingContext,
+                detail: Some("started by Runtime".to_string()),
+            },
+        });
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TextDelta {
+                correlation: correlation("execution-new", "turn-new"),
+                text: "first live delta".to_string(),
+                start_bytes: 0,
+                end_bytes: 16,
+                stream_revision: 16,
+            },
+        });
+
+        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
+        assert_eq!(app.current_turn_id.as_deref(), Some("turn-new"));
+        assert_eq!(
+            app.current_execution_status,
+            Some(harness_contract::projection::ExecutionLiveStatus::PreparingContext)
+        );
+        assert_eq!(app.telemetry.orphan_event_count, 0);
+        assert!(app.timeline_iter().any(|(_, entry)| matches!(
+            entry,
+            TimelineEntry::Message {
+                role,
+                content,
+                identity: Some(MessageIdentity {
+                    source: MessageSource::Live,
+                    execution_id: Some(execution_id),
+                    turn_id: Some(turn_id),
+                    ..
+                }),
+                ..
+            } if role == "assistant"
+                && content == "first live delta"
+                && execution_id == "execution-new"
+                && turn_id == "turn-new"
+        )));
+
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::ExecutionPhase {
+                correlation: correlation("execution-old", "turn-old"),
+                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
+                detail: Some("delayed old phase".to_string()),
+            },
+        });
+        assert_eq!(
+            app.current_execution_id.as_deref(),
+            Some("execution-new"),
+            "a superseded execution cannot reclaim the observer after the new Runtime phase"
+        );
+    }
+
+    #[test]
+    fn first_live_delta_activates_a_committed_followup_when_phase_was_coalesced() {
+        let mut app = App::new("test", "sess");
+        app.turn_interaction.ingress_accepted("execution-old");
+        app.current_execution_id = Some("execution-old".to_string());
+        app.current_turn_id = Some("turn-old".to_string());
+        app.current_execution_status =
+            Some(harness_contract::projection::ExecutionLiveStatus::Finalizing);
+
+        let mut admitted = correlation("execution-new", "turn-new");
+        admitted.message_id = Some("message-new".to_string());
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::UserMessageCommitted {
+                correlation: admitted,
+                content: "queued until Runtime starts it".to_string(),
+                sequence: 8,
+                created_at_ms: 9,
+            },
+        });
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TextDelta {
+                correlation: correlation("execution-new", "turn-new"),
+                text: "visible before terminal".to_string(),
+                start_bytes: 0,
+                end_bytes: 23,
+                stream_revision: 23,
+            },
+        });
+
+        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
+        assert_eq!(app.current_turn_id.as_deref(), Some("turn-new"));
+        assert_eq!(app.telemetry.orphan_event_count, 0);
+        assert!(app.timeline_iter().any(|(_, entry)| matches!(
+            entry,
+            TimelineEntry::Message {
+                role,
+                content,
+                identity: Some(MessageIdentity {
+                    source: MessageSource::Live,
+                    execution_id: Some(execution_id),
+                    ..
+                }),
+                ..
+            } if role == "assistant"
+                && content == "visible before terminal"
+                && execution_id == "execution-new"
+        )));
+
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TextDelta {
+                correlation: correlation("execution-old", "turn-old"),
+                text: "late old output".to_string(),
+                start_bytes: 0,
+                end_bytes: 15,
+                stream_revision: 15,
+            },
+        });
+        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
+        assert_eq!(
+            app.telemetry.orphan_event_count, 1,
+            "the causal tombstone must reject delayed output from the superseded execution"
+        );
+    }
+
+    #[test]
+    fn first_live_delta_activates_new_turn_after_terminal_when_admission_was_missed() {
+        let mut app = App::new("test", "sess");
+        app.current_execution_id = Some("execution-old".to_string());
+        app.current_turn_id = Some("turn-old".to_string());
+        app.current_execution_status =
+            Some(harness_contract::projection::ExecutionLiveStatus::Complete);
+        app.terminal_correlations
+            .push_back(("execution-old".to_string(), "turn-old".to_string()));
+        app.turn_interaction.terminal_observed();
+
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TextDelta {
+                correlation: correlation("execution-new", "turn-new"),
+                text: "visible before terminal".to_string(),
+                start_bytes: 0,
+                end_bytes: 23,
+                stream_revision: 23,
+            },
+        });
+
+        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
+        assert_eq!(app.current_turn_id.as_deref(), Some("turn-new"));
+        assert_eq!(app.telemetry.orphan_event_count, 0);
+        assert!(app.timeline_iter().any(|(_, entry)| matches!(
+            entry,
+            TimelineEntry::Message {
+                role,
+                content,
+                identity: Some(MessageIdentity {
+                    source: MessageSource::Live,
+                    execution_id: Some(execution_id),
+                    ..
+                }),
+                ..
+            } if role == "assistant"
+                && content == "visible before terminal"
+                && execution_id == "execution-new"
+        )));
+
+        app.apply_event(CowdEvent::GatewaySession {
+            event: crate::protocol::GatewaySessionEvent::TextDelta {
+                correlation: correlation("execution-old", "turn-old"),
+                text: "late old output".to_string(),
+                start_bytes: 0,
+                end_bytes: 15,
+                stream_revision: 15,
+            },
+        });
+        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
+        assert_eq!(app.telemetry.orphan_event_count, 1);
     }
 
     #[test]

@@ -67,7 +67,7 @@ pub struct StrategyProposal {
     pub rationale: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum StrategyDecisionSource {
     Deterministic,
@@ -79,7 +79,9 @@ pub enum StrategyDecisionSource {
 /// Runtime execution alternatives compared by the deterministic strategy
 /// policy. These names describe ownership/topology, not a second execution
 /// engine: each candidate still compiles into the canonical ExecutionGraph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionCandidateKind {
     Direct,
@@ -101,7 +103,7 @@ impl ExecutionCandidateKind {
 /// Versioned resource facts used by candidate scoring. Detached consumers get
 /// the conservative assumed snapshot; an admitted Runtime turn replaces it
 /// with observed provider/tool/team availability.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StrategyResourceSnapshot {
     pub version: String,
     pub provider_available: bool,
@@ -144,7 +146,7 @@ impl Default for StrategyResourceSnapshot {
 /// Duration, token, quality, and risk fields are intentionally independent.
 /// Selection applies hard gates and lexicographic/Pareto comparisons instead
 /// of adding unlike units into a synthetic score.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionCandidateEstimate {
     pub candidate: ExecutionCandidateKind,
     pub eligible: bool,

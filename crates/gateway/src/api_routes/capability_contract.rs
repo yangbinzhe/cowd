@@ -178,74 +178,6 @@ fn gateway_openapi_document_from_contract(
         }),
     );
     for (name, schema) in [
-        (
-            "ExecutionProjectionEntity",
-            execution_projection_entity_schema(),
-        ),
-        (
-            "StrategyCandidateEstimate",
-            strategy_candidate_estimate_schema(),
-        ),
-        (
-            "StrategyResourceSnapshot",
-            strategy_resource_snapshot_schema(),
-        ),
-        (
-            "StrategyEvidenceScopeProjection",
-            strategy_evidence_scope_schema(),
-        ),
-        ("StrategyTransitionProjection", strategy_transition_schema()),
-        ("StrategyActualProjection", strategy_actual_schema()),
-        (
-            "StrategyDecisionProjection",
-            strategy_decision_projection_schema(),
-        ),
-        (
-            "ExecutionNodeProjection",
-            execution_node_projection_schema(),
-        ),
-        (
-            "ExecutionEdgeProjection",
-            execution_edge_projection_schema(),
-        ),
-        ("ExecutionParentBinding", execution_parent_binding_schema()),
-        (
-            "ExecutionGraphProjection",
-            execution_graph_projection_schema(),
-        ),
-        (
-            "ChildExecutionProjection",
-            child_execution_projection_schema(),
-        ),
-        ("ContextComponentUsage", context_component_usage_schema()),
-        ("ContextUsageProjection", context_usage_projection_schema()),
-        ("RunMetricsProjection", run_metrics_projection_schema()),
-        ("ExecutionLiveState", execution_live_state_schema()),
-        ("ExecutionProjection", execution_projection_schema()),
-        (
-            "SessionExecutionIndexProjection",
-            session_execution_index_projection_schema(),
-        ),
-        (
-            "SessionExecutionIndicesProjection",
-            session_execution_indices_projection_schema(),
-        ),
-        ("EvidenceFreshness", evidence_freshness_schema()),
-        ("TurnEvidenceProjection", turn_evidence_projection_schema()),
-        (
-            "SessionEvidenceProjection",
-            session_evidence_projection_schema(),
-        ),
-        ("ProjectionEvent", projection_event_schema()),
-        ("ProjectionDelta", projection_delta_schema()),
-        (
-            "ExecutionCommandRequest",
-            execution_command_request_schema(),
-        ),
-        (
-            "ExecutionCommandReceipt",
-            execution_command_receipt_schema(),
-        ),
         ("SendMessageRequest", send_message_request_schema()),
         ("SendMessageReceipt", send_message_receipt_schema()),
         (
@@ -333,6 +265,33 @@ fn gateway_openapi_document_from_contract(
     ] {
         schemas.insert(name.to_string(), schema);
     }
+    insert_canonical_schema::<harness_contract::projection::ExecutionProjection>(
+        &mut schemas,
+        "ExecutionProjection",
+    );
+    insert_canonical_schema::<harness_contract::projection::ProjectionDelta>(
+        &mut schemas,
+        "ProjectionDelta",
+    );
+    insert_canonical_schema::<harness_contract::projection::ExecutionCommandRequest>(
+        &mut schemas,
+        "ExecutionCommandRequest",
+    );
+    insert_canonical_schema::<harness_contract::projection::ExecutionCommandReceipt>(
+        &mut schemas,
+        "ExecutionCommandReceipt",
+    );
+    insert_canonical_schema::<harness_contract::projection::SessionExecutionIndicesProjection>(
+        &mut schemas,
+        "SessionExecutionIndicesProjection",
+    );
+    insert_canonical_schema::<harness_contract::projection::SessionEvidenceProjection>(
+        &mut schemas,
+        "SessionEvidenceProjection",
+    );
+    if let Some(entity) = schemas.get("ProjectionEntity").cloned() {
+        schemas.insert("ExecutionProjectionEntity".to_string(), entity);
+    }
     schemas.extend(app_components);
 
     json!({
@@ -360,8 +319,51 @@ fn gateway_openapi_document_from_contract(
             "route_count": contract.route_count,
             "capability_count": contract.capability_count,
             "coverage": contract.coverage
-        }
+        },
+        "x-cowd-projection-v2-golden": serde_json::from_str::<Value>(include_str!(
+            "../../../harness-contract/tests/fixtures/projection-v2/materialization.json"
+        )).expect("canonical projection v2 fixture must be valid JSON")
     })
+}
+
+fn insert_canonical_schema<T: schemars::JsonSchema>(schemas: &mut Map<String, Value>, name: &str) {
+    let mut root = serde_json::to_value(schemars::schema_for!(T))
+        .expect("canonical harness contract schema must serialize");
+    let definitions = root
+        .as_object_mut()
+        .and_then(|object| object.remove("$defs"))
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    rewrite_schema_refs(&mut root);
+    for (definition_name, mut definition) in definitions {
+        rewrite_schema_refs(&mut definition);
+        schemas.insert(definition_name, definition);
+    }
+    schemas.insert(name.to_string(), root);
+}
+
+fn rewrite_schema_refs(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let rewritten = object
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|reference| reference.strip_prefix("#/$defs/"))
+                .map(|name| format!("#/components/schemas/{name}"));
+            if let Some(reference) = rewritten {
+                object.insert("$ref".to_string(), Value::String(reference));
+            }
+            for child in object.values_mut() {
+                rewrite_schema_refs(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                rewrite_schema_refs(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn gateway_openai_tools() -> Value {
@@ -1103,6 +1105,7 @@ fn live_source_selector_schema() -> Value {
             "kind": {"type": "string", "enum": ["session", "execution", "mission"]},
             "id": {"type": "string", "minLength": 1, "maxLength": 256},
             "cursor": {"type": "integer", "minimum": 0},
+            "revision": {"type": "integer", "minimum": 0},
             "detail_scope": {"type": "string", "enum": ["summary", "full"]}
         },
         "additionalProperties": false
@@ -1630,494 +1633,6 @@ fn mission_command_response_schema() -> Value {
     })
 }
 
-fn execution_projection_entity_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["id", "kind", "revision", "evidence_refs"],
-        "properties": {
-            "id": {"type": "string"},
-            "kind": {"type": "string"},
-            "revision": {"type": "integer", "minimum": 0},
-            "status": {"type": ["string", "null"]},
-            "summary": {"type": ["string", "null"]},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}},
-            "detail": {"type": ["object", "array", "string", "number", "boolean", "null"]}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn strategy_candidate_estimate_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["candidate", "eligible", "estimated_serial_ms", "estimated_critical_path_ms", "startup_overhead_ms", "context_duplication_tokens", "merge_cost_ms", "evidence_overlap_penalty_bp", "provider_concurrency_penalty_bp", "risk_approval_penalty_bp", "expected_quality_lift_bp", "duration_calibration_source", "duration_sample_count", "quality_calibration_source", "quality_sample_count", "duration_provenance", "token_provenance", "quality_provenance", "risk_provenance", "reasons"],
-        "properties": {
-            "candidate": {"type": "string", "enum": ["direct", "parallel_tools", "team"]},
-            "eligible": {"type": "boolean"},
-            "estimated_serial_ms": {"type": "integer", "minimum": 0},
-            "estimated_critical_path_ms": {"type": "integer", "minimum": 0},
-            "startup_overhead_ms": {"type": "integer", "minimum": 0},
-            "context_duplication_tokens": {"type": "integer", "minimum": 0},
-            "merge_cost_ms": {"type": "integer", "minimum": 0},
-            "evidence_overlap_penalty_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
-            "provider_concurrency_penalty_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
-            "risk_approval_penalty_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
-            "expected_quality_lift_bp": {"type": "integer"},
-            "duration_calibration_source": {"type": "string"},
-            "duration_sample_count": {"type": "integer", "minimum": 0},
-            "quality_calibration_source": {"type": "string"},
-            "quality_sample_count": {"type": "integer", "minimum": 0},
-            "duration_provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]},
-            "token_provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]},
-            "quality_provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]},
-            "risk_provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]},
-            "reasons": {"type": "array", "items": {"type": "string"}}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn strategy_resource_snapshot_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["version", "provider_available", "tools_available", "team_available", "provider_concurrency", "tool_concurrency", "team_slots", "provider_concurrency_penalty_bp", "sample_source", "sample_count", "provenance"],
-        "properties": {
-            "version": {"type": "string"},
-            "provider_available": {"type": "boolean"},
-            "tools_available": {"type": "boolean"},
-            "team_available": {"type": "boolean"},
-            "provider_concurrency": {"type": "integer", "minimum": 0},
-            "tool_concurrency": {"type": "integer", "minimum": 0},
-            "team_slots": {"type": "integer", "minimum": 0},
-            "provider_concurrency_penalty_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
-            "sample_source": {"type": "string"},
-            "sample_count": {"type": "integer", "minimum": 0},
-            "provenance": {"type": "string", "enum": ["observed", "calibrated", "assumed", "unknown"]}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn strategy_evidence_scope_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["role_id", "focus_id", "responsibility_summary", "capability_cropped_refs", "scope_hash", "overlap_budget_bp", "novelty_target_bp"],
-        "properties": {
-            "role_id": {"type": "string"},
-            "focus_id": {"type": "string"},
-            "responsibility_summary": {"type": "string"},
-            "capability_cropped_refs": {"type": "array", "items": {"type": "string"}},
-            "scope_hash": {"type": "string"},
-            "overlap_budget_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
-            "novelty_target_bp": {"type": "integer", "minimum": 0, "maximum": 10000}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn strategy_transition_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["revision", "kind", "status", "summary"],
-        "properties": {
-            "revision": {"type": "integer", "minimum": 0},
-            "kind": {"type": "string", "enum": ["runtime.strategy.downgraded", "runtime.strategy.early_stopped"]},
-            "status": {"type": "string"},
-            "summary": {"type": "string"}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn strategy_actual_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["duration_ms", "input_tokens", "output_tokens", "cached_tokens", "tool_calls", "duplicate_tool_calls", "max_tool_concurrency_observed", "parallel_tool_batches", "write_attempt_refs", "evidence_overlap_bp", "evidence_overlap_observed", "working_state_verified", "merge_cost_ms", "parent_merge_count", "evaluation_token_limit", "evaluation_tokens_consumed", "evaluation_budget_observed", "evaluation_budget_breached", "terminal_reason"],
-        "properties": {
-            "duration_ms": {"type": "integer", "minimum": 0},
-            "input_tokens": {"type": "integer", "minimum": 0},
-            "output_tokens": {"type": "integer", "minimum": 0},
-            "cached_tokens": {"type": "integer", "minimum": 0},
-            "tool_calls": {"type": "integer", "minimum": 0},
-            "duplicate_tool_calls": {"type": "integer", "minimum": 0},
-            "max_tool_concurrency_observed": {"type": "integer", "minimum": 0},
-            "parallel_tool_batches": {"type": "integer", "minimum": 0},
-            "write_attempt_refs": {"type": "array", "items": {"type": "string"}},
-            "evidence_overlap_bp": {"type": "integer", "minimum": 0, "maximum": 10000},
-            "evidence_overlap_observed": {"type": "boolean"},
-            "working_state_verified": {"type": "boolean"},
-            "merge_cost_ms": {"type": "integer", "minimum": 0},
-            "parent_merge_count": {"type": "integer", "minimum": 0},
-            "evaluation_token_limit": {"type": "integer", "minimum": 0},
-            "evaluation_tokens_consumed": {"type": "integer", "minimum": 0},
-            "evaluation_budget_observed": {"type": "boolean"},
-            "evaluation_budget_breached": {"type": "boolean"},
-            "quality_score_bp": {"type": ["integer", "null"], "minimum": 0, "maximum": 10000},
-            "actual_speedup_ratio_bp": {"type": ["integer", "null"], "minimum": 0},
-            "terminal_reason": {"type": "string"}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn strategy_decision_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["id", "kind", "revision", "evidence_refs"],
-        "properties": {
-            "schema_version": {"type": "integer", "const": 1},
-            "id": {"type": "string"},
-            "kind": {"type": "string"},
-            "revision": {"type": "integer", "minimum": 0},
-            "status": {"type": ["string", "null"]},
-            "summary": {"type": ["string", "null"]},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}},
-            "detail": {"type": ["object", "array", "string", "number", "boolean", "null"]},
-            "decision_id": {"type": ["string", "null"]},
-            "execution_id": {"type": ["string", "null"]},
-            "session_id": {"type": ["string", "null"]},
-            "turn_id": {"type": ["string", "null"]},
-            "selected_candidate": {"type": ["string", "null"], "enum": ["direct", "parallel_tools", "team", null]},
-            "selected_pattern": {"type": ["string", "null"], "enum": ["direct", "explore", "execute", "deliberate", "collaborate", "supervise", null]},
-            "candidate_estimates": {"type": "array", "items": {"$ref": "#/components/schemas/StrategyCandidateEstimate"}},
-            "benefit_reason": {"type": "array", "items": {"type": "string"}},
-            "cost_reason": {"type": "array", "items": {"type": "string"}},
-            "evidence_scopes": {"type": "array", "items": {"$ref": "#/components/schemas/StrategyEvidenceScopeProjection"}},
-            "downgrade": {"type": "array", "items": {"$ref": "#/components/schemas/StrategyTransitionProjection"}},
-            "early_stop": {"type": "array", "items": {"$ref": "#/components/schemas/StrategyTransitionProjection"}},
-            "estimated": {"oneOf": [{"$ref": "#/components/schemas/StrategyCandidateEstimate"}, {"type": "null"}]},
-            "actual": {"oneOf": [{"$ref": "#/components/schemas/StrategyActualProjection"}, {"type": "null"}]},
-            "resource_snapshot": {"oneOf": [{"$ref": "#/components/schemas/StrategyResourceSnapshot"}, {"type": "null"}]},
-            "policy_version": {"type": ["string", "null"]},
-            "source": {"type": ["string", "null"], "enum": ["deterministic", "model_validated", "experience_adapted", "resource_adapted", null]},
-            "confidence": {"type": ["integer", "null"], "minimum": 0, "maximum": 100},
-            "proof_status": {"type": ["string", "null"], "enum": ["not_proven", "calibrated", null]},
-            "actual_status": {"type": ["string", "null"], "enum": ["unknown", "observed", null]},
-            "team_id": {"type": ["string", "null"]},
-            "team_execution_id": {"type": ["string", "null"]}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn execution_node_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["node_id", "kind", "status", "executor_kind", "evidence_refs"],
-        "properties": {
-            "node_id": {"type": "string"},
-            "kind": {"type": "string"},
-            "status": {"type": "string"},
-            "executor_kind": {"type": "string"},
-            "result_ref": {"type": ["string", "null"]},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn execution_graph_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["graph_id", "revision", "objective", "nodes", "edges", "commit_cursor"],
-        "properties": {
-            "graph_id": {"type": "string"},
-            "revision": {"type": "integer", "minimum": 0},
-            "objective": {"type": "string"},
-            "parent_execution": {"oneOf": [{"$ref": "#/components/schemas/ExecutionParentBinding"}, {"type": "null"}]},
-            "nodes": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionNodeProjection"}},
-            "edges": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionEdgeProjection"}},
-            "commit_cursor": {"type": "integer", "minimum": 0},
-            "terminal_result_ref": {"type": ["string", "null"]}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn execution_edge_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["from", "to", "kind"],
-        "properties": {
-            "from": {"type": "string"},
-            "to": {"type": "string"},
-            "kind": {"type": "string", "enum": ["depends_on", "verifies", "produces"]}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn execution_parent_binding_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["execution_id", "node_id"],
-        "properties": {
-            "execution_id": {"type": "string"},
-            "node_id": {"type": "string"}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn child_execution_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["execution_id", "parent_execution_id", "parent_node_id", "revision", "cursor", "status", "objective"],
-        "properties": {
-            "execution_id": {"type": "string"},
-            "parent_execution_id": {"type": "string"},
-            "parent_node_id": {"type": "string"},
-            "revision": {"type": "integer", "minimum": 0},
-            "cursor": {"type": "integer", "minimum": 0},
-            "status": {"type": "string"},
-            "objective": {"type": "string"}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn context_component_usage_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["kind", "tokens", "occurrences"],
-        "properties": {
-            "kind": {"type": "string"},
-            "tokens": {"type": "integer", "minimum": 0},
-            "occurrences": {"type": "integer", "minimum": 0}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn context_usage_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["components"],
-        "properties": {
-            "model": {"type": ["string", "null"]},
-            "window_tokens": {"type": ["integer", "null"], "minimum": 0},
-            "window_source": {"type": ["string", "null"]},
-            "input_tokens": {"type": ["integer", "null"], "minimum": 0},
-            "input_source": {"type": ["string", "null"]},
-            "remaining_tokens": {"type": ["integer", "null"], "minimum": 0},
-            "usage_percent_bp": {"type": ["integer", "null"], "minimum": 0, "maximum": 10000},
-            "request_sequence": {"type": ["integer", "null"], "minimum": 0},
-            "components": {"type": "array", "items": {"$ref": "#/components/schemas/ContextComponentUsage"}}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn run_metrics_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["tool_calls", "memory_recalls", "memory_evidence", "approvals", "context_items", "files_touched", "input_tokens", "output_tokens", "total_tokens"],
-        "properties": {
-            "tool_calls": {"type": "integer", "minimum": 0},
-            "memory_recalls": {"type": "integer", "minimum": 0},
-            "memory_evidence": {"type": "integer", "minimum": 0},
-            "approvals": {"type": "integer", "minimum": 0},
-            "context_items": {"type": "integer", "minimum": 0},
-            "files_touched": {"type": "integer", "minimum": 0},
-            "input_tokens": {"type": "integer", "minimum": 0},
-            "output_tokens": {"type": "integer", "minimum": 0},
-            "total_tokens": {"type": "integer", "minimum": 0}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn execution_live_state_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["revision", "status", "started_at_ms", "updated_at_ms", "last_progress_at_ms", "metrics"],
-        "properties": {
-            "revision": {"type": "integer", "minimum": 0},
-            "status": {"type": "string", "enum": ["queued", "preparing_context", "calling_model", "thinking", "calling_tool", "waiting_approval", "finalizing", "complete", "cancelled", "error"]},
-            "status_detail": {"type": ["string", "null"]},
-            "turn_id": {"type": ["string", "null"]},
-            "started_at_ms": {"type": "integer", "minimum": 0},
-            "updated_at_ms": {"type": "integer", "minimum": 0},
-            "last_progress_at_ms": {"type": "integer", "minimum": 0},
-            "context_usage": {"oneOf": [{"$ref": "#/components/schemas/ContextUsageProjection"}, {"type": "null"}]},
-            "metrics": {"$ref": "#/components/schemas/RunMetricsProjection"},
-            "output_preview": {"type": ["string", "null"]},
-            "terminal_ref": {"type": ["string", "null"]},
-            "error": {"type": ["string", "null"]}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn session_execution_index_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["session_id", "active_execution_ids"],
-        "properties": {
-            "session_id": {"type": "string"},
-            "active_execution_ids": {"type": "array", "items": {"type": "string"}},
-            "latest_execution_id": {"type": ["string", "null"]},
-            "latest_status": {"type": ["string", "null"], "enum": ["queued", "preparing_context", "calling_model", "thinking", "calling_tool", "waiting_approval", "finalizing", "complete", "cancelled", "error", null]},
-            "latest_live_revision": {"type": ["integer", "null"], "minimum": 0},
-            "last_progress_at_ms": {"type": ["integer", "null"], "minimum": 0},
-            "terminal_ref": {"type": ["string", "null"]}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn session_execution_indices_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["items"],
-        "properties": {"items": {"type": "array", "items": {"$ref": "#/components/schemas/SessionExecutionIndexProjection"}}},
-        "additionalProperties": false
-    })
-}
-
-fn evidence_freshness_schema() -> Value {
-    json!({"type": "string", "enum": ["live", "durable", "unavailable"]})
-}
-
-fn turn_evidence_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["session_id", "turn_id", "input_message_id", "execution_id", "evidence_refs", "freshness"],
-        "properties": {
-            "session_id": {"type": "string"},
-            "turn_id": {"type": "string"},
-            "input_message_id": {"type": "string"},
-            "execution_id": {"type": "string"},
-            "terminal_ref": {"type": ["string", "null"]},
-            "assistant_message_id": {"type": ["string", "null"]},
-            "context_report_id": {"type": ["string", "null"]},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}},
-            "freshness": {"$ref": "#/components/schemas/EvidenceFreshness"}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn session_evidence_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["session_id", "evidence_refs", "turns", "freshness"],
-        "properties": {
-            "session_id": {"type": "string"},
-            "evidence_refs": {"type": "array", "items": {"type": "string"}},
-            "turns": {"type": "array", "items": {"$ref": "#/components/schemas/TurnEvidenceProjection"}},
-            "freshness": {"$ref": "#/components/schemas/EvidenceFreshness"}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn execution_projection_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["schema_version", "execution_id", "revision", "cursor", "graph", "child_executions", "goals", "agents", "teams", "relations", "approvals", "interventions", "usage", "context", "evidence", "health", "recovery", "available_commands"],
-        "properties": {
-            "schema_version": {"type": "integer", "const": 1},
-            "execution_id": {"type": "string"},
-            "revision": {"type": "integer", "minimum": 0},
-            "cursor": {"type": "integer", "minimum": 0},
-            "session_id": {"type": ["string", "null"]},
-            "mission_id": {"type": ["string", "null"]},
-            "strategy": {"oneOf": [{"$ref": "#/components/schemas/StrategyDecisionProjection"}, {"type": "null"}]},
-            "graph": {"$ref": "#/components/schemas/ExecutionGraphProjection"},
-            "child_executions": {"type": "array", "items": {"$ref": "#/components/schemas/ChildExecutionProjection"}},
-            "goals": projection_entity_list_schema(),
-            "agents": projection_entity_list_schema(),
-            "teams": projection_entity_list_schema(),
-            "relations": projection_entity_list_schema(),
-            "approvals": projection_entity_list_schema(),
-            "interventions": projection_entity_list_schema(),
-            "usage": projection_entity_list_schema(),
-            "context": projection_entity_list_schema(),
-            "evidence": projection_entity_list_schema(),
-            "health": projection_entity_list_schema(),
-            "recovery": projection_entity_list_schema(),
-            "live": {"oneOf": [{"$ref": "#/components/schemas/ExecutionLiveState"}, {"type": "null"}]},
-            "available_commands": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["command", "available"],
-                    "properties": {
-                        "command": {"type": "string", "enum": ["pause", "resume", "cancel", "replan"]},
-                        "available": {"type": "boolean"},
-                        "reason": {"type": ["string", "null"]}
-                    },
-                    "additionalProperties": false
-                }
-            }
-        },
-        "additionalProperties": false
-    })
-}
-
-fn projection_entity_list_schema() -> Value {
-    json!({"type": "array", "items": {"$ref": "#/components/schemas/ExecutionProjectionEntity"}})
-}
-
-fn projection_event_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["commit_cursor", "transaction_index", "event_id", "kind"],
-        "properties": {
-            "commit_cursor": {"type": "integer", "minimum": 0},
-            "transaction_index": {"type": "integer", "minimum": 0},
-            "event_id": {"type": "string"},
-            "kind": {"type": "string"},
-            "entity": {"oneOf": [{"$ref": "#/components/schemas/ExecutionProjectionEntity"}, {"type": "null"}]}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn projection_delta_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["schema_version", "execution_id", "base_cursor", "target_cursor", "events"],
-        "properties": {
-            "schema_version": {"type": "integer", "const": 1},
-            "execution_id": {"type": "string"},
-            "base_cursor": {"type": "integer", "minimum": 0},
-            "target_cursor": {"type": "integer", "minimum": 0},
-            "events": {"type": "array", "items": {"$ref": "#/components/schemas/ProjectionEvent"}}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn execution_command_request_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["command_id", "expected_revision", "command", "payload"],
-        "properties": {
-            "command_id": {"type": "string", "minLength": 1},
-            "expected_revision": {"type": "integer", "minimum": 0},
-            "command": {"type": "string", "enum": ["pause", "resume", "cancel", "replan"]},
-            "payload": {}
-        },
-        "additionalProperties": false
-    })
-}
-
-fn execution_command_receipt_schema() -> Value {
-    json!({
-        "type": "object",
-        "required": ["command_id", "accepted_revision", "status"],
-        "properties": {
-            "command_id": {"type": "string"},
-            "accepted_revision": {"type": "integer", "minimum": 0},
-            "status": {"type": "string", "enum": ["accepted", "rejected_stale_revision"]},
-            "reason": {"type": ["string", "null"]}
-        },
-        "additionalProperties": false
-    })
-}
-
 fn send_message_request_schema() -> Value {
     json!({
         "type": "object",
@@ -2413,6 +1928,21 @@ fn openai_tool(capability: &GatewayCapability) -> Value {
 mod tests {
     use super::*;
 
+    fn schema_contains_ref(schema: &Value, expected: &str) -> bool {
+        match schema {
+            Value::Object(object) => {
+                object.get("$ref").and_then(Value::as_str) == Some(expected)
+                    || object
+                        .values()
+                        .any(|value| schema_contains_ref(value, expected))
+            }
+            Value::Array(values) => values
+                .iter()
+                .any(|value| schema_contains_ref(value, expected)),
+            _ => false,
+        }
+    }
+
     #[test]
     fn capability_contract_covers_every_route() {
         let manifest = gateway_route_manifest();
@@ -2493,29 +2023,63 @@ mod tests {
                 ["child_executions"]["items"]["$ref"],
             "#/components/schemas/ChildExecutionProjection"
         );
-        assert_eq!(
-            document["components"]["schemas"]["ExecutionProjection"]["properties"]["strategy"]
-                ["oneOf"][0]["$ref"],
-            "#/components/schemas/StrategyDecisionProjection"
+        assert!(
+            schema_contains_ref(
+                &document["components"]["schemas"]["ExecutionProjection"]["properties"]["strategy"],
+                "#/components/schemas/StrategyDecisionProjection",
+            ),
+            "canonical nullable strategy schema must reference StrategyDecisionProjection"
         );
+        let strategy_required = document["components"]["schemas"]["StrategyDecisionProjection"]
+            ["required"]
+            .as_array()
+            .expect("strategy required fields");
+        for field in ["id", "kind", "revision"] {
+            assert!(
+                strategy_required.iter().any(|value| value == field),
+                "strategy schema must require {field}"
+            );
+        }
         assert_eq!(
-            document["components"]["schemas"]["StrategyDecisionProjection"]["required"],
-            serde_json::json!(["id", "kind", "revision", "evidence_refs"])
+            document["components"]["schemas"]["StrategyDecisionProjection"]["properties"]
+                ["evidence_refs"]["default"],
+            serde_json::json!([])
         );
         assert_eq!(
             document["components"]["schemas"]["StrategyDecisionProjection"]["properties"]
-                ["schema_version"]["const"],
+                ["schema_version"]["default"],
             1
         );
-        assert_eq!(
-            document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]
-                ["parent_execution"]["oneOf"][0]["$ref"],
-            "#/components/schemas/ExecutionParentBinding"
+        assert!(
+            schema_contains_ref(
+                &document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]
+                    ["parent_execution"],
+                "#/components/schemas/ExecutionParentBinding",
+            ),
+            "canonical nullable parent schema must reference ExecutionParentBinding"
         );
         assert_eq!(
             document["components"]["schemas"]["ExecutionGraphProjection"]["properties"]["edges"]
                 ["items"]["$ref"],
             "#/components/schemas/ExecutionEdgeProjection"
+        );
+        let delta_schema = &document["components"]["schemas"]["ProjectionDelta"];
+        assert_eq!(
+            delta_schema["properties"]["operations"]["default"],
+            serde_json::json!([])
+        );
+        assert!(schema_contains_ref(
+            &delta_schema["properties"]["operations"],
+            "#/components/schemas/ProjectionOperation"
+        ));
+        let golden = &document["x-cowd-projection-v2-golden"];
+        assert_eq!(
+            golden["delta"]["schema_version"],
+            harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            golden["delta"]["reducer_version"],
+            harness_contract::projection::EXECUTION_PROJECTION_REDUCER_VERSION
         );
 
         let events = &document["paths"]["/api/runtime/live/{id}"]["get"];

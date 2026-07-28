@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 pub use harness_contract::execution_graph::ExecutionServiceClass;
 
-type ResourceGrantObserver = Arc<dyn Fn(&ResourceGrantReceipt) + Send + Sync>;
+type ResourceAdmissionObserver = Arc<dyn Fn(&ResourceAdmissionObservation) + Send + Sync>;
 
 /// Independently throttled execution resource families.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -181,6 +181,108 @@ pub struct ResourceGrantReceipt {
     pub wait_reason: Option<ResourceWaitReason>,
     pub blocker: Option<Uuid>,
     pub policy_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceAdmissionObservationStatus {
+    Queued,
+    Waiting,
+    Granted,
+    Deferred,
+    Overloaded,
+}
+
+/// Durable, transport-neutral observation of one admission state transition.
+///
+/// The resource manager remains the sole queue owner. Observers receive facts
+/// only when a request enters the queue, changes wait reason, or reaches a
+/// terminal decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceAdmissionObservation {
+    pub request_id: Uuid,
+    pub status: ResourceAdmissionObservationStatus,
+    pub requested_priority: Option<u8>,
+    pub deadline_at_ms: Option<u64>,
+    pub requested_service_class: ExecutionServiceClass,
+    pub resolved_service_class: ExecutionServiceClass,
+    pub parent_class_ceiling: Option<ExecutionServiceClass>,
+    pub demands: Vec<(ExecutionResourceKind, usize)>,
+    pub normalized_scope: Option<String>,
+    pub fairness_key: String,
+    pub enqueue_sequence: Option<u64>,
+    pub enqueued_at_ms: Option<u64>,
+    pub observed_at_ms: u64,
+    pub queue_age_ms: u64,
+    pub wait_reason: Option<ResourceWaitReason>,
+    pub blocker: Option<Uuid>,
+    pub policy_revision: u64,
+    pub pending: usize,
+}
+
+impl ResourceAdmissionObservation {
+    #[allow(clippy::too_many_arguments)]
+    fn from_request(
+        request: &ResourceAdmissionRequest,
+        status: ResourceAdmissionObservationStatus,
+        resolved_service_class: ExecutionServiceClass,
+        enqueue_sequence: Option<u64>,
+        enqueued_at_ms: Option<u64>,
+        observed_at_ms: u64,
+        queue_age_ms: u64,
+        wait_reason: Option<ResourceWaitReason>,
+        blocker: Option<Uuid>,
+        policy_revision: u64,
+        pending: usize,
+    ) -> Self {
+        Self {
+            request_id: request.request_id,
+            status,
+            requested_priority: request.requested_priority,
+            deadline_at_ms: request.deadline_at_ms,
+            requested_service_class: request.requested_service_class,
+            resolved_service_class,
+            parent_class_ceiling: request.parent_class_ceiling,
+            demands: request.demands.clone(),
+            normalized_scope: request.normalized_scope.clone(),
+            fairness_key: request.fairness_key.clone(),
+            enqueue_sequence,
+            enqueued_at_ms,
+            observed_at_ms,
+            queue_age_ms,
+            wait_reason,
+            blocker,
+            policy_revision,
+            pending,
+        }
+    }
+
+    fn from_receipt(
+        receipt: &ResourceGrantReceipt,
+        status: ResourceAdmissionObservationStatus,
+        pending: usize,
+    ) -> Self {
+        Self {
+            request_id: receipt.request_id,
+            status,
+            requested_priority: receipt.requested_priority,
+            deadline_at_ms: receipt.deadline_at_ms,
+            requested_service_class: receipt.requested_service_class,
+            resolved_service_class: receipt.resolved_service_class,
+            parent_class_ceiling: receipt.parent_class_ceiling,
+            demands: receipt.demands.clone(),
+            normalized_scope: receipt.normalized_scope.clone(),
+            fairness_key: receipt.fairness_key.clone(),
+            enqueue_sequence: Some(receipt.enqueue_sequence),
+            enqueued_at_ms: Some(receipt.enqueued_at_ms),
+            observed_at_ms: receipt.granted_at_ms,
+            queue_age_ms: receipt.queue_age_ms,
+            wait_reason: receipt.wait_reason,
+            blocker: receipt.blocker,
+            policy_revision: receipt.policy_revision,
+            pending,
+        }
+    }
 }
 
 /// Terminal result of the single fair admission API.
@@ -458,7 +560,7 @@ struct IncreaseBaseline {
 #[derive(Clone, Default)]
 pub struct ExecutionResourceManager {
     shared: Arc<Shared>,
-    grant_observer: Arc<OnceLock<ResourceGrantObserver>>,
+    admission_observer: Arc<OnceLock<ResourceAdmissionObserver>>,
 }
 
 impl std::fmt::Debug for ExecutionResourceManager {
@@ -466,8 +568,8 @@ impl std::fmt::Debug for ExecutionResourceManager {
         formatter
             .debug_struct("ExecutionResourceManager")
             .field(
-                "grant_observer_installed",
-                &self.grant_observer.get().is_some(),
+                "admission_observer_installed",
+                &self.admission_observer.get().is_some(),
             )
             .finish_non_exhaustive()
     }
@@ -515,17 +617,30 @@ impl ExecutionResourceManager {
                 }),
                 changed: Notify::new(),
             }),
-            grant_observer: Arc::new(OnceLock::new()),
+            admission_observer: Arc::new(OnceLock::new()),
         }
     }
 
-    pub(crate) fn install_grant_observer(
+    pub(crate) fn install_admission_observer(
         &self,
-        observer: impl Fn(&ResourceGrantReceipt) + Send + Sync + 'static,
+        observer: impl Fn(&ResourceAdmissionObservation) + Send + Sync + 'static,
     ) -> Result<(), &'static str> {
-        self.grant_observer
+        self.admission_observer
             .set(Arc::new(observer))
-            .map_err(|_| "resource grant observer is already installed")
+            .map_err(|_| "resource admission observer is already installed")
+    }
+
+    fn observe_admission(&self, observation: ResourceAdmissionObservation) {
+        if let Some(observer) = self.admission_observer.get() {
+            observer(&observation);
+        }
+    }
+
+    fn pending_count(&self) -> usize {
+        self.shared
+            .state
+            .lock()
+            .map_or(0, |guard| guard.waiters.len())
     }
 
     /// Records one typed terminal observation and applies the sole adaptive
@@ -672,7 +787,7 @@ impl ExecutionResourceManager {
         }
         let resolved_service_class = request.resolved_service_class();
         let started = Instant::now();
-        let policy_revision = {
+        let registration = {
             let mut guard = self
                 .shared
                 .state
@@ -683,55 +798,129 @@ impl ExecutionResourceManager {
                 .deadline_at_ms
                 .is_some_and(|deadline| deadline <= now_ms())
             {
-                return Ok(ResourceAdmissionDecision::Deferred {
-                    request_id: request.request_id,
+                AdmissionRegistration::Deferred {
                     wait_reason: ResourceWaitReason::DeadlineExpired,
                     policy_revision: guard.admission_policy.revision,
-                });
-            }
-            if !request.scope_feasible {
-                return Ok(ResourceAdmissionDecision::Deferred {
-                    request_id: request.request_id,
+                    pending: guard.waiters.len(),
+                }
+            } else if !request.scope_feasible {
+                AdmissionRegistration::Deferred {
                     wait_reason: ResourceWaitReason::ScopeInfeasible,
                     policy_revision: guard.admission_policy.revision,
-                });
-            }
-            if request_id_exists(&guard, request.request_id) {
+                    pending: guard.waiters.len(),
+                }
+            } else if request_id_exists(&guard, request.request_id) {
                 return Err(ResourceAcquireError::DuplicateRequest(request.request_id));
-            }
-            if let Some(reason) =
+            } else if let Some(wait_reason) =
                 pending_limit_reason(&guard, resolved_service_class, &request.fairness_key)
             {
-                return Ok(ResourceAdmissionDecision::Overloaded {
-                    request_id: request.request_id,
-                    wait_reason: reason,
+                AdmissionRegistration::Overloaded {
+                    wait_reason,
                     policy_revision: guard.admission_policy.revision,
                     pending: guard.waiters.len(),
+                }
+            } else {
+                let enqueue_sequence = guard.next_enqueue_sequence;
+                guard.next_enqueue_sequence = guard.next_enqueue_sequence.wrapping_add(1);
+                let enqueued_at_ms = now_ms();
+                let policy_revision = guard.admission_policy.revision;
+                guard.waiters.push_back(PendingResourceDemand {
+                    id: request.request_id,
+                    demands: request.demands.clone(),
+                    requested_priority: request.requested_priority,
+                    deadline_at_ms: request.deadline_at_ms,
+                    requested_service_class: request.requested_service_class,
+                    resolved_service_class,
+                    parent_class_ceiling: request.parent_class_ceiling,
+                    normalized_scope: request.normalized_scope.clone(),
+                    scope_feasible: request.scope_feasible,
+                    fairness_key: request.fairness_key.clone(),
+                    enqueue_sequence,
+                    enqueued_at_ms,
+                    enqueued_at: started,
+                    policy_revision,
+                    last_wait_reason: None,
+                    last_blocker: None,
                 });
+                AdmissionRegistration::Queued {
+                    enqueue_sequence,
+                    enqueued_at_ms,
+                    policy_revision,
+                    pending: guard.waiters.len(),
+                }
             }
-            let enqueue_sequence = guard.next_enqueue_sequence;
-            guard.next_enqueue_sequence = guard.next_enqueue_sequence.wrapping_add(1);
-            let enqueued_at_ms = now_ms();
-            let policy_revision = guard.admission_policy.revision;
-            guard.waiters.push_back(PendingResourceDemand {
-                id: request.request_id,
-                demands: request.demands.clone(),
-                requested_priority: request.requested_priority,
-                deadline_at_ms: request.deadline_at_ms,
-                requested_service_class: request.requested_service_class,
-                resolved_service_class,
-                parent_class_ceiling: request.parent_class_ceiling,
-                normalized_scope: request.normalized_scope.clone(),
-                scope_feasible: request.scope_feasible,
-                fairness_key: request.fairness_key.clone(),
+        };
+        let (enqueue_sequence, enqueued_at_ms, policy_revision) = match registration {
+            AdmissionRegistration::Queued {
                 enqueue_sequence,
                 enqueued_at_ms,
-                enqueued_at: started,
                 policy_revision,
-                last_wait_reason: None,
-                last_blocker: None,
-            });
-            policy_revision
+                pending,
+            } => {
+                self.observe_admission(ResourceAdmissionObservation::from_request(
+                    &request,
+                    ResourceAdmissionObservationStatus::Queued,
+                    resolved_service_class,
+                    Some(enqueue_sequence),
+                    Some(enqueued_at_ms),
+                    enqueued_at_ms,
+                    0,
+                    None,
+                    None,
+                    policy_revision,
+                    pending,
+                ));
+                (enqueue_sequence, enqueued_at_ms, policy_revision)
+            }
+            AdmissionRegistration::Deferred {
+                wait_reason,
+                policy_revision,
+                pending,
+            } => {
+                self.observe_admission(ResourceAdmissionObservation::from_request(
+                    &request,
+                    ResourceAdmissionObservationStatus::Deferred,
+                    resolved_service_class,
+                    None,
+                    None,
+                    now_ms(),
+                    0,
+                    Some(wait_reason),
+                    None,
+                    policy_revision,
+                    pending,
+                ));
+                return Ok(ResourceAdmissionDecision::Deferred {
+                    request_id: request.request_id,
+                    wait_reason,
+                    policy_revision,
+                });
+            }
+            AdmissionRegistration::Overloaded {
+                wait_reason,
+                policy_revision,
+                pending,
+            } => {
+                self.observe_admission(ResourceAdmissionObservation::from_request(
+                    &request,
+                    ResourceAdmissionObservationStatus::Overloaded,
+                    resolved_service_class,
+                    None,
+                    None,
+                    now_ms(),
+                    0,
+                    Some(wait_reason),
+                    None,
+                    policy_revision,
+                    pending,
+                ));
+                return Ok(ResourceAdmissionDecision::Overloaded {
+                    request_id: request.request_id,
+                    wait_reason,
+                    policy_revision,
+                    pending,
+                });
+            }
         };
         self.shared.changed.notify_waiters();
 
@@ -758,9 +947,11 @@ impl ExecutionResourceManager {
                 AdmissionAttempt::Granted { receipt } => {
                     registration.active = false;
                     self.shared.changed.notify_waiters();
-                    if let Some(observer) = self.grant_observer.get() {
-                        observer(&receipt);
-                    }
+                    self.observe_admission(ResourceAdmissionObservation::from_receipt(
+                        &receipt,
+                        ResourceAdmissionObservationStatus::Granted,
+                        self.pending_count(),
+                    ));
                     return Ok(ResourceAdmissionDecision::Granted {
                         lease: ExecutionResourceLease {
                             shared: Arc::clone(&self.shared),
@@ -774,14 +965,47 @@ impl ExecutionResourceManager {
                 }
                 AdmissionAttempt::Deferred {
                     wait_reason: ResourceWaitReason::DeadlineExpired,
+                    blocker,
                     ..
                 } => {
                     registration.finish(ResourceResultClass::TimedOut);
+                    self.observe_admission(ResourceAdmissionObservation::from_request(
+                        &request,
+                        ResourceAdmissionObservationStatus::Deferred,
+                        resolved_service_class,
+                        Some(enqueue_sequence),
+                        Some(enqueued_at_ms),
+                        now_ms(),
+                        duration_millis(started.elapsed()),
+                        Some(ResourceWaitReason::DeadlineExpired),
+                        blocker,
+                        policy_revision,
+                        self.pending_count(),
+                    ));
                     return Ok(ResourceAdmissionDecision::Deferred {
                         request_id: request.request_id,
                         wait_reason: ResourceWaitReason::DeadlineExpired,
                         policy_revision,
                     });
+                }
+                AdmissionAttempt::Deferred {
+                    wait_reason,
+                    blocker,
+                    changed: true,
+                } => {
+                    self.observe_admission(ResourceAdmissionObservation::from_request(
+                        &request,
+                        ResourceAdmissionObservationStatus::Waiting,
+                        resolved_service_class,
+                        Some(enqueue_sequence),
+                        Some(enqueued_at_ms),
+                        now_ms(),
+                        duration_millis(started.elapsed()),
+                        Some(wait_reason),
+                        blocker,
+                        policy_revision,
+                        self.pending_count(),
+                    ));
                 }
                 AdmissionAttempt::Deferred { .. } => {}
             }
@@ -797,6 +1021,19 @@ impl ExecutionResourceManager {
             let remaining_timeout = timeout.and_then(|limit| limit.checked_sub(started.elapsed()));
             if timeout.is_some() && remaining_timeout.is_none() {
                 registration.finish(ResourceResultClass::TimedOut);
+                self.observe_admission(ResourceAdmissionObservation::from_request(
+                    &request,
+                    ResourceAdmissionObservationStatus::Deferred,
+                    resolved_service_class,
+                    Some(enqueue_sequence),
+                    Some(enqueued_at_ms),
+                    now_ms(),
+                    duration_millis(started.elapsed()),
+                    Some(ResourceWaitReason::DeadlineExpired),
+                    None,
+                    policy_revision,
+                    self.pending_count(),
+                ));
                 return Ok(ResourceAdmissionDecision::Deferred {
                     request_id: request.request_id,
                     wait_reason: ResourceWaitReason::DeadlineExpired,
@@ -867,8 +1104,34 @@ impl ExecutionResourceManager {
 
 #[derive(Debug)]
 enum AdmissionAttempt {
-    Granted { receipt: ResourceGrantReceipt },
-    Deferred { wait_reason: ResourceWaitReason },
+    Granted {
+        receipt: ResourceGrantReceipt,
+    },
+    Deferred {
+        wait_reason: ResourceWaitReason,
+        blocker: Option<Uuid>,
+        changed: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AdmissionRegistration {
+    Queued {
+        enqueue_sequence: u64,
+        enqueued_at_ms: u64,
+        policy_revision: u64,
+        pending: usize,
+    },
+    Deferred {
+        wait_reason: ResourceWaitReason,
+        policy_revision: u64,
+        pending: usize,
+    },
+    Overloaded {
+        wait_reason: ResourceWaitReason,
+        policy_revision: u64,
+        pending: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -997,9 +1260,15 @@ fn evaluate_and_grant(
                 .waiters
                 .get_mut(position)
                 .ok_or(ResourceAcquireError::RegistrationLost)?;
+            let changed =
+                waiter.last_wait_reason != Some(wait_reason) || waiter.last_blocker != blocker;
             waiter.last_wait_reason = Some(wait_reason);
             waiter.last_blocker = blocker;
-            Ok(AdmissionAttempt::Deferred { wait_reason })
+            Ok(AdmissionAttempt::Deferred {
+                wait_reason,
+                blocker,
+                changed,
+            })
         }
     }
 }
@@ -1733,6 +2002,13 @@ mod tests {
             .acquire(ExecutionResourceKind::Tool, None)
             .await
             .unwrap();
+        let observations = Arc::new(Mutex::new(Vec::<ResourceAdmissionObservation>::new()));
+        let observed = Arc::clone(&observations);
+        manager
+            .install_admission_observer(move |observation| {
+                observed.lock().unwrap().push(observation.clone());
+            })
+            .unwrap();
         let request = ResourceAdmissionRequest::new(
             ExecutionServiceClass::Interactive,
             [(ExecutionResourceKind::Tool, 1)],
@@ -1766,6 +2042,26 @@ mod tests {
             receipt.normalized_scope.as_deref(),
             Some("workspace:/tmp/project")
         );
+        let observations = observations.lock().unwrap();
+        assert_eq!(
+            observations
+                .iter()
+                .map(|observation| observation.status)
+                .collect::<Vec<_>>(),
+            vec![
+                ResourceAdmissionObservationStatus::Queued,
+                ResourceAdmissionObservationStatus::Waiting,
+                ResourceAdmissionObservationStatus::Granted,
+            ]
+        );
+        assert!(observations
+            .iter()
+            .all(|observation| observation.request_id == request_id));
+        assert_eq!(
+            observations[1].wait_reason,
+            Some(ResourceWaitReason::Capacity)
+        );
+        assert!(observations[1].blocker.is_some());
         drop(lease);
     }
 

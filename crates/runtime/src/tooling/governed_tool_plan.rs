@@ -991,18 +991,23 @@ pub(crate) fn resource_scope_from_effect(effect: &ToolEffectDescriptor) -> ToolR
 fn normalized_resource_scope(
     effect: &ToolEffectDescriptor,
 ) -> Result<ToolResourceScope, (String, String)> {
-    let scope = resource_scope_from_effect(effect);
+    let mut scope = resource_scope_from_effect(effect);
+    let descriptor_declares_workspace_scope = scope.kind == "workspace";
     if scope.unknown {
         return Err((
             "unknown".to_string(),
             "registered descriptors must declare a concrete effect scope".to_string(),
         ));
     }
-    for path in &scope.paths {
-        if path == "." && scope.kind == "workspace" {
-            continue;
-        }
+    for path in &mut scope.paths {
+        *path = normalize_workspace_relative_scope_path(path)?;
         if path == "." {
+            if descriptor_declares_workspace_scope {
+                continue;
+            }
+            if effect.effect_kind == ToolEffectKind::Read {
+                continue;
+            }
             return Err((
                 path.clone(),
                 "a concrete resource scope cannot normalize to the workspace root".to_string(),
@@ -1010,7 +1015,38 @@ fn normalized_resource_scope(
         }
         validate_relative_scope_path(path)?;
     }
+    if !descriptor_declares_workspace_scope
+        && effect.effect_kind == ToolEffectKind::Read
+        && scope.paths.iter().any(|path| path == ".")
+    {
+        return Ok(ToolResourceScope::workspace());
+    }
+    scope.paths.sort();
+    scope.paths.dedup();
     Ok(scope)
+}
+
+fn normalize_workspace_relative_scope_path(path: &str) -> Result<String, (String, String)> {
+    use std::path::Path;
+
+    let normalized = normalize_resource_path(path);
+    let normalized_path = Path::new(&normalized);
+    if !normalized_path.is_absolute() {
+        return Ok(normalized);
+    }
+    let workspace = std::env::current_dir().map_err(|error| {
+        (
+            normalized.clone(),
+            format!("cannot resolve the active workspace root: {error}"),
+        )
+    })?;
+    let relative = normalized_path.strip_prefix(&workspace).map_err(|_| {
+        (
+            normalized.clone(),
+            "absolute scope path is outside the active workspace".to_string(),
+        )
+    })?;
+    Ok(normalize_resource_path(&relative.to_string_lossy()))
 }
 
 fn validate_relative_scope_path(path: &str) -> Result<(), (String, String)> {
@@ -1576,6 +1612,97 @@ mod tests {
         assert_eq!(plan.tasks[1].purity, ToolPurity::Network);
         assert_eq!(plan.tasks[1].resource_scope.kind, "network");
         assert_eq!(plan.tasks[1].authority_set, vec!["network.call"]);
+    }
+
+    #[test]
+    fn readonly_workspace_root_scope_is_canonical_and_writes_still_fail_closed() {
+        let readonly = GovernedToolCompiler
+            .compile(
+                &[request_with_input(
+                    "glob-root",
+                    "glob_search",
+                    r#"{"pattern":"**/*.rs","path":"."}"#,
+                    Vec::new(),
+                )],
+                |name, input| Some((fixture_effect(name, input), 1, "workspace-root".to_string())),
+            )
+            .expect("read-only workspace root is a valid governed scope");
+        assert_eq!(readonly.tasks[0].resource_scope.kind, "workspace");
+        assert_eq!(readonly.tasks[0].resource_scope.paths, vec!["."]);
+
+        let write = GovernedToolCompiler.compile(
+            &[request_with_input(
+                "write-root",
+                "write_file",
+                r#"{"path":".","content":"no"}"#,
+                Vec::new(),
+            )],
+            |name, input| Some((fixture_effect(name, input), 1, "workspace-root".to_string())),
+        );
+        assert!(matches!(
+            write,
+            Err(GovernedToolCompileError::InvalidNormalizedScope { task_id, .. })
+                if task_id == "write-root"
+        ));
+    }
+
+    #[test]
+    fn readonly_absolute_scope_is_relativized_only_inside_the_workspace() {
+        let workspace = std::env::current_dir().expect("workspace");
+        let inside = workspace.join("crates/runtime/src");
+        let input = serde_json::json!({
+            "pattern": "**/*.rs",
+            "path": inside,
+        })
+        .to_string();
+        let plan = GovernedToolCompiler
+            .compile(
+                &[request_with_input(
+                    "glob-inside",
+                    "glob_search",
+                    &input,
+                    Vec::new(),
+                )],
+                |name, input| {
+                    Some((
+                        fixture_effect(name, input),
+                        1,
+                        "workspace-absolute".to_string(),
+                    ))
+                },
+            )
+            .expect("absolute paths inside the workspace should be relativized");
+        assert_eq!(
+            plan.tasks[0].resource_scope.paths,
+            vec!["crates/runtime/src"]
+        );
+
+        let outside = std::env::temp_dir().join("cowd-outside-workspace");
+        let outside_input = serde_json::json!({
+            "pattern": "**/*.rs",
+            "path": outside,
+        })
+        .to_string();
+        let rejected = GovernedToolCompiler.compile(
+            &[request_with_input(
+                "glob-outside",
+                "glob_search",
+                &outside_input,
+                Vec::new(),
+            )],
+            |name, input| {
+                Some((
+                    fixture_effect(name, input),
+                    1,
+                    "workspace-absolute".to_string(),
+                ))
+            },
+        );
+        assert!(matches!(
+            rejected,
+            Err(GovernedToolCompileError::InvalidNormalizedScope { task_id, .. })
+                if task_id == "glob-outside"
+        ));
     }
 
     #[test]

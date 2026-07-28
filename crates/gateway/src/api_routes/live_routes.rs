@@ -382,7 +382,7 @@ async fn get_live_stream(
         ));
     }
 
-    let initial_cursors = match headers
+    let (initial_cursors, initial_revisions) = match headers
         .get("last-event-id")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
@@ -393,23 +393,32 @@ async fn get_live_stream(
             &snapshot,
             &state.live_registry.checkpoint_secret,
         ) {
-            Ok(checkpoint) => checkpoint.source_cursors,
+            Ok(checkpoint) => (checkpoint.source_cursors, checkpoint.source_revisions),
             Err(error) => {
                 entry.active_connection.store(false, Ordering::Release);
                 return Err(api_error(StatusCode::CONFLICT, error));
             }
         },
-        None => snapshot
-            .selector
-            .sources
-            .iter()
-            .map(|source| (source.key(), source.cursor))
-            .collect(),
+        None => (
+            snapshot
+                .selector
+                .sources
+                .iter()
+                .map(|source| (source.key(), source.cursor))
+                .collect(),
+            snapshot
+                .selector
+                .sources
+                .iter()
+                .map(|source| (source.key(), source.revision))
+                .collect(),
+        ),
     };
 
     let (tx, rx) = mpsc::channel(entry.limits.queue_capacity);
     let terminal = Arc::new(Mutex::new(None));
     let delivered_cursors = Arc::new(Mutex::new(initial_cursors.clone()));
+    let delivered_revisions = Arc::new(Mutex::new(initial_revisions.clone()));
     let checkpoint_secret = state.live_registry.checkpoint_secret;
     if let Err(error) = spawn_subscription_coordinator(
         Arc::clone(&state),
@@ -418,6 +427,7 @@ async fn get_live_stream(
         tx,
         Arc::clone(&terminal),
         initial_cursors,
+        initial_revisions,
     ) {
         entry.active_connection.store(false, Ordering::Release);
         return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, error));
@@ -427,7 +437,9 @@ async fn get_live_stream(
         entry,
         terminal,
         delivered_cursors,
+        delivered_revisions,
         checkpoint_secret,
+        ready_revision: 0,
         ended: false,
     };
     Ok(Sse::new(stream)
@@ -474,6 +486,7 @@ fn spawn_subscription_coordinator(
     tx: mpsc::Sender<QueuedEnvelope>,
     terminal: Arc<Mutex<Option<TerminalSignal>>>,
     initial_cursors: BTreeMap<String, u64>,
+    initial_revisions: BTreeMap<String, u64>,
 ) -> Result<(), String> {
     let tasks = state
         .services
@@ -496,6 +509,7 @@ fn spawn_subscription_coordinator(
                     tx,
                     terminal,
                     initial_cursors,
+                    initial_revisions,
                     cancellation,
                 )
                 .await;
@@ -514,11 +528,13 @@ async fn run_subscription_coordinator(
     tx: mpsc::Sender<QueuedEnvelope>,
     terminal: Arc<Mutex<Option<TerminalSignal>>>,
     initial_cursors: BTreeMap<String, u64>,
+    initial_revisions: BTreeMap<String, u64>,
     cancellation: runtime::CancellationToken,
 ) {
     let mut revision_rx = entry.revisions.subscribe();
     let mut previous_sources = BTreeSet::new();
     let mut first_revision = true;
+    let mut retiring_source_tasks: Option<JoinSet<()>> = None;
     loop {
         let revision = revision_rx.borrow().clone();
         if revision.deleted || revision.expires_at_ms <= now_ms() {
@@ -557,7 +573,7 @@ async fn run_subscription_coordinator(
         let mut source_tasks = JoinSet::new();
         let mut baseline_receivers = Vec::new();
         let (release_tx, release_rx) = watch::channel(false);
-        for source in revision.selector.sources.clone() {
+        for mut source in revision.selector.sources.clone() {
             let (baseline_tx, baseline_rx) = oneshot::channel();
             baseline_receivers.push(baseline_rx);
             let source_cursor = if first_revision {
@@ -568,6 +584,12 @@ async fn run_subscription_coordinator(
             } else {
                 source.cursor
             };
+            if first_revision {
+                source.revision = initial_revisions
+                    .get(&source.key())
+                    .copied()
+                    .unwrap_or(source.revision);
+            }
             let source_state = Arc::clone(&state);
             let source_principal = principal.clone();
             let source_entry = Arc::clone(&entry);
@@ -629,6 +651,9 @@ async fn run_subscription_coordinator(
         let baselines_ready = tokio::select! {
             _ = cancellation.cancelled() => {
                 abort_and_join_live_sources(&mut source_tasks).await;
+                if let Some(mut retiring) = retiring_source_tasks.take() {
+                    abort_and_join_live_sources(&mut retiring).await;
+                }
                 return;
             }
             ready = tokio::time::timeout(
@@ -647,6 +672,9 @@ async fn run_subscription_coordinator(
                 "live subscription source baselines did not materialize in time",
             );
             abort_and_join_live_sources(&mut source_tasks).await;
+            if let Some(mut retiring) = retiring_source_tasks.take() {
+                abort_and_join_live_sources(&mut retiring).await;
+            }
             return;
         }
         let barrier_event = if first_revision {
@@ -672,6 +700,9 @@ async fn run_subscription_coordinator(
         );
         queue_envelope(&tx, &terminal, &entry, barrier, None);
         release_tx.send_replace(true);
+        if let Some(mut retiring) = retiring_source_tasks.take() {
+            abort_and_join_live_sources(&mut retiring).await;
+        }
 
         previous_sources = current_sources;
         first_revision = false;
@@ -704,10 +735,16 @@ async fn run_subscription_coordinator(
                 }
             }
         };
-        abort_and_join_live_sources(&mut source_tasks).await;
         if !transition {
+            abort_and_join_live_sources(&mut source_tasks).await;
             return;
         }
+        // Keep the old revision alive until every source in the replacement
+        // revision has subscribed, materialized its baseline and crossed the
+        // revision barrier. The client already ignores old-revision
+        // envelopes, while this overlap closes the event-bus gap that would
+        // otherwise lose non-replayable live deltas during selector PATCHes.
+        retiring_source_tasks = Some(source_tasks);
     }
 }
 
@@ -811,7 +848,7 @@ async fn run_session_source(
         &terminal,
         &entry,
         baseline,
-        Some((source.key(), cursor)),
+        Some((source.key(), cursor, 0)),
     );
     mark_source_baseline_ready(&mut baseline_ready);
     if !await_revision_release(&mut release).await {
@@ -936,10 +973,37 @@ async fn run_execution_source(
             return;
         }
     };
-    let initial_snapshot =
-        match runtime::execution_projection::snapshot(&runtime, &source.id, &initial_context).await
-        {
-            Ok(snapshot) => snapshot,
+    let (
+        mut projection_revision,
+        mut projection_authorization_revision,
+        mut projection_redaction_revision,
+        mut last_live_revision,
+        initial_terminal,
+    ) = if cursor > 0 && source.revision > 0 {
+        let delta = match runtime::execution_projection::delta(
+            &runtime,
+            &source.id,
+            source.revision,
+            cursor,
+            &initial_context,
+        ) {
+            Ok(delta) if delta.resync_reason.is_none() => delta,
+            Ok(delta) => {
+                queue_source_resync(
+                    &tx,
+                    &terminal,
+                    &entry,
+                    revision,
+                    &source,
+                    cursor,
+                    &format!(
+                        "execution projection resume requires resync: {:?}",
+                        delta.resync_reason
+                    ),
+                );
+                mark_source_baseline_ready(&mut baseline_ready);
+                return;
+            }
             Err(error) => {
                 queue_source_resync(
                     &tx,
@@ -954,44 +1018,110 @@ async fn run_execution_source(
                 return;
             }
         };
-    if initial_snapshot.cursor < cursor {
-        queue_source_resync(
+        let terminal_delta = delta.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                harness_contract::projection::ProjectionOperation::SetTerminal { .. }
+            )
+        });
+        cursor = delta.target_cursor;
+        if delta.target_cursor > delta.base_cursor || delta.target_revision > delta.from_revision {
+            let update = envelope(
+                &entry,
+                revision,
+                "execution",
+                &source.id,
+                source.detail_scope,
+                Some(cursor),
+                DeliveryClass::Durable,
+                SourceHealth::Live,
+                "projection_delta",
+                serde_json::to_value(&delta).unwrap_or_default(),
+            );
+            queue_envelope(
+                &tx,
+                &terminal,
+                &entry,
+                update,
+                Some((source.key(), cursor, delta.target_revision)),
+            );
+        }
+        let resumed_live = runtime.execution_live(&source.id);
+        (
+            delta.target_revision,
+            delta.authorization_revision,
+            delta.redaction_revision,
+            resumed_live.as_ref().map(|live| live.revision),
+            terminal_delta
+                || resumed_live
+                    .as_ref()
+                    .is_some_and(|live| live.status.is_terminal()),
+        )
+    } else {
+        let initial_snapshot =
+            match runtime::execution_projection::snapshot(&runtime, &source.id, &initial_context)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    queue_source_resync(
+                        &tx,
+                        &terminal,
+                        &entry,
+                        revision,
+                        &source,
+                        cursor,
+                        &error.to_string(),
+                    );
+                    mark_source_baseline_ready(&mut baseline_ready);
+                    return;
+                }
+            };
+        if initial_snapshot.cursor < cursor {
+            queue_source_resync(
+                &tx,
+                &terminal,
+                &entry,
+                revision,
+                &source,
+                cursor,
+                "execution checkpoint is ahead of the canonical projection",
+            );
+            mark_source_baseline_ready(&mut baseline_ready);
+            return;
+        }
+        cursor = initial_snapshot.cursor;
+        let values = (
+            initial_snapshot.revision,
+            initial_snapshot.authorization_revision,
+            initial_snapshot.redaction_revision.clone(),
+            initial_snapshot.live.as_ref().map(|live| live.revision),
+            initial_snapshot
+                .live
+                .as_ref()
+                .is_some_and(|live| live.status.is_terminal()),
+        );
+        let baseline = envelope(
+            &entry,
+            revision,
+            "execution",
+            &source.id,
+            source.detail_scope,
+            Some(cursor),
+            DeliveryClass::SnapshotReconstructable,
+            SourceHealth::Baseline,
+            "projection_snapshot",
+            serde_json::to_value(initial_snapshot).unwrap_or_default(),
+        );
+        queue_envelope(
             &tx,
             &terminal,
             &entry,
-            revision,
-            &source,
-            cursor,
-            "execution checkpoint is ahead of the canonical projection",
+            baseline,
+            Some((source.key(), cursor, values.0)),
         );
-        mark_source_baseline_ready(&mut baseline_ready);
-        return;
-    }
-    cursor = initial_snapshot.cursor;
-    let mut last_live_revision = initial_snapshot.live.as_ref().map(|live| live.revision);
-    let initial_terminal = initial_snapshot
-        .live
-        .as_ref()
-        .is_some_and(|live| live.status.is_terminal());
-    let baseline = envelope(
-        &entry,
-        revision,
-        "execution",
-        &source.id,
-        source.detail_scope,
-        Some(cursor),
-        DeliveryClass::SnapshotReconstructable,
-        SourceHealth::Baseline,
-        "projection_snapshot",
-        serde_json::to_value(initial_snapshot).unwrap_or_default(),
-    );
-    queue_envelope(
-        &tx,
-        &terminal,
-        &entry,
-        baseline,
-        Some((source.key(), cursor)),
-    );
+        values
+    };
     mark_source_baseline_ready(&mut baseline_ready);
     if !await_revision_release(&mut release).await || initial_terminal {
         return;
@@ -1063,52 +1193,79 @@ async fn run_execution_source(
             }
         }
 
-        match runtime::execution_projection::delta(&runtime, &source.id, cursor, &context) {
-            Ok(delta) if delta.target_cursor > cursor || cursor == 0 => {
-                match runtime::execution_projection::snapshot(&runtime, &source.id, &context).await
+        match runtime::execution_projection::delta(
+            &runtime,
+            &source.id,
+            projection_revision,
+            cursor,
+            &context,
+        ) {
+            Ok(delta) if delta.resync_reason.is_some() => {
+                queue_source_resync(
+                    &tx,
+                    &terminal,
+                    &entry,
+                    revision,
+                    &source,
+                    cursor,
+                    &format!(
+                        "execution projection delta requires resync: {:?}",
+                        delta.resync_reason
+                    ),
+                );
+                return;
+            }
+            Ok(delta)
+                if delta.target_cursor > cursor
+                    || delta.target_revision > projection_revision
+                    || cursor == 0 =>
+            {
+                if delta.authorization_revision != projection_authorization_revision
+                    || delta.redaction_revision != projection_redaction_revision
+                    || delta.detail_scope != source.detail_scope
                 {
-                    Ok(snapshot) => {
-                        cursor = cursor.max(snapshot.cursor).max(delta.target_cursor);
-                        last_live_revision = snapshot.live.as_ref().map(|live| live.revision);
-                        let is_terminal = snapshot
-                            .live
-                            .as_ref()
-                            .is_some_and(|live| live.status.is_terminal());
-                        let update = envelope(
-                            &entry,
-                            revision,
-                            "execution",
-                            &source.id,
-                            source.detail_scope,
-                            Some(cursor),
-                            DeliveryClass::SnapshotReconstructable,
-                            SourceHealth::Live,
-                            "projection_snapshot",
-                            serde_json::to_value(snapshot).unwrap_or_default(),
-                        );
-                        queue_envelope(
-                            &tx,
-                            &terminal,
-                            &entry,
-                            update,
-                            Some((source.key(), cursor)),
-                        );
-                        if is_terminal {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        queue_source_resync(
-                            &tx,
-                            &terminal,
-                            &entry,
-                            revision,
-                            &source,
-                            cursor,
-                            &error.to_string(),
-                        );
-                        return;
-                    }
+                    queue_source_resync(
+                        &tx,
+                        &terminal,
+                        &entry,
+                        revision,
+                        &source,
+                        cursor,
+                        "execution projection authority or redaction scope changed",
+                    );
+                    return;
+                }
+                let is_terminal = delta.operations.iter().any(|operation| {
+                    matches!(
+                        operation,
+                        harness_contract::projection::ProjectionOperation::SetTerminal { .. }
+                    )
+                });
+                cursor = delta.target_cursor;
+                projection_revision = delta.target_revision;
+                projection_authorization_revision = delta.authorization_revision;
+                projection_redaction_revision = delta.redaction_revision.clone();
+                let update = envelope(
+                    &entry,
+                    revision,
+                    "execution",
+                    &source.id,
+                    source.detail_scope,
+                    Some(cursor),
+                    DeliveryClass::Durable,
+                    SourceHealth::Live,
+                    "projection_delta",
+                    serde_json::to_value(delta).unwrap_or_default(),
+                );
+                queue_envelope(
+                    &tx,
+                    &terminal,
+                    &entry,
+                    update,
+                    Some((source.key(), cursor, projection_revision)),
+                );
+                if is_terminal {
+                    return;
                 }
             }
             Ok(_) => {}
@@ -1182,7 +1339,7 @@ async fn run_mission_source(
         &terminal,
         &entry,
         baseline,
-        Some((source.key(), cursor)),
+        Some((source.key(), cursor, materialized_revision)),
     );
     mark_source_baseline_ready(&mut baseline_ready);
     if !await_revision_release(&mut release).await {
@@ -1251,7 +1408,13 @@ async fn run_mission_source(
                 "mission_snapshot",
                 serde_json::to_value(snapshot).unwrap_or_default(),
             );
-            queue_envelope(&tx, &terminal, &entry, update, Some((source.key(), cursor)));
+            queue_envelope(
+                &tx,
+                &terminal,
+                &entry,
+                update,
+                Some((source.key(), cursor, materialized_revision)),
+            );
             continue;
         }
         if delta.to_cursor == cursor
@@ -1274,7 +1437,13 @@ async fn run_mission_source(
             "mission_delta",
             serde_json::to_value(delta).unwrap_or_default(),
         );
-        queue_envelope(&tx, &terminal, &entry, update, Some((source.key(), cursor)));
+        queue_envelope(
+            &tx,
+            &terminal,
+            &entry,
+            update,
+            Some((source.key(), cursor, materialized_revision)),
+        );
     }
 }
 
@@ -1337,7 +1506,7 @@ fn queue_session_payload(
         terminal,
         entry,
         result,
-        cursor.map(|value| (source.key(), value)),
+        cursor.map(|value| (source.key(), value, source.revision)),
     );
 }
 
@@ -1388,7 +1557,13 @@ fn queue_source_resync(
         "source.resync_required",
         serde_json::json!({"reason": reason, "cursor": cursor}),
     );
-    queue_envelope(tx, terminal, entry, resync, Some((source.key(), cursor)));
+    queue_envelope(
+        tx,
+        terminal,
+        entry,
+        resync,
+        Some((source.key(), cursor, source.revision)),
+    );
 }
 
 fn queue_envelope(
@@ -1396,7 +1571,7 @@ fn queue_envelope(
     terminal: &Arc<Mutex<Option<TerminalSignal>>>,
     entry: &SubscriptionEntry,
     envelope: LiveEnvelope,
-    checkpoint_update: Option<(String, u64)>,
+    checkpoint_update: Option<(String, u64, u64)>,
 ) {
     let delivery = envelope.delivery_class;
     match tx.try_send(QueuedEnvelope {
@@ -1488,7 +1663,7 @@ fn envelope(
 
 struct QueuedEnvelope {
     envelope: LiveEnvelope,
-    checkpoint_update: Option<(String, u64)>,
+    checkpoint_update: Option<(String, u64, u64)>,
 }
 
 impl QueuedEnvelope {
@@ -1529,7 +1704,9 @@ struct PhysicalLiveStream {
     entry: Arc<SubscriptionEntry>,
     terminal: Arc<Mutex<Option<TerminalSignal>>>,
     delivered_cursors: Arc<Mutex<BTreeMap<String, u64>>>,
+    delivered_revisions: Arc<Mutex<BTreeMap<String, u64>>>,
     checkpoint_secret: [u8; 32],
+    ready_revision: u64,
     ended: bool,
 }
 
@@ -1579,18 +1756,36 @@ impl Stream for PhysicalLiveStream {
             match queued {
                 Some(queued) => {
                     let snapshot = self.entry.snapshot();
-                    if queued.envelope.subscription_revision != snapshot.revision {
+                    if queued.envelope.subscription_revision != snapshot.revision
+                        && queued.envelope.subscription_revision != self.ready_revision
+                    {
                         continue;
                     }
-                    let writes_checkpoint = queued.checkpoint_update.is_some()
-                        || queued.envelope.event == "subscription.ready";
-                    if let Some((source, cursor)) = queued.checkpoint_update {
+                    let revision_barrier = matches!(
+                        queued.envelope.event.as_str(),
+                        "subscription.ready" | "subscription.revision.changed"
+                    );
+                    if revision_barrier
+                        && queued.envelope.subscription_revision == snapshot.revision
+                    {
+                        self.ready_revision = snapshot.revision;
+                    }
+                    let writes_checkpoint = queued.checkpoint_update.is_some() || revision_barrier;
+                    if let Some((source, cursor, revision)) = queued.checkpoint_update {
+                        let source_revision_key = source.clone();
                         let mut delivered = self
                             .delivered_cursors
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let current = delivered.entry(source).or_default();
                         *current = (*current).max(cursor);
+                        let mut delivered_revisions = self
+                            .delivered_revisions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let current_revision =
+                            delivered_revisions.entry(source_revision_key).or_default();
+                        *current_revision = (*current_revision).max(revision);
                     }
                     let event = Event::default()
                         .event("live")
@@ -1658,6 +1853,11 @@ impl PhysicalLiveStream {
             key_revision,
             source_cursors: self
                 .delivered_cursors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            source_revisions: self
+                .delivered_revisions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
@@ -1973,6 +2173,7 @@ fn verify_checkpoint(
     if checkpoint
         .source_cursors
         .keys()
+        .chain(checkpoint.source_revisions.keys())
         .any(|source| !allowed.contains(source))
     {
         return Err("composite checkpoint contains an unselected source".to_string());
@@ -2081,6 +2282,7 @@ mod tests {
             kind: LiveSourceKind::Session,
             id: id.to_string(),
             cursor: 0,
+            revision: 0,
             detail_scope: ProjectionDetailScope::Summary,
         }
     }
@@ -2129,6 +2331,7 @@ mod tests {
             expires_at_ms: revision.expires_at_ms,
             key_revision,
             source_cursors: BTreeMap::from([("session:a".to_string(), 9)]),
+            source_revisions: BTreeMap::from([("session:a".to_string(), 0)]),
         };
         mutate(&mut checkpoint);
         let key = derive_checkpoint_key(&TEST_CHECKPOINT_SECRET, checkpoint.key_revision).unwrap();
@@ -2141,6 +2344,7 @@ mod tests {
             kind: LiveSourceKind::Session,
             id: "session-1".to_string(),
             cursor: 0,
+            revision: 0,
             detail_scope: ProjectionDetailScope::Summary,
         };
         let error = normalize_selector(
@@ -2192,6 +2396,7 @@ mod tests {
             expires_at_ms: now_ms() + 60_000,
             key_revision: checkpoint_key_revision(now_ms()),
             source_cursors: BTreeMap::from([("session:a".to_string(), 9)]),
+            source_revisions: BTreeMap::from([("session:a".to_string(), 0)]),
         };
         let token = sign_checkpoint(&checkpoint, &[7; 32], 6_144).unwrap();
         let (payload, signature) = token.split_once('.').unwrap();
@@ -2323,6 +2528,7 @@ mod tests {
             source_cursors: (0..64)
                 .map(|index| (format!("session:{index:04}"), index))
                 .collect(),
+            source_revisions: BTreeMap::new(),
         };
         let error = sign_checkpoint(&checkpoint, &[3; 32], 128).unwrap_err();
         assert!(error.contains("exceeds"));
@@ -2355,7 +2561,7 @@ mod tests {
                 "old",
                 serde_json::Value::Null,
             ),
-            checkpoint_update: Some(("session:a".to_string(), 1)),
+            checkpoint_update: Some(("session:a".to_string(), 1, 0)),
         })
         .await
         .unwrap();
@@ -2372,7 +2578,7 @@ mod tests {
                 "current",
                 serde_json::Value::Null,
             ),
-            checkpoint_update: Some(("session:a".to_string(), 2)),
+            checkpoint_update: Some(("session:a".to_string(), 2, 7)),
         })
         .await
         .unwrap();
@@ -2382,13 +2588,152 @@ mod tests {
             entry,
             terminal: Arc::new(Mutex::new(None)),
             delivered_cursors: Arc::new(Mutex::new(BTreeMap::new())),
+            delivered_revisions: Arc::new(Mutex::new(BTreeMap::new())),
             checkpoint_secret: TEST_CHECKPOINT_SECRET,
+            ready_revision: 0,
             ended: false,
         };
         let event = stream.next().await.unwrap().unwrap();
         let rendered = format!("{event:?}");
         assert!(rendered.contains("current"));
         assert!(!rendered.contains("old"));
+        assert_eq!(
+            stream
+                .delivered_revisions
+                .lock()
+                .unwrap()
+                .get("session:a")
+                .copied(),
+            Some(7),
+            "the signed resume checkpoint must retain the applied projection revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_stream_keeps_ready_revision_until_replacement_barrier() {
+        let entry = test_entry(LiveSelector {
+            sources: vec![test_source("a")],
+        });
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(QueuedEnvelope {
+            envelope: envelope(
+                &entry,
+                1,
+                "subscription",
+                "subscription-a",
+                ProjectionDetailScope::Summary,
+                None,
+                DeliveryClass::SnapshotReconstructable,
+                SourceHealth::Baseline,
+                "subscription.ready",
+                serde_json::Value::Null,
+            ),
+            checkpoint_update: None,
+        })
+        .await
+        .unwrap();
+        let mut stream = PhysicalLiveStream {
+            rx: ReceiverStream::new(rx),
+            entry: Arc::clone(&entry),
+            terminal: Arc::new(Mutex::new(None)),
+            delivered_cursors: Arc::new(Mutex::new(BTreeMap::new())),
+            delivered_revisions: Arc::new(Mutex::new(BTreeMap::new())),
+            checkpoint_secret: TEST_CHECKPOINT_SECRET,
+            ready_revision: 0,
+            ended: false,
+        };
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(format!("{first:?}").contains("subscription.ready"));
+        assert_eq!(stream.ready_revision, 1);
+
+        let current = entry.snapshot();
+        entry.revisions.send_replace(Arc::new(SubscriptionRevision {
+            revision: 2,
+            selector: current.selector.clone(),
+            selector_hash: current.selector_hash.clone(),
+            expires_at_ms: current.expires_at_ms,
+            deleted: false,
+        }));
+        tx.send(QueuedEnvelope {
+            envelope: envelope(
+                &entry,
+                1,
+                "session",
+                "a",
+                ProjectionDetailScope::Summary,
+                None,
+                DeliveryClass::EphemeralPreview,
+                SourceHealth::Live,
+                "old-before-barrier",
+                serde_json::Value::Null,
+            ),
+            checkpoint_update: None,
+        })
+        .await
+        .unwrap();
+        let old_before_barrier = stream.next().await.unwrap().unwrap();
+        assert!(format!("{old_before_barrier:?}").contains("old-before-barrier"));
+
+        tx.send(QueuedEnvelope {
+            envelope: envelope(
+                &entry,
+                2,
+                "subscription",
+                "subscription-a",
+                ProjectionDetailScope::Summary,
+                None,
+                DeliveryClass::SnapshotReconstructable,
+                SourceHealth::Baseline,
+                "subscription.revision.changed",
+                serde_json::Value::Null,
+            ),
+            checkpoint_update: None,
+        })
+        .await
+        .unwrap();
+        let replacement_barrier = stream.next().await.unwrap().unwrap();
+        assert!(format!("{replacement_barrier:?}").contains("subscription.revision.changed"));
+        assert_eq!(stream.ready_revision, 2);
+
+        tx.send(QueuedEnvelope {
+            envelope: envelope(
+                &entry,
+                1,
+                "session",
+                "a",
+                ProjectionDetailScope::Summary,
+                None,
+                DeliveryClass::EphemeralPreview,
+                SourceHealth::Live,
+                "old-after-barrier",
+                serde_json::Value::Null,
+            ),
+            checkpoint_update: None,
+        })
+        .await
+        .unwrap();
+        tx.send(QueuedEnvelope {
+            envelope: envelope(
+                &entry,
+                2,
+                "session",
+                "a",
+                ProjectionDetailScope::Summary,
+                None,
+                DeliveryClass::EphemeralPreview,
+                SourceHealth::Live,
+                "current-after-barrier",
+                serde_json::Value::Null,
+            ),
+            checkpoint_update: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let current_after_barrier = stream.next().await.unwrap().unwrap();
+        let rendered = format!("{current_after_barrier:?}");
+        assert!(rendered.contains("current-after-barrier"));
+        assert!(!rendered.contains("old-after-barrier"));
     }
 
     #[tokio::test]

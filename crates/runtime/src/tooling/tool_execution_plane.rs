@@ -135,6 +135,7 @@ impl ToolExecutionPlane {
             timeout,
             ExecutionServiceClass::Foreground,
             None,
+            None,
             operation,
         )
         .await
@@ -146,6 +147,7 @@ impl ToolExecutionPlane {
         timeout: Option<Duration>,
         service_class: ExecutionServiceClass,
         parent_class_ceiling: Option<ExecutionServiceClass>,
+        session_id: Option<&str>,
         operation: F,
     ) -> Result<T, ToolExecutionPlaneError>
     where
@@ -158,6 +160,7 @@ impl ToolExecutionPlane {
                 timeout,
                 service_class,
                 parent_class_ceiling,
+                session_id,
                 operation,
             )
             .await;
@@ -174,6 +177,7 @@ impl ToolExecutionPlane {
         timeout: Option<Duration>,
         service_class: ExecutionServiceClass,
         parent_class_ceiling: Option<ExecutionServiceClass>,
+        session_id: Option<&str>,
         operation: F,
     ) -> (
         Result<T, ToolExecutionPlaneError>,
@@ -202,7 +206,11 @@ impl ToolExecutionPlane {
         let resource_demands = execution_resource_demands(demand);
         let mut request = ResourceAdmissionRequest::new(service_class, resource_demands)
             .with_scope(normalized_scope, true)
-            .with_fairness_key(format!("tool:{service_class:?}"));
+            .with_fairness_key(
+                session_id
+                    .map(|session_id| format!("session:{session_id}"))
+                    .unwrap_or_else(|| format!("tool:{service_class:?}")),
+            );
         if let Some(parent_class_ceiling) = parent_class_ceiling {
             request = request.with_parent_class_ceiling(parent_class_ceiling);
         }
@@ -385,6 +393,7 @@ mod tests {
     use super::*;
     use crate::execution_core::graph::ResourceQuota;
     use harness_contract::tool::ResourceScopeDemand;
+    use std::sync::Mutex;
 
     fn plane(limit: usize) -> ToolExecutionPlane {
         ToolExecutionPlane::new(
@@ -453,6 +462,7 @@ mod tests {
                 None,
                 ExecutionServiceClass::Interactive,
                 None,
+                None,
                 || 1,
             )
             .await;
@@ -469,6 +479,49 @@ mod tests {
 
         drop(admission);
         assert_eq!(waiting.await.unwrap().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn classified_tool_admission_is_bound_to_its_session() {
+        let resources = Arc::new(ExecutionResourceManager::new([
+            (
+                ExecutionResourceKind::Tool,
+                ResourceQuota::new(1, 1, 1).expect("quota"),
+            ),
+            (
+                ExecutionResourceKind::Custom("tool.cpu".to_string()),
+                ResourceQuota::new(1, 1, 1).expect("quota"),
+            ),
+        ]));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        resources
+            .install_admission_observer(move |observation| {
+                captured.lock().unwrap().push(observation.clone());
+            })
+            .expect("observer");
+        let plane =
+            ToolExecutionPlane::new(Arc::clone(&resources), Arc::new(ScopeLockManager::new()));
+
+        assert_eq!(
+            plane
+                .execute_classified(
+                    &ResourceDemand::default(),
+                    None,
+                    ExecutionServiceClass::Foreground,
+                    None,
+                    Some("session-a"),
+                    || 7,
+                )
+                .await
+                .expect("tool execution"),
+            7
+        );
+        let observed = observed.lock().unwrap();
+        assert!(!observed.is_empty());
+        assert!(observed
+            .iter()
+            .all(|observation| observation.fairness_key == "session:session-a"));
     }
 
     #[tokio::test]

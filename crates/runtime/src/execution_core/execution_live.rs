@@ -215,6 +215,15 @@ impl LiveExecutionRecord {
         )
     }
 
+    fn complete_recovered(&mut self, terminal_ref: String) -> bool {
+        self.live.terminal_ref = Some(terminal_ref);
+        self.live.error = None;
+        self.transition(
+            ExecutionLiveStatus::Complete,
+            Some("durable terminal recovered".to_string()),
+        )
+    }
+
     fn fail(&mut self, error: String) -> bool {
         self.live.error = Some(error.clone());
         self.transition(ExecutionLiveStatus::Error, Some(error))
@@ -453,6 +462,12 @@ impl ExecutionLiveStore {
     ) {
         self.update_record(execution_id, |record| {
             record.complete(report, write_attempt_paths, terminal_ref)
+        });
+    }
+
+    pub(crate) fn complete_recovered(&self, execution_id: &str, terminal_ref: String) {
+        self.update_record(execution_id, |record| {
+            record.complete_recovered(terminal_ref)
         });
     }
 
@@ -834,6 +849,61 @@ mod tests {
                 .unwrap()
                 .len(),
             3
+        );
+    }
+
+    #[test]
+    fn durable_terminal_recovery_closes_a_finalizing_live_projection_idempotently() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let store = ExecutionLiveStore::new(Arc::clone(&event_store));
+        let execution_id = "execution-recovered-terminal";
+        store.record_queued(
+            "session-recovered-terminal",
+            execution_id.to_string(),
+            "turn-recovered-terminal".to_string(),
+        );
+        let phase = |status, detail: &str| CowdEvent::ExecutionScoped {
+            context: CowdExecutionContext {
+                execution_id: execution_id.to_string(),
+                session_id: "session-recovered-terminal".to_string(),
+                turn_id: "turn-recovered-terminal".to_string(),
+            },
+            event: Box::new(CowdEvent::ExecutionPhase {
+                status,
+                detail: Some(detail.to_string()),
+            }),
+        };
+        store.observe_event(
+            "session-recovered-terminal",
+            &phase(ExecutionLiveStatus::CallingModel, "calling model"),
+        );
+        store.observe_event(
+            "session-recovered-terminal",
+            &phase(ExecutionLiveStatus::Finalizing, "synthesizing terminal"),
+        );
+
+        store.complete_recovered(execution_id, "terminal-recovered".to_string());
+        let terminal = store.execution_live(execution_id).unwrap();
+        assert_eq!(terminal.status, ExecutionLiveStatus::Complete);
+        assert_eq!(
+            terminal.status_detail.as_deref(),
+            Some("durable terminal recovered")
+        );
+        assert_eq!(terminal.terminal_ref.as_deref(), Some("terminal-recovered"));
+        let terminal_revision = terminal.revision;
+
+        store.complete_recovered(execution_id, "terminal-recovered".to_string());
+        assert_eq!(
+            store.execution_live(execution_id).unwrap().revision,
+            terminal_revision,
+            "replaying the same durable terminal must be idempotent"
+        );
+
+        let rehydrated = ExecutionLiveStore::new(event_store);
+        assert_eq!(
+            rehydrated.execution_live(execution_id).unwrap().status,
+            ExecutionLiveStatus::Complete,
+            "the repaired terminal projection must survive process restart"
         );
     }
 

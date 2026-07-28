@@ -261,6 +261,7 @@ pub(crate) fn to_runtime_input_record(
         next_attempt_at_ms: record.next_attempt_at_ms,
         claim_owner: record.claim_owner,
         claim_token: record.claim_token,
+        claim_fence_epoch: record.claim_fence_epoch,
         claim_expires_at_ms: record.claim_expires_at_ms,
         failure_class: record
             .failure_class

@@ -5,7 +5,7 @@ pub use crate::reality::EvidenceRef;
 use crate::tool::ToolExposureProjection;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceDurability {
     Pending,
@@ -125,7 +125,7 @@ pub struct ToolOutputEnvelope {
     pub receipt: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EvidenceAccessRef {
     pub evidence_ref: EvidenceRef,
     pub sha256: String,
@@ -934,7 +934,7 @@ impl ContextTurnReport {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ContextComponentUsage {
     pub kind: String,
     pub tokens: u64,

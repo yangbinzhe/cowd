@@ -258,7 +258,9 @@ async fn run_tui_live_manager(
                         let current_revision =
                             subscription.as_ref().map_or(0, |active| active.revision);
                         if result.is_ok() && previous_revision != current_revision {
-                            ready_revision = 0;
+                            if ready_revision != previous_revision {
+                                ready_revision = 0;
+                            }
                             pending_revision_envelopes.clear();
                         }
                         if result.is_ok() && connection.as_ref().is_none_or(|task| task.is_finished()) {
@@ -300,7 +302,9 @@ async fn run_tui_live_manager(
                             let current_revision =
                                 subscription.as_ref().map_or(0, |active| active.revision);
                             if result.is_ok() && previous_revision != current_revision {
-                                ready_revision = 0;
+                                if ready_revision != previous_revision {
+                                    ready_revision = 0;
+                                }
                                 pending_revision_envelopes.clear();
                             }
                             if let Err(reason) = result {
@@ -325,7 +329,9 @@ async fn run_tui_live_manager(
                     LiveTransportEvent::Envelope(envelope) => {
                         let current_revision =
                             subscription.as_ref().map_or(0, |active| active.revision);
-                        if envelope.subscription_revision < current_revision {
+                        if envelope.subscription_revision < current_revision
+                            && envelope.subscription_revision != ready_revision
+                        {
                             continue;
                         }
                         if envelope.subscription_revision > current_revision {
@@ -422,8 +428,10 @@ fn refresh_tui_live_source_selector(source: &mut LiveSourceState) {
     };
     let mut selector = first.selector.clone();
     selector.cursor = selector.cursor.max(source.selector.cursor);
+    selector.revision = selector.revision.max(source.selector.revision);
     for subscriber in source.subscribers.values().skip(1) {
         selector.cursor = selector.cursor.max(subscriber.selector.cursor);
+        selector.revision = selector.revision.max(subscriber.selector.revision);
         if subscriber.selector.detail_scope
             == harness_contract::projection::ProjectionDetailScope::Full
         {
@@ -491,6 +499,22 @@ async fn deliver_tui_live_envelope(
     };
     if let Some(cursor) = envelope.source_cursor {
         source.selector.cursor = source.selector.cursor.max(cursor);
+    }
+    if envelope.source_kind == "execution" {
+        let revision = match envelope.event.as_str() {
+            "projection_snapshot" => envelope
+                .payload
+                .get("revision")
+                .and_then(serde_json::Value::as_u64),
+            "projection_delta" => envelope
+                .payload
+                .get("target_revision")
+                .and_then(serde_json::Value::as_u64),
+            _ => None,
+        };
+        if let Some(revision) = revision {
+            source.selector.revision = source.selector.revision.max(revision);
+        }
     }
     let mut closed = Vec::new();
     for (subscriber_id, subscriber) in &source.subscribers {
@@ -1511,6 +1535,7 @@ impl GatewayApiClient {
                 kind: harness_contract::live::LiveSourceKind::Session,
                 id: session_id.to_string(),
                 cursor: after_commit_cursor.unwrap_or_default(),
+                revision: 0,
                 detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
             })
             .await?;
@@ -1835,16 +1860,18 @@ impl GatewayApiClient {
         &self,
         execution_id: &str,
         after_cursor: u64,
+        after_revision: u64,
         full: bool,
         generation: u64,
         tx: CowdEventSender,
-    ) -> Result<u64, GatewayApiError> {
+    ) -> Result<(u64, u64), GatewayApiError> {
         let mut source = self
             .live
             .subscribe(harness_contract::live::LiveSourceSelector {
                 kind: harness_contract::live::LiveSourceKind::Execution,
                 id: execution_id.to_string(),
                 cursor: after_cursor,
+                revision: after_revision,
                 detail_scope: if full {
                     harness_contract::projection::ProjectionDetailScope::Full
                 } else {
@@ -1864,6 +1891,7 @@ impl GatewayApiClient {
         })?;
 
         let mut latest_cursor = after_cursor;
+        let mut latest_revision = after_revision;
         while let Some(envelope) = source.recv().await {
             if envelope.source_kind != "execution" || envelope.source_id != execution_id {
                 return Err(GatewayApiError::Contract(
@@ -1882,8 +1910,34 @@ impl GatewayApiClient {
                 ));
             }
             if envelope.source_health == harness_contract::live::SourceHealth::ResyncRequired {
-                return Ok(envelope.source_cursor.unwrap_or(latest_cursor));
+                let snapshot = self.execution_projection(execution_id, full).await?;
+                latest_cursor = snapshot.cursor;
+                latest_revision = snapshot.revision;
+                tx.send_wait(CowdEvent::ExecutionProjectionLoaded {
+                    generation,
+                    projection: snapshot,
+                })
+                .await
+                .map_err(|_| {
+                    GatewayApiError::Url(
+                        "TUI execution projection consumer closed during resync".to_string(),
+                    )
+                })?;
+                return Ok((latest_cursor, latest_revision));
             }
+            latest_revision = match envelope.event.as_str() {
+                "projection_snapshot" => envelope
+                    .payload
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(latest_revision),
+                "projection_delta" => envelope
+                    .payload
+                    .get("target_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(latest_revision),
+                _ => latest_revision,
+            };
             let frame = format!("event: {}\ndata: {}", envelope.event, envelope.payload);
             latest_cursor = self
                 .apply_execution_projection_sse_frame(
@@ -1896,7 +1950,7 @@ impl GatewayApiClient {
                 )
                 .await?;
         }
-        Ok(latest_cursor)
+        Ok((latest_cursor, latest_revision))
     }
 
     pub async fn consume_mission_live_source(
@@ -1910,6 +1964,7 @@ impl GatewayApiClient {
                 kind: harness_contract::live::LiveSourceKind::Mission,
                 id: mission_id.to_string(),
                 cursor: 0,
+                revision: 0,
                 detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
             })
             .await?;
@@ -4900,6 +4955,7 @@ mod tests {
                 kind: harness_contract::live::LiveSourceKind::Execution,
                 id: "execution-1".to_string(),
                 cursor: 11,
+                revision: 1,
                 detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
             },
             subscribers: BTreeMap::from([
@@ -4910,6 +4966,7 @@ mod tests {
                             kind: harness_contract::live::LiveSourceKind::Execution,
                             id: "execution-1".to_string(),
                             cursor: 5,
+                            revision: 1,
                             detail_scope:
                                 harness_contract::projection::ProjectionDetailScope::Summary,
                         },
@@ -4923,6 +4980,7 @@ mod tests {
                             kind: harness_contract::live::LiveSourceKind::Execution,
                             id: "execution-1".to_string(),
                             cursor: 7,
+                            revision: 1,
                             detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
                         },
                         tx: full_tx,
@@ -4956,12 +5014,14 @@ mod tests {
             kind: harness_contract::live::LiveSourceKind::Session,
             id: "session-1".to_string(),
             cursor: 13,
+            revision: 0,
             detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
         };
         let mission_selector = harness_contract::live::LiveSourceSelector {
             kind: harness_contract::live::LiveSourceKind::Mission,
             id: "mission-1".to_string(),
             cursor: 0,
+            revision: 0,
             detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
         };
         let mut sources = BTreeMap::from([
@@ -5022,6 +5082,7 @@ mod tests {
             kind: harness_contract::live::LiveSourceKind::Session,
             id: "session-contract".to_string(),
             cursor: 42,
+            revision: 0,
             detail_scope: harness_contract::projection::ProjectionDetailScope::Full,
         };
         let mut sources = BTreeMap::from([(
@@ -5342,11 +5403,24 @@ mod tests {
     #[test]
     fn gateway_sse_frame_parses_canonical_projection_delta_only_from_named_event() {
         let delta = serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
+            "reducer_version": 1,
             "execution_id": "graph-1",
+            "from_revision": 1,
+            "target_revision": 1,
             "base_cursor": 4,
             "target_cursor": 5,
-            "events": []
+            "detail_scope": "summary",
+            "authorization_revision": 1,
+            "redaction_revision": "sha256:test",
+            "source_health": "fresh",
+            "operations": [
+                {
+                    "op": "advance_cursor",
+                    "cursor": 5
+                }
+            ],
+            "resync_reason": null
         });
         let frame = format!("id: 5\nevent: projection_delta\ndata: {delta}");
         let parsed = gateway_sse_frame_projection_delta(&frame).expect("projection delta");

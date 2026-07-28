@@ -84,7 +84,7 @@ fn resolve_effect_properties(
                 .unwrap_or_default();
             command_effect(command)
         }
-        "builtin.readonly" => EffectProperties {
+        "builtin.readonly" | "runtime.readonly" => EffectProperties {
             effect_kind: ToolEffectKind::Read,
             idempotency: ToolIdempotency::Idempotent,
             scopes: vec![read_scope()],
@@ -106,7 +106,7 @@ fn resolve_effect_properties(
             mutates_packages: false,
             mutates_system: false,
         },
-        "builtin.workspace_write" => EffectProperties {
+        "builtin.workspace_write" | "runtime.state_write" => EffectProperties {
             effect_kind: ToolEffectKind::Write,
             idempotency: ToolIdempotency::IdempotentWithKey,
             scopes: vec![write_scope()],
@@ -129,6 +129,51 @@ fn resolve_effect_properties(
             approval_class: ToolApprovalClass::Policy,
             uses_network: true,
             spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        },
+        "runtime.external_read" => EffectProperties {
+            effect_kind: ToolEffectKind::Network,
+            idempotency: ToolIdempotency::Idempotent,
+            scopes: vec![scope(
+                PermissionResource::Network,
+                PermissionOperation::Call,
+                target,
+            )],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: true,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+        },
+        "runtime.external_write" => EffectProperties {
+            effect_kind: ToolEffectKind::Network,
+            idempotency: ToolIdempotency::IdempotentWithKey,
+            scopes: vec![scope(
+                PermissionResource::Network,
+                PermissionOperation::Call,
+                target,
+            )],
+            required_permission: ToolPermissionMode::WorkspaceWrite,
+            approval_class: ToolApprovalClass::User,
+            uses_network: true,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+        },
+        "runtime.external_danger" => EffectProperties {
+            effect_kind: ToolEffectKind::Network,
+            idempotency: ToolIdempotency::NonIdempotent,
+            scopes: vec![scope(
+                PermissionResource::Network,
+                PermissionOperation::Call,
+                target,
+            )],
+            required_permission: ToolPermissionMode::DangerFullAccess,
+            approval_class: ToolApprovalClass::User,
+            uses_network: true,
+            spawns_process: true,
             mutates_packages: false,
             mutates_system: false,
         },

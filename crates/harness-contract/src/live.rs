@@ -31,6 +31,8 @@ pub struct LiveSourceSelector {
     #[serde(default)]
     pub cursor: u64,
     #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
     pub detail_scope: ProjectionDetailScope,
 }
 
@@ -143,6 +145,8 @@ pub struct CompositeCheckpoint {
     pub key_revision: u64,
     #[serde(default)]
     pub source_cursors: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub source_revisions: BTreeMap<String, u64>,
 }
 
 pub fn live_envelope_json_schema() -> Value {
@@ -253,6 +257,7 @@ mod tests {
             kind: LiveSourceKind::Execution,
             id: "same-id".to_string(),
             cursor: 0,
+            revision: 0,
             detail_scope: ProjectionDetailScope::Full,
         };
         assert_eq!(source.key(), "execution:same-id");
@@ -264,6 +269,7 @@ mod tests {
             kind: LiveSourceKind::Mission,
             id: "workspace".to_string(),
             cursor: 4,
+            revision: 0,
             detail_scope: ProjectionDetailScope::Summary,
         };
         assert_eq!(source.key(), "mission:workspace");

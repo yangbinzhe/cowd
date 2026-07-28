@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use harness_contract::tool::{
     ToolDefinition as KernelToolDefinition, ToolDescriptorHealth, ToolDescriptorRef,
-    ToolPermissionMode as KernelToolPermissionMode,
+    ToolEffectKind, ToolEffectResolverSpec, ToolPermissionMode as KernelToolPermissionMode,
 };
 use plugins::PluginTool;
 use serde_json::Value;
@@ -74,6 +74,7 @@ pub struct RuntimeToolDefinition {
     pub description: Option<String>,
     pub input_schema: Value,
     pub required_permission: PermissionMode,
+    pub effect_resolver: ToolEffectResolverSpec,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,6 +141,18 @@ impl ToolCatalog {
                 return Err(format!(
                     "runtime tool `{}` conflicts with an existing tool name",
                     tool.name
+                ));
+            }
+            let descriptor = crate::tool_orchestrator::resolve_registered_tool_effect(
+                &tool.effect_resolver,
+                &tool.name,
+                &Value::Object(serde_json::Map::new()),
+                kernel_permission_mode(tool.required_permission),
+            );
+            if descriptor.effect_kind == ToolEffectKind::Unknown {
+                return Err(format!(
+                    "runtime tool `{}` declares unsupported effect resolver `{}`",
+                    tool.name, tool.effect_resolver.resolver_id
                 ));
             }
         }
@@ -335,6 +348,9 @@ impl ToolCatalog {
         if mvp_tool_specs().iter().any(|spec| spec.name == name) {
             return builtin_effect_resolver_spec(name);
         }
+        if let Some(tool) = self.runtime_tools.iter().find(|tool| tool.name == name) {
+            return tool.effect_resolver.clone();
+        }
         let source = if self.has_runtime_tool(name) {
             "runtime"
         } else if self
@@ -515,6 +531,25 @@ mod tests {
     use super::*;
     use mcp::McpService;
     use std::sync::Arc;
+
+    #[test]
+    fn runtime_tool_registration_rejects_unknown_effect_resolvers() {
+        let error = ToolCatalog::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "unclassified_runtime_tool".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                required_permission: PermissionMode::ReadOnly,
+                effect_resolver: ToolEffectResolverSpec {
+                    resolver_id: "runtime.unknown".to_string(),
+                    resolver_version: 1,
+                },
+            }])
+            .expect_err("unknown effects must fail during registration");
+
+        assert!(error.contains("unsupported effect resolver"));
+        assert!(error.contains("unclassified_runtime_tool"));
+    }
 
     #[derive(Debug)]
     struct FakeMcpService {

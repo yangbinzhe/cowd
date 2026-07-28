@@ -990,11 +990,19 @@ impl RuntimeService {
         record: &session::SessionRuntimeOutboxRecord,
         content: &str,
     ) -> Result<runtime::SessionIngressExecutionReceipt, String> {
+        let invocation_id = uuid::Uuid::new_v4();
         let terminal_id = format!("turn-terminal:{}", record.request_id);
         let graph_id = runtime::session_ingress_graph_id(
             &record.session_id,
             &record.request_id,
             &record.turn_id,
+        );
+        tracing::debug!(
+            %invocation_id,
+            request_id = %record.request_id,
+            graph_id,
+            terminal_id,
+            "entered canonical Session ingress execution"
         );
         if let Some(terminal) = self
             .runtime_services
@@ -1010,10 +1018,26 @@ impl RuntimeService {
                 self.await_session_terminal_materialization(&terminal_id)
                     .await?
             };
+            tracing::debug!(
+                %invocation_id,
+                request_id = %record.request_id,
+                graph_id,
+                terminal_id,
+                terminal_status = %terminal.status,
+                "restoring live execution from an existing durable terminal"
+            );
             // A worker may be replaying an already-committed terminal after
-            // process recovery. Re-establish the exact primary marker before
-            // settling so an in-memory projection created by a fresh Surface
-            // does not remain queued forever.
+            // process recovery. Re-establish the live record and mark it
+            // terminal before best-effort Session projection journaling. The
+            // durable terminal carrier, not that secondary journal, is the
+            // completion authority.
+            self.record_live_execution(
+                &record.session_id,
+                graph_id.clone(),
+                record.turn_id.clone(),
+            );
+            self.runtime_services
+                .complete_recovered_live_execution(&graph_id, terminal_id.clone());
             self.bind_primary_ingress_projection(record, &graph_id)
                 .await;
             self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
@@ -1133,6 +1157,12 @@ impl RuntimeService {
         };
         self.bind_primary_ingress_projection(record, &graph_id)
             .await;
+        tracing::debug!(
+            %invocation_id,
+            request_id = %record.request_id,
+            graph_id,
+            "starting fresh Runtime ingress turn"
+        );
         // The complete Runtime turn state machine is intentionally large. Keep
         // it behind one heap allocation so Gateway worker stacks do not grow
         // with every execution capability added to Runtime.
@@ -1184,8 +1214,24 @@ impl RuntimeService {
             self.await_session_terminal_materialization(&terminal_id)
                 .await?
         };
-        self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
-            .await;
+        tracing::debug!(
+            %invocation_id,
+            request_id = %record.request_id,
+            graph_id,
+            terminal_id,
+            terminal_status = %terminal.status,
+            completion = ?summary.terminal_completion,
+            calibrated_input_tokens = ?summary
+                .context_turn_report
+                .ledger
+                .as_ref()
+                .and_then(|ledger| ledger.calibrated_input_tokens),
+            "materialized fresh Runtime terminal; committing canonical live terminal"
+        );
+        // Once the durable terminal is materialized, every canonical live read
+        // must observe a terminal state. Session input projection journaling is
+        // useful evidence but is not allowed to hold completion behind storage
+        // latency or a failed secondary write.
         match summary.terminal_completion {
             harness_contract::goal::GoalCompletion::Satisfied => self.complete_live_execution(
                 &graph_id,
@@ -1220,6 +1266,8 @@ impl RuntimeService {
                     .cancel_live_execution(&graph_id, "Runtime turn cancelled".to_string());
             }
         }
+        self.settle_primary_ingress_projection(record, &graph_id, &terminal_id)
+            .await;
         let runtime_record =
             crate::session_runtime_data_port::to_runtime_input_record(record.clone());
         if let Some(resolution) = self.session_input_router.record_target_terminal(

@@ -4018,6 +4018,10 @@ mod tests {
                         "additionalProperties": false
                     }),
                     required_permission: PermissionMode::ReadOnly,
+                    effect_resolver: harness_contract::tool::ToolEffectResolverSpec {
+                        resolver_id: "runtime.external_read".to_string(),
+                        resolver_version: 1,
+                    },
                 }])
                 .expect("runtime tools should register"),
         );

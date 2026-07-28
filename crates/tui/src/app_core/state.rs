@@ -766,6 +766,25 @@ impl TuiState {
                     }
                 }
             }
+            CowdEvent::GatewaySession {
+                event:
+                    crate::protocol::GatewaySessionEvent::ExecutionPhase {
+                        correlation,
+                        status,
+                        ..
+                    },
+            } if *status != harness_contract::projection::ExecutionLiveStatus::Queued
+                && !correlation
+                    .execution_id
+                    .as_deref()
+                    .is_some_and(|execution_id| {
+                        self.app.execution_is_terminalized(execution_id)
+                    }) =>
+            {
+                if let Some(execution_id) = correlation.execution_id.as_deref() {
+                    self.app.turn_interaction.ingress_accepted(execution_id);
+                }
+            }
             CowdEvent::ExecutionGraphSummary { summary } => {
                 if let Some(execution_id) = summary.graph_id.as_deref() {
                     self.app.turn_interaction.ingress_accepted(execution_id);

@@ -1281,6 +1281,7 @@ pub struct RuntimeError {
     provider_context_window_limit: Option<u32>,
     provider_tool_protocol_failure: bool,
     provider_resource_result: crate::execution_core::graph::ResourceResultClass,
+    provider_usage: Option<TokenUsage>,
 }
 
 impl RuntimeError {
@@ -1291,6 +1292,7 @@ impl RuntimeError {
             provider_context_window_limit: None,
             provider_tool_protocol_failure: false,
             provider_resource_result: crate::execution_core::graph::ResourceResultClass::Failed,
+            provider_usage: None,
         }
     }
 
@@ -1304,6 +1306,7 @@ impl RuntimeError {
             provider_context_window_limit,
             provider_tool_protocol_failure: false,
             provider_resource_result: crate::execution_core::graph::ResourceResultClass::Failed,
+            provider_usage: None,
         }
     }
 
@@ -1319,7 +1322,14 @@ impl RuntimeError {
             provider_context_window_limit,
             provider_tool_protocol_failure,
             provider_resource_result,
+            provider_usage: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_provider_usage(mut self, usage: TokenUsage) -> Self {
+        self.provider_usage = Some(usage);
+        self
     }
 
     #[must_use]
@@ -1337,6 +1347,11 @@ impl RuntimeError {
         &self,
     ) -> crate::execution_core::graph::ResourceResultClass {
         self.provider_resource_result
+    }
+
+    #[must_use]
+    pub const fn provider_usage(&self) -> Option<TokenUsage> {
+        self.provider_usage
     }
 }
 
@@ -4847,15 +4862,29 @@ where
 
             let requested_tool_call_count = calls.len();
             let unexposed_tool_names = unexposed_model_tool_names(&calls, &exposed_tool_ids);
-            let calls = if unexposed_tool_names.is_empty() {
-                calls
-            } else {
+            if !unexposed_tool_names.is_empty() {
                 // Provider transports validate framing, while Runtime owns
-                // this request's exposure lease. Reject the whole mixed batch
-                // before graph planning so a native or compatibility call
-                // cannot execute a registered but currently hidden tool.
-                Vec::new()
-            };
+                // this request's exposure lease. Treat a hidden or invented
+                // call as a protocol failure before publishing any assistant
+                // transcript. The graph host owns the single governed retry
+                // and fail-closed terminal, so this path cannot accumulate
+                // empty internal assistant turns.
+                self.reconcile_provider_context_usage(usage);
+                self.usage_tracker.record(usage);
+                if let Some(callback) = &self.tool_callback {
+                    callback.on_usage(&usage);
+                }
+                return Err(RuntimeError::with_provider_failure_metadata(
+                    format!(
+                        "provider requested tool names outside this request's exposure lease: [{}]",
+                        unexposed_tool_names.join(", ")
+                    ),
+                    None,
+                    true,
+                    crate::execution_core::graph::ResourceResultClass::Failed,
+                )
+                .with_provider_usage(usage));
+            }
             let mut blocks = Vec::new();
             if !thinking.is_empty() {
                 blocks.push(ContentBlock::Thinking {
@@ -4895,16 +4924,7 @@ where
                 &assistant_message,
                 requested_tool_call_count,
             );
-            let classified = if unexposed_tool_names.is_empty() {
-                classify_model_step_intent(text, calls)
-            } else {
-                ModelStepIntent::Replan {
-                    reason: format!(
-                        "provider requested tool names outside this request's exposure lease: [{}]. Runtime rejected the complete batch without execution. Select only a native tool schema exposed in the next request, or return a final answer from retained evidence",
-                        unexposed_tool_names.join(", ")
-                    ),
-                }
-            };
+            let classified = classify_model_step_intent(text, calls);
             let intent = apply_explicit_team_requirement(
                 self.explicit_team_escalation,
                 user_input,
@@ -5512,6 +5532,7 @@ where
                 Some(timeout),
                 self.execution_service_class,
                 Some(self.execution_service_class),
+                Some(self.session().session_id.as_str()),
                 move || {
                     executor.execute_authorized(
                         &authorization.authorization,
@@ -5845,6 +5866,7 @@ where
                                 Some(tool_timeout),
                                 self.execution_service_class,
                                 Some(self.execution_service_class),
+                                Some(self.session().session_id.as_str()),
                                 move || {
                                     if is_evidence_retrieve {
                                         return retrieve_tool_evidence_from_sandbox(

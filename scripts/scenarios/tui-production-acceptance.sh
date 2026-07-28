@@ -15,7 +15,9 @@ PROVIDER_PORT="${COWD_TUI_ACCEPTANCE_PROVIDER_PORT:-18784}"
 BASE_URL="http://127.0.0.1:$GATEWAY_PORT"
 TOKEN="cowd-tui-acceptance-token"
 MODEL="cowd-tui-acceptance-model"
+MODEL_VISIBLE_PREFIX="${MODEL:0:23}"
 SCREEN_PREFIX="cowd-tui-acceptance-$PPID-$$"
+TMUX_SOCKET="cowd-tui-acceptance-$PPID-$$"
 SESSION_A="tui-acceptance-session-a-$$"
 SESSION_B="tui-acceptance-session-b-$$"
 SESSION_LONG="tui-acceptance-session-long-$$"
@@ -57,6 +59,7 @@ cleanup() {
   for target in "${!TUI_SCREEN[@]}"; do
     stop_tui "$target"
   done
+  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   if [[ -n "$SESSION_STREAM_PID" ]]; then
     kill "$SESSION_STREAM_PID" >/dev/null 2>&1 || true
     wait "$SESSION_STREAM_PID" >/dev/null 2>&1 || true
@@ -72,6 +75,10 @@ cleanup() {
   if [[ -n "$PROVIDER_PID" ]]; then
     kill "$PROVIDER_PID" >/dev/null 2>&1 || true
     wait "$PROVIDER_PID" >/dev/null 2>&1 || true
+  fi
+  if [[ -d "$CONFIG_HOME/logs" ]]; then
+    rm -rf "$ARTIFACT_DIR/runtime-logs"
+    cp -a "$CONFIG_HOME/logs" "$ARTIFACT_DIR/runtime-logs"
   fi
   rm -rf "$RUNTIME_DIR"
 }
@@ -104,8 +111,8 @@ capture() {
   [[ -n "$session" ]] || return 1
   for _ in {1..10}; do
     rm -f "$ARTIFACT_DIR/$name.txt"
-    if screen -S "$session" -X hardcopy -h "$ARTIFACT_DIR/$name.txt" \
-      >/dev/null 2>&1 \
+    if tmux -L "$TMUX_SOCKET" capture-pane -p -t "$session:0.0" \
+      >"$ARTIFACT_DIR/$name.txt" 2>/dev/null \
       && [[ -f "$ARTIFACT_DIR/$name.txt" ]]; then
       return 0
     fi
@@ -121,7 +128,8 @@ capture_utf8() {
   local session="${TUI_SCREEN[$target]:-}"
   local log_path="${TUI_UTF8_LOG[$target]:-}"
   [[ -n "$session" && -n "$log_path" && -f "$log_path" ]] || return 1
-  screen -S "$session" -X logfile flush 0 >/dev/null 2>&1 || return 1
+  tmux -L "$TMUX_SOCKET" capture-pane -p -e -S - -t "$session:0.0" \
+    >"$log_path" 2>/dev/null || return 1
   python3 - "$log_path" "$ARTIFACT_DIR/$name.txt" <<'PY'
 import pathlib
 import re
@@ -227,6 +235,32 @@ PY
   return 1
 }
 
+wait_session_input_idle() {
+  local session_id="$1"
+  local output="$2"
+  for _ in {1..320}; do
+    if auth_curl "$BASE_URL/api/sessions/$session_id/input-projection" \
+      >"$output" 2>/dev/null \
+      && python3 - "$output" <<'PY'
+import json
+import sys
+
+projection = json.load(open(sys.argv[1], encoding="utf-8"))
+idle = (
+    projection.get("pending_count") == 0
+    and projection.get("queued_next_count") == 0
+    and projection.get("active_turn_id") is None
+)
+raise SystemExit(0 if idle else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 start_gateway() {
   env \
     COWD_CONFIG_HOME="$CONFIG_HOME" \
@@ -263,35 +297,22 @@ start_tui() {
   local utf8_log="$ARTIFACT_DIR/$target-screen-utf8.log"
   [[ -z "${TUI_SCREEN[$target]:-}" ]] \
     || fail "TUI PTY target $target is already active"
-  (
-    cd "$WORKSPACE"
-    exec screen \
-      -D -m \
-      -L \
-      -Logfile "$utf8_log" \
-      -S "$screen_name" \
-      -c /dev/null \
-      -T xterm-256color \
-      -U \
-      -h 2000 \
-      env \
-        COWD_CONFIG_HOME="$CONFIG_HOME" \
-        COWD_API_TOKEN="$TOKEN" \
-        COWD_GATEWAY_URL="$BASE_URL" \
-        COWD_TUI_OBSERVER_ID="$observer_id" \
-        COWD_DISABLE_DAEMON_AUTOSTART=1 \
-        HOME="$HOME_DIR" \
-        TERM=xterm-256color \
-        "$BIN" --yolo --model "$MODEL" --session "$session_id"
-  ) >>"$driver_log" 2>&1 &
+  : >"$utf8_log"
+  tmux -L "$TMUX_SOCKET" new-session \
+    -d \
+    -s "$screen_name" \
+    -x "$width" \
+    -y "$height" \
+    -c "$WORKSPACE" \
+    "env COWD_CONFIG_HOME='$CONFIG_HOME' COWD_API_TOKEN='$TOKEN' COWD_GATEWAY_URL='$BASE_URL' COWD_TUI_OBSERVER_ID='$observer_id' COWD_DISABLE_DAEMON_AUTOSTART=1 HOME='$HOME_DIR' TERM=xterm-256color '$BIN' --yolo --model '$MODEL' --session '$session_id'" \
+    >>"$driver_log" 2>&1
+  tmux -L "$TMUX_SOCKET" set-option -t "$screen_name" history-limit 200000 \
+    >/dev/null 2>&1
   TUI_SCREEN["$target"]="$screen_name"
-  TUI_DRIVER_PID["$target"]=$!
+  TUI_DRIVER_PID["$target"]="$(tmux -L "$TMUX_SOCKET" display-message -p -t "$screen_name:0.0" '#{pane_pid}')"
   TUI_UTF8_LOG["$target"]="$utf8_log"
   for _ in {1..80}; do
-    if screen -S "$screen_name" -Q windows >/dev/null 2>&1; then
-      screen -S "$screen_name" -X logfile flush 0 >/dev/null 2>&1
-      screen -S "$screen_name" -X width "$width" "$height" \
-        >/dev/null 2>&1
+    if tmux -L "$TMUX_SOCKET" has-session -t "$screen_name" >/dev/null 2>&1; then
       return 0
     fi
     tui_alive "$target" || return 1
@@ -303,7 +324,10 @@ start_tui() {
 tui_alive() {
   local target="$1"
   local pid="${TUI_DRIVER_PID[$target]:-}"
-  [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
+  local session="${TUI_SCREEN[$target]:-}"
+  [[ -n "$pid" && -n "$session" ]] \
+    && kill -0 "$pid" >/dev/null 2>&1 \
+    && tmux -L "$TMUX_SOCKET" has-session -t "$session" >/dev/null 2>&1
 }
 
 send_raw() {
@@ -311,7 +335,16 @@ send_raw() {
   local bytes="$2"
   local session="${TUI_SCREEN[$target]:-}"
   [[ -n "$session" ]] || return 1
-  screen -S "$session" -X stuff "$bytes" >/dev/null 2>&1
+  case "$bytes" in
+    $'\003') tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" C-c ;;
+    $'\006') tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" C-f ;;
+    $'\020') tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" C-p ;;
+    $'\r') tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" Enter ;;
+    $'\033') tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" Escape ;;
+    $'\033[F') tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" End ;;
+    $'\033[H') tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" Home ;;
+    *) tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" -l -- "$bytes" ;;
+  esac >/dev/null 2>&1
 }
 
 resize_tui() {
@@ -320,14 +353,19 @@ resize_tui() {
   local height="$3"
   local session="${TUI_SCREEN[$target]:-}"
   [[ -n "$session" ]] || return 1
-  screen -S "$session" -X width "$width" "$height" >/dev/null 2>&1
+  tmux -L "$TMUX_SOCKET" resize-window -t "$session:0" -x "$width" -y "$height" \
+    >/dev/null 2>&1
 }
 
 tui_process_pid() {
   local target="$1"
   local driver_pid="${TUI_DRIVER_PID[$target]:-}"
   [[ -n "$driver_pid" ]] || return 1
-  pgrep -P "$driver_pid" -x cowd | head -1
+  if [[ "$(ps -o comm= -p "$driver_pid" 2>/dev/null | xargs)" == "cowd" ]]; then
+    printf '%s\n' "$driver_pid"
+  else
+    pgrep -P "$driver_pid" -x cowd | head -1
+  fi
 }
 
 stop_tui() {
@@ -335,17 +373,23 @@ stop_tui() {
   local session="${TUI_SCREEN[$target]:-}"
   local pid="${TUI_DRIVER_PID[$target]:-}"
   [[ -n "$session" && -n "$pid" ]] || return 0
-  screen -S "$session" -X stuff $'\003' >/dev/null 2>&1 || true
+  tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" C-c >/dev/null 2>&1 || true
   for _ in {1..40}; do
     kill -0 "$pid" >/dev/null 2>&1 || break
     sleep 0.1
   done
   if kill -0 "$pid" >/dev/null 2>&1; then
-    screen -S "$session" -X stuff $'\003' >/dev/null 2>&1 || true
-    sleep 0.2
+    tmux -L "$TMUX_SOCKET" send-keys -t "$session:0.0" C-c >/dev/null 2>&1 || true
+    # TUI intentionally requires a second Ctrl+C while idle. Give its normal
+    # shutdown path the same bounded window to release the Runtime lease and
+    # detach the observer before falling back to a forced PTY teardown.
+    for _ in {1..40}; do
+      kill -0 "$pid" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
   fi
   if kill -0 "$pid" >/dev/null 2>&1; then
-    screen -S "$session" -X quit >/dev/null 2>&1 || true
+    tmux -L "$TMUX_SOCKET" kill-session -t "$session" >/dev/null 2>&1 || true
   fi
   for _ in {1..20}; do
     kill -0 "$pid" >/dev/null 2>&1 || break
@@ -361,7 +405,7 @@ stop_tui() {
   if kill -0 "$pid" >/dev/null 2>&1; then
     kill -KILL "$pid" >/dev/null 2>&1 || true
   fi
-  wait "$pid" >/dev/null 2>&1 || true
+  tmux -L "$TMUX_SOCKET" kill-session -t "$session" >/dev/null 2>&1 || true
   unset 'TUI_SCREEN[$target]'
   unset 'TUI_DRIVER_PID[$target]'
   unset 'TUI_UTF8_LOG[$target]'
@@ -374,7 +418,7 @@ send_prompt() {
   send_raw "$target" $'\r'
 }
 
-for command in screen curl node python3 rg ss pgrep getconf sqlite3; do
+for command in tmux curl node python3 rg ss pgrep getconf sqlite3; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "$command is required for TUI production acceptance" >&2
     exit 1
@@ -462,16 +506,30 @@ start_gateway || fail "isolated Gateway did not become healthy"
 pass "isolated provider and Gateway are healthy"
 
 start_tui writer "$SESSION_A" "tui:tui-acceptance-writer" 120 40
-wait_capture writer "$MODEL" boot \
+wait_capture writer "$MODEL_VISIBLE_PREFIX" boot \
   || fail "writer TUI did not render the requested model"
+auth_curl "$BASE_URL/api/runtime/control-plane" >"$ARTIFACT_DIR/runtime-control-plane.json"
+python3 - "$ARTIFACT_DIR/runtime-control-plane.json" "$MODEL" <<'PY'
+import json
+import sys
+
+control = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = sys.argv[2]
+provider = control.get("components", {}).get("provider", {})
+assert provider.get("configured_model") == expected, provider
+assert provider.get("configured_model_resolved") is True, provider
+PY
 rg -Fq "$EXPECTED_VERSION" "$ARTIFACT_DIR/boot.txt" \
   || fail "writer TUI did not render version $EXPECTED_VERSION"
 rg -q 'idle|ready' "$ARTIFACT_DIR/boot.txt" \
   || fail "writer TUI did not expose an idle/ready state"
+resize_tui writer 80 24
+sleep 0.2
 capture_utf8 writer boot-utf8 \
   || fail "writer TUI UTF-8 transcript could not be captured"
 rg -q 'ctx[[:space:]]+—|context[[:space:]]+—' "$ARTIFACT_DIR/boot-utf8.txt" \
   || fail "unknown new-session context metric was not rendered as —"
+resize_tui writer 120 40
 send_raw writer $'\020'
 wait_capture writer ' Command Palette ' boot-palette \
   || fail "new-session action palette did not respond"
@@ -485,7 +543,7 @@ resize_tui writer 90 32
 sleep 0.2
 capture writer boot-resized \
   || fail "new-session resized screen could not be captured"
-rg -q "$MODEL" "$ARTIFACT_DIR/boot-resized.txt" \
+rg -q "$MODEL_VISIBLE_PREFIX" "$ARTIFACT_DIR/boot-resized.txt" \
   || fail "new-session resize lost the requested model"
 resize_tui writer 120 40
 pass "E1 new-session version/model/idle/unknown metrics and palette/resize interaction are visible"
@@ -544,7 +602,7 @@ wait_capture writer "TUI_ACCEPTANCE-TURN2-ACK recalled=$NONCE_A" turn2 \
 pass "E2 multi-turn causal history is current and not shifted by one answer"
 
 start_tui long-wrap "$SESSION_LONG" "tui:tui-acceptance-long-wrap" 120 40
-wait_capture long-wrap "$MODEL" long-wrap-boot \
+wait_capture long-wrap "$MODEL_VISIBLE_PREFIX" long-wrap-boot \
   || fail "independent long-response session did not start"
 send_prompt long-wrap "TUI_ACCEPTANCE_LONG_WRAP render the deterministic width fixture"
 wait_message "$SESSION_LONG" "END-OF-LONG-RESPONSE" \
@@ -568,10 +626,8 @@ for size in 40x24 60x30 90x32 120x40 200x52; do
   sleep 0.15
   capture long-wrap "width-$size-head" \
     || fail "long-response head could not be captured at terminal size $size"
-  rg -q 'TUI_ACCEPTANCE-LONG-BEGIN' "$ARTIFACT_DIR/width-$size-head.txt" \
-    || fail "long-response Home navigation could not reach its head at $size"
-  rg -q 'ROW-00.*中文|ROW-00' "$ARTIFACT_DIR/width-$size-head.txt" \
-    || fail "long-response first CJK/URL/JSON/code matrix row was not reachable at $size"
+  rg -q '"row":0' "$ARTIFACT_DIR/width-$size-head.txt" \
+    || fail "long-response Home navigation did not reach the first CJK/URL/JSON/code matrix row at $size"
   send_raw long-wrap $'\033[F'
   sleep 0.15
   capture long-wrap "width-$size-return-tail" \
@@ -612,7 +668,7 @@ wait_message "$SESSION_A" "TUI_ACCEPTANCE-SLOW-END" \
   || fail "slow streaming response did not complete"
 wait_capture writer 'TUI_ACCEPTANCE-SLOW-END' slow-complete \
   || fail "slow streaming completion was not rendered"
-wait_capture writer 'ctx[[:space:]]+[[:digit:]]+[[:space:]]+/16[.]4k' slow-complete-metrics \
+wait_capture writer 'ctx[[:space:]]+[[:digit:].]+k?[[:space:]]+/16[.]4k' slow-complete-metrics \
   || fail "canonical execution metrics did not reach a stable terminal render"
 capture_utf8 writer slow-complete-utf8 \
   || fail "slow completion UTF-8 transcript could not be captured"
@@ -629,10 +685,80 @@ assert isinstance(execution_id, str) and execution_id, value
 print(execution_id)
 PY
 )"
-auth_curl "$BASE_URL/api/runtime/executions/$slow_execution_id?detail_scope=full" \
-  >"$ARTIFACT_DIR/slow-execution-projection.json"
-rg -q "$MODEL" "$ARTIFACT_DIR/slow-complete.txt" \
+slow_projection_terminal=0
+for _ in {1..160}; do
+  auth_curl "$BASE_URL/api/runtime/executions/$slow_execution_id?detail_scope=full" \
+    >"$ARTIFACT_DIR/slow-execution-projection.json"
+  if python3 - "$ARTIFACT_DIR/slow-execution-projection.json" <<'PY'
+import json
+import sys
+
+projection = json.load(open(sys.argv[1], encoding="utf-8"))
+raise SystemExit(0 if projection.get("live", {}).get("status") == "complete" else 1)
+PY
+  then
+    slow_projection_terminal=1
+    break
+  fi
+  sleep 0.05
+done
+[[ "$slow_projection_terminal" == "1" ]] \
+  || fail "canonical execution projection did not reach complete"
+rg -q "$MODEL_VISIBLE_PREFIX" "$ARTIFACT_DIR/slow-complete.txt" \
   || fail "effective model disappeared after a real turn"
+slow_surface_terminal=0
+for _ in {1..160}; do
+  capture writer slow-complete-metrics \
+    || fail "slow completion terminal screen could not be captured"
+  if python3 - \
+    "$ARTIFACT_DIR/slow-execution-projection.json" \
+    "$ARTIFACT_DIR/slow-complete-metrics.txt" <<'PY'
+import json
+import sys
+
+projection = json.load(open(sys.argv[1], encoding="utf-8"))
+screen = open(sys.argv[2], encoding="utf-8", errors="replace").read()
+usage = projection["live"]["context_usage"]
+metrics = projection["live"]["metrics"]
+
+def fmt_tokens(value):
+    value = int(value)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 10_000:
+        return f"{value / 1_000:.1f}k"
+    if value >= 1_000:
+        return f"{value // 1_000}k"
+    return str(value)
+
+used = int(usage["input_tokens"])
+window = int(usage["window_tokens"])
+remaining = int(usage["remaining_tokens"])
+percent = int(usage["usage_percent_bp"]) / 100
+expected_context = (
+    f"ctx {fmt_tokens(used)} /{fmt_tokens(window)} "
+    f"{percent:.0f}% rem {fmt_tokens(remaining)}"
+)
+expected_metrics = (
+    f"in {fmt_tokens(metrics['input_tokens'])} · "
+    f"out {fmt_tokens(metrics['output_tokens'])} · "
+    f"total {fmt_tokens(metrics['total_tokens'])}"
+)
+settled = (
+    expected_context in screen
+    and expected_metrics in screen
+    and "Processing..." not in screen
+)
+raise SystemExit(0 if settled else 1)
+PY
+  then
+    slow_surface_terminal=1
+    break
+  fi
+  sleep 0.05
+done
+[[ "$slow_surface_terminal" == "1" ]] \
+  || fail "TUI did not converge to the canonical terminal context and token metrics"
 python3 - \
   "$ARTIFACT_DIR/slow-execution-projection.json" \
   "$ARTIFACT_DIR/slow-complete-metrics.txt" \
@@ -641,7 +767,7 @@ import json
 import sys
 
 projection = json.load(open(sys.argv[1], encoding="utf-8"))
-screen = open(sys.argv[2], encoding="latin-1").read()
+screen = open(sys.argv[2], encoding="utf-8", errors="replace").read()
 expected_model = sys.argv[3]
 live = projection["live"]
 usage = live["context_usage"]
@@ -814,6 +940,9 @@ owners = {lease.get("owner", "") for lease in leases}
 assert any(owner.endswith(":observer:tui:tui-acceptance-writer-restart") for owner in owners), owners
 assert any(owner.endswith(":observer:tui:tui-acceptance-observer") for owner in owners), owners
 PY
+wait_session_input_idle \
+  "$SESSION_A" "$ARTIFACT_DIR/session-a-before-collaborative-progress.json" \
+  || fail "session ingress did not become idle before collaborative progress verification"
 send_prompt writer "TUI_ACCEPTANCE_OBSERVER_SYNC publish one answer to both terminals"
 writer_partial=0
 observer_partial=0
@@ -853,7 +982,7 @@ wait_capture observer 'TUI_ACCEPTANCE-OBSERVER-SYNC-ACK' observer-sync \
 pass "E8 two collaborative Surfaces share one session and see matching pre-terminal progress plus one canonical terminal"
 
 start_tui session-b "$SESSION_B" "tui:tui-acceptance-session-b" 90 32
-wait_capture session-b "$MODEL" session-b-boot \
+wait_capture session-b "$MODEL_VISIBLE_PREFIX" session-b-boot \
   || fail "second independent session did not start"
 send_prompt session-b "TUI_ACCEPTANCE_TURN_1 remember $NONCE_B and acknowledge it exactly"
 wait_message "$SESSION_B" "TUI_ACCEPTANCE-TURN1-ACK nonce=$NONCE_B" \

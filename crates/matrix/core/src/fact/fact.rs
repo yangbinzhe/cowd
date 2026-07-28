@@ -255,7 +255,7 @@ mod fact_kernel_bridge_tests {
         assert_eq!(kernel_fact.id.as_str(), "fact-1");
         assert_eq!(kernel_fact.entity, "agent:coder");
         assert_eq!(kernel_fact.predicate, AI_GROWTH_SIGNAL_FACT);
-        assert_eq!(kernel_fact.confidence.basis_points(), 9_100);
+        assert_eq!(kernel_fact.confidence.basis_points(), Some(9_100));
         assert_eq!(kernel_fact.source.id, "eval://run-1");
     }
 

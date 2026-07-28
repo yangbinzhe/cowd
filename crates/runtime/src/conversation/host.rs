@@ -3904,10 +3904,11 @@ where
                         // replace a valid score object with unrelated fallback text.
                         } else if let Some(reason) = (!state.evaluation_judge_only)
                             .then(|| {
-                                final_answer_recovery_reason_for_objective(
+                                final_answer_recovery_reason_for_execution_scope(
                                     &text,
                                     self.services.workspace_root(),
                                     &state.content,
+                                    state.bounded_evidence_role,
                                 )
                             })
                             .flatten()
@@ -4527,10 +4528,32 @@ where
                 // that governs tools decide whether the next node retries,
                 // changes strategy, or produces an honest blocked result.
                 let protocol_failure = error.is_provider_tool_protocol_failure();
+                let provider_usage = error.provider_usage();
                 let reason = error.to_string();
-                let (goal_id, iteration, protocol_attempt, observation_identity) = {
+                let (
+                    goal_id,
+                    iteration,
+                    protocol_attempt,
+                    terminal_checkpoint_protocol_failure,
+                    clean_terminal_retry_attempted,
+                    observation_identity,
+                ) = {
                     let mut state = self.state.lock().await;
                     state.iterations = state.iterations.saturating_add(1);
+                    if let Some(usage) = provider_usage {
+                        state.input_tokens = state
+                            .input_tokens
+                            .saturating_add(u64::from(usage.input_tokens));
+                        state.output_tokens = state
+                            .output_tokens
+                            .saturating_add(u64::from(usage.output_tokens));
+                        state.cache_create_tokens = state
+                            .cache_create_tokens
+                            .saturating_add(u64::from(usage.cache_creation_input_tokens));
+                        state.cache_read_tokens = state
+                            .cache_read_tokens
+                            .saturating_add(u64::from(usage.cache_read_input_tokens));
+                    }
                     // `execute_model_step` temporarily appends the ingress user
                     // before asking the provider, and the host rolls that
                     // uncommitted mutation back after every attempt.  A failed
@@ -4550,11 +4573,16 @@ where
                             state.provider_protocol_recovery_attempts.saturating_add(1);
                         state.provider_protocol_recovery_attempts
                     });
+                    let terminal_checkpoint_protocol_failure = protocol_failure
+                        && state.successful_tool_calls > 0
+                        && (force_text_only_response || clean_terminal_synthesis);
                     let identity = runtime_observation_identity(&self.services, &state, ticket);
                     (
                         state.goal_id.clone(),
                         state.iterations,
                         protocol_attempt,
+                        terminal_checkpoint_protocol_failure,
+                        state.clean_terminal_retry_attempted,
                         identity,
                     )
                 };
@@ -4569,16 +4597,40 @@ where
                 );
                 observation.evidence_refs = vec![format!("execution_node:{}", ticket.node_id)];
                 observation.cost_delta.model_steps = 1;
+                if let Some(usage) = provider_usage {
+                    observation.cost_delta.input_tokens = u64::from(usage.input_tokens);
+                    observation.cost_delta.output_tokens = u64::from(usage.output_tokens);
+                    observation.cost_delta.cached_tokens = u64::from(usage.cache_read_input_tokens);
+                }
                 observation.failure_class = Some(ObservationFailureClass::Provider);
                 let intervention = if let Some(attempt) = protocol_attempt {
+                    let kind = provider_protocol_intervention_kind_for_checkpoint(
+                        attempt,
+                        terminal_checkpoint_protocol_failure,
+                        clean_terminal_synthesis,
+                        clean_terminal_retry_attempted,
+                    );
                     harness_contract::goal::RuntimeIntervention {
                         goal_id: goal_id.clone(),
-                        kind: provider_protocol_intervention_kind(attempt),
-                        reason: if attempt <= PROVIDER_PROTOCOL_RECOVERY_BUDGET {
-                            "provider emitted a malformed recognized tool protocol frame; retry exactly once without treating protocol bytes as assistant text"
+                        kind,
+                        reason: if kind == RuntimeInterventionKind::Synthesize {
+                            if clean_terminal_synthesis {
+                                "the isolated terminal synthesis emitted another invalid or unexposed tool action; retry once from committed evidence with zero tools and no exploratory transcript"
+                                    .to_string()
+                            } else {
+                                "an evidence-complete terminal checkpoint emitted an invalid or unexposed tool action; isolate committed evidence and synthesize with zero tools instead of reopening exploration"
+                                    .to_string()
+                            }
+                        } else if kind == RuntimeInterventionKind::Block
+                            && terminal_checkpoint_protocol_failure
+                        {
+                            "the provider repeated an invalid or unexposed tool action after the bounded isolated terminal-synthesis retry"
+                                .to_string()
+                        } else if attempt <= PROVIDER_PROTOCOL_RECOVERY_BUDGET {
+                            "provider emitted an invalid tool protocol frame or requested a tool outside the active exposure lease; retry exactly once without treating protocol bytes as assistant text"
                                 .to_string()
                         } else {
-                            "provider repeated a malformed recognized tool protocol frame after the single governed retry"
+                            "provider repeated an invalid or unexposed tool protocol action after the single governed retry"
                                 .to_string()
                         },
                         evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
@@ -4598,6 +4650,24 @@ where
                 let (next, replan_reason, next_model_instruction) = {
                     let mut state = self.state.lock().await;
                     let (node, next_model_instruction) = match intervention.kind {
+                        RuntimeInterventionKind::Synthesize => {
+                            if clean_terminal_synthesis {
+                                state.clean_terminal_retry_attempted = true;
+                            }
+                            state.clean_terminal_synthesis_attempted = true;
+                            state.clean_terminal_synthesis_next = true;
+                            (
+                                dynamic_node(
+                                    ticket,
+                                    iteration,
+                                    "provider-protocol-clean-synthesis-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                ),
+                                None,
+                            )
+                        }
                         RuntimeInterventionKind::Block => {
                             state.terminal_override = Some((
                                 GoalCompletion::Blocked,
@@ -4636,7 +4706,7 @@ where
                         }
                         RuntimeInterventionKind::Replan => {
                             let instruction = if protocol_failure {
-                                "Runtime provider-protocol recovery (single attempt): the prior response used a malformed recognized tool-call frame. Retry from committed evidence using only an exposed native tool with valid arguments, or return a normal visible final answer. Never print tool-protocol markup as prose."
+                                "Runtime provider-protocol recovery (single attempt): the prior response used an invalid tool-call frame or requested a tool outside the active exposure lease. Retry from committed evidence using only an exposed native tool with valid arguments, or return a normal visible final answer. Never print tool-protocol markup as prose."
                                     .to_string()
                             } else {
                                 "Runtime recovery directive: a provider step failed. Replan from the committed goal and evidence before retrying; do not assume uncommitted output is valid."
@@ -5337,6 +5407,11 @@ where
         let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
         let repeated_evidence_saturation = state.consecutive_low_novelty_batches
             >= evidence_saturation_limit(bounded_evidence_role);
+        let focus_synthesis_ready = should_force_focus_synthesis(
+            focus_acceptance_met,
+            &focus_acceptance_scopes,
+            repeated_evidence_saturation,
+        );
         let successful_write_observed = state
             .focus_observed_resource_scopes
             .iter()
@@ -5361,7 +5436,7 @@ where
         }
         let has_successful_tool_evidence = state.successful_tool_calls > 0;
         state.tool_results.extend(result.messages);
-        if focus_acceptance_met {
+        if focus_synthesis_ready {
             if let Some(item) = focus_synthesis_evidence_context_item(
                 &ticket.node_id,
                 &calls,
@@ -5521,7 +5596,7 @@ where
         }
         let goal_id = state.goal_id.clone();
         drop(state);
-        if focus_acceptance_met
+        if focus_synthesis_ready
             || (repeated_evidence_saturation
                 && !focus_acceptance_pending
                 && !required_write_recovery)
@@ -5529,8 +5604,8 @@ where
             self.runtime
                 .lock()
                 .await
-                .record_turn_strategy_early_stop(if focus_acceptance_met {
-                    "the first bounded evidence batch satisfied the Focus acceptance checkpoint"
+                .record_turn_strategy_early_stop(if focus_synthesis_ready {
+                    "the bounded Focus contract is complete and further evidence acquisition saturated"
                 } else if bounded_evidence_role {
                     "two consecutive bounded evidence batches added no required evidence coverage"
                 } else {
@@ -5541,15 +5616,22 @@ where
                     reason: error.to_string(),
                 })?;
         }
-        let intervention = if focus_acceptance_met {
+        let intervention = if focus_synthesis_ready {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
                 kind: RuntimeInterventionKind::Synthesize,
-                reason: "the first bounded evidence batch satisfied the Focus acceptance checkpoint; retain its receipts and synthesize without another tool/model exploration step"
+                reason: "the bounded Focus contract is complete and further evidence acquisition saturated; retain its receipts and synthesize without another tool/model exploration step"
                     .to_string(),
                 evidence_refs: observation.evidence_refs.clone(),
                 expected_graph_revision: None,
             })
+        } else if focus_acceptance_met {
+            // A directory-level read contract is a minimum evidence boundary,
+            // not proof that the model has enough material for every requested
+            // claim. Keep the authorized read tools available while evidence
+            // still adds information; the bounded saturation policy below
+            // closes repeated exploration deterministically.
+            None
         } else if continue_with_tool_batch || orchestration_terminal_summary.is_some() {
             None
         } else if required_write_recovery {
@@ -5670,7 +5752,7 @@ where
                     .map_or(RuntimeInterventionKind::Continue, |value| value.kind);
                 match kind {
                     RuntimeInterventionKind::Synthesize => {
-                        let focus_terminal_candidate = if focus_acceptance_met {
+                        let focus_terminal_candidate = if focus_synthesis_ready {
                             let retained = state.pending_focus_terminal_candidate.take().and_then(
                                 |candidate| {
                                     normalized_team_terminal_candidate(
@@ -6044,6 +6126,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     )),
                     self.ticket.service_class,
                     Some(self.ticket.service_class),
+                    Some(self.session_id),
                     move || {
                         execute_fenced_runtime_tool(
                             host.as_ref(),
@@ -6526,7 +6609,10 @@ where
                 input_sequence: Some(ingress.input_sequence),
                 input_claim_owner: Some(terminal_fence.claim_owner),
                 input_claim_token: Some(terminal_fence.claim_token),
-                input_claim_revision: Some(terminal_fence.claim_revision),
+                // Runtime terminal storage predates the immutable fence epoch
+                // name. Its `input_claim_revision` column carries that epoch,
+                // never the renewable outbox row revision.
+                input_claim_revision: Some(terminal_fence.claim_fence_epoch),
                 payload_ref: format!(
                     "assistant_terminal_v2:{}",
                     serde_json::to_string(&serde_json::json!({
@@ -6926,6 +7012,22 @@ fn provider_protocol_intervention_kind(attempt: u8) -> RuntimeInterventionKind {
     }
 }
 
+fn provider_protocol_intervention_kind_for_checkpoint(
+    attempt: u8,
+    terminal_checkpoint_protocol_failure: bool,
+    clean_terminal_synthesis: bool,
+    clean_terminal_retry_attempted: bool,
+) -> RuntimeInterventionKind {
+    if !terminal_checkpoint_protocol_failure {
+        return provider_protocol_intervention_kind(attempt);
+    }
+    if clean_terminal_synthesis && clean_terminal_retry_attempted {
+        RuntimeInterventionKind::Block
+    } else {
+        RuntimeInterventionKind::Synthesize
+    }
+}
+
 fn runtime_replan_context_item(
     node_id: &str,
     intervention: Option<&RuntimeIntervention>,
@@ -6996,6 +7098,23 @@ fn final_answer_recovery_reason_for_objective(
                     .to_string()
             })
     })
+}
+
+fn final_answer_recovery_reason_for_execution_scope(
+    text: &str,
+    workspace_root: &std::path::Path,
+    objective: &str,
+    bounded_evidence_role: bool,
+) -> Option<String> {
+    if bounded_evidence_role {
+        // A delegated role owns only its typed Focus/output contract. Aggregate
+        // requirements from the parent objective (for example, a minimum
+        // number of source paths across all lanes) belong to the parent
+        // synthesizer and must not reject an otherwise complete child result.
+        final_answer_recovery_reason(text, workspace_root)
+    } else {
+        final_answer_recovery_reason_for_objective(text, workspace_root, objective)
+    }
 }
 
 fn looks_like_unfinished_work_preamble(text: &str) -> bool {
@@ -7541,6 +7660,21 @@ const fn evidence_saturation_limit(bounded_evidence_role: bool) -> usize {
     } else {
         3
     }
+}
+
+fn should_force_focus_synthesis(
+    focus_acceptance_met: bool,
+    required_scopes: &[String],
+    repeated_evidence_saturation: bool,
+) -> bool {
+    if !focus_acceptance_met {
+        return false;
+    }
+    let read_only = !required_scopes.is_empty()
+        && required_scopes
+            .iter()
+            .all(|scope| scope.starts_with("read:"));
+    !read_only || repeated_evidence_saturation
 }
 
 fn should_recover_missing_required_write(
@@ -9132,6 +9266,53 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct UnexposedToolThenFinalClient {
+        attempts: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<ApiRequest>>>,
+    }
+
+    impl ApiClient for UnexposedToolThenFinalClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.requests
+                .lock()
+                .expect("capture exposure recovery request")
+                .push(request);
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::ToolUse {
+                        id: "hidden-tool".to_string(),
+                        name: "invented_hidden_tool".to_string(),
+                        input: "{}".to_string(),
+                    }),
+                    Ok(AssistantEvent::Usage(model_protocol::usage::TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 2,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: 0,
+                    })),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "exposure recovery retained current objective".to_string(),
+                )),
+                Ok(AssistantEvent::Usage(model_protocol::usage::TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 3,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                })),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[derive(Clone)]
     struct ToolOnlyThenFinalClient {
         attempts: Arc<AtomicUsize>,
         saw_terminal_boundary: Arc<std::sync::atomic::AtomicBool>,
@@ -9174,7 +9355,7 @@ mod tests {
                             .iter()
                             .map(|packet| &packet.content),
                     )
-                    .any(|fragment| fragment.contains("final-answer recovery")),
+                    .any(|fragment| fragment.contains("provider-protocol recovery")),
                 Ordering::SeqCst,
             );
             Box::pin(stream::iter(vec![
@@ -10112,6 +10293,75 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn unexposed_tool_call_uses_one_protocol_retry_without_empty_transcript_rows() {
+        const OBJECTIVE: &str = "inspect the active tool exposure contract";
+
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            UnexposedToolThenFinalClient {
+                attempts: Arc::clone(&attempts),
+                requests: Arc::clone(&requests),
+            },
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let (runtime, result) = submit_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            OBJECTIVE,
+            &SharedPrompter::none(),
+        )
+        .await;
+        let summary = result.expect("single exposure recovery must complete");
+        assert_eq!(
+            summary.final_answer,
+            "exposure recovery retained current objective"
+        );
+        assert_eq!(summary.usage.input_tokens, 30);
+        assert_eq!(summary.usage.output_tokens, 5);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert!(requests
+            .lock()
+            .expect("captured requests")
+            .get(1)
+            .is_some_and(|request| request
+                .prompt
+                .trusted_system
+                .iter()
+                .chain(
+                    request
+                        .prompt
+                        .contextual_packets
+                        .iter()
+                        .map(|packet| &packet.content),
+                )
+                .any(|fragment| fragment.contains("provider-protocol recovery"))));
+
+        let transcript = runtime.session_async().await.materialize_messages();
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|message| message.role == crate::MessageRole::User)
+                .count(),
+            1
+        );
+        let assistants = transcript
+            .iter()
+            .filter(|message| message.role == crate::MessageRole::Assistant)
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 1);
+        assert!(assistants[0].blocks.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text == "exposure recovery retained current objective")
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn provider_failures_replan_then_switch_to_a_real_recovery_request() {
         let services = crate::RuntimeServices::in_memory().expect("runtime services");
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -10193,7 +10443,7 @@ mod tests {
         assert!(saw_terminal_boundary.load(Ordering::SeqCst));
         assert!(
             saw_recovery_guidance.load(Ordering::SeqCst),
-            "a text-only exposure violation must enter governed terminal recovery"
+            "a text-only exposure violation must enter the single governed provider-protocol recovery"
         );
         assert!(
             summary.tool_results.is_empty(),
@@ -11741,6 +11991,67 @@ mod tests {
     }
 
     #[test]
+    fn delegated_focus_uses_its_own_terminal_contract_before_parent_aggregation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/memory/src"))
+            .expect("memory source root");
+        std::fs::write(workspace.path().join("crates/memory/src/lib.rs"), "lib")
+            .expect("memory source");
+        let role_result = r#"{"findings":"memory owns durable recall","evidence":"crates/memory/src/lib.rs","unresolved":"none"}"#;
+        let parent_objective = "综合团队结论，并给出至少两个实际源码路径作为证据。";
+
+        assert_eq!(
+            final_answer_recovery_reason_for_execution_scope(
+                role_result,
+                workspace.path(),
+                parent_objective,
+                true,
+            ),
+            None,
+            "a completed bounded role must not inherit aggregate evidence cardinality"
+        );
+        assert_eq!(
+            final_answer_recovery_reason_for_execution_scope(
+                role_result,
+                workspace.path(),
+                parent_objective,
+                false,
+            ),
+            Some(
+                "final answer did not include at least two existing workspace source files required by the objective"
+                    .to_string()
+            ),
+            "the parent synthesis must retain its aggregate evidence gate"
+        );
+        assert!(
+            final_answer_recovery_reason_for_execution_scope(
+                "<tool_call><function=read_file></function></tool_call>",
+                workspace.path(),
+                parent_objective,
+                true,
+            )
+            .is_some(),
+            "delegated roles still retain terminal protocol safety checks"
+        );
+    }
+
+    #[test]
+    fn read_only_focus_converges_on_evidence_saturation_not_first_file() {
+        let read_scope = vec!["read:crates/runtime".to_string()];
+
+        assert!(!should_force_focus_synthesis(true, &read_scope, false));
+        assert!(
+            should_force_focus_synthesis(true, &read_scope, true),
+            "a bounded read role must converge after repeated responsibility-zone saturation"
+        );
+        assert!(
+            should_force_focus_synthesis(true, &["write:src/lib.rs".to_string()], false,),
+            "effect contracts must synthesize immediately after their exact obligation completes"
+        );
+        assert!(!should_force_focus_synthesis(false, &read_scope, true));
+    }
+
+    #[test]
     fn runtime_replan_is_injected_as_private_system_guidance() {
         let intervention = RuntimeIntervention {
             goal_id: "goal".to_string(),
@@ -12047,6 +12358,22 @@ mod tests {
         assert_eq!(
             provider_protocol_intervention_kind(2),
             RuntimeInterventionKind::Block
+        );
+        assert_eq!(
+            provider_protocol_intervention_kind_for_checkpoint(1, true, false, false),
+            RuntimeInterventionKind::Synthesize
+        );
+        assert_eq!(
+            provider_protocol_intervention_kind_for_checkpoint(2, true, true, false),
+            RuntimeInterventionKind::Synthesize
+        );
+        assert_eq!(
+            provider_protocol_intervention_kind_for_checkpoint(3, true, true, true),
+            RuntimeInterventionKind::Block
+        );
+        assert_eq!(
+            provider_protocol_intervention_kind_for_checkpoint(1, false, false, false),
+            RuntimeInterventionKind::Replan
         );
     }
 }

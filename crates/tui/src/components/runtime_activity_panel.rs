@@ -1,5 +1,5 @@
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
-use harness_contract::projection::StrategyDecisionProjection;
+use harness_contract::projection::{ProjectionEntityPayload, StrategyDecisionProjection};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style, Stylize},
@@ -79,6 +79,15 @@ pub struct RuntimeActivityPanel {
     projection_team_event_count: usize,
     projection_approval_count: usize,
     projection_model_speed: String,
+    projection_admission_status: String,
+    projection_admission_queue_ms: u64,
+    projection_admission_wait_reason: String,
+    projection_outcome_status: String,
+    projection_outcome_duration_ms: u64,
+    projection_outcome_tools: u64,
+    projection_outcome_quality: String,
+    projection_evidence_count: usize,
+    projection_evidence_completeness: String,
     session_id: String,
     model: String,
     provider_status: String,
@@ -127,6 +136,56 @@ impl RuntimeActivityPanel {
             .latest_execution_projection
             .as_ref()
             .and_then(|projection| projection.strategy.clone());
+        self.projection_admission_status.clear();
+        self.projection_admission_queue_ms = 0;
+        self.projection_admission_wait_reason.clear();
+        self.projection_outcome_status.clear();
+        self.projection_outcome_duration_ms = 0;
+        self.projection_outcome_tools = 0;
+        self.projection_outcome_quality.clear();
+        self.projection_evidence_count = 0;
+        self.projection_evidence_completeness.clear();
+        if let Some(projection) = app.latest_execution_projection.as_ref() {
+            if let Some(admission) = projection
+                .admissions
+                .iter()
+                .filter_map(|entity| match entity.payload.as_ref() {
+                    Some(ProjectionEntityPayload::Admission(admission)) => {
+                        Some((entity.revision, admission))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(revision, _)| *revision)
+                .map(|(_, admission)| admission)
+            {
+                self.projection_admission_status =
+                    format!("{:?}", admission.status).to_ascii_lowercase();
+                self.projection_admission_queue_ms = admission.queue_age_ms;
+                self.projection_admission_wait_reason =
+                    admission.wait_reason.clone().unwrap_or_default();
+            }
+            if let Some(outcome) = projection
+                .outcomes
+                .iter()
+                .filter_map(|entity| match entity.payload.as_ref() {
+                    Some(ProjectionEntityPayload::Outcome(outcome)) => {
+                        Some((entity.revision, outcome))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(revision, _)| *revision)
+                .map(|(_, outcome)| outcome)
+            {
+                self.projection_outcome_status = outcome.terminal_class.clone();
+                self.projection_outcome_duration_ms = outcome.duration_ms;
+                self.projection_outcome_tools = outcome.tool_calls;
+                self.projection_outcome_quality =
+                    format!("{:?}", outcome.quality).to_ascii_lowercase();
+                self.projection_evidence_completeness =
+                    format!("{:?}", outcome.evidence_completeness).to_ascii_lowercase();
+            }
+            self.projection_evidence_count = projection.evidence.len();
+        }
         self.strategy_agent_ids = app
             .latest_execution_projection
             .as_ref()
@@ -653,6 +712,47 @@ impl Component for RuntimeActivityPanel {
                 ),
             ]));
         }
+        if !self.projection_admission_status.is_empty()
+            || !self.projection_outcome_status.is_empty()
+            || self.projection_evidence_count > 0
+        {
+            let admission = if self.projection_admission_status.is_empty() {
+                "unknown".to_string()
+            } else if self.projection_admission_wait_reason.is_empty() {
+                format!(
+                    "{} {}ms",
+                    self.projection_admission_status, self.projection_admission_queue_ms
+                )
+            } else {
+                format!(
+                    "{} {}ms {}",
+                    self.projection_admission_status,
+                    self.projection_admission_queue_ms,
+                    preview(&self.projection_admission_wait_reason, 24)
+                )
+            };
+            let outcome = if self.projection_outcome_status.is_empty() {
+                "pending".to_string()
+            } else {
+                format!(
+                    "{} {}ms tools {} quality {}",
+                    self.projection_outcome_status,
+                    self.projection_outcome_duration_ms,
+                    self.projection_outcome_tools,
+                    self.projection_outcome_quality
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Lifecycle:", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        " admission {admission} | outcome {outcome} | evidence {} {}",
+                        self.projection_evidence_count, self.projection_evidence_completeness
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+        }
 
         if !self.recent_process.is_empty() {
             if !lines.is_empty() {
@@ -955,6 +1055,9 @@ mod tests {
             execution_id: "execution-547".to_string(),
             revision: 4,
             cursor: 4,
+            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+            authorization_revision: 1,
+            redaction_revision: "redaction-1".to_string(),
             session_id: Some("session-547".to_string()),
             mission_id: Some("mission-547".to_string()),
             strategy: Some(strategy),
@@ -970,11 +1073,14 @@ mod tests {
                 status: Some("running".to_string()),
                 summary: None,
                 evidence_refs: Vec::new(),
+                payload: None,
                 detail: Some(serde_json::json!({"graph_id": "execution-547"})),
             }],
             teams: Vec::new(),
             relations: Vec::new(),
             approvals: Vec::new(),
+            admissions: Vec::new(),
+            outcomes: Vec::new(),
             interventions: Vec::new(),
             usage: Vec::new(),
             context: Vec::new(),
@@ -1091,6 +1197,27 @@ mod tests {
         // The runtime panel owns tool process details; the separate Activity
         // panel remains a manually opened recent-event stream.
         assert!(!rendered.contains("user: ship the runtime console"));
+    }
+
+    #[test]
+    fn renders_canonical_admission_outcome_and_evidence_without_prose_inference() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../harness-contract/tests/fixtures/projection-v2/materialization.json"
+        ))
+        .expect("canonical projection corpus");
+        let projection: crate::protocol::ExecutionProjection =
+            serde_json::from_value(corpus["expected"].clone()).expect("expected projection");
+        let mut app = App::new("m", "session-golden");
+        app.latest_execution_projection = Some(projection);
+
+        let mut panel = RuntimeActivityPanel::new();
+        panel.sync_from_app(&app);
+        let rendered = render_panel(&mut panel, 120, 16);
+
+        assert!(rendered.contains("Lifecycle:"));
+        assert!(rendered.contains("admission materialized 8ms"));
+        assert!(rendered.contains("outcome completed 12ms tools 1 quality unknown"));
+        assert!(rendered.contains("evidence 1 sufficient"));
     }
 
     #[test]

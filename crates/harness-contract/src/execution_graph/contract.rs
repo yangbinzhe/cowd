@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionNodeKind {
     InlineModel,
@@ -17,7 +17,7 @@ pub enum ExecutionNodeKind {
     Timer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionNodeStatus {
     Planned,
@@ -43,7 +43,7 @@ impl ExecutionNodeStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionEdgeKind {
     DependsOn,
@@ -127,7 +127,7 @@ pub struct ExecutionFailure {
     pub evidence_refs: Vec<EvidenceAccessRef>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionUsage {
     /// The provider model that actually produced this node result. This is
     /// distinct from a requested model because Runtime may use a configured
@@ -171,7 +171,7 @@ pub struct ExecutionRecoveryCursor {
 /// Durable lineage from a nested execution back to the graph node that
 /// requested it. This is runtime-owned metadata: model tool JSON must never
 /// be trusted to populate it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionParentBinding {
     pub execution_id: String,
     pub node_id: String,
@@ -182,7 +182,18 @@ pub struct ExecutionParentBinding {
 /// This is persisted with the graph so recovery cannot silently promote
 /// background or maintenance work based on a process-local naming heuristic.
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionServiceClass {

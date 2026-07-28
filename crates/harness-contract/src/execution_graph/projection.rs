@@ -6,7 +6,7 @@ use super::{
 };
 use crate::context::EvidenceAccessRef;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionNodeProjection {
     pub node_id: String,
     pub kind: ExecutionNodeKind,
@@ -24,14 +24,14 @@ pub struct ExecutionNodeProjection {
 /// Read-only graph relation safe for surfaces. Execution payloads and private
 /// prompts stay in Runtime; consumers only need stable topology to render and
 /// control the durable graph.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionEdgeProjection {
     pub from: String,
     pub to: String,
     pub kind: ExecutionEdgeKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionGraphProjection {
     pub graph_id: String,
     pub revision: u64,

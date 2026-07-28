@@ -26,12 +26,13 @@ pub use registry::{
 pub use resources::{
     ExecutionAdmissionPolicy, ExecutionResourceKind, ExecutionResourceLease,
     ExecutionResourceManager, ExecutionResourceSnapshot, ExecutionServiceClass,
-    ResourceAcquireError, ResourceAdmissionDecision, ResourceAdmissionRequest,
-    ResourceGrantReceipt, ResourceLimitAdjustment, ResourceObservation,
-    ResourceObservationFreshness, ResourceQuota, ResourceResultClass, ResourceWaitReason,
-    ScopeLockError, ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest,
-    ScopedResource, WorktreeLease, WorktreeLeaseError, WorktreeLeaseManager, WorktreeLeaseRecord,
-    WorktreeLeaseRequest, WorktreeLeaseStatus, WorktreeOwnership,
+    ResourceAcquireError, ResourceAdmissionDecision, ResourceAdmissionObservation,
+    ResourceAdmissionObservationStatus, ResourceAdmissionRequest, ResourceGrantReceipt,
+    ResourceLimitAdjustment, ResourceObservation, ResourceObservationFreshness, ResourceQuota,
+    ResourceResultClass, ResourceWaitReason, ScopeLockError, ScopeLockLease, ScopeLockManager,
+    ScopeLockMode, ScopeLockRequest, ScopedResource, WorktreeLease, WorktreeLeaseError,
+    WorktreeLeaseManager, WorktreeLeaseRecord, WorktreeLeaseRequest, WorktreeLeaseStatus,
+    WorktreeOwnership,
 };
 #[cfg(test)]
 pub(crate) use runner::validate_worktree_path;

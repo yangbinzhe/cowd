@@ -64,7 +64,9 @@ pub enum TaskRisk {
 ///
 /// Unknown values remain explicit so callers cannot accidentally treat a
 /// missing observation as a zero-cost or zero-risk measurement.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum MeasureProvenance {
     Observed,
@@ -81,7 +83,7 @@ impl MeasureProvenance {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionPattern {
     Direct,

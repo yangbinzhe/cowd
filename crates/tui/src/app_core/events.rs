@@ -576,11 +576,23 @@ mod tests {
             tx.send(CowdEvent::ExecutionProjectionDelta {
                 generation: 7,
                 delta: harness_contract::projection::ProjectionDelta {
-                    schema_version: 1,
+                    schema_version:
+                        harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
+                    reducer_version:
+                        harness_contract::projection::EXECUTION_PROJECTION_REDUCER_VERSION,
                     execution_id: "execution-a".to_string(),
+                    from_revision: cursor.saturating_sub(1),
+                    target_revision: cursor,
                     base_cursor: cursor.saturating_sub(1),
                     target_cursor: cursor,
-                    events: Vec::new(),
+                    detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+                    authorization_revision: 1,
+                    redaction_revision: "redaction-1".to_string(),
+                    source_health: harness_contract::projection::ProjectionSourceHealth::Fresh,
+                    operations: vec![
+                        harness_contract::projection::ProjectionOperation::AdvanceCursor { cursor },
+                    ],
+                    resync_reason: None,
                 },
             })
             .expect("reliable projection");

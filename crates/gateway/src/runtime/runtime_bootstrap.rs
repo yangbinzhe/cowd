@@ -9,6 +9,8 @@ use runtime::{ConfigLoader, McpServerManager, ToolError};
 use serde_json::json;
 use tools::{permissions::PermissionMode as ToolPermissionMode, RuntimeToolDefinition};
 
+use harness_contract::tool::ToolEffectResolverSpec;
+
 pub(crate) type GatewayToolRegistry = tools::ToolCatalog;
 pub(crate) type RuntimePluginStateBuildOutput = (
     Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -565,6 +567,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.external_read"),
         },
         RuntimeToolDefinition {
             name: "lark_cli_write".to_string(),
@@ -588,6 +591,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::DangerFullAccess,
+            effect_resolver: runtime_effect_resolver("runtime.external_danger"),
         },
         RuntimeToolDefinition {
             name: "runtime_config_view".to_string(),
@@ -606,6 +610,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
         RuntimeToolDefinition {
             name: "runtime_resource_capabilities".to_string(),
@@ -623,6 +628,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
         RuntimeToolDefinition {
             name: "runtime_capabilities".to_string(),
@@ -644,6 +650,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
@@ -702,6 +709,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::WorkspaceWrite,
+            effect_resolver: runtime_effect_resolver("runtime.state_write"),
         },
         RuntimeToolDefinition {
             name: "evidence_retrieve".to_string(),
@@ -719,11 +727,13 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
     ]
 }
 
 fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
+    let required_permission = permission_mode_for_mcp_tool(&tool.tool);
     RuntimeToolDefinition {
         name: tool.qualified_name.clone(),
         description: Some(
@@ -737,7 +747,8 @@ fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDef
             .input_schema
             .clone()
             .unwrap_or_else(|| json!({ "type": "object", "additionalProperties": true })),
-        required_permission: permission_mode_for_mcp_tool(&tool.tool),
+        required_permission,
+        effect_resolver: mcp_effect_resolver(required_permission),
     }
 }
 
@@ -758,6 +769,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::DangerFullAccess,
+            effect_resolver: runtime_effect_resolver("runtime.external_danger"),
         },
         RuntimeToolDefinition {
             name: "ListMcpResourcesTool".to_string(),
@@ -773,6 +785,7 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.external_read"),
         },
         RuntimeToolDefinition {
             name: "ReadMcpResourceTool".to_string(),
@@ -787,8 +800,27 @@ fn mcp_wrapper_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.external_read"),
         },
     ]
+}
+
+pub(crate) fn runtime_effect_resolver(resolver_id: &str) -> ToolEffectResolverSpec {
+    ToolEffectResolverSpec {
+        resolver_id: resolver_id.to_string(),
+        resolver_version: 1,
+    }
+}
+
+fn mcp_effect_resolver(permission: ToolPermissionMode) -> ToolEffectResolverSpec {
+    let resolver_id = match permission {
+        ToolPermissionMode::ReadOnly => "runtime.external_read",
+        ToolPermissionMode::WorkspaceWrite => "runtime.external_write",
+        ToolPermissionMode::DangerFullAccess
+        | ToolPermissionMode::Prompt
+        | ToolPermissionMode::Allow => "runtime.external_danger",
+    };
+    runtime_effect_resolver(resolver_id)
 }
 
 fn permission_mode_for_mcp_tool(tool: &runtime::McpTool) -> ToolPermissionMode {
@@ -835,6 +867,10 @@ mod tests {
             .expect("Lark read tool");
         assert_eq!(lark_read.required_permission, ToolPermissionMode::ReadOnly);
         assert_eq!(lark_read.input_schema["required"][0], "args");
+        assert_eq!(
+            lark_read.effect_resolver.resolver_id,
+            "runtime.external_read"
+        );
         let lark_write = tools
             .iter()
             .find(|tool| tool.name == "lark_cli_write")
@@ -842,6 +878,10 @@ mod tests {
         assert_eq!(
             lark_write.required_permission,
             ToolPermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            lark_write.effect_resolver.resolver_id,
+            "runtime.external_danger"
         );
 
         let capability_tool = tools
@@ -866,5 +906,72 @@ mod tests {
             ToolPermissionMode::ReadOnly
         );
         assert_eq!(evidence_tool.input_schema["required"][0], "evidence_ref");
+    }
+
+    #[test]
+    fn mcp_annotations_select_explicit_external_effect_contracts() {
+        for (annotations, expected_permission, expected_resolver) in [
+            (
+                json!({"readOnlyHint": true}),
+                ToolPermissionMode::ReadOnly,
+                "runtime.external_read",
+            ),
+            (
+                json!({}),
+                ToolPermissionMode::WorkspaceWrite,
+                "runtime.external_write",
+            ),
+            (
+                json!({"destructiveHint": true}),
+                ToolPermissionMode::DangerFullAccess,
+                "runtime.external_danger",
+            ),
+        ] {
+            let definition = mcp_runtime_tool_definition(&runtime::ManagedMcpTool {
+                server_name: "fixture".to_string(),
+                qualified_name: format!("mcp__fixture__{expected_resolver}"),
+                raw_name: "fixture".to_string(),
+                tool: runtime::McpTool {
+                    name: "fixture".to_string(),
+                    description: None,
+                    input_schema: Some(json!({"type": "object"})),
+                    annotations: Some(annotations),
+                    meta: None,
+                },
+            });
+            assert_eq!(definition.required_permission, expected_permission);
+            assert_eq!(definition.effect_resolver.resolver_id, expected_resolver);
+        }
+    }
+
+    #[test]
+    fn every_gateway_runtime_tool_declares_a_concrete_effect_contract() {
+        let mut tools = runtime_capability_tool_definitions();
+        tools.extend(mcp_wrapper_tool_definitions());
+        let catalog = GatewayToolRegistry::builtin()
+            .with_runtime_tools(tools)
+            .expect("all gateway runtime tools must register concrete effects");
+
+        for definition in catalog.definitions(None) {
+            if !catalog.has_runtime_tool(&definition.name) {
+                continue;
+            }
+            let resolver = catalog.effect_resolver(&definition.name);
+            let effect = tools::tool_orchestrator::resolve_registered_tool_effect(
+                &resolver,
+                &definition.name,
+                &json!({}),
+                catalog
+                    .required_permission(&definition.name)
+                    .expect("registered permission"),
+            );
+            assert_ne!(
+                effect.effect_kind,
+                harness_contract::tool::ToolEffectKind::Unknown,
+                "{} resolved through {}",
+                definition.name,
+                resolver.resolver_id
+            );
+        }
     }
 }

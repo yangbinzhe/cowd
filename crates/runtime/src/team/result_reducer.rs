@@ -54,7 +54,6 @@ impl SynthesizeBackend for TeamResultReducer {
             .await
             .map_err(|error| error.to_string())?;
         let mut summaries = Vec::new();
-        let mut supporting_outputs = Vec::new();
         let mut evidence = Vec::new();
         let mut usage = ExecutionUsage::default();
         let mut blockers = Vec::new();
@@ -97,13 +96,7 @@ impl SynthesizeBackend for TeamResultReducer {
             match returned.status {
                 AgentTerminalStatus::Completed => {
                     if terminal_agent_nodes.contains(&node.id) {
-                        summaries.push(format!("## {}\n{}", packet.agent_id(), returned.outcome));
-                    } else {
-                        supporting_outputs.push(format!(
-                            "## {}\n{}",
-                            packet.agent_id(),
-                            returned.outcome
-                        ));
+                        summaries.push(render_terminal_outcome(&returned.outcome));
                     }
                 }
                 AgentTerminalStatus::Failed
@@ -138,13 +131,12 @@ impl SynthesizeBackend for TeamResultReducer {
             // completed evidence and name the gap for the parent turn. This
             // keeps a single unavailable synthesis worker from erasing a
             // real, auditable team result.
-            let mut final_answer = String::new();
-            if !supporting_outputs.is_empty() {
-                final_answer.push_str("# Committed supporting role outputs\n\n");
-                final_answer.push_str(&supporting_outputs.join("\n\n"));
-                final_answer.push_str("\n\n# Terminal review/synthesis\n\n");
-            }
-            final_answer.push_str(&summaries.join("\n\n"));
+            // Supporting roles remain available through durable Agent returns,
+            // Team working state and evidence refs. Publishing their machine
+            // contracts again in the user answer duplicates context and can
+            // truncate the actual terminal review. Only topology-terminal
+            // roles own the user-facing Team result.
+            let mut final_answer = summaries.join("\n\n");
             if !blockers.is_empty() {
                 final_answer.push_str("\n\n## Unresolved team role outcomes\n");
                 for blocker in blockers {
@@ -183,6 +175,97 @@ impl SynthesizeBackend for TeamResultReducer {
     }
 }
 
+fn render_terminal_outcome(outcome: &str) -> String {
+    let Ok(serde_json::Value::Object(mut fields)) =
+        serde_json::from_str::<serde_json::Value>(outcome)
+    else {
+        return outcome.trim().to_string();
+    };
+    let mut sections = Vec::new();
+    if let Some(summary) = fields.remove("summary") {
+        append_rendered_field(&mut sections, None, summary);
+    }
+    for (field, heading) in [
+        ("findings", "Findings"),
+        ("plan", "Plan"),
+        ("proposal", "Proposal"),
+        ("critique", "Critique"),
+        ("checkpoint", "Checkpoint"),
+        ("implementation", "Implementation"),
+        ("mitigation", "Mitigation"),
+        ("review", "Review"),
+        ("risks", "Risks"),
+        ("unresolved", "Unresolved"),
+        ("evidence", "Evidence"),
+    ] {
+        if let Some(value) = fields.remove(field) {
+            append_rendered_field(&mut sections, Some(heading), value);
+        }
+    }
+    for (field, value) in fields {
+        let heading = field
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().collect::<String>() + chars.as_str()
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        append_rendered_field(&mut sections, Some(&heading), value);
+    }
+    if sections.is_empty() {
+        outcome.trim().to_string()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+fn append_rendered_field(
+    sections: &mut Vec<String>,
+    heading: Option<&str>,
+    value: serde_json::Value,
+) {
+    let body = render_structured_value(&value);
+    if body.trim().is_empty() {
+        return;
+    }
+    sections.push(heading.map_or(body.clone(), |heading| format!("## {heading}\n{body}")));
+}
+
+fn render_structured_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => value.trim().to_string(),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(|value| {
+                let rendered = render_structured_value(value);
+                (!rendered.is_empty()).then(|| format!("- {}", rendered.replace('\n', "\n  ")))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .filter_map(|(key, value)| {
+                let rendered = render_structured_value(value);
+                (!rendered.is_empty()).then(|| {
+                    if rendered.contains('\n') {
+                        format!("- **{key}**:\n  {}", rendered.replace('\n', "\n  "))
+                    } else {
+                        format!("- **{key}**: {rendered}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
 fn terminal_agent_node_ids(
     graph: &harness_contract::execution_graph::ExecutionGraph,
 ) -> BTreeSet<String> {
@@ -211,7 +294,7 @@ mod tests {
         ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
     };
 
-    use super::terminal_agent_node_ids;
+    use super::{render_terminal_outcome, terminal_agent_node_ids};
 
     #[test]
     fn only_topology_terminal_agent_publishes_the_team_answer() {
@@ -233,5 +316,27 @@ mod tests {
             terminal_agent_node_ids(&graph),
             std::collections::BTreeSet::from(["synthesizer".to_string()])
         );
+    }
+
+    #[test]
+    fn structured_terminal_outcome_becomes_user_facing_markdown() {
+        let rendered = render_terminal_outcome(
+            r#"{
+                "summary":"Runtime, Memory, and Gateway have distinct canonical state boundaries.",
+                "evidence":[
+                    {"path":"crates/runtime/src/lib.rs","receipt":"tool://runtime"},
+                    {"path":"crates/memory/src/lib.rs","receipt":"tool://memory"}
+                ],
+                "unresolved":["Verify commit-to-broadcast ordering."]
+            }"#,
+        );
+
+        assert!(rendered
+            .starts_with("Runtime, Memory, and Gateway have distinct canonical state boundaries."));
+        assert!(rendered.contains("## Evidence"));
+        assert!(rendered.contains("crates/runtime/src/lib.rs"));
+        assert!(rendered.contains("crates/memory/src/lib.rs"));
+        assert!(rendered.contains("## Unresolved"));
+        assert!(!rendered.contains(r#""summary""#));
     }
 }

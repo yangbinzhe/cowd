@@ -590,6 +590,7 @@ mod tests {
                 status: Some("completed".to_string()),
                 summary: None,
                 evidence_refs: Vec::new(),
+                payload: None,
                 detail: Some(serde_json::json!({"graph_id": "execution-547"})),
             },
             ProjectionEntity {
@@ -599,6 +600,7 @@ mod tests {
                 status: Some("completed".to_string()),
                 summary: None,
                 evidence_refs: Vec::new(),
+                payload: None,
                 detail: Some(serde_json::json!({"graph_id": "execution-other"})),
             },
         ];

@@ -205,10 +205,13 @@ mod tests {
 
     fn projection(revision: u64, status: ExecutionLiveStatus) -> ExecutionProjection {
         ExecutionProjection {
-            schema_version: 1,
+            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "execution-a".to_string(),
             revision,
             cursor: revision,
+            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+            authorization_revision: 1,
+            redaction_revision: "redaction-1".to_string(),
             session_id: Some("session-a".to_string()),
             mission_id: None,
             strategy: None,
@@ -221,6 +224,8 @@ mod tests {
             teams: Vec::new(),
             relations: Vec::new(),
             approvals: Vec::new(),
+            admissions: Vec::new(),
+            outcomes: Vec::new(),
             interventions: Vec::new(),
             usage: Vec::new(),
             context: Vec::new(),

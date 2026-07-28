@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
 
 use cowd_app_host::TuiAppEvent;
 
@@ -247,14 +246,9 @@ pub enum SessionStreamConnectionState {
     },
 }
 
-/// TUI-side durable cursor guard. It deliberately does not infer graph or
-/// session lifecycle from textual events: a gap requests a new canonical
-/// snapshot from Gateway.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionProjectionReducer {
-    execution_id: Option<String>,
-    cursor: u64,
-    seen_event_ids: BTreeSet<String>,
+    projection: Option<ExecutionProjection>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,39 +260,39 @@ pub enum ProjectionDeltaApply {
 impl ExecutionProjectionReducer {
     pub fn install_snapshot(&mut self, projection: &ExecutionProjection) -> ProjectionDeltaApply {
         if validate_execution_projection_schema(projection).is_err() {
-            self.execution_id = None;
-            self.cursor = 0;
-            self.seen_event_ids.clear();
+            self.projection = None;
             return ProjectionDeltaApply::ResyncRequired;
         }
-        self.execution_id = Some(projection.execution_id.clone());
-        self.cursor = projection.cursor;
-        self.seen_event_ids.clear();
+        self.projection = Some(projection.clone());
         ProjectionDeltaApply::Applied
     }
 
     pub fn apply_delta(&mut self, delta: &ProjectionDelta) -> ProjectionDeltaApply {
-        if validate_projection_delta_schema(delta).is_err()
-            || self.execution_id.as_deref() != Some(delta.execution_id.as_str())
-            || self.cursor != delta.base_cursor
-            || delta.target_cursor < delta.base_cursor
-        {
+        if validate_projection_delta_schema(delta).is_err() {
             return ProjectionDeltaApply::ResyncRequired;
         }
-        for event in &delta.events {
-            if event.commit_cursor < delta.base_cursor || event.commit_cursor > delta.target_cursor
-            {
-                return ProjectionDeltaApply::ResyncRequired;
+        let Some(current) = self.projection.as_ref() else {
+            return ProjectionDeltaApply::ResyncRequired;
+        };
+        match harness_contract::projection::reduce_projection_delta(current, delta) {
+            Ok(next) => {
+                self.projection = Some(next);
+                ProjectionDeltaApply::Applied
             }
-            self.seen_event_ids.insert(event.event_id.clone());
+            Err(_) => ProjectionDeltaApply::ResyncRequired,
         }
-        self.cursor = delta.target_cursor;
-        ProjectionDeltaApply::Applied
     }
 
     #[must_use]
-    pub const fn cursor(&self) -> u64 {
-        self.cursor
+    pub fn cursor(&self) -> u64 {
+        self.projection
+            .as_ref()
+            .map_or(0, |projection| projection.cursor)
+    }
+
+    #[must_use]
+    pub const fn projection(&self) -> Option<&ExecutionProjection> {
+        self.projection.as_ref()
     }
 }
 
@@ -327,10 +321,13 @@ pub fn validate_execution_projection_schema(
 }
 
 pub fn validate_projection_delta_schema(delta: &ProjectionDelta) -> Result<(), String> {
-    if delta.schema_version != harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION {
+    if delta.schema_version != harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION
+        || delta.reducer_version
+            != harness_contract::projection::EXECUTION_PROJECTION_REDUCER_VERSION
+    {
         return Err(format!(
-            "unsupported execution projection delta schema_version {}",
-            delta.schema_version
+            "unsupported execution projection delta schema/reducer {}/{}",
+            delta.schema_version, delta.reducer_version
         ));
     }
     Ok(())
@@ -619,15 +616,20 @@ mod tests {
     use super::*;
     use harness_contract::execution_graph::ExecutionGraph;
     use harness_contract::projection::{
-        ExecutionProjection, ProjectionCommandAvailability, ProjectionEvent, ProjectionEventKind,
+        ExecutionProjection, ProjectionCommandAvailability, ProjectionDetailScope,
+        ProjectionOperation, ProjectionSourceHealth, EXECUTION_PROJECTION_REDUCER_VERSION,
+        EXECUTION_PROJECTION_SCHEMA_VERSION,
     };
 
     fn snapshot() -> ExecutionProjection {
         ExecutionProjection {
-            schema_version: 1,
+            schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
             execution_id: "graph-a".to_string(),
             revision: 1,
             cursor: 10,
+            detail_scope: ProjectionDetailScope::Summary,
+            authorization_revision: 1,
+            redaction_revision: "redaction-1".to_string(),
             session_id: None,
             mission_id: None,
             strategy: None,
@@ -640,6 +642,8 @@ mod tests {
             teams: Vec::new(),
             relations: Vec::new(),
             approvals: Vec::new(),
+            admissions: Vec::new(),
+            outcomes: Vec::new(),
             interventions: Vec::new(),
             usage: Vec::new(),
             context: Vec::new(),
@@ -657,17 +661,19 @@ mod tests {
         let mut reducer = ExecutionProjectionReducer::default();
         reducer.install_snapshot(&projection);
         let delta = ProjectionDelta {
-            schema_version: 1,
+            schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
+            reducer_version: EXECUTION_PROJECTION_REDUCER_VERSION,
             execution_id: "graph-a".to_string(),
+            from_revision: 1,
+            target_revision: 1,
             base_cursor: 10,
             target_cursor: 11,
-            events: vec![ProjectionEvent {
-                commit_cursor: 11,
-                transaction_index: 0,
-                event_id: "event-11".to_string(),
-                kind: ProjectionEventKind::CursorAdvanced,
-                entity: None,
-            }],
+            detail_scope: ProjectionDetailScope::Summary,
+            authorization_revision: 1,
+            redaction_revision: "redaction-1".to_string(),
+            source_health: ProjectionSourceHealth::Fresh,
+            operations: vec![ProjectionOperation::AdvanceCursor { cursor: 11 }],
+            resync_reason: None,
         };
         assert_eq!(reducer.apply_delta(&delta), ProjectionDeltaApply::Applied);
         assert_eq!(reducer.cursor(), 11);
@@ -675,12 +681,42 @@ mod tests {
             reducer.apply_delta(&delta),
             ProjectionDeltaApply::ResyncRequired
         );
+        assert_eq!(reducer.cursor(), 11);
+        assert_eq!(reducer.projection().map(|value| value.revision), Some(1));
+    }
+
+    #[test]
+    fn projection_reducer_consumes_the_canonical_cross_surface_golden_corpus() {
+        #[derive(Deserialize)]
+        struct Corpus {
+            initial: ExecutionProjection,
+            delta: ProjectionDelta,
+            expected: ExecutionProjection,
+        }
+
+        let corpus: Corpus = serde_json::from_str(include_str!(
+            "../../../harness-contract/tests/fixtures/projection-v2/materialization.json"
+        ))
+        .expect("canonical projection v2 corpus");
+        let mut reducer = ExecutionProjectionReducer::default();
+        assert_eq!(
+            reducer.install_snapshot(&corpus.initial),
+            ProjectionDeltaApply::Applied
+        );
+        assert_eq!(
+            reducer.apply_delta(&corpus.delta),
+            ProjectionDeltaApply::Applied
+        );
+        assert_eq!(reducer.projection(), Some(&corpus.expected));
+        assert_eq!(corpus.expected.admissions.len(), 1);
+        assert_eq!(corpus.expected.outcomes.len(), 1);
+        assert!(corpus.expected.evidence[0].payload.is_some());
     }
 
     #[test]
     fn projection_reducer_fails_closed_on_execution_delta_and_nested_strategy_versions() {
         let mut invalid_execution = snapshot();
-        invalid_execution.schema_version = 2;
+        invalid_execution.schema_version = EXECUTION_PROJECTION_SCHEMA_VERSION + 1;
         let mut reducer = ExecutionProjectionReducer::default();
         assert_eq!(
             reducer.install_snapshot(&invalid_execution),
@@ -710,11 +746,19 @@ mod tests {
         );
         assert_eq!(
             reducer.apply_delta(&ProjectionDelta {
-                schema_version: 2,
+                schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION + 1,
+                reducer_version: EXECUTION_PROJECTION_REDUCER_VERSION,
                 execution_id: projection.execution_id,
+                from_revision: projection.revision,
+                target_revision: projection.revision,
                 base_cursor: projection.cursor,
                 target_cursor: projection.cursor,
-                events: Vec::new(),
+                detail_scope: projection.detail_scope,
+                authorization_revision: projection.authorization_revision,
+                redaction_revision: projection.redaction_revision,
+                source_health: ProjectionSourceHealth::Fresh,
+                operations: Vec::new(),
+                resync_reason: None,
             }),
             ProjectionDeltaApply::ResyncRequired
         );

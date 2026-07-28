@@ -207,7 +207,7 @@ pub struct SessionExecutionFenceSnapshot {
     pub session_generation: u64,
     pub claim_owner: String,
     pub claim_token: String,
-    pub claim_revision: u64,
+    pub claim_fence_epoch: u64,
 }
 
 impl std::fmt::Debug for SessionExecutionFence {
@@ -277,6 +277,7 @@ impl SessionExecutionFence {
             && record.sequence == self.input_sequence
             && record.claim_owner.as_deref() == Some(self.claim_owner.as_str())
             && record.claim_token.as_deref() == Some(self.claim_token.as_str())
+            && record.claim_fence_epoch.is_some()
             && matches!(
                 record.status,
                 SessionRuntimeInputStatus::Claimed | SessionRuntimeInputStatus::Running
@@ -291,7 +292,9 @@ impl SessionExecutionFence {
                 session_generation: self.generation,
                 claim_owner: self.claim_owner.clone(),
                 claim_token: self.claim_token.clone(),
-                claim_revision: record.revision,
+                claim_fence_epoch: record
+                    .claim_fence_epoch
+                    .expect("current claim checked for immutable fence epoch"),
             })
         } else {
             Err(format!(
@@ -1408,6 +1411,79 @@ mod tests {
         assert_eq!(second.claimed, 0, "renewed lease must not be reclaimed");
         assert_eq!(task.await.unwrap().unwrap().materialized, 1);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execution_fence_uses_immutable_claim_epoch_across_revision_changes() {
+        let (store, _services, router) = fixture().await;
+        let request = SessionRuntimeOutboxRequest {
+            input_id: "fence-i1".into(),
+            request_id: "fence-r1".into(),
+            turn_id: "fence-t1".into(),
+            message_id: "fence-m1".into(),
+            session_generation: 1,
+            decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+            target_turn_id: None,
+            classification_json: None,
+            created_at_ms: now_ms(),
+            runtime_options_json: None,
+        };
+        router
+            .persist_input("s1", "fenced", &request)
+            .await
+            .unwrap();
+        let claimed = store
+            .claim_session_runtime_outbox("fence-worker", now_ms(), 30_000, 1)
+            .await
+            .unwrap()
+            .pop()
+            .expect("claim");
+        let claim_token = claimed.claim_token.clone().expect("claim token");
+        let running = store
+            .mark_session_runtime_outbox_running(
+                &claimed.request_id,
+                "fence-worker",
+                claimed.session_generation,
+                &claim_token,
+                claimed.revision,
+                now_ms(),
+            )
+            .await
+            .unwrap();
+        let immutable_epoch = running.claim_fence_epoch.expect("claim fence epoch");
+        assert_ne!(running.revision, immutable_epoch);
+
+        let query = crate::session_runtime_port::TestSessionPortAdapter::new(Arc::clone(&store));
+        let fence = SessionExecutionFence::from_claim(
+            query,
+            &running.request_id,
+            &running.session_id,
+            running.session_generation,
+            running.sequence,
+            running.claim_owner.clone().expect("claim owner"),
+            claim_token.clone(),
+        )
+        .unwrap();
+        let renewed = store
+            .renew_session_runtime_outbox_lease(
+                &running.request_id,
+                "fence-worker",
+                running.session_generation,
+                &claim_token,
+                running.revision,
+                now_ms(),
+                30_000,
+            )
+            .await
+            .unwrap();
+        assert!(renewed.revision > running.revision);
+
+        let snapshot = fence
+            .verify(SessionExecutionFencePhase::TerminalCommit)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.claim_fence_epoch, immutable_epoch);
+        assert_ne!(snapshot.claim_fence_epoch, renewed.revision);
     }
 
     #[tokio::test]

@@ -34,8 +34,9 @@ use super::graph::{
     },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError,
-    ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry, ResourceQuota,
-    ScopeLockError, ScopeLockManager, WorktreeLeaseError, WorktreeLeaseManager,
+    ExecutionStateStoreError, NodeExecutor, NodeExecutorError, NodeExecutorRegistry,
+    ResourceAdmissionObservationStatus, ResourceQuota, ScopeLockError, ScopeLockManager,
+    WorktreeLeaseError, WorktreeLeaseManager,
 };
 use super::protocols::ProtocolResultReducer;
 use crate::agent::binding::request_for_intent;
@@ -1152,25 +1153,45 @@ impl RuntimeServices {
         let resource_manager = Arc::new(ExecutionResourceManager::new(resource_quotas));
         let resource_event_store = Arc::clone(&event_store);
         resource_manager
-            .install_grant_observer(move |receipt| {
+            .install_admission_observer(move |observation| {
+                let mut refs = vec![RuntimeEventRef {
+                    kind: "resource_request".to_string(),
+                    id: observation.request_id.to_string(),
+                }];
+                if let Some(execution_id) = observation.fairness_key.strip_prefix("graph:") {
+                    refs.push(RuntimeEventRef {
+                        kind: "execution_graph".to_string(),
+                        id: execution_id.to_string(),
+                    });
+                } else if let Some(session_id) = observation.fairness_key.strip_prefix("session:") {
+                    refs.push(RuntimeEventRef {
+                        kind: "session".to_string(),
+                        id: session_id.to_string(),
+                    });
+                }
+                let state = match observation.status {
+                    ResourceAdmissionObservationStatus::Queued => "queued",
+                    ResourceAdmissionObservationStatus::Waiting => "waiting",
+                    ResourceAdmissionObservationStatus::Granted => "granted",
+                    ResourceAdmissionObservationStatus::Deferred => "deferred",
+                    ResourceAdmissionObservationStatus::Overloaded => "overloaded",
+                };
                 if let Err(error) = resource_event_store.append(RuntimeEventInput {
-                    stream_id: format!("resource-admission:{}", receipt.request_id),
+                    stream_id: format!("resource-admission:{}", observation.request_id),
                     scope: RuntimeEventScope::Schedule,
-                    kind: "resource.admission.granted".to_string(),
-                    status: Some("granted".to_string()),
+                    kind: format!("resource.admission.{state}"),
+                    status: Some(state.to_string()),
                     actor: Some("execution_resource_manager".to_string()),
-                    refs: vec![RuntimeEventRef {
-                        kind: "resource_request".to_string(),
-                        id: receipt.request_id.to_string(),
-                    }],
-                    payload: serde_json::to_value(receipt).unwrap_or_else(
+                    refs,
+                    payload: serde_json::to_value(observation).unwrap_or_else(
                         |error| serde_json::json!({ "serialization_error": error.to_string() }),
                     ),
                 }) {
                     tracing::warn!(
                         error = %error,
-                        request_id = %receipt.request_id,
-                        "resource admission grant evidence could not be persisted"
+                        request_id = %observation.request_id,
+                        state,
+                        "resource admission transition evidence could not be persisted"
                     );
                 }
             })
@@ -1815,6 +1836,15 @@ impl RuntimeServices {
     ) {
         self.live_execution_store
             .complete(execution_id, report, write_attempt_paths, terminal_ref);
+    }
+
+    /// Re-establish the terminal live projection from an already materialized
+    /// Session terminal during durable replay. Detailed metrics remain those
+    /// captured by the last live checkpoint; the terminal carrier is the
+    /// authority for completion.
+    pub fn complete_recovered_live_execution(&self, execution_id: &str, terminal_ref: String) {
+        self.live_execution_store
+            .complete_recovered(execution_id, terminal_ref);
     }
 
     pub fn fail_live_execution(&self, execution_id: &str, error: String) {

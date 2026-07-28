@@ -1060,6 +1060,9 @@ mod tests {
                     "additionalProperties": false
                 }),
                 required_permission: ToolPermissionMode::ReadOnly,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.readonly",
+                ),
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None);
@@ -1089,6 +1092,9 @@ mod tests {
                 description: Some("safe config view".to_string()),
                 input_schema: json!({"type":"object","additionalProperties":false}),
                 required_permission: ToolPermissionMode::ReadOnly,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.readonly",
+                ),
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None);
@@ -1111,6 +1117,9 @@ mod tests {
                 description: Some("resource capability query".to_string()),
                 input_schema: json!({"type":"object","additionalProperties":true}),
                 required_permission: ToolPermissionMode::ReadOnly,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.readonly",
+                ),
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None);
@@ -1157,6 +1166,9 @@ mod tests {
                     "additionalProperties": true
                 }),
                 required_permission: ToolPermissionMode::WorkspaceWrite,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.state_write",
+                ),
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None);
@@ -1183,6 +1195,9 @@ mod tests {
                 description: Some("read company catalog".to_string()),
                 input_schema: json!({"type":"object"}),
                 required_permission: ToolPermissionMode::ReadOnly,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.readonly",
+                ),
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None);
@@ -1202,12 +1217,18 @@ mod tests {
                     description: Some("capability guidance".to_string()),
                     input_schema: json!({"type":"object","properties":{"intent":{"type":"string"}},"required":["intent"]}),
                     required_permission: ToolPermissionMode::ReadOnly,
+                    effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                        "runtime.readonly",
+                    ),
                 },
                 RuntimeToolDefinition {
                     name: "runtime_orchestrate".to_string(),
                     description: Some("runtime orchestration".to_string()),
                     input_schema: json!({"type":"object","properties":{"intent":{"type":"string"},"action":{"type":"string"}},"required":["intent"]}),
                     required_permission: ToolPermissionMode::WorkspaceWrite,
+                    effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                        "runtime.state_write",
+                    ),
                 },
             ])
             .expect("runtime tool registry");
@@ -1265,6 +1286,9 @@ mod tests {
                     "additionalProperties": true
                 }),
                 required_permission: ToolPermissionMode::WorkspaceWrite,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.state_write",
+                ),
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None)
@@ -1307,6 +1331,9 @@ mod tests {
                     "additionalProperties": true
                 }),
                 required_permission: ToolPermissionMode::WorkspaceWrite,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.state_write",
+                ),
             }])
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry, None)

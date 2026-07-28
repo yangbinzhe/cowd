@@ -72,14 +72,32 @@ function responseFor(messages, tools) {
         "surfaces-webui": "surfaces/webui",
       };
       const focusRoot = focusRoots[focus];
-      const toolResultObserved = messages.some((message) => message?.role === "tool");
-      if (!toolResultObserved && focusRoot && suffix) {
+      const roleStart = messages.findLastIndex(
+        (message) =>
+          message?.role === "user" &&
+          textOf(message.content).includes("## Team role"),
+      );
+      const toolResults = messages
+        .slice(Math.max(0, roleStart))
+        .filter((message) => message?.role === "tool");
+      if (toolResults.length === 0 && focusRoot && suffix) {
         const pattern = `e2e-team-${suffix}.md`;
         return {
           chunks: [
             '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="glob_search">',
             `<｜｜DSML｜｜parameter name="pattern" string="true">${pattern}</｜｜DSML｜｜parameter>`,
             `<｜｜DSML｜｜parameter name="path" string="true">${focusRoot}</｜｜DSML｜｜parameter>`,
+            "</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
+          ],
+          finishReason: "stop",
+        };
+      }
+      if (toolResults.length === 1 && focusRoot && suffix) {
+        const path = `${focusRoot}/e2e-team-${suffix}.md`;
+        return {
+          chunks: [
+            '<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="read_file">',
+            `<｜｜DSML｜｜parameter name="path" string="true">${path}</｜｜DSML｜｜parameter>`,
             "</｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>",
           ],
           finishReason: "stop",
@@ -225,9 +243,10 @@ function responseFor(messages, tools) {
           "TUI_ACCEPTANCE-OBSERVER-SYNC-ACK",
         ],
         finishReason: "stop",
-        // Keep a deterministic pre-terminal window long enough for the
-        // acceptance harness to capture both independent terminal surfaces.
-        delayMs: 1000,
+        // Keep a deterministic pre-terminal window long enough for two
+        // independent tmux surfaces to redraw and be captured serially even
+        // while the machine is linking other Rust targets.
+        delayMs: 2500,
       };
     }
     const marker = latest.includes("from WebUI")

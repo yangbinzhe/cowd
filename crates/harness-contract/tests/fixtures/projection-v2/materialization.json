@@ -1,0 +1,542 @@
+{
+  "initial": {
+    "schema_version": 2,
+    "execution_id": "execution-golden",
+    "revision": 1,
+    "cursor": 1,
+    "detail_scope": "summary",
+    "authorization_revision": 7,
+    "redaction_revision": "sha256:golden",
+    "session_id": "session-golden",
+    "mission_id": "mission-golden",
+    "strategy": null,
+    "graph": {
+      "graph_id": "execution-golden",
+      "revision": 1,
+      "objective": "verify projection reducer",
+      "service_class": "interactive",
+      "parent_execution": null,
+      "nodes": [
+        {
+          "node_id": "node-a",
+          "kind": "tool_batch",
+          "status": "running",
+          "executor_kind": "runtime",
+          "result_ref": null,
+          "evidence_refs": [],
+          "usage": {
+            "model": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "duration_ms": 0,
+            "tool_calls": 0,
+            "duplicate_tool_calls": 0,
+            "runtime_write_attempt_paths": [],
+            "runtime_observed_resource_scopes": []
+          }
+        },
+        {
+          "node_id": "node-obsolete",
+          "kind": "verify",
+          "status": "planned",
+          "executor_kind": "runtime",
+          "result_ref": null,
+          "evidence_refs": [],
+          "usage": {
+            "model": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "duration_ms": 0,
+            "tool_calls": 0,
+            "duplicate_tool_calls": 0,
+            "runtime_write_attempt_paths": [],
+            "runtime_observed_resource_scopes": []
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "node-a",
+          "to": "node-obsolete",
+          "kind": "verifies"
+        }
+      ],
+      "commit_cursor": 1,
+      "terminal_result_ref": null
+    },
+    "child_executions": [
+      {
+        "execution_id": "child-obsolete",
+        "parent_execution_id": "execution-golden",
+        "parent_node_id": "node-obsolete",
+        "revision": 1,
+        "cursor": 1,
+        "status": "planned",
+        "objective": "obsolete child"
+      }
+    ],
+    "goals": [],
+    "agents": [],
+    "teams": [],
+    "relations": [],
+    "approvals": [],
+    "admissions": [],
+    "outcomes": [],
+    "interventions": [],
+    "usage": [],
+    "context": [],
+    "evidence": [],
+    "health": [
+      {
+        "id": "health-obsolete",
+        "kind": "execution_health",
+        "revision": 1,
+        "status": "stale",
+        "summary": "obsolete health",
+        "evidence_refs": []
+      }
+    ],
+    "recovery": [],
+    "live": null,
+    "available_commands": [
+      {
+        "command": "pause",
+        "available": true,
+        "reason": null
+      }
+    ]
+  },
+  "delta": {
+    "schema_version": 2,
+    "reducer_version": 1,
+    "execution_id": "execution-golden",
+    "from_revision": 1,
+    "target_revision": 2,
+    "base_cursor": 1,
+    "target_cursor": 2,
+    "detail_scope": "summary",
+    "authorization_revision": 7,
+    "redaction_revision": "sha256:golden",
+    "source_health": "fresh",
+    "operations": [
+      {
+        "op": "set_projection_header",
+        "revision": 2,
+        "session_id": "session-golden",
+        "mission_id": "mission-golden"
+      },
+      {
+        "op": "set_graph_metadata",
+        "revision": 2,
+        "commit_cursor": 2,
+        "objective": "verify projection reducer",
+        "service_class": "interactive",
+        "parent_execution": null
+      },
+      {
+        "op": "replace_graph_topology",
+        "node_ids": ["node-a", "node-b"],
+        "edges": [
+          {
+            "from": "node-a",
+            "to": "node-b",
+            "kind": "produces"
+          }
+        ]
+      },
+      {
+        "op": "upsert_graph_node",
+        "node": {
+          "node_id": "node-a",
+          "kind": "tool_batch",
+          "status": "completed",
+          "executor_kind": "runtime",
+          "result_ref": "result:node-a",
+          "evidence_refs": [],
+          "usage": {
+            "model": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "duration_ms": 12,
+            "tool_calls": 1,
+            "duplicate_tool_calls": 0,
+            "runtime_write_attempt_paths": [],
+            "runtime_observed_resource_scopes": []
+          }
+        }
+      },
+      {
+        "op": "upsert_graph_node",
+        "node": {
+          "node_id": "node-b",
+          "kind": "synthesize",
+          "status": "completed",
+          "executor_kind": "runtime",
+          "result_ref": "result:node-b",
+          "evidence_refs": [],
+          "usage": {
+            "model": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "duration_ms": 3,
+            "tool_calls": 0,
+            "duplicate_tool_calls": 0,
+            "runtime_write_attempt_paths": [],
+            "runtime_observed_resource_scopes": []
+          }
+        }
+      },
+      {
+        "op": "remove_graph_node",
+        "node_id": "node-obsolete"
+      },
+      {
+        "op": "upsert_child_execution",
+        "child": {
+          "execution_id": "child-current",
+          "parent_execution_id": "execution-golden",
+          "parent_node_id": "node-b",
+          "revision": 2,
+          "cursor": 2,
+          "status": "completed",
+          "objective": "current child"
+        }
+      },
+      {
+        "op": "remove_child_execution",
+        "execution_id": "child-obsolete"
+      },
+      {
+        "op": "replace_strategy",
+        "strategy": null
+      },
+      {
+        "op": "upsert_entity",
+        "collection": "admissions",
+        "entity": {
+          "id": "admission:request-node-a",
+          "kind": "admission",
+          "revision": 2,
+          "status": "materialized",
+          "summary": "resource.admission.granted",
+          "evidence_refs": ["execution-golden"],
+          "payload": {
+            "type": "admission",
+            "value": {
+              "request_id": "request-node-a",
+              "status": "materialized",
+              "requested_service_class": "interactive",
+              "resolved_service_class": "interactive",
+              "requested_priority": 7,
+              "deadline_at_ms": null,
+              "queue_age_ms": 8,
+              "wait_reason": null,
+              "blocker": null,
+              "resource_demands": ["provider_slot:1"],
+              "normalized_scope": "graph:execution-golden",
+              "accepted_at_ms": 20,
+              "policy_revision": 3,
+              "refs": ["execution_graph:execution-golden"]
+            }
+          }
+        }
+      },
+      {
+        "op": "upsert_entity",
+        "collection": "outcomes",
+        "entity": {
+          "id": "outcome:execution-golden",
+          "kind": "outcome",
+          "revision": 2,
+          "status": "completed",
+          "summary": "runtime.outcome.recorded.v1",
+          "evidence_refs": ["evidence:node-a"],
+          "payload": {
+            "type": "outcome",
+            "value": {
+              "execution_id": "execution-golden",
+              "session_id": "session-golden",
+              "turn_id": "turn-golden",
+              "task_id": null,
+              "mission_id": "mission-golden",
+              "agent_id": null,
+              "team_id": null,
+              "execution_graph_ref": "execution-golden",
+              "provider": "deepseek",
+              "model": "deepseek-pro",
+              "profile": "pro",
+              "protocol": "responses",
+              "config_revision": "config-3",
+              "strategy_revision": "strategy-2",
+              "terminal_class": "completed",
+              "duration_ms": 12,
+              "input_tokens": 40,
+              "output_tokens": 12,
+              "cached_tokens": 8,
+              "tool_calls": 1,
+              "duplicate_tool_calls": 0,
+              "retries": 0,
+              "quality": "unknown",
+              "evidence_completeness": "sufficient",
+              "freshness_ms": 2,
+              "evidence_refs": [
+                {
+                  "ref_type": "tool",
+                  "id": "node-a",
+                  "source": "runtime",
+                  "boundary": "observed",
+                  "confidence_bp": null
+                }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "op": "upsert_entity",
+        "collection": "evidence",
+        "entity": {
+          "id": "evidence-node-a",
+          "kind": "tool_outcome",
+          "revision": 2,
+          "status": "supported",
+          "summary": "tool result is durably supported",
+          "evidence_refs": ["evidence:node-a"],
+          "payload": {
+            "type": "evidence",
+            "value": {
+              "evidence_ref": {
+                "ref_type": "tool",
+                "id": "node-a",
+                "source": "runtime",
+                "boundary": "observed",
+                "confidence_bp": null
+              },
+              "support": "supported",
+              "completeness": "sufficient",
+              "freshness_ms": 2,
+              "projector_lag_commits": 0
+            }
+          }
+        }
+      },
+      {
+        "op": "remove_entity",
+        "collection": "health",
+        "entity_key": "health-obsolete"
+      },
+      {
+        "op": "replace_available_commands",
+        "commands": []
+      },
+      {
+        "op": "set_terminal",
+        "terminal_result_ref": "result:node-a"
+      },
+      {
+        "op": "advance_cursor",
+        "cursor": 2
+      }
+    ],
+    "resync_reason": null
+  },
+  "expected": {
+    "schema_version": 2,
+    "execution_id": "execution-golden",
+    "revision": 2,
+    "cursor": 2,
+    "detail_scope": "summary",
+    "authorization_revision": 7,
+    "redaction_revision": "sha256:golden",
+    "session_id": "session-golden",
+    "mission_id": "mission-golden",
+    "strategy": null,
+    "graph": {
+      "graph_id": "execution-golden",
+      "revision": 2,
+      "objective": "verify projection reducer",
+      "service_class": "interactive",
+      "parent_execution": null,
+      "nodes": [
+        {
+          "node_id": "node-a",
+          "kind": "tool_batch",
+          "status": "completed",
+          "executor_kind": "runtime",
+          "result_ref": "result:node-a",
+          "evidence_refs": [],
+          "usage": {
+            "model": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "duration_ms": 12,
+            "tool_calls": 1,
+            "duplicate_tool_calls": 0,
+            "runtime_write_attempt_paths": [],
+            "runtime_observed_resource_scopes": []
+          }
+        },
+        {
+          "node_id": "node-b",
+          "kind": "synthesize",
+          "status": "completed",
+          "executor_kind": "runtime",
+          "result_ref": "result:node-b",
+          "evidence_refs": [],
+          "usage": {
+            "model": null,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "duration_ms": 3,
+            "tool_calls": 0,
+            "duplicate_tool_calls": 0,
+            "runtime_write_attempt_paths": [],
+            "runtime_observed_resource_scopes": []
+          }
+        }
+      ],
+      "edges": [
+        {
+          "from": "node-a",
+          "to": "node-b",
+          "kind": "produces"
+        }
+      ],
+      "commit_cursor": 2,
+      "terminal_result_ref": "result:node-a"
+    },
+    "child_executions": [
+      {
+        "execution_id": "child-current",
+        "parent_execution_id": "execution-golden",
+        "parent_node_id": "node-b",
+        "revision": 2,
+        "cursor": 2,
+        "status": "completed",
+        "objective": "current child"
+      }
+    ],
+    "goals": [],
+    "agents": [],
+    "teams": [],
+    "relations": [],
+    "approvals": [],
+    "admissions": [
+      {
+        "id": "admission:request-node-a",
+        "kind": "admission",
+        "revision": 2,
+        "status": "materialized",
+        "summary": "resource.admission.granted",
+        "evidence_refs": ["execution-golden"],
+        "payload": {
+          "type": "admission",
+          "value": {
+            "request_id": "request-node-a",
+            "status": "materialized",
+            "requested_service_class": "interactive",
+            "resolved_service_class": "interactive",
+            "requested_priority": 7,
+            "deadline_at_ms": null,
+            "queue_age_ms": 8,
+            "wait_reason": null,
+            "blocker": null,
+            "resource_demands": ["provider_slot:1"],
+            "normalized_scope": "graph:execution-golden",
+            "accepted_at_ms": 20,
+            "policy_revision": 3,
+            "refs": ["execution_graph:execution-golden"]
+          }
+        }
+      }
+    ],
+    "outcomes": [
+      {
+        "id": "outcome:execution-golden",
+        "kind": "outcome",
+        "revision": 2,
+        "status": "completed",
+        "summary": "runtime.outcome.recorded.v1",
+        "evidence_refs": ["evidence:node-a"],
+        "payload": {
+          "type": "outcome",
+          "value": {
+            "execution_id": "execution-golden",
+            "session_id": "session-golden",
+            "turn_id": "turn-golden",
+            "task_id": null,
+            "mission_id": "mission-golden",
+            "agent_id": null,
+            "team_id": null,
+            "execution_graph_ref": "execution-golden",
+            "provider": "deepseek",
+            "model": "deepseek-pro",
+            "profile": "pro",
+            "protocol": "responses",
+            "config_revision": "config-3",
+            "strategy_revision": "strategy-2",
+            "terminal_class": "completed",
+            "duration_ms": 12,
+            "input_tokens": 40,
+            "output_tokens": 12,
+            "cached_tokens": 8,
+            "tool_calls": 1,
+            "duplicate_tool_calls": 0,
+            "retries": 0,
+            "quality": "unknown",
+            "evidence_completeness": "sufficient",
+            "freshness_ms": 2,
+            "evidence_refs": [
+              {
+                "ref_type": "tool",
+                "id": "node-a",
+                "source": "runtime",
+                "boundary": "observed",
+                "confidence_bp": null
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "interventions": [],
+    "usage": [],
+    "context": [],
+    "evidence": [
+      {
+        "id": "evidence-node-a",
+        "kind": "tool_outcome",
+        "revision": 2,
+        "status": "supported",
+        "summary": "tool result is durably supported",
+        "evidence_refs": ["evidence:node-a"],
+        "payload": {
+          "type": "evidence",
+          "value": {
+            "evidence_ref": {
+              "ref_type": "tool",
+              "id": "node-a",
+              "source": "runtime",
+              "boundary": "observed",
+              "confidence_bp": null
+            },
+            "support": "supported",
+            "completeness": "sufficient",
+            "freshness_ms": 2,
+            "projector_lag_commits": 0
+          }
+        }
+      }
+    ],
+    "health": [],
+    "recovery": [],
+    "live": null,
+    "available_commands": []
+  }
+}

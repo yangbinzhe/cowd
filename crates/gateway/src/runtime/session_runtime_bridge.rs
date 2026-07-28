@@ -171,7 +171,7 @@ fn session_input_record_from_runtime(
         next_attempt_at_ms: record.next_attempt_at_ms,
         claim_owner: record.claim_owner.clone(),
         claim_token: record.claim_token.clone(),
-        claim_fence_epoch: None,
+        claim_fence_epoch: record.claim_fence_epoch,
         claim_expires_at_ms: record.claim_expires_at_ms,
         failure_class,
         last_error: record.last_error.clone(),
@@ -1656,6 +1656,15 @@ async fn run_ingress_worker(
                         drop(lease);
                         break;
                     };
+                    tracing::debug!(
+                        request_id = %record.request_id,
+                        worker_id,
+                        status = ?record.status,
+                        revision = record.revision,
+                        attempts = record.attempts,
+                        claim_expires_at_ms = ?record.claim_expires_at_ms,
+                        "Session ingress worker claimed durable input"
+                    );
                     claimed_any = true;
                     let session_service = Arc::clone(&session_service);
                     let executor = executor.clone();
@@ -1852,6 +1861,13 @@ async fn process_claimed_session_input(
             return;
         }
     };
+    tracing::debug!(
+        request_id = %running.request_id,
+        worker_id,
+        revision = running.revision,
+        claim_expires_at_ms = ?running.claim_expires_at_ms,
+        "Session ingress claim entered running state"
+    );
 
     if matches!(
         record.decision,
@@ -1998,6 +2014,13 @@ async fn execute_primary_ingress_with_lease(
     };
     match outcome {
         Some(Ok(executed)) => {
+            tracing::debug!(
+                request_id = %record.request_id,
+                worker_id,
+                revision,
+                commit_cursor = executed.commit_cursor,
+                "Session Runtime execution returned to ingress worker"
+            );
             let already_settled = session_service
                 .ingress_completed_at(&record.request_id, executed.commit_cursor)
                 .await
@@ -2025,6 +2048,13 @@ async fn execute_primary_ingress_with_lease(
             }
         }
         Some(Err(error)) => {
+            tracing::warn!(
+                request_id = %record.request_id,
+                worker_id,
+                revision,
+                %error,
+                "Session Runtime execution failed before durable ingress acknowledgement"
+            );
             record_ingress_failure(
                 session_service,
                 worker_id,

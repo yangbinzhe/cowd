@@ -167,6 +167,7 @@ impl ExecutionProjectionReducerController {
         gateway_client: GatewayApiClient,
         execution_id: String,
         initial_cursor: u64,
+        initial_revision: u64,
         generation: u64,
         event_tx: CowdEventSender,
     ) {
@@ -183,6 +184,7 @@ impl ExecutionProjectionReducerController {
             gateway_client,
             execution_id.clone(),
             initial_cursor,
+            initial_revision,
             generation,
             event_tx,
         ) {
@@ -204,6 +206,13 @@ impl ExecutionProjectionReducerController {
         self.selected
             .as_ref()
             .map(|selected| selected.execution_id.clone())
+    }
+
+    fn selected_generation(&self, execution_id: &str) -> Option<u64> {
+        self.selected
+            .as_ref()
+            .filter(|selected| selected.execution_id == execution_id)
+            .map(|selected| selected.generation)
     }
 
     /// Coalesce every canonical snapshot request for one selected execution.
@@ -252,6 +261,10 @@ impl ExecutionProjectionReducerController {
             return crate::protocol::ProjectionDeltaApply::ResyncRequired;
         }
         self.reducer.apply_delta(delta)
+    }
+
+    fn materialized_projection(&self) -> Option<&crate::protocol::ExecutionProjection> {
+        self.reducer.projection()
     }
 
     fn clear_selection_if(&mut self, generation: u64, execution_id: &str) {
@@ -1175,11 +1188,13 @@ fn attach_gateway_session(
                     {
                         Ok(projection) => {
                             let cursor = projection.cursor;
+                            let revision = projection.revision;
                             state.apply_execution_projection(projection);
                             execution_projection_source.switch(
                                 gateway_client.clone(),
                                 execution_id,
                                 cursor,
+                                revision,
                                 generation,
                                 event_tx.clone(),
                             );
@@ -2146,11 +2161,13 @@ fn commit_prepared_session_switch(
         {
             if let Some(projection) = execution_projection {
                 let cursor = projection.cursor;
+                let revision = projection.revision;
                 state.apply_execution_projection(projection);
                 execution_projection_source.switch(
                     gateway_client.clone(),
                     execution_id,
                     cursor,
+                    revision,
                     projection_generation,
                     event_tx.clone(),
                 );
@@ -3000,17 +3017,25 @@ async fn drain_cowd_events_state(
         if let CowdEvent::ExecutionProjectionDelta { generation, delta } = &event {
             if execution_projection_source.accepts(*generation, &delta.execution_id) {
                 let apply = execution_projection_source.apply_delta(*generation, delta);
-                // ProjectionEvent carries a safe event entity, not a complete
-                // graph/strategy/command patch. A legacy Gateway delta thus
-                // advances the persistent cursor guard but coalesces exactly
-                // one canonical refresh. Current Gateways send canonical
-                // snapshots on the same SSE connection and never enter this
-                // compatibility path.
-                let needs_snapshot = !delta.events.is_empty()
-                    || matches!(apply, crate::protocol::ProjectionDeltaApply::ResyncRequired);
-                if needs_snapshot
-                    && execution_projection_source
-                        .begin_snapshot_request(*generation, &delta.execution_id)
+                tracing::debug!(
+                    generation,
+                    execution_id = %delta.execution_id,
+                    from_revision = delta.from_revision,
+                    target_revision = delta.target_revision,
+                    base_cursor = delta.base_cursor,
+                    target_cursor = delta.target_cursor,
+                    result = ?apply,
+                    "TUI applied canonical execution projection delta"
+                );
+                if matches!(apply, crate::protocol::ProjectionDeltaApply::Applied) {
+                    if let Some(projection) = execution_projection_source
+                        .materialized_projection()
+                        .cloned()
+                    {
+                        state.apply_execution_projection(projection);
+                    }
+                } else if execution_projection_source
+                    .begin_snapshot_request(*generation, &delta.execution_id)
                 {
                     spawn_execution_projection_refresh(
                         gateway_client.clone(),
@@ -3029,6 +3054,13 @@ async fn drain_cowd_events_state(
         if let CowdEvent::ExecutionProjectionLive { generation, update } = &event {
             if execution_projection_source.accepts(*generation, &update.execution_id) {
                 state.apply_execution_live_update(update.clone());
+                tracing::debug!(
+                    generation,
+                    execution_id = %update.execution_id,
+                    live_revision = update.live.revision,
+                    status = ?update.live.status,
+                    "TUI applied canonical execution live update"
+                );
             }
             count += 1;
             if count >= limit {
@@ -3091,8 +3123,22 @@ async fn drain_cowd_events_state(
             let execution_id = projection.execution_id.clone();
             if execution_projection_source.accepts(*generation, &execution_id) {
                 execution_projection_source.finish_snapshot_request(*generation, &execution_id);
+                let install = execution_projection_source.install_snapshot(*generation, projection);
+                tracing::debug!(
+                    generation,
+                    execution_id = %execution_id,
+                    revision = projection.revision,
+                    cursor = projection.cursor,
+                    live_revision = projection.live.as_ref().map(|live| live.revision),
+                    live_status = ?projection.live.as_ref().map(|live| live.status),
+                    input_source = projection.live.as_ref()
+                        .and_then(|live| live.context_usage.as_ref())
+                        .and_then(|usage| usage.input_source.as_deref()),
+                    result = ?install,
+                    "TUI installed canonical execution projection snapshot"
+                );
                 if matches!(
-                    execution_projection_source.install_snapshot(*generation, projection),
+                    install,
                     crate::protocol::ProjectionDeltaApply::ResyncRequired
                 ) {
                     state.add_system_notice(
@@ -3110,6 +3156,7 @@ async fn drain_cowd_events_state(
                     gateway_client.clone(),
                     execution_id,
                     projection.cursor,
+                    projection.revision,
                     *generation,
                     event_tx.clone(),
                 );
@@ -3121,6 +3168,12 @@ async fn drain_cowd_events_state(
             continue;
         }
         let mut materialization = None;
+        let terminal_execution_id = match &event {
+            CowdEvent::GatewaySession {
+                event: crate::protocol::GatewaySessionEvent::TerminalCommitted { correlation, .. },
+            } => correlation.execution_id.clone(),
+            _ => None,
+        };
         if let Some(next_execution_id) = execution_id.as_deref() {
             let previous_execution_id = execution_projection_source
                 .selected_execution_id()
@@ -3133,6 +3186,11 @@ async fn drain_cowd_events_state(
                 });
             if let Some(generation) = execution_projection_source.begin_selection(next_execution_id)
             {
+                tracing::debug!(
+                    generation,
+                    execution_id = %next_execution_id,
+                    "TUI selected canonical execution projection"
+                );
                 state.app.projection_connection_state =
                     Some(crate::protocol::SessionStreamConnectionState::Connecting);
                 if let Some(previous_execution_id) = previous_execution_id
@@ -3150,6 +3208,19 @@ async fn drain_cowd_events_state(
         if let Some((execution_id, generation)) = materialization {
             if execution_projection_source.begin_snapshot_request(generation, &execution_id) {
                 spawn_execution_projection_materialization(
+                    gateway_client.clone(),
+                    execution_id,
+                    generation,
+                    event_tx.clone(),
+                );
+            }
+        }
+        if let Some(execution_id) = terminal_execution_id {
+            let generation = execution_projection_source
+                .selected_generation(&execution_id)
+                .or_else(|| execution_projection_source.begin_selection(&execution_id));
+            if let Some(generation) = generation {
+                spawn_execution_projection_terminal_convergence(
                     gateway_client.clone(),
                     execution_id,
                     generation,
@@ -3311,6 +3382,76 @@ fn spawn_execution_projection_materialization(
     });
 }
 
+/// A durable terminal closes the Session stream before independently
+/// delivered execution-projection updates are guaranteed to reach a Surface.
+/// Reconcile one canonical terminal snapshot so exact provider/context facts
+/// cannot remain stuck behind an earlier request-budget estimate.
+fn spawn_execution_projection_terminal_convergence(
+    gateway_client: GatewayApiClient,
+    execution_id: String,
+    generation: u64,
+    event_tx: CowdEventSender,
+) {
+    let Some(runtime) = shared_rt() else {
+        let _ = event_tx.send(CowdEvent::ExecutionProjectionRefreshFailed {
+            generation,
+            execution_id,
+            message: "Terminal execution projection convergence is unavailable because the TUI async runtime is not running"
+                .to_string(),
+        });
+        return;
+    };
+    runtime.spawn(async move {
+        let mut last_error = None;
+        for attempt in 0..=EXECUTION_PROJECTION_MATERIALIZATION_DELAYS.len() {
+            if attempt > 0 {
+                tokio::time::sleep(EXECUTION_PROJECTION_MATERIALIZATION_DELAYS[attempt - 1]).await;
+            }
+            match gateway_client.execution_projection(&execution_id, true).await {
+                Ok(projection)
+                    if projection
+                        .live
+                        .as_ref()
+                        .is_some_and(|live| live.status.is_terminal()) =>
+                {
+                    let _ = event_tx.send(CowdEvent::ExecutionProjectionLoaded {
+                        generation,
+                        projection,
+                    });
+                    return;
+                }
+                Ok(projection) => {
+                    last_error = Some(format!(
+                        "projection is not terminal yet (revision={}, cursor={}, live={:?})",
+                        projection.revision,
+                        projection.cursor,
+                        projection.live.as_ref().map(|live| live.status)
+                    ));
+                }
+                Err(error) if projection_access_or_contract_error(&error) => {
+                    let _ = event_tx.send(CowdEvent::ExecutionProjectionAccessRevoked {
+                        generation,
+                        execution_id,
+                        message: format!(
+                            "Terminal execution projection authority changed while converging: {error}"
+                        ),
+                    });
+                    return;
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+        }
+        let _ = event_tx.send(CowdEvent::ExecutionProjectionRefreshFailed {
+            generation,
+            execution_id,
+            message: format!(
+                "Canonical execution projection did not converge after durable terminal: {}",
+                last_error.unwrap_or_else(|| "unknown error".to_string())
+            ),
+        });
+    });
+}
+
 /// Fetch the latest canonical projection outside the render/event drain.
 /// Snapshot refreshes are coalesced by `ExecutionProjectionReducerController`,
 /// so high-rate graph deltas cannot create an HTTP fan-out or block keystrokes.
@@ -3361,6 +3502,7 @@ fn spawn_execution_projection_source(
     gateway_client: GatewayApiClient,
     execution_id: String,
     initial_cursor: u64,
+    initial_revision: u64,
     generation: u64,
     event_tx: CowdEventSender,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -3373,6 +3515,7 @@ fn spawn_execution_projection_source(
     };
     Some(runtime.spawn(async move {
         let mut cursor = initial_cursor;
+        let mut revision = initial_revision;
         let mut retry_delay = Duration::from_millis(250);
         let mut reconnect_attempts = 0_u64;
         let _ = event_tx.send(CowdEvent::ExecutionProjectionConnection {
@@ -3387,14 +3530,16 @@ fn spawn_execution_projection_source(
                 .consume_execution_live_source(
                     &execution_id,
                     cursor,
+                    revision,
                     true,
                     generation,
                     event_tx.clone(),
                 )
                 .await
             {
-                Ok(next_cursor) => {
+                Ok((next_cursor, next_revision)) => {
                     cursor = cursor.max(next_cursor);
+                    revision = revision.max(next_revision);
                     if cursor > cursor_before_attempt {
                         reconnect_attempts = 0;
                         retry_delay = Duration::from_millis(250);
@@ -3888,10 +4033,13 @@ mod tests {
         tx.send(CowdEvent::ExecutionProjectionLoaded {
             generation: old_generation,
             projection: ExecutionProjection {
-                schema_version: 1,
+                schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
                 execution_id: "execution-old".to_string(),
                 revision: 9,
                 cursor: 9,
+                detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
+                authorization_revision: 1,
+                redaction_revision: "redaction-1".to_string(),
                 session_id: Some("session-rest-generation".to_string()),
                 mission_id: None,
                 strategy: None,
@@ -3902,6 +4050,8 @@ mod tests {
                 teams: Vec::new(),
                 relations: Vec::new(),
                 approvals: Vec::new(),
+                admissions: Vec::new(),
+                outcomes: Vec::new(),
                 interventions: Vec::new(),
                 usage: Vec::new(),
                 context: Vec::new(),
