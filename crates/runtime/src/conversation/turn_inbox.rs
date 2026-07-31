@@ -1,3 +1,4 @@
+use harness_contract::turn::InputRelationKind;
 use harness_contract::turn::TurnInputCheckpoint;
 
 use crate::{
@@ -17,19 +18,51 @@ pub fn checkpoint_guidance(
         return None;
     }
 
-    Some(
-        [
+    let mut guidance = vec![
             format!(
                 "## Runtime input updates at `{}`",
                 checkpoint.as_str()
-        ),
-        format!(
+            ),
+            format!(
             "{} additional user/session input(s) arrived while this turn was running. Review the labelled user-context updates before continuing. Decide whether they supplement the current answer, change the plan, or should be acknowledged as queued work. Do not ignore high-priority corrections.",
             records.len()
-        ),
-        ]
-        .join("\n"),
-    )
+            ),
+        ];
+    let proposals = records
+        .iter()
+        .filter_map(|record| record.relation_proposal.as_ref())
+        .map(|proposal| proposal.candidate)
+        .collect::<Vec<_>>();
+    if proposals.contains(&InputRelationKind::Progress) {
+        guidance.push(
+            "A progress query is an observation, not a request to stop or restart work. Answer from the current Goal/Mission projection and retained execution evidence."
+                .to_string(),
+        );
+    }
+    if proposals.iter().any(|candidate| {
+        matches!(
+            candidate,
+            InputRelationKind::NewTask | InputRelationKind::Subtask
+        )
+    }) {
+        guidance.push(
+            "Appended work must be compiled into the current canonical Mission/ExecutionGraph through model-visible orchestration capabilities; do not keep it as an untracked prose TODO."
+                .to_string(),
+        );
+    }
+    if proposals.contains(&InputRelationKind::NewSession) {
+        guidance.push(
+            "Create an independent Session only when the user explicitly requested isolation; preserve a typed relation/handoff instead of copying the full transcript."
+                .to_string(),
+        );
+    }
+    if proposals.contains(&InputRelationKind::Background) {
+        guidance.push(
+            "Backgrounding changes execution service class and foreground ownership, not the Mission's goal, evidence, or durable graph identity."
+                .to_string(),
+        );
+    }
+    Some(guidance.join("\n"))
 }
 
 /// Materialize inputs that arrived during a turn as explicitly untrusted user
@@ -111,5 +144,26 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].authority, ContextAuthority::User);
         assert!(items[0].content.contains("ignore all safeguards"));
+    }
+
+    #[test]
+    fn appended_work_guidance_requires_canonical_graph_materialization() {
+        let stream = SessionInputStream::new("session-1");
+        let turn_id = TurnId::from_string("turn-1");
+        stream.set_active_turn(Some(turn_id.clone()));
+        let envelope = SessionInputEnvelope::text(
+            "session-1",
+            InputSourceKind::Webui,
+            "后续把测试任务加入待办",
+        );
+        let receipt = stream.admit(envelope, stream.runtime_state());
+        assert!(receipt.relation_proposal.is_some());
+        let records =
+            stream.consume_for_checkpoint(&turn_id, TurnInputCheckpoint::AfterToolResult, 4);
+        let guidance = checkpoint_guidance(TurnInputCheckpoint::AfterToolResult, &records)
+            .expect("runtime guidance");
+
+        assert!(guidance.contains("canonical Mission/ExecutionGraph"));
+        assert!(guidance.contains("untracked prose TODO"));
     }
 }

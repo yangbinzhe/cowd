@@ -21,10 +21,11 @@ use harness_contract::{
         SessionExecutionIndexProjection,
     },
     turn::{
-        InputPayloadKind, InputRoutingDecision, InputRoutingReason, InputSourceKind,
-        SessionInputEnvelope, SessionInputId, SessionInputProjection, SessionInputReceipt,
-        SessionInputStatus, TurnEvent, TurnId, TurnInboxSnapshot, TurnInput, TurnJournalEnvelope,
-        TurnJournalPhase, TurnReceipt, TurnStatus,
+        InputPayloadKind, InputRelationKind, InputRelationProposal, InputRoutingDecision,
+        InputRoutingReason, InputSourceKind, SessionInputEnvelope, SessionInputId,
+        SessionInputProjection, SessionInputReceipt, SessionInputStatus, TurnEvent, TurnId,
+        TurnInboxSnapshot, TurnInput, TurnJournalEnvelope, TurnJournalPhase, TurnReceipt,
+        TurnStatus,
     },
 };
 use session::SessionLeaseRegistry;
@@ -723,6 +724,37 @@ impl RuntimeService {
         self.runtime_services.session_execution_index(session_id)
     }
 
+    /// Build a bounded, read-only response for control-plane inputs that can
+    /// be answered without waiting for the active Provider step. The durable
+    /// Session input still owns receipt and ordering; this projection is only
+    /// an immediate Surface view over canonical Mission/Execution state.
+    pub(crate) fn responsive_input_projection(
+        &self,
+        session_id: &str,
+        proposal: Option<&InputRelationProposal>,
+    ) -> Option<serde_json::Value> {
+        let proposal = proposal?;
+        if proposal.candidate != InputRelationKind::Progress {
+            return None;
+        }
+        let mission_port = runtime::MissionRuntimePort::new(self.runtime_services());
+        if mission_port.ensure_default_mission().is_err() {
+            return None;
+        }
+        let mission = mission_port.projection();
+        let execution = self.session_execution_index(session_id);
+        Some(serde_json::json!({
+            "kind": "session_input.progress",
+            "session_id": session_id,
+            "mission": mission.aggregate,
+            "execution": execution,
+            "teams": mission.team_projection,
+            "agents": mission.agent_projection,
+            "approvals": mission.approval_projection,
+            "health": mission.health_projection,
+        }))
+    }
+
     pub(crate) fn running_session_execution_indices(&self) -> Vec<SessionExecutionIndexProjection> {
         self.runtime_services.running_session_execution_indices()
     }
@@ -1076,6 +1108,12 @@ impl RuntimeService {
         content: String,
         status: SessionInputStatus,
     ) -> Result<(), RuntimeTurnExecutionError> {
+        let relation_proposal = record
+            .classification_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| value.get("relation_proposal").cloned())
+            .and_then(|value| serde_json::from_value::<InputRelationProposal>(value).ok());
         let active_turn_id = record
             .target_turn_id
             .as_ref()
@@ -1097,6 +1135,7 @@ impl RuntimeService {
             metadata: serde_json::json!({
                 "durable_request_id": record.request_id,
                 "session_generation": record.session_generation,
+                "relation_proposal": relation_proposal.clone(),
             }),
             created_at,
         };
@@ -1105,7 +1144,7 @@ impl RuntimeService {
             session_id: record.session_id.clone(),
             status,
             decision: record.decision,
-            relation_proposal: None,
+            relation_proposal,
             reason: Some(InputRoutingReason::new(
                 "durable_delivery",
                 "input delivered from the durable Session queue",
@@ -1113,6 +1152,10 @@ impl RuntimeService {
             )),
             active_turn_id,
             evidence_refs: vec![format!("session-input:{}", record.input_id)],
+            cursor: Some(harness_contract::turn::SessionInputCursor::new(
+                record.session_generation,
+                u64::try_from(record.sequence).unwrap_or(u64::MAX),
+            )),
             created_at,
         };
         self.project_durable_session_input(envelope, receipt).await
@@ -4189,6 +4232,7 @@ mod tests {
                     created_at_ms: claim_at,
                 }],
                 runtime_commit_cursor: terminal_receipt.commit_cursor,
+                consumed_input_sequence: record.sequence,
                 created_at_ms: claim_at,
                 fence: session::SessionTerminalExecutionFence {
                     request_id: record.request_id.clone(),
@@ -4676,6 +4720,7 @@ mod tests {
             )),
             active_turn_id: Some(turn_id.clone()),
             evidence_refs: Vec::new(),
+            cursor: Some(harness_contract::turn::SessionInputCursor::new(1, 2)),
             created_at: envelope.created_at,
         };
         stream.project_durable(envelope, receipt);
@@ -5268,5 +5313,105 @@ mod tests {
             .session_execution_index("session-supplement")
             .active_execution_ids
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_supplement_preserves_relation_proposal_for_runtime_policy() {
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        let turn_id = TurnId::from_string("turn-active");
+        let stream = runtime::SessionInputStream::new("session-supplement");
+        stream.set_active_turn(Some(turn_id.clone()));
+        service
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("session-supplement".to_string(), stream);
+        let record = session::SessionRuntimeOutboxRecord {
+            input_id: "input-supplement".to_string(),
+            request_id: "request-supplement".to_string(),
+            turn_id: "turn-carrier".to_string(),
+            message_id: "message-supplement".to_string(),
+            session_id: "session-supplement".to_string(),
+            sequence: 2,
+            session_generation: 1,
+            decision: InputRoutingDecision::SupplementCurrentTurn,
+            target_turn_id: Some(turn_id.to_string()),
+            classification_json: Some(
+                serde_json::json!({
+                    "relation_proposal": {
+                        "candidate": "new_task",
+                        "confidence_basis_points": 9000,
+                        "reasons": ["explicit_test"]
+                    }
+                })
+                .to_string(),
+            ),
+            status: session::SessionRuntimeInputStatus::Running,
+            runtime_commit_cursor: None,
+            attempts: 1,
+            next_attempt_at_ms: 0,
+            claim_owner: Some("worker".to_string()),
+            claim_token: Some("claim".to_string()),
+            claim_fence_epoch: Some(1),
+            claim_expires_at_ms: Some(10_000),
+            failure_class: None,
+            last_error: None,
+            revision: 2,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+            terminal_at_ms: None,
+            runtime_options_json: None,
+        };
+
+        service
+            .deliver_durable_session_input_view(
+                &record,
+                "append this work".to_string(),
+                SessionInputStatus::AttachedToTurn,
+            )
+            .await
+            .expect("durable supplement projected");
+
+        let record = service
+            .session_inputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("session-supplement")
+            .and_then(|stream| {
+                stream.record_snapshot(&SessionInputId::from_string("input-supplement"))
+            })
+            .expect("projected record");
+        assert_eq!(
+            record
+                .relation_proposal
+                .expect("relation proposal")
+                .candidate,
+            InputRelationKind::NewTask
+        );
+        assert_eq!(
+            record.cursor,
+            Some(harness_contract::turn::SessionInputCursor::new(1, 2))
+        );
+    }
+
+    #[test]
+    fn progress_input_materializes_bounded_mission_projection_without_provider_wait() {
+        let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
+        let projection = service
+            .responsive_input_projection(
+                "session-progress",
+                Some(&InputRelationProposal {
+                    candidate: InputRelationKind::Progress,
+                    confidence_basis_points: 9_000,
+                    reasons: vec!["progress_query".to_string()],
+                    target_ref: None,
+                }),
+            )
+            .expect("progress projection");
+
+        assert_eq!(projection["kind"], "session_input.progress");
+        assert_eq!(projection["session_id"], "session-progress");
+        assert!(projection["mission"].is_object());
+        assert!(projection["execution"]["executions"].is_array());
     }
 }

@@ -115,6 +115,39 @@ pub fn propose_input_relation(envelope: &SessionInputEnvelope) -> Option<InputRe
     let (candidate, confidence, reason) = if contains_any(
         &normalized,
         &[
+            "/progress",
+            "progress?",
+            "what is the progress",
+            "what's the progress",
+            "当前进度",
+            "现在进度",
+            "进展如何",
+            "进度怎么样",
+            "做到哪了",
+            "做到哪里",
+        ],
+    ) {
+        (InputRelationKind::Progress, 9_000, "progress_query")
+    } else if contains_any(
+        &normalized,
+        &[
+            "/background",
+            "continue in background",
+            "run in background",
+            "后台继续",
+            "转到后台",
+            "后台运行",
+            "后台执行",
+        ],
+    ) {
+        (
+            InputRelationKind::Background,
+            8_900,
+            "background_execution_request",
+        )
+    } else if contains_any(
+        &normalized,
+        &[
             "@session",
             "cross-session",
             "跨session",
@@ -260,5 +293,26 @@ mod tests {
         assert_eq!(decision, InputRoutingDecision::SupplementCurrentTurn);
         assert_eq!(reason.code, "active_turn_supplement");
         assert_eq!(proposal.candidate, InputRelationKind::NewSession);
+    }
+
+    #[test]
+    fn progress_and_background_are_typed_relation_proposals() {
+        let progress =
+            SessionInputEnvelope::text("s1", InputSourceKind::Surface, "现在进度怎么样？");
+        let background =
+            SessionInputEnvelope::text("s1", InputSourceKind::Surface, "转到后台继续执行");
+
+        assert_eq!(
+            propose_input_relation(&progress)
+                .expect("progress proposal")
+                .candidate,
+            InputRelationKind::Progress
+        );
+        assert_eq!(
+            propose_input_relation(&background)
+                .expect("background proposal")
+                .candidate,
+            InputRelationKind::Background
+        );
     }
 }

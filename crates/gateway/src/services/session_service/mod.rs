@@ -24,8 +24,9 @@ use crate::runtime_service::RuntimeService;
 use chrono::{DateTime, Utc};
 use harness_contract::turn::{
     InputPayloadKind, InputRelationProposal, InputRoutingDecision, InputRoutingReason,
-    InputSourceKind, SessionInputEnvelope, SessionInputId, SessionInputProjection,
-    SessionInputReceipt, SessionInputStatus, TurnId, TurnInboxItem, TurnInboxSnapshot,
+    InputSourceKind, SessionInputCursor, SessionInputEnvelope, SessionInputId,
+    SessionInputProjection, SessionInputReceipt, SessionInputStatus, TurnId, TurnInboxItem,
+    TurnInboxSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use session::{
@@ -1306,7 +1307,7 @@ impl SessionService {
         };
         let classification = DurableInputClassification {
             reason,
-            relation_proposal,
+            relation_proposal: relation_proposal.clone(),
             source_kind: envelope.source_kind,
             payload_kind: envelope.payload_kind,
             content_preview: envelope.content_preview.clone(),
@@ -1369,10 +1370,12 @@ impl SessionService {
         let (execution_graph_id, projection_turn_id, _supplemental) = runtime
             .publish_user_message_committed(&record, &envelope.content)
             .await;
+        let materialized =
+            runtime.responsive_input_projection(&record.session_id, relation_proposal.as_ref());
         Ok(crate::runtime_service::SessionInputAdmission {
             execution_graph_id,
             receipt,
-            materialized: None,
+            materialized,
             terminal_id: format!("turn-terminal:{}", record.request_id),
             turn_id: projection_turn_id,
             message_id: record.message_id,
@@ -1432,11 +1435,19 @@ impl SessionService {
             .iter()
             .filter(|item| item.status == SessionInputStatus::Consumed)
             .count();
+        let admitted_cursor = items.iter().filter_map(|item| item.cursor).max();
+        let consumed_cursor = items
+            .iter()
+            .filter(|item| item.consumed_at.is_some())
+            .filter_map(|item| item.cursor)
+            .max();
         Ok(TurnInboxSnapshot {
             session_id: session_id.to_string(),
             turn_id: selected_turn_id,
             pending_count: items.len().saturating_sub(consumed_count),
             consumed_count,
+            admitted_cursor,
+            consumed_cursor,
             items,
             updated_at: Utc::now(),
         })
@@ -2539,6 +2550,10 @@ fn receipt_from_durable_input(record: &SessionRuntimeOutboxRecord) -> SessionInp
             .as_ref()
             .map(|turn_id| TurnId::from_string(turn_id.clone())),
         evidence_refs: vec![format!("session-input:{}", record.input_id)],
+        cursor: Some(SessionInputCursor::new(
+            record.session_generation,
+            u64::try_from(record.sequence).unwrap_or(u64::MAX),
+        )),
         created_at: classification.map_or_else(
             || created_at_from_millis(record.created_at_ms),
             |item| item.created_at,
@@ -2565,6 +2580,10 @@ fn inbox_item_from_durable_input(record: &SessionRuntimeOutboxRecord) -> TurnInb
             |item| item.created_at,
         ),
         consumed_at: record.terminal_at_ms.map(created_at_from_millis),
+        cursor: Some(SessionInputCursor::new(
+            record.session_generation,
+            u64::try_from(record.sequence).unwrap_or(u64::MAX),
+        )),
     }
 }
 
@@ -2590,6 +2609,12 @@ fn projection_from_durable_inputs(
         .iter()
         .filter(|item| item.status == SessionInputStatus::QueuedNext)
         .count();
+    let admitted_cursor = inputs.iter().filter_map(|item| item.cursor).max();
+    let consumed_cursor = inputs
+        .iter()
+        .filter(|item| item.consumed_at.is_some())
+        .filter_map(|item| item.cursor)
+        .max();
     SessionInputProjection {
         session_id: session_id.to_string(),
         active_turn_id,
@@ -2597,6 +2622,8 @@ fn projection_from_durable_inputs(
         pending_count,
         queued_next_count,
         consumed_count,
+        admitted_cursor,
+        consumed_cursor,
         last_decision: records.last().map(|record| record.decision),
         inputs,
         updated_at: Utc::now(),

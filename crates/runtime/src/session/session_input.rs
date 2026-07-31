@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use harness_contract::turn::{
-    InputRelationProposal, InputRoutingDecision, InputRoutingReason, SessionInputEnvelope,
-    SessionInputId, SessionInputProjection, SessionInputReceipt, SessionInputStatus, TurnId,
-    TurnInboxItem, TurnInboxSnapshot, TurnInputCheckpoint,
+    InputRelationProposal, InputRoutingDecision, InputRoutingReason, SessionInputCursor,
+    SessionInputEnvelope, SessionInputId, SessionInputProjection, SessionInputReceipt,
+    SessionInputStatus, TurnId, TurnInboxItem, TurnInboxSnapshot, TurnInputCheckpoint,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,7 @@ pub struct SessionInputRecord {
     pub evidence_refs: Vec<String>,
     pub checkpoint: Option<TurnInputCheckpoint>,
     pub consumed_at: Option<DateTime<Utc>>,
+    pub cursor: Option<SessionInputCursor>,
     /// The user request that directly owns a durable ingress graph. It is
     /// already supplied to `submit_ingress_turn`, so checkpoint consumers must
     /// not inject its content into the provider prompt a second time.
@@ -41,6 +42,7 @@ impl SessionInputRecord {
             reason: Some(self.reason.clone()),
             active_turn_id: self.active_turn_id.clone(),
             evidence_refs: self.evidence_refs.clone(),
+            cursor: self.cursor,
             created_at: self.envelope.created_at,
         }
     }
@@ -57,6 +59,7 @@ impl SessionInputRecord {
             checkpoint: self.checkpoint,
             created_at: self.envelope.created_at,
             consumed_at: self.consumed_at,
+            cursor: self.cursor,
         }
     }
 }
@@ -181,6 +184,7 @@ impl SessionInputStream {
                 )),
                 active_turn_id: inner.active_turn_id.clone(),
                 evidence_refs: vec![format!("session-input:duplicate:{}", existing.as_str())],
+                cursor: None,
                 created_at: now,
             };
         }
@@ -207,6 +211,7 @@ impl SessionInputStream {
             reason: Some(reason.clone()),
             active_turn_id: active_turn_id.clone(),
             evidence_refs: evidence_refs.clone(),
+            cursor: None,
             created_at: now,
         };
         inner
@@ -222,6 +227,7 @@ impl SessionInputStream {
             evidence_refs,
             checkpoint: None,
             consumed_at: None,
+            cursor: None,
             primary_ingress: false,
         });
         receipt
@@ -256,6 +262,7 @@ impl SessionInputStream {
             record.relation_proposal = receipt.relation_proposal.clone();
             record.active_turn_id = receipt.active_turn_id.clone();
             record.evidence_refs = receipt.evidence_refs.clone();
+            record.cursor = receipt.cursor;
             return receipt;
         }
 
@@ -278,6 +285,7 @@ impl SessionInputStream {
             evidence_refs: receipt.evidence_refs.clone(),
             checkpoint: None,
             consumed_at: None,
+            cursor: receipt.cursor,
             primary_ingress: false,
         });
         receipt
@@ -307,6 +315,7 @@ impl SessionInputStream {
         record.relation_proposal = receipt.relation_proposal.clone();
         record.active_turn_id = receipt.active_turn_id.clone();
         record.evidence_refs = receipt.evidence_refs.clone();
+        record.cursor = receipt.cursor;
         true
     }
 
@@ -632,6 +641,13 @@ impl SessionInputStream {
             pending_count,
             queued_next_count,
             consumed_count,
+            admitted_cursor: highest_cursor(inner.records.iter()),
+            consumed_cursor: highest_cursor(
+                inner
+                    .records
+                    .iter()
+                    .filter(|record| record.consumed_at.is_some()),
+            ),
             last_decision: inner.records.last().map(|record| record.decision),
             inputs: inner
                 .records
@@ -674,6 +690,13 @@ impl SessionInputStream {
             turn_id: selected_turn_id,
             pending_count,
             consumed_count,
+            admitted_cursor: highest_cursor(inner.records.iter()),
+            consumed_cursor: highest_cursor(
+                inner
+                    .records
+                    .iter()
+                    .filter(|record| record.consumed_at.is_some()),
+            ),
             items,
             updated_at: Utc::now(),
         }
@@ -689,6 +712,27 @@ impl SessionInputStream {
             .find(|record| &record.envelope.input_id == input_id)
             .cloned()
     }
+
+    #[must_use]
+    pub fn highest_consumed_cursor(&self, turn_id: &TurnId) -> Option<SessionInputCursor> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        highest_cursor(inner.records.iter().filter(|record| {
+            record.consumed_at.is_some()
+                && record
+                    .active_turn_id
+                    .as_ref()
+                    .is_some_and(|active| active == turn_id)
+        }))
+    }
+}
+
+fn highest_cursor<'a>(
+    records: impl IntoIterator<Item = &'a SessionInputRecord>,
+) -> Option<SessionInputCursor> {
+    records.into_iter().filter_map(|record| record.cursor).max()
 }
 
 fn status_for_decision(decision: InputRoutingDecision) -> SessionInputStatus {
@@ -861,6 +905,35 @@ mod tests {
         );
         assert_eq!(consumed.len(), 1);
         assert_eq!(stream.projection().consumed_count, 1);
+    }
+
+    #[test]
+    fn durable_cursor_advances_only_when_checkpoint_consumes_input() {
+        let stream = SessionInputStream::new("s1");
+        let turn_id = TurnId::from_string("turn-1");
+        stream.set_active_turn(Some(turn_id.clone()));
+        let envelope =
+            SessionInputEnvelope::text("s1", InputSourceKind::Webui, "durable supplement");
+        let mut receipt =
+            stream.admit(envelope.clone(), RuntimeInputState::active(turn_id.clone()));
+        receipt.cursor = Some(SessionInputCursor::new(7, 42));
+        stream.project_durable(envelope, receipt);
+
+        let before = stream.projection();
+        assert_eq!(before.admitted_cursor, Some(SessionInputCursor::new(7, 42)));
+        assert_eq!(before.consumed_cursor, None);
+
+        let consumed =
+            stream.consume_for_checkpoint(&turn_id, TurnInputCheckpoint::AfterProviderResponse, 4);
+        assert_eq!(consumed.len(), 1);
+        assert_eq!(
+            stream.highest_consumed_cursor(&turn_id),
+            Some(SessionInputCursor::new(7, 42))
+        );
+        assert_eq!(
+            stream.projection().consumed_cursor,
+            Some(SessionInputCursor::new(7, 42))
+        );
     }
 
     #[test]

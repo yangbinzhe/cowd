@@ -2769,6 +2769,115 @@ impl PostgresSessionStore {
                 current.revision
             )));
         }
+        let newest_pending_sequence = transaction
+            .query_one(
+                "SELECT MAX(sequence)
+                   FROM session_runtime_outbox
+                  WHERE session_id=$1 AND session_generation=$2
+                    AND sequence>$3
+                    AND status NOT IN (
+                      'rejected_duplicate','rejected_policy','completed',
+                      'supplemented','failed','cancelled','expired'
+                    )",
+                &[
+                    &request.session_id,
+                    &to_u64_i64(request.fence.session_generation, "session generation")?,
+                    &to_i64(request.fence.input_sequence, "input sequence")?,
+                ],
+            )
+            .map_err(postgres_error)?
+            .try_get::<_, Option<i64>>(0)
+            .map_err(postgres_error)?
+            .map(|value| value.max(0) as usize);
+        if newest_pending_sequence
+            .is_some_and(|sequence| sequence > request.consumed_input_sequence)
+        {
+            return Err(session::SessionError::StaleExecutionFence(format!(
+                "terminal input cursor {} is behind pending Session input {}",
+                request.consumed_input_sequence,
+                newest_pending_sequence.unwrap_or_default()
+            )));
+        }
+        let consumed_rows = transaction
+            .query(
+                "SELECT request_id
+                   FROM session_runtime_outbox
+                  WHERE session_id=$1 AND session_generation=$2
+                    AND sequence>$3 AND sequence<=$4
+                    AND status IN ('accepted','classified','queued','reclassified')
+                    AND decision IN (
+                      'supplement_current_turn',
+                      'interrupt_and_replan',
+                      'control_or_approval'
+                    )
+                  ORDER BY sequence ASC
+                  FOR UPDATE",
+                &[
+                    &request.session_id,
+                    &to_u64_i64(request.fence.session_generation, "session generation")?,
+                    &to_i64(request.fence.input_sequence, "input sequence")?,
+                    &to_i64(request.consumed_input_sequence, "consumed input sequence")?,
+                ],
+            )
+            .map_err(postgres_error)?;
+        for row in consumed_rows {
+            let request_id = row.try_get::<_, String>(0).map_err(postgres_error)?;
+            let before = runtime_outbox_tx(&mut transaction, &request_id)?.ok_or_else(|| {
+                session::SessionError::Store(format!(
+                    "consumed Session input `{request_id}` disappeared during terminal commit"
+                ))
+            })?;
+            let changed = transaction
+                .execute(
+                    "UPDATE session_runtime_outbox
+                        SET status='supplemented',terminal_at_ms=$1,
+                            claim_owner=NULL,claim_token=NULL,
+                            claim_fence_epoch=NULL,claim_expires_at_ms=NULL,
+                            failure_class=NULL,last_error=NULL,
+                            updated_at_ms=$1,revision=revision+1
+                      WHERE request_id=$2 AND revision=$3
+                        AND status IN ('accepted','classified','queued','reclassified')",
+                    &[
+                        &to_u64_i64(request.created_at_ms, "terminal commit time")?,
+                        &request_id,
+                        &to_u64_i64(before.revision, "input revision")?,
+                    ],
+                )
+                .map_err(postgres_error)?;
+            if changed != 1 {
+                return Err(session::SessionError::StaleExecutionFence(format!(
+                    "consumed Session input `{request_id}` changed during terminal commit"
+                )));
+            }
+            let supplemented =
+                runtime_outbox_tx(&mut transaction, &request_id)?.ok_or_else(|| {
+                    session::SessionError::Store(format!(
+                        "supplemented Session input `{request_id}` disappeared"
+                    ))
+                })?;
+            append_runtime_history_tx(
+                &mut transaction,
+                &supplemented,
+                "terminal_input_cursor_commit",
+                Some(&request.fence.claim_owner),
+                Some(before.revision),
+                before.status,
+                SessionRuntimeInputStatus::Supplemented,
+                None,
+                request.created_at_ms,
+            )?;
+            append_input_timeline_event_tx(
+                &mut transaction,
+                &request_from_outbox(&supplemented),
+                &supplemented.session_id,
+                supplemented.sequence,
+                SessionRuntimeInputStatus::Supplemented.timeline_event_kind(),
+                SessionRuntimeInputStatus::Supplemented,
+                Some(&request.fence.claim_owner),
+                None,
+                request.created_at_ms,
+            )?;
+        }
         let (messages, inserted) = append_terminal_transcript_tx(
             &mut transaction,
             &request.terminal_message_id,
@@ -7053,6 +7162,7 @@ fn validate_terminal_commit(
 ) -> session::SessionResult<()> {
     if request.turn_id.trim().is_empty()
         || request.runtime_commit_cursor == 0
+        || request.consumed_input_sequence < request.fence.input_sequence
         || request.fence.request_id.trim().is_empty()
         || request.fence.session_generation == 0
         || request.fence.claim_owner.trim().is_empty()
@@ -8768,6 +8878,7 @@ mod tests {
             turn_id: request.turn_id.clone(),
             messages,
             runtime_commit_cursor: 42,
+            consumed_input_sequence: running.sequence,
             created_at_ms: 104,
             fence: session::SessionTerminalExecutionFence {
                 request_id: request.request_id.clone(),
@@ -8864,6 +8975,7 @@ mod tests {
                 created_at_ms: 0,
             }],
             runtime_commit_cursor: 43,
+            consumed_input_sequence: stale_running.sequence,
             created_at_ms: 250,
             fence: session::SessionTerminalExecutionFence {
                 request_id: stale_request.request_id.clone(),
@@ -8951,6 +9063,7 @@ mod tests {
                 created_at_ms: 0,
             }],
             runtime_commit_cursor: 44,
+            consumed_input_sequence: running.sequence,
             created_at_ms: 103,
             fence: session::SessionTerminalExecutionFence {
                 request_id: request.request_id,

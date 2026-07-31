@@ -229,6 +229,7 @@ fn terminal_commit(
         turn_id: request.turn_id.clone(),
         messages: terminal_messages(session_id, id),
         runtime_commit_cursor: 42,
+        consumed_input_sequence: running.sequence,
         created_at_ms,
         fence: SessionTerminalExecutionFence {
             request_id: request.request_id.clone(),

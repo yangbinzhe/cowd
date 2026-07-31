@@ -5018,12 +5018,11 @@ where
         }
     }
 
-    fn consume_runtime_inputs_at_checkpoint(
+    fn consume_runtime_input_records(
         &self,
         turn_id: &TurnId,
         checkpoint: TurnInputCheckpoint,
-        prompt: &mut PromptAssembly,
-    ) -> usize {
+    ) -> Vec<crate::session_input::SessionInputRecord> {
         let consumed = self
             .session_input_stream
             .consume_for_checkpoint(turn_id, checkpoint, 32);
@@ -5031,12 +5030,6 @@ where
             if let Ok(mut pending) = self.consumed_session_inputs.lock() {
                 pending.extend(consumed.iter().cloned());
             }
-        }
-        if let Some(guidance) = crate::turn_inbox::checkpoint_guidance(checkpoint, &consumed) {
-            prompt.push_trusted_system(guidance);
-        }
-        for item in crate::turn_inbox::checkpoint_context_items(checkpoint, &consumed) {
-            prompt.push_context_item(&item);
         }
         if let Some(ref cowd) = self.cowd_bus {
             if !consumed.is_empty() {
@@ -5057,7 +5050,60 @@ where
                     .inbox_snapshot(Some(turn_id.clone())),
             });
         }
-        consumed.len()
+        consumed
+    }
+
+    fn consume_runtime_inputs_at_checkpoint(
+        &self,
+        turn_id: &TurnId,
+        checkpoint: TurnInputCheckpoint,
+        prompt: &mut PromptAssembly,
+    ) -> Vec<crate::session_input::SessionInputRecord> {
+        let consumed = self.consume_runtime_input_records(turn_id, checkpoint);
+        if let Some(guidance) = crate::turn_inbox::checkpoint_guidance(checkpoint, &consumed) {
+            prompt.push_trusted_system(guidance);
+        }
+        for item in crate::turn_inbox::checkpoint_context_items(checkpoint, &consumed) {
+            prompt.push_context_item(&item);
+        }
+        consumed
+    }
+
+    /// Consume active-turn input after a Provider/tool boundary and place its
+    /// typed context on the next Provider request.
+    pub(crate) fn consume_active_runtime_inputs_for_next_step(
+        &self,
+        checkpoint: TurnInputCheckpoint,
+    ) -> Vec<crate::session_input::SessionInputRecord> {
+        let Some(turn_id) = self.session_input_stream.active_turn_id() else {
+            return Vec::new();
+        };
+        let consumed = self.consume_runtime_input_records(&turn_id, checkpoint);
+        if let Some(guidance) = crate::turn_inbox::checkpoint_guidance(checkpoint, &consumed) {
+            let mut item = ContextItem::new(
+                format!("turn-input-guidance:{}", checkpoint.as_str()),
+                ContextSourceKind::Task,
+                ContextRole::Instruction,
+                guidance,
+            );
+            item.authority = ContextAuthority::System;
+            item.visibility = ContextVisibility::Private;
+            self.push_next_model_context_item(item);
+        }
+        for item in crate::turn_inbox::checkpoint_context_items(checkpoint, &consumed) {
+            self.push_next_model_context_item(item);
+        }
+        consumed
+    }
+
+    #[must_use]
+    pub(crate) fn consumed_session_input_cursor(
+        &self,
+    ) -> Option<harness_contract::turn::SessionInputCursor> {
+        self.session_input_stream
+            .active_turn_id()
+            .as_ref()
+            .and_then(|turn_id| self.session_input_stream.highest_consumed_cursor(turn_id))
     }
 
     /// Drain compact receipts for inputs consumed during the current provider
@@ -5549,7 +5595,7 @@ where
         // physically usable input window. The per-attempt packer below still
         // applies each model's hard cap, schema and history. If preflight
         // compacts the transcript, this snapshot is rebuilt before dispatch.
-        let one_shot_context_items = self.take_next_model_context_items();
+        let mut one_shot_context_items = self.take_next_model_context_items();
         let context_select_started = Instant::now();
         let mut prompt = self
             .prepare_reality_context_with_budget_and_items(
@@ -5630,6 +5676,14 @@ where
                 .is_err()
         });
         if no_candidate_can_fit {
+            if let Some(turn_id) = self.session_input_stream.active_turn_id() {
+                let consumed = self
+                    .consume_runtime_input_records(&turn_id, TurnInputCheckpoint::BeforeCompaction);
+                one_shot_context_items.extend(crate::turn_inbox::checkpoint_context_items(
+                    TurnInputCheckpoint::BeforeCompaction,
+                    &consumed,
+                ));
+            }
             let compaction = self
                 .compact_session_with_checkpoint(self.compaction_config_for_session(1))
                 .await?;
@@ -5968,6 +6022,9 @@ where
                     models_tried.push(model.clone());
                 }
             }
+            self.consume_active_runtime_inputs_for_next_step(
+                TurnInputCheckpoint::AfterProviderResponse,
+            );
             return Ok(ModelStepResult {
                 intent,
                 assistant_message,

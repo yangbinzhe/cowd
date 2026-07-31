@@ -484,6 +484,9 @@ pub struct SessionTerminalTranscriptCommit {
     pub turn_id: String,
     pub messages: Vec<SessionMessage>,
     pub runtime_commit_cursor: u64,
+    /// Highest durable Session input sequence incorporated into this terminal
+    /// candidate. A newer accepted input fences this candidate.
+    pub consumed_input_sequence: usize,
     pub created_at_ms: u64,
     pub fence: SessionTerminalExecutionFence,
 }
@@ -3318,6 +3321,7 @@ fn validate_terminal_transcript(
 fn validate_terminal_commit(request: &SessionTerminalTranscriptCommit) -> Result<()> {
     if request.turn_id.trim().is_empty()
         || request.runtime_commit_cursor == 0
+        || request.consumed_input_sequence < request.fence.input_sequence
         || request.fence.request_id.trim().is_empty()
         || request.fence.session_generation == 0
         || request.fence.claim_owner.trim().is_empty()
@@ -4920,6 +4924,120 @@ impl SqliteSessionStore {
                 current.status,
                 current.revision
             )));
+        }
+        let newest_pending_sequence = tx
+            .query_row(
+                r"SELECT MAX(sequence)
+                     FROM session_runtime_outbox
+                    WHERE session_id=?1 AND session_generation=?2
+                      AND sequence>?3
+                      AND status NOT IN (
+                        'rejected_duplicate','rejected_policy','completed',
+                        'supplemented','failed','cancelled','expired'
+                      )",
+                params![
+                    request.session_id,
+                    request.fence.session_generation as i64,
+                    request.fence.input_sequence as i64,
+                ],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(sql_err)?
+            .map(|value| value.max(0) as usize);
+        if newest_pending_sequence
+            .is_some_and(|sequence| sequence > request.consumed_input_sequence)
+        {
+            return Err(SessionError::StaleExecutionFence(format!(
+                "terminal input cursor {} is behind pending Session input {}",
+                request.consumed_input_sequence,
+                newest_pending_sequence.unwrap_or_default()
+            )));
+        }
+        let consumed_request_ids = {
+            let mut statement = tx
+                .prepare(
+                    r"SELECT request_id
+                         FROM session_runtime_outbox
+                        WHERE session_id=?1 AND session_generation=?2
+                          AND sequence>?3 AND sequence<=?4
+                          AND status IN ('accepted','classified','queued','reclassified')
+                          AND decision IN (
+                            'supplement_current_turn',
+                            'interrupt_and_replan',
+                            'control_or_approval'
+                          )
+                        ORDER BY sequence ASC",
+                )
+                .map_err(sql_err)?;
+            let request_ids = statement
+                .query_map(
+                    params![
+                        request.session_id,
+                        request.fence.session_generation as i64,
+                        request.fence.input_sequence as i64,
+                        request.consumed_input_sequence as i64,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(sql_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sql_err)?;
+            request_ids
+        };
+        for request_id in consumed_request_ids {
+            let before = query_outbox(&tx, &request_id)?.ok_or_else(|| {
+                SessionError::Store(format!(
+                    "consumed Session input `{request_id}` disappeared during terminal commit"
+                ))
+            })?;
+            let changed = tx
+                .execute(
+                    r"UPDATE session_runtime_outbox
+                          SET status='supplemented', terminal_at_ms=?1,
+                              claim_owner=NULL, claim_token=NULL,
+                              claim_fence_epoch=NULL, claim_expires_at_ms=NULL,
+                              failure_class=NULL, last_error=NULL,
+                              updated_at_ms=?1, revision=revision+1
+                        WHERE request_id=?2 AND revision=?3
+                          AND status IN ('accepted','classified','queued','reclassified')",
+                    params![
+                        request.created_at_ms as i64,
+                        request_id,
+                        before.revision as i64,
+                    ],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(SessionError::StaleExecutionFence(format!(
+                    "consumed Session input `{request_id}` changed during terminal commit"
+                )));
+            }
+            let supplemented = query_outbox(&tx, &request_id)?.ok_or_else(|| {
+                SessionError::Store(format!(
+                    "supplemented Session input `{request_id}` disappeared"
+                ))
+            })?;
+            append_outbox_history(
+                &tx,
+                &supplemented,
+                "terminal_input_cursor_commit",
+                Some(&request.fence.claim_owner),
+                None,
+                before.status.as_str(),
+                SessionRuntimeInputStatus::Supplemented.as_str(),
+                request.created_at_ms,
+            )?;
+            append_input_timeline_event(
+                &tx,
+                &request_from_outbox(&supplemented),
+                &supplemented.session_id,
+                supplemented.sequence,
+                SessionRuntimeInputStatus::Supplemented.timeline_event_kind(),
+                SessionRuntimeInputStatus::Supplemented,
+                Some(&request.fence.claim_owner),
+                None,
+                request.created_at_ms,
+            )?;
         }
         let (messages, inserted) = append_terminal_transcript_tx(
             &tx,

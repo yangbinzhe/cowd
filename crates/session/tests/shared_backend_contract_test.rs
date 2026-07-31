@@ -45,6 +45,11 @@ fn sqlite_input_generation_and_claim_fence_contract() {
 }
 
 #[test]
+fn sqlite_terminal_input_cursor_cas_contract() {
+    backend_contract::terminal_input_cursor_cas(&mut SqliteFixture::new());
+}
+
+#[test]
 fn sqlite_lifecycle_contract() {
     backend_contract::lifecycle_recovery_and_single_tombstone(&mut SqliteFixture::new());
 }

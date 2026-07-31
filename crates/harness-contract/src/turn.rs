@@ -86,6 +86,26 @@ impl std::fmt::Display for SessionInputId {
     }
 }
 
+/// Monotonic durable position of one Session input. `generation` fences a
+/// reopened Session authority while `sequence` orders inputs inside that
+/// generation. Runtime may cache this value, but Session storage remains its
+/// only authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SessionInputCursor {
+    pub generation: u64,
+    pub sequence: u64,
+}
+
+impl SessionInputCursor {
+    #[must_use]
+    pub const fn new(generation: u64, sequence: u64) -> Self {
+        Self {
+            generation,
+            sequence,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputSourceKind {
@@ -164,6 +184,8 @@ pub struct InputRelationProposal {
 pub enum InputRelationKind {
     Supplement,
     Replan,
+    Progress,
+    Background,
     NewTask,
     NewSession,
     Subtask,
@@ -398,6 +420,8 @@ pub struct SessionInputReceipt {
     pub active_turn_id: Option<TurnId>,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SessionInputCursor>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -415,6 +439,8 @@ pub struct TurnInboxItem {
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consumed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SessionInputCursor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -424,6 +450,10 @@ pub struct TurnInboxSnapshot {
     pub turn_id: Option<TurnId>,
     pub pending_count: usize,
     pub consumed_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_cursor: Option<SessionInputCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_cursor: Option<SessionInputCursor>,
     #[serde(default)]
     pub items: Vec<TurnInboxItem>,
     pub updated_at: DateTime<Utc>,
@@ -438,6 +468,10 @@ pub struct SessionInputProjection {
     pub pending_count: usize,
     pub queued_next_count: usize,
     pub consumed_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_cursor: Option<SessionInputCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumed_cursor: Option<SessionInputCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_decision: Option<InputRoutingDecision>,
     #[serde(default)]

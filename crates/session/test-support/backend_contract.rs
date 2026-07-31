@@ -147,6 +147,7 @@ fn terminal_commit(
         turn_id: request.turn_id.clone(),
         messages: terminal_messages(session_id, id),
         runtime_commit_cursor: 42,
+        consumed_input_sequence: running.sequence,
         created_at_ms: now_ms,
         fence: SessionTerminalExecutionFence {
             request_id: request.request_id.clone(),
@@ -310,6 +311,66 @@ pub fn input_generation_and_claim_fence(fixture: &mut impl BackendContractFixtur
             .expect("count committed transcript"),
         3
     );
+}
+
+/// Proves that the terminal transcript and every supplement it incorporated
+/// settle in one transaction. An input beyond the advertised consumed cursor
+/// must fence the stale terminal without writing any assistant row.
+pub fn terminal_input_cursor_cas(fixture: &mut impl BackendContractFixture) {
+    let session_id = "contract-terminal-input-cursor";
+    fixture
+        .backend()
+        .create_session(&record(session_id))
+        .expect("create terminal cursor Session");
+    let (request, running, token) =
+        running_input(fixture.backend(), session_id, "cursor-primary", 100, 10_000);
+
+    let mut supplement = ingress("cursor-supplement", 1);
+    supplement.decision = InputRoutingDecision::SupplementCurrentTurn;
+    supplement.target_turn_id = Some(request.turn_id.clone());
+    append_input(fixture.backend(), session_id, &supplement);
+    let supplement_record = fixture
+        .backend()
+        .get_session_runtime_outbox(&supplement.request_id)
+        .expect("read supplement")
+        .expect("supplement persists");
+
+    let stale = terminal_commit(
+        &request,
+        &running,
+        &token,
+        session_id,
+        "cursor-primary",
+        120,
+    );
+    assert_stale_fence(
+        fixture
+            .backend()
+            .commit_terminal_transcript_if_fenced(&stale),
+    );
+    assert_eq!(
+        fixture
+            .backend()
+            .get_message_count(session_id)
+            .expect("count transcript after stale cursor"),
+        2,
+        "only the two user inputs may exist after a stale terminal"
+    );
+
+    let mut current = stale;
+    current.consumed_input_sequence = supplement_record.sequence;
+    let receipt = fixture
+        .backend()
+        .commit_terminal_transcript_if_fenced(&current)
+        .expect("commit terminal at current input cursor");
+    assert!(receipt.inserted);
+    assert_eq!(receipt.input.status, SessionRuntimeInputStatus::Completed);
+    let supplemented = fixture
+        .backend()
+        .get_session_runtime_outbox(&supplement.request_id)
+        .expect("read settled supplement")
+        .expect("supplement remains auditable");
+    assert_eq!(supplemented.status, SessionRuntimeInputStatus::Supplemented);
 }
 
 fn lifecycle_event(session_id: &str, kind: &str, at_ms: u64) -> SessionEvent {

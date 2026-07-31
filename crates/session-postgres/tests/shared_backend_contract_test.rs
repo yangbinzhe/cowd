@@ -92,6 +92,13 @@ fn postgres_input_generation_and_claim_fence_contract() {
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn postgres_terminal_input_cursor_cas_contract() {
+    let _guard = postgres_test_guard();
+    backend_contract::terminal_input_cursor_cas(&mut PostgresFixture::new());
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_lifecycle_contract() {
     let _guard = postgres_test_guard();
     backend_contract::lifecycle_recovery_and_single_tombstone(&mut PostgresFixture::new());

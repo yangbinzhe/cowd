@@ -2360,6 +2360,10 @@ async fn deliver_terminal(
                         turn_id: turn_id.clone(),
                         messages,
                         runtime_commit_cursor: record.commit_cursor,
+                        consumed_input_sequence: payload
+                            .consumed_input_sequence
+                            .unwrap_or(input_sequence as usize)
+                            .max(input_sequence as usize),
                         created_at_ms: now_ms(),
                         fence: session::SessionTerminalExecutionFence {
                             request_id: request_id.clone(),
@@ -2487,6 +2491,7 @@ pub(crate) struct DecodedTerminalPayload {
     pub(crate) token_usage_json: Option<String>,
     pub(crate) ingress_message_id: Option<String>,
     pub(crate) transcript: Option<Vec<DecodedTerminalTranscriptMessage>>,
+    pub(crate) consumed_input_sequence: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2630,6 +2635,22 @@ pub(crate) fn decode_terminal_payload(
         } else {
             None
         };
+        let consumed_input_sequence = if is_v2 {
+            Some(
+                payload
+                    .get("consumed_input_sequence")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        (
+                            runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                            "terminal transcript requires consumed_input_sequence".to_string(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
         let transcript = if is_v2 {
             let messages = payload
                 .get("transcript")
@@ -2749,6 +2770,7 @@ pub(crate) fn decode_terminal_payload(
             token_usage_json,
             ingress_message_id,
             transcript,
+            consumed_input_sequence,
         });
     }
     let encoded = payload_ref.strip_prefix("assistant_json:").ok_or_else(|| {
@@ -2763,6 +2785,7 @@ pub(crate) fn decode_terminal_payload(
             token_usage_json: None,
             ingress_message_id: None,
             transcript: None,
+            consumed_input_sequence: None,
         })
         .map_err(|error| {
             (
@@ -3336,6 +3359,7 @@ mod tests {
             serde_json::json!({
                 "text": "done",
                 "ingress_message_id": "ingress-1",
+                "consumed_input_sequence": 0,
                 "token_usage": {
                     "input_tokens": 0,
                     "output_tokens": 0,
@@ -3460,7 +3484,7 @@ mod tests {
             "request-stale-generation",
             "turn-stale-generation",
             "ingress-stale-generation",
-            r#"assistant_terminal_v2:{"text":"must not commit","ingress_message_id":"ingress-stale-generation","token_usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"must not commit"}]}]}"#,
+            r#"assistant_terminal_v2:{"text":"must not commit","ingress_message_id":"ingress-stale-generation","consumed_input_sequence":0,"token_usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"must not commit"}]}]}"#,
         )
         .await;
         let claim_at = now_ms();
@@ -3549,7 +3573,7 @@ mod tests {
             "usage-request",
             "usage-turn",
             "usage-ingress",
-            r#"assistant_terminal_v2:{"text":"done","ingress_message_id":"usage-ingress","token_usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"done"}]}]}"#,
+            r#"assistant_terminal_v2:{"text":"done","ingress_message_id":"usage-ingress","consumed_input_sequence":0,"token_usage":{"input_tokens":12,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"transcript":[{"role":"assistant","blocks":[{"type":"text","text":"done"}]}]}"#,
         )
         .await;
         let record = event_store

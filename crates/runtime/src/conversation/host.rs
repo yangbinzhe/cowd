@@ -39,7 +39,7 @@ use harness_contract::goal::{
 use harness_contract::skill::{AgentSkillProfile, SkillCapabilityProfile};
 use harness_contract::turn::{
     InputRoutingDecision, SessionInputEnvelope, SessionInputProjection, SessionInputReceipt,
-    TurnId, TurnInboxSnapshot,
+    TurnId, TurnInboxSnapshot, TurnInputCheckpoint,
 };
 use harness_contract::MeasureProvenance;
 use serde::{Deserialize, Serialize};
@@ -1008,7 +1008,15 @@ where
             })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
         graph.parent_execution = execution_parent;
-        if graph.parent_execution.is_some() {
+        if strategy
+            .decision
+            .strategy
+            .understanding
+            .requests_background
+        {
+            graph.service_class =
+                harness_contract::execution_graph::ExecutionServiceClass::Background;
+        } else if graph.parent_execution.is_some() {
             graph.service_class =
                 harness_contract::execution_graph::ExecutionServiceClass::Foreground;
         }
@@ -1105,6 +1113,15 @@ where
             turn_state.goal_id = goal_id;
             turn_state.required_write_for_completion =
                 strategy.decision.strategy.understanding.requires_write;
+        }
+        {
+            let runtime = runtime.lock().await;
+            runtime.consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::TurnStart);
+            if ingress.is_some() {
+                runtime.consume_active_runtime_inputs_for_next_step(
+                    TurnInputCheckpoint::IngressDispatched,
+                );
+            }
         }
         let inline_kind = "inline_model".to_string();
         let tool_kind = "tool_batch".to_string();
@@ -3396,9 +3413,39 @@ where
                     .pending_transcript
                     .insert(ticket.node_id.clone(), committed_messages);
                 let goal_id = state.goal_id.clone();
+                let late_inputs = consumed_inputs.iter().any(|record| {
+                    record.checkpoint == Some(TurnInputCheckpoint::AfterProviderResponse)
+                });
+                if late_inputs {
+                    // The provider result was produced against an older input
+                    // cursor. Keep its usage and observations, but never
+                    // publish the stale assistant candidate as transcript.
+                    state.assistant_messages.pop();
+                    state.pending_transcript.remove(&ticket.node_id);
+                }
                 let correction_inputs = consumed_inputs
                     .iter()
-                    .filter(|record| record.decision == InputRoutingDecision::InterruptAndReplan)
+                    .filter(|record| {
+                        record.decision == InputRoutingDecision::InterruptAndReplan
+                            || record.relation_proposal.as_ref().is_some_and(|proposal| {
+                                proposal.candidate
+                                    == harness_contract::turn::InputRelationKind::Replan
+                            })
+                    })
+                    .map(|record| record.envelope.content.trim())
+                    .filter(|content| !content.is_empty())
+                    .collect::<Vec<_>>();
+                let appended_work_inputs = consumed_inputs
+                    .iter()
+                    .filter(|record| {
+                        record.relation_proposal.as_ref().is_some_and(|proposal| {
+                            matches!(
+                                proposal.candidate,
+                                harness_contract::turn::InputRelationKind::NewTask
+                                    | harness_contract::turn::InputRelationKind::Subtask
+                            )
+                        })
+                    })
                     .map(|record| record.envelope.content.trim())
                     .filter(|content| !content.is_empty())
                     .collect::<Vec<_>>();
@@ -3471,10 +3518,13 @@ where
                     }
                     observation
                 });
-                let input_revision = if correction_inputs.is_empty() {
+                let input_revision = if correction_inputs.is_empty()
+                    && appended_work_inputs.is_empty()
+                {
                     None
                 } else {
                     let correction = correction_inputs.join("\n");
+                    let appended_work = appended_work_inputs.join("\n");
                     let goal = self
                         .services
                         .goal_store()
@@ -3494,37 +3544,71 @@ where
                             &goal_id,
                             goal.revision,
                             goal.user_sequence.saturating_add(1),
-                            "a running-session user correction requested a governed replan",
+                            if correction_inputs.is_empty() {
+                                "running-session input appended governed Mission work"
+                            } else if appended_work_inputs.is_empty() {
+                                "a running-session user correction requested a governed replan"
+                            } else {
+                                "running-session input corrected the Goal and appended Mission work"
+                            },
                             |goal| {
-                                goal.objective.push_str("\n\nUser correction:\n");
-                                goal.objective.push_str(&correction);
-                                goal.constraints.push(format!(
-                                    "latest_user_correction:{}",
-                                    sha256_digest(&correction),
-                                ));
-                                vec![
-                                    "objective".to_string(),
-                                    "constraints".to_string(),
-                                    "user_sequence".to_string(),
-                                ]
+                                let mut changed = vec!["user_sequence".to_string()];
+                                if !correction.is_empty() {
+                                    goal.objective.push_str("\n\nUser correction:\n");
+                                    goal.objective.push_str(&correction);
+                                    goal.constraints.push(format!(
+                                        "latest_user_correction:{}",
+                                        sha256_digest(&correction),
+                                    ));
+                                    changed.extend([
+                                        "objective".to_string(),
+                                        "constraints".to_string(),
+                                    ]);
+                                }
+                                if !appended_work.is_empty() {
+                                    goal.objective.push_str("\n\nAdditional Mission work:\n");
+                                    goal.objective.push_str(&appended_work);
+                                    goal.constraints.push(format!(
+                                        "appended_mission_work:{}",
+                                        sha256_digest(&appended_work),
+                                    ));
+                                    if !changed.iter().any(|field| field == "objective") {
+                                        changed.extend([
+                                            "objective".to_string(),
+                                            "constraints".to_string(),
+                                        ]);
+                                    }
+                                }
+                                changed
                             },
                         )
                         .map_err(|reason| NodeExecutorError::Poll {
                             node_id: ticket.node_id.clone(),
                             reason,
                         })?;
-                    state.content.push_str(
-                        "\n\nLatest user correction (must supersede stale assumptions):\n",
-                    );
-                    state.content.push_str(&correction);
+                    if !correction.is_empty() {
+                        state.content.push_str(
+                            "\n\nLatest user correction (must supersede stale assumptions):\n",
+                        );
+                        state.content.push_str(&correction);
+                    }
+                    if !appended_work.is_empty() {
+                        state.content.push_str(
+                            "\n\nAdditional Mission work (compile into governed graph nodes before completing):\n",
+                        );
+                        state.content.push_str(&appended_work);
+                    }
                     Some(revision)
                 };
-                let mut intent = input_revision.as_ref().map_or_else(
-                    || step.intent.clone(),
-                    |_| ModelStepIntent::Replan {
-                        reason: "a newer user correction superseded the current plan".to_string(),
-                    },
-                );
+                let mut intent = if late_inputs {
+                    ModelStepIntent::Replan {
+                        reason:
+                            "new Session input arrived after the Provider response; continue from the newer durable input cursor"
+                                .to_string(),
+                    }
+                } else {
+                    step.intent.clone()
+                };
                 if force_text_only_response || step.text_only_response {
                     intent = match intent {
                         ModelStepIntent::ToolCalls { .. }
@@ -5297,6 +5381,10 @@ where
             );
             (result, orchestration_terminal_summary)
         };
+        self.runtime
+            .lock()
+            .await
+            .consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::AfterToolResult);
         {
             let mut state = self.state.lock().await;
             for call in &calls {
@@ -6748,6 +6836,83 @@ where
                 detail: Some("synthesizing terminal".to_string()),
             });
         }
+        let pending_inputs = self
+            .runtime
+            .lock()
+            .await
+            .consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::BeforeFinalAnswer);
+        if !pending_inputs.is_empty() {
+            let discard_latest_assistant = {
+                let mut state = self.state.lock().await;
+                state.terminal_override = None;
+                state.clean_terminal_synthesis_next = false;
+                state.pending_focus_terminal_candidate = None;
+                state.assistant_messages.pop().is_some()
+            };
+            if discard_latest_assistant {
+                let mut runtime = self.runtime.lock().await;
+                let message_count = runtime.session_async().await.message_count();
+                if message_count > 0 {
+                    runtime
+                        .session_mut_async()
+                        .await
+                        .truncate_messages(message_count.saturating_sub(1));
+                }
+            }
+            let next = dynamic_node(
+                ticket,
+                self.state.lock().await.iterations,
+                "input-cursor-replan-model",
+                ExecutionNodeKind::InlineModel,
+                "inline_model",
+                "inline_model",
+            );
+            let evidence_refs = pending_inputs
+                .iter()
+                .map(|record| format!("session_input:{}", record.envelope.input_id))
+                .collect::<Vec<_>>();
+            let mut outcome = NodeExecutionOutcome::new(completed_result(
+                Some(format!("{}:terminal-superseded", ticket.graph_id)),
+                ExecutionUsage::default(),
+            ))
+            .with_replan(ExecutionGraphReplan {
+                nodes: vec![next.clone()],
+                edges: dynamic_edges(&ticket.node_id, &[next]),
+                reason:
+                    "new durable Session input crossed the final-answer barrier; terminal candidate was superseded"
+                        .to_string(),
+            });
+            let observation_identity = {
+                let state = self.state.lock().await;
+                runtime_observation_identity(&self.services, &state, ticket)
+            };
+            let mut observation = runtime_observation(
+                observation_identity,
+                RuntimeObservationKind::UserInput,
+                "runtime.before_final_answer",
+                u64::from(ticket.attempt),
+                format!(
+                    "{} newer Session input(s) superseded the terminal candidate",
+                    pending_inputs.len()
+                ),
+                format!(
+                    "terminal-input-cursor:{}",
+                    sha256_digest(&evidence_refs.join("\n"))
+                ),
+                ObservationResultClass::Informational,
+            );
+            observation.evidence_refs = evidence_refs;
+            outcome.domain_events.push(
+                self.services
+                    .goal_store()
+                    .observation_event(
+                        &observation,
+                        format!("{}:terminal-input-observation", ticket.idempotency_key),
+                    )
+                    .map_err(|error| error.to_string())?,
+            );
+            return Ok(outcome);
+        }
         let projection = self
             .services
             .execution_supervisor()
@@ -6807,16 +6972,24 @@ where
                 .map_err(|error| format!("goal completion cannot commit: {error}"))?,
         );
         if let Some(ingress) = ingress {
-            let terminal_fence = self
-                .runtime
-                .lock()
-                .await
-                .capture_session_execution_fence(crate::SessionExecutionFencePhase::TerminalCommit)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| {
-                    "Session terminal requires a durable execution fence snapshot".to_string()
-                })?;
+            let (terminal_fence, consumed_input_sequence) = {
+                let runtime = self.runtime.lock().await;
+                let terminal_fence = runtime
+                    .capture_session_execution_fence(
+                        crate::SessionExecutionFencePhase::TerminalCommit,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        "Session terminal requires a durable execution fence snapshot".to_string()
+                    })?;
+                let consumed_input_sequence = runtime
+                    .consumed_session_input_cursor()
+                    .filter(|cursor| cursor.generation == ingress.session_generation)
+                    .map_or(ingress.input_sequence, |cursor| cursor.sequence)
+                    .max(ingress.input_sequence);
+                (terminal_fence, consumed_input_sequence)
+            };
             let mut transcript = {
                 let runtime = self.runtime.lock().await;
                 let session = runtime.session_async().await;
@@ -6879,6 +7052,7 @@ where
                     serde_json::to_string(&serde_json::json!({
                         "text": final_answer,
                         "ingress_message_id": ingress.message_id,
+                        "consumed_input_sequence": consumed_input_sequence,
                         "transcript": transcript,
                         "token_usage": {
                             "input_tokens": input_tokens,
