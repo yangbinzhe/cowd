@@ -2778,6 +2778,11 @@ impl PostgresSessionStore {
                     AND status NOT IN (
                       'rejected_duplicate','rejected_policy','completed',
                       'supplemented','failed','cancelled','expired'
+                    )
+                    AND decision IN (
+                      'supplement_current_turn',
+                      'interrupt_and_replan',
+                      'control_or_approval'
                     )",
                 &[
                     &request.session_id,
@@ -8893,6 +8898,7 @@ mod tests {
         };
         let mut wrong_sequence = commit.clone();
         wrong_sequence.fence.input_sequence = wrong_sequence.fence.input_sequence.saturating_add(1);
+        wrong_sequence.consumed_input_sequence = wrong_sequence.fence.input_sequence;
         assert!(matches!(
             store.commit_terminal_transcript_if_fenced(&wrong_sequence),
             Err(session::SessionError::StaleExecutionFence(_))

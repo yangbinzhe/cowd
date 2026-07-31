@@ -321,6 +321,7 @@ fn sqlite_fenced_terminal_commit_is_atomic_identity_bound_and_idempotent() {
     );
     let mut wrong_sequence = commit.clone();
     wrong_sequence.fence.input_sequence = wrong_sequence.fence.input_sequence.saturating_add(1);
+    wrong_sequence.consumed_input_sequence = wrong_sequence.fence.input_sequence;
     assert!(matches!(
         store.commit_terminal_transcript_if_fenced(&wrong_sequence),
         Err(SessionError::StaleExecutionFence(_))

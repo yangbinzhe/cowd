@@ -1208,6 +1208,30 @@ impl GatewayApiClient {
         .await;
     }
 
+    pub async fn session_history_index(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::protocol::SessionHistoryIndexProjection, GatewayApiError> {
+        let value = self
+            .get_json(&format!(
+                "/api/sessions/{}/history-index?metadata_limit=128&card_limit=64",
+                url_encode(session_id)
+            ))
+            .await?;
+        let projection =
+            serde_json::from_value::<crate::protocol::SessionHistoryIndexProjection>(value)
+                .map_err(|error| {
+                    GatewayApiError::Contract(format!("invalid session history index: {error}"))
+                })?;
+        if projection.session_id != session_id {
+            return Err(GatewayApiError::Contract(format!(
+                "requested session `{session_id}` but Gateway returned history index for `{}`",
+                projection.session_id
+            )));
+        }
+        Ok(projection)
+    }
+
     pub async fn session_execution_index(
         &self,
         session_id: &str,
@@ -4048,7 +4072,7 @@ async fn hydrate_session_history_once(
     accepted_sequence: &AtomicUsize,
     authority_generation: u64,
 ) -> Result<usize, GatewayApiError> {
-    const HISTORY_WINDOW_CAP: usize = 50_000;
+    const HISTORY_WINDOW_CAP: usize = 500;
     let started = std::time::Instant::now();
     let hydration_kind = if from_sequence == 0 {
         crate::protocol::SessionHistoryHydrationKind::InitialWindow
@@ -4062,12 +4086,21 @@ async fn hydrate_session_history_once(
     let mut has_older = false;
 
     if from_sequence == 0 {
-        // Discover total cheaply, then hydrate only the newest bounded window.
-        // Downloading an unbounded transcript merely to evict its oldest pages
-        // in App caused avoidable database/network/render churn.
-        let probe = client.session_messages_offset(session_id, 0, 1).await?;
-        total_messages = probe.total;
-        oldest_offset = probe.total.saturating_sub(HISTORY_WINDOW_CAP);
+        // Materialize the body-free index first, then fetch only the bounded
+        // transcript tail. Older bodies remain available through explicit
+        // paging and exact reads.
+        let history_index = client.session_history_index(session_id).await?;
+        total_messages = history_index.total_messages as usize;
+        tx.send_wait(session_scoped_event(
+            session_id,
+            authority_generation,
+            CowdEvent::SessionHistoryIndexLoaded {
+                projection: history_index,
+            },
+        ))
+        .await
+        .map_err(|_| GatewayApiError::Url("TUI event receiver closed".to_string()))?;
+        oldest_offset = total_messages.saturating_sub(HISTORY_WINDOW_CAP);
         has_older = oldest_offset > 0;
         let mut offset = oldest_offset;
         loop {
@@ -5956,6 +5989,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_history_index_is_typed_bounded_and_session_scoped() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0; 4096];
+            let n = socket.read(&mut buf).await.expect("read");
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with(
+                "GET /api/sessions/session-1/history-index?metadata_limit=128&card_limit=64 HTTP/1.1"
+            ));
+            assert!(req.contains("authorization: Bearer test-token"));
+            let body = serde_json::json!({
+                "schema_version": 1,
+                "session_id": "session-1",
+                "projection_generation": 9,
+                "durable_cursor": 42,
+                "event_cursor": 41,
+                "history_revision": 7,
+                "total_messages": 100000,
+                "total_bytes": 8000000,
+                "latest_checkpoint_sequence": 90000,
+                "latest_checkpoint_event_id": "checkpoint-1",
+                "index_generation": 4,
+                "indexed_through_sequence": 99999,
+                "index_card_count": 250,
+                "index_complete": true,
+                "recovery_state": "ready",
+                "recent_metadata": [],
+                "cards": []
+            })
+            .to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write");
+        });
+
+        let client =
+            GatewayApiClient::new(format!("http://{addr}"), Some("test-token".to_string()))
+                .expect("client");
+        let projection = client
+            .session_history_index("session-1")
+            .await
+            .expect("history index");
+        assert_eq!(projection.session_id, "session-1");
+        assert_eq!(projection.total_messages, 100_000);
+        assert_eq!(projection.projection_generation, 9);
+        assert!(projection.recent_metadata.is_empty());
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
     async fn runtime_control_plane_gets_json_with_auth() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -6095,18 +6187,49 @@ mod tests {
                 .await
                 .expect("write stream response");
 
-            let (mut probe_socket, _) = listener.accept().await.expect("accept history probe");
+            let (mut probe_socket, _) = listener.accept().await.expect("accept history index");
             let mut request = vec![0; 4096];
             let size = probe_socket
                 .read(&mut request)
                 .await
-                .expect("read history probe");
+                .expect("read history index");
             let request = String::from_utf8_lossy(&request[..size]);
             assert!(
-                request
-                    .starts_with("GET /api/sessions/session-1/messages?offset=0&limit=1 HTTP/1.1"),
+                request.starts_with(
+                    "GET /api/sessions/session-1/history-index?metadata_limit=128&card_limit=64 HTTP/1.1"
+                ),
                 "{request}"
             );
+            let history_index = serde_json::json!({
+                "schema_version": 1,
+                "session_id": "session-1",
+                "projection_generation": 1,
+                "durable_cursor": 1,
+                "event_cursor": 1,
+                "history_revision": 1,
+                "total_messages": 1,
+                "total_bytes": 64,
+                "latest_checkpoint_sequence": null,
+                "latest_checkpoint_event_id": null,
+                "index_generation": 1,
+                "indexed_through_sequence": 0,
+                "index_card_count": 1,
+                "index_complete": true,
+                "recovery_state": "ready",
+                "recent_metadata": [],
+                "cards": []
+            })
+            .to_string();
+            probe_socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{history_index}",
+                        history_index.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write history index");
             let history = serde_json::json!({
                 "session_id": "session-1",
                 "messages": [{
@@ -6125,17 +6248,6 @@ mod tests {
                 "has_more": false
             })
             .to_string();
-            probe_socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{history}",
-                        history.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .expect("write history probe");
-
             let (mut history_socket, _) = listener.accept().await.expect("accept history page");
             let mut request = vec![0; 4096];
             let size = history_socket
@@ -6300,7 +6412,7 @@ mod tests {
                     .await
                     .expect("read follow-up request");
                 let request = String::from_utf8_lossy(&request[..size]);
-                if request.starts_with("GET /api/sessions/session-1/messages") {
+                if request.starts_with("GET /api/sessions/session-1/history-index") {
                     socket
                         .write_all(
                             b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: 31\r\nconnection: close\r\n\r\n{\"error\":\"history unavailable\"}",

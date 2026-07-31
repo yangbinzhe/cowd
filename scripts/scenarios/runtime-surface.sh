@@ -62,7 +62,7 @@ on_error() {
 trap cleanup EXIT
 trap on_error ERR
 
-for cmd in tmux curl python3 rg ss sqlite3; do
+for cmd in tmux curl python3 rg ss; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "$cmd is required for runtime surface unified scenario" >&2
     exit 1
@@ -181,11 +181,25 @@ rg -q "tasks" "$TMP_DIR/tasks.json"
 rg -q "runtime_control_plane" "$TMP_DIR/control-plane.json"
 rg -q "connector_summary" "$TMP_DIR/connectors.json"
 
-TASK_DB="$CONFIG_HOME/storage/tasks.sqlite"
-if [[ ! -f "$TASK_DB" ]]; then
-  TASK_DB="$CONFIG_HOME/tasks.db"
-fi
-sqlite3 "$TASK_DB" "SELECT COUNT(*) FROM tasks;" | rg -q '^[1-9][0-9]*$'
+tmux kill-session -t "$GATEWAY_SESSION" >/dev/null 2>&1 || true
+tmux new-session -d -s "$GATEWAY_SESSION" \
+  "bash -lc \"cd '$WORKDIR' && \
+    export COWD_CONFIG_HOME='$CONFIG_HOME' && \
+    export HOME='$HOME_DIR' && \
+    '$BIN' gateway run >'$GATEWAY_LOG' 2>&1\""
+for _ in {1..120}; do
+  if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+curl -fsS "$BASE_URL/api/tasks" >"$TMP_DIR/tasks-after-restart.json"
+python3 - "$TMP_DIR/tasks-after-restart.json" "$TASK_ID" <<'PY'
+import json, sys
+data=json.load(open(sys.argv[1]))
+tasks=data.get("tasks") or []
+assert any(task.get("task_id") == sys.argv[2] for task in tasks), data
+PY
 
 if [[ "${COWD_RUNTIME_SURFACE_REAL_CONNECTOR_PROVIDER:-}" == "feishu.readonly" ]]; then
   curl -fsS "$BASE_URL/api/connectors/services/feishu.readonly/tools" >"$TMP_DIR/feishu-tools.json"

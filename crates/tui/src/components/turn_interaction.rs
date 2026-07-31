@@ -242,6 +242,7 @@ mod tests {
                 last_progress_at_ms: revision,
                 context_usage: None,
                 metrics: Default::default(),
+                latency: Default::default(),
                 output_preview: None,
                 output_preview_start_bytes: 0,
                 output_bytes: 0,

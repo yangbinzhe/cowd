@@ -2250,6 +2250,66 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn session_history_index_is_bounded_typed_and_body_free() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "surface-history-index";
+        store
+            .create_session(&new_api_session_record(
+                session_id,
+                Some("test-model".into()),
+            ))
+            .await
+            .unwrap();
+        for sequence in 0..3 {
+            store
+                .insert_message(&session::SessionMessage {
+                    stable_message_id: format!("message-{sequence}"),
+                    session_id: session_id.to_string(),
+                    sequence,
+                    role: if sequence % 2 == 0 {
+                        "user".to_string()
+                    } else {
+                        "assistant".to_string()
+                    },
+                    content_json: format!(
+                        "[{{\"type\":\"text\",\"text\":\"secret body {sequence}\"}}]"
+                    ),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: sequence as u64 + 1,
+                })
+                .await
+                .unwrap();
+        }
+        let app = api_router(test_state_with_store(store));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/sessions/{session_id}/history-index?metadata_limit=2&card_limit=8"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let projection: harness_contract::projection::SessionHistoryIndexProjection =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(projection.session_id, session_id);
+        assert_eq!(projection.total_messages, 3);
+        assert_eq!(projection.recent_metadata.len(), 2);
+        assert!(projection.projection_generation > 0);
+        assert!(
+            !String::from_utf8_lossy(&body).contains("secret body"),
+            "history index must not materialize transcript bodies"
+        );
+    }
+
     #[test]
     fn producer_namespace_comes_from_active_app_routes_or_gateway_route_family() {
         let state = test_state();

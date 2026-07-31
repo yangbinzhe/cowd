@@ -389,6 +389,25 @@ pub struct RunMetricsProjection {
     pub total_tokens: u64,
 }
 
+/// Runtime-owned latency attribution for one execution.
+///
+/// Provider wall time is measured by the provider stream owner. Harness time
+/// is the remaining execution wall time, so parallel child executions keep
+/// their own attribution instead of being added into a misleading root total.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct ExecutionLatencyProjection {
+    #[serde(default)]
+    pub total_elapsed_ms: u64,
+    #[serde(default)]
+    pub harness_elapsed_ms: u64,
+    #[serde(default)]
+    pub provider_wall_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_latency_ms: Option<u64>,
+    #[serde(default)]
+    pub provider_active_stream_ms: u64,
+}
+
 /// Runtime-owned, current-turn facts.  It is an additive field on the
 /// existing execution projection so older surface clients remain compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -453,6 +472,8 @@ pub struct ExecutionLiveState {
     pub context_usage: Option<ContextUsageProjection>,
     #[serde(default)]
     pub metrics: RunMetricsProjection,
+    #[serde(default)]
+    pub latency: ExecutionLatencyProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_preview: Option<String>,
     /// Byte offset of `output_preview` within the current assistant part.
@@ -582,6 +603,82 @@ pub struct SessionEvidenceProjection {
     pub freshness: EvidenceFreshness,
 }
 
+pub const SESSION_HISTORY_INDEX_SCHEMA_VERSION: u32 = 1;
+
+/// Body-free message metadata used to navigate a long Session before loading
+/// exact transcript rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionHistoryMessageMetadataProjection {
+    pub message_id: String,
+    pub sequence: u64,
+    pub role: String,
+    pub blocks_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    pub created_at_ms: u64,
+    pub content_bytes: u64,
+}
+
+/// Rebuildable navigation card. The card is never authoritative transcript
+/// content; `source_start_sequence..=source_end_sequence` and `source_digest`
+/// locate and verify the immutable source rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionHistoryCardProjection {
+    pub card_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_card_id: Option<String>,
+    pub source_start_sequence: u64,
+    pub source_end_sequence: u64,
+    pub source_message_count: u64,
+    pub source_digest: String,
+    pub summary: String,
+    pub scope: String,
+    pub authority: String,
+    pub generation: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionHistoryRecoveryState {
+    Ready,
+    ManifestRebuilt,
+    IndexPending,
+    CheckpointMissing,
+    CheckpointMalformed,
+}
+
+/// Bounded, transport-neutral read model for Session activation and history
+/// navigation. Surfaces render this first and fetch transcript bodies only
+/// through the exact message/page APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionHistoryIndexProjection {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub projection_generation: u64,
+    pub durable_cursor: u64,
+    pub event_cursor: u64,
+    pub history_revision: u64,
+    pub total_messages: u64,
+    pub total_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_checkpoint_event_id: Option<String>,
+    pub index_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_through_sequence: Option<u64>,
+    pub index_card_count: u64,
+    pub index_complete: bool,
+    pub recovery_state: SessionHistoryRecoveryState,
+    #[serde(default)]
+    pub recent_metadata: Vec<SessionHistoryMessageMetadataProjection>,
+    #[serde(default)]
+    pub cards: Vec<SessionHistoryCardProjection>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionProjection {
     pub schema_version: u32,
@@ -692,6 +789,7 @@ mod tests {
             last_progress_at_ms: 11,
             context_usage: None,
             metrics: RunMetricsProjection::default(),
+            latency: ExecutionLatencyProjection::default(),
             output_preview: None,
             output_preview_start_bytes: 0,
             output_bytes: 0,

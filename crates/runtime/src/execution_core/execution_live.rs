@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use harness_contract::context::ContextTurnReport;
 use harness_contract::projection::{
-    ContextUsageProjection, ExecutionLiveOutputPart, ExecutionLiveState, ExecutionLiveStatus,
-    RunMetricsProjection, SessionExecutionEntryProjection, SessionExecutionIndexProjection,
+    ContextUsageProjection, ExecutionLatencyProjection, ExecutionLiveOutputPart,
+    ExecutionLiveState, ExecutionLiveStatus, RunMetricsProjection, SessionExecutionEntryProjection,
+    SessionExecutionIndexProjection,
 };
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +88,7 @@ impl LiveExecutionRecord {
                 last_progress_at_ms: now,
                 context_usage: None,
                 metrics: RunMetricsProjection::default(),
+                latency: ExecutionLatencyProjection::default(),
                 output_preview: None,
                 output_preview_start_bytes: 0,
                 output_bytes: 0,
@@ -121,6 +123,34 @@ impl LiveExecutionRecord {
         self.live.metrics.input_tokens = input_tokens;
         self.live.metrics.output_tokens = output_tokens;
         self.live.metrics.total_tokens = total_tokens;
+        self.refresh_latency();
+    }
+
+    fn refresh_latency(&mut self) {
+        let observed_elapsed_ms = self
+            .live
+            .updated_at_ms
+            .saturating_sub(self.live.started_at_ms);
+        let provider_wall_ms = self
+            .own_model_usage
+            .as_ref()
+            .map_or(0, |telemetry| telemetry.wall_duration_ms);
+        let total_elapsed_ms = observed_elapsed_ms.max(provider_wall_ms);
+        self.live.latency = ExecutionLatencyProjection {
+            total_elapsed_ms,
+            harness_elapsed_ms: total_elapsed_ms.saturating_sub(provider_wall_ms),
+            provider_wall_ms,
+            first_token_latency_ms: self
+                .own_model_usage
+                .as_ref()
+                .and_then(|telemetry| telemetry.first_token_latency_ms),
+            provider_active_stream_ms: self
+                .own_model_usage
+                .as_ref()
+                .and_then(|telemetry| telemetry.active_stream_duration_ms)
+                .unwrap_or_default()
+                .min(provider_wall_ms),
+        };
     }
 
     fn transition(&mut self, status: ExecutionLiveStatus, detail: Option<String>) -> bool {
@@ -142,6 +172,7 @@ impl LiveExecutionRecord {
         self.live.updated_at_ms = now;
         self.live.last_progress_at_ms = now;
         self.live.revision = self.live.revision.saturating_add(1);
+        self.refresh_latency();
         true
     }
 
@@ -150,6 +181,7 @@ impl LiveExecutionRecord {
         self.live.updated_at_ms = now;
         self.live.last_progress_at_ms = now;
         self.live.revision = self.live.revision.saturating_add(1);
+        self.refresh_latency();
     }
 
     fn append_preview(&mut self, identity: &crate::CausalItemIdentity, text: &str) {
@@ -1606,6 +1638,15 @@ mod tests {
 
         let live = store.execution_live(execution_id).unwrap();
         assert_eq!(live.metrics.input_tokens, 1_300);
+        assert_eq!(live.latency.provider_wall_ms, 3);
+        assert_eq!(live.latency.first_token_latency_ms, Some(1));
+        assert_eq!(live.latency.provider_active_stream_ms, 2);
+        assert_eq!(
+            live.latency.total_elapsed_ms,
+            live.latency
+                .harness_elapsed_ms
+                .saturating_add(live.latency.provider_wall_ms)
+        );
         assert_eq!(
             live.context_usage.and_then(|usage| usage.input_tokens),
             Some(700),

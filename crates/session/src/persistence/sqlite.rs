@@ -4934,6 +4934,11 @@ impl SqliteSessionStore {
                       AND status NOT IN (
                         'rejected_duplicate','rejected_policy','completed',
                         'supplemented','failed','cancelled','expired'
+                      )
+                      AND decision IN (
+                        'supplement_current_turn',
+                        'interrupt_and_replan',
+                        'control_or_approval'
                       )",
                 params![
                     request.session_id,

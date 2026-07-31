@@ -203,6 +203,7 @@ pub fn input_generation_and_claim_fence(fixture: &mut impl BackendContractFixtur
     let commit = terminal_commit(&request, &running, &token, stale_session, "stale", 120);
     let mut wrong_sequence = commit.clone();
     wrong_sequence.fence.input_sequence += 1;
+    wrong_sequence.consumed_input_sequence = wrong_sequence.fence.input_sequence;
     assert_stale_fence(
         fixture
             .backend()

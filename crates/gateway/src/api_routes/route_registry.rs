@@ -19,7 +19,7 @@ use harness_contract::{
     projection::{
         ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionLiveUpdate, ExecutionProjection,
         SessionEvidenceProjection, SessionExecutionIndexProjection,
-        SessionExecutionIndicesProjection, TurnEvidenceProjection,
+        SessionExecutionIndicesProjection, SessionHistoryIndexProjection, TurnEvidenceProjection,
     },
 };
 
@@ -204,6 +204,18 @@ fn session_execution_live_spec() -> TypedRouteSpec<(), (), ExecutionLiveUpdate> 
     )
 }
 
+fn session_history_index_spec() -> TypedRouteSpec<
+    (),
+    super::session_routes::SessionHistoryIndexQuery,
+    SessionHistoryIndexProjection,
+> {
+    TypedRouteSpec::new(
+        "GET",
+        "/api/sessions/:id/history-index",
+        "session_history_index_get",
+    )
+}
+
 fn session_evidence_spec() -> TypedRouteSpec<(), (), SessionEvidenceProjection> {
     TypedRouteSpec::new("GET", "/api/sessions/:id/evidence", "session_evidence_get")
 }
@@ -306,6 +318,7 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         session_execution_indices_spec().metadata(None, "SessionExecutionIndicesProjection", false),
         session_execution_index_spec().metadata(None, "SessionExecutionIndexProjection", false),
         session_execution_live_spec().metadata(None, "ExecutionLiveUpdate", false),
+        session_history_index_spec().metadata(None, "SessionHistoryIndexProjection", false),
         session_evidence_spec().metadata(None, "SessionEvidenceProjection", false),
         turn_evidence_spec().metadata(None, "TurnEvidenceProjection", false),
         live_create_spec().metadata(
@@ -415,6 +428,10 @@ mod tests {
         assert_eq!(
             spec("mission_control_delta_get").response_schema,
             "MissionProjectionDelta"
+        );
+        assert_eq!(
+            spec("session_history_index_get").response_schema,
+            "SessionHistoryIndexProjection"
         );
     }
 }

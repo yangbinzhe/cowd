@@ -41,6 +41,10 @@ fn memory_config(sqlite_path: &std::path::Path) -> MemoryConfig {
             reserved_response: 1_000,
             ..Default::default()
         },
+        layers: memory::config::LayerConfig {
+            l4_enabled: true,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }

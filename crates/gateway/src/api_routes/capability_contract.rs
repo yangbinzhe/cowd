@@ -293,6 +293,10 @@ fn gateway_openapi_document_from_contract(
         &mut schemas,
         "SessionEvidenceProjection",
     );
+    insert_canonical_schema::<harness_contract::projection::SessionHistoryIndexProjection>(
+        &mut schemas,
+        "SessionHistoryIndexProjection",
+    );
     if let Some(entity) = schemas.get("ProjectionEntity").cloned() {
         schemas.insert("ExecutionProjectionEntity".to_string(), entity);
     }
@@ -1980,6 +1984,11 @@ mod tests {
         assert_eq!(document["openapi"], "3.1.0");
         assert!(document["paths"]["/api/gateway/capability-contract"]["get"].is_object());
         assert!(document["paths"]["/api/sessions/{id}/messages"]["post"].is_object());
+        assert_eq!(
+            document["paths"]["/api/sessions/{id}/history-index"]["get"]["operationId"],
+            "session_history_index_get"
+        );
+        assert!(document["components"]["schemas"]["SessionHistoryIndexProjection"].is_object());
         assert!(document["paths"]["/api/runtime/managed-agents"]["get"].is_object());
         assert!(document["paths"]["/api/runtime/managed-agents/{id}/trigger"]["post"].is_object());
         assert!(document["paths"]["/api/surfaces/{id}/trigger-events"]["get"].is_object());

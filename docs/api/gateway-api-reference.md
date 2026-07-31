@@ -27,7 +27,7 @@ Gateway 现在以 `/api/gateway/capability-contract` 作为运行时接口能力
 - [公共入口与认证](#公共入口与认证)：11 个接口
 - [Cowd 核心投影与发布门禁](#cowd-核心投影与发布门禁)：10 个接口
 - [Runtime 执行核心](#runtime-执行核心)：28 个接口
-- [Session 生命周期](#session-生命周期)：24 个接口
+- [Session 生命周期](#session-生命周期)：25 个接口
 - [对话消息与 SSE](#对话消息与-sse)：8 个接口
 - [Mission Control / 多 Session 多 Agent 协同](#mission-control-/-多-session-多-agent-协同)：34 个接口
 - [Agent 目录、组队与运行](#agent-目录、组队与运行)：18 个接口
@@ -141,6 +141,7 @@ AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提�
 | `GET` | `/api/sessions/:id/events` | Session 生命周期 查询接口 | id | 支持 Query 参数，详见 handler Params struct | - | `get_session_events` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/evidence` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_evidence` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/execution` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_execution_index` | `session_routes.rs` | P1 |
+| `GET` | `/api/sessions/:id/history-index` | 读取无正文历史索引、恢复状态、checkpoint、覆盖率、近期元数据和导航卡片 | id | `metadata_limit`、`card_limit` | - | `get_session_history_index` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/lifecycle` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `session_lifecycle_handler` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/projection` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `get_session_projection` | `session_routes.rs` | P1 |
 | `GET` | `/api/sessions/:id/replay` | Session 生命周期 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `replay_session_handler` | `session_routes.rs` | P1 |

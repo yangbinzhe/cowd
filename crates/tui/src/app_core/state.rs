@@ -1750,7 +1750,7 @@ impl TuiState {
             let queued_preview = self
                 .app
                 .queued_follow_up_preview()
-                .map(|input| input.content_preview.as_str());
+                .map(|input| format!("{} · {}", input.decision, input.content_preview));
             let degraded = {
                 let _guard = self.render_profiler.guard("composer");
                 match error_recovery::catch_render_panic(
@@ -1764,7 +1764,7 @@ impl TuiState {
                             &mut self.context_suggestions,
                             pending_resources,
                             queued_follow_ups,
-                            queued_preview,
+                            queued_preview.as_deref(),
                         );
                     }),
                 ) {

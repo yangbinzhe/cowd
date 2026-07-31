@@ -834,6 +834,7 @@ TUI 的定位不是 WebUI 的终端复刻版，而是终端环境中的 `Termina
 | `POST /api/sessions` | 创建 session |
 | `GET /api/sessions/:id/events` | session event |
 | `GET /api/sessions/:id/runs` | run 列表 |
+| `GET /api/sessions/:id/history-index` | 无正文历史索引：恢复状态、checkpoint、索引覆盖、近期元数据和导航卡片 |
 | `POST /api/sessions/:id/messages` | 发送消息 |
 | `POST/PATCH /api/runtime/live-subscriptions` | 创建或原子更新 Surface 多源实时订阅 |
 | `GET /api/runtime/live/:id` | Session、Execution、Mission 共用的 multiplex SSE |
@@ -1174,12 +1175,14 @@ cargo tree -p gateway --edges normal | rg 'edge-adapters|lettre|imap|mail-parser
 - Runtime Module Map 已把 conversation、provider、tooling、mission、session、agent、team、steward、approval、context、recovery、policy、reality bridge 等核心域纳入代码级归属合同。
 - Harness Eval 已服务化，Gateway/WebUI/TUI 可查询 latest/report/scenario/run，并通过 deterministic smoke 验证 runtime capability domains 覆盖情况。
 - Gateway 已提供 `session.run_projection`，从持久 `session_events` 聚合 run graph、工具时间线、token/model telemetry、memory/context 证据、team/session 状态和 risk/approval 事件；TUI 启动时会拉取该投影并在 Runtime Activity 面板展示紧凑摘要，WebUI/报告可消费同一事实源。
+- Gateway 已提供 body-free `SessionHistoryIndexProjection`。WebUI/TUI 先读取恢复代际、checkpoint、索引覆盖和近期消息元数据，再按需分页读取正文；长 Session 首屏不再依赖全部历史正文。Runtime live projection 同时区分 Harness 与 Provider wall time，便于定位慢在上下文、调度还是模型。
+- WebUI 全景面板和 TUI 状态栏使用相同 Session/Input/Execution 投影，展示连续输入的归属决策、历史恢复状态、上下文覆盖与 Harness/Provider 延迟；Surface 不自行推断第二套执行状态。
 - Runtime 已在 provider usage 层接入 `ModelPerformanceRegistry`，能从 `RunModelTelemetry` 聚合首 token 延迟、输出速度、真实/估算 usage、失败率和质量评分，并按 quick/standard/deep/recovery 意图生成 `ModelRouteDecision`；`runtime_capabilities` 已暴露 `model_router`，模型能看到该能力并据此选择快答、深度或恢复策略。
 - SurfaceHost 已具备持久 inbox/outbox/delivery event、重试、DLQ 和 operator replay/retry 修复入口。
 - SurfaceHost 已能把 inbound runtime 处理和 outbound reply 投递关联成完整状态机，`replied` / `reply_failed` / `reply_retry_scheduled` 进入 inbox 终态或修复态，WebUI/TUI 使用 active snapshot 避免已回复消息继续显示为 working。
 - Feishu managed sidecar 已通过 WebSocket 接收真实消息，并支持 `message.processing_complete` / `message.processing_failed` action 清理 Typing reaction；回复发送路径也会兜底清理原消息处理状态。
 - WebUI 静态 surface 构建产物已要求同时生成 `dist/index.html`，Gateway 根路由和 `/s/webui/*` fallback 均以该文件为静态入口。
-- 当前阶段版本标签：`v0.9.616`。
+- 当前阶段版本标签：`v0.9.622`。
 
 ### 11.2 是否达到当前阶段目标
 

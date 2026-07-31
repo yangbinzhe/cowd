@@ -143,6 +143,7 @@ fn is_reliable_event(event: &CowdEvent) -> bool {
                 | crate::protocol::GatewaySessionEvent::TerminalCommitted { .. }
                 | crate::protocol::GatewaySessionEvent::TurnError { .. },
         } | CowdEvent::SessionHistoryPage { .. }
+            | CowdEvent::SessionHistoryIndexLoaded { .. }
             | CowdEvent::SessionHistoryCatchupPage { .. }
             | CowdEvent::SessionHistoryHydrated { .. }
             | CowdEvent::SessionHistoryOlderPage { .. }

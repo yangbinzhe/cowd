@@ -5,7 +5,8 @@ use cowd_app_host::TuiAppEvent;
 
 pub use harness_contract::projection::{
     ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionLiveUpdate, ExecutionProjection,
-    ProjectionDelta, SessionExecutionIndexProjection,
+    ProjectionDelta, SessionExecutionIndexProjection, SessionHistoryIndexProjection,
+    SessionHistoryRecoveryState,
 };
 
 /// Stable identity carried by Gateway session events.
@@ -404,6 +405,11 @@ pub enum CowdEvent {
     },
     SessionHistoryPage {
         page: SessionMessagesPage,
+    },
+    /// Body-free activation/history navigation state loaded before transcript
+    /// pages. This is the same typed Gateway contract consumed by WebUI.
+    SessionHistoryIndexLoaded {
+        projection: SessionHistoryIndexProjection,
     },
     /// Messages committed after the last accepted durable sequence. App may
     /// install these only while its visible window is at the durable tail;

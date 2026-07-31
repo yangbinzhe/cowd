@@ -13,18 +13,37 @@ CONFIG_HOME="$TMP_DIR/config"
 HOME_DIR="$TMP_DIR/home"
 LOG="$TMP_DIR/gateway.log"
 API_TOKEN="context-runtime-$$_credential"
+FAILED=0
 
 curl() {
   command curl -H "Authorization: Bearer $API_TOKEN" "$@"
 }
 
 cleanup() {
+  if [[ "$FAILED" == "1" && "${COWD_CONTEXT_RUNTIME_KEEP_TMP:-0}" == "1" ]]; then
+    echo "preserving context runtime temp dir: $TMP_DIR" >&2
+    return
+  fi
   if command -v tmux >/dev/null 2>&1; then
     tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
   fi
   rm -rf "$TMP_DIR"
 }
+
+on_error() {
+  local status=$?
+  FAILED=1
+  echo "context runtime scenario failed with status $status" >&2
+  echo "----- context runtime temp dir -----" >&2
+  echo "$TMP_DIR" >&2
+  echo "----- gateway log -----" >&2
+  sed -n '1,260p' "$LOG" >&2 || true
+  echo "-----------------------" >&2
+  exit "$status"
+}
+
 trap cleanup EXIT
+trap on_error ERR
 
 if ! command -v tmux >/dev/null 2>&1; then
   echo "tmux is required for context runtime scenario" >&2
@@ -39,6 +58,13 @@ fi
 mkdir -p "$WORKDIR/.cowd" "$CONFIG_HOME" "$HOME_DIR/.cowd"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "claude-sonnet-4-6"
+providers:
+  scenario:
+    base_url: "http://127.0.0.1:1"
+    api_key: "context-runtime-provider-key"
+    protocol: "completions"
+    models:
+      - "claude-sonnet-4-6"
 permissions:
   defaultMode: "dontAsk"
 memory:

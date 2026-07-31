@@ -29,6 +29,7 @@ pub struct SystemStatusBar {
     evidence: String,
     model: String,
     transport: String,
+    history: String,
     issue: Option<String>,
     activity_timeline_len: usize,
     activity_full_sync_revision: u64,
@@ -165,6 +166,18 @@ impl SystemStatusBar {
                 };
             }
         }
+        self.history = app.session_history_index.as_ref().map_or_else(
+            || "history:syncing".to_string(),
+            |index| {
+                let indexed = index
+                    .indexed_through_sequence
+                    .map_or(0, |sequence| sequence.saturating_add(1));
+                format!(
+                    "history:{indexed}/{} g{}",
+                    index.total_messages, index.projection_generation
+                )
+            },
+        );
         self.issue = app
             .gateway_degraded_reasons
             .first()
@@ -213,6 +226,8 @@ impl Component for SystemStatusBar {
                 format!("session {}", short_session(&self.session_id)),
                 Style::default().fg(Color::White),
             ),
+            sep(),
+            Span::styled(self.history.clone(), Style::default().fg(Color::DarkGray)),
             sep(),
             Span::styled(
                 format!("approvals:{} ", self.approval_count),

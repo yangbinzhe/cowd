@@ -414,6 +414,10 @@ impl StatusBar {
                 "run_status" => Some(format_run_status(app)),
                 "model_telemetry" => {
                     let mut facts = Vec::new();
+                    if let Some(latency) = app.current_execution_latency.as_ref() {
+                        facts.push(format!("h:{}ms", latency.harness_elapsed_ms));
+                        facts.push(format!("p:{}ms", latency.provider_wall_ms));
+                    }
                     if let Some(telemetry) = app.latest_model_telemetry.as_ref() {
                         if let Some(latency) = telemetry.first_token_latency_ms {
                             facts.push(format!("first:{}ms", latency));

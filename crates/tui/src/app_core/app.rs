@@ -529,6 +529,7 @@ pub struct App {
     pub execution_started_at_ms: Option<u64>,
     pub last_progress_at_ms: Option<u64>,
     pub current_run_metrics: Option<harness_contract::projection::RunMetricsProjection>,
+    pub current_execution_latency: Option<harness_contract::projection::ExecutionLatencyProjection>,
     pub latest_model_telemetry: Option<crate::protocol::RunModelTelemetryProjection>,
     pub context_used_tokens: Option<u64>,
     pub context_window_tokens: Option<u64>,
@@ -536,6 +537,7 @@ pub struct App {
     pub context_usage_percent_bp: Option<u16>,
     pub context_usage_source: Option<String>,
     pub history_hydrated: bool,
+    pub session_history_index: Option<crate::protocol::SessionHistoryIndexProjection>,
     pub history_hydration_error: Option<String>,
     pub history_window_truncated: bool,
     pub history_oldest_offset: usize,
@@ -880,6 +882,7 @@ impl App {
             execution_started_at_ms: None,
             last_progress_at_ms: None,
             current_run_metrics: None,
+            current_execution_latency: None,
             latest_model_telemetry: None,
             context_used_tokens: None,
             context_window_tokens: None,
@@ -887,6 +890,7 @@ impl App {
             context_usage_percent_bp: None,
             context_usage_source: None,
             history_hydrated: false,
+            session_history_index: None,
             history_hydration_error: None,
             history_window_truncated: false,
             history_oldest_offset: 0,
@@ -1188,6 +1192,7 @@ impl App {
         self.execution_started_at_ms = Some(live.started_at_ms);
         self.last_progress_at_ms = Some(live.last_progress_at_ms);
         self.current_run_metrics = Some(live.metrics.clone());
+        self.current_execution_latency = Some(live.latency.clone());
         self.turn_input_tokens = live.metrics.input_tokens;
         self.turn_output_tokens = live.metrics.output_tokens;
         self.turn_usage_known = live.context_usage.as_ref().is_some_and(|usage| {
@@ -1309,6 +1314,7 @@ impl App {
         self.execution_started_at_ms = None;
         self.last_progress_at_ms = None;
         self.current_run_metrics = None;
+        self.current_execution_latency = None;
         self.latest_model_telemetry = None;
         self.effective_model = None;
         self.model_source = None;
@@ -3973,6 +3979,28 @@ impl App {
             CowdEvent::SessionHistoryPage { page } => {
                 self.apply_history_page(page);
             }
+            CowdEvent::SessionHistoryIndexLoaded { projection } => {
+                if projection.session_id == self.session_id {
+                    self.history_total_messages = projection.total_messages as usize;
+                    self.history_has_older =
+                        projection.total_messages as usize > self.timeline_len();
+                    if !matches!(
+                        projection.recovery_state,
+                        crate::protocol::SessionHistoryRecoveryState::Ready
+                            | crate::protocol::SessionHistoryRecoveryState::ManifestRebuilt
+                    ) {
+                        self.add_system_notice(
+                            SystemNoticeKind::Warning,
+                            &format!(
+                                "Session history index recovery state: {:?}",
+                                projection.recovery_state
+                            ),
+                        );
+                    }
+                    self.session_history_index = Some(projection);
+                    self.msg_version = self.msg_version.wrapping_add(1);
+                }
+            }
             CowdEvent::SessionHistoryCatchupPage { page } => {
                 let visible_at_tail = self.history_window_end_offset >= self.history_total_messages;
                 if visible_at_tail {
@@ -5012,6 +5040,7 @@ mod tests {
                     total_tokens: 207,
                     ..Default::default()
                 },
+                latency: Default::default(),
                 output_preview: None,
                 output_preview_start_bytes: 0,
                 output_bytes: 0,
@@ -5137,6 +5166,42 @@ mod tests {
             .notification
             .as_deref()
             .is_some_and(|notice| notice.contains("Durable history")));
+    }
+
+    #[test]
+    fn body_free_history_index_drives_session_coverage_without_materializing_messages() {
+        let mut app = App::new("test", "sess");
+        app.apply_event(CowdEvent::SessionHistoryIndexLoaded {
+            projection: crate::protocol::SessionHistoryIndexProjection {
+                schema_version: 1,
+                session_id: "sess".to_string(),
+                projection_generation: 9,
+                durable_cursor: 42,
+                event_cursor: 41,
+                history_revision: 7,
+                total_messages: 100_000,
+                total_bytes: 8_000_000,
+                latest_checkpoint_sequence: Some(90_000),
+                latest_checkpoint_event_id: Some("checkpoint-1".to_string()),
+                index_generation: 4,
+                indexed_through_sequence: Some(99_999),
+                index_card_count: 250,
+                index_complete: true,
+                recovery_state: crate::protocol::SessionHistoryRecoveryState::Ready,
+                recent_metadata: Vec::new(),
+                cards: Vec::new(),
+            },
+        });
+
+        assert_eq!(app.history_total_messages, 100_000);
+        assert!(app.history_has_older);
+        assert_eq!(
+            app.session_history_index
+                .as_ref()
+                .map(|index| (index.projection_generation, index.durable_cursor)),
+            Some((9, 42))
+        );
+        assert!(app.timeline_is_empty());
     }
 
     #[test]

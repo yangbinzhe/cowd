@@ -65,6 +65,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         .route("/api/sessions/:id/turns", get(get_session_turns))
         .route("/api/sessions/:id/turns/:turn_id", get(get_session_turn))
         .route(
+            "/api/sessions/:id/history-index",
+            get(get_session_history_index),
+        )
+        .route(
             "/api/sessions/:id/turns/:turn_id/evidence",
             get(get_turn_evidence),
         )
@@ -645,10 +649,200 @@ struct GetEventsParams {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct SessionHistoryIndexQuery {
+    #[serde(default = "default_history_metadata_limit")]
+    metadata_limit: usize,
+    #[serde(default = "default_history_card_limit")]
+    card_limit: usize,
+}
+
+const fn default_history_metadata_limit() -> usize {
+    128
+}
+
+const fn default_history_card_limit() -> usize {
+    64
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchMessagesParams {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
+}
+
+pub(super) async fn get_session_history_index(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Query(query): Query<SessionHistoryIndexQuery>,
+) -> Result<
+    Json<harness_contract::projection::SessionHistoryIndexProjection>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    use harness_contract::projection::{
+        SessionHistoryCardProjection, SessionHistoryIndexProjection,
+        SessionHistoryMessageMetadataProjection, SessionHistoryRecoveryState,
+        SESSION_HISTORY_INDEX_SCHEMA_VERSION,
+    };
+
+    authorize_session_access(&state, &principal, &id, SessionAccess::Read).await?;
+    let runtime = state.services.runtime.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "runtime service unavailable".to_string(),
+            }),
+        )
+    })?;
+    let history = runtime
+        .runtime_services()
+        .session_history_reader()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "canonical session history reader unavailable".to_string(),
+                }),
+            )
+        })?;
+    let mut rebuilt = false;
+    let manifest = match history.activation_manifest(&id).await {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            rebuilt = true;
+            history
+                .rebuild_activation_manifest(
+                    &id,
+                    chrono::Utc::now().timestamp_millis().max(0) as u64,
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!("failed to rebuild session history manifest: {error}"),
+                        }),
+                    )
+                })?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: format!("session {id} has no durable history manifest"),
+                        }),
+                    )
+                })?
+        }
+        Err(error) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to read session history manifest: {error}"),
+                }),
+            ));
+        }
+    };
+    let total_messages = manifest.recovery.transcript_messages as usize;
+    let metadata_limit = query.metadata_limit.clamp(1, 2_048);
+    let recent_metadata = history
+        .message_metadata_page(
+            &id,
+            total_messages.saturating_sub(metadata_limit),
+            metadata_limit,
+        )
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to read session history metadata: {error}"),
+                }),
+            )
+        })?
+        .into_iter()
+        .map(|item| SessionHistoryMessageMetadataProjection {
+            message_id: item.stable_message_id,
+            sequence: item.sequence as u64,
+            role: item.role,
+            blocks_count: item.blocks_count as u64,
+            tool_use_id: item.tool_use_id,
+            tool_name: item.tool_name,
+            created_at_ms: item.created_at_ms,
+            content_bytes: item.content_bytes as u64,
+        })
+        .collect();
+    let cards = history
+        .context_index_cards(&id, query.card_limit.clamp(1, 512))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to read session history cards: {error}"),
+                }),
+            )
+        })?
+        .into_iter()
+        .map(|card| SessionHistoryCardProjection {
+            card_id: card.card_id,
+            parent_card_id: card.parent_card_id,
+            source_start_sequence: card.source_start_sequence as u64,
+            source_end_sequence: card.source_end_sequence as u64,
+            source_message_count: card.source_message_count as u64,
+            source_digest: card.source_digest,
+            summary: card.summary,
+            scope: card.scope,
+            authority: card.authority,
+            generation: card.generation,
+            updated_at_ms: card.updated_at_ms,
+        })
+        .collect();
+    let checkpoint = history
+        .latest_domain_event_by_kind(&id, "memory.semantic_checkpoint.created")
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("failed to read session checkpoint locator: {error}"),
+                }),
+            )
+        })?;
+    let recovery_state = if rebuilt {
+        SessionHistoryRecoveryState::ManifestRebuilt
+    } else if manifest.recovery.latest_checkpoint_sequence.is_some() && checkpoint.is_none() {
+        SessionHistoryRecoveryState::CheckpointMissing
+    } else if checkpoint
+        .as_ref()
+        .is_some_and(|event| crate::semantic_checkpoint_from_event(event, &id).is_none())
+    {
+        SessionHistoryRecoveryState::CheckpointMalformed
+    } else if !manifest.index_complete {
+        SessionHistoryRecoveryState::IndexPending
+    } else {
+        SessionHistoryRecoveryState::Ready
+    };
+    Ok(Json(SessionHistoryIndexProjection {
+        schema_version: SESSION_HISTORY_INDEX_SCHEMA_VERSION,
+        session_id: id,
+        projection_generation: manifest.projection_generation,
+        durable_cursor: manifest.recovery.durable_cursor,
+        event_cursor: manifest.recovery.event_cursor,
+        history_revision: manifest.recovery.history_revision,
+        total_messages: manifest.recovery.transcript_messages,
+        total_bytes: manifest.recovery.transcript_bytes,
+        latest_checkpoint_sequence: manifest.recovery.latest_checkpoint_sequence,
+        latest_checkpoint_event_id: manifest.recovery.latest_checkpoint_event_id,
+        index_generation: manifest.recovery.index_generation,
+        indexed_through_sequence: manifest.recovery.indexed_through_sequence,
+        index_card_count: manifest.recovery.index_card_count,
+        index_complete: manifest.index_complete,
+        recovery_state,
+        recent_metadata,
+        cards,
+    }))
 }
 
 #[derive(Deserialize)]
