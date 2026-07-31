@@ -6719,11 +6719,11 @@ UU conflicted.rs",
                 )
                 .expect("test permission should authorize tool")
                 .authorization;
-            executor.execute_authorized(&authorization, tool_name, input)
+            SHARED_RT.block_on(executor.execute_authorized(&authorization, tool_name, input))
         };
 
-        assert!(executor
-            .execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
+        assert!(SHARED_RT
+            .block_on(executor.execute("mcp__alpha__echo", r#"{"text":"hello"}"#))
             .is_err());
 
         let tool_output = authorize_and_execute("mcp__alpha__echo", r#"{"text":"hello"}"#)
@@ -6741,8 +6741,8 @@ UU conflicted.rs",
             serde_json::from_str(&wrapped_output).expect("wrapped output should be json");
         assert_eq!(wrapped_json["structuredContent"]["echoed"], "wrapped");
 
-        let search_output = executor
-            .execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#)
+        let search_output = SHARED_RT
+            .block_on(executor.execute("ToolSearch", r#"{"query":"alpha echo","max_results":5}"#))
             .expect("tool search should execute");
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");
@@ -6825,8 +6825,8 @@ UU conflicted.rs",
         let executor =
             GatewayToolExecutor::from_tool_host(None, false, tool_host, state.mcp_state.clone());
 
-        let search_output = executor
-            .execute("ToolSearch", r#"{"query":"remote","max_results":5}"#)
+        let search_output = SHARED_RT
+            .block_on(executor.execute("ToolSearch", r#"{"query":"remote","max_results":5}"#))
             .expect("tool search should execute");
         let search_json: serde_json::Value =
             serde_json::from_str(&search_output).expect("search output should be json");

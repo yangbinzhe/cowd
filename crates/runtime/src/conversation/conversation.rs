@@ -1882,23 +1882,20 @@ pub trait ApiClient {
     }
 }
 
-/// Trait implemented by tool dispatchers that execute model-requested tools.
+/// Object-safe asynchronous contract for model-requested Tool execution.
+///
+/// Implementors must keep native asynchronous work on the calling Runtime.
+/// Explicitly blocking libraries and process adapters are isolated by
+/// `ToolExecutionPlane`; callers must not construct private runtimes or
+/// threads.
+#[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync + 'static {
-    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError>;
-
     /// Execute a Tool using the bounded-output contract consumed by Runtime.
-    ///
-    /// Implementors that can produce large output should publish it through
-    /// Runtime's Artifact sink and return `StagedArtifact`. Existing small
-    /// tools retain their behavior through this default adapter.
-    fn execute_output(
+    async fn execute_output(
         &self,
         tool_name: &str,
         input: &str,
-    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        self.execute(tool_name, input)
-            .map(harness_contract::context::ToolOutputDraft::bounded_inline)
-    }
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError>;
 
     /// Production executors override this with a receipt from their pinned
     /// ToolHost. The fallback is deliberately read-only for small embedded and
@@ -1980,25 +1977,15 @@ pub trait ToolExecutor: Send + Sync + 'static {
             .collect()
     }
 
-    fn execute_authorized(
+    async fn execute_authorized_output(
         &self,
         _authorization: &harness_contract::tool::ToolExecutionAuthorization,
         tool_name: &str,
         _input: &str,
-    ) -> Result<String, ToolError> {
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         Err(ToolError::new(format!(
             "tool `{tool_name}` has no authorized execution implementation"
         )))
-    }
-
-    fn execute_authorized_output(
-        &self,
-        authorization: &harness_contract::tool::ToolExecutionAuthorization,
-        tool_name: &str,
-        input: &str,
-    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-        self.execute_authorized(authorization, tool_name, input)
-            .map(harness_contract::context::ToolOutputDraft::bounded_inline)
     }
 
     fn has_registered_tools(&self) -> bool {
@@ -6494,27 +6481,30 @@ where
         let checkpoint_demand = crate::governed_tool_plan::resource_demand_from_effect(&descriptor);
         let result = self
             .tool_execution_plane
-            .execute_classified(
+            .execute_async_classified_retained(
                 &checkpoint_demand,
                 Some(timeout),
                 self.execution_service_class,
                 Some(self.execution_service_class),
                 Some(self.session().session_id.as_str()),
-                move || {
-                    executor.execute_authorized(
-                        &authorization.authorization,
-                        "checkpoint_create",
-                        &checkpoint_input,
-                    )
+                async move {
+                    executor
+                        .execute_authorized_output(
+                            &authorization.authorization,
+                            "checkpoint_create",
+                            &checkpoint_input,
+                        )
+                        .await
                 },
             )
             .await;
+        let result = result.0;
         match result {
             Ok(Ok(output)) => {
                 validation.checkpoint_created = true;
                 tracing::info!(
                     strategy_lease_id = %execution_decision.lease.lease_id,
-                    checkpoint = %preview_chars(&output, 240),
+                    checkpoint = %preview_chars(output.model_text(), 240),
                     "strategy checkpoint created before mutation"
                 );
             }
@@ -6827,32 +6817,32 @@ where
                     crate::execution_core::graph::ToolEffectState::Fresh
                     | crate::execution_core::graph::ToolEffectState::NotRequired => {
                         let (execution, admission) = plane
-                            .execute_classified_retained(
+                            .execute_async_classified_retained(
                                 &demand,
                                 Some(tool_timeout),
                                 self.execution_service_class,
                                 Some(self.execution_service_class),
                                 Some(self.session().session_id.as_str()),
-                                move || {
+                                async move {
                                     if is_evidence_retrieve {
                                         return retrieve_tool_evidence_from_sandbox(
-                                        evidence_sandbox.as_ref(),
-                                        &tinput,
-                                    )
-                                    .map(harness_contract::context::ToolOutputDraft::bounded_inline)
-                                    .map_err(ToolError::new);
+                                            evidence_sandbox.as_ref(),
+                                            &tinput,
+                                        )
+                                        .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+                                        .map_err(ToolError::new);
                                     }
                                     if matches!(
                                         tname.as_str(),
                                         "ToolSearch" | "runtime_capabilities"
                                     ) {
-                                        tool_exec.execute_output(&tname, &tinput)
+                                        tool_exec.execute_output(&tname, &tinput).await
                                     } else {
                                         tool_exec.execute_authorized_output(
                                             &authorization.authorization,
                                             &tname,
                                             &tinput,
-                                        )
+                                        ).await
                                     }
                                 },
                             )
@@ -10837,11 +10827,22 @@ impl StaticToolExecutor {
     }
 }
 
+#[async_trait::async_trait]
 impl ToolExecutor for StaticToolExecutor {
-    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
-        self.handlers
+    async fn execute_output(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        let output = self
+            .handlers
             .get(tool_name)
-            .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(input)
+            .ok_or_else(|| ToolError::new(format!("unknown tool: {tool_name}")))?(
+            input
+        )?;
+        Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
+            output,
+        ))
     }
 
     fn registered_tool_effect(
@@ -10913,18 +10914,18 @@ impl ToolExecutor for StaticToolExecutor {
         })
     }
 
-    fn execute_authorized(
+    async fn execute_authorized_output(
         &self,
         authorization: &harness_contract::tool::ToolExecutionAuthorization,
         tool_name: &str,
         input: &str,
-    ) -> Result<String, ToolError> {
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         if authorization.tool_id != tool_name {
             return Err(ToolError::new(
                 "static tool authorization names a different tool",
             ));
         }
-        self.execute(tool_name, input)
+        self.execute_output(tool_name, input).await
     }
 
     fn has_registered_tools(&self) -> bool {
@@ -13710,8 +13711,13 @@ mod tests {
 
     struct ExposureToolExecutor;
 
+    #[async_trait::async_trait]
     impl crate::ToolExecutor for ExposureToolExecutor {
-        fn execute(&self, _name: &str, _input: &str) -> Result<String, crate::ToolError> {
+        async fn execute_output(
+            &self,
+            _name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
             Err(crate::ToolError::new("test executor must not run"))
         }
 
@@ -13825,8 +13831,13 @@ mod tests {
 
     struct MutationExposureToolExecutor;
 
+    #[async_trait::async_trait]
     impl crate::ToolExecutor for MutationExposureToolExecutor {
-        fn execute(&self, _name: &str, _input: &str) -> Result<String, crate::ToolError> {
+        async fn execute_output(
+            &self,
+            _name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
             Err(crate::ToolError::new("exposure test executor must not run"))
         }
 
@@ -13969,13 +13980,17 @@ mod tests {
 
     struct DynamicExposureToolExecutor;
 
+    #[async_trait::async_trait]
     impl crate::ToolExecutor for DynamicExposureToolExecutor {
-        fn execute(&self, name: &str, _input: &str) -> Result<String, crate::ToolError> {
-            if name == "custom_reader" {
-                return Ok("README contents".to_string());
-            }
-            if name == "ToolSearch" {
-                return Ok(serde_json::json!({
+        async fn execute_output(
+            &self,
+            name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
+            let output = if name == "custom_reader" {
+                "README contents".to_string()
+            } else if name == "ToolSearch" {
+                serde_json::json!({
                     "query": "read files",
                     "catalog_revision": 0,
                     "descriptors": [{
@@ -13989,9 +14004,13 @@ mod tests {
                     }],
                     "activation_candidates": ["custom_reader"]
                 })
-                .to_string());
-            }
-            Err(crate::ToolError::new("unknown dynamic tool"))
+                .to_string()
+            } else {
+                return Err(crate::ToolError::new("unknown dynamic tool"));
+            };
+            Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
+                output,
+            ))
         }
 
         fn available_tool_names(&self) -> Vec<String> {
@@ -14038,18 +14057,18 @@ mod tests {
             })
         }
 
-        fn execute_authorized(
+        async fn execute_authorized_output(
             &self,
             authorization: &harness_contract::tool::ToolExecutionAuthorization,
             name: &str,
             input: &str,
-        ) -> Result<String, crate::ToolError> {
+        ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
             if authorization.tool_id != name {
                 return Err(crate::ToolError::new(
                     "dynamic tool authorization names a different tool",
                 ));
             }
-            self.execute(name, input)
+            self.execute_output(name, input).await
         }
     }
 
@@ -14212,14 +14231,15 @@ mod tests {
         };
         let discovery_output = runtime
             .tool_executor
-            .execute("ToolSearch", &calls[0].input)
+            .execute_output("ToolSearch", &calls[0].input)
+            .await
             .expect("governed ToolSearch execution");
         let discovery_result = runtime
             .prepare_governed_tool_result(
                 &calls[0].id,
                 &calls[0].name,
                 &calls[0].input,
-                &discovery_output,
+                discovery_output.model_text(),
                 false,
             )
             .await

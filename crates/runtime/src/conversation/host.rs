@@ -100,7 +100,7 @@ where
     pub system_prompt: Vec<String>,
     pub feature_config: RuntimeFeatureConfig,
     pub emit_output: bool,
-    pub stream_callback: Option<std::sync::mpsc::SyncSender<CowdEvent>>,
+    pub stream_callback: Option<tokio::sync::mpsc::Sender<CowdEvent>>,
     pub tool_callback: Option<Arc<dyn ToolCallback>>,
     pub model_context_window: Option<u32>,
     pub hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
@@ -6272,7 +6272,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
             );
             let (execution, retained_admission) = self
                 .execution_plane
-                .execute_classified_retained(
+                .execute_async_classified_retained(
                     &task.resource_demand,
                     Some(std::time::Duration::from_secs(
                         task.safety_category.default_timeout_secs(),
@@ -6280,13 +6280,14 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     self.ticket.service_class,
                     Some(self.ticket.service_class),
                     Some(self.session_id),
-                    move || {
+                    async move {
                         execute_fenced_runtime_tool(
                             host.as_ref(),
                             &commit_service,
                             &request,
                             effect.as_ref(),
                         )
+                        .await
                     },
                 )
                 .await;
@@ -6598,7 +6599,7 @@ fn failed_governed_tool_outcome(
     }
 }
 
-fn execute_fenced_runtime_tool(
+async fn execute_fenced_runtime_tool(
     host: &dyn crate::RuntimeExecutionHost,
     commit_service: &crate::execution_core::graph::ExecutionCommitService,
     request: &crate::RuntimeToolExecutionRequest,
@@ -6647,7 +6648,7 @@ fn execute_fenced_runtime_tool(
             crate::execution_core::graph::ToolEffectState::Fresh
             | crate::execution_core::graph::ToolEffectState::NotRequired,
         ) => {
-            let outcome = host.execute_runtime_tool(request);
+            let outcome = host.execute_runtime_tool(request).await;
             if let Err(error) = commit_service.commit_tool_effect(request, effect, &outcome) {
                 return crate::RuntimeToolExecutionOutcome {
                     tool_use_id: request.tool_use_id.clone(),
@@ -9981,8 +9982,13 @@ mod tests {
 
     struct NoopToolExecutor;
 
+    #[async_trait::async_trait]
     impl ToolExecutor for NoopToolExecutor {
-        fn execute(&self, name: &str, _input: &str) -> Result<String, ToolError> {
+        async fn execute_output(
+            &self,
+            name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
             Err(ToolError::new(format!("unexpected tool call: {name}")))
         }
     }
@@ -10085,14 +10091,21 @@ mod tests {
 
     struct TeamTerminalReceiptExecutor;
 
+    #[async_trait::async_trait]
     impl ToolExecutor for TeamTerminalReceiptExecutor {
-        fn execute(&self, name: &str, _input: &str) -> Result<String, ToolError> {
+        async fn execute_output(
+            &self,
+            name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
             assert_eq!(name, "runtime_orchestrate");
-            Ok(serde_json::json!({
-                "status": "completed",
-                "terminal_summary": "Team completed the architecture review with checked runtime evidence."
-            })
-            .to_string())
+            Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
+                serde_json::json!({
+                    "status": "completed",
+                    "terminal_summary": "Team completed the architecture review with checked runtime evidence."
+                })
+                .to_string(),
+            ))
         }
 
         fn available_tool_names(&self) -> Vec<String> {
@@ -10143,16 +10156,16 @@ mod tests {
             })
         }
 
-        fn execute_authorized(
+        async fn execute_authorized_output(
             &self,
             authorization: &harness_contract::tool::ToolExecutionAuthorization,
             name: &str,
             input: &str,
-        ) -> Result<String, ToolError> {
+        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
             if authorization.tool_id != name {
                 return Err(ToolError::new("authorization tool does not match request"));
             }
-            self.execute(name, input)
+            self.execute_output(name, input).await
         }
     }
 
@@ -10452,14 +10465,15 @@ mod tests {
         observed_peak: Arc<AtomicUsize>,
     }
 
+    #[async_trait::async_trait]
     impl crate::RuntimeExecutionHost for ConcurrentRuntimeToolHost {
-        fn execute_runtime_tool(
+        async fn execute_runtime_tool(
             &self,
             request: &crate::RuntimeToolExecutionRequest,
         ) -> crate::RuntimeToolExecutionOutcome {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.observed_peak.fetch_max(active, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
             crate::RuntimeToolExecutionOutcome {
                 tool_use_id: request.tool_use_id.clone(),
@@ -10473,10 +10487,15 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ToolExecutor for RecordingToolExecutor {
-        fn execute(&self, name: &str, _input: &str) -> Result<String, ToolError> {
-            if name == "ToolSearch" {
-                return Ok(serde_json::json!({
+        async fn execute_output(
+            &self,
+            name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+            let output = if name == "ToolSearch" {
+                serde_json::json!({
                     "query": "read and update source files",
                     "catalog_revision": 0,
                     "descriptors": [
@@ -10501,11 +10520,15 @@ mod tests {
                     ],
                     "activation_candidates": ["read_file", "write_file"]
                 })
-                .to_string());
-            }
-            self.order.lock().unwrap().push(name.to_string());
-            self.executed.fetch_add(1, Ordering::SeqCst);
-            Ok(format!("{name} complete"))
+                .to_string()
+            } else {
+                self.order.lock().unwrap().push(name.to_string());
+                self.executed.fetch_add(1, Ordering::SeqCst);
+                format!("{name} complete")
+            };
+            Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
+                output,
+            ))
         }
 
         fn available_tool_names(&self) -> Vec<String> {
@@ -10566,16 +10589,16 @@ mod tests {
             }
         }
 
-        fn execute_authorized(
+        async fn execute_authorized_output(
             &self,
             authorization: &harness_contract::tool::ToolExecutionAuthorization,
             name: &str,
             input: &str,
-        ) -> Result<String, ToolError> {
+        ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
             if authorization.tool_id != name {
                 return Err(ToolError::new("authorization tool does not match request"));
             }
-            self.execute(name, input)
+            self.execute_output(name, input).await
         }
 
         fn classify_tool_safety(

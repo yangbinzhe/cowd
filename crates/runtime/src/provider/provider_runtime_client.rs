@@ -94,7 +94,7 @@ pub struct ProviderRuntimeClient {
     tool_exposure: Option<ToolExposureProjection>,
     reasoning_effort: Option<String>,
     emit_output: bool,
-    stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     tool_schema_cache: Arc<std::sync::Mutex<Option<CompiledToolSchema>>>,
     tool_schema_compilations: Arc<AtomicU64>,
     tool_schema_cache_hits: Arc<AtomicU64>,
@@ -214,7 +214,7 @@ impl ProviderRuntimeClient {
     #[must_use]
     pub fn with_stream_callback(
         mut self,
-        stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+        stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     ) -> Self {
         self.stream_callback = stream_callback;
         self
@@ -539,7 +539,7 @@ async fn forward_provider_attempt(
     context_window_limit: u32,
     reasoning_effort: Option<String>,
     emit_output: bool,
-    stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     sender: tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) {
     let request_context = &entry.request_context;
@@ -637,7 +637,7 @@ async fn forward_provider_stream(
     effective_model: &str,
     resolved_profile: &ResolvedProviderProfile,
     emit_output: bool,
-    stream_callback: Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let mut stream = client
@@ -974,7 +974,7 @@ async fn forward_events(
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
     events: Vec<AssistantEvent>,
     emit_output: bool,
-    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    stream_callback: &Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     emitted: &mut bool,
 ) -> bool {
     for event in events {
@@ -989,7 +989,7 @@ async fn forward_event(
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
     event: AssistantEvent,
     emit_output: bool,
-    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    stream_callback: &Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     emitted: &mut bool,
 ) -> bool {
     if let AssistantEvent::TextDelta(text) = &event {
@@ -1016,7 +1016,7 @@ async fn forward_text_delta(
     text: String,
     pending_text: &mut String,
     emit_output: bool,
-    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    stream_callback: &Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     emitted: &mut bool,
 ) -> bool {
     if pending_text.is_empty() && sender.capacity() > 0 {
@@ -1040,7 +1040,7 @@ async fn flush_pending_text(
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
     pending_text: &mut String,
     emit_output: bool,
-    stream_callback: &Option<std::sync::mpsc::SyncSender<crate::CowdEvent>>,
+    stream_callback: &Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     emitted: &mut bool,
 ) -> bool {
     if pending_text.is_empty() {

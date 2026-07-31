@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
@@ -224,31 +223,20 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         });
         let policy = permission_policy(&packet.permission_lease, &allowed_tools);
         let cancellation = crate::CancellationToken::new();
-        let (provider_event_sender, provider_event_receiver) = mpsc::sync_channel(64);
-        let progress_reporter_stop = Arc::new(AtomicBool::new(false));
-        let reporter_stop = Arc::clone(&progress_reporter_stop);
+        let (provider_event_sender, mut provider_event_receiver) = tokio::sync::mpsc::channel(64);
         let progress_runtime = Arc::clone(services.agent_runtime());
         let progress_agent_id = packet.agent_id().to_string();
         let progress_run_id = packet.run_id().to_string();
-        let progress_reporter = std::thread::spawn(move || {
+        let progress_reporter = tokio::spawn(async move {
             let mut saw_model_output = false;
-            while !reporter_stop.load(Ordering::SeqCst) {
-                match provider_event_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(event) => {
-                        if matches!(event, crate::CowdEvent::TextDelta { .. }) && !saw_model_output
-                        {
-                            saw_model_output = true;
-                            let _ = progress_runtime.record_progress(
-                                &progress_agent_id,
-                                "agent.provider.first_output",
-                                &format!(
-                                    "provider produced the first output for run {progress_run_id}"
-                                ),
-                            );
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            while let Some(event) = provider_event_receiver.recv().await {
+                if matches!(event, crate::CowdEvent::TextDelta { .. }) && !saw_model_output {
+                    saw_model_output = true;
+                    let _ = progress_runtime.record_progress(
+                        &progress_agent_id,
+                        "agent.provider.first_output",
+                        &format!("provider produced the first output for run {progress_run_id}"),
+                    );
                 }
             }
         });
@@ -408,8 +396,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // reporter owns no runtime state beyond the lifecycle projection, so
         // it can be joined before the terminal Agent result is committed.
         drop(runtime);
-        progress_reporter_stop.store(true, Ordering::SeqCst);
-        let _ = progress_reporter.join();
+        let _ = progress_reporter.await;
         drop(active_run_cleanup);
         let summary = result.map_err(|error| format!("in-process agent turn failed: {error}"))?;
         let evidence_refs =
@@ -842,8 +829,13 @@ struct ScopedToolExecutionReceipt {
     after_digests: BTreeMap<String, Option<String>>,
 }
 
+#[async_trait::async_trait]
 impl ToolExecutor for ScopedRuntimeToolExecutor {
-    fn execute(&self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+    async fn execute_output(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         if tool_name == "ToolSearch" {
             let query = serde_json::from_str::<serde_json::Value>(input)
                 .ok()
@@ -856,9 +848,11 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
                 .unwrap_or_default();
             let mut receipt = self.tool_discovery_receipt();
             receipt.query = query;
-            return serde_json::to_string(&receipt).map_err(|error| {
-                ToolError::new(format!("serialize agent tool discovery: {error}"))
-            });
+            return serde_json::to_string(&receipt)
+                .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+                .map_err(|error| {
+                    ToolError::new(format!("serialize agent tool discovery: {error}"))
+                });
         }
         if tool_name == "checkpoint_create" {
             return Err(ToolError::new(
@@ -878,6 +872,8 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
         self.execute_scoped(tool_name, &normalized_input, None)
+            .await
+            .map(harness_contract::context::ToolOutputDraft::bounded_inline)
     }
 
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
@@ -943,19 +939,22 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         })?
     }
 
-    fn execute_authorized(
+    async fn execute_authorized_output(
         &self,
         authorization: &harness_contract::tool::ToolExecutionAuthorization,
         tool_name: &str,
         input: &str,
-    ) -> Result<String, ToolError> {
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
         if authorization.tool_id != tool_name {
             return Err(ToolError::new(
                 "agent tool authorization does not match the allowed tool request",
             ));
         }
         if tool_name == "checkpoint_create" {
-            return self.execute_internal_checkpoint(input, authorization.clone());
+            return self
+                .execute_internal_checkpoint(input, authorization.clone())
+                .await
+                .map(harness_contract::context::ToolOutputDraft::bounded_inline);
         }
         if !self.allowed_tools.contains(tool_name) {
             return Err(ToolError::new(
@@ -970,6 +969,8 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
         self.execute_scoped(tool_name, &normalized_input, Some(authorization.clone()))
+            .await
+            .map(harness_contract::context::ToolOutputDraft::bounded_inline)
     }
 
     fn available_tool_names(&self) -> Vec<String> {
@@ -1032,7 +1033,7 @@ impl ScopedRuntimeToolExecutor {
         Ok(serde_json::Value::Object(object))
     }
 
-    fn execute_internal_checkpoint(
+    async fn execute_internal_checkpoint(
         &self,
         input: &str,
         authorization: harness_contract::tool::ToolExecutionAuthorization,
@@ -1078,7 +1079,7 @@ impl ScopedRuntimeToolExecutor {
             evaluation_isolated: false,
             managed_invocation: None,
         };
-        let outcome = self.host.execute_runtime_tool(&request);
+        let outcome = self.host.execute_runtime_tool(&request).await;
         match outcome.status {
             RuntimeToolExecutionStatus::Executed => Ok(outcome.output.unwrap_or_default()),
             RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(
@@ -1156,7 +1157,7 @@ impl ScopedRuntimeToolExecutor {
         Ok(())
     }
 
-    fn execute_scoped(
+    async fn execute_scoped(
         &self,
         tool_name: &str,
         input: &str,
@@ -1228,7 +1229,7 @@ impl ScopedRuntimeToolExecutor {
             evaluation_isolated: false,
             managed_invocation: self.managed_invocation.clone(),
         };
-        let outcome = self.host.execute_runtime_tool(&request);
+        let outcome = self.host.execute_runtime_tool(&request).await;
         match outcome.status {
             RuntimeToolExecutionStatus::Executed => {
                 let after_digests = requested
@@ -2349,8 +2350,9 @@ mod tests {
 
     struct NoopRuntimeExecutionHost;
 
+    #[async_trait::async_trait]
     impl crate::RuntimeExecutionHost for NoopRuntimeExecutionHost {
-        fn execute_runtime_tool(
+        async fn execute_runtime_tool(
             &self,
             _request: &crate::RuntimeToolExecutionRequest,
         ) -> crate::RuntimeToolExecutionOutcome {
@@ -2368,8 +2370,9 @@ mod tests {
 
     struct EchoRuntimeExecutionHost;
 
+    #[async_trait::async_trait]
     impl crate::RuntimeExecutionHost for EchoRuntimeExecutionHost {
-        fn execute_runtime_tool(
+        async fn execute_runtime_tool(
             &self,
             request: &crate::RuntimeToolExecutionRequest,
         ) -> crate::RuntimeToolExecutionOutcome {
@@ -2418,8 +2421,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl crate::RuntimeExecutionHost for InputSensitiveRuntimeExecutionHost {
-        fn execute_runtime_tool(
+        async fn execute_runtime_tool(
             &self,
             request: &crate::RuntimeToolExecutionRequest,
         ) -> crate::RuntimeToolExecutionOutcome {
@@ -2640,8 +2644,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn team_tool_boundary_enforces_the_exact_focus_scope() {
+    #[tokio::test]
+    async fn team_tool_boundary_enforces_the_exact_focus_scope() {
         let root = tempfile::tempdir().expect("scoped workspace");
         std::fs::create_dir_all(root.path().join("crates/runtime/src")).expect("runtime scope");
         std::fs::write(root.path().join("crates/runtime/src/lib.rs"), "checked")
@@ -2731,7 +2735,8 @@ mod tests {
         })
         .to_string();
         executor
-            .execute_authorized(&authorization, "read_file", &absolute_input)
+            .execute_authorized_output(&authorization, "read_file", &absolute_input)
+            .await
             .expect("workspace-internal absolute read is normalized and executed");
         let receipts = executor
             .receipts
@@ -2741,8 +2746,8 @@ mod tests {
         assert_eq!(receipts[0].paths, ["crates/runtime/src/lib.rs"]);
     }
 
-    #[test]
-    fn absolute_path_authorization_and_execution_share_the_normalized_descriptor() {
+    #[tokio::test]
+    async fn absolute_path_authorization_and_execution_share_the_normalized_descriptor() {
         let root = tempfile::tempdir().expect("scoped workspace");
         let target = root.path().join("fixtures/target.txt");
         std::fs::create_dir_all(target.parent().expect("target parent")).expect("scope directory");
@@ -2777,9 +2782,10 @@ mod tests {
 
         assert_eq!(
             executor
-                .execute_authorized(&authorization, "read_file", &absolute_value.to_string(),)
+                .execute_authorized_output(&authorization, "read_file", &absolute_value.to_string(),)
+                .await
                 .expect("same normalized descriptor must remain current"),
-            "authorized:read_file"
+            harness_contract::context::ToolOutputDraft::bounded_inline("authorized:read_file")
         );
         let receipts = executor
             .receipts
@@ -2831,8 +2837,8 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn scoped_executor_advertises_only_packet_authorized_tools() {
+    #[tokio::test]
+    async fn scoped_executor_advertises_only_packet_authorized_tools() {
         let executor = ScopedRuntimeToolExecutor {
             host: Arc::new(NoopRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
@@ -2861,8 +2867,10 @@ mod tests {
         assert!(executor.classify_tool_safety("write_file", "{}").is_none());
         let discovery: harness_contract::tool::ToolDiscoveryReceipt = serde_json::from_str(
             &executor
-                .execute("ToolSearch", r#"{"query":"read"}"#)
-                .expect("bootstrap search should return the canonical receipt"),
+                .execute_output("ToolSearch", r#"{"query":"read"}"#)
+                .await
+                .expect("bootstrap search should return the canonical receipt")
+                .model_text(),
         )
         .expect("canonical discovery receipt");
         assert_eq!(discovery.query, "read");
@@ -2875,12 +2883,13 @@ mod tests {
             .available_tool_names()
             .contains(&"checkpoint_create".to_string()));
         assert!(executor
-            .execute("checkpoint_create", r#"{"label":"model"}"#)
+            .execute_output("checkpoint_create", r#"{"label":"model"}"#)
+            .await
             .is_err());
     }
 
-    #[test]
-    fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
+    #[tokio::test]
+    async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
         let executor = ScopedRuntimeToolExecutor {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
@@ -2913,9 +2922,16 @@ mod tests {
 
         assert_eq!(
             executor
-                .execute_authorized(&authorization, "checkpoint_create", r#"{"label":"guard"}"#,)
+                .execute_authorized_output(
+                    &authorization,
+                    "checkpoint_create",
+                    r#"{"label":"guard"}"#,
+                )
+                .await
                 .expect("hidden checkpoint should reach the pinned Runtime host"),
-            "authorized:checkpoint_create"
+            harness_contract::context::ToolOutputDraft::bounded_inline(
+                "authorized:checkpoint_create"
+            )
         );
         assert!(executor
             .receipts
@@ -2971,8 +2987,8 @@ mod tests {
         assert_eq!(output["review"], "verified");
     }
 
-    #[test]
-    fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools() {
+    #[tokio::test]
+    async fn scoped_executor_propagates_runtime_authorization_for_normal_agent_tools() {
         let executor = ScopedRuntimeToolExecutor {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
@@ -2996,15 +3012,18 @@ mod tests {
             .authorization;
         assert_eq!(
             executor
-                .execute_authorized(&authorization, "read_file", r#"{"path":"README.md"}"#)
+                .execute_authorized_output(&authorization, "read_file", r#"{"path":"README.md"}"#)
+                .await
                 .expect("authorized tool should execute"),
-            "authorized:read_file"
+            harness_contract::context::ToolOutputDraft::bounded_inline("authorized:read_file")
         );
         assert!(executor
-            .execute("read_file", r#"{"path":"README.md"}"#)
+            .execute_output("read_file", r#"{"path":"README.md"}"#)
+            .await
             .is_err());
         assert!(executor
-            .execute_authorized(&authorization, "write_file", r#"{"path":"README.md"}"#)
+            .execute_authorized_output(&authorization, "write_file", r#"{"path":"README.md"}"#)
+            .await
             .is_err());
     }
 

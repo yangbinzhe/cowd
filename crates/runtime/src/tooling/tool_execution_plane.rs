@@ -1,8 +1,10 @@
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use futures::FutureExt;
 use harness_contract::tool::{ResourceAccess, ResourceDemand};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -120,6 +122,21 @@ impl ToolExecutionPlane {
         let _ = self.supervisor.set(Arc::downgrade(supervisor));
     }
 
+    /// Central adapter for an explicitly blocking dependency used from an
+    /// already governed asynchronous Tool invocation.
+    pub async fn adapt_blocking<T, F>(operation: F) -> Result<T, ToolExecutionPlaneError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(AssertUnwindSafe(operation))
+                .map_err(|_| ToolExecutionPlaneError::Panicked)
+        })
+        .await
+        .map_err(|error| ToolExecutionPlaneError::Worker(error.to_string()))?
+    }
+
     pub async fn execute<T, F>(
         &self,
         demand: &ResourceDemand,
@@ -187,65 +204,19 @@ impl ToolExecutionPlane {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        self.counters.submitted.fetch_add(1, Ordering::Relaxed);
-        let admission_started = Instant::now();
-        let scope_requests = match scope_requests(demand) {
-            Ok(requests) => requests,
+        let mut admission = match self
+            .admit(
+                demand,
+                timeout,
+                service_class,
+                parent_class_ceiling,
+                session_id,
+            )
+            .await
+        {
+            Ok(admission) => admission,
             Err(error) => return (Err(error), None),
         };
-        let normalized_scope = format!("{scope_requests:?}");
-        let scope_lease = match self.scopes.acquire(scope_requests, timeout).await {
-            Ok(lease) => lease,
-            Err(error) => {
-                return (
-                    Err(ToolExecutionPlaneError::Admission(error.to_string())),
-                    None,
-                );
-            }
-        };
-        let resource_demands = execution_resource_demands(demand);
-        let mut request = ResourceAdmissionRequest::new(service_class, resource_demands)
-            .with_scope(normalized_scope, true)
-            .with_fairness_key(
-                session_id
-                    .map(|session_id| format!("session:{session_id}"))
-                    .unwrap_or_else(|| format!("tool:{service_class:?}")),
-            );
-        if let Some(parent_class_ceiling) = parent_class_ceiling {
-            request = request.with_parent_class_ceiling(parent_class_ceiling);
-        }
-        if let Some(remaining) = remaining_timeout(timeout, admission_started) {
-            request = request
-                .with_deadline_at_ms(wall_now_ms().saturating_add(duration_millis(remaining)));
-        }
-        let decision = match self.resources.admit(request).await {
-            Ok(decision) => decision,
-            Err(error) => {
-                return (
-                    Err(ToolExecutionPlaneError::Admission(error.to_string())),
-                    None,
-                );
-            }
-        };
-        let lease = match decision {
-            ResourceAdmissionDecision::Granted { lease, .. } => lease,
-            ResourceAdmissionDecision::Deferred { wait_reason, .. }
-            | ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
-                return (
-                    Err(ToolExecutionPlaneError::Admission(format!(
-                        "resource admission did not grant: {wait_reason:?}"
-                    ))),
-                    None,
-                );
-            }
-        };
-        let queue_wait = admission_started.elapsed();
-        let mut admission = ToolExecutionAdmission::new(
-            scope_lease,
-            lease,
-            Arc::clone(&self.resources),
-            queue_wait,
-        );
         self.counters.active.fetch_add(1, Ordering::AcqRel);
         let counters = Arc::clone(&self.counters);
         let mut worker = tokio::task::spawn_blocking(move || {
@@ -305,6 +276,139 @@ impl ToolExecutionPlane {
         };
         admission.set_result_class(result_class);
         (execution, Some(admission))
+    }
+
+    /// Execute a native asynchronous Tool while retaining its scope and
+    /// capacity leases through the caller's durable terminal commit.
+    ///
+    /// Unlike [`Self::execute_classified_retained`], this path never allocates
+    /// a blocking worker. Database, network, Runtime-control, and retrieval
+    /// adapters use this canonical path.
+    pub async fn execute_async_classified_retained<T, Fut>(
+        &self,
+        demand: &ResourceDemand,
+        timeout: Option<Duration>,
+        service_class: ExecutionServiceClass,
+        parent_class_ceiling: Option<ExecutionServiceClass>,
+        session_id: Option<&str>,
+        operation: Fut,
+    ) -> (
+        Result<T, ToolExecutionPlaneError>,
+        Option<ToolExecutionAdmission>,
+    )
+    where
+        T: Send,
+        Fut: Future<Output = T> + Send,
+    {
+        let mut admission = match self
+            .admit(
+                demand,
+                timeout,
+                service_class,
+                parent_class_ceiling,
+                session_id,
+            )
+            .await
+        {
+            Ok(admission) => admission,
+            Err(error) => return (Err(error), None),
+        };
+        self.counters.active.fetch_add(1, Ordering::AcqRel);
+        let operation = AssertUnwindSafe(operation).catch_unwind();
+        tokio::pin!(operation);
+        let mut soft_timed_out = false;
+        let execution = if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, &mut operation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    soft_timed_out = true;
+                    self.counters
+                        .timed_out_waiters
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        ?timeout,
+                        "asynchronous tool crossed its soft timeout; waiting for truthful completion"
+                    );
+                    operation.await
+                }
+            }
+        } else {
+            operation.await
+        };
+        self.counters.active.fetch_sub(1, Ordering::AcqRel);
+        let execution = match execution {
+            Ok(value) => {
+                self.counters.completed.fetch_add(1, Ordering::Relaxed);
+                Ok(value)
+            }
+            Err(_) => {
+                self.counters.failed.fetch_add(1, Ordering::Relaxed);
+                self.counters.panicked.fetch_add(1, Ordering::Relaxed);
+                Err(ToolExecutionPlaneError::Panicked)
+            }
+        };
+        admission.set_result_class(if soft_timed_out {
+            ResourceResultClass::TimedOut
+        } else if execution.is_ok() {
+            ResourceResultClass::Completed
+        } else {
+            ResourceResultClass::Failed
+        });
+        (execution, Some(admission))
+    }
+
+    async fn admit(
+        &self,
+        demand: &ResourceDemand,
+        timeout: Option<Duration>,
+        service_class: ExecutionServiceClass,
+        parent_class_ceiling: Option<ExecutionServiceClass>,
+        session_id: Option<&str>,
+    ) -> Result<ToolExecutionAdmission, ToolExecutionPlaneError> {
+        self.counters.submitted.fetch_add(1, Ordering::Relaxed);
+        let admission_started = Instant::now();
+        let scope_requests = scope_requests(demand)?;
+        let normalized_scope = format!("{scope_requests:?}");
+        let scope_lease = self
+            .scopes
+            .acquire(scope_requests, timeout)
+            .await
+            .map_err(|error| ToolExecutionPlaneError::Admission(error.to_string()))?;
+        let resource_demands = execution_resource_demands(demand);
+        let mut request = ResourceAdmissionRequest::new(service_class, resource_demands)
+            .with_scope(normalized_scope, true)
+            .with_fairness_key(
+                session_id
+                    .map(|session_id| format!("session:{session_id}"))
+                    .unwrap_or_else(|| format!("tool:{service_class:?}")),
+            );
+        if let Some(parent_class_ceiling) = parent_class_ceiling {
+            request = request.with_parent_class_ceiling(parent_class_ceiling);
+        }
+        if let Some(remaining) = remaining_timeout(timeout, admission_started) {
+            request = request
+                .with_deadline_at_ms(wall_now_ms().saturating_add(duration_millis(remaining)));
+        }
+        let decision = self
+            .resources
+            .admit(request)
+            .await
+            .map_err(|error| ToolExecutionPlaneError::Admission(error.to_string()))?;
+        let lease = match decision {
+            ResourceAdmissionDecision::Granted { lease, .. } => lease,
+            ResourceAdmissionDecision::Deferred { wait_reason, .. }
+            | ResourceAdmissionDecision::Overloaded { wait_reason, .. } => {
+                return Err(ToolExecutionPlaneError::Admission(format!(
+                    "resource admission did not grant: {wait_reason:?}"
+                )));
+            }
+        };
+        Ok(ToolExecutionAdmission::new(
+            scope_lease,
+            lease,
+            Arc::clone(&self.resources),
+            admission_started.elapsed(),
+        ))
     }
 
     #[must_use]
@@ -393,6 +497,7 @@ mod tests {
     use super::*;
     use crate::execution_core::graph::ResourceQuota;
     use harness_contract::tool::ResourceScopeDemand;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
     fn plane(limit: usize) -> ToolExecutionPlane {
@@ -444,6 +549,87 @@ mod tests {
             .expect("soft timeout must not invent a terminal result");
         assert_eq!(plane.stats().active, 0);
         assert_eq!(plane.stats().timed_out_waiters, 1);
+    }
+
+    #[tokio::test]
+    async fn native_async_reads_share_governed_capacity() {
+        let plane = plane(16);
+        let executions = (0..100).map(|value| {
+            let plane = plane.clone();
+            tokio::spawn(async move {
+                let (result, admission) = plane
+                    .execute_async_classified_retained(
+                        &ResourceDemand::default(),
+                        None,
+                        ExecutionServiceClass::Foreground,
+                        None,
+                        Some("async-read-session"),
+                        async move {
+                            tokio::task::yield_now().await;
+                            value
+                        },
+                    )
+                    .await;
+                drop(admission);
+                result
+            })
+        });
+
+        let results = futures::future::join_all(executions).await;
+        assert_eq!(results.len(), 100);
+        for (expected, result) in results.into_iter().enumerate() {
+            assert_eq!(
+                result.expect("task join").expect("governed execution"),
+                expected
+            );
+        }
+        assert_eq!(plane.stats().active, 0);
+        assert_eq!(plane.stats().submitted, 100);
+        assert_eq!(plane.stats().completed, 100);
+    }
+
+    #[tokio::test]
+    async fn native_async_soft_timeout_preserves_truthful_completion() {
+        let plane = plane(1);
+        let (result, admission) = plane
+            .execute_async_classified_retained(
+                &ResourceDemand::default(),
+                Some(Duration::from_millis(5)),
+                ExecutionServiceClass::Foreground,
+                None,
+                Some("soft-timeout-session"),
+                async {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    "completed"
+                },
+            )
+            .await;
+
+        assert_eq!(result.expect("truthful completion"), "completed");
+        drop(admission);
+        assert_eq!(plane.stats().active, 0);
+        assert_eq!(plane.stats().timed_out_waiters, 1);
+    }
+
+    #[tokio::test]
+    async fn blocking_adapter_does_not_stall_the_async_runtime() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&ticks);
+        let heartbeat = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        ToolExecutionPlane::adapt_blocking(|| {
+            std::thread::sleep(Duration::from_millis(40));
+        })
+        .await
+        .expect("blocking adapter");
+        heartbeat.await.expect("heartbeat task");
+
+        assert_eq!(ticks.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]

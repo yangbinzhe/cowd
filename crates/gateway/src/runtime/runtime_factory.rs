@@ -34,7 +34,7 @@ pub(crate) fn create_runtime_entry(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
+    stream_callback: Option<tokio::sync::mpsc::Sender<runtime::CowdEvent>>,
     resume_context: Option<runtime::ResumeContextPacket>,
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {
     let runtime_plugin_state = crate::runtime_bootstrap::assemble_runtime_state()?;
@@ -72,7 +72,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     tool_callback: Option<std::sync::Arc<dyn runtime::ToolCallback>>,
-    stream_callback: Option<std::sync::mpsc::SyncSender<runtime::CowdEvent>>,
+    stream_callback: Option<tokio::sync::mpsc::Sender<runtime::CowdEvent>>,
     runtime_plugin_state: RuntimeBootstrapState,
     resume_context: Option<runtime::ResumeContextPacket>,
 ) -> Result<GatewayRuntimeEntry, Box<dyn std::error::Error>> {

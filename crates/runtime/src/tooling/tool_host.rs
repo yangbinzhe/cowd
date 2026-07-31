@@ -96,8 +96,9 @@ pub struct RuntimeToolExecutionOutcome {
 ///
 /// Graph scheduling, dependency resolution, policy, retries, and lifecycle
 /// commits are deliberately outside this contract and belong to the Runner.
+#[async_trait::async_trait]
 pub trait RuntimeExecutionHost: Send + Sync {
-    fn execute_runtime_tool(
+    async fn execute_runtime_tool(
         &self,
         request: &RuntimeToolExecutionRequest,
     ) -> RuntimeToolExecutionOutcome;

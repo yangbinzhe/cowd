@@ -5207,8 +5207,9 @@ mod tests {
 
     struct TestExecutionHost;
 
+    #[async_trait::async_trait]
     impl crate::RuntimeExecutionHost for TestExecutionHost {
-        fn execute_runtime_tool(
+        async fn execute_runtime_tool(
             &self,
             request: &crate::RuntimeToolExecutionRequest,
         ) -> crate::RuntimeToolExecutionOutcome {
