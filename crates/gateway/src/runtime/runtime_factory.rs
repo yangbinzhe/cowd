@@ -107,19 +107,6 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     let capability_item =
         runtime_capability_context_item(&tool_definitions, allowed_tools.as_ref(), model_ctx);
     let runtime_session_id = session.session_id.clone();
-    let tool_executor = std::sync::Arc::new(
-        GatewayToolExecutor::from_tool_host(
-            allowed_tools.clone(),
-            emit_output,
-            tool_host,
-            mcp_state.clone(),
-        )
-        .with_runtime_session_id(runtime_session_id)
-        .with_runtime_model_lease(model.clone()),
-    );
-    tool_executor
-        .bind_runtime_services(Arc::clone(&runtime_services))
-        .map_err(std::io::Error::other)?;
     let primary_binding = primary_turn_binding(&runtime_services, session_id)?;
     let primary_memory_agent_id = primary_binding.instance.instance_id.clone();
     let primary_definition_lineage = Some(
@@ -130,6 +117,29 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
             .to_string(),
     );
     let primary_memory_read_scopes = primary_binding.data_lease.read_scopes.clone();
+    let primary_memory_context =
+        memory::MemoryTurnContext::new(session_id, primary_memory_agent_id.clone())
+            .with_definition_lineage_id(primary_definition_lineage.clone())
+            .with_project_id(Some(runtime::memory_project_id_for_workspace(
+                &workspace_root,
+            )))
+            .with_task_id(Some(primary_binding.data_lease.task_id.clone()))
+            .with_team_id(primary_binding.data_lease.team_id.clone())
+            .with_cognitive_read_scopes(primary_memory_read_scopes.clone());
+    let tool_executor = std::sync::Arc::new(
+        GatewayToolExecutor::from_tool_host(
+            allowed_tools.clone(),
+            emit_output,
+            tool_host,
+            mcp_state.clone(),
+        )
+        .with_runtime_session_id(runtime_session_id)
+        .with_runtime_memory_context(primary_memory_context)
+        .with_runtime_model_lease(model.clone()),
+    );
+    tool_executor
+        .bind_runtime_services(Arc::clone(&runtime_services))
+        .map_err(std::io::Error::other)?;
     let runtime = runtime::StandardRuntimeHost::new(runtime::StandardRuntimeHostConfig {
         session,
         provider_registry,

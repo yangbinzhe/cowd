@@ -96,6 +96,7 @@ impl ToolSafetyCategory {
             | "git_diff"
             | "git_show"
             | "memory_search"
+            | "context_retrieve"
             | "memory_list"
             | "memory_get"
             | "session_list"
@@ -247,6 +248,7 @@ fn normalize_tool_name_for_safety(name: &str) -> String {
         "askuserquestion" => "ask_user_question".to_string(),
         "toolsearch" => "tool_search".to_string(),
         "runtimecapabilities" => "runtime_capabilities".to_string(),
+        "contextretrieve" => "context_retrieve".to_string(),
         "runtimeorchestrate" => "runtime_orchestrate".to_string(),
         "listmcpresources" => "list_mcp_resources".to_string(),
         "readmcpresource" => "read_mcp_resource".to_string(),

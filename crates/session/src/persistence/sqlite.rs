@@ -2654,6 +2654,17 @@ fn escape_like_pattern(input: &str) -> String {
     out
 }
 
+fn fts_literal_terms(input: &str) -> Option<String> {
+    let terms = input
+        .split_whitespace()
+        .map(|term| term.trim())
+        .filter(|term| !term.is_empty())
+        .take(12)
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    (!terms.is_empty()).then(|| terms.join(" OR "))
+}
+
 fn session_sort_expression(sort: &str) -> &'static str {
     match sort {
         "created_at" => "created_at",
@@ -3812,6 +3823,109 @@ impl SqliteSessionStore {
         Ok(SessionListPage {
             records,
             total: total as usize,
+        })
+    }
+
+    /// Discover Session metadata and transcript matches inside the current
+    /// Session's durable workspace/actor boundary.
+    ///
+    /// The current Session row is the authority source. A caller cannot widen
+    /// the query by supplying a workspace or principal in tool input.
+    pub fn discover_browsable_sessions(
+        &self,
+        current_session_id: &str,
+        query: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SessionListPage> {
+        let conn = self.conn()?;
+        let limit = limit.clamp(1, 100);
+        let query = query.map(str::trim).filter(|query| !query.is_empty());
+        let mut values = vec![Value::Text(current_session_id.to_string())];
+        let mut query_clause = String::new();
+
+        if let Some(query) = query {
+            let like = format!("%{}%", escape_like_pattern(query));
+            values.push(Value::Text(like));
+            query_clause.push_str(
+                r" AND (
+                       s.session_id LIKE ? ESCAPE '\' COLLATE NOCASE
+                    OR s.platform LIKE ? ESCAPE '\' COLLATE NOCASE
+                    OR s.chat_id LIKE ? ESCAPE '\' COLLATE NOCASE
+                    OR COALESCE(s.metadata_json, '') LIKE ? ESCAPE '\' COLLATE NOCASE",
+            );
+            for _ in 0..3 {
+                values.push(values[1].clone());
+            }
+            if let Some(fts_query) = fts_literal_terms(query) {
+                values.push(Value::Text(fts_query));
+                query_clause.push_str(
+                    r" OR EXISTS (
+                           SELECT 1
+                             FROM messages m
+                             JOIN messages_fts ON m.id = messages_fts.rowid
+                            WHERE m.session_id = s.session_id
+                              AND messages_fts MATCH ?
+                       )",
+                );
+            }
+            query_clause.push(')');
+        }
+
+        let authority_clause = r"
+            FROM sessions s
+            JOIN sessions current ON current.session_id = ?
+           WHERE s.status NOT IN ('deleted', 'deleting')
+             AND (
+                    s.session_id = current.session_id
+                 OR (
+                        NULLIF(json_extract(current.metadata_json, '$.workspace_root'), '') IS NOT NULL
+                    AND json_extract(s.metadata_json, '$.workspace_root')
+                        = json_extract(current.metadata_json, '$.workspace_root')
+                    AND (
+                           (
+                               NULLIF(json_extract(current.metadata_json, '$.owner_principal_id'), '') IS NOT NULL
+                           AND json_extract(s.metadata_json, '$.owner_principal_id')
+                               = json_extract(current.metadata_json, '$.owner_principal_id')
+                           )
+                        OR (
+                               NULLIF(json_extract(current.metadata_json, '$.owner_principal_id'), '') IS NULL
+                           AND NULLIF(current.user_id, '') IS NOT NULL
+                           AND s.platform = current.platform
+                           AND s.user_id = current.user_id
+                           )
+                       )
+                    )
+                 )";
+        let count_sql = format!("SELECT COUNT(*) {authority_clause}{query_clause}");
+        let total = conn
+            .query_row(&count_sql, params_from_iter(values.iter()), |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(sql_err)?;
+
+        let page_sql = format!(
+            r"SELECT s.session_id, s.platform, s.chat_id, s.user_id, s.model,
+                      s.created_at, s.last_activity, s.message_count, s.reset_policy,
+                      s.metadata_json, s.input_tokens, s.output_tokens,
+                      s.estimated_cost_usd, s.status
+                 {authority_clause}{query_clause}
+                ORDER BY s.last_activity DESC, s.session_id ASC
+                LIMIT ? OFFSET ?"
+        );
+        values.push(Value::Integer(limit as i64));
+        values.push(Value::Integer(offset as i64));
+        let mut stmt = conn.prepare(&page_sql).map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params_from_iter(values.iter()), row_to_record)
+            .map_err(sql_err)?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(sql_err)?);
+        }
+        Ok(SessionListPage {
+            records,
+            total: total.max(0) as usize,
         })
     }
 

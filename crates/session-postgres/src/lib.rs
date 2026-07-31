@@ -1442,6 +1442,100 @@ impl PostgresSessionStore {
         })
     }
 
+    pub fn discover_browsable_sessions(
+        &self,
+        current_session_id: &str,
+        query: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> session::SessionResult<SessionListPage> {
+        let query = query.map(str::trim).filter(|query| !query.is_empty());
+        let limit = i64::try_from(limit.clamp(1, 100)).map_err(|_| {
+            session::SessionError::Store("Session discovery limit overflow".to_string())
+        })?;
+        let offset = i64::try_from(offset).map_err(|_| {
+            session::SessionError::Store("Session discovery offset overflow".to_string())
+        })?;
+        let authority_clause = r"
+            FROM session_records s
+            JOIN session_records current ON current.session_id=$1
+           WHERE s.status NOT IN ('deleted', 'deleting')
+             AND (
+                    s.session_id=current.session_id
+                 OR (
+                        NULLIF(current.metadata_json::jsonb ->> 'workspace_root', '') IS NOT NULL
+                    AND s.metadata_json::jsonb ->> 'workspace_root'
+                        = current.metadata_json::jsonb ->> 'workspace_root'
+                    AND (
+                           (
+                               NULLIF(current.metadata_json::jsonb ->> 'owner_principal_id', '') IS NOT NULL
+                           AND s.metadata_json::jsonb ->> 'owner_principal_id'
+                               = current.metadata_json::jsonb ->> 'owner_principal_id'
+                           )
+                        OR (
+                               NULLIF(current.metadata_json::jsonb ->> 'owner_principal_id', '') IS NULL
+                           AND NULLIF(current.user_id, '') IS NOT NULL
+                           AND s.platform=current.platform
+                           AND s.user_id=current.user_id
+                           )
+                       )
+                    )
+                 )
+             AND (
+                    $2::text IS NULL
+                 OR to_tsvector('simple',
+                        coalesce(s.session_id, '') || ' ' || coalesce(s.platform, '') || ' ' ||
+                        coalesce(s.chat_id, '') || ' ' || coalesce(s.metadata_json, ''))
+                    @@ websearch_to_tsquery('simple', $2)
+                 OR s.session_id ILIKE '%' || $2 || '%'
+                 OR s.platform ILIKE '%' || $2 || '%'
+                 OR s.chat_id ILIKE '%' || $2 || '%'
+                 OR coalesce(s.metadata_json, '') ILIKE '%' || $2 || '%'
+                 OR EXISTS (
+                        SELECT 1
+                          FROM session_messages m
+                         WHERE m.session_id=s.session_id
+                           AND to_tsvector('simple',
+                               coalesce(m.role, '') || ' ' || coalesce(m.content_json, '') || ' ' ||
+                               coalesce(m.tool_name, ''))
+                               @@ websearch_to_tsquery('simple', $2)
+                    )
+                 )";
+        let mut connection = self.executor.checkout_runtime().map_err(storage_error)?;
+        let total: i64 = connection
+            .query_one(
+                &format!("SELECT COUNT(*) {authority_clause}"),
+                &[&current_session_id, &query],
+            )
+            .map_err(postgres_error)?
+            .try_get(0)
+            .map_err(postgres_error)?;
+        let rows = connection
+            .query(
+                &format!(
+                    r"SELECT s.session_id, s.platform, s.chat_id, s.user_id, s.model,
+                              s.created_at, s.last_activity, s.message_count, s.reset_policy,
+                              s.metadata_json, s.input_tokens, s.output_tokens,
+                              s.estimated_cost_usd, s.status
+                         {authority_clause}
+                        ORDER BY s.last_activity DESC, s.session_id ASC
+                        LIMIT $3 OFFSET $4"
+                ),
+                &[&current_session_id, &query, &limit, &offset],
+            )
+            .map_err(postgres_error)?;
+        let records = rows
+            .iter()
+            .map(row_to_session)
+            .collect::<session::SessionResult<Vec<_>>>()?;
+        Ok(SessionListPage {
+            records,
+            total: usize::try_from(total).map_err(|_| {
+                session::SessionError::Store("Session discovery count overflow".to_string())
+            })?,
+        })
+    }
+
     pub fn search_sessions(
         &self,
         query: &str,
@@ -6869,6 +6963,15 @@ impl session::SessionStoreBackend for PostgresSessionStore {
         v: &SessionListOptions<'_>,
     ) -> session::SessionResult<SessionListPage> {
         self.list_sessions_page(v)
+    }
+    fn discover_browsable_sessions(
+        &self,
+        current_session_id: &str,
+        query: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> session::SessionResult<SessionListPage> {
+        self.discover_browsable_sessions(current_session_id, query, limit, offset)
     }
     fn list_sessions_by_platform(&self, v: &str) -> session::SessionResult<Vec<SessionRecord>> {
         self.list_sessions_by_platform(v)

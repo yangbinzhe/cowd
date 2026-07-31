@@ -225,6 +225,28 @@ impl PermissionPolicy {
         context: &PermissionContext,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
+        self.authorize_required_with_context(
+            tool_name,
+            input,
+            self.required_mode_for(tool_name),
+            context,
+            prompter,
+        )
+    }
+
+    /// Authorize a governed invocation using the permission requirement from
+    /// its compiled tool-effect descriptor. Rules and hooks remain policy
+    /// concerns; effect classification has one source of truth.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn authorize_required_with_context(
+        &self,
+        tool_name: &str,
+        input: &str,
+        required_mode: PermissionMode,
+        context: &PermissionContext,
+        prompter: Option<&mut dyn PermissionPrompter>,
+    ) -> PermissionOutcome {
         if let Some(rule) = Self::find_matching_rule(&self.deny_rules, tool_name, input) {
             return PermissionOutcome::Deny {
                 reason: format!(
@@ -235,7 +257,6 @@ impl PermissionPolicy {
         }
 
         let current_mode = self.active_mode();
-        let required_mode = self.required_mode_for(tool_name);
         let ask_rule = Self::find_matching_rule(&self.ask_rules, tool_name, input);
         let allow_rule = Self::find_matching_rule(&self.allow_rules, tool_name, input);
 
@@ -554,6 +575,57 @@ mod tests {
             policy.authorize("write_file", "{}", None),
             PermissionOutcome::Allow
         );
+    }
+
+    #[test]
+    fn governed_authorization_uses_the_compiled_descriptor_without_a_name_map() {
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite);
+
+        assert_eq!(
+            policy.authorize_required_with_context(
+                "generated_delivery_tool",
+                "{}",
+                PermissionMode::WorkspaceWrite,
+                &PermissionContext::default(),
+                None,
+            ),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn governed_authorization_does_not_reclassify_a_descriptor_by_legacy_name_map() {
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("generated_delivery_tool", PermissionMode::DangerFullAccess);
+
+        assert_eq!(
+            policy.authorize_required_with_context(
+                "generated_delivery_tool",
+                "{}",
+                PermissionMode::WorkspaceWrite,
+                &PermissionContext::default(),
+                None,
+            ),
+            PermissionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn governed_authorization_cannot_downgrade_a_dangerous_descriptor() {
+        let policy = PermissionPolicy::new(PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("generated_delivery_tool", PermissionMode::ReadOnly);
+
+        assert!(matches!(
+            policy.authorize_required_with_context(
+                "generated_delivery_tool",
+                "{}",
+                PermissionMode::DangerFullAccess,
+                &PermissionContext::default(),
+                None,
+            ),
+            PermissionOutcome::Deny { reason }
+                if reason.contains("requires approval to escalate")
+        ));
     }
 
     #[test]

@@ -631,6 +631,59 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
             effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
         RuntimeToolDefinition {
+            name: "context_retrieve".to_string(),
+            description: Some(
+                "Actively retrieve focused context when the automatically assembled packet is incomplete or appears unrelated. Search the current Runtime Binding's Memory, read one authorized Memory by an id returned from search, discover the current actor's own Session catalog, or read bounded history from the current, explicitly related, or explicitly selected authorized Session. Use session_catalog first when a Session ID is unknown, then follow returned read_request/next_request objects. Evidence references are audit locators, not MCP resources. This tool cannot mutate Memory or cross durable workspace/actor boundaries.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["memory", "session_catalog", "session_history"]
+                    },
+                    "query": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "A focused semantic or full-text query. Required for memory search unless memory_id is supplied, and for related_sessions search; optional for catalog listing and latest-message reads."
+                    },
+                    "memory_id": {
+                        "type": "string",
+                        "description": "Exact Memory UUID returned by a prior memory search. Valid only with source=memory and always rechecked against the current Runtime Memory Binding."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["current", "related_sessions", "workspace_sessions", "explicit_session"],
+                        "description": "Defaults by source: memory/current, session_catalog/workspace_sessions, session_history/current. explicit_session requires session_id and passes a durable workspace/actor or SessionRelationGraph authorization check."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Explicit target returned by session_catalog. Valid only with session_history/explicit_session."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 16,
+                        "default": 8
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Session catalog page offset."
+                    },
+                    "before_sequence": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Read an older bounded page ending before this message sequence when query is omitted."
+                    }
+                },
+                "required": ["source"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.readonly"),
+        },
+        RuntimeToolDefinition {
             name: "runtime_capabilities".to_string(),
             description: Some(
                 "Return Cowd runtime capability guidance, execution patterns, evidence planning, batch/parallel tool advice, and orchestration suggestions for the current task.".to_string(),
@@ -900,6 +953,36 @@ mod tests {
         assert!(capability_tool.input_schema["properties"]["detail"]["enum"]
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "budget_controls")));
+
+        let context_tool = tools
+            .iter()
+            .find(|tool| tool.name == "context_retrieve")
+            .expect("context retrieval tool");
+        assert_eq!(
+            context_tool.required_permission,
+            ToolPermissionMode::ReadOnly
+        );
+        assert_eq!(context_tool.input_schema["required"][0], "source");
+        assert_eq!(
+            context_tool.input_schema["required"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(context_tool.input_schema["properties"]["source"]["enum"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "session_catalog")));
+        assert!(context_tool.input_schema["properties"]["scope"]["enum"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item == "explicit_session")));
+        assert_eq!(
+            context_tool.input_schema["properties"]["memory_id"]["type"],
+            "string"
+        );
+        assert!(context_tool
+            .description
+            .as_deref()
+            .is_some_and(|description| description.contains("not MCP resources")));
 
         let evidence_tool = tools
             .iter()

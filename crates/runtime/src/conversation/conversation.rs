@@ -622,36 +622,11 @@ fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("runtime_orchestrate")
 }
 
-/// Derive the semantic execution pattern from the requested effects. Network
-/// evidence gathering is exploration, not workspace mutation; classifying
-/// both as `Execute` made exposed WebSearch calls predictably fail their
-/// strategy lease.
-fn tool_batch_pattern(calls: &[ModelToolCall]) -> harness_contract::core::ExecutionPattern {
-    if calls.iter().any(is_runtime_team_orchestration_call) {
-        return harness_contract::core::ExecutionPattern::Collaborate;
-    }
-    let categories = calls
-        .iter()
-        .map(|call| crate::tool_orchestrator::classify_tool_request(&call.name, &call.input))
-        .collect::<Vec<_>>();
-    if categories.iter().any(|category| {
-        matches!(
-            category,
-            crate::tool_orchestrator::ToolSafetyCategory::WriteLocal
-                | crate::tool_orchestrator::ToolSafetyCategory::Destructive
-        )
-    }) {
-        harness_contract::core::ExecutionPattern::Execute
-    } else {
-        harness_contract::core::ExecutionPattern::Explore
-    }
-}
-
 fn model_team_request_conflicts_with_admission(
     candidate: harness_contract::strategy::ExecutionCandidateKind,
     calls: &[ModelToolCall],
 ) -> bool {
-    tool_batch_pattern(calls) == harness_contract::core::ExecutionPattern::Collaborate
+    calls.iter().any(is_runtime_team_orchestration_call)
         && candidate != harness_contract::strategy::ExecutionCandidateKind::Team
 }
 
@@ -1529,7 +1504,11 @@ fn rate_per_second(count: u64, duration_ms: u64) -> Option<f64> {
 fn bootstrap_tool_ids(
     maximum_permission: harness_contract::tool::ToolPermissionMode,
 ) -> Vec<String> {
-    let mut bootstrap = vec!["ToolSearch".to_string(), "runtime_capabilities".to_string()];
+    let mut bootstrap = vec![
+        "ToolSearch".to_string(),
+        "context_retrieve".to_string(),
+        "runtime_capabilities".to_string(),
+    ];
     // Stateful orchestration is a runtime-native capability. When the current
     // policy already permits workspace writes, exposing it up front lets the
     // model intentionally start a real team or execution graph instead of
@@ -1754,11 +1733,16 @@ mod tool_exposure_contract_tests {
     fn stateful_runtime_orchestration_is_bootstrapped_only_when_policy_allows_write() {
         assert_eq!(
             bootstrap_tool_ids(ToolPermissionMode::ReadOnly),
-            vec!["ToolSearch", "runtime_capabilities"]
+            vec!["ToolSearch", "context_retrieve", "runtime_capabilities"]
         );
         assert_eq!(
             bootstrap_tool_ids(ToolPermissionMode::WorkspaceWrite),
-            vec!["ToolSearch", "runtime_capabilities", "runtime_orchestrate"]
+            vec![
+                "ToolSearch",
+                "context_retrieve",
+                "runtime_capabilities",
+                "runtime_orchestrate"
+            ]
         );
     }
 }
@@ -1804,6 +1788,20 @@ fn contract_permission_mode(
         | crate::PermissionMode::Prompt
         | crate::PermissionMode::Allow => {
             harness_contract::tool::ToolPermissionMode::DangerFullAccess
+        }
+    }
+}
+
+const fn runtime_permission_mode(
+    mode: harness_contract::tool::ToolPermissionMode,
+) -> crate::PermissionMode {
+    match mode {
+        harness_contract::tool::ToolPermissionMode::ReadOnly => crate::PermissionMode::ReadOnly,
+        harness_contract::tool::ToolPermissionMode::WorkspaceWrite => {
+            crate::PermissionMode::WorkspaceWrite
+        }
+        harness_contract::tool::ToolPermissionMode::DangerFullAccess => {
+            crate::PermissionMode::DangerFullAccess
         }
     }
 }
@@ -4468,7 +4466,7 @@ where
         true
     }
 
-    fn memory_turn_context(&self) -> MemoryTurnContext {
+    pub(crate) fn memory_turn_context(&self) -> MemoryTurnContext {
         let session = self.session();
         let project_id = memory_project_id_for_session(&session);
         let task_id = Some(format!("session-task-{}", session.session_id));
@@ -6048,12 +6046,13 @@ where
             }
         };
         self.record_governed_tool_plan(&plan, self.session().message_count());
+        let previous_compile_target = decision.compile_target;
         let model_team_conflicts_with_admission = model_team_request_conflicts_with_admission(
             decision.strategy.selected_candidate,
             calls,
         );
         if !model_team_conflicts_with_admission {
-            let target_pattern = tool_batch_pattern(calls);
+            let requests_team = calls.iter().any(is_runtime_team_orchestration_call);
             let has_network = plan.tasks.iter().any(|task| {
                 task.safety_category == crate::tool_orchestrator::ToolSafetyCategory::Network
             });
@@ -6065,6 +6064,13 @@ where
                             | crate::tool_orchestrator::ToolSafetyCategory::Destructive
                     )
             });
+            let target_pattern = if requests_team {
+                harness_contract::core::ExecutionPattern::Collaborate
+            } else if has_mutation {
+                harness_contract::core::ExecutionPattern::Execute
+            } else {
+                harness_contract::core::ExecutionPattern::Explore
+            };
             let requests_parallelism = target_pattern
                 == harness_contract::core::ExecutionPattern::Collaborate
                 || plan
@@ -6092,6 +6098,9 @@ where
                     has_network,
                     has_mutation,
                     requests_parallelism,
+                    previous_compile_target
+                        == crate::execution_core::RuntimeCompileTarget::EvidenceGraph
+                        && has_mutation,
                     "provider tool batch retained the admitted decision lease",
                 )?;
             }
@@ -6336,7 +6345,7 @@ where
                 validation.allowed = false;
                 validation
                     .findings
-                    .push("critical_mutation_missing_approval_runtime".to_string());
+                    .push("mutation_missing_approval_runtime".to_string());
                 return;
             };
             let operations = execution_plan
@@ -6387,14 +6396,14 @@ where
                     validation.allowed = false;
                     validation
                         .findings
-                        .push(format!("critical_mutation_approval_denied:{reason}"));
+                        .push(format!("mutation_approval_denied:{reason}"));
                     return;
                 }
                 crate::approval_gate::ApprovalGateResult::TimedOut { .. } => {
                     validation.allowed = false;
                     validation
                         .findings
-                        .push("critical_mutation_approval_timed_out".to_string());
+                        .push("mutation_approval_timed_out".to_string());
                     return;
                 }
             }
@@ -6545,16 +6554,18 @@ where
                 reason: format!("PreToolUse hook denied tool `{tool_name}`"),
             }
         } else if let Some(prompt) = prompter.lock().as_mut() {
-            self.permission_policy.authorize_with_context(
+            self.permission_policy.authorize_required_with_context(
                 tool_name,
                 &effective_input,
+                runtime_permission_mode(task.effect.required_permission),
                 &permission_context,
                 Some(prompt.as_mut()),
             )
         } else {
-            self.permission_policy.authorize_with_context(
+            self.permission_policy.authorize_required_with_context(
                 tool_name,
                 &effective_input,
+                runtime_permission_mode(task.effect.required_permission),
                 &permission_context,
                 None,
             )
@@ -6741,6 +6752,7 @@ where
                     category: task.safety_category,
                     authorization: Some(authorization.authorization.clone()),
                     session_id: Some(self.session().session_id),
+                    memory_context: Some(self.memory_turn_context()),
                     model_lease: None,
                     parent_execution: None,
                     evaluation_isolated: false,
@@ -9362,6 +9374,7 @@ where
         requires_external_facts: bool,
         requires_write: bool,
         requests_parallelism: bool,
+        requires_explicit_approval: bool,
         reason: &str,
     ) -> Result<crate::execution_core::RuntimeExecutionDecision, RuntimeError> {
         let (state, previous) = {
@@ -9384,6 +9397,27 @@ where
                     reason,
                 )
                 .map_err(RuntimeError::new)?;
+            if requires_explicit_approval
+                && state
+                    .decision
+                    .pattern()
+                    .supports_gate(harness_contract::core::ExecutionPolicyGate::Approval)
+                && !state
+                    .decision
+                    .strategy
+                    .gates
+                    .contains(&harness_contract::core::ExecutionPolicyGate::Approval)
+            {
+                state
+                    .decision
+                    .strategy
+                    .gates
+                    .push(harness_contract::core::ExecutionPolicyGate::Approval);
+                state.decision.strategy.reasons.push(
+                    "an evidence-only strategy requested mutation; explicit approval is required before delivery"
+                        .to_string(),
+                );
+            }
             (state.clone(), previous)
         };
         if let Err(error) =
@@ -10433,6 +10467,15 @@ fn memory_project_id_for_session(session: &Session) -> Option<String> {
         .workspace_root
         .clone()
         .or_else(|| std::env::current_dir().ok())?;
+    Some(memory_project_id_for_workspace(&root))
+}
+
+/// Derive the Memory project scope used by every Runtime entry for a workspace.
+///
+/// Active context tools use this function as well, so passive injection and
+/// model-initiated retrieval cannot drift into different project namespaces.
+#[must_use]
+pub fn memory_project_id_for_workspace(root: &Path) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     root.display().to_string().hash(&mut hasher);
     let hash = hasher.finish();
@@ -10449,7 +10492,7 @@ fn memory_project_id_for_session(session: &Session) -> Option<String> {
             }
         })
         .collect::<String>();
-    Some(format!("{name}-{hash:016x}"))
+    format!("{name}-{hash:016x}")
 }
 
 fn fact_extraction_trigger_for_turn(
@@ -10784,7 +10827,7 @@ impl ToolExecutor for StaticToolExecutor {
     fn registered_tool_effect(
         &self,
         tool_name: &str,
-        _input: &serde_json::Value,
+        input: &serde_json::Value,
     ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
         use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
         use harness_contract::tool::{
@@ -10794,7 +10837,11 @@ impl ToolExecutor for StaticToolExecutor {
 
         self.handlers.contains_key(tool_name).then(|| {
             let safety = crate::tool_orchestrator::ToolSafetyCategory::from_tool_name(tool_name);
-            let (effect_kind, required_permission, scope, approval_class) = match safety {
+            let target = ["path", "url", "server", "uri", "target"]
+                .into_iter()
+                .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
+                .map(str::to_string);
+            let (effect_kind, required_permission, mut scope, approval_class) = match safety {
                 crate::tool_orchestrator::ToolSafetyCategory::ReadOnly => (
                     ToolEffectKind::Read,
                     ToolPermissionMode::ReadOnly,
@@ -10820,9 +10867,13 @@ impl ToolExecutor for StaticToolExecutor {
                     ToolApprovalClass::User,
                 ),
             };
+            scope.target = target.clone();
             ToolEffectDescriptor {
                 tool_id: tool_name.to_string(),
-                descriptor_hash: format!("static:{tool_name}:{effect_kind:?}"),
+                descriptor_hash: format!(
+                    "static:{tool_name}:{effect_kind:?}:{}",
+                    target.as_deref().unwrap_or_default()
+                ),
                 effect_kind,
                 idempotency: ToolIdempotency::Unknown,
                 scopes: vec![scope],
@@ -10876,13 +10927,13 @@ mod tests {
         is_runtime_team_orchestration_call, memory_project_id_for_session,
         model_team_request_conflicts_with_admission, prepared_vision_payload, preview_chars,
         provider_transport_policy, rate_per_second, required_team_orchestration_call,
-        tool_batch_pattern, turn_strategy_event_kind_allowed, unexposed_model_tool_names,
-        vision_user_message, ApiClient, ApiRequest, AssistantEvent, AssistantItemKind,
-        CancellationToken, CognitiveContextManager, ConversationRuntime, EarlyToolCandidate,
-        EarlyToolDispatchFuture, EarlyToolDispatchResult, EarlyToolDispatcher,
-        EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan, ModelStreamReducer,
-        ModelToolCall, ProviderContextInventory, RuntimeError, StaticToolExecutor,
-        ToolExposureState, TurnStablePrefixMetrics, TurnToolExposureMetrics,
+        turn_strategy_event_kind_allowed, unexposed_model_tool_names, vision_user_message,
+        ApiClient, ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken,
+        CognitiveContextManager, ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture,
+        EarlyToolDispatchResult, EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent,
+        ModelStepToolPlan, ModelStreamReducer, ModelToolCall, ProviderContextInventory,
+        RuntimeError, StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics,
+        TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -11204,24 +11255,7 @@ mod tests {
     #[test]
     fn team_orchestration_tool_batch_keeps_the_collaboration_strategy() {
         let calls = vec![required_team_orchestration_call("必须实际启动团队")];
-        assert_eq!(
-            tool_batch_pattern(&calls),
-            harness_contract::core::ExecutionPattern::Collaborate
-        );
-    }
-
-    #[test]
-    fn network_tool_batch_is_exploration_not_workspace_execution() {
-        let calls = vec![ModelToolCall {
-            id: "search".to_string(),
-            name: "WebSearch".to_string(),
-            input: r#"{"query":"WAIC 2026"}"#.to_string(),
-            depends_on: Vec::new(),
-        }];
-        assert_eq!(
-            tool_batch_pattern(&calls),
-            harness_contract::core::ExecutionPattern::Explore
-        );
+        assert!(calls.iter().any(is_runtime_team_orchestration_call));
     }
 
     #[test]
@@ -12219,6 +12253,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
                 "provider tool batch retained the admitted decision lease",
             )
             .expect("running ToolBatch retarget is a selected revision");
@@ -12309,6 +12344,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 "provider emitted parallel external research calls",
             )
             .expect("retarget network batch");
@@ -12331,6 +12367,329 @@ mod tests {
             canonical.selected_candidate,
             harness_contract::strategy::ExecutionCandidateKind::ParallelTools
         );
+    }
+
+    #[test]
+    fn evidence_strategy_revises_to_explicitly_approved_delivery_without_changing_lease() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        let admitted = runtime
+            .begin_turn_strategy("turn-research-delivery", "调研外部资料并形成报告")
+            .expect("admit strategy");
+        runtime
+            .bind_turn_strategy_execution("turn-research-delivery", "graph-research-delivery")
+            .expect("bind graph");
+
+        let decision = runtime
+            .retarget_active_turn_strategy_for_tool_requirements(
+                harness_contract::strategy::ExecutionCandidateKind::Direct,
+                harness_contract::core::ExecutionPattern::Execute,
+                true,
+                true,
+                false,
+                true,
+                "research evidence is being delivered to the workspace",
+            )
+            .expect("retarget approved delivery");
+
+        assert_eq!(decision.lease.lease_id, admitted.decision_lease);
+        assert!(decision.decision_revision > 1);
+        assert_eq!(
+            decision.compile_target,
+            crate::execution_core::RuntimeCompileTarget::ExecutionGraph
+        );
+        assert!(decision
+            .gates()
+            .contains(&harness_contract::core::ExecutionPolicyGate::Permission));
+        assert!(decision
+            .gates()
+            .contains(&harness_contract::core::ExecutionPolicyGate::Approval));
+        assert!(decision
+            .modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::WithGuardrails));
+        assert!(decision
+            .modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::WithExternalResearch));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn research_delivery_waits_for_approval_before_writing_the_real_artifact() {
+        use approval::{SharedApprovalHistoryLedger, SqliteApprovalHistoryLedger};
+
+        let relative_path = format!(
+            "target/research-delivery-{}.md",
+            uuid::Uuid::new_v4().simple()
+        );
+        let absolute_path = std::env::current_dir()
+            .expect("workspace")
+            .join(&relative_path);
+        fs::create_dir_all(absolute_path.parent().expect("delivery parent"))
+            .expect("create delivery parent");
+        let write_path = absolute_path.clone();
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed_writes = Arc::clone(&writes);
+        let history: SharedApprovalHistoryLedger =
+            Arc::new(SqliteApprovalHistoryLedger::in_memory().expect("approval history"));
+        let gate = Arc::new(crate::approval_gate::SmartApprovalGate::new(
+            Arc::new(crate::permission_enforcer::DestructivePatternDetector::new(
+                std::env::current_dir().expect("workspace"),
+            )),
+            crate::config::ApprovalConfig::default(),
+            history,
+        ));
+        let session = Session::new();
+        let session_store =
+            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("session store"));
+        session_store
+            .create_session(&session::SessionRecord {
+                session_id: session.session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "approved-research-delivery".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-07-31T00:00:00Z".to_string(),
+                last_activity: "2026-07-31T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost_usd: 0.0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("session record");
+        let artifact_root = tempfile::tempdir().expect("artifact root");
+        let runtime = Arc::new(
+            ConversationRuntime::new(
+                session,
+                MockApi,
+                StaticToolExecutor::new().register("write_file", move |_| {
+                    fs::write(&write_path, "# Verified research delivery\n")
+                        .map_err(|error| crate::ToolError::new(error.to_string()))?;
+                    observed_writes.fetch_add(1, Ordering::SeqCst);
+                    Ok("written".to_string())
+                }),
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                vec!["system".to_string()],
+            )
+            .without_memory()
+            .with_runtime_event_store(Arc::new(
+                RuntimeEventStore::open_in_memory().expect("runtime event store"),
+            ))
+            .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+                session_store,
+            ))
+            .with_artifact_store(Arc::new(
+                crate::ArtifactStore::sqlite(
+                    artifact_root.path(),
+                    crate::ArtifactStoreConfig::default(),
+                )
+                .expect("artifact store"),
+            ))
+            .with_approval_gate(Arc::clone(&gate)),
+        );
+        let admitted = runtime
+            .begin_turn_strategy("turn-approved-research-delivery", "调研外部资料并形成报告")
+            .expect("admit evidence strategy");
+        assert_eq!(
+            admitted.decision.compile_target,
+            crate::execution_core::RuntimeCompileTarget::EvidenceGraph
+        );
+
+        let calls = vec![ModelToolCall {
+            id: "write-approved-research-delivery".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({
+                "path": relative_path,
+                "content": "# Verified research delivery\n"
+            })
+            .to_string(),
+            depends_on: Vec::new(),
+        }];
+        let executing_runtime = Arc::clone(&runtime);
+        let execution = tokio::spawn(async move {
+            executing_runtime
+                .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
+                .await
+        });
+
+        let request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let request = match request {
+            Ok(request) => request,
+            Err(_) if execution.is_finished() => {
+                let result = execution
+                    .await
+                    .expect("delivery task should join while diagnosing missing approval");
+                panic!(
+                    "research delivery completed before approval registration: {result:?}; strategy={:?}",
+                    runtime.active_turn_strategy()
+                );
+            }
+            Err(_) => panic!(
+                "research delivery remained active without registering approval; strategy={:?}",
+                runtime.active_turn_strategy()
+            ),
+        };
+        assert!(
+            request.command.contains(&admitted.decision_lease),
+            "approval must identify the strategy lease: {}",
+            request.command
+        );
+        assert!(
+            request.command.contains(&relative_path),
+            "approval must identify the delivery target: {}",
+            request.command
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(!absolute_path.exists());
+
+        gate.resolve_approval(
+            &request.id,
+            crate::permission_enforcer::ApprovalVerdict::Approved,
+            crate::permission_enforcer::ApprovalPersistence::Once,
+        )
+        .await
+        .expect("resolve pending approval");
+        let result = tokio::time::timeout(Duration::from_secs(5), execution)
+            .await
+            .expect("approved research delivery should finish")
+            .expect("delivery task should join")
+            .expect("approved write batch should execute");
+        assert_eq!(result.failed, 0, "approved delivery result: {result:?}");
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read_to_string(&absolute_path).expect("read delivered artifact"),
+            "# Verified research delivery\n"
+        );
+        let strategy = runtime
+            .active_turn_strategy()
+            .expect("revised strategy remains active");
+        assert_eq!(strategy.decision.lease.lease_id, admitted.decision_lease);
+        assert!(strategy.decision.decision_revision > 1);
+        assert_eq!(
+            strategy.decision.compile_target,
+            crate::execution_core::RuntimeCompileTarget::ExecutionGraph
+        );
+        assert!(strategy
+            .decision
+            .gates()
+            .contains(&harness_contract::core::ExecutionPolicyGate::Approval));
+        fs::remove_file(&absolute_path).expect("remove delivered test artifact");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_research_delivery_never_reaches_the_write_executor() {
+        use approval::{SharedApprovalHistoryLedger, SqliteApprovalHistoryLedger};
+
+        let relative_path = format!(
+            "target/rejected-research-delivery-{}.md",
+            uuid::Uuid::new_v4().simple()
+        );
+        let absolute_path = std::env::current_dir()
+            .expect("workspace")
+            .join(&relative_path);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let observed_writes = Arc::clone(&writes);
+        let history: SharedApprovalHistoryLedger =
+            Arc::new(SqliteApprovalHistoryLedger::in_memory().expect("approval history"));
+        let gate = Arc::new(crate::approval_gate::SmartApprovalGate::new(
+            Arc::new(crate::permission_enforcer::DestructivePatternDetector::new(
+                std::env::current_dir().expect("workspace"),
+            )),
+            crate::config::ApprovalConfig::default(),
+            history,
+        ));
+        let runtime = Arc::new(
+            ConversationRuntime::new(
+                Session::new(),
+                MockApi,
+                StaticToolExecutor::new().register("write_file", move |_| {
+                    observed_writes.fetch_add(1, Ordering::SeqCst);
+                    Ok("must not execute".to_string())
+                }),
+                PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+                vec!["system".to_string()],
+            )
+            .without_memory()
+            .with_runtime_event_store(Arc::new(
+                RuntimeEventStore::open_in_memory().expect("runtime event store"),
+            ))
+            .with_approval_gate(Arc::clone(&gate)),
+        );
+        runtime
+            .begin_turn_strategy("turn-rejected-research-delivery", "调研外部资料并形成报告")
+            .expect("admit evidence strategy");
+        let calls = vec![ModelToolCall {
+            id: "write-rejected-research-delivery".to_string(),
+            name: "write_file".to_string(),
+            input: serde_json::json!({
+                "path": relative_path,
+                "content": "# Rejected research delivery\n"
+            })
+            .to_string(),
+            depends_on: Vec::new(),
+        }];
+        let executing_runtime = Arc::clone(&runtime);
+        let execution = tokio::spawn(async move {
+            executing_runtime
+                .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
+                .await
+        });
+        let request = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(request) = gate.get_pending_requests().await.into_iter().next() {
+                    break request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("rejected delivery must register approval");
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(!absolute_path.exists());
+
+        gate.resolve_approval(
+            &request.id,
+            crate::permission_enforcer::ApprovalVerdict::Denied {
+                reason: "test rejection".to_string(),
+            },
+            crate::permission_enforcer::ApprovalPersistence::Once,
+        )
+        .await
+        .expect("reject pending approval");
+        let result = tokio::time::timeout(Duration::from_secs(5), execution)
+            .await
+            .expect("rejected research delivery should finish")
+            .expect("delivery task should join");
+        let result = result.expect("rejected delivery returns a governed failure receipt");
+        assert_eq!(result.failed, 1);
+        assert!(result
+            .messages
+            .iter()
+            .any(|message| message.blocks.iter().any(|block| matches!(
+                block,
+                ContentBlock::ToolResult { output, is_error: true, .. }
+                    if output.contains("approval") || output.contains("denied")
+            ))));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(!absolute_path.exists());
     }
 
     #[tokio::test]
@@ -12456,6 +12815,7 @@ mod tests {
                     false,
                     false,
                     candidate == harness_contract::strategy::ExecutionCandidateKind::ParallelTools,
+                    false,
                     "test binds the canonical execution candidate",
                 )
                 .expect("retarget");
@@ -12992,7 +13352,7 @@ mod tests {
         assert!(critical_validation
             .findings
             .iter()
-            .any(|finding| finding == "critical_mutation_missing_approval_runtime"));
+            .any(|finding| finding == "mutation_missing_approval_runtime"));
         assert_eq!(checkpoint_calls.load(Ordering::SeqCst), 1);
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
     }

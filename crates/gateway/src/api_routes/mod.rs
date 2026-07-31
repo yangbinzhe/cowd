@@ -2439,6 +2439,104 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn session_evidence_projection_preserves_durable_order_for_large_history() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "ordered-evidence-history";
+        store
+            .create_session(&new_api_session_record(session_id, None))
+            .await
+            .unwrap();
+        let session_generation = store
+            .get_session_input_admission(session_id)
+            .await
+            .unwrap()
+            .expect("session admission")
+            .generation;
+        for index in 0..100_u64 {
+            store
+                .append_ingress_with_runtime_outbox(
+                    session_id,
+                    "user",
+                    Some(&format!(
+                        "[{{\"type\":\"text\",\"text\":\"ordered input {index}\"}}]"
+                    )),
+                    index,
+                    &session::SessionRuntimeOutboxRequest {
+                        input_id: format!("ordered-input-{index:03}"),
+                        request_id: format!("ordered-request-{index:03}"),
+                        turn_id: format!("ordered-turn-{index:03}"),
+                        message_id: format!("ordered-message-{index:03}"),
+                        session_generation,
+                        decision: harness_contract::turn::InputRoutingDecision::StartNewTurn,
+                        target_turn_id: None,
+                        classification_json: None,
+                        created_at_ms: index,
+                        runtime_options_json: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let response = api_router(test_state_with_store(store))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/sessions/{session_id}/evidence"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let turns = value["turns"].as_array().expect("turn projections");
+        assert_eq!(turns.len(), 100);
+        for (index, turn) in turns.iter().enumerate() {
+            assert_eq!(
+                turn["turn_id"],
+                format!("ordered-turn-{index:03}"),
+                "bounded parallel projection must retain durable ingress order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn evidence_batch_resolver_preserves_order_and_isolates_unavailable_items() {
+        let refs = (0..100)
+            .map(|index| format!("unsupported://ordered-{index:03}"))
+            .collect::<Vec<_>>();
+        let response = api_router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/evidence/resolve/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "session_id": "explicit-session",
+                            "refs": refs,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = value["items"].as_array().expect("evidence items");
+        assert_eq!(items.len(), 100);
+        for (index, item) in items.iter().enumerate() {
+            assert_eq!(item["ref"], format!("unsupported://ordered-{index:03}"));
+            assert_eq!(item["status"], "unavailable");
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_outbox_management_reports_poison_and_retries_both_directions() {
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
         store
@@ -10115,6 +10213,61 @@ pub(crate) mod tests {
         assert!(
             execution_error.contains("no longer accepts input"),
             "unexpected admission rejection: {execution_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_running_session_cancels_and_drains_before_committing_tombstone() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        let session_id = "running-delete-session";
+        let execution_id = "running-delete-execution";
+        store
+            .create_session(&new_api_session_record(session_id, None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(Arc::clone(&store));
+        let runtime = state.services.runtime.as_ref().expect("runtime service");
+        let active = runtime.spawn_test_active_session_execution(
+            session_id,
+            "running-delete-turn",
+            execution_id,
+        );
+        assert!(runtime
+            .running_session_execution_indices()
+            .iter()
+            .any(|entry| entry.session_id == session_id
+                && entry
+                    .active_execution_ids
+                    .contains(&execution_id.to_string())));
+
+        let response = api_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/sessions/{session_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        tokio::time::timeout(std::time::Duration::from_secs(1), active)
+            .await
+            .expect("active turn should observe lifecycle cancellation")
+            .expect("active turn test task");
+        assert!(!runtime
+            .running_session_execution_indices()
+            .iter()
+            .any(|entry| entry.session_id == session_id && !entry.active_execution_ids.is_empty()));
+        assert_eq!(
+            store
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .expect("durable tombstone")
+                .status,
+            "deleted"
         );
     }
 

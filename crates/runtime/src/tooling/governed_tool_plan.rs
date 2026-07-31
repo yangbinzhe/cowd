@@ -527,9 +527,8 @@ impl ValidatedGovernedToolDag {
             .any(|task| task.safety_category == ToolSafetyCategory::Network);
         let has_mutation = governed_tasks.iter().any(|task| is_mutation(task));
         let high_or_critical = matches!(decision.risk(), TaskRisk::High | TaskRisk::Critical);
-        let requires_approval = has_mutation
-            && decision.risk() == TaskRisk::Critical
-            && decision.gates().contains(&ExecutionPolicyGate::Approval);
+        let requires_approval =
+            has_mutation && decision.gates().contains(&ExecutionPolicyGate::Approval);
         let requires_checkpoint = has_mutation
             && high_or_critical
             && decision
@@ -1942,6 +1941,19 @@ mod tests {
                 .validate_against_execution_decision(&execution)
                 .allowed
         );
+        let approved_delivery = execution_decision(
+            RuntimeCompileTarget::ExecutionGraph,
+            TaskRisk::Medium,
+            &[ExecutionModifier::WithGuardrails],
+            &[
+                ExecutionPolicyGate::Permission,
+                ExecutionPolicyGate::Approval,
+            ],
+        );
+        let approved_delivery_report =
+            write_plan.validate_against_execution_decision(&approved_delivery);
+        assert!(approved_delivery_report.allowed);
+        assert!(approved_delivery_report.requires_approval);
     }
 
     #[test]
@@ -2065,6 +2077,63 @@ mod tests {
         let decision =
             execution_decision(RuntimeCompileTarget::EvidenceGraph, TaskRisk::Low, &[], &[]);
         assert!(plan.validate_against_execution_decision(&decision).allowed);
+    }
+
+    #[test]
+    fn registered_dynamic_write_metadata_drives_governance_without_name_heuristics() {
+        let plan = GovernedToolCompiler
+            .compile(
+                &[request_with_input(
+                    "plugin-write",
+                    "company_report_publisher",
+                    r#"{"path":"reports/final.md"}"#,
+                    Vec::new(),
+                )],
+                |name, input| {
+                    let mut effect = fixture_effect(name, input);
+                    effect.effect_kind = ToolEffectKind::Write;
+                    effect.idempotency = ToolIdempotency::IdempotentWithKey;
+                    effect.required_permission =
+                        harness_contract::tool::ToolPermissionMode::WorkspaceWrite;
+                    effect.approval_class = harness_contract::tool::ToolApprovalClass::Policy;
+                    effect.scopes = vec![PermissionScope {
+                        resource: PermissionResource::File,
+                        operation: PermissionOperation::Write,
+                        target: Some("reports/final.md".to_string()),
+                    }];
+                    Some((effect, 9, "dynamic-write-descriptor".to_string()))
+                },
+            )
+            .expect("registered dynamic write descriptor compiles");
+
+        assert_eq!(
+            plan.tasks[0].safety_category,
+            ToolSafetyCategory::WriteLocal
+        );
+        let evidence_only = execution_decision(
+            RuntimeCompileTarget::EvidenceGraph,
+            TaskRisk::Medium,
+            &[],
+            &[],
+        );
+        assert!(
+            !plan
+                .validate_against_execution_decision(&evidence_only)
+                .allowed
+        );
+
+        let approved_delivery = execution_decision(
+            RuntimeCompileTarget::ExecutionGraph,
+            TaskRisk::Medium,
+            &[ExecutionModifier::WithGuardrails],
+            &[
+                ExecutionPolicyGate::Permission,
+                ExecutionPolicyGate::Approval,
+            ],
+        );
+        let report = plan.validate_against_execution_decision(&approved_delivery);
+        assert!(report.allowed);
+        assert!(report.requires_approval);
     }
 
     #[test]

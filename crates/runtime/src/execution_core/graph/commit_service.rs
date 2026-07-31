@@ -1491,6 +1491,7 @@ mod tests {
             category: crate::ToolSafetyCategory::ReadOnly,
             authorization: None,
             session_id: Some("session".to_string()),
+            memory_context: None,
             model_lease: None,
             parent_execution: None,
             evaluation_isolated: false,

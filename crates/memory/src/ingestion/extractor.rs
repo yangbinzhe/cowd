@@ -1042,9 +1042,17 @@ mod tests {
         ];
 
         let entries = ex.extract(&messages).await.unwrap();
-        assert!(entries
+        let preference = entries
             .iter()
-            .any(|entry| entry.category == MemoryCategory::UserPreference));
+            .find(|entry| entry.category == MemoryCategory::UserPreference)
+            .expect("durable preference");
+        assert!(
+            !preference
+                .tags
+                .iter()
+                .any(|tag| tag == "memory-policy:always"),
+            "durable storage must not be confused with unconditional turn injection"
+        );
     }
 
     #[tokio::test]

@@ -458,24 +458,26 @@ mod tests {
         Arc<L4PromotionService>,
     ) {
         let root = tempfile::tempdir().expect("runtime fixture");
-        let memory = Arc::new(
-            CognitiveContextManager::new(MemoryConfig {
-                store: StoreConfig {
-                    sqlite_path: root.path().join("memory.sqlite"),
-                    blob_dir: root.path().join("memory-blobs"),
-                    enable_vector_index: false,
-                    ..Default::default()
-                },
-                budget: BudgetConfig {
-                    context_window: 16_000,
-                    reserved_system: 2_000,
-                    reserved_response: 1_000,
-                    ..Default::default()
-                },
+        let mut memory_config = MemoryConfig {
+            store: StoreConfig {
+                sqlite_path: root.path().join("memory.sqlite"),
+                blob_dir: root.path().join("memory-blobs"),
+                enable_vector_index: false,
                 ..Default::default()
-            })
-            .await
-            .expect("memory manager"),
+            },
+            budget: BudgetConfig {
+                context_window: 16_000,
+                reserved_system: 2_000,
+                reserved_response: 1_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        memory_config.layers.l4_enabled = true;
+        let memory = Arc::new(
+            CognitiveContextManager::new(memory_config)
+                .await
+                .expect("memory manager"),
         );
         let events = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let approvals = Arc::new(crate::ApprovalQueue::new(Arc::clone(&events)));

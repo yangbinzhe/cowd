@@ -883,6 +883,23 @@ impl RuntimeService {
         self.cancel_active_session_turns(session_id, reason)
     }
 
+    #[cfg(test)]
+    pub(crate) fn spawn_test_active_session_execution(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        execution_id: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let (cancellation, guard) = self
+            .install_active_turn_control(turn_id, session_id, Some(execution_id.to_string()))
+            .expect("install test active turn");
+        self.record_live_execution(session_id, execution_id.to_string(), turn_id.to_string());
+        tokio::spawn(async move {
+            cancellation.cancelled().await;
+            drop(guard);
+        })
+    }
+
     /// Atomically close Runtime turn admission and cancel every turn that was
     /// already accepted. The registry lock is the admission fence: no turn can
     /// be inserted between the snapshot and cancellation.

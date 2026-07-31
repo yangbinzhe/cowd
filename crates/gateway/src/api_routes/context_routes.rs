@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures::{stream, StreamExt};
 use serde::Deserialize;
 
 use super::{AppState, ErrorResponse};
@@ -258,33 +259,47 @@ async fn resolve_evidence_refs_batch_handler(
     let session_id = request
         .session_id
         .or_else(|| state.list_active_session_ids().into_iter().next());
-    let mut items = Vec::with_capacity(refs.len());
-    for reference in refs {
-        let resolved = state
-            .services
-            .context
-            .resolve_evidence_ref_with_snippet(
-                &state.services.session,
-                &state.services.connector,
-                &state.workspace_root,
-                &reference,
-                session_id.as_deref(),
-                request.snippet_bytes,
-            )
-            .await;
-        match resolved {
-            Ok(evidence) => items.push(serde_json::json!({
-                "ref": reference,
-                "status": if evidence.get("available").and_then(serde_json::Value::as_bool) == Some(false) { "unavailable" } else { "resolved" },
-                "evidence": evidence,
-            })),
-            Err(error) => items.push(serde_json::json!({
-                "ref": reference,
-                "status": "unavailable",
-                "error": error.message(),
-            })),
+    const EVIDENCE_RESOLVE_CONCURRENCY: usize = 8;
+    let snippet_bytes = request.snippet_bytes;
+    let mut resolved = stream::iter(refs.into_iter().enumerate().map(|(index, reference)| {
+        let state = Arc::clone(&state);
+        let session_id = session_id.clone();
+        async move {
+            let resolved = state
+                .services
+                .context
+                .resolve_evidence_ref_with_snippet(
+                    &state.services.session,
+                    &state.services.connector,
+                    &state.workspace_root,
+                    &reference,
+                    session_id.as_deref(),
+                    snippet_bytes,
+                )
+                .await;
+            let item = match resolved {
+                Ok(evidence) => serde_json::json!({
+                    "ref": reference,
+                    "status": if evidence.get("available").and_then(serde_json::Value::as_bool) == Some(false) { "unavailable" } else { "resolved" },
+                    "evidence": evidence,
+                }),
+                Err(error) => serde_json::json!({
+                    "ref": reference,
+                    "status": "unavailable",
+                    "error": error.message(),
+                }),
+            };
+            (index, item)
         }
-    }
+    }))
+    .buffer_unordered(EVIDENCE_RESOLVE_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    resolved.sort_by_key(|(index, _)| *index);
+    let items = resolved
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
     Ok(Json(serde_json::json!({
         "kind": "evidence_batch_projection",
         "count": items.len(),

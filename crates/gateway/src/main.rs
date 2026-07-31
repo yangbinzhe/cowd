@@ -2755,6 +2755,11 @@ pub(crate) fn runtime_capability_context_item(
     } else {
         "runtime_orchestrate=not_registered"
     };
+    let context_retrieval = if has_tool("context_retrieve") {
+        "context_retrieve=registered; use it when automatic context is incomplete, uncertain, or appears unrelated; discover authorized prior Sessions through source=session_catalog before requesting explicit Session history"
+    } else {
+        "context_retrieve=not_registered"
+    };
     let allowed_state = allowed_tools.map_or_else(
         || "allowed_tools=all available registry tools".to_string(),
         |allowed| format!("allowed_tools=restricted count={}", allowed.len()),
@@ -2766,6 +2771,7 @@ registered_tool_count={}\n\
 {allowed_state}\n\
 {runtime_query}\n\
 {runtime_orchestration}\n\
+{context_retrieval}\n\
 registered_batch_readonly_tools={}\n\
 registered_prepared_readonly_tools={}\n\
 Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use ToolSearch to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. Distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex work, use active runtime orchestration when present. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",

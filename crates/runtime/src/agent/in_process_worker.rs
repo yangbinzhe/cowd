@@ -195,10 +195,24 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             })
             .collect::<BTreeSet<_>>();
         let tool_names = allowed_tools.iter().cloned().collect::<Vec<_>>();
+        let memory_context = memory::MemoryTurnContext::new(
+            packet.session_id(),
+            binding.instance.instance_id.clone(),
+        )
+        .with_definition_lineage_id(Some(
+            binding.definition_ref.definition_id.as_str().to_string(),
+        ))
+        .with_project_id(Some(crate::memory_project_id_for_workspace(
+            services.workspace_root(),
+        )))
+        .with_task_id(Some(binding.data_lease.task_id.clone()))
+        .with_team_id(binding.data_lease.team_id.clone())
+        .with_cognitive_read_scopes(binding.data_lease.read_scopes.clone());
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
             host,
             allowed_tools: allowed_tools.clone(),
             session_id: packet.session_id().to_string(),
+            memory_context,
             model_lease: selection.model.clone(),
             execution_id: packet.graph_id().to_string(),
             node_id: packet.node_id().to_string(),
@@ -805,6 +819,7 @@ struct ScopedRuntimeToolExecutor {
     host: Arc<dyn RuntimeExecutionHost>,
     allowed_tools: BTreeSet<String>,
     session_id: String,
+    memory_context: memory::MemoryTurnContext,
     model_lease: String,
     execution_id: String,
     node_id: String,
@@ -1050,6 +1065,7 @@ impl ScopedRuntimeToolExecutor {
             category: crate::ToolSafetyCategory::WriteLocal,
             authorization: Some(authorization),
             session_id: Some(self.session_id.clone()),
+            memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: self.execution_id.clone(),
@@ -1082,6 +1098,13 @@ impl ScopedRuntimeToolExecutor {
         let Some(allowed_scopes) = self.resource_scopes.as_deref() else {
             return Ok(());
         };
+        // Context retrieval is bounded by the Runtime-issued MemoryTurnContext
+        // and durable Session actor/workspace checks, not by a filesystem path.
+        // Treating its read-only runtime scope as an unbounded path would make
+        // Team Agents lose the context continuity that the primary Agent has.
+        if tool_name == "context_retrieve" {
+            return Ok(());
+        }
         let input = serde_json::from_str::<serde_json::Value>(input)
             .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
         let descriptor = self
@@ -1193,6 +1216,7 @@ impl ScopedRuntimeToolExecutor {
             category: crate::ToolSafetyCategory::from_effect(&descriptor),
             authorization,
             session_id: Some(self.session_id.clone()),
+            memory_context: Some(self.memory_context.clone()),
             model_lease: Some(self.model_lease.clone()),
             parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
                 execution_id: self.execution_id.clone(),
@@ -2629,8 +2653,10 @@ mod tests {
                 "read_file".to_string(),
                 "grep_search".to_string(),
                 "glob_search".to_string(),
+                "context_retrieve".to_string(),
             ]),
             session_id: "session".to_string(),
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
@@ -2653,6 +2679,12 @@ mod tests {
         assert!(executor
             .enforce_resource_ceiling("grep_search", r#"{"pattern":"unsafe"}"#)
             .is_err());
+        executor
+            .enforce_resource_ceiling(
+                "context_retrieve",
+                r#"{"source":"session_history","scope":"current"}"#,
+            )
+            .expect("Runtime-bound context retrieval is not a filesystem escape");
 
         let normalized = normalize_delegated_resource_paths(
             "glob_search",
@@ -2719,6 +2751,7 @@ mod tests {
             host: Arc::new(InputSensitiveRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
@@ -2770,6 +2803,7 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string(), "write_file".to_string()]),
             session_id: "session".to_string(),
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
@@ -2803,6 +2837,7 @@ mod tests {
             host: Arc::new(NoopRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string(), "grep_search".to_string()]),
             session_id: "session".to_string(),
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
@@ -2850,6 +2885,7 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
@@ -2941,6 +2977,7 @@ mod tests {
             host: Arc::new(EchoRuntimeExecutionHost),
             allowed_tools: BTreeSet::from(["read_file".to_string()]),
             session_id: "session".to_string(),
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),

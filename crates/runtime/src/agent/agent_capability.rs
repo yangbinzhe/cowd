@@ -36,6 +36,10 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
         allowed_tools.insert("grep_search".to_string());
         allowed_tools.insert("glob_search".to_string());
     }
+    // Every Runtime-owned Agent receives the same read-only context continuity
+    // entry point. The tool itself enforces the exact Agent/Session/Project/
+    // Team Binding, so this does not grant broad Memory or Session access.
+    allowed_tools.insert("context_retrieve".to_string());
     let mut permission_policy = PermissionPolicy::new(permission_mode);
     for tool in &allowed_tools {
         permission_policy =
@@ -88,11 +92,16 @@ struct CapabilityMapping {
 fn capability_mapping(capability: &str) -> CapabilityMapping {
     match capability {
         "read" => CapabilityMapping {
-            tools: &["read_file"],
+            tools: &["read_file", "context_retrieve"],
             required_mode: PermissionMode::ReadOnly,
         },
         "search" => CapabilityMapping {
-            tools: &["grep_search", "glob_search", "ToolSearch"],
+            tools: &[
+                "grep_search",
+                "glob_search",
+                "ToolSearch",
+                "context_retrieve",
+            ],
             required_mode: PermissionMode::ReadOnly,
         },
         "network" | "web" => CapabilityMapping {
@@ -163,6 +172,7 @@ mod tests {
         assert!(resolved.allowed_tools.contains("read_file"));
         assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("ToolSearch"));
+        assert!(resolved.allowed_tools.contains("context_retrieve"));
         assert_eq!(resolved.evidence_duties, vec!["source_notes"]);
     }
 
@@ -178,6 +188,7 @@ mod tests {
         assert!(resolved.allowed_tools.contains("write_file"));
         assert!(resolved.allowed_tools.contains("edit_file"));
         assert!(resolved.allowed_tools.contains("bash"));
+        assert!(resolved.allowed_tools.contains("context_retrieve"));
         assert_eq!(
             resolved.permission_policy.required_mode_for("write_file"),
             PermissionMode::WorkspaceWrite

@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use session::{SessionEvent, SessionMessage, SessionRecord};
 use sha2::{Digest, Sha256};
@@ -155,80 +156,100 @@ async fn session_evidence_projection(
     }
     records.sort_by_key(|record| (record.sequence, record.request_id.clone()));
 
-    let mut all_refs = BTreeSet::new();
-    let mut turns = Vec::with_capacity(records.len());
-    for record in records {
-        // The relation is deterministic from the durable ingress identity;
-        // never approximate it from message text, sequence, or timestamps.
-        let execution_id =
-            runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id);
-        let projection = match super::runtime_routes::execution_projection_context(
-            state,
-            principal,
-            &execution_id,
-            ProjectionDetailScope::Summary,
-        )
-        .await
-        {
-            Ok(context) => match runtime::execution_projection::snapshot(
-                runtime_service.runtime_services().as_ref(),
+    const EVIDENCE_PROJECTION_CONCURRENCY: usize = 8;
+    let runtime_services = runtime_service.runtime_services();
+    let mut projected = stream::iter(records.into_iter().enumerate().map(|(index, record)| {
+        let runtime_services = Arc::clone(&runtime_services);
+        async move {
+            // The relation is deterministic from the durable ingress identity;
+            // never approximate it from message text, sequence, or timestamps.
+            let execution_id =
+                runtime::session_ingress_graph_id(session_id, &record.request_id, &record.turn_id);
+            let projection = match super::runtime_routes::execution_projection_context(
+                state,
+                principal,
                 &execution_id,
-                &context,
+                ProjectionDetailScope::Summary,
             )
             .await
             {
-                Ok(projection) => Some(projection),
-                Err(runtime::RuntimeServicesError::ProjectionAccessDenied) => {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        Json(ErrorResponse {
-                            error: format!(
-                                "execution {execution_id} evidence is outside the authenticated principal scope"
-                            ),
-                        }),
-                    ));
+                Ok(context) => {
+                    match runtime::execution_projection::snapshot(
+                        runtime_services.as_ref(),
+                        &execution_id,
+                        &context,
+                    )
+                    .await
+                    {
+                        Ok(projection) => Some(projection),
+                        Err(runtime::RuntimeServicesError::ProjectionAccessDenied) => {
+                            return Err((
+                                StatusCode::FORBIDDEN,
+                                Json(ErrorResponse {
+                                    error: format!(
+                                        "execution {execution_id} evidence is outside the authenticated principal scope"
+                                    ),
+                                }),
+                            ));
+                        }
+                        Err(_) => None,
+                    }
                 }
-                Err(_) => None,
-            },
-            Err((StatusCode::NOT_FOUND, _)) => None,
-            Err(error) => return Err(error),
-        };
-        let mut evidence_refs = projection
-            .as_ref()
-            .map(|projection| {
-                projection
-                    .evidence
-                    .iter()
-                    .flat_map(|entity| entity.evidence_refs.iter().cloned())
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default();
-        all_refs.extend(evidence_refs.iter().cloned());
-        let live = runtime_service.execution_live(&execution_id);
-        let freshness = if live.is_some() {
-            EvidenceFreshness::Live
-        } else if projection.is_some() {
-            EvidenceFreshness::Durable
-        } else {
-            EvidenceFreshness::Unavailable
-        };
-        let terminal_ref = (record.status == session::SessionRuntimeInputStatus::Completed)
-            .then(|| format!("turn-terminal:{}", record.request_id));
-        let assistant_message_id = terminal_ref
-            .as_ref()
-            .map(|_| format!("assistant:{}", record.message_id));
-        turns.push(TurnEvidenceProjection {
-            session_id: session_id.to_string(),
-            turn_id: record.turn_id,
-            input_message_id: record.message_id,
-            execution_id,
-            terminal_ref,
-            assistant_message_id,
-            context_report_id: None,
-            evidence_refs: std::mem::take(&mut evidence_refs).into_iter().collect(),
-            freshness,
-        });
-    }
+                Err((StatusCode::NOT_FOUND, _)) => None,
+                Err(error) => return Err(error),
+            };
+            let evidence_refs = projection
+                .as_ref()
+                .map(|projection| {
+                    projection
+                        .evidence
+                        .iter()
+                        .flat_map(|entity| entity.evidence_refs.iter().cloned())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            let freshness = if runtime_service.execution_live(&execution_id).is_some() {
+                EvidenceFreshness::Live
+            } else if projection.is_some() {
+                EvidenceFreshness::Durable
+            } else {
+                EvidenceFreshness::Unavailable
+            };
+            let terminal_ref = (record.status == session::SessionRuntimeInputStatus::Completed)
+                .then(|| format!("turn-terminal:{}", record.request_id));
+            let assistant_message_id = terminal_ref
+                .as_ref()
+                .map(|_| format!("assistant:{}", record.message_id));
+            Ok((
+                index,
+                TurnEvidenceProjection {
+                    session_id: session_id.to_string(),
+                    turn_id: record.turn_id,
+                    input_message_id: record.message_id,
+                    execution_id,
+                    terminal_ref,
+                    assistant_message_id,
+                    context_report_id: None,
+                    evidence_refs: evidence_refs.into_iter().collect(),
+                    freshness,
+                },
+            ))
+        }
+    }))
+    .buffer_unordered(EVIDENCE_PROJECTION_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    projected.sort_by_key(|(index, _)| *index);
+    let turns = projected
+        .into_iter()
+        .map(|(_, projection)| projection)
+        .collect::<Vec<_>>();
+    let all_refs = turns
+        .iter()
+        .flat_map(|turn| turn.evidence_refs.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let freshness = if turns
         .iter()
         .any(|turn| turn.freshness == EvidenceFreshness::Live)
@@ -1826,6 +1847,32 @@ fn payload_type_contains(payload: &serde_json::Value, needles: &[&str]) -> bool 
         .unwrap_or(false)
 }
 
+fn session_input_content_preview(payload: &serde_json::Value) -> Option<String> {
+    let direct = payload
+        .get("content_preview")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let classified = payload.get("classification").and_then(|classification| {
+        if classification.is_object() {
+            classification
+                .get("content_preview")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        } else {
+            let parsed =
+                serde_json::from_str::<serde_json::Value>(classification.as_str()?).ok()?;
+            parsed
+                .get("content_preview")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }
+    });
+    direct
+        .or(classified)
+        .map(|preview| preview.trim().to_string())
+        .filter(|preview| !preview.is_empty())
+}
+
 #[derive(Default)]
 struct TurnProjectionAccumulator {
     turn_id: String,
@@ -1872,6 +1919,9 @@ impl TurnProjectionAccumulator {
             "session.input.accepted.v1" | "session.input.queued.v1" => {
                 self.status = "pending".to_string();
                 self.submitted_at_ms = self.submitted_at_ms.or(created_at_ms);
+                if let Some(preview) = session_input_content_preview(payload) {
+                    self.observe_user_preview(preview);
+                }
             }
             "SessionInputIngressBound" => {
                 self.status = "running".to_string();
@@ -1940,7 +1990,7 @@ impl TurnProjectionAccumulator {
                     .and_then(|inner| inner.get("prompt_preview"))
                     .and_then(serde_json::Value::as_str)
                 {
-                    self.user_preview = Some(preview.to_string());
+                    self.observe_user_preview(preview.to_string());
                 }
             }
             Some("running") => {
@@ -1962,6 +2012,12 @@ impl TurnProjectionAccumulator {
             _ => {}
         }
         collect_projection_evidence_refs(payload, &mut self.evidence_refs);
+    }
+
+    fn observe_user_preview(&mut self, preview: String) {
+        if self.user_preview.is_none() && !preview.trim().is_empty() {
+            self.user_preview = Some(preview);
+        }
     }
 
     fn into_value(self) -> serde_json::Value {
@@ -3736,7 +3792,10 @@ mod tests {
                 "created_at_ms": 10,
                 "status": "accepted",
                 "refs": [{"type": "turn", "id": "turn-1"}],
-                "payload": {"turn_id": "turn-1"}
+                "payload": {
+                    "turn_id": "turn-1",
+                    "classification": "{\"decision\":\"start_new_turn\",\"content_preview\":\"inspect the runtime\"}"
+                }
             }),
             serde_json::json!({
                 "type": "SessionInputIngressBound",
@@ -3771,6 +3830,10 @@ mod tests {
 
         assert_eq!(projection["turn_count"], 1);
         assert_eq!(projection["turns"][0]["status"], "completed");
+        assert_eq!(
+            projection["turns"][0]["user_preview"],
+            "inspect the runtime"
+        );
         assert_eq!(
             projection["turns"][0]["event_sequences"],
             serde_json::json!([0, 1, 2, 3, 4])
@@ -3913,7 +3976,10 @@ mod tests {
                 "refs": [{"type": "turn", "id": "turn-main"}],
                 "payload": {
                     "decision": "start_new_turn",
-                    "turn_id": "turn-main"
+                    "turn_id": "turn-main",
+                    "classification": {
+                        "content_preview": "the original user request"
+                    }
                 }
             }),
             serde_json::json!({
@@ -3934,7 +4000,10 @@ mod tests {
                 "payload": {
                     "decision": "supplement_current_turn",
                     "turn_id": "turn-supplement",
-                    "target_turn_id": "turn-main"
+                    "target_turn_id": "turn-main",
+                    "classification": {
+                        "content_preview": "a later supplemental instruction"
+                    }
                 }
             }),
             serde_json::json!({
@@ -3962,6 +4031,10 @@ mod tests {
         assert_eq!(
             projection["turns"][0]["event_sequences"],
             serde_json::json!([0, 1, 2, 3, 4])
+        );
+        assert_eq!(
+            projection["turns"][0]["user_preview"],
+            "the original user request"
         );
     }
 

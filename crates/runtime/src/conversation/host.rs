@@ -2733,6 +2733,7 @@ struct HostEarlyToolDispatcher<T: ToolExecutor> {
     event_bus: Option<crate::CowdEventBus>,
     ticket: NodeExecutionTicket,
     session_id: String,
+    memory_context: memory::MemoryTurnContext,
     model_lease: Option<String>,
     decision: crate::execution_core::RuntimeExecutionDecision,
     permission_mode: crate::PermissionMode,
@@ -2785,6 +2786,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
         let event_bus = self.event_bus.clone();
         let ticket = self.ticket.clone();
         let session_id = self.session_id.clone();
+        let memory_context = self.memory_context.clone();
         let model_lease = self.model_lease.clone();
         let decision = self.decision.clone();
         let permission_mode = self.permission_mode;
@@ -2888,6 +2890,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 event_bus,
                 calls: &calls,
                 session_id: &session_id,
+                memory_context: Some(&memory_context),
                 model_lease: model_lease.as_deref(),
                 ticket: &early_ticket,
                 tool_authorizations: &authorizations,
@@ -3175,6 +3178,7 @@ where
                             event_bus: runtime.cowd_bus().cloned(),
                             ticket: ticket.clone(),
                             session_id: early_session_id.clone(),
+                            memory_context: runtime.memory_turn_context(),
                             model_lease: early_model_lease.clone(),
                             decision: strategy.decision,
                             permission_mode: runtime.permission_policy().active_mode(),
@@ -5214,12 +5218,16 @@ where
             self.services.tool_execution_host()
         };
         let (result, orchestration_terminal_summary) = if let Some(host) = governed_host {
-            let event_bus = self.runtime.lock().await.cowd_bus().cloned();
+            let (event_bus, memory_context) = {
+                let runtime = self.runtime.lock().await;
+                (runtime.cowd_bus().cloned(), runtime.memory_turn_context())
+            };
             let governed = execute_governed_runtime_tool_batch(
                 Arc::clone(host),
                 event_bus,
                 &calls,
                 &session_id,
+                Some(&memory_context),
                 model_lease.as_deref(),
                 ticket,
                 &tool_authorizations,
@@ -6199,6 +6207,7 @@ struct HostGovernedToolContext<'a> {
     event_bus: Option<crate::CowdEventBus>,
     calls: &'a [ModelToolCall],
     session_id: &'a str,
+    memory_context: Option<&'a memory::MemoryTurnContext>,
     model_lease: Option<&'a str>,
     ticket: &'a NodeExecutionTicket,
     tool_authorizations:
@@ -6254,6 +6263,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                 self.plan_id,
                 self.plan_revision,
                 self.session_id,
+                self.memory_context,
                 self.model_lease,
                 self.ticket,
                 authorization,
@@ -6351,6 +6361,7 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     self.plan_id,
                     self.plan_revision,
                     self.session_id,
+                    self.memory_context,
                     self.model_lease,
                     self.ticket,
                     self.tool_authorizations.get(&call.id).cloned(),
@@ -6420,6 +6431,7 @@ async fn execute_governed_runtime_tool_batch(
     event_bus: Option<crate::CowdEventBus>,
     calls: &[ModelToolCall],
     session_id: &str,
+    memory_context: Option<&memory::MemoryTurnContext>,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
     tool_authorizations: &std::collections::HashMap<
@@ -6509,6 +6521,7 @@ async fn execute_governed_runtime_tool_batch(
         event_bus,
         calls,
         session_id,
+        memory_context,
         model_lease,
         ticket,
         tool_authorizations,
@@ -6670,6 +6683,7 @@ fn bound_runtime_tool_request(
     plan_id: &str,
     plan_revision: u64,
     session_id: &str,
+    memory_context: Option<&memory::MemoryTurnContext>,
     model_lease: Option<&str>,
     ticket: &NodeExecutionTicket,
     authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
@@ -6687,6 +6701,7 @@ fn bound_runtime_tool_request(
         category: task.safety_category,
         authorization,
         session_id: Some(session_id.to_string()),
+        memory_context: memory_context.cloned(),
         model_lease: model_lease.map(ToString::to_string),
         parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
             execution_id: ticket.graph_id.clone(),
@@ -11416,6 +11431,7 @@ mod tests {
             None,
             &calls,
             "session",
+            None,
             None,
             &ticket,
             &std::collections::HashMap::new(),

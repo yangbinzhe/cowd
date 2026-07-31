@@ -415,6 +415,29 @@ impl UnifiedSessionStore {
         .await
     }
 
+    /// Discover sessions that share the current Session's durable workspace
+    /// and actor identity. Message content participates in the query, but only
+    /// records inside that authority boundary can affect ranking or results.
+    pub async fn discover_browsable_sessions(
+        &self,
+        current_session_id: &str,
+        query: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<SessionListPage> {
+        let current_session_id = current_session_id.to_string();
+        let query = query.map(str::to_string);
+        self.execute_read(move |backend| {
+            backend.discover_browsable_sessions(
+                &current_session_id,
+                query.as_deref(),
+                limit,
+                offset,
+            )
+        })
+        .await
+    }
+
     /// List all sessions for a given platform, ordered by `last_activity DESC`.
     pub async fn list_sessions_by_platform(&self, platform: &str) -> Result<Vec<SessionRecord>> {
         let platform = platform.to_string();

@@ -427,7 +427,7 @@ impl MemoryKernel {
                     .filter_active_entries(prepared.entries)
                     .await
                     .into_iter()
-                    .filter(|entry| memory_scope_visible_to_ctx(&entry.scope, ctx))
+                    .filter(|entry| memory_entry_visible_to_ctx(entry, ctx))
                     .collect();
                 prepared.total_tokens = prepared
                     .entries
@@ -768,6 +768,115 @@ impl MemoryKernel {
         .await
     }
 
+    /// Actively search Memory inside an exact Runtime Binding.
+    ///
+    /// Unlike [`Self::context_packet_preview`], this path does not begin with
+    /// progressive passive layer loading. It queries the durable FTS/vector
+    /// indexes first, then applies the same lifecycle, scope, relevance,
+    /// deduplication, and token-budget gates used by normal context assembly.
+    /// This distinction is required for Session/Task memories that are valid
+    /// on demand but intentionally absent from every turn's passive packet.
+    pub async fn retrieve_packet_preview(
+        &self,
+        ctx: &MemoryTurnContext,
+        query: &str,
+        max_items: usize,
+        max_tokens: u64,
+    ) -> MemoryKernelResult<MemoryContextPacket> {
+        let candidate_limit = max_items.saturating_mul(8).clamp(16, 128);
+        let search_scopes = memory_binding_search_scopes(ctx);
+        let mut candidates = self
+            .manager
+            .search_memories_in_scopes(query, &search_scopes, candidate_limit)
+            .await?;
+        let mut vector_scores = HashMap::new();
+        let seen = candidates
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+        for (entry, score) in self
+            .manager
+            .vector_recall_candidates(query, &seen, candidate_limit)
+            .await
+            .unwrap_or_default()
+        {
+            vector_scores.insert(entry.id, score);
+            candidates.push(entry);
+        }
+        let candidates = self.filter_active_entries(candidates).await;
+        let (candidates, mut omitted) = deduplicate_memory_entries_for_recall(candidates);
+        let mut selected_sources = HashMap::new();
+        let mut relevance_omissions = Vec::new();
+        let candidates = candidates
+            .into_iter()
+            // Scope failures are intentionally silent: callers must not learn
+            // even the title/id of a Memory outside their Binding.
+            .filter(|entry| memory_entry_visible_to_ctx(entry, ctx))
+            .filter(|entry| {
+                let relevance =
+                    memory_entry_turn_relevance(entry, query, vector_scores.get(&entry.id).copied());
+                if relevance.accepted {
+                    selected_sources.insert(entry.id, RecallSourceKind::Memory);
+                    true
+                } else {
+                    relevance_omissions.push(OmittedMemory {
+                        id: entry.id,
+                        title: entry.title.clone(),
+                        reason: format!(
+                            "active retrieval relevance below scope threshold ({:.2} < {:.2}, scope={})",
+                            relevance.score, relevance.threshold, entry.scope
+                        ),
+                    });
+                    false
+                }
+            })
+            .collect();
+        omitted.append(&mut relevance_omissions);
+        let usage_summary = self.usage_summary().await.unwrap_or_default();
+        let mut packet = self
+            .context_packet_from_entries_with_budget(
+                candidates,
+                max_items,
+                max_tokens,
+                &self.manager.budget_config(),
+                Some(&usage_summary),
+            )
+            .await?;
+        packet.omitted.extend(omitted);
+        packet.recall_report = recall_report_from_packet(
+            &packet,
+            selected_sources,
+            vector_scores,
+            vec![RecallSourceResult {
+                source: RecallSourceKind::Memory,
+                status: "active_binding_search".to_string(),
+                selected_count: packet.selected.len(),
+                omitted_count: packet.omitted.len(),
+                degraded_reason: None,
+            }],
+        );
+        Ok(packet)
+    }
+
+    /// Read one exact Memory entry through the same lifecycle and Runtime
+    /// Binding gates used by active retrieval.
+    ///
+    /// An unknown or unauthorized id returns `None` so callers cannot use ids
+    /// to probe another Session, Project, Agent, Team, or knowledge scope.
+    pub async fn retrieve_visible_entry(
+        &self,
+        ctx: &MemoryTurnContext,
+        memory_id: MemoryId,
+    ) -> MemoryKernelResult<Option<MemoryEntry>> {
+        let Some(entry) = self.manager.get_entry(&memory_id.to_string()).await? else {
+            return Ok(None);
+        };
+        let mut active = self.filter_active_entries(vec![entry]).await;
+        Ok(active
+            .pop()
+            .filter(|entry| memory_entry_visible_to_ctx(entry, ctx)))
+    }
+
     async fn context_packet_with_mode(
         &self,
         ctx: &MemoryTurnContext,
@@ -860,11 +969,30 @@ impl MemoryKernel {
         }
         let (deduplicated_entries, mut duplicate_omissions) =
             deduplicate_memory_entries_for_recall(prepared.entries);
+        let mut relevance_omissions = Vec::new();
         prepared.entries = deduplicated_entries
             .into_iter()
-            .filter(|entry| memory_scope_visible_to_ctx(&entry.scope, ctx))
+            .filter(|entry| memory_entry_visible_to_ctx(entry, ctx))
+            .filter(|entry| {
+                let vector_score = vector_scores.get(&entry.id).copied();
+                let relevance = memory_entry_turn_relevance(entry, query, vector_score);
+                if relevance.accepted {
+                    true
+                } else {
+                    relevance_omissions.push(OmittedMemory {
+                        id: entry.id,
+                        title: entry.title.clone(),
+                        reason: format!(
+                            "turn relevance below scope threshold ({:.2} < {:.2}, scope={})",
+                            relevance.score, relevance.threshold, entry.scope
+                        ),
+                    });
+                    false
+                }
+            })
             .collect();
         checkpoint_omissions.append(&mut duplicate_omissions);
+        checkpoint_omissions.append(&mut relevance_omissions);
         let usage_summary = self.usage_summary().await.unwrap_or_default();
         let mut packet = self
             .context_packet_from_entries_with_budget(
@@ -898,7 +1026,7 @@ impl MemoryKernel {
             .into_iter()
             .filter(|entry| {
                 entry.tags.iter().any(|tag| tag == "semantic-checkpoint")
-                    && memory_scope_visible_to_ctx(&entry.scope, ctx)
+                    && memory_entry_visible_to_ctx(entry, ctx)
             })
             .map(|entry| (checkpoint_recall_score(&entry, ctx, query), entry))
             .collect::<Vec<_>>();
@@ -1530,12 +1658,14 @@ pub(crate) fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -
         // by carrying that enum value.
         MemoryScope::Global
             if entry.layer == MemoryLayer::L0
-                || entry.category == MemoryCategory::UserPreference
                 || !matches!(entry.visibility, AgentVisibility::Private)
                 || matches!(
                     entry.source,
                     MemorySource::UserExplicit | MemorySource::Import
-                ) =>
+                )
+                || entry.tags.iter().any(|tag| {
+                    matches!(tag.as_str(), "memory-policy:always" | "always-active")
+                }) =>
         {
             MemoryScope::Global
         }
@@ -1555,7 +1685,12 @@ pub(crate) fn scoped_entry_scope(ctx: &MemoryTurnContext, entry: &MemoryEntry) -
 }
 
 fn default_scope_for_entry(ctx: &MemoryTurnContext, entry: &MemoryEntry) -> MemoryScope {
-    if entry.layer == MemoryLayer::L0 || entry.category == MemoryCategory::UserPreference {
+    if entry.layer == MemoryLayer::L0
+        || entry
+            .tags
+            .iter()
+            .any(|tag| matches!(tag.as_str(), "memory-policy:always" | "always-active"))
+    {
         return MemoryScope::Global;
     }
     if entry.category == MemoryCategory::Shared {
@@ -1581,6 +1716,81 @@ pub(crate) fn default_scope_for_ctx(ctx: &MemoryTurnContext) -> MemoryScope {
         return MemoryScope::Project(project_id.to_string());
     }
     MemoryScope::Session(ctx.session_id.clone())
+}
+
+fn memory_entry_visible_to_ctx(entry: &MemoryEntry, ctx: &MemoryTurnContext) -> bool {
+    // Historic extraction treated every UserPreference as globally readable.
+    // A private inferred topic preference is not workspace-wide authority even
+    // when an older row already carries `scope=global`.
+    if matches!(entry.scope, MemoryScope::Global)
+        && entry.layer != MemoryLayer::L0
+        && matches!(entry.visibility, AgentVisibility::Private)
+        && matches!(
+            entry.source,
+            MemorySource::AutoExtracted | MemorySource::Compression | MemorySource::Prefetch
+        )
+        && !entry
+            .tags
+            .iter()
+            .any(|tag| matches!(tag.as_str(), "memory-policy:always" | "always-active"))
+    {
+        return false;
+    }
+    memory_scope_visible_to_ctx(&entry.scope, ctx)
+}
+
+fn memory_binding_search_scopes(ctx: &MemoryTurnContext) -> Vec<MemoryScope> {
+    use harness_contract::agent::CognitiveReadScope;
+
+    let mut scopes = vec![MemoryScope::AgentInstance(ctx.agent_id.clone())];
+    if ctx
+        .cognitive_read_scopes
+        .contains(&CognitiveReadScope::Session)
+    {
+        scopes.push(MemoryScope::Session(ctx.session_id.clone()));
+        if let Some(task_id) = ctx.task_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            scopes.push(MemoryScope::Task(task_id.to_string()));
+        }
+    }
+    if ctx
+        .cognitive_read_scopes
+        .contains(&CognitiveReadScope::Project)
+    {
+        if let Some(project_id) = ctx.project_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            scopes.push(MemoryScope::Project(project_id.to_string()));
+        }
+    }
+    if ctx
+        .cognitive_read_scopes
+        .contains(&CognitiveReadScope::DefinitionLineage)
+    {
+        if let Some(definition_id) = ctx
+            .definition_lineage_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
+            scopes.push(MemoryScope::AgentDefinitionLineage(
+                definition_id.to_string(),
+            ));
+        }
+    }
+    if ctx
+        .cognitive_read_scopes
+        .contains(&CognitiveReadScope::Team)
+    {
+        if let Some(team_id) = ctx.team_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            scopes.push(MemoryScope::TeamRun(team_id.to_string()));
+        }
+    }
+    if ctx
+        .cognitive_read_scopes
+        .contains(&CognitiveReadScope::WorkspaceKnowledge)
+    {
+        scopes.push(MemoryScope::Global);
+    }
+    scopes.sort_by_key(MemoryScope::scope_key);
+    scopes.dedup();
+    scopes
 }
 
 pub(crate) fn memory_scope_visible_to_ctx(scope: &MemoryScope, ctx: &MemoryTurnContext) -> bool {
@@ -1622,6 +1832,49 @@ pub(crate) fn memory_scope_visible_to_ctx(scope: &MemoryScope, ctx: &MemoryTurnC
                     .contains(&CognitiveReadScope::Team)
         }
         MemoryScope::LegacyUnresolvedAgent(_) => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnRelevanceDecision {
+    accepted: bool,
+    score: f32,
+    threshold: f32,
+}
+
+fn memory_entry_turn_relevance(
+    entry: &MemoryEntry,
+    query: &str,
+    vector_score: Option<f32>,
+) -> TurnRelevanceDecision {
+    if entry.layer == MemoryLayer::L0
+        || entry
+            .tags
+            .iter()
+            .any(|tag| matches!(tag.as_str(), "memory-policy:always" | "always-active"))
+    {
+        return TurnRelevanceDecision {
+            accepted: true,
+            score: 1.0,
+            threshold: 0.0,
+        };
+    }
+
+    let lexical_score = query_overlap_score(query, &entry.title, &entry.content);
+    let semantic_score = vector_score.unwrap_or_default().clamp(0.0, 1.0);
+    let score = lexical_score.max(semantic_score);
+    let threshold = match entry.scope {
+        MemoryScope::Session(_) | MemoryScope::Task(_) => 0.05,
+        MemoryScope::AgentInstance(_)
+        | MemoryScope::AgentDefinitionLineage(_)
+        | MemoryScope::TeamRun(_) => 0.07,
+        MemoryScope::Project(_) => 0.08,
+        MemoryScope::Global | MemoryScope::LegacyUnresolvedAgent(_) => 0.12,
+    };
+    TurnRelevanceDecision {
+        accepted: score >= threshold,
+        score,
+        threshold,
     }
 }
 
@@ -1773,23 +2026,100 @@ fn memory_atom_relevance(atom: &MemoryAtomView) -> f32 {
 }
 
 fn query_overlap_score(query: &str, title: &str, content: &str) -> f32 {
-    let query = query.to_lowercase();
+    let query = query.trim().to_lowercase();
     let haystack = format!("{} {}", title.to_lowercase(), content.to_lowercase());
-    if query.trim().len() > 8 && haystack.contains(query.trim()) {
+    if query.chars().count() > 4 && haystack.contains(query.as_str()) {
         return 0.46;
     }
-    let tokens = query
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-        .filter(|token| token.len() >= 3)
-        .collect::<HashSet<_>>();
-    if tokens.is_empty() {
+    let query_terms = semantic_relevance_terms(&query);
+    if query_terms.is_empty() {
         return 0.0;
     }
-    let matched = tokens
-        .iter()
-        .filter(|token| haystack.contains(**token))
-        .count();
-    ((matched as f32 / tokens.len() as f32) * 0.42).min(0.42)
+    let haystack_terms = semantic_relevance_terms(&haystack);
+    let matched = query_terms.intersection(&haystack_terms).count();
+    if matched == 0 {
+        return 0.0;
+    }
+    let coverage = matched as f32 / query_terms.len() as f32;
+    let specificity =
+        matched as f32 / haystack_terms.len().max(1).min(query_terms.len() * 4) as f32;
+    (coverage * 0.36 + specificity.min(1.0) * 0.10).min(0.46)
+}
+
+fn semantic_relevance_terms(text: &str) -> HashSet<String> {
+    let mut terms = HashSet::new();
+    let mut ascii_word = String::new();
+    let mut cjk_run = Vec::new();
+
+    let flush_ascii = |word: &mut String, terms: &mut HashSet<String>| {
+        if word.chars().count() >= 2 && !is_generic_relevance_term(word) {
+            terms.insert(std::mem::take(word));
+        } else {
+            word.clear();
+        }
+    };
+    let flush_cjk = |run: &mut Vec<char>, terms: &mut HashSet<String>| {
+        if run.len() == 1 {
+            terms.insert(run[0].to_string());
+        } else {
+            for pair in run.windows(2) {
+                terms.insert(pair.iter().collect());
+            }
+        }
+        run.clear();
+    };
+
+    for character in text.chars().flat_map(char::to_lowercase) {
+        if is_cjk(character) {
+            flush_ascii(&mut ascii_word, &mut terms);
+            cjk_run.push(character);
+        } else {
+            flush_cjk(&mut cjk_run, &mut terms);
+            if character.is_alphanumeric() || matches!(character, '_' | '-') {
+                ascii_word.push(character);
+            } else {
+                flush_ascii(&mut ascii_word, &mut terms);
+            }
+        }
+    }
+    flush_ascii(&mut ascii_word, &mut terms);
+    flush_cjk(&mut cjk_run, &mut terms);
+    terms
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+    )
+}
+
+fn is_generic_relevance_term(term: &str) -> bool {
+    matches!(
+        term,
+        "the"
+            | "and"
+            | "for"
+            | "with"
+            | "from"
+            | "this"
+            | "that"
+            | "have"
+            | "what"
+            | "when"
+            | "where"
+            | "how"
+            | "please"
+            | "分析"
+            | "问题"
+            | "现在"
+            | "当前"
+            | "进行"
+            | "这个"
+            | "那个"
+    )
 }
 
 fn memory_entry_selection_rank(entry: &MemoryEntry) -> i32 {
@@ -2070,6 +2400,134 @@ mod tests {
         assert!(omitted[0].reason.contains("duplicate recall candidate"));
     }
 
+    #[tokio::test]
+    async fn exact_memory_retrieval_respects_runtime_binding_scope() {
+        let temp = tempfile::tempdir().expect("temporary memory root");
+        let manager = Arc::new(
+            CognitiveContextManager::new(crate::config::MemoryConfig {
+                store: crate::config::StoreConfig {
+                    sqlite_path: temp.path().join("memory.sqlite"),
+                    blob_dir: temp.path().join("blobs"),
+                    enable_vector_index: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("manager"),
+        );
+        let kernel = MemoryKernel::new(Arc::clone(&manager));
+        let visible = memory_entry("Visible", "current project fact", 0.0, 0.95, 0);
+        let visible_id = visible.id;
+        let hidden = MemoryEntry {
+            scope: MemoryScope::Project("other-project".to_string()),
+            ..memory_entry("Hidden", "other project fact", 0.0, 0.95, 0)
+        };
+        let hidden_id = hidden.id;
+        manager.remember(visible).await.expect("visible memory");
+        manager.remember(hidden).await.expect("hidden memory");
+        let context = MemoryTurnContext::new("session-a", "agent-a")
+            .with_project_id(Some("cowd".to_string()))
+            .with_cognitive_read_scopes(vec![
+                harness_contract::agent::CognitiveReadScope::Session,
+                harness_contract::agent::CognitiveReadScope::Project,
+            ]);
+
+        assert!(kernel
+            .retrieve_visible_entry(&context, visible_id)
+            .await
+            .expect("visible lookup")
+            .is_some());
+        assert!(kernel
+            .retrieve_visible_entry(&context, hidden_id)
+            .await
+            .expect("hidden lookup")
+            .is_none());
+    }
+
+    #[test]
+    fn turn_relevance_rejects_unrelated_high_priority_memory() {
+        let mut entry = memory_entry(
+            "Medicine inventory policy",
+            "Track prescription inventory by batch and expiry date.",
+            0.0,
+            0.98,
+            0,
+        );
+        entry.layer = MemoryLayer::L1;
+        entry.priority = Priority::Critical;
+        entry.scope = MemoryScope::Session("session-a".to_string());
+
+        let decision = memory_entry_turn_relevance(&entry, "分析 Rust 会话上下文压缩机制", None);
+
+        assert!(!decision.accepted);
+        assert!(decision.score < decision.threshold);
+    }
+
+    #[test]
+    fn turn_relevance_understands_chinese_terms() {
+        let mut entry = memory_entry(
+            "会话记忆治理",
+            "上下文压缩后应保留会话记忆线索并支持主动召回。",
+            0.0,
+            0.9,
+            0,
+        );
+        entry.scope = MemoryScope::Project("cowd".to_string());
+
+        let decision =
+            memory_entry_turn_relevance(&entry, "分析上下文记忆召回为什么会混入无关内容", None);
+
+        assert!(decision.accepted, "{decision:?}");
+    }
+
+    #[test]
+    fn l0_and_explicit_always_policy_survive_topic_filter() {
+        let mut identity = memory_entry("Identity", "Always answer as Cowd.", 0.0, 1.0, 0);
+        identity.layer = MemoryLayer::L0;
+        identity.scope = MemoryScope::Global;
+        assert!(
+            memory_entry_turn_relevance(&identity, "unrelated manufacturing question", None)
+                .accepted
+        );
+
+        let mut policy = memory_entry("Language", "Always use Chinese.", 0.0, 1.0, 0);
+        policy.tags.push("memory-policy:always".to_string());
+        assert!(
+            memory_entry_turn_relevance(&policy, "unrelated manufacturing question", None).accepted
+        );
+    }
+
+    #[test]
+    fn inferred_private_legacy_global_memory_is_not_visible() {
+        let mut entry = memory_entry("Old preference", "Topic-specific preference", 0.0, 0.9, 0);
+        entry.layer = MemoryLayer::L1;
+        entry.category = MemoryCategory::UserPreference;
+        entry.scope = MemoryScope::Global;
+        entry.visibility = AgentVisibility::Private;
+        entry.source = MemorySource::AutoExtracted;
+        let context = MemoryTurnContext::new("session-a", "agent-a");
+
+        assert!(!memory_entry_visible_to_ctx(&entry, &context));
+    }
+
+    #[test]
+    fn inferred_l1_preference_defaults_to_turn_scope_not_global() {
+        let mut entry = memory_entry("Preference", "Use a local formatting rule.", 0.0, 0.9, 0);
+        entry.layer = MemoryLayer::L1;
+        entry.category = MemoryCategory::UserPreference;
+        entry.scope = MemoryScope::default();
+        entry.visibility = AgentVisibility::Private;
+        entry.source = MemorySource::AutoExtracted;
+        let context =
+            MemoryTurnContext::new("session-a", "agent-a").with_task_id(Some("task-a".to_string()));
+
+        assert_eq!(
+            scoped_entry_scope(&context, &entry),
+            MemoryScope::Task("task-a".to_string())
+        );
+    }
+
     #[test]
     fn default_scope_never_persists_the_empty_session_sentinel() {
         let context = MemoryTurnContext::new("session-a", "primary");
@@ -2098,8 +2556,10 @@ mod tests {
         };
         assert_eq!(
             scoped_entry_scope(&context, &preference),
-            MemoryScope::Global
+            MemoryScope::Task("task-a".to_string())
         );
+        // An already-governed shared preference may still carry an explicit
+        // Global scope; inference alone no longer grants that authority.
         let resolved_preference = MemoryEntry {
             scope: MemoryScope::Global,
             ..preference.clone()

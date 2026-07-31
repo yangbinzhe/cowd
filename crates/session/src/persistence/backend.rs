@@ -42,6 +42,7 @@ macro_rules! session_store_backend_contract {
             (mark_session_closed, (session_id: &str), Result<()>),
             (list_sessions, (), Result<Vec<SessionRecord>>),
             (list_sessions_page, (opts: &SessionListOptions<'_>), Result<SessionListPage>),
+            (discover_browsable_sessions, (current_session_id: &str, query: Option<&str>, limit: usize, offset: usize), Result<SessionListPage>),
             (list_sessions_by_platform, (platform: &str), Result<Vec<SessionRecord>>),
             (list_sessions_by_workspace_root, (workspace_root: &str), Result<Vec<SessionRecord>>),
             (search_sessions, (query: &str, limit: usize), Result<Vec<SessionSearchResult>>),

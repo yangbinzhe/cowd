@@ -422,6 +422,7 @@ pub fn runtime_capability_primer() -> String {
         "- For long or expensive work, produce an early staged answer with checked facts, then continue with batched evidence and runtime orchestration instead of serial probing.".to_string(),
         "- Prefer full-file or batched reads when the context window can hold the evidence; avoid artificial tiny range reads unless the target is genuinely large.".to_string(),
         "- Current user instructions override conflicting recalled memory or knowledge rules for this turn; if a recalled preference conflicts with the explicit current request, suppress that memory and follow the current request.".to_string(),
+        "- When automatically assembled context is incomplete, uncertain, or unrelated, use active `context_retrieve`: search Memory through the exact Runtime Binding, or discover authorized Sessions through `session_catalog` before reading `explicit_session` history. Its evidence references are audit locators, not MCP resources.".to_string(),
         "- Use `runtime_capabilities` when you need a compact, read-only recommendation for available runtime affordances.".to_string(),
         "- Use `runtime_capabilities` with detail=`execution_patterns`, `team_templates`, `agent_catalog`, `orchestration_options`, or `budget_controls` when deciding how to solve complex work.".to_string(),
         "- Use `runtime_orchestrate` only when it is an active native schema and a runtime state change is intended; it is not a read-only query.".to_string(),
@@ -524,6 +525,9 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     let runtime_orchestrate_enabled = available_tool_names
         .iter()
         .any(|name| name == "runtime_orchestrate");
+    let context_retrieve_enabled = available_tool_names
+        .iter()
+        .any(|name| name == "context_retrieve");
     let runtime_orchestrate_available =
         execution_decision.executable && runtime_orchestrate_enabled;
     let model_callable_tools = runtime_model_callable_tools()
@@ -587,6 +591,22 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
             "recommended_actions": execution_decision.recommended_actions,
             "expected_projection": action_selection.expected_projection,
             "details": "request detail=orchestration_options or runtime_action_contract for the full stateful action contract"
+        },
+        "context_retrieval": {
+            "available": context_retrieve_enabled,
+            "tool": "context_retrieve",
+            "permission": "read-only",
+            "use_when": "automatic context is incomplete, uncertain, appears unrelated, or the task needs a prior Session or Memory detail",
+            "memory_flow": [
+                {"source": "memory", "scope": "current", "query": "focused semantic query"},
+                {"source": "memory", "scope": "current", "memory_id": "id returned by search"}
+            ],
+            "session_flow": [
+                {"source": "session_catalog", "scope": "workspace_sessions", "query": "optional topic"},
+                {"source": "session_history", "scope": "explicit_session", "session_id": "catalog returned id"}
+            ],
+            "authority": "exact Runtime Memory Binding plus durable Session workspace/actor or relation checks",
+            "reference_contract": "Follow returned read_request/next_request objects. session:// and memory: values are audit locators, not MCP resources."
         },
         "action_plane": compact_action_plane(&action_plane),
         "model_router": runtime_model_router_capability(),
@@ -854,6 +874,7 @@ fn runtime_model_callable_tools() -> Vec<&'static str> {
         "grep_many",
         "glob_many",
         "tool_batch_readonly",
+        "context_retrieve",
         "runtime_capabilities",
         "runtime_orchestrate",
         "ToolSearch",
@@ -1208,6 +1229,8 @@ mod tests {
         assert!(primer.contains("subagent, team"));
         assert!(primer.contains("runtime-owned"));
         assert!(primer.contains("runtime_capabilities"));
+        assert!(primer.contains("context_retrieve"));
+        assert!(primer.contains("not MCP resources"));
         assert!(primer.contains("Runtime action contract"));
         assert!(primer.contains("use_team_template"));
         assert!(primer.contains("dispatch_session"));
@@ -1248,6 +1271,11 @@ mod tests {
         assert_eq!(
             response["model_router"]["mode"],
             "pinned_primary_ordered_fallbacks"
+        );
+        assert_eq!(response["context_retrieval"]["available"], true);
+        assert_eq!(
+            response["context_retrieval"]["session_flow"][0]["source"],
+            "session_catalog"
         );
         assert_eq!(response["model_router"]["task_text_affects_order"], false);
         assert!(
@@ -1350,6 +1378,7 @@ mod tests {
         );
 
         assert_eq!(response["runtime_orchestrate"]["available"], false);
+        assert_eq!(response["context_retrieval"]["available"], false);
         assert_eq!(response["action_plane"]["can_execute_now"], false);
         assert!(response["action_plane"].get("recipes").is_none());
         assert!(response["action_plane"]["details"]

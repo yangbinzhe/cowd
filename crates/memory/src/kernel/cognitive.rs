@@ -3633,6 +3633,36 @@ impl CognitiveContextManager {
         })
     }
 
+    /// Search only scopes already authorized by an exact Runtime Binding.
+    ///
+    /// Scope filtering happens inside each FTS query before ranking and
+    /// limiting. This prevents a large unrelated project from displacing
+    /// eligible results before the Memory kernel applies its final policy
+    /// checks. Global rows are included by the store and remain subject to the
+    /// kernel's visibility fence.
+    pub(crate) async fn search_memories_in_scopes(
+        &self,
+        query: &str,
+        scopes: &[MemoryScope],
+        limit_per_scope: usize,
+    ) -> Result<Vec<MemoryEntry>> {
+        let mut entries = Vec::new();
+        let mut seen = HashSet::new();
+        for scope in scopes {
+            for entry in self
+                .orchestrator
+                .store()
+                .search_fts_scoped(query, scope, limit_per_scope.clamp(1, 128))
+                .await?
+            {
+                if seen.insert(entry.id) {
+                    entries.push(entry);
+                }
+            }
+        }
+        Ok(entries)
+    }
+
     /// Quick FTS5 search with just a query string.
     ///
     /// Convenience method that creates a default request with the given query.
@@ -4448,11 +4478,21 @@ mod tests {
             .expect("decision entry");
 
         assert_eq!(first[preference_index].id, retry[preference_index].id);
-        assert_eq!(
+        assert_ne!(
             first[preference_index].id, other_project[preference_index].id,
-            "durable user preferences are global across projects"
+            "automatically inferred preferences must remain project-scoped"
         );
-        assert_eq!(first[preference_index].scope, MemoryScope::Global);
+        assert_eq!(
+            first[preference_index].scope,
+            MemoryScope::Project("project-a".into())
+        );
+        assert!(
+            !first[preference_index]
+                .tags
+                .iter()
+                .any(|tag| tag == "memory-policy:always"),
+            "heuristic extraction cannot grant unconditional injection authority"
+        );
 
         assert_eq!(first[decision_index].id, retry[decision_index].id);
         assert_ne!(

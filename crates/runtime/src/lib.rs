@@ -407,10 +407,10 @@ pub use context_evidence::{
 pub use context_fanout::{plan_context_fanout, ContextFanoutPlan, FanoutToolCall};
 pub use context_tool_exposure::{ToolExposurePlanner, ToolExposurePolicy, ToolExposureState};
 pub use conversation::{
-    build_cc_memory_config, image_user_message_from_path, ApiClient, ApiRequest, AssistantEvent,
-    AssistantItemKind, AutoCompactionEvent, CancellationToken, ConversationRuntime, MemoryCallback,
-    ProviderContextInventory, RuntimeError, StaticToolExecutor, ToolCallback, ToolError,
-    ToolExecutor, TurnSummary,
+    build_cc_memory_config, image_user_message_from_path, memory_project_id_for_workspace,
+    ApiClient, ApiRequest, AssistantEvent, AssistantItemKind, AutoCompactionEvent,
+    CancellationToken, ConversationRuntime, MemoryCallback, ProviderContextInventory, RuntimeError,
+    StaticToolExecutor, ToolCallback, ToolError, ToolExecutor, TurnSummary,
 };
 pub use cowd_event::{
     CausalItemIdentity, CausalItemKind, CowdEvent, CowdEventBus, CowdExecutionContext,

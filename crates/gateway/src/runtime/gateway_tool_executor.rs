@@ -54,9 +54,40 @@ struct RuntimeResourceCapabilitiesRequest {
     intent: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ContextRetrieveSource {
+    Memory,
+    SessionCatalog,
+    SessionHistory,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ContextRetrieveScope {
+    Current,
+    RelatedSessions,
+    WorkspaceSessions,
+    ExplicitSession,
+}
+
+#[derive(Debug, Deserialize)]
+struct ContextRetrieveRequest {
+    source: ContextRetrieveSource,
+    #[serde(default)]
+    query: Option<String>,
+    memory_id: Option<String>,
+    scope: Option<ContextRetrieveScope>,
+    session_id: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    before_sequence: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RuntimeToolExecutionBinding<'a> {
     session_id: Option<&'a str>,
+    memory_context: Option<&'a memory::MemoryTurnContext>,
     model_lease: Option<&'a str>,
     parent_execution: Option<&'a harness_contract::execution_graph::ExecutionParentBinding>,
 }
@@ -76,12 +107,17 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
     )
 }
 
+fn is_gateway_context_tool(tool_name: &str) -> bool {
+    tool_name == "context_retrieve"
+}
+
 pub(crate) struct GatewayToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_host: Arc<ToolHost>,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     runtime_session_id: Option<String>,
+    runtime_memory_context: Option<memory::MemoryTurnContext>,
     runtime_model_lease: Option<String>,
     runtime_execution_decision: Arc<Mutex<Option<runtime::RuntimeExecutionDecision>>>,
     runtime_services: Arc<OnceLock<Arc<runtime::RuntimeServices>>>,
@@ -111,6 +147,7 @@ impl GatewayToolExecutor {
             tool_host,
             mcp_state,
             runtime_session_id: None,
+            runtime_memory_context: None,
             runtime_model_lease: None,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
             runtime_services: Arc::new(OnceLock::new()),
@@ -129,6 +166,7 @@ impl GatewayToolExecutor {
             tool_host,
             mcp_state,
             runtime_session_id: None,
+            runtime_memory_context: None,
             runtime_model_lease: None,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
             runtime_services: Arc::new(OnceLock::new()),
@@ -141,6 +179,17 @@ impl GatewayToolExecutor {
         if !session_id.is_empty() {
             self.runtime_session_id = Some(session_id);
         }
+        self
+    }
+
+    /// Bind active Memory retrieval to the same exact lease used by passive
+    /// context assembly for this ConversationRuntime.
+    #[must_use]
+    pub(crate) fn with_runtime_memory_context(
+        mut self,
+        context: memory::MemoryTurnContext,
+    ) -> Self {
+        self.runtime_memory_context = Some(context);
         self
     }
 
@@ -216,6 +265,7 @@ impl GatewayToolExecutor {
             value,
             RuntimeToolExecutionBinding {
                 session_id: self.runtime_session_id.as_deref(),
+                memory_context: self.runtime_memory_context.as_ref(),
                 model_lease: self.runtime_model_lease.as_deref(),
                 parent_execution: None,
             },
@@ -255,6 +305,11 @@ impl GatewayToolExecutor {
             let input: RuntimeResourceCapabilitiesRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
             return self.execute_runtime_resource_capabilities(input);
+        }
+        if tool_name == "context_retrieve" {
+            let input: ContextRetrieveRequest = serde_json::from_value(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            return self.execute_context_retrieve(input, binding);
         }
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
@@ -359,6 +414,19 @@ impl GatewayToolExecutor {
                 .map_err(|error| ToolError::new(error.to_string()));
         }
 
+        if tool_name == "ReadMcpResourceTool" {
+            if let Some(uri) = value
+                .get("uri")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+            {
+                if uri.starts_with("session://") || uri.starts_with("memory:") {
+                    return Err(ToolError::new(
+                        "Session and Memory evidence references are audit locators, not MCP resources. Use `context_retrieve` and its returned `read_request` or `next_request` to read authorized content.",
+                    ));
+                }
+            }
+        }
         let Some(mcp_state) = &self.mcp_state else {
             return Err(ToolError::new(format!(
                 "runtime tool `{tool_name}` is unavailable without configured MCP servers"
@@ -393,6 +461,428 @@ impl GatewayToolExecutor {
             }
             _ => mcp_state.call_tool(tool_name, Some(value)),
         }
+    }
+
+    fn execute_context_retrieve(
+        &self,
+        input: ContextRetrieveRequest,
+        binding: RuntimeToolExecutionBinding<'_>,
+    ) -> Result<String, ToolError> {
+        let query = input
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+            .map(str::to_string);
+        let session_id = binding
+            .session_id
+            .filter(|session_id| !session_id.trim().is_empty())
+            .ok_or_else(|| {
+                ToolError::new("context_retrieve requires a Runtime-bound session identity")
+            })?
+            .to_string();
+        let services = self.runtime_services.get().cloned().ok_or_else(|| {
+            ToolError::new("context_retrieve requires the workspace RuntimeServices")
+        })?;
+        let limit = input.limit.unwrap_or(8).clamp(1, 16);
+        if input.memory_id.is_some() && input.source != ContextRetrieveSource::Memory {
+            return Err(ToolError::new("memory_id is valid only with source=memory"));
+        }
+        if input.source == ContextRetrieveSource::Memory
+            && input.memory_id.is_some()
+            && query.is_some()
+        {
+            return Err(ToolError::new(
+                "memory retrieval accepts either query or memory_id, not both",
+            ));
+        }
+
+        let value = match input.source {
+            ContextRetrieveSource::Memory => {
+                if input
+                    .scope
+                    .is_some_and(|scope| scope != ContextRetrieveScope::Current)
+                {
+                    return Err(ToolError::new(
+                        "memory retrieval uses only the current Runtime Binding",
+                    ));
+                }
+                let Some(manager) = services.memory_manager() else {
+                    return serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "runtime.context_retrieval",
+                        "source": "memory",
+                        "scope": "current_binding",
+                        "status": "degraded",
+                        "reason": "memory manager is not configured",
+                        "selected": [],
+                    }))
+                    .map_err(|error| ToolError::new(error.to_string()));
+                };
+                let Some(context) = binding.memory_context.cloned() else {
+                    return serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "runtime.context_retrieval",
+                        "source": "memory",
+                        "scope": "current_binding",
+                        "status": "degraded",
+                        "reason": "Runtime did not supply an exact Memory Binding",
+                        "selected": [],
+                    }))
+                    .map_err(|error| ToolError::new(error.to_string()));
+                };
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let runtime_handle = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|error| ToolError::new(error.to_string()))?;
+                            let kernel = memory::MemoryKernel::new(manager);
+                            if let Some(memory_id) = input
+                                .memory_id
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|memory_id| !memory_id.is_empty())
+                            {
+                                let memory_id = uuid::Uuid::try_parse(memory_id).map_err(|_| {
+                                    ToolError::new("memory_id must be a valid Memory UUID")
+                                })?;
+                                let entry = runtime_handle
+                                    .block_on(kernel.retrieve_visible_entry(&context, memory_id))
+                                    .map_err(|error| ToolError::new(error.to_string()))?;
+                                let selected = entry
+                                    .map(|entry| {
+                                        let (content, truncated) =
+                                            bounded_context_text(&entry.content, 8_192);
+                                        serde_json::json!({
+                                            "memory_id": entry.id,
+                                            "layer": format!("{:?}", entry.layer),
+                                            "category": format!("{:?}", entry.category),
+                                            "title": entry.title,
+                                            "content": content,
+                                            "content_truncated": truncated,
+                                            "scope": entry.scope.to_string(),
+                                            "updated_at": entry.updated_at,
+                                            "evidence_ref": format!("memory:{}", entry.id),
+                                        })
+                                    })
+                                    .into_iter()
+                                    .collect::<Vec<_>>();
+                                return Ok(serde_json::json!({
+                                    "kind": "runtime.context_retrieval",
+                                    "source": "memory",
+                                    "scope": "current_binding",
+                                    "status": "completed",
+                                    "memory_id": memory_id,
+                                    "selected_count": selected.len(),
+                                    "selected": selected,
+                                    "authorization": "exact Runtime Memory Binding",
+                                    "reference_contract": context_reference_contract(),
+                                }));
+                            }
+                            let query = query.as_deref().ok_or_else(|| {
+                                ToolError::new("memory retrieval requires query or memory_id")
+                            })?;
+                            let packet = runtime_handle
+                                .block_on(
+                                    kernel.retrieve_packet_preview(&context, query, limit, 8_192),
+                                )
+                                .map_err(|error| ToolError::new(error.to_string()))?;
+                            Ok(serde_json::json!({
+                                "kind": "runtime.context_retrieval",
+                                "source": "memory",
+                                "scope": "current_binding",
+                                "status": "completed",
+                                "query": query,
+                                "selected": packet.selected.iter().map(|item| serde_json::json!({
+                                    "memory_id": item.atom.id,
+                                    "layer": format!("{:?}", item.atom.layer),
+                                    "role": format!("{:?}", item.role),
+                                    "title": item.atom.title,
+                                    "preview": item.content_preview,
+                                    "reason": item.reason,
+                                    "evidence_ref": item.atom.evidence_pointer,
+                                    "read_request": {
+                                        "source": "memory",
+                                        "scope": "current",
+                                        "memory_id": item.atom.id,
+                                    },
+                                })).collect::<Vec<_>>(),
+                                "selected_count": packet.selected.len(),
+                                "omitted_count": packet.omitted.len(),
+                                "truncated": packet.truncated,
+                                "token_estimate": packet.token_estimate,
+                                "reference_contract": context_reference_contract(),
+                            }))
+                        })
+                        .join()
+                        .map_err(|_| ToolError::new("context memory retrieval worker panicked"))?
+                })?
+            }
+            ContextRetrieveSource::SessionCatalog => {
+                if input
+                    .scope
+                    .is_some_and(|scope| scope != ContextRetrieveScope::WorkspaceSessions)
+                {
+                    return Err(ToolError::new(
+                        "session_catalog supports only workspace_sessions scope",
+                    ));
+                }
+                let Some(history) = services.session_history_reader() else {
+                    return serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "runtime.context_retrieval",
+                        "source": "session_catalog",
+                        "scope": "workspace_sessions",
+                        "status": "degraded",
+                        "reason": "session history reader is not configured",
+                        "selected": [],
+                    }))
+                    .map_err(|error| ToolError::new(error.to_string()));
+                };
+                let offset = input.offset.unwrap_or(0);
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let runtime_handle = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|error| ToolError::new(error.to_string()))?;
+                            let page = runtime_handle
+                                .block_on(history.discover_browsable_sessions(
+                                    &session_id,
+                                    query.as_deref(),
+                                    limit,
+                                    offset,
+                                ))
+                                .map_err(|error| ToolError::new(error.to_string()))?;
+                            Ok(serde_json::json!({
+                                "kind": "runtime.context_retrieval",
+                                "source": "session_catalog",
+                                "scope": "workspace_sessions",
+                                "status": "completed",
+                                "query": query,
+                                "selected": page.records.iter().map(|record| serde_json::json!({
+                                    "session_id": record.session_id,
+                                    "title": session_record_title(record),
+                                    "platform": record.platform,
+                                    "status": record.status,
+                                    "last_activity": record.last_activity,
+                                    "message_count": record.message_count,
+                                    "evidence_ref": format!("session://{}", record.session_id),
+                                    "read_request": {
+                                        "source": "session_history",
+                                        "scope": "explicit_session",
+                                        "session_id": record.session_id,
+                                        "limit": limit,
+                                    },
+                                })).collect::<Vec<_>>(),
+                                "selected_count": page.records.len(),
+                                "total": page.total,
+                                "offset": offset,
+                                "next_offset": (offset + page.records.len() < page.total)
+                                    .then_some(offset + page.records.len()),
+                                "next_request": (offset + page.records.len() < page.total)
+                                    .then(|| serde_json::json!({
+                                        "source": "session_catalog",
+                                        "scope": "workspace_sessions",
+                                        "query": query,
+                                        "limit": limit,
+                                        "offset": offset + page.records.len(),
+                                    })),
+                                "truncated": offset + page.records.len() < page.total,
+                                "authorization": "same durable workspace and actor identity",
+                                "reference_contract": context_reference_contract(),
+                            }))
+                        })
+                        .join()
+                        .map_err(|_| ToolError::new("session catalog retrieval worker panicked"))?
+                })?
+            }
+            ContextRetrieveSource::SessionHistory => {
+                let Some(history) = services.session_history_reader() else {
+                    return serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "runtime.context_retrieval",
+                        "source": "session_history",
+                        "scope": "current",
+                        "status": "degraded",
+                        "reason": "session history reader is not configured",
+                        "selected": [],
+                    }))
+                    .map_err(|error| ToolError::new(error.to_string()));
+                };
+                let retrieval_scope = input.scope.unwrap_or(ContextRetrieveScope::Current);
+                let mut authorized_sessions =
+                    std::collections::BTreeSet::from([session_id.clone()]);
+                for relation in services.session_relations().relations_for(&session_id) {
+                    if relation.from_session_id == session_id {
+                        authorized_sessions.insert(relation.to_session_id);
+                    } else if relation.to_session_id == session_id {
+                        authorized_sessions.insert(relation.from_session_id);
+                    }
+                }
+                let target_session_id = match retrieval_scope {
+                    ContextRetrieveScope::Current => session_id.clone(),
+                    ContextRetrieveScope::ExplicitSession => input
+                        .session_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            ToolError::new(
+                                "explicit_session retrieval requires a target session_id",
+                            )
+                        })?
+                        .to_string(),
+                    ContextRetrieveScope::RelatedSessions => session_id.clone(),
+                    ContextRetrieveScope::WorkspaceSessions => {
+                        return Err(ToolError::new(
+                            "use source=session_catalog to discover workspace Sessions, then source=session_history with scope=explicit_session",
+                        ));
+                    }
+                };
+                let explicitly_authorized = authorized_sessions.contains(&target_session_id);
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            let runtime_handle = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(|error| ToolError::new(error.to_string()))?;
+                            let workspace_authorized = if retrieval_scope
+                                == ContextRetrieveScope::ExplicitSession
+                                && !explicitly_authorized
+                            {
+                                runtime_handle
+                                    .block_on(history.can_read_session(
+                                        &session_id,
+                                        &target_session_id,
+                                    ))
+                                    .map_err(|error| ToolError::new(error.to_string()))?
+                            } else {
+                                false
+                            };
+                            if retrieval_scope == ContextRetrieveScope::ExplicitSession
+                                && !explicitly_authorized
+                                && !workspace_authorized
+                            {
+                                return Err(ToolError::new(format!(
+                                    "target Session `{target_session_id}` is outside the current Session's durable workspace/actor boundary and has no explicit relation"
+                                )));
+                            }
+                            let authorized_sessions =
+                                authorized_sessions.into_iter().collect::<Vec<_>>();
+                            let (messages, next_before_sequence) = match retrieval_scope {
+                                ContextRetrieveScope::Current
+                                | ContextRetrieveScope::ExplicitSession => {
+                                    if let Some(query) = query.as_deref() {
+                                        (
+                                            runtime_handle.block_on(history.search_messages(
+                                                query,
+                                                &target_session_id,
+                                                limit,
+                                            )),
+                                            None,
+                                        )
+                                    } else {
+                                        let count = runtime_handle
+                                            .block_on(history.message_count(&target_session_id))
+                                            .map_err(|error| ToolError::new(error.to_string()))?;
+                                        let end = input.before_sequence.unwrap_or(count).min(count);
+                                        let start = end.saturating_sub(limit);
+                                        (
+                                            runtime_handle.block_on(history.messages(
+                                                &target_session_id,
+                                                start,
+                                                end.saturating_sub(start).max(1),
+                                            )),
+                                            (start > 0).then_some(start),
+                                        )
+                                    }
+                                }
+                                ContextRetrieveScope::RelatedSessions => {
+                                    let query = query.as_deref().ok_or_else(|| {
+                                        ToolError::new(
+                                            "related_sessions retrieval requires a focused query",
+                                        )
+                                    })?;
+                                    (
+                                        runtime_handle.block_on(
+                                            history.search_messages_in_sessions(
+                                                query,
+                                                &authorized_sessions,
+                                                limit,
+                                            ),
+                                        ),
+                                        None,
+                                    )
+                                }
+                                ContextRetrieveScope::WorkspaceSessions => unreachable!(),
+                            };
+                            let messages =
+                                messages.map_err(|error| ToolError::new(error.to_string()))?;
+                            let authorization_basis = if target_session_id == session_id {
+                                "current_session"
+                            } else if explicitly_authorized {
+                                "durable_session_relation"
+                            } else {
+                                "same_workspace_and_actor"
+                            };
+                            let truncated = if query.is_some() {
+                                messages.len() == limit
+                            } else {
+                                next_before_sequence.is_some()
+                            };
+                            Ok(serde_json::json!({
+                                "kind": "runtime.context_retrieval",
+                                "source": "session_history",
+                                "scope": match retrieval_scope {
+                                    ContextRetrieveScope::Current => "current",
+                                    ContextRetrieveScope::RelatedSessions => "related_sessions",
+                                    ContextRetrieveScope::ExplicitSession => "explicit_session",
+                                    ContextRetrieveScope::WorkspaceSessions => unreachable!(),
+                                },
+                                "status": "completed",
+                                "query": query,
+                                "target_session_id": (retrieval_scope != ContextRetrieveScope::RelatedSessions)
+                                    .then_some(target_session_id.clone()),
+                                "authorized_session_count": authorized_sessions.len(),
+                                "selected": messages.iter().map(|message| serde_json::json!({
+                                    "message_id": message.stable_message_id,
+                                    "session_id": message.session_id,
+                                    "sequence": message.sequence,
+                                    "role": message.role,
+                                    "created_at_ms": message.created_at_ms,
+                                    "preview": session_message_preview(&message.content_json, 800),
+                                    "evidence_ref": format!(
+                                        "session://{}/messages/{}",
+                                        message.session_id, message.sequence
+                                    ),
+                                })).collect::<Vec<_>>(),
+                                "selected_count": messages.len(),
+                                "next_before_sequence": next_before_sequence,
+                                "next_request": next_before_sequence.map(|before_sequence| serde_json::json!({
+                                    "source": "session_history",
+                                    "scope": match retrieval_scope {
+                                        ContextRetrieveScope::Current => "current",
+                                        ContextRetrieveScope::ExplicitSession => "explicit_session",
+                                        ContextRetrieveScope::RelatedSessions => "related_sessions",
+                                        ContextRetrieveScope::WorkspaceSessions => unreachable!(),
+                                    },
+                                    "session_id": (retrieval_scope == ContextRetrieveScope::ExplicitSession)
+                                        .then_some(target_session_id.clone()),
+                                    "limit": limit,
+                                    "before_sequence": before_sequence,
+                                })),
+                                "truncated": truncated,
+                                "authorization_basis": authorization_basis,
+                                "reference_contract": context_reference_contract(),
+                            }))
+                        })
+                        .join()
+                        .map_err(|_| ToolError::new("session history retrieval worker panicked"))?
+                })?
+            }
+        };
+        serde_json::to_string_pretty(&value).map_err(|error| ToolError::new(error.to_string()))
     }
 
     fn execute_runtime_config_view(
@@ -671,6 +1161,78 @@ fn capability_name_matches(value: &str, keywords: &[String]) -> bool {
     keywords.iter().any(|keyword| normalized.contains(keyword))
 }
 
+fn context_reference_contract() -> serde_json::Value {
+    serde_json::json!({
+        "evidence_refs": "audit locators retained with the result; they are not MCP resources",
+        "drill_down_tool": "context_retrieve",
+        "instruction": "Evidence locators are not MCP resources. Use a selected item's read_request or the response next_request; do not pass session:// or memory: references to ReadMcpResourceTool.",
+    })
+}
+
+fn bounded_context_text(content: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = content.chars();
+    let bounded = chars.by_ref().take(max_chars).collect::<String>();
+    let truncated = chars.next().is_some();
+    (bounded, truncated)
+}
+
+fn session_message_preview(content_json: &str, max_chars: usize) -> String {
+    let value = serde_json::from_str::<serde_json::Value>(content_json).unwrap_or_default();
+    let blocks = value.as_array().map_or_else(Vec::new, Clone::clone);
+    let mut parts = Vec::new();
+    for block in blocks {
+        let kind = block
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let text = match kind {
+            "text" | "reasoning_summary" => block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            "tool_use" => block
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(|name| format!("[tool:{name}]")),
+            "tool_result" => block
+                .get("output")
+                .and_then(serde_json::Value::as_str)
+                .map(|output| format!("[tool_result] {output}")),
+            "image" => Some("[image]".to_string()),
+            _ => None,
+        };
+        if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+            parts.push(text);
+        }
+    }
+    let joined = parts.join("\n");
+    let mut preview = joined.chars().take(max_chars).collect::<String>();
+    if joined.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn session_record_title(record: &session::SessionRecord) -> String {
+    record
+        .metadata_json
+        .as_deref()
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+        .and_then(|metadata| {
+            metadata
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            (!record.chat_id.trim().is_empty())
+                .then(|| record.chat_id.clone())
+                .unwrap_or_else(|| record.session_id.clone())
+        })
+}
+
 impl ToolExecutor for GatewayToolExecutor {
     fn tool_discovery_receipt(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
         let lease = self.tool_host.pin_snapshot();
@@ -705,7 +1267,7 @@ impl ToolExecutor for GatewayToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         let result = if tool_name == "ToolSearch" {
             self.execute_search_tool(value)
-        } else if is_gateway_runtime_control_tool(tool_name) {
+        } else if is_gateway_runtime_control_tool(tool_name) || is_gateway_context_tool(tool_name) {
             self.execute_runtime_tool(tool_name, value)
         } else {
             Err(ToolError::new(format!(
@@ -776,7 +1338,10 @@ impl ToolExecutor for GatewayToolExecutor {
             .ok_or_else(|| ToolError::new(format!("tool `{tool_name}` is not registered")))?;
         let value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
-        if tool_name == "ToolSearch" || is_gateway_runtime_control_tool(&tool_name) {
+        if tool_name == "ToolSearch"
+            || is_gateway_runtime_control_tool(&tool_name)
+            || is_gateway_context_tool(&tool_name)
+        {
             return self.execute(&tool_name, input);
         }
         self.tool_host
@@ -978,12 +1543,15 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
         };
         let result = if request.tool_name == "ToolSearch" {
             self.execute_search_tool(value)
-        } else if is_gateway_runtime_control_tool(&request.tool_name) {
+        } else if is_gateway_runtime_control_tool(&request.tool_name)
+            || is_gateway_context_tool(&request.tool_name)
+        {
             self.execute_runtime_tool_with_binding(
                 &request.tool_name,
                 value,
                 RuntimeToolExecutionBinding {
                     session_id: request.session_id.as_deref(),
+                    memory_context: request.memory_context.as_ref(),
                     model_lease: request.model_lease.as_deref(),
                     parent_execution: request.parent_execution.as_ref(),
                 },
@@ -1162,9 +1730,443 @@ mod tests {
         assert!(output.contains("tool_batch_readonly"));
         let response: serde_json::Value = serde_json::from_str(&output).expect("capability json");
         assert_eq!(response["runtime_orchestrate"]["available"], false);
+        assert_eq!(response["context_retrieval"]["available"], false);
         assert!(response["strategy"]["model_callable_tools"]
             .as_array()
             .is_some_and(|tools| tools.iter().all(|tool| tool != "runtime_orchestrate")));
+    }
+
+    #[test]
+    fn context_retrieve_is_runtime_bound_and_degrades_explicitly() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "context_retrieve".to_string(),
+                description: Some("bounded context retrieval".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string" },
+                        "query": { "type": "string" }
+                    },
+                    "required": ["source", "query"]
+                }),
+                required_permission: ToolPermissionMode::ReadOnly,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.readonly",
+                ),
+            }])
+            .expect("runtime tool registry");
+        let executor =
+            GatewayToolExecutor::new(None, false, registry, None).with_runtime_session_id("s1");
+        executor
+            .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
+            .expect("bind services");
+
+        let output = executor
+            .execute(
+                "context_retrieve",
+                r#"{"source":"memory","query":"session decisions"}"#,
+            )
+            .expect("unconfigured memory returns a degraded receipt");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("context receipt");
+
+        assert_eq!(value["kind"], "runtime.context_retrieval");
+        assert_eq!(value["status"], "degraded");
+        assert_eq!(value["source"], "memory");
+    }
+
+    #[test]
+    fn context_evidence_references_do_not_fall_through_to_mcp() {
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin(), None);
+
+        let error = executor
+            .execute_runtime_tool(
+                "ReadMcpResourceTool",
+                json!({
+                    "server": "runtime",
+                    "uri": "session://session-a/messages/4",
+                }),
+            )
+            .expect_err("Session evidence is not an MCP resource");
+
+        assert!(error.to_string().contains("context_retrieve"));
+        assert!(error.to_string().contains("not MCP resources"));
+    }
+
+    #[tokio::test]
+    async fn context_retrieve_reads_the_exact_runtime_memory_binding() {
+        let temp = tempfile::tempdir().expect("context retrieval root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let manager = Arc::new(
+            memory::CognitiveContextManager::new(memory::MemoryConfig {
+                store: memory::config::StoreConfig {
+                    sqlite_path: temp.path().join("memory.sqlite"),
+                    blob_dir: temp.path().join("blobs"),
+                    enable_vector_index: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .expect("memory manager"),
+        );
+        let context = memory::MemoryTurnContext::new("session-exact", "agent-exact")
+            .with_definition_lineage_id(Some("definition-exact".to_string()))
+            .with_project_id(Some(runtime::memory_project_id_for_workspace(&workspace)))
+            .with_task_id(Some("task-exact".to_string()))
+            .with_cognitive_read_scopes(vec![
+                harness_contract::agent::CognitiveReadScope::Session,
+                harness_contract::agent::CognitiveReadScope::Project,
+            ]);
+        let now = chrono::Utc::now();
+        let exact_memory_id = uuid::Uuid::new_v4();
+        manager
+            .remember_for_turn(
+                &context,
+                memory::MemoryEntry {
+                    id: exact_memory_id,
+                    layer: memory::MemoryLayer::L2,
+                    category: memory::MemoryCategory::Decision,
+                    priority: memory::Priority::High,
+                    source: memory::MemorySource::UserExplicit,
+                    title: "Context isolation decision".to_string(),
+                    content: "Use exact runtime binding for active memory retrieval.".to_string(),
+                    embedding: None,
+                    tags: vec!["context-isolation".to_string()],
+                    relations: Vec::new(),
+                    confidence: 0.98,
+                    access_count: 0,
+                    staleness: 0.0,
+                    created_at: now,
+                    updated_at: now,
+                    last_accessed_at: None,
+                    scope: memory::MemoryScope::default(),
+                    session_id: None,
+                    source_agent: None,
+                    visibility: memory::AgentVisibility::Private,
+                },
+            )
+            .await
+            .expect("remember exact binding");
+        let other_context = memory::MemoryTurnContext::new("session-other", "agent-other")
+            .with_project_id(Some("other-project".to_string()))
+            .with_task_id(Some("task-other".to_string()))
+            .with_cognitive_read_scopes(vec![
+                harness_contract::agent::CognitiveReadScope::Session,
+                harness_contract::agent::CognitiveReadScope::Project,
+            ]);
+        manager
+            .remember_for_turn(
+                &other_context,
+                memory::MemoryEntry {
+                    id: uuid::Uuid::new_v4(),
+                    layer: memory::MemoryLayer::L2,
+                    category: memory::MemoryCategory::Decision,
+                    priority: memory::Priority::Critical,
+                    source: memory::MemorySource::UserExplicit,
+                    title: "Other project context isolation decision".to_string(),
+                    content:
+                        "Other project also mentions exact runtime binding and must remain hidden."
+                            .to_string(),
+                    embedding: None,
+                    tags: vec!["context-isolation".to_string()],
+                    relations: Vec::new(),
+                    confidence: 1.0,
+                    access_count: 0,
+                    staleness: 0.0,
+                    created_at: now,
+                    updated_at: now,
+                    last_accessed_at: None,
+                    scope: memory::MemoryScope::default(),
+                    session_id: None,
+                    source_agent: None,
+                    visibility: memory::AgentVisibility::Private,
+                },
+            )
+            .await
+            .expect("remember out-of-binding memory");
+        assert_eq!(
+            manager
+                .list_all_entries()
+                .await
+                .expect("list remembered entries")
+                .len(),
+            2
+        );
+        assert_eq!(
+            manager
+                .search_memories(memory::SearchMemoriesRequest {
+                    query: "exact runtime binding".to_string(),
+                    limit: 8,
+                    ..Default::default()
+                })
+                .await
+                .expect("search remembered entries")
+                .entries
+                .len(),
+            2
+        );
+        let services = runtime::RuntimeServices::builder(temp.path().join("home"), &workspace)
+            .memory_manager(Arc::clone(&manager))
+            .build()
+            .expect("runtime services");
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "context_retrieve".to_string(),
+                description: Some("bounded context retrieval".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string" },
+                        "query": { "type": "string" }
+                    },
+                    "required": ["source", "query"]
+                }),
+                required_permission: ToolPermissionMode::ReadOnly,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.readonly",
+                ),
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None)
+            .with_runtime_session_id("session-exact")
+            .with_runtime_memory_context(context);
+        executor
+            .bind_runtime_services(services)
+            .expect("bind services");
+
+        let output = executor
+            .execute(
+                "context_retrieve",
+                r#"{"source":"memory","query":"exact runtime binding","limit":8}"#,
+            )
+            .expect("active memory retrieval");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("context receipt");
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["selected_count"], 1, "{output}");
+        assert_eq!(value["selected"][0]["title"], "Context isolation decision");
+        assert_eq!(
+            value["selected"][0]["read_request"]["memory_id"],
+            exact_memory_id.to_string()
+        );
+        assert!(value["reference_contract"]["instruction"]
+            .as_str()
+            .is_some_and(|instruction| instruction.contains("not MCP resources")));
+        assert!(!output.contains("Other project"));
+
+        let exact_output = executor
+            .execute(
+                "context_retrieve",
+                &serde_json::json!({
+                    "source": "memory",
+                    "memory_id": exact_memory_id,
+                })
+                .to_string(),
+            )
+            .expect("exact authorized memory retrieval");
+        let exact: serde_json::Value =
+            serde_json::from_str(&exact_output).expect("exact memory receipt");
+        assert_eq!(exact["selected_count"], 1);
+        assert_eq!(
+            exact["selected"][0]["content"],
+            "Use exact runtime binding for active memory retrieval."
+        );
+    }
+
+    #[tokio::test]
+    async fn context_retrieve_follows_only_durable_session_relations() {
+        let temp = tempfile::tempdir().expect("session retrieval root");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store =
+            Arc::new(session::UnifiedSessionStore::open_in_memory().expect("session store"));
+        let now = chrono::Utc::now().to_rfc3339();
+        for session_id in [
+            "session-current",
+            "session-related",
+            "session-workspace-peer",
+            "session-unrelated",
+        ] {
+            let owner = if matches!(session_id, "session-current" | "session-workspace-peer") {
+                "local-human"
+            } else {
+                "other-human"
+            };
+            store
+                .create_session(&session::SessionRecord {
+                    session_id: session_id.to_string(),
+                    platform: "test".to_string(),
+                    chat_id: session_id.to_string(),
+                    user_id: None,
+                    model: None,
+                    created_at: now.clone(),
+                    last_activity: now.clone(),
+                    message_count: 0,
+                    reset_policy: "manual".to_string(),
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "title": format!("Context {session_id}"),
+                            "workspace_root": workspace.display().to_string(),
+                            "owner_principal_id": owner,
+                        })
+                        .to_string(),
+                    ),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    estimated_cost_usd: 0.0,
+                    status: "active".to_string(),
+                })
+                .await
+                .expect("create session");
+            store
+                .insert_message(&session::SessionMessage {
+                    stable_message_id: format!("{session_id}-message"),
+                    session_id: session_id.to_string(),
+                    sequence: 0,
+                    role: "user".to_string(),
+                    content_json: serde_json::json!([{
+                        "type": "text",
+                        "text": format!("shared gateway relation marker from {session_id}")
+                    }])
+                    .to_string(),
+                    blocks_count: 1,
+                    tool_use_id: None,
+                    tool_name: None,
+                    token_usage_json: None,
+                    created_at_ms: 1,
+                })
+                .await
+                .expect("insert session message");
+        }
+        let event_bus = crate::event_bus::SessionProjectionHub::new();
+        let repository = Arc::new(
+            crate::services::session_service::repository::SessionRepository::new(
+                Arc::new(crate::gateway::HotSessionPool::new()),
+                Some(Arc::clone(&store)),
+                event_bus,
+            ),
+        );
+        let presence = Arc::new(
+            crate::services::session_service::presence::SessionPresenceLedger::with_store(
+                Arc::clone(&store),
+            ),
+        );
+        let session_port =
+            crate::session_runtime_data_port::GatewaySessionRuntimePort::new_for_test(
+                repository, presence,
+            );
+        let services = runtime::RuntimeServices::builder(temp.path().join("home"), &workspace)
+            .build()
+            .expect("runtime services");
+        services
+            .install_session_ports(session_port.clone(), session_port.clone(), session_port)
+            .expect("install session ports");
+        services
+            .session_relations()
+            .add_relation(
+                "session-current",
+                "session-related",
+                runtime::SessionRelationKind::References,
+                "current session explicitly references the related session",
+                Vec::new(),
+            )
+            .expect("durable session relation");
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "context_retrieve".to_string(),
+                description: Some("bounded context retrieval".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string" },
+                        "query": { "type": "string" },
+                        "scope": { "type": "string" }
+                    },
+                    "required": ["source", "query"]
+                }),
+                required_permission: ToolPermissionMode::ReadOnly,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.readonly",
+                ),
+            }])
+            .expect("runtime tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry, None)
+            .with_runtime_session_id("session-current");
+        executor
+            .bind_runtime_services(services)
+            .expect("bind services");
+
+        let output = executor
+            .execute(
+                "context_retrieve",
+                r#"{"source":"session_history","scope":"related_sessions","query":"gateway relation marker","limit":8}"#,
+            )
+            .expect("active related-session retrieval");
+        let value: serde_json::Value = serde_json::from_str(&output).expect("context receipt");
+
+        assert_eq!(value["status"], "completed");
+        assert_eq!(value["scope"], "related_sessions");
+        assert_eq!(value["authorized_session_count"], 2);
+        assert_eq!(value["selected_count"], 2, "{output}");
+        assert!(output.contains("session-current"));
+        assert!(output.contains("session-related"));
+        assert!(!output.contains("session-unrelated"));
+
+        let catalog_output = executor
+            .execute(
+                "context_retrieve",
+                r#"{"source":"session_catalog","query":"gateway relation marker","limit":8}"#,
+            )
+            .expect("discover same-actor workspace Sessions");
+        let catalog: serde_json::Value =
+            serde_json::from_str(&catalog_output).expect("session catalog receipt");
+        assert_eq!(catalog["scope"], "workspace_sessions");
+        assert_eq!(catalog["selected_count"], 2, "{catalog_output}");
+        assert!(catalog_output.contains("session-current"));
+        assert!(catalog_output.contains("session-workspace-peer"));
+        assert!(!catalog_output.contains("session-related"));
+        assert_eq!(
+            catalog["selected"][0]["read_request"]["source"],
+            "session_history"
+        );
+        assert!(catalog["reference_contract"]["instruction"]
+            .as_str()
+            .is_some_and(|instruction| instruction.contains("not MCP resources")));
+        assert!(!catalog_output.contains("session-unrelated"));
+
+        let explicit_output = executor
+            .execute(
+                "context_retrieve",
+                r#"{"source":"session_history","scope":"explicit_session","session_id":"session-workspace-peer","limit":8}"#,
+            )
+            .expect("read explicit same-actor Session");
+        let explicit: serde_json::Value =
+            serde_json::from_str(&explicit_output).expect("explicit session receipt");
+        assert_eq!(explicit["scope"], "explicit_session");
+        assert_eq!(explicit["selected_count"], 1, "{explicit_output}");
+        assert!(explicit_output.contains("session-workspace-peer"));
+
+        let denied = executor
+            .execute(
+                "context_retrieve",
+                r#"{"source":"session_history","scope":"explicit_session","session_id":"session-unrelated","limit":8}"#,
+            )
+            .expect_err("other actor Session must remain hidden");
+        assert!(denied.to_string().contains("outside"));
+    }
+
+    #[test]
+    fn session_message_preview_is_bounded_and_structured() {
+        let preview = session_message_preview(
+            r#"[{"type":"text","text":"hello context"},{"type":"tool_use","name":"read_file"}]"#,
+            20,
+        );
+
+        assert!(preview.starts_with("hello context"));
+        assert!(preview.contains("[tool"));
+        assert!(preview.chars().count() <= 23);
     }
 
     #[test]

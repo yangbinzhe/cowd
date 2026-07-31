@@ -24,6 +24,13 @@ pub struct RuntimeToolExecutionRequest {
     /// concurrent sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Exact Memory read binding compiled by the owning ConversationRuntime.
+    ///
+    /// Context retrieval must not reconstruct Agent/Definition/Team authority
+    /// from a Session id at the Gateway boundary. Primary and delegated
+    /// runtimes carry the same lease that passive context assembly uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_context: Option<memory::MemoryTurnContext>,
     /// Selected parent model lease. Runtime control tools inherit this binding
     /// for any child AgentTask graph instead of resolving an imaginary default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,6 +64,7 @@ impl RuntimeToolExecutionRequest {
             category: ToolSafetyCategory::Destructive,
             authorization: None,
             session_id: None,
+            memory_context: None,
             model_lease: None,
             parent_execution: None,
             evaluation_isolated: false,
