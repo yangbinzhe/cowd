@@ -218,6 +218,7 @@ impl ToolService {
 pub(crate) struct SystemService {
     pub(crate) label: &'static str,
     pub(crate) owner: &'static str,
+    authorization_negotiator: runtime::AuthorizationNegotiator,
 }
 
 impl SystemService {
@@ -225,6 +226,7 @@ impl SystemService {
         Self {
             label: "system",
             owner: "0.9.315 System service boundary",
+            authorization_negotiator: runtime::AuthorizationNegotiator::new(),
         }
     }
 

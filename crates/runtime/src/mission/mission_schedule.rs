@@ -14,6 +14,7 @@ use cron::Schedule;
 use harness_contract::mission::{
     MissionSchedule, MissionScheduleFire, MissionScheduleStatus, ScheduleTrigger,
 };
+use harness_contract::policy::PermissionMode;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime_event_store::RuntimeTransactionEventInput;
@@ -26,7 +27,7 @@ pub struct CreateMissionScheduleRequest {
     pub objective: String,
     pub trigger: ScheduleTrigger,
     pub autonomy_profile: String,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub priority: u8,
 }
 
@@ -43,7 +44,7 @@ pub struct UpdateMissionScheduleRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autonomy_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission_lease: Option<String>,
+    pub permission_ceiling: Option<PermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u8>,
 }
@@ -111,7 +112,7 @@ impl MissionScheduleStore {
             objective: request.objective,
             trigger: request.trigger,
             autonomy_profile: request.autonomy_profile,
-            permission_lease: request.permission_lease,
+            permission_ceiling: request.permission_ceiling,
             priority: request.priority,
             next_at_ms,
             status: MissionScheduleStatus::Scheduled,
@@ -161,11 +162,8 @@ impl MissionScheduleStore {
                 }
                 schedule.autonomy_profile = autonomy_profile;
             }
-            if let Some(permission_lease) = request.permission_lease {
-                if permission_lease.trim().is_empty() {
-                    return Err("schedule permission_lease must not be empty".to_string());
-                }
-                schedule.permission_lease = permission_lease;
+            if let Some(permission_ceiling) = request.permission_ceiling {
+                schedule.permission_ceiling = permission_ceiling;
             }
             if let Some(priority) = request.priority {
                 schedule.priority = priority;
@@ -227,7 +225,7 @@ impl MissionScheduleStore {
                     due_at_ms,
                     target_session_id: schedule.target_session_id.clone(),
                     objective: schedule.objective.clone(),
-                    permission_lease: schedule.permission_lease.clone(),
+                    permission_ceiling: schedule.permission_ceiling.clone(),
                     priority: schedule.priority,
                     status: status.to_string(),
                     graph_id: None,
@@ -407,7 +405,6 @@ fn validate_create_request(request: &CreateMissionScheduleRequest) -> Result<(),
         ("mission_id", request.mission_id.as_str()),
         ("target_session_id", request.target_session_id.as_str()),
         ("objective", request.objective.as_str()),
-        ("permission_lease", request.permission_lease.as_str()),
     ] {
         if value.trim().is_empty() {
             return Err(format!("schedule {name} must not be empty"));
@@ -492,7 +489,7 @@ mod tests {
             objective: "inspect pending evidence".to_string(),
             trigger,
             autonomy_profile: "assisted".to_string(),
-            permission_lease: "read_only".to_string(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             priority: 64,
         }
     }
@@ -588,7 +585,7 @@ mod tests {
                     objective: Some("stale".to_string()),
                     trigger: None,
                     autonomy_profile: None,
-                    permission_lease: None,
+                    permission_ceiling: None,
                     priority: None,
                 },
                 1_500,
@@ -602,7 +599,9 @@ mod tests {
                     objective: Some("inspect revised evidence".to_string()),
                     trigger: Some(ScheduleTrigger::Interval { every_ms: 500 }),
                     autonomy_profile: Some("supervised".to_string()),
-                    permission_lease: Some("reviewed".to_string()),
+                    permission_ceiling: Some(
+                        harness_contract::policy::PermissionMode::WorkspaceWrite,
+                    ),
                     priority: Some(90),
                 },
                 1_500,

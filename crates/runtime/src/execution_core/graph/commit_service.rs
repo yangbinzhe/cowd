@@ -1524,6 +1524,7 @@ mod tests {
             spawns_process: false,
             mutates_packages: false,
             mutates_system: false,
+            assessment: harness_contract::policy::EffectAssessment::default(),
         }
     }
 
@@ -1558,7 +1559,7 @@ mod tests {
             resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
-            permission_lease: "read_only".to_string(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "fast".to_string(),
             budget_lease: ContextBudgetLeaseRef::new("budget", "agent-instance", "agent", 1_000, 1),
             binding: None,

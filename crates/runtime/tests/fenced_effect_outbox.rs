@@ -26,7 +26,7 @@ fn definition() -> ManagedAgentDefinition {
         session_id: "managed-session".to_string(),
         objective: "exercise fenced effect".to_string(),
         acceptance: vec!["single write".to_string()],
-        permission_lease: "workspace_write".to_string(),
+        permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite,
         model_lease: "default".to_string(),
         granted_capabilities: vec![AgentCapability::Read, AgentCapability::Write],
         allowed_tool_contract_refs: vec!["tool/write_file".to_string()],

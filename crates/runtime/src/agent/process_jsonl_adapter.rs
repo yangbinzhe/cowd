@@ -396,7 +396,7 @@ mod tests {
             resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
-            permission_lease: "read_only".into(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "test".into(),
             budget_lease: ContextBudgetLeaseRef::new(
                 "budget-process-1",

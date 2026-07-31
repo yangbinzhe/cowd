@@ -8,6 +8,7 @@
 
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
 use approval::{ApprovalPolicyArtifact, FileApprovalPolicyArtifact};
+pub use harness_contract::policy::{ApprovalPersistence, RiskLevel};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -673,29 +674,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Risk level for dangerous commands
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RiskLevel {
-    Low,      // mv (overwrite), cp (overwrite)
-    Medium,   // git reset, pip uninstall, apt remove
-    High,     // rm -rf (specified dir), git push --force, chmod 777
-    Critical, // rm -rf /, dd, mkfs, format
-}
-
 /// Approval verdict from user
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApprovalVerdict {
     Approved,
     Denied { reason: String },
     TimedOut,
-}
-
-/// 3-level approval persistence (inspired by hermes approval.py)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ApprovalPersistence {
-    Once,    // Approve this time only
-    Session, // Approve for this session
-    Always,  // Permanently approve (write to config)
 }
 
 /// Approval request sent to frontend
@@ -1141,7 +1125,9 @@ impl DestructivePatternDetector {
             if let Some(persistence) = cache.get(&cache_key) {
                 match persistence {
                     ApprovalPersistence::Session | ApprovalPersistence::Always => return None,
-                    ApprovalPersistence::Once => {}
+                    ApprovalPersistence::Once
+                    | ApprovalPersistence::Turn
+                    | ApprovalPersistence::Task => {}
                 }
             }
         }
@@ -1200,7 +1186,9 @@ impl DestructivePatternDetector {
                 cache.insert(cache_key, persistence);
                 Ok(())
             }
-            ApprovalPersistence::Once => Ok(()),
+            ApprovalPersistence::Once | ApprovalPersistence::Turn | ApprovalPersistence::Task => {
+                Ok(())
+            }
             ApprovalPersistence::Always => self.approval_policy.add_always_allowed(&normalized),
         }
     }
@@ -1268,7 +1256,9 @@ impl DestructivePatternDetector {
                             },
                         };
                     }
-                    ApprovalPersistence::Once => {}
+                    ApprovalPersistence::Once
+                    | ApprovalPersistence::Turn
+                    | ApprovalPersistence::Task => {}
                 }
             }
         }

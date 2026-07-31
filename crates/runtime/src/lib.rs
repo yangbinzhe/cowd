@@ -162,6 +162,8 @@ pub mod agent_runtime;
 pub mod approval_gate;
 #[path = "context/artifact.rs"]
 pub mod artifact;
+#[path = "policy/authorization_negotiator.rs"]
+pub mod authorization_negotiator;
 #[path = "policy/autonomy_profile.rs"]
 pub mod autonomy_profile;
 #[path = "session/checkpoint.rs"]
@@ -354,6 +356,7 @@ pub use approval_queue::{
     ApprovalSourceKind, ApprovalTimeoutPolicy, GlobalApprovalDecisionReceipt,
     GlobalApprovalRequest, GlobalApprovalStatus, SubmitGlobalApprovalRequest,
 };
+pub use authorization_negotiator::{AuthorizationNegotiator, AuthorizationRequest};
 pub use autonomy_profile::{
     ApprovalPolicy as AutonomyApprovalPolicy, AutonomyBudget, AutonomyDecision,
     AutonomyDecisionInput, AutonomyDecisionKind, AutonomyProfileCatalog, AutonomyProfileId,
@@ -421,11 +424,11 @@ pub use cowd_event::{
 };
 pub use cross_plane_policy::{
     ConnectorActionContext, ConnectorDecisionEvidence, CrossPlaneAction, CrossPlaneAuditRecord,
-    CrossPlaneControlPlane, CrossPlaneDecisionEvidence, CrossPlaneDispatchOutcome,
-    CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt, CrossPlaneGrant,
-    CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan, CrossPlanePolicyConfig,
-    CrossPlanePolicyDecision, CrossPlanePolicyEngine, CrossPlaneResolvedIdentity,
-    CrossPlaneSummary, GrantType, IdentityTrust, PolicyDecisionKind,
+    CrossPlaneControlPlane, CrossPlaneDecisionEvidence, CrossPlaneDecisionKind,
+    CrossPlaneDispatchOutcome, CrossPlaneDispatchTarget, CrossPlaneExecutionReceipt,
+    CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlaneOutboundMessagePlan,
+    CrossPlanePolicyConfig, CrossPlanePolicyDecision, CrossPlanePolicyEngine,
+    CrossPlaneResolvedIdentity, CrossPlaneSummary, GrantType, IdentityTrust,
 };
 pub use definition_registry::{
     DefinitionRegistryError, RuntimeDefinitionRegistry, RuntimeTeamTemplateCatalogEntry,

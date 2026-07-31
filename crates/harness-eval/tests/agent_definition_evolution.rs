@@ -38,7 +38,7 @@ fn paired_definition_workload_executes_contract_samples_and_returns_runtime_owne
         allowed_tools: Vec::new(),
         allowed_skills: Vec::new(),
         resource_scopes: vec!["read:crates/runtime".to_string()],
-        permission_lease: "read_only".to_string(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         model_lease: "default".to_string(),
     };
     fs::write(
@@ -89,7 +89,7 @@ fn evaluator_rejects_observations_not_bound_to_candidate_revision() {
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
             resource_scopes: vec!["read:crates/runtime".to_string()],
-            permission_lease: "read_only".to_string(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "default".to_string(),
         })
         .expect("scenario JSON"),

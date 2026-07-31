@@ -4,17 +4,10 @@
 //! cross-plane or approval engines; adapters should convert those decisions
 //! into receipts from this crate.
 
+use super::PolicyDecisionKind;
 use crate::agent::{AgentPolicyRequirement, AgentSpec};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PolicyDecisionKind {
-    Allow,
-    Deny,
-    Ask,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

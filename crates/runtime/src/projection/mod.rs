@@ -1015,7 +1015,7 @@ mod tests {
                 context_lens: Vec::new(),
                 evidence_refs: Vec::new(),
                 context_budget_lease: None,
-                permission_lease: "test".to_string(),
+                permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
                 deadline_at_ms: None,
                 priority: 1,
                 correlation_id: "scope-correlation".to_string(),

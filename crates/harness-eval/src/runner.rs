@@ -761,7 +761,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             role_binding_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
-            permission_lease: "read_only".to_string(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "harness_eval".to_string(),
             budget_lease: None,
             managed_invocation: None,
@@ -1080,14 +1080,31 @@ fn run_eval_tool_call(
     let host = tools::ToolHost::builtin("harness-eval", workspace_root);
     let lease = host.pin_snapshot();
     let effect = lease.describe_effect(name, &input);
-    let result = runtime::ToolPolicy
-        .authorize(
-            &effect,
-            format!("harness-eval:{scenario_id}:{call_index}"),
-            runtime::PermissionMode::ReadOnly,
-            30,
-        )
-        .map_err(|error| error.to_string())
+    let authorization_request_id = format!("harness-eval:{scenario_id}:{call_index}");
+    let permission_policy = runtime::PermissionPolicy::new(runtime::PermissionMode::ReadOnly);
+    let authorization_request = runtime::AuthorizationRequest {
+        principal_id: format!("evaluation:{scenario_id}"),
+        capability: effect.tool_id.clone(),
+        input: input.to_string(),
+        idempotency_key: authorization_request_id.clone(),
+        effect: effect.clone(),
+        parent_ceiling: runtime::PermissionMode::ReadOnly,
+        parent_lease_id: Some(format!("evaluation:{scenario_id}")),
+        approval_satisfied: false,
+        recovery_scope: format!("evaluation:{scenario_id}"),
+        context: runtime::PermissionContext::default(),
+        safe_alternatives: Vec::new(),
+    };
+    let capability =
+        runtime::AuthorizationNegotiator::new().assess(&permission_policy, &authorization_request);
+    let result = capability
+        .lease
+        .ok_or_else(|| "evaluation tool capability was not authorized".to_string())
+        .and_then(|authorization_lease| {
+            runtime::ToolPolicy
+                .authorize(&effect, authorization_request_id, authorization_lease, 30)
+                .map_err(|error| error.to_string())
+        })
         .and_then(|decision| {
             lease
                 .execute(&decision.authorization, name, &input)

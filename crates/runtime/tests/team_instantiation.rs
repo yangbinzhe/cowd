@@ -62,7 +62,7 @@ fn request(template_id: &str, mission_id: &str) -> TeamInstantiationRequest {
         role_binding_overrides: Vec::new(),
         cardinality_overrides: Vec::new(),
         focus_partition_plans: Vec::new(),
-        permission_lease: "read_only".to_string(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         model_lease: "default".to_string(),
         budget_lease: None,
         managed_invocation: None,

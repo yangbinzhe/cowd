@@ -35,7 +35,7 @@ pub enum GrantType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PolicyDecisionKind {
+pub enum CrossPlaneDecisionKind {
     Allow,
     Deny,
     RequireSingleApproval,
@@ -559,32 +559,32 @@ impl CrossPlaneAuditRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossPlanePolicyConfig {
-    pub unknown_actor: PolicyDecisionKind,
-    pub claimed_identity: PolicyDecisionKind,
-    pub observed_identity: PolicyDecisionKind,
-    pub confidential_data: PolicyDecisionKind,
-    pub secret_data: PolicyDecisionKind,
-    pub high_risk: PolicyDecisionKind,
-    pub critical_risk: PolicyDecisionKind,
+    pub unknown_actor: CrossPlaneDecisionKind,
+    pub claimed_identity: CrossPlaneDecisionKind,
+    pub observed_identity: CrossPlaneDecisionKind,
+    pub confidential_data: CrossPlaneDecisionKind,
+    pub secret_data: CrossPlaneDecisionKind,
+    pub high_risk: CrossPlaneDecisionKind,
+    pub critical_risk: CrossPlaneDecisionKind,
 }
 
 impl Default for CrossPlanePolicyConfig {
     fn default() -> Self {
         Self {
-            unknown_actor: PolicyDecisionKind::Deny,
-            claimed_identity: PolicyDecisionKind::RequireSingleApproval,
-            observed_identity: PolicyDecisionKind::RequireSingleApproval,
-            confidential_data: PolicyDecisionKind::RequireSingleApproval,
-            secret_data: PolicyDecisionKind::RequireAdminApproval,
-            high_risk: PolicyDecisionKind::RequireSingleApproval,
-            critical_risk: PolicyDecisionKind::RequireAdminApproval,
+            unknown_actor: CrossPlaneDecisionKind::Deny,
+            claimed_identity: CrossPlaneDecisionKind::RequireSingleApproval,
+            observed_identity: CrossPlaneDecisionKind::RequireSingleApproval,
+            confidential_data: CrossPlaneDecisionKind::RequireSingleApproval,
+            secret_data: CrossPlaneDecisionKind::RequireAdminApproval,
+            high_risk: CrossPlaneDecisionKind::RequireSingleApproval,
+            critical_risk: CrossPlaneDecisionKind::RequireAdminApproval,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrossPlanePolicyDecision {
-    pub decision: PolicyDecisionKind,
+    pub decision: CrossPlaneDecisionKind,
     pub reason: String,
     pub matched_grant: Option<CrossPlaneGrant>,
     pub required_approval: Option<GrantType>,
@@ -1039,7 +1039,7 @@ impl CrossPlanePolicyEngine {
             .cloned()
         {
             return CrossPlanePolicyDecision {
-                decision: PolicyDecisionKind::Allow,
+                decision: CrossPlaneDecisionKind::Allow,
                 reason: "matched_grant".to_string(),
                 matched_grant: Some(grant),
                 required_approval: None,
@@ -1084,7 +1084,7 @@ impl CrossPlanePolicyEngine {
 
         if context.is_some_and(|context| context.requires_approval) {
             return CrossPlanePolicyDecision {
-                decision: PolicyDecisionKind::RequireSingleApproval,
+                decision: CrossPlaneDecisionKind::RequireSingleApproval,
                 reason: "connector_capability_requires_approval".to_string(),
                 matched_grant: None,
                 required_approval: Some(GrantType::SingleUse),
@@ -1101,14 +1101,14 @@ impl CrossPlanePolicyEngine {
                 self.decision(self.config.high_risk, "high_risk_requires_approval")
             }
             CrossPlaneRisk::Medium => CrossPlanePolicyDecision {
-                decision: PolicyDecisionKind::RequireSingleApproval,
+                decision: CrossPlaneDecisionKind::RequireSingleApproval,
                 reason: "medium_risk_requires_approval_without_grant".to_string(),
                 matched_grant: None,
                 required_approval: Some(GrantType::SingleUse),
                 degrade_to: None,
             },
             CrossPlaneRisk::Low => CrossPlanePolicyDecision {
-                decision: PolicyDecisionKind::Allow,
+                decision: CrossPlaneDecisionKind::Allow,
                 reason: "low_risk_verified_actor".to_string(),
                 matched_grant: None,
                 required_approval: None,
@@ -1125,7 +1125,7 @@ impl CrossPlanePolicyEngine {
         let context = context?;
         if context.capability_id != action.requested_capability {
             return Some(CrossPlanePolicyDecision {
-                decision: PolicyDecisionKind::Deny,
+                decision: CrossPlaneDecisionKind::Deny,
                 reason: "connector_capability_mismatch".to_string(),
                 matched_grant: None,
                 required_approval: None,
@@ -1134,7 +1134,7 @@ impl CrossPlanePolicyEngine {
         }
         if !context.missing_scopes.is_empty() {
             return Some(CrossPlanePolicyDecision {
-                decision: PolicyDecisionKind::Deny,
+                decision: CrossPlaneDecisionKind::Deny,
                 reason: format!(
                     "connector_missing_account_scope:{}",
                     context.missing_scopes.join(",")
@@ -1147,7 +1147,7 @@ impl CrossPlanePolicyEngine {
         match context.account_status.as_deref() {
             Some("disabled") => {
                 return Some(CrossPlanePolicyDecision {
-                    decision: PolicyDecisionKind::Deny,
+                    decision: CrossPlaneDecisionKind::Deny,
                     reason: "connector_account_disabled".to_string(),
                     matched_grant: None,
                     required_approval: None,
@@ -1156,7 +1156,7 @@ impl CrossPlanePolicyEngine {
             }
             Some("degraded" | "unknown") if context.requests_commit() => {
                 return Some(CrossPlanePolicyDecision {
-                    decision: PolicyDecisionKind::Deny,
+                    decision: CrossPlaneDecisionKind::Deny,
                     reason: "connector_account_not_ready_for_commit".to_string(),
                     matched_grant: None,
                     required_approval: None,
@@ -1167,7 +1167,7 @@ impl CrossPlanePolicyEngine {
         }
         if context.requests_commit() && !context.supports_commit {
             return Some(CrossPlanePolicyDecision {
-                decision: PolicyDecisionKind::Deny,
+                decision: CrossPlaneDecisionKind::Deny,
                 reason: "connector_capability_does_not_support_commit".to_string(),
                 matched_grant: None,
                 required_approval: None,
@@ -1179,16 +1179,16 @@ impl CrossPlanePolicyEngine {
 
     fn decision(
         &self,
-        decision: PolicyDecisionKind,
+        decision: CrossPlaneDecisionKind,
         reason: impl Into<String>,
     ) -> CrossPlanePolicyDecision {
         let required_approval = match decision {
-            PolicyDecisionKind::RequireSingleApproval => Some(GrantType::SingleUse),
-            PolicyDecisionKind::RequirePersistentGrant => Some(GrantType::Persistent),
-            PolicyDecisionKind::RequireAdminApproval => Some(GrantType::Persistent),
-            PolicyDecisionKind::Allow | PolicyDecisionKind::Deny | PolicyDecisionKind::Degrade => {
-                None
-            }
+            CrossPlaneDecisionKind::RequireSingleApproval => Some(GrantType::SingleUse),
+            CrossPlaneDecisionKind::RequirePersistentGrant => Some(GrantType::Persistent),
+            CrossPlaneDecisionKind::RequireAdminApproval => Some(GrantType::Persistent),
+            CrossPlaneDecisionKind::Allow
+            | CrossPlaneDecisionKind::Deny
+            | CrossPlaneDecisionKind::Degrade => None,
         };
         CrossPlanePolicyDecision {
             decision,
@@ -1465,7 +1465,7 @@ mod tests {
 
         let decision = engine.decide(&action, now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Deny);
         assert_eq!(decision.reason, "unknown_actor");
     }
 
@@ -1478,7 +1478,7 @@ mod tests {
 
         let decision = engine.decide(&action, now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Allow);
         assert_eq!(decision.reason, "low_risk_verified_actor");
     }
 
@@ -1508,7 +1508,7 @@ mod tests {
 
         let decision = engine.decide_with_connector_context(&action, Some(&context), now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Deny);
         assert_eq!(
             decision.reason,
             "connector_missing_account_scope:document:read"
@@ -1540,7 +1540,7 @@ mod tests {
 
         let decision = engine.decide_with_connector_context(&action, Some(&context), now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Deny);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Deny);
         assert_eq!(decision.reason, "connector_account_disabled");
     }
 
@@ -1570,7 +1570,7 @@ mod tests {
 
         let decision = engine.decide_with_connector_context(&action, Some(&context), now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Allow);
         assert_eq!(decision.reason, "matched_grant");
     }
 
@@ -1583,7 +1583,10 @@ mod tests {
 
         let decision = engine.decide(&action, now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::RequireSingleApproval);
+        assert_eq!(
+            decision.decision,
+            CrossPlaneDecisionKind::RequireSingleApproval
+        );
         assert_eq!(decision.required_approval, Some(GrantType::SingleUse));
     }
 
@@ -1603,7 +1606,7 @@ mod tests {
 
         let decision = engine.decide(&action, now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Allow);
         assert_eq!(decision.reason, "matched_grant");
         assert!(decision.matched_grant.is_some());
     }
@@ -1679,7 +1682,7 @@ mod tests {
         let (action, decision, evidence) =
             control.decide_with_connector_context(action, None, now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Allow);
         assert_eq!(decision.reason, "matched_grant");
         assert_eq!(action.actor_principal, "user:yi");
         assert_eq!(
@@ -1704,7 +1707,7 @@ mod tests {
 
         let (_action, decision) = control.decide_with_action(action, now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Allow);
         assert_eq!(control.summary(now()).active_grants, 1);
     }
 
@@ -1733,7 +1736,7 @@ mod tests {
         let (_action, decision, evidence) =
             control.decide_with_connector_context(action, Some(context), now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Allow);
         assert_eq!(
             evidence
                 .connector_context
@@ -1902,7 +1905,10 @@ mod tests {
 
         let decision = engine.decide(&action, now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::RequireSingleApproval);
+        assert_eq!(
+            decision.decision,
+            CrossPlaneDecisionKind::RequireSingleApproval
+        );
     }
 
     #[test]
@@ -1922,7 +1928,7 @@ mod tests {
         action.identity_trust = IdentityTrust::Verified;
         let (_action, decision) = control.decide_with_action(action, now());
 
-        assert_eq!(decision.decision, PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, CrossPlaneDecisionKind::Allow);
         assert_eq!(control.summary(now()).verified_identities, 1);
         assert_eq!(control.summary(now()).active_grants, 1);
         assert!(control.revoke_identity(&binding_id));

@@ -1,9 +1,7 @@
+use harness_contract::policy::AuthorizationLease;
 use harness_contract::tool::{
     ToolEffectDescriptor, ToolEffectKind, ToolExecutionAuthorization, ToolIdempotency,
-    ToolPermissionMode,
 };
-
-use crate::PermissionMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolExecutionPolicyDecision {
@@ -16,11 +14,12 @@ pub struct ToolExecutionPolicyDecision {
 pub enum ToolPolicyError {
     #[error("tool effect descriptor has no permission scope")]
     MissingScope,
-    #[error("tool requires {required:?}, active permission is {active:?}")]
-    PermissionDenied {
-        required: ToolPermissionMode,
-        active: PermissionMode,
-    },
+    #[error("authorization lease does not cover tool effect")]
+    LeaseScopeMismatch,
+    #[error("authorization lease does not permit required mode")]
+    PermissionDenied,
+    #[error("authorization lease idempotency key does not match request")]
+    LeaseIdempotencyMismatch,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -31,16 +30,18 @@ impl ToolPolicy {
         &self,
         descriptor: &ToolEffectDescriptor,
         request_id: impl Into<String>,
-        active_permission: PermissionMode,
+        authorization_lease: AuthorizationLease,
         timeout_secs: u64,
     ) -> Result<ToolExecutionPolicyDecision, ToolPolicyError> {
-        if permission_rank(descriptor.required_permission)
-            > runtime_permission_rank(active_permission)
+        if !authorization_lease.permits(&descriptor.tool_id, descriptor.required_permission) {
+            return Err(ToolPolicyError::PermissionDenied);
+        }
+        if !descriptor
+            .scopes
+            .iter()
+            .all(|scope| authorization_lease.scopes.contains(scope))
         {
-            return Err(ToolPolicyError::PermissionDenied {
-                required: descriptor.required_permission,
-                active: active_permission,
-            });
+            return Err(ToolPolicyError::LeaseScopeMismatch);
         }
         let scope = descriptor
             .scopes
@@ -48,8 +49,15 @@ impl ToolPolicy {
             .cloned()
             .ok_or(ToolPolicyError::MissingScope)?;
         let request_id = request_id.into();
-        let idempotency_key = matches!(descriptor.idempotency, ToolIdempotency::IdempotentWithKey)
-            .then(|| format!("{request_id}:{}", descriptor.descriptor_hash));
+        let idempotency_key =
+            if matches!(descriptor.idempotency, ToolIdempotency::IdempotentWithKey) {
+                if authorization_lease.idempotency_key != request_id {
+                    return Err(ToolPolicyError::LeaseIdempotencyMismatch);
+                }
+                Some(request_id.clone())
+            } else {
+                None
+            };
         let parallel_safe = descriptor.idempotency == ToolIdempotency::Idempotent
             && matches!(descriptor.effect_kind, ToolEffectKind::Read);
         Ok(ToolExecutionPolicyDecision {
@@ -58,43 +66,13 @@ impl ToolPolicy {
                 tool_id: descriptor.tool_id.clone(),
                 descriptor_hash: descriptor.descriptor_hash.clone(),
                 scope,
-                permission_lease: format!(
-                    "permission:{}:{}",
-                    active_permission_label(active_permission),
-                    descriptor.descriptor_hash
-                ),
+                authorization_lease,
                 timeout_lease: format!("timeout:{timeout_secs}"),
                 idempotency_key,
             },
             timeout_secs,
             parallel_safe,
         })
-    }
-}
-
-fn permission_rank(mode: ToolPermissionMode) -> u8 {
-    match mode {
-        ToolPermissionMode::ReadOnly => 0,
-        ToolPermissionMode::WorkspaceWrite => 1,
-        ToolPermissionMode::DangerFullAccess => 2,
-    }
-}
-
-fn runtime_permission_rank(mode: PermissionMode) -> u8 {
-    match mode {
-        PermissionMode::ReadOnly => 0,
-        PermissionMode::WorkspaceWrite => 1,
-        PermissionMode::DangerFullAccess | PermissionMode::Prompt | PermissionMode::Allow => 2,
-    }
-}
-
-fn active_permission_label(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::ReadOnly => "read_only",
-        PermissionMode::WorkspaceWrite => "workspace_write",
-        PermissionMode::DangerFullAccess => "danger_full_access",
-        PermissionMode::Prompt => "prompt",
-        PermissionMode::Allow => "allow",
     }
 }
 
@@ -124,6 +102,25 @@ mod tests {
             spawns_process: false,
             mutates_packages: false,
             mutates_system: false,
+            assessment: harness_contract::policy::EffectAssessment::default(),
+        }
+    }
+
+    fn lease(descriptor: &ToolEffectDescriptor, ceiling: ToolPermissionMode) -> AuthorizationLease {
+        AuthorizationLease {
+            lease_id: "lease".to_string(),
+            principal_id: "test".to_string(),
+            parent_lease_id: None,
+            capability: descriptor.tool_id.clone(),
+            scopes: descriptor.scopes.clone(),
+            ceiling,
+            issued_at_ms: 0,
+            expires_at_ms: u64::MAX,
+            max_uses: 1,
+            remaining_uses: 1,
+            idempotency_key: "request".to_string(),
+            signature: "test-signature".to_string(),
+            status: harness_contract::policy::AuthorizationLeaseStatus::Active,
         }
     }
 
@@ -133,26 +130,30 @@ mod tests {
             .authorize(
                 &descriptor(ToolPermissionMode::WorkspaceWrite),
                 "request",
-                PermissionMode::ReadOnly,
+                lease(
+                    &descriptor(ToolPermissionMode::WorkspaceWrite),
+                    ToolPermissionMode::ReadOnly,
+                ),
                 30,
             )
             .unwrap_err();
-        assert!(matches!(error, ToolPolicyError::PermissionDenied { .. }));
+        assert!(matches!(error, ToolPolicyError::PermissionDenied));
     }
 
     #[test]
     fn write_authorization_has_stable_idempotency_key() {
+        let descriptor = descriptor(ToolPermissionMode::WorkspaceWrite);
         let decision = ToolPolicy
             .authorize(
-                &descriptor(ToolPermissionMode::WorkspaceWrite),
+                &descriptor,
                 "request",
-                PermissionMode::WorkspaceWrite,
+                lease(&descriptor, ToolPermissionMode::WorkspaceWrite),
                 30,
             )
             .unwrap();
         assert_eq!(
             decision.authorization.idempotency_key.as_deref(),
-            Some("request:hash")
+            Some("request")
         );
         assert!(!decision.parallel_safe);
     }

@@ -1,14 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalPersistence {
-    Once,
-    Turn,
-    Task,
-    Session,
-    Always,
-}
+pub use harness_contract::policy::ApprovalPersistence;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {

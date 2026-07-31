@@ -109,10 +109,10 @@ pub fn compile_orchestration(
             role_binding_overrides: Vec::new(),
             cardinality_overrides: team_cardinality_overrides(request, selected_template_path)?,
             focus_partition_plans: request.focus_partition_plans.clone(),
-            permission_lease: if request.constraints.requires_write == Some(true) {
-                "workspace-write".to_string()
+            permission_ceiling: if request.constraints.requires_write == Some(true) {
+                harness_contract::policy::PermissionMode::WorkspaceWrite
             } else {
-                "read_only".to_string()
+                harness_contract::policy::PermissionMode::ReadOnly
             },
             model_lease: request
                 .model_lease
@@ -208,10 +208,10 @@ fn compile_session_dispatch(
             })
             .collect(),
         context_budget_lease: None,
-        permission_lease: if request.constraints.requires_write == Some(true) {
-            "workspace-write".to_string()
+        permission_ceiling: if request.constraints.requires_write == Some(true) {
+            harness_contract::policy::PermissionMode::WorkspaceWrite
         } else {
-            "read_only".to_string()
+            harness_contract::policy::PermissionMode::ReadOnly
         },
         deadline_at_ms: None,
         priority: 128,

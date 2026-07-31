@@ -301,7 +301,9 @@ use crate::governed_tool_plan::{
 };
 use crate::hooks::{HookAbortSignal, HookProgressReporter, HookRunResult, HookRunner};
 use crate::knowledge_activation::KnowledgeActivationRuntime;
-use crate::permissions::{PermissionContext, PermissionOutcome, PermissionPolicy};
+use crate::permissions::{
+    PermissionContext, PermissionPolicy, PermissionPromptDecision, PermissionRequest,
+};
 use crate::runtime_control::RuntimeControlPolicy;
 use crate::runtime_harness::{RuntimeAiKernel, RuntimeAiKernelTrace};
 use crate::session::{ContentBlock, ConversationMessage, MessageEvent, Session, SessionEventLog};
@@ -1792,18 +1794,37 @@ fn contract_permission_mode(
     }
 }
 
-const fn runtime_permission_mode(
-    mode: harness_contract::tool::ToolPermissionMode,
-) -> crate::PermissionMode {
-    match mode {
-        harness_contract::tool::ToolPermissionMode::ReadOnly => crate::PermissionMode::ReadOnly,
-        harness_contract::tool::ToolPermissionMode::WorkspaceWrite => {
-            crate::PermissionMode::WorkspaceWrite
-        }
-        harness_contract::tool::ToolPermissionMode::DangerFullAccess => {
-            crate::PermissionMode::DangerFullAccess
-        }
-    }
+fn denied_capability_assessment(
+    mut assessment: harness_contract::policy::CapabilityAssessment,
+    reason: &str,
+    approval_ref: &str,
+) -> harness_contract::policy::CapabilityAssessment {
+    assessment.path = harness_contract::policy::AuthorizationPath::HardDeny;
+    assessment.lease = None;
+    assessment.gap = Some(harness_contract::policy::CapabilityGap {
+        fingerprint: assessment
+            .gap
+            .as_ref()
+            .map(|gap| gap.fingerprint.clone())
+            .unwrap_or_else(|| assessment.assessment_id.clone()),
+        kind: harness_contract::policy::CapabilityGapKind::ApprovalRequired,
+        capability: assessment.capability.clone(),
+        requested_scopes: assessment.requested_scopes.clone(),
+        required_mode: assessment.required_mode,
+        active_ceiling: assessment.active_ceiling,
+        parent_ceiling: assessment.parent_ceiling,
+        reason: reason.to_string(),
+        safe_alternatives: assessment
+            .gap
+            .as_ref()
+            .map(|gap| gap.safe_alternatives.clone())
+            .unwrap_or_default(),
+        recoverable: false,
+    });
+    assessment
+        .evidence_refs
+        .push(format!("approval:{approval_ref}:{reason}"));
+    assessment
 }
 
 fn apply_runtime_budget_to_control_policy(
@@ -2670,6 +2691,7 @@ pub struct ConversationRuntime<C, T> {
         std::sync::Mutex<Option<harness_contract::knowledge::KnowledgeTurnReport>>,
     /// Sole bounded execution boundary for synchronous Tool implementations.
     tool_execution_plane: Arc<crate::ToolExecutionPlane>,
+    authorization_negotiator: crate::AuthorizationNegotiator,
     /// Every root and delegated Conversation shares the Runtime Provider
     /// admission owner. AgentTask leases govern Agent slots, not Provider
     /// transport, so child conversations must not bypass this boundary.
@@ -2696,6 +2718,11 @@ pub struct ConversationRuntime<C, T> {
     /// Present only for a Gateway-owned durable Session ingress. It fences
     /// provider/tool/terminal side effects against generation and claim loss.
     session_execution_fence: Option<crate::SessionExecutionFence>,
+}
+
+pub(crate) enum ToolAuthorizationDecision {
+    Authorized(crate::ToolExecutionPolicyDecision),
+    Gap(harness_contract::policy::CapabilityAssessment),
 }
 
 struct ConversationGovernedToolContext<'a, C, T> {
@@ -3154,6 +3181,7 @@ where
                 )),
                 Arc::new(crate::execution_core::graph::ScopeLockManager::new()),
             )),
+            authorization_negotiator: crate::AuthorizationNegotiator::new(),
             provider_admission: None,
             execution_service_class:
                 crate::execution_core::graph::ExecutionServiceClass::Interactive,
@@ -6574,17 +6602,30 @@ where
                 crate::ToolSafetyCategory::from_effect(&descriptor).default_timeout_secs(),
             )
         });
-        let authorization = match crate::ToolPolicy.authorize(
+        let authorization = match self.assess_tool_authorization(
             &descriptor,
+            &checkpoint_input,
             format!(
                 "{}:checkpoint:{}",
                 self.session().session_id,
                 execution_decision.lease.lease_id
             ),
-            self.permission_policy.active_mode(),
+            PermissionContext::default(),
+            validation.approval_satisfied,
             timeout.as_secs(),
         ) {
-            Ok(decision) => decision,
+            Ok(ToolAuthorizationDecision::Authorized(decision)) => decision,
+            Ok(ToolAuthorizationDecision::Gap(assessment)) => {
+                validation.allowed = false;
+                validation.findings.push(format!(
+                    "checkpoint_authorization_denied:{}",
+                    assessment
+                        .gap
+                        .as_ref()
+                        .map_or("unknown capability gap", |gap| gap.reason.as_str())
+                ));
+                return;
+            }
             Err(error) => {
                 validation.allowed = false;
                 validation
@@ -6656,102 +6697,53 @@ where
         let effective_input = pre_hook_result
             .updated_input()
             .map_or_else(|| input.to_string(), ToOwned::to_owned);
-        let permission_context = PermissionContext::new(
+        let mut permission_context = PermissionContext::new(
             pre_hook_result.permission_override(),
             pre_hook_result.permission_reason().map(ToOwned::to_owned),
         );
-
-        let permission_outcome = if pre_hook_result.is_cancelled() {
-            PermissionOutcome::Deny {
-                reason: format!("PreToolUse hook cancelled tool `{tool_name}`"),
-            }
+        if pre_hook_result.is_cancelled() {
+            permission_context = PermissionContext::new(
+                Some(crate::permissions::PermissionOverride::Deny),
+                Some(format!("PreToolUse hook cancelled tool `{tool_name}`")),
+            );
         } else if pre_hook_result.is_failed() {
             let hook_msgs = pre_hook_result.messages().join("; ");
-            PermissionOutcome::Deny {
-                reason: if hook_msgs.is_empty() {
+            permission_context = PermissionContext::new(
+                Some(crate::permissions::PermissionOverride::Deny),
+                Some(if hook_msgs.is_empty() {
                     format!("PreToolUse hook failed for tool `{tool_name}`")
                 } else {
                     format!("PreToolUse hook failed for tool `{tool_name}`: {hook_msgs}")
-                },
-            }
+                }),
+            );
         } else if pre_hook_result.is_denied() {
-            PermissionOutcome::Deny {
-                reason: format!("PreToolUse hook denied tool `{tool_name}`"),
-            }
-        } else if let Some(prompt) = prompter.lock().as_mut() {
-            self.permission_policy.authorize_required_with_context(
-                tool_name,
+            permission_context = PermissionContext::new(
+                Some(crate::permissions::PermissionOverride::Deny),
+                Some(format!("PreToolUse hook denied tool `{tool_name}`")),
+            );
+        }
+        let profile_timeout = Duration::from_secs(task.safety_category.default_timeout_secs());
+        let tool_timeout = self
+            .tool_timeout
+            .map_or(profile_timeout, |timeout| timeout.min(profile_timeout));
+        let authorization_id = format!(
+            "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
+            self.session().session_id
+        );
+        let authorization_decision = self
+            .negotiate_tool_authorization(
+                &task.effect,
                 &effective_input,
-                runtime_permission_mode(task.effect.required_permission),
-                &permission_context,
-                Some(prompt.as_mut()),
+                authorization_id,
+                permission_context,
+                strategy_approval_satisfied,
+                tool_timeout.as_secs(),
+                prompter,
             )
-        } else {
-            self.permission_policy.authorize_required_with_context(
-                tool_name,
-                &effective_input,
-                runtime_permission_mode(task.effect.required_permission),
-                &permission_context,
-                None,
-            )
-        };
+            .await?;
 
-        match permission_outcome {
-            PermissionOutcome::Allow => {
-                // Smart approval gate check
-                if !strategy_approval_satisfied {
-                    if let Some(gate) = &self.approval_gate {
-                        let approval_bus = self.cowd_bus().cloned();
-                        let approval_tool = tool_name.to_string();
-                        let gate_result = gate
-                            .evaluate_with_observer(tool_name, &effective_input, move |request| {
-                                if let Some(cowd) = approval_bus {
-                                    cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
-                                        request_id: request.id.clone(),
-                                        tool: approval_tool,
-                                    });
-                                }
-                            })
-                            .await;
-                        let denial_reason = match gate_result {
-                            crate::approval_gate::ApprovalGateResult::Denied { reason, .. } => {
-                                Some(reason)
-                            }
-                            crate::approval_gate::ApprovalGateResult::TimedOut { .. } => {
-                                Some(format!("approval timed out for tool `{tool_name}`"))
-                            }
-                            crate::approval_gate::ApprovalGateResult::AutoPass { .. }
-                            | crate::approval_gate::ApprovalGateResult::Approved { .. } => None,
-                        };
-                        if let Some(reason) = denial_reason {
-                            self.record_tool_invocation_denied(
-                                tool_use_id,
-                                tool_name,
-                                &effective_input,
-                                iterations,
-                                ToolFailureKind::ApprovalDenied,
-                                &reason,
-                            );
-                            let denied = ConversationMessage::tool_result(
-                                tool_use_id.to_string(),
-                                tool_name.to_string(),
-                                reason,
-                                true,
-                            );
-                            self.session
-                                .write()
-                                .await
-                                .push_message(denied.clone())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
-                            self.record_message_event(
-                                &denied,
-                                self.session().message_count().wrapping_sub(1),
-                            );
-                            return Ok(denied);
-                        }
-                    }
-                }
-
+        match authorization_decision {
+            ToolAuthorizationDecision::Authorized(authorization) => {
                 // Gate evaluator check — runs commit quality gates (PreFlight,
                 // Abort, Revision, Escalation) against the tool input before
                 // allowing execution.
@@ -6843,23 +6835,7 @@ where
                 let tname = tool_name.to_string();
                 let tname_for_err = tname.clone();
                 let tinput = effective_input.clone();
-                let profile_timeout =
-                    Duration::from_secs(task.safety_category.default_timeout_secs());
-                let tool_timeout = self
-                    .tool_timeout
-                    .map_or(profile_timeout, |t| t.min(profile_timeout));
                 let tool_exec = Arc::clone(&self.tool_executor);
-                let authorization = crate::ToolPolicy
-                    .authorize(
-                        &task.effect,
-                        format!(
-                            "{}:{plan_id}:{plan_revision}:{tool_use_id}:{iterations}",
-                            self.session().session_id
-                        ),
-                        self.permission_policy.active_mode(),
-                        tool_timeout.as_secs(),
-                    )
-                    .map_err(|error| RuntimeError::new(error.to_string()))?;
                 let evidence_sandbox = self.tool_output_sandbox.clone();
                 let is_evidence_retrieve = tool_name == "evidence_retrieve";
                 let demand = task.resource_demand.clone();
@@ -7216,7 +7192,12 @@ where
                 self.record_tool_finished(iterations, &result);
                 Ok(result)
             }
-            PermissionOutcome::Deny { reason } => {
+            ToolAuthorizationDecision::Gap(assessment) => {
+                let gap = assessment.gap.as_ref();
+                let reason = gap.map_or_else(
+                    || "capability authorization was not granted".to_string(),
+                    |gap| gap.reason.clone(),
+                );
                 let failure_kind = if reason.starts_with("PreToolUse hook") {
                     ToolFailureKind::HookDenied
                 } else {
@@ -7230,11 +7211,25 @@ where
                     failure_kind,
                     &reason,
                 );
+                let first_recovery = gap.is_some_and(|gap| gap.recoverable);
+                let payload = serde_json::json!({
+                    "kind": "capability_gap",
+                    "assessment_id": assessment.assessment_id,
+                    "path": assessment.path,
+                    "gap": assessment.gap,
+                    "controlled_recovery_available": first_recovery,
+                    "instruction": if first_recovery {
+                        "Use one listed safe alternative or revise the plan with existing capabilities. Do not repeat the same denied action without new evidence or approval."
+                    } else {
+                        "The same capability gap is closed for this turn. Preserve evidence and report the limitation without retrying the denied action."
+                    },
+                })
+                .to_string();
                 let denied = ConversationMessage::tool_result(
                     tool_use_id.to_string(),
                     tool_name.to_string(),
-                    reason,
-                    true,
+                    payload,
+                    !first_recovery,
                 );
                 self.session
                     .write()
@@ -7372,6 +7367,269 @@ where
     #[must_use]
     pub fn permission_policy(&self) -> &PermissionPolicy {
         &self.permission_policy
+    }
+
+    #[must_use]
+    pub(crate) fn authorization_negotiator(&self) -> crate::AuthorizationNegotiator {
+        self.authorization_negotiator.clone()
+    }
+
+    fn authorization_request(
+        &self,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        input: &str,
+        idempotency_key: String,
+        permission_context: PermissionContext,
+        approval_satisfied: bool,
+    ) -> crate::AuthorizationRequest {
+        let execution_context = self
+            .cowd_bus()
+            .and_then(crate::CowdEventBus::current_execution_context);
+        let delegated = self.memory_agent_id != "primary";
+        let recovery_scope = execution_context.as_ref().map_or_else(
+            || format!("session:{}", self.session().session_id),
+            |context| format!("turn:{}", context.turn_id),
+        );
+        let safe_alternatives = match descriptor.effect_kind {
+            harness_contract::tool::ToolEffectKind::Read => Vec::new(),
+            harness_contract::tool::ToolEffectKind::Write => {
+                vec!["return a patch or proposed change without applying it".to_string()]
+            }
+            harness_contract::tool::ToolEffectKind::Network => {
+                vec!["use already-authorized local or cached evidence".to_string()]
+            }
+            harness_contract::tool::ToolEffectKind::Process
+            | harness_contract::tool::ToolEffectKind::Package => {
+                vec!["inspect and report the required operation without executing it".to_string()]
+            }
+            harness_contract::tool::ToolEffectKind::System
+            | harness_contract::tool::ToolEffectKind::Destructive
+            | harness_contract::tool::ToolEffectKind::Unknown => Vec::new(),
+        };
+        crate::AuthorizationRequest {
+            principal_id: if delegated {
+                format!("agent:{}", self.memory_agent_id)
+            } else {
+                format!("session:{}", self.session().session_id)
+            },
+            capability: descriptor.tool_id.clone(),
+            input: input.to_string(),
+            idempotency_key,
+            effect: descriptor.clone(),
+            parent_ceiling: if delegated {
+                self.permission_policy.active_mode()
+            } else {
+                crate::PermissionMode::DangerFullAccess
+            },
+            parent_lease_id: delegated.then(|| format!("binding:{}", self.memory_agent_id)),
+            approval_satisfied,
+            recovery_scope,
+            context: permission_context,
+            safe_alternatives,
+        }
+    }
+
+    fn record_capability_assessment(
+        &self,
+        assessment: &harness_contract::policy::CapabilityAssessment,
+    ) {
+        if let Some(cowd) = self.cowd_bus() {
+            cowd.emit(crate::cowd_event::CowdEvent::CapabilityAssessed {
+                assessment: assessment.clone(),
+            });
+        }
+        let mut refs = vec![RuntimeEventRef {
+            kind: "capability".to_string(),
+            id: assessment.capability.clone(),
+        }];
+        if let Some(lease) = assessment.lease.as_ref() {
+            refs.push(RuntimeEventRef {
+                kind: "authorization_lease".to_string(),
+                id: lease.lease_id.clone(),
+            });
+        }
+        self.append_execution_runtime_event(
+            RuntimeEventScope::Tool,
+            "authorization.capability_assessed",
+            Some(format!("{:?}", assessment.path).to_ascii_lowercase()),
+            refs,
+            serde_json::to_value(assessment).unwrap_or_else(|_| serde_json::json!({})),
+        );
+        for transition in self.authorization_negotiator.drain_transitions() {
+            if let Some(cowd) = self.cowd_bus() {
+                cowd.emit(crate::cowd_event::CowdEvent::AuthorizationLeaseTransition {
+                    transition: transition.clone(),
+                });
+            }
+            self.append_execution_runtime_event(
+                RuntimeEventScope::Tool,
+                "authorization.lease_transition",
+                Some(format!("{:?}", transition.kind).to_ascii_lowercase()),
+                vec![RuntimeEventRef {
+                    kind: "authorization_lease".to_string(),
+                    id: transition.lease.lease_id.clone(),
+                }],
+                serde_json::to_value(transition).unwrap_or_else(|_| serde_json::json!({})),
+            );
+        }
+    }
+
+    pub(crate) fn assess_tool_authorization(
+        &self,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        input: &str,
+        idempotency_key: String,
+        permission_context: PermissionContext,
+        approval_satisfied: bool,
+        timeout_secs: u64,
+    ) -> Result<ToolAuthorizationDecision, RuntimeError> {
+        let request = self.authorization_request(
+            descriptor,
+            input,
+            idempotency_key.clone(),
+            permission_context,
+            approval_satisfied,
+        );
+        let assessment = self
+            .authorization_negotiator
+            .assess(&self.permission_policy, &request);
+        self.record_capability_assessment(&assessment);
+        if let Some(lease) = assessment.lease.clone() {
+            return crate::ToolPolicy
+                .authorize(descriptor, idempotency_key, lease, timeout_secs)
+                .map(ToolAuthorizationDecision::Authorized)
+                .map_err(|error| RuntimeError::new(error.to_string()));
+        }
+        Ok(ToolAuthorizationDecision::Gap(assessment))
+    }
+
+    pub(crate) async fn negotiate_tool_authorization(
+        &self,
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        input: &str,
+        idempotency_key: String,
+        permission_context: PermissionContext,
+        approval_satisfied: bool,
+        timeout_secs: u64,
+        prompter: &crate::permissions::SharedPrompter,
+    ) -> Result<ToolAuthorizationDecision, RuntimeError> {
+        let initial = self.assess_tool_authorization(
+            descriptor,
+            input,
+            idempotency_key.clone(),
+            permission_context.clone(),
+            approval_satisfied,
+            timeout_secs,
+        )?;
+        let ToolAuthorizationDecision::Gap(assessment) = initial else {
+            return Ok(initial);
+        };
+        if assessment.path != harness_contract::policy::AuthorizationPath::HumanApproval {
+            return Ok(ToolAuthorizationDecision::Gap(
+                self.govern_capability_gap(assessment),
+            ));
+        }
+
+        let request = self.authorization_request(
+            descriptor,
+            input,
+            idempotency_key.clone(),
+            permission_context,
+            false,
+        );
+        let approval_ref = if let Some(gate) = &self.approval_gate {
+            let approval_bus = self.cowd_bus().cloned();
+            let approval_tool = descriptor.tool_id.clone();
+            match gate
+                .require_explicit_approval_with_observer(
+                    &descriptor.tool_id,
+                    input,
+                    move |pending| {
+                        if let Some(cowd) = approval_bus {
+                            cowd.emit(crate::cowd_event::CowdEvent::ApprovalRequested {
+                                request_id: pending.id.clone(),
+                                tool: approval_tool.clone(),
+                            });
+                        }
+                    },
+                )
+                .await
+            {
+                crate::approval_gate::ApprovalGateResult::Approved { request_id, .. } => request_id,
+                crate::approval_gate::ApprovalGateResult::AutoPass { .. } => {
+                    "approval:auto-pass".to_string()
+                }
+                crate::approval_gate::ApprovalGateResult::Denied { reason, request_id } => {
+                    let denied = denied_capability_assessment(assessment, &reason, &request_id);
+                    self.record_capability_assessment(&denied);
+                    return Ok(ToolAuthorizationDecision::Gap(denied));
+                }
+                crate::approval_gate::ApprovalGateResult::TimedOut { request_id } => {
+                    let denied =
+                        denied_capability_assessment(assessment, "approval timed out", &request_id);
+                    self.record_capability_assessment(&denied);
+                    return Ok(ToolAuthorizationDecision::Gap(denied));
+                }
+            }
+        } else {
+            let decision = prompter.lock().as_mut().map(|prompt| {
+                prompt.decide(&PermissionRequest {
+                    tool_name: descriptor.tool_id.clone(),
+                    input: input.to_string(),
+                    current_mode: self.permission_policy.active_mode(),
+                    required_mode: assessment.required_mode,
+                    reason: assessment.gap.as_ref().map(|gap| gap.reason.clone()),
+                })
+            });
+            match decision {
+                Some(PermissionPromptDecision::Allow) => "approval:prompter".to_string(),
+                Some(PermissionPromptDecision::Deny { reason }) => {
+                    let denied =
+                        denied_capability_assessment(assessment, &reason, "approval:prompter");
+                    self.record_capability_assessment(&denied);
+                    return Ok(ToolAuthorizationDecision::Gap(denied));
+                }
+                None => {
+                    return Ok(ToolAuthorizationDecision::Gap(
+                        self.govern_capability_gap(assessment),
+                    ))
+                }
+            }
+        };
+
+        let approved =
+            self.authorization_negotiator
+                .approve(&self.permission_policy, &request, &approval_ref);
+        self.record_capability_assessment(&approved);
+        let Some(lease) = approved.lease.clone() else {
+            return Ok(ToolAuthorizationDecision::Gap(approved));
+        };
+        crate::ToolPolicy
+            .authorize(descriptor, idempotency_key, lease, timeout_secs)
+            .map(ToolAuthorizationDecision::Authorized)
+            .map_err(|error| RuntimeError::new(error.to_string()))
+    }
+
+    fn govern_capability_gap(
+        &self,
+        mut assessment: harness_contract::policy::CapabilityAssessment,
+    ) -> harness_contract::policy::CapabilityAssessment {
+        if assessment.gap.as_ref().is_some_and(|gap| gap.recoverable)
+            && !self
+                .authorization_negotiator
+                .claim_controlled_recovery(&assessment)
+        {
+            if let Some(gap) = assessment.gap.as_mut() {
+                gap.recoverable = false;
+                gap.reason.push_str(
+                    "; the same capability gap already consumed its single controlled recovery",
+                );
+            }
+            assessment
+                .evidence_refs
+                .push("authorization.recovery_circuit_open".to_string());
+        }
+        assessment
     }
 
     pub fn set_permission_mode(&mut self, mode: crate::PermissionMode) {
@@ -11305,6 +11563,40 @@ impl ToolExecutor for StaticToolExecutor {
                     safety,
                     crate::tool_orchestrator::ToolSafetyCategory::Destructive
                 ),
+                assessment: harness_contract::policy::EffectAssessment {
+                    reversibility: match effect_kind {
+                        ToolEffectKind::Read | ToolEffectKind::Network => {
+                            harness_contract::policy::EffectReversibility::Reversible
+                        }
+                        ToolEffectKind::Write => {
+                            harness_contract::policy::EffectReversibility::Compensatable
+                        }
+                        _ => harness_contract::policy::EffectReversibility::Irreversible,
+                    },
+                    externality: match effect_kind {
+                        ToolEffectKind::Read => {
+                            harness_contract::policy::EffectExternality::Internal
+                        }
+                        ToolEffectKind::Write => {
+                            harness_contract::policy::EffectExternality::Workspace
+                        }
+                        ToolEffectKind::Network => {
+                            harness_contract::policy::EffectExternality::NetworkRead
+                        }
+                        _ => harness_contract::policy::EffectExternality::System,
+                    },
+                    data_sensitivity: harness_contract::policy::DataClassification::Internal,
+                    novelty: harness_contract::policy::EffectNovelty::Routine,
+                    blast_radius: match effect_kind {
+                        ToolEffectKind::Read | ToolEffectKind::Network => {
+                            harness_contract::policy::EffectBlastRadius::Item
+                        }
+                        ToolEffectKind::Write => {
+                            harness_contract::policy::EffectBlastRadius::Workspace
+                        }
+                        _ => harness_contract::policy::EffectBlastRadius::System,
+                    },
+                },
             }
         })
     }
@@ -14444,6 +14736,7 @@ mod tests {
                 spawns_process: false,
                 mutates_packages: false,
                 mutates_system: false,
+                assessment: harness_contract::policy::EffectAssessment::default(),
             })
         }
 

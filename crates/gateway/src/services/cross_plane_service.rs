@@ -71,7 +71,7 @@ impl CrossPlaneService {
         action: CrossPlaneAction,
         decision: CrossPlanePolicyDecision,
     ) -> CrossPlaneExecutionReceipt {
-        let allowed = decision.decision == runtime::PolicyDecisionKind::Allow;
+        let allowed = decision.decision == runtime::CrossPlaneDecisionKind::Allow;
         CrossPlaneExecutionReceipt::new(
             idempotency_key,
             mode,
@@ -96,7 +96,7 @@ impl CrossPlaneService {
         decision: CrossPlanePolicyDecision,
         evidence: CrossPlaneDecisionEvidence,
     ) -> Result<CrossPlaneExecutionReceipt, runtime::CrossPlaneRuntimeError> {
-        let allowed = decision.decision == runtime::PolicyDecisionKind::Allow;
+        let allowed = decision.decision == runtime::CrossPlaneDecisionKind::Allow;
         let (_, receipt) = self.record_action_execution(CrossPlaneExecutionRecord {
             idempotency_key,
             mode,

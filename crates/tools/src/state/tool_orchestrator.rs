@@ -6,7 +6,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+use harness_contract::policy::{
+    DataClassification, EffectAssessment, EffectBlastRadius, EffectExternality, EffectNovelty,
+    EffectReversibility, PermissionOperation, PermissionResource, PermissionScope,
+};
 use harness_contract::tool::{
     ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolEffectResolverSpec,
     ToolIdempotency, ToolPermissionMode,
@@ -26,6 +29,7 @@ pub fn resolve_registered_tool_effect(
         stricter_permission(properties.required_permission, catalog_permission);
 
     let descriptor_hash = descriptor_hash(tool_id, input, &properties);
+    let assessment = effect_assessment(&properties, input);
     ToolEffectDescriptor {
         tool_id: tool_id.to_string(),
         descriptor_hash,
@@ -38,6 +42,90 @@ pub fn resolve_registered_tool_effect(
         spawns_process: properties.spawns_process,
         mutates_packages: properties.mutates_packages,
         mutates_system: properties.mutates_system,
+        assessment,
+    }
+}
+
+fn effect_assessment(properties: &EffectProperties, input: &Value) -> EffectAssessment {
+    let externality = if properties.mutates_system
+        || matches!(
+            properties.effect_kind,
+            ToolEffectKind::System | ToolEffectKind::Package | ToolEffectKind::Destructive
+        ) {
+        EffectExternality::System
+    } else if properties.uses_network
+        && properties.required_permission != ToolPermissionMode::ReadOnly
+    {
+        EffectExternality::ExternalMutation
+    } else if properties.uses_network {
+        EffectExternality::NetworkRead
+    } else if matches!(
+        properties.effect_kind,
+        ToolEffectKind::Write | ToolEffectKind::Process
+    ) {
+        EffectExternality::Workspace
+    } else {
+        EffectExternality::Internal
+    };
+    let reversibility = match properties.effect_kind {
+        ToolEffectKind::Read | ToolEffectKind::Network => EffectReversibility::Reversible,
+        ToolEffectKind::Write | ToolEffectKind::Process => EffectReversibility::Compensatable,
+        ToolEffectKind::Destructive | ToolEffectKind::System => EffectReversibility::Irreversible,
+        ToolEffectKind::Package | ToolEffectKind::Unknown => EffectReversibility::Unknown,
+    };
+    let blast_radius = match externality {
+        EffectExternality::Internal => EffectBlastRadius::Item,
+        EffectExternality::Workspace => EffectBlastRadius::Workspace,
+        EffectExternality::NetworkRead => EffectBlastRadius::Item,
+        EffectExternality::ExternalMutation => EffectBlastRadius::ExternalAccount,
+        EffectExternality::System => EffectBlastRadius::System,
+        EffectExternality::Unknown => EffectBlastRadius::Unknown,
+    };
+    EffectAssessment {
+        reversibility,
+        externality,
+        data_sensitivity: data_classification(properties, input),
+        novelty: match properties.effect_kind {
+            ToolEffectKind::Package => EffectNovelty::NewCapability,
+            ToolEffectKind::Process => EffectNovelty::NewTarget,
+            ToolEffectKind::Unknown => EffectNovelty::Unknown,
+            _ => EffectNovelty::Routine,
+        },
+        blast_radius,
+    }
+}
+
+fn data_classification(properties: &EffectProperties, input: &Value) -> DataClassification {
+    if input
+        .get("contains_secrets")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return DataClassification::Secret;
+    }
+    if let Some(classification) = input.get("data_classification").and_then(Value::as_str) {
+        return match classification.trim().to_ascii_lowercase().as_str() {
+            "public" => DataClassification::Public,
+            "confidential" => DataClassification::Confidential,
+            "secret" => DataClassification::Secret,
+            _ => DataClassification::Internal,
+        };
+    }
+    let target = resource_target(input)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if target == ".env"
+        || target.ends_with("/.env")
+        || target.contains("/.ssh/")
+        || target.contains("credentials")
+        || target.contains("secrets.")
+    {
+        return DataClassification::Secret;
+    }
+    if properties.uses_network && properties.required_permission == ToolPermissionMode::ReadOnly {
+        DataClassification::Public
+    } else {
+        DataClassification::Internal
     }
 }
 
@@ -439,7 +527,9 @@ const fn permission_rank(mode: ToolPermissionMode) -> u8 {
     match mode {
         ToolPermissionMode::ReadOnly => 0,
         ToolPermissionMode::WorkspaceWrite => 1,
-        ToolPermissionMode::DangerFullAccess => 2,
+        ToolPermissionMode::DangerFullAccess
+        | ToolPermissionMode::Prompt
+        | ToolPermissionMode::Allow => 2,
     }
 }
 
@@ -631,6 +721,34 @@ mod tests {
         assert_eq!(
             remote_trigger.required_permission,
             ToolPermissionMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn effect_assessment_marks_explicit_and_sensitive_path_data() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.readonly".to_string(),
+            resolver_version: 1,
+        };
+        let environment = resolve_registered_tool_effect(
+            &resolver,
+            "read_file",
+            &json!({"path": ".env"}),
+            ToolPermissionMode::ReadOnly,
+        );
+        let confidential = resolve_registered_tool_effect(
+            &resolver,
+            "read_file",
+            &json!({"path": "docs/design.md", "data_classification": "confidential"}),
+            ToolPermissionMode::ReadOnly,
+        );
+        assert_eq!(
+            environment.assessment.data_sensitivity,
+            DataClassification::Secret
+        );
+        assert_eq!(
+            confidential.assessment.data_sensitivity,
+            DataClassification::Confidential
         );
     }
 }

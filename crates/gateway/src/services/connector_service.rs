@@ -2,8 +2,8 @@ use std::path::Path;
 
 use connector::{ExternalResourceRef, ResourceDirectoryRepository, ResourceDirectoryResult};
 use runtime::{
-    CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneExecutionReceipt,
-    CrossPlanePolicyDecision, PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneDecisionKind,
+    CrossPlaneExecutionReceipt, CrossPlanePolicyDecision,
 };
 
 use super::{ConnectorService, CrossPlaneExecutionRecord, CrossPlaneService, ServiceEnvelope};
@@ -29,7 +29,7 @@ impl ConnectorService {
     }
 
     pub(crate) fn policy_allows(&self, decision: &CrossPlanePolicyDecision) -> bool {
-        decision.decision == PolicyDecisionKind::Allow
+        decision.decision == CrossPlaneDecisionKind::Allow
     }
 
     pub(crate) fn record_service_execution_receipt(

@@ -2756,7 +2756,8 @@ struct HostEarlyToolDispatcher<T: ToolExecutor> {
     memory_context: memory::MemoryTurnContext,
     model_lease: Option<String>,
     decision: crate::execution_core::RuntimeExecutionDecision,
-    permission_mode: crate::PermissionMode,
+    permission_policy: crate::PermissionPolicy,
+    authorization_negotiator: crate::AuthorizationNegotiator,
     timeout: std::time::Duration,
     early_read_locks:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -2809,7 +2810,8 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
         let memory_context = self.memory_context.clone();
         let model_lease = self.model_lease.clone();
         let decision = self.decision.clone();
-        let permission_mode = self.permission_mode;
+        let permission_policy = self.permission_policy.clone();
+        let authorization_negotiator = self.authorization_negotiator.clone();
         let timeout = self.timeout;
         let early_read_locks = Arc::clone(&self.early_read_locks);
         Box::pin(async move {
@@ -2862,18 +2864,52 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                     validation.findings.join(",")
                 ));
             }
+            let authorization_id = format!(
+                "{}:{}:early",
+                session_id,
+                candidate
+                    .identity
+                    .tool_call_id
+                    .as_deref()
+                    .unwrap_or(&candidate.call.id)
+            );
+            let assessment = authorization_negotiator.assess(
+                &permission_policy,
+                &crate::AuthorizationRequest {
+                    principal_id: format!("session:{session_id}"),
+                    capability: effect.tool_id.clone(),
+                    input: candidate.call.input.clone(),
+                    idempotency_key: authorization_id.clone(),
+                    effect: effect.clone(),
+                    parent_ceiling: crate::PermissionMode::DangerFullAccess,
+                    parent_lease_id: None,
+                    approval_satisfied: false,
+                    recovery_scope: format!("execution:{}", ticket.graph_id),
+                    context: crate::PermissionContext::default(),
+                    safe_alternatives: Vec::new(),
+                },
+            );
+            if let Some(bus) = event_bus.as_ref() {
+                bus.emit(CowdEvent::CapabilityAssessed {
+                    assessment: assessment.clone(),
+                });
+                for transition in authorization_negotiator.drain_transitions() {
+                    bus.emit(CowdEvent::AuthorizationLeaseTransition { transition });
+                }
+            }
+            let Some(lease) = assessment.lease else {
+                return defer(format!(
+                    "capability_gap:{}",
+                    assessment
+                        .gap
+                        .as_ref()
+                        .map_or("authorization unavailable", |gap| gap.reason.as_str())
+                ));
+            };
             let authorization = match crate::ToolPolicy.authorize(
                 effect,
-                format!(
-                    "{}:{}:early",
-                    session_id,
-                    candidate
-                        .identity
-                        .tool_call_id
-                        .as_deref()
-                        .unwrap_or(&candidate.call.id)
-                ),
-                permission_mode,
+                authorization_id,
+                lease,
                 timeout.as_secs(),
             ) {
                 Ok(authorization) if authorization.parallel_safe => authorization.authorization,
@@ -2894,6 +2930,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
             let _early_read_guard = early_read_lock.lock().await;
             let mut invocations = std::collections::HashMap::new();
             invocations.insert(candidate.call.id.clone(), invocation);
+            let capability_gaps = std::collections::HashMap::new();
             let mut idempotency_keys = std::collections::HashMap::new();
             idempotency_keys.insert(
                 candidate.call.id.clone(),
@@ -2914,6 +2951,7 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 model_lease: model_lease.as_deref(),
                 ticket: &early_ticket,
                 tool_authorizations: &authorizations,
+                capability_gaps: &capability_gaps,
                 prepared_invocations: &invocations,
                 plan_id: &plan.plan_id,
                 plan_revision: plan.revision,
@@ -3201,7 +3239,8 @@ where
                             memory_context: runtime.memory_turn_context(),
                             model_lease: early_model_lease.clone(),
                             decision: strategy.decision,
-                            permission_mode: runtime.permission_policy().active_mode(),
+                            permission_policy: runtime.permission_policy().clone(),
+                            authorization_negotiator: runtime.authorization_negotiator(),
                             timeout: runtime
                                 .tool_timeout()
                                 .unwrap_or_else(|| std::time::Duration::from_secs(60)),
@@ -5140,7 +5179,7 @@ fn agent_proposal_nodes(
             .map(|call| call.name.clone())
             .collect(),
         allowed_skills: Vec::new(),
-        permission_lease: "turn-permission-lease".to_string(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         model_lease: state.model.clone().unwrap_or_default(),
         budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
             format!("budget:{}", agent_node.id),
@@ -5256,17 +5295,16 @@ where
         // runtime. These are necessary for delegated agent tool calls that
         // travel through the governed path, because the Gateway's ToolHost
         // must verify the same descriptor before execution.
-        let (tool_authorizations, prepared_tool_invocations): (
+        let (tool_authorizations, prepared_tool_invocations, capability_gaps): (
             std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
             std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
+            std::collections::HashMap<String, harness_contract::policy::CapabilityAssessment>,
         ) = {
             let runtime = self.runtime.lock().await;
             let tool_exec = Arc::clone(runtime.tool_executor());
-            let active_mode = runtime.permission_policy().active_mode();
             let default_timeout = runtime
                 .tool_timeout()
                 .unwrap_or_else(|| std::time::Duration::from_secs(60));
-            drop(runtime);
             let requests = calls
                 .iter()
                 .map(|call| crate::tool_dispatch::ToolRequest {
@@ -5279,6 +5317,7 @@ where
             let prepared = tool_exec.prepare_governed_invocations(&requests);
             let mut auths = std::collections::HashMap::new();
             let mut prepared_by_id = std::collections::HashMap::new();
+            let mut gaps = std::collections::HashMap::new();
             for call in &calls {
                 if let Some(invocation) = prepared
                     .iter()
@@ -5287,17 +5326,36 @@ where
                     let descriptor = invocation.effect.clone();
                     prepared_by_id.insert(call.id.clone(), invocation.clone());
                     let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
-                    if let Ok(decision) = crate::ToolPolicy.authorize(
-                        &descriptor,
-                        request_id,
-                        active_mode,
-                        default_timeout.as_secs(),
-                    ) {
-                        auths.insert(call.id.clone(), decision.authorization);
+                    match runtime
+                        .negotiate_tool_authorization(
+                            &descriptor,
+                            &call.input,
+                            request_id,
+                            crate::PermissionContext::default(),
+                            false,
+                            default_timeout.as_secs(),
+                            &prompter,
+                        )
+                        .await
+                    {
+                        Ok(crate::conversation::ToolAuthorizationDecision::Authorized(
+                            decision,
+                        )) => {
+                            auths.insert(call.id.clone(), decision.authorization);
+                        }
+                        Ok(crate::conversation::ToolAuthorizationDecision::Gap(assessment)) => {
+                            gaps.insert(call.id.clone(), assessment);
+                        }
+                        Err(error) => {
+                            gaps.insert(
+                                call.id.clone(),
+                                synthetic_capability_gap(&descriptor, error.to_string()),
+                            );
+                        }
                     }
                 }
             }
-            (auths, prepared_by_id)
+            (auths, prepared_by_id, gaps)
         };
         let governed_host = if delegated_agent_role {
             None
@@ -5318,6 +5376,7 @@ where
                 model_lease.as_deref(),
                 ticket,
                 &tool_authorizations,
+                &capability_gaps,
                 &prepared_tool_invocations,
                 &execution_decision,
                 self.services.tool_execution_plane(),
@@ -6303,6 +6362,8 @@ struct HostGovernedToolContext<'a> {
     ticket: &'a NodeExecutionTicket,
     tool_authorizations:
         &'a std::collections::HashMap<String, harness_contract::tool::ToolExecutionAuthorization>,
+    capability_gaps:
+        &'a std::collections::HashMap<String, harness_contract::policy::CapabilityAssessment>,
     prepared_invocations:
         &'a std::collections::HashMap<String, harness_contract::tool::GovernedToolInvocation>,
     plan_id: &'a str,
@@ -6341,6 +6402,13 @@ impl crate::GovernedToolExecutionContext for HostGovernedToolContext<'_> {
                     task.tool_call_id, task.original_call_index
                 )
             })?;
+            if let Some(assessment) = self.capability_gaps.get(&call.id) {
+                return Ok(capability_gap_outcome(
+                    call,
+                    task.safety_category,
+                    assessment,
+                ));
+            }
             let host = Arc::clone(&self.host);
             let authorization = self.tool_authorizations.get(&call.id).cloned();
             let effect = self
@@ -6530,6 +6598,10 @@ async fn execute_governed_runtime_tool_batch(
         String,
         harness_contract::tool::ToolExecutionAuthorization,
     >,
+    capability_gaps: &std::collections::HashMap<
+        String,
+        harness_contract::policy::CapabilityAssessment,
+    >,
     prepared_invocations: &std::collections::HashMap<
         String,
         harness_contract::tool::GovernedToolInvocation,
@@ -6617,6 +6689,7 @@ async fn execute_governed_runtime_tool_batch(
         model_lease,
         ticket,
         tool_authorizations,
+        capability_gaps,
         prepared_invocations,
         plan_id: &plan.plan_id,
         plan_revision: plan.revision,
@@ -6811,6 +6884,74 @@ fn tool_outcome_message(outcome: crate::RuntimeToolExecutionOutcome) -> Conversa
         outcome.output.or(outcome.error).unwrap_or_default(),
         outcome.status != crate::RuntimeToolExecutionStatus::Executed,
     )
+}
+
+fn capability_gap_outcome(
+    call: &ModelToolCall,
+    category: crate::ToolSafetyCategory,
+    assessment: &harness_contract::policy::CapabilityAssessment,
+) -> crate::RuntimeToolExecutionOutcome {
+    let recoverable = assessment.gap.as_ref().is_some_and(|gap| gap.recoverable);
+    let payload = serde_json::json!({
+        "kind": "capability_gap",
+        "assessment": assessment,
+        "controlled_recovery_available": recoverable,
+        "instruction": if recoverable {
+            "Choose one safe alternative or revise the graph using already-authorized capabilities."
+        } else {
+            "Preserve current evidence and stop retrying this denied capability."
+        },
+    })
+    .to_string();
+    crate::RuntimeToolExecutionOutcome {
+        tool_use_id: call.id.clone(),
+        tool_name: call.name.clone(),
+        status: if recoverable {
+            crate::RuntimeToolExecutionStatus::Executed
+        } else {
+            crate::RuntimeToolExecutionStatus::BlockedPermission
+        },
+        category,
+        output: recoverable.then_some(payload.clone()),
+        error: (!recoverable).then_some(payload),
+        evidence_ref: format!("capability-gap:{}", assessment.assessment_id),
+    }
+}
+
+fn synthetic_capability_gap(
+    descriptor: &harness_contract::tool::ToolEffectDescriptor,
+    reason: String,
+) -> harness_contract::policy::CapabilityAssessment {
+    let fingerprint = format!(
+        "authorization-internal:{}:{}",
+        descriptor.tool_id, descriptor.descriptor_hash
+    );
+    harness_contract::policy::CapabilityAssessment {
+        assessment_id: format!("capability-assessment-{}", uuid::Uuid::new_v4()),
+        capability: descriptor.tool_id.clone(),
+        effect: descriptor.assessment.clone(),
+        requested_scopes: descriptor.scopes.clone(),
+        required_mode: descriptor.required_permission,
+        active_ceiling: crate::PermissionMode::ReadOnly,
+        parent_ceiling: crate::PermissionMode::ReadOnly,
+        risk: harness_contract::policy::RiskLevel::High,
+        path: harness_contract::policy::AuthorizationPath::HardDeny,
+        lease: None,
+        gap: Some(harness_contract::policy::CapabilityGap {
+            fingerprint,
+            kind: harness_contract::policy::CapabilityGapKind::CapabilityUnavailable,
+            capability: descriptor.tool_id.clone(),
+            requested_scopes: descriptor.scopes.clone(),
+            required_mode: descriptor.required_permission,
+            active_ceiling: crate::PermissionMode::ReadOnly,
+            parent_ceiling: crate::PermissionMode::ReadOnly,
+            reason: reason.clone(),
+            safe_alternatives: Vec::new(),
+            recoverable: false,
+        }),
+        evidence_refs: vec![reason],
+        assessed_at_ms: crate::tool_invocation::now_ms(),
+    }
 }
 
 struct TurnSynthesizeBackend<C: ApiClient, T: ToolExecutor> {
@@ -8377,6 +8518,25 @@ fn graph_metadata_effect(
         spawns_process: false,
         mutates_packages: false,
         mutates_system: false,
+        assessment: harness_contract::policy::EffectAssessment {
+            reversibility: if effect_kind == ToolEffectKind::Read {
+                harness_contract::policy::EffectReversibility::Reversible
+            } else {
+                harness_contract::policy::EffectReversibility::Compensatable
+            },
+            externality: if effect_kind == ToolEffectKind::Read {
+                harness_contract::policy::EffectExternality::Internal
+            } else {
+                harness_contract::policy::EffectExternality::Workspace
+            },
+            data_sensitivity: harness_contract::policy::DataClassification::Internal,
+            novelty: harness_contract::policy::EffectNovelty::Routine,
+            blast_radius: if effect_kind == ToolEffectKind::Read {
+                harness_contract::policy::EffectBlastRadius::Item
+            } else {
+                harness_contract::policy::EffectBlastRadius::Workspace
+            },
+        },
     })
 }
 
@@ -10330,6 +10490,7 @@ mod tests {
                 spawns_process: false,
                 mutates_packages: false,
                 mutates_system: false,
+                assessment: harness_contract::policy::EffectAssessment::default(),
             })
         }
 
@@ -10745,6 +10906,7 @@ mod tests {
                     spawns_process: false,
                     mutates_packages: false,
                     mutates_system: false,
+                    assessment: harness_contract::policy::EffectAssessment::default(),
                 }),
                 "write_file" => Some(ToolEffectDescriptor {
                     tool_id: name.to_string(),
@@ -10761,6 +10923,7 @@ mod tests {
                     spawns_process: false,
                     mutates_packages: false,
                     mutates_system: false,
+                    assessment: harness_contract::policy::EffectAssessment::default(),
                 }),
                 _ => None,
             }
@@ -11603,6 +11766,7 @@ mod tests {
                     spawns_process: false,
                     mutates_packages: false,
                     mutates_system: false,
+                    assessment: harness_contract::policy::EffectAssessment::default(),
                 };
                 (
                     call.id.clone(),
@@ -11634,6 +11798,7 @@ mod tests {
             None,
             None,
             &ticket,
+            &std::collections::HashMap::new(),
             &std::collections::HashMap::new(),
             &tool_effects,
             &decision,
@@ -11909,6 +12074,7 @@ mod tests {
                             spawns_process: false,
                             mutates_packages: false,
                             mutates_system: false,
+                            assessment: harness_contract::policy::EffectAssessment::default(),
                         },
                         resource_demand: harness_contract::tool::ResourceDemand::default(),
                         explicit_dependencies: Vec::new(),

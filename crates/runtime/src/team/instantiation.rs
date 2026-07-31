@@ -316,7 +316,7 @@ impl TeamInstantiationService {
                     // it cannot grant a tool absent from the role contract.
                     allowed_tools: role_allowed_tools.clone(),
                     allowed_skills: Vec::new(),
-                    permission_lease: request.permission_lease.clone(),
+                    permission_ceiling: request.permission_ceiling.clone(),
                     model_lease: request.model_lease.clone(),
                     budget_lease: slot_budget_lease(&request, &node_id, slot),
                     managed_invocation: request.managed_invocation.clone(),
@@ -530,8 +530,8 @@ impl TeamInstantiationService {
                     .any(|scope| scope == "network:*")
                 {
                     "builtin/cowd/external-research-synthesis"
-                } else if request.permission_lease == "workspace_write"
-                    || request.permission_lease == "workspace-write"
+                } else if request.permission_ceiling
+                    == harness_contract::policy::PermissionMode::WorkspaceWrite
                 {
                     "builtin/cowd/execute-review"
                 } else {

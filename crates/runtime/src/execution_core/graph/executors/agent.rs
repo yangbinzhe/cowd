@@ -450,7 +450,7 @@ mod tests {
             resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
-            permission_lease: "permission-1".into(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model-1".into(),
             budget_lease: ContextBudgetLeaseRef::new("budget-1", "agent-1", "agent", 1000, 1),
             binding: None,

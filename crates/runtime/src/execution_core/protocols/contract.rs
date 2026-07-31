@@ -4,6 +4,7 @@ use harness_contract::context::EvidenceAccessRef;
 use serde::{Deserialize, Serialize};
 
 use harness_contract::execution_graph::ExecutionParentBinding;
+use harness_contract::policy::PermissionMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -289,7 +290,7 @@ pub struct ProtocolCompileRequest {
     pub evidence_refs: Vec<EvidenceAccessRef>,
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub model_lease: String,
     #[serde(default)]
     pub backend_constraint: Option<String>,
@@ -330,7 +331,7 @@ impl ProtocolCompileRequest {
             evidence_refs: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
-            permission_lease: "read_only".to_string(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "default".to_string(),
             backend_constraint: None,
             budget_lease_id: "protocol-budget".to_string(),

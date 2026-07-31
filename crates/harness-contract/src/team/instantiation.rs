@@ -14,6 +14,7 @@ use crate::agent::{AgentCapability, AgentDefinitionRevisionRef, ValidationError}
 use crate::context::ContextBudgetLeaseRef;
 use crate::core::TaskRisk;
 use crate::execution_graph::ExecutionParentBinding;
+use crate::policy::PermissionMode;
 
 use super::{RoleCardinalityPolicy, TeamTemplateDefinitionId, TeamTemplateRevisionRef};
 
@@ -229,7 +230,7 @@ pub struct TeamInstantiationRequest {
     pub cardinality_overrides: Vec<TeamRoleCardinalityOverride>,
     #[serde(default)]
     pub focus_partition_plans: Vec<FocusPartitionPlan>,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub model_lease: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_lease: Option<ContextBudgetLeaseRef>,
@@ -249,7 +250,6 @@ impl TeamInstantiationRequest {
             ("team.session_id", &self.session_id),
             ("team.mission_id", &self.mission_id),
             ("team.objective", &self.objective),
-            ("team.permission_lease", &self.permission_lease),
             ("team.model_lease", &self.model_lease),
         ] {
             if value.trim().is_empty() {
@@ -595,7 +595,7 @@ mod tests {
             role_binding_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
-            permission_lease: "read_only".to_string(),
+            permission_ceiling: PermissionMode::ReadOnly,
             model_lease: "default".to_string(),
             budget_lease: None,
             managed_invocation: None,

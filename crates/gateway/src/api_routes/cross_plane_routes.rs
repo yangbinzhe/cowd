@@ -8,8 +8,8 @@ use axum::{
     Json, Router,
 };
 use runtime::{
-    CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneDispatchTarget, CrossPlaneGrant,
-    CrossPlaneIdentityBinding, CrossPlanePolicyDecision, PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneDecisionEvidence, CrossPlaneDecisionKind, CrossPlaneDispatchTarget,
+    CrossPlaneGrant, CrossPlaneIdentityBinding, CrossPlanePolicyDecision,
 };
 use serde::{Deserialize, Serialize};
 
@@ -475,7 +475,7 @@ async fn cross_plane_action_execute_handler(
     let mut execution_graph = None;
 
     if mode == "dry_run" {
-        if readiness.decision.decision == PolicyDecisionKind::Allow {
+        if readiness.decision.decision == CrossPlaneDecisionKind::Allow {
             status = "planned";
             dispatch_status = "dry_run";
             audit_result = "dry_run";
@@ -706,7 +706,7 @@ async fn evaluate_action_readiness(
         .as_ref()
         .map(|target| target.blockers.clone())
         .unwrap_or_default();
-    if decision.decision != PolicyDecisionKind::Allow {
+    if decision.decision != CrossPlaneDecisionKind::Allow {
         blockers.push(format!("policy:{}", decision.reason));
     }
     if let Some(readiness) = &platform_readiness {

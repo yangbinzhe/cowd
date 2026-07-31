@@ -211,6 +211,12 @@ pub enum CowdEvent {
     RuntimePolicyDecision {
         summary: RuntimePolicyDecisionSummary,
     },
+    CapabilityAssessed {
+        assessment: harness_contract::policy::CapabilityAssessment,
+    },
+    AuthorizationLeaseTransition {
+        transition: harness_contract::policy::AuthorizationLeaseTransition,
+    },
     ExecutionGraphSummary {
         summary: RuntimeExecutionGraphSummary,
     },

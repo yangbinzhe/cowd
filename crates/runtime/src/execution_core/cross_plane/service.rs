@@ -100,20 +100,20 @@ impl CrossPlaneRuntimeService {
         summary.audit_records = records.len();
         summary.allowed_actions = records
             .iter()
-            .filter(|record| record.decision.decision == crate::PolicyDecisionKind::Allow)
+            .filter(|record| record.decision.decision == crate::CrossPlaneDecisionKind::Allow)
             .count();
         summary.denied_actions = records
             .iter()
-            .filter(|record| record.decision.decision == crate::PolicyDecisionKind::Deny)
+            .filter(|record| record.decision.decision == crate::CrossPlaneDecisionKind::Deny)
             .count();
         summary.approval_required_actions = records
             .iter()
             .filter(|record| {
                 matches!(
                     record.decision.decision,
-                    crate::PolicyDecisionKind::RequireSingleApproval
-                        | crate::PolicyDecisionKind::RequirePersistentGrant
-                        | crate::PolicyDecisionKind::RequireAdminApproval
+                    crate::CrossPlaneDecisionKind::RequireSingleApproval
+                        | crate::CrossPlaneDecisionKind::RequirePersistentGrant
+                        | crate::CrossPlaneDecisionKind::RequireAdminApproval
                 )
             })
             .count();
@@ -911,7 +911,7 @@ mod tests {
         action.risk = harness_contract::policy::CrossPlaneRisk::High;
         let (action, decision, evidence) =
             service.decide_with_connector_context(action, None, Utc::now());
-        assert_eq!(decision.decision, crate::PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, crate::CrossPlaneDecisionKind::Allow);
         assert_eq!(
             decision
                 .matched_grant
@@ -985,7 +985,7 @@ mod tests {
         action.risk = harness_contract::policy::CrossPlaneRisk::High;
         let (action, decision, evidence) =
             service.decide_with_connector_context(action, None, Utc::now());
-        assert_eq!(decision.decision, crate::PolicyDecisionKind::Allow);
+        assert_eq!(decision.decision, crate::CrossPlaneDecisionKind::Allow);
 
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let handles = (0..2)

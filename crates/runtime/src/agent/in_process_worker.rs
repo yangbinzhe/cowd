@@ -221,7 +221,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
         });
-        let policy = permission_policy(&packet.permission_lease, &allowed_tools);
+        let policy = permission_policy(packet.permission_ceiling, &allowed_tools);
         let cancellation = crate::CancellationToken::new();
         let (provider_event_sender, mut provider_event_receiver) = tokio::sync::mpsc::channel(64);
         let progress_runtime = Arc::clone(services.agent_runtime());
@@ -1555,13 +1555,7 @@ fn normalized_relative_parts(value: &str) -> Option<Vec<String>> {
     Some(parts)
 }
 
-fn permission_policy(lease: &str, tools: &BTreeSet<String>) -> PermissionPolicy {
-    let mode = match lease {
-        "danger-full-access" => PermissionMode::DangerFullAccess,
-        "workspace-write" => PermissionMode::WorkspaceWrite,
-        "prompt" => PermissionMode::Prompt,
-        _ => PermissionMode::ReadOnly,
-    };
+fn permission_policy(mode: PermissionMode, tools: &BTreeSet<String>) -> PermissionPolicy {
     tools
         .iter()
         .fold(PermissionPolicy::new(mode), |policy, tool| {
@@ -2073,6 +2067,28 @@ mod tests {
     use harness_contract::agent::AgentCommand;
     use harness_contract::turn::TurnId;
 
+    fn test_authorization_lease(
+        descriptor: &harness_contract::tool::ToolEffectDescriptor,
+        ceiling: PermissionMode,
+        idempotency_key: &str,
+    ) -> harness_contract::policy::AuthorizationLease {
+        harness_contract::policy::AuthorizationLease {
+            lease_id: format!("test-lease:{idempotency_key}"),
+            principal_id: "test-agent".to_string(),
+            parent_lease_id: None,
+            capability: descriptor.tool_id.clone(),
+            scopes: descriptor.scopes.clone(),
+            ceiling,
+            issued_at_ms: 0,
+            expires_at_ms: u64::MAX,
+            max_uses: 1,
+            remaining_uses: 1,
+            idempotency_key: idempotency_key.to_string(),
+            signature: "test-signature".to_string(),
+            status: harness_contract::policy::AuthorizationLeaseStatus::Active,
+        }
+    }
+
     fn scoped_receipt(
         sequence: u64,
         effect_kind: harness_contract::tool::ToolEffectKind,
@@ -2122,7 +2138,7 @@ mod tests {
             resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
-            permission_lease: "read_only".into(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".into(),
             budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
                 "budget", "agent", "agent", 0, 1,
@@ -2504,13 +2520,14 @@ mod tests {
             spawns_process: false,
             mutates_packages: false,
             mutates_system: false,
+            assessment: harness_contract::policy::EffectAssessment::default(),
         })
     }
 
     #[test]
-    fn permission_policy_never_escalates_an_unspecified_lease() {
+    fn read_only_ceiling_never_escalates_for_a_write_tool() {
         let tools = BTreeSet::from(["write_file".to_string()]);
-        let policy = permission_policy("unknown-lease", &tools);
+        let policy = permission_policy(PermissionMode::ReadOnly, &tools);
         assert_eq!(policy.active_mode(), PermissionMode::ReadOnly);
         assert_eq!(
             policy.required_mode_for("write_file"),
@@ -2634,9 +2651,9 @@ mod tests {
     }
 
     #[test]
-    fn permission_policy_uses_the_explicit_packet_lease() {
+    fn permission_policy_uses_the_explicit_packet_ceiling() {
         let tools = BTreeSet::from(["write_file".to_string()]);
-        let policy = permission_policy("workspace-write", &tools);
+        let policy = permission_policy(PermissionMode::WorkspaceWrite, &tools);
         assert_eq!(policy.active_mode(), PermissionMode::WorkspaceWrite);
         assert_eq!(
             policy.required_mode_for("write_file"),
@@ -2724,9 +2741,23 @@ mod tests {
         let authorization = harness_contract::tool::ToolExecutionAuthorization {
             request_id: "absolute-read".into(),
             tool_id: "read_file".into(),
-            descriptor_hash: descriptor.descriptor_hash,
+            descriptor_hash: descriptor.descriptor_hash.clone(),
             scope: descriptor.scopes[0].clone(),
-            permission_lease: "permission:read_only".into(),
+            authorization_lease: harness_contract::policy::AuthorizationLease {
+                lease_id: "permission:read_only".into(),
+                principal_id: "test-agent".into(),
+                parent_lease_id: None,
+                capability: "read_file".into(),
+                scopes: descriptor.scopes.clone(),
+                ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+                issued_at_ms: 0,
+                expires_at_ms: u64::MAX,
+                max_uses: 1,
+                remaining_uses: 1,
+                idempotency_key: "absolute-read".into(),
+                signature: "test-signature".into(),
+                status: harness_contract::policy::AuthorizationLeaseStatus::Active,
+            },
             timeout_lease: "timeout:30".into(),
             idempotency_key: None,
         };
@@ -2774,7 +2805,11 @@ mod tests {
             .authorize(
                 &descriptor,
                 "absolute-agent-read",
-                PermissionMode::ReadOnly,
+                test_authorization_lease(
+                    &descriptor,
+                    PermissionMode::ReadOnly,
+                    "absolute-agent-read",
+                ),
                 30,
             )
             .expect("normalized read authorization")
@@ -2914,7 +2949,11 @@ mod tests {
             .authorize(
                 &descriptor,
                 "agent-checkpoint-test",
-                PermissionMode::WorkspaceWrite,
+                test_authorization_lease(
+                    &descriptor,
+                    PermissionMode::WorkspaceWrite,
+                    "agent-checkpoint-test",
+                ),
                 30,
             )
             .expect("Runtime should authorize its internal checkpoint")
@@ -3007,7 +3046,12 @@ mod tests {
             .registered_tool_effect("read_file", &serde_json::json!({"path": "README.md"}))
             .expect("allow-listed delegated tool must describe its effect");
         let authorization = crate::ToolPolicy
-            .authorize(&descriptor, "agent-test", PermissionMode::ReadOnly, 30)
+            .authorize(
+                &descriptor,
+                "agent-test",
+                test_authorization_lease(&descriptor, PermissionMode::ReadOnly, "agent-test"),
+                30,
+            )
             .expect("read tool should be authorized")
             .authorization;
         assert_eq!(
@@ -3050,7 +3094,7 @@ mod tests {
             resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
-            permission_lease: "read_only".into(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".into(),
             budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
                 "budget", "agent", "agent", 0, 1,
@@ -3285,7 +3329,7 @@ mod tests {
             resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
-            permission_lease: "read_only".into(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".into(),
             budget_lease: harness_contract::context::ContextBudgetLeaseRef::new(
                 "budget", "agent", "agent", 0, 1,

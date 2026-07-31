@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentCapability, AgentDefinitionId, RevisionSelector, ValidationError};
 use crate::mission::ScheduleTrigger;
+use crate::policy::PermissionMode;
 use crate::team::{TeamTemplateDefinitionId, TeamTemplateSelector};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +120,7 @@ pub struct ManagedAgentDefinition {
     pub objective: String,
     #[serde(default)]
     pub acceptance: Vec<String>,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub model_lease: String,
     /// Runtime intersects these direct-Agent grants with the selected
     /// Definition's capability ceiling. An empty list never expands to the
@@ -223,7 +224,6 @@ impl ManagedAgentDefinition {
             ("managed_agent_id", self.managed_agent_id.as_str()),
             ("session_id", self.session_id.as_str()),
             ("objective", self.objective.as_str()),
-            ("permission_lease", self.permission_lease.as_str()),
             ("model_lease", self.model_lease.as_str()),
         ] {
             if value.trim().is_empty() {

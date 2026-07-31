@@ -17,15 +17,30 @@ fn authorize(
     input: &serde_json::Value,
 ) -> ToolExecutionAuthorization {
     let effect = lease.describe_effect(name, input);
+    let idempotency_key = (effect.idempotency == ToolIdempotency::IdempotentWithKey)
+        .then(|| format!("integration:{name}"));
     ToolExecutionAuthorization {
         request_id: format!("integration:{name}"),
         tool_id: name.to_string(),
-        descriptor_hash: effect.descriptor_hash,
+        descriptor_hash: effect.descriptor_hash.clone(),
         scope: effect.scopes[0].clone(),
-        permission_lease: "integration-test".to_string(),
+        authorization_lease: harness_contract::policy::AuthorizationLease {
+            lease_id: "integration-test".to_string(),
+            principal_id: "integration".to_string(),
+            parent_lease_id: None,
+            capability: name.to_string(),
+            scopes: effect.scopes.clone(),
+            ceiling: effect.required_permission,
+            issued_at_ms: 0,
+            expires_at_ms: u64::MAX,
+            max_uses: 1,
+            remaining_uses: 1,
+            idempotency_key: idempotency_key.clone().unwrap_or_default(),
+            signature: "integration-signature".to_string(),
+            status: harness_contract::policy::AuthorizationLeaseStatus::Active,
+        },
         timeout_lease: "timeout:30".to_string(),
-        idempotency_key: (effect.idempotency == ToolIdempotency::IdempotentWithKey)
-            .then(|| format!("integration:{name}")),
+        idempotency_key,
     }
 }
 

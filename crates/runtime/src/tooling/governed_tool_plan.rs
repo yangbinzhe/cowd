@@ -727,6 +727,7 @@ fn unknown_effect(tool_name: &str, input: &Value) -> ToolEffectDescriptor {
         spawns_process: true,
         mutates_packages: false,
         mutates_system: false,
+        assessment: harness_contract::policy::EffectAssessment::default(),
     }
 }
 

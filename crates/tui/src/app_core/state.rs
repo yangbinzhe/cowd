@@ -2975,7 +2975,7 @@ impl TuiState {
                 "role_binding_overrides": [],
                 "cardinality_overrides": [],
                 "focus_partition_plans": [],
-                "permission_lease": "read_only",
+                "permission_ceiling": "read-only",
                 "model_lease": "default",
                 "resource_scopes": [format!("session:{}", self.app.session_id)],
             });

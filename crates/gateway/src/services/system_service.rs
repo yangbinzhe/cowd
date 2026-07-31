@@ -247,13 +247,32 @@ impl SystemService {
             _ => self.with_workspace_root(workspace_root, || {
                 let lease = host.pin_snapshot();
                 let effect = lease.describe_effect(tool_name, &input);
+                let request_id = format!("system-api:{tool_name}");
+                let permission_policy =
+                    runtime::PermissionPolicy::new(runtime::PermissionMode::ReadOnly);
+                let assessment = self.authorization_negotiator.assess(
+                    &permission_policy,
+                    &runtime::AuthorizationRequest {
+                        principal_id: "gateway:system-api".to_string(),
+                        capability: effect.tool_id.clone(),
+                        input: input.to_string(),
+                        idempotency_key: request_id.clone(),
+                        effect: effect.clone(),
+                        parent_ceiling: runtime::PermissionMode::ReadOnly,
+                        parent_lease_id: Some("gateway:system-api".to_string()),
+                        approval_satisfied: false,
+                        recovery_scope: request_id.clone(),
+                        context: runtime::PermissionContext::default(),
+                        safe_alternatives: Vec::new(),
+                    },
+                );
+                let authorization_lease = assessment.lease.clone().ok_or_else(|| {
+                    serde_json::to_string(&assessment).unwrap_or_else(|_| {
+                        "system API capability authorization failed".to_string()
+                    })
+                })?;
                 let decision = runtime::ToolPolicy
-                    .authorize(
-                        &effect,
-                        format!("system-api:{tool_name}"),
-                        runtime::PermissionMode::DangerFullAccess,
-                        300,
-                    )
+                    .authorize(&effect, request_id, authorization_lease, 300)
                     .map_err(|error| error.to_string())?;
                 lease
                     .execute(&decision.authorization, tool_name, &input)

@@ -80,7 +80,7 @@ impl AgentRunEvaluation {
             "provider": returned.provider,
             "model": returned.model,
             "team_id": packet.team_id(),
-            "permission_lease": packet.permission_lease,
+            "permission_ceiling": packet.permission_ceiling,
             "tool_contract_refs": binding.tool_contract_refs,
             "skill_refs": binding.skill_refs,
         }));

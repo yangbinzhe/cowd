@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+harness-contract = { path = "../harness-contract" }
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

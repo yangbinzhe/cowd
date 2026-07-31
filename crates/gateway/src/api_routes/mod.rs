@@ -4212,7 +4212,7 @@ pub(crate) mod tests {
                                 },
                                 "objective": "research architecture and review implementation",
                                 "acceptance": ["summary", "evidence"],
-                                "permission_lease": "workspace-write",
+                                "permission_ceiling": "workspace-write",
                                 "model_lease": "default",
                                 "resource_scopes": ["write:crates/runtime"]
                             }
@@ -13179,7 +13179,7 @@ providers:
             .runtime_services();
         let action = runtime::CrossPlaneAction::new("operator", "channel.send");
         let decision = runtime::CrossPlanePolicyDecision {
-            decision: runtime::PolicyDecisionKind::RequireSingleApproval,
+            decision: runtime::CrossPlaneDecisionKind::RequireSingleApproval,
             reason: "operator approval required".to_string(),
             matched_grant: None,
             required_approval: Some(runtime::GrantType::SingleUse),
@@ -13282,7 +13282,7 @@ providers:
         let state = test_state();
         let action = runtime::CrossPlaneAction::new("operator", "channel.send");
         let decision = runtime::CrossPlanePolicyDecision {
-            decision: runtime::PolicyDecisionKind::Allow,
+            decision: runtime::CrossPlaneDecisionKind::Allow,
             reason: "test grant".to_string(),
             matched_grant: None,
             required_approval: None,

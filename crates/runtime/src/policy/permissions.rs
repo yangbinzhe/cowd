@@ -1,34 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::RuntimePermissionRuleConfig;
 
-/// Permission level assigned to a tool invocation or runtime session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PermissionMode {
-    ReadOnly,
-    WorkspaceWrite,
-    DangerFullAccess,
-    Prompt,
-    Allow,
-}
-
-impl PermissionMode {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read-only",
-            Self::WorkspaceWrite => "workspace-write",
-            Self::DangerFullAccess => "danger-full-access",
-            Self::Prompt => "prompt",
-            Self::Allow => "allow",
-        }
-    }
-}
+pub use harness_contract::policy::PermissionMode;
 
 /// Hook-provided override applied before standard permission evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +109,20 @@ impl Clone for SharedPrompter {
 pub enum PermissionOutcome {
     Allow,
     Deny { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionPolicyRoute {
+    Allow {
+        standing_grant: bool,
+        reason: String,
+    },
+    Ask {
+        reason: String,
+    },
+    HardDeny {
+        reason: String,
+    },
 }
 
 /// Evaluates permission mode requirements plus allow/deny/ask rules.
@@ -247,113 +238,97 @@ impl PermissionPolicy {
         context: &PermissionContext,
         prompter: Option<&mut dyn PermissionPrompter>,
     ) -> PermissionOutcome {
+        match self.route_required_with_context(tool_name, input, required_mode, context) {
+            PermissionPolicyRoute::Allow { .. } => PermissionOutcome::Allow,
+            PermissionPolicyRoute::Ask { reason } => Self::prompt_or_deny(
+                tool_name,
+                input,
+                self.active_mode(),
+                required_mode,
+                Some(reason),
+                prompter,
+            ),
+            PermissionPolicyRoute::HardDeny { reason } => PermissionOutcome::Deny { reason },
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn route_required_with_context(
+        &self,
+        tool_name: &str,
+        input: &str,
+        required_mode: PermissionMode,
+        context: &PermissionContext,
+    ) -> PermissionPolicyRoute {
         if let Some(rule) = Self::find_matching_rule(&self.deny_rules, tool_name, input) {
-            return PermissionOutcome::Deny {
+            return PermissionPolicyRoute::HardDeny {
                 reason: format!(
                     "Permission to use {tool_name} has been denied by rule '{}'",
                     rule.raw
                 ),
             };
         }
+        if context.override_decision() == Some(PermissionOverride::Deny) {
+            return PermissionPolicyRoute::HardDeny {
+                reason: context.override_reason().map_or_else(
+                    || format!("tool '{tool_name}' denied by hook"),
+                    ToOwned::to_owned,
+                ),
+            };
+        }
 
         let current_mode = self.active_mode();
-        let ask_rule = Self::find_matching_rule(&self.ask_rules, tool_name, input);
-        let allow_rule = Self::find_matching_rule(&self.allow_rules, tool_name, input);
-
-        match context.override_decision() {
-            Some(PermissionOverride::Deny) => {
-                return PermissionOutcome::Deny {
-                    reason: context.override_reason().map_or_else(
-                        || format!("tool '{tool_name}' denied by hook"),
-                        ToOwned::to_owned,
-                    ),
-                };
-            }
-            Some(PermissionOverride::Ask) => {
-                let reason = context.override_reason().map_or_else(
+        if let Some(rule) = Self::find_matching_rule(&self.ask_rules, tool_name, input) {
+            return PermissionPolicyRoute::Ask {
+                reason: format!(
+                    "tool '{tool_name}' requires approval due to ask rule '{}'",
+                    rule.raw
+                ),
+            };
+        }
+        if context.override_decision() == Some(PermissionOverride::Ask) {
+            return PermissionPolicyRoute::Ask {
+                reason: context.override_reason().map_or_else(
                     || format!("tool '{tool_name}' requires approval due to hook guidance"),
                     ToOwned::to_owned,
-                );
-                return Self::prompt_or_deny(
-                    tool_name,
-                    input,
-                    current_mode,
-                    required_mode,
-                    Some(reason),
-                    prompter,
-                );
-            }
-            Some(PermissionOverride::Allow) => {
-                if let Some(rule) = ask_rule {
-                    let reason = format!(
-                        "tool '{tool_name}' requires approval due to ask rule '{}'",
-                        rule.raw
-                    );
-                    return Self::prompt_or_deny(
-                        tool_name,
-                        input,
-                        current_mode,
-                        required_mode,
-                        Some(reason),
-                        prompter,
-                    );
-                }
-                if allow_rule.is_some()
-                    || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
-                {
-                    return PermissionOutcome::Allow;
-                }
-            }
-            None => {}
+                ),
+            };
         }
 
-        if let Some(rule) = ask_rule {
-            let reason = format!(
-                "tool '{tool_name}' requires approval due to ask rule '{}'",
-                rule.raw
-            );
-            return Self::prompt_or_deny(
-                tool_name,
-                input,
-                current_mode,
-                required_mode,
-                Some(reason),
-                prompter,
-            );
-        }
-
-        if allow_rule.is_some()
+        let standing_grant =
+            Self::find_matching_rule(&self.allow_rules, tool_name, input).is_some();
+        if standing_grant
             || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
+            || current_mode.permits(required_mode)
         {
-            return PermissionOutcome::Allow;
+            return PermissionPolicyRoute::Allow {
+                standing_grant,
+                reason: if standing_grant {
+                    "matching standing scoped grant".to_string()
+                } else {
+                    "active policy ceiling permits assessed effect".to_string()
+                },
+            };
         }
 
         if current_mode == PermissionMode::Prompt
             || (current_mode == PermissionMode::WorkspaceWrite
                 && required_mode == PermissionMode::DangerFullAccess)
         {
-            let reason = Some(format!(
-                "tool '{tool_name}' requires approval to escalate from {} to {}",
-                current_mode.as_str(),
-                required_mode.as_str()
-            ));
-            return Self::prompt_or_deny(
-                tool_name,
-                input,
-                current_mode,
-                required_mode,
-                reason,
-                prompter,
-            );
+            return PermissionPolicyRoute::Ask {
+                reason: format!(
+                    "tool '{tool_name}' requires approval to escalate from {} to {}",
+                    current_mode.as_str(),
+                    required_mode.as_str()
+                ),
+            };
         }
 
-        PermissionOutcome::Deny {
+        PermissionPolicyRoute::Ask {
             reason: format!(
-                "tool '{tool_name}' requires {} permission; current mode is {}",
-                required_mode.as_str(),
-                current_mode.as_str()
+                "tool '{tool_name}' requires a scoped elevation from {} to {}",
+                current_mode.as_str(),
+                required_mode.as_str()
             ),
         }
     }
@@ -539,7 +514,7 @@ fn extract_permission_subject(input: &str) -> Option<String> {
 mod tests {
     use super::{
         PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
-        PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+        PermissionPolicyRoute, PermissionPromptDecision, PermissionPrompter, PermissionRequest,
     };
     use crate::config::RuntimePermissionRuleConfig;
 
@@ -629,18 +604,28 @@ mod tests {
     }
 
     #[test]
-    fn denies_read_only_escalations_without_prompt() {
+    fn read_only_escalations_route_to_approval_instead_of_hard_deny() {
         let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
             .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
             .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
 
         assert!(matches!(
-            policy.authorize("write_file", "{}", None),
-            PermissionOutcome::Deny { reason } if reason.contains("requires workspace-write permission")
+            policy.route_required_with_context(
+                "write_file",
+                "{}",
+                PermissionMode::WorkspaceWrite,
+                &PermissionContext::default(),
+            ),
+            PermissionPolicyRoute::Ask { .. }
         ));
         assert!(matches!(
-            policy.authorize("bash", "{}", None),
-            PermissionOutcome::Deny { reason } if reason.contains("requires danger-full-access permission")
+            policy.route_required_with_context(
+                "bash",
+                "{}",
+                PermissionMode::DangerFullAccess,
+                &PermissionContext::default(),
+            ),
+            PermissionPolicyRoute::Ask { .. }
         ));
     }
 
@@ -756,6 +741,29 @@ mod tests {
         );
 
         assert_eq!(outcome, PermissionOutcome::Allow);
+        assert_eq!(prompter.seen.len(), 1);
+    }
+
+    #[test]
+    fn hook_allow_cannot_widen_the_active_permission_ceiling() {
+        let policy = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+        let context = PermissionContext::new(
+            Some(PermissionOverride::Allow),
+            Some("hook recommended the action".to_string()),
+        );
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: false,
+        };
+
+        let outcome = policy.authorize_with_context(
+            "write_file",
+            r#"{"path":"src/lib.rs"}"#,
+            &context,
+            Some(&mut prompter),
+        );
+        assert!(matches!(outcome, PermissionOutcome::Deny { .. }));
         assert_eq!(prompter.seen.len(), 1);
     }
 

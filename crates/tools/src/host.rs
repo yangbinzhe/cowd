@@ -341,13 +341,21 @@ impl ToolHostLease {
                 requested: canonical_id,
             });
         }
-        if authorization.permission_lease.trim().is_empty()
+        let effective = self.describe_effect(&canonical_id, input);
+        let lease = &authorization.authorization_lease;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        if lease.signature.trim().is_empty()
             || authorization.timeout_lease.trim().is_empty()
+            || !lease.is_active_at(now_ms)
+            || !lease.permits(&canonical_id, effective.required_permission)
         {
             return Err(ToolHostError::InvalidLease);
         }
 
-        let effective = self.describe_effect(&canonical_id, input);
         if authorization.descriptor_hash != effective.descriptor_hash {
             return Err(ToolHostError::EffectEscalated {
                 authorized_hash: authorization.descriptor_hash.clone(),
@@ -357,6 +365,13 @@ impl ToolHostLease {
         if !effective.scopes.contains(&authorization.scope) {
             return Err(ToolHostError::ScopeNotAuthorized);
         }
+        if !effective
+            .scopes
+            .iter()
+            .all(|scope| lease.scopes.contains(scope))
+        {
+            return Err(ToolHostError::ScopeNotAuthorized);
+        }
         if effective.idempotency == ToolIdempotency::IdempotentWithKey
             && authorization
                 .idempotency_key
@@ -364,6 +379,13 @@ impl ToolHostLease {
                 .is_none_or(str::is_empty)
         {
             return Err(ToolHostError::MissingIdempotencyKey);
+        }
+        if authorization
+            .idempotency_key
+            .as_deref()
+            .is_some_and(|key| !lease.idempotency_key.is_empty() && lease.idempotency_key != key)
+        {
+            return Err(ToolHostError::InvalidLease);
         }
         if !self.snapshot.catalog.contains(&canonical_id) {
             return Err(ToolHostError::ToolNotFound(canonical_id));
@@ -563,14 +585,29 @@ mod tests {
         descriptor: &ToolEffectDescriptor,
         idempotency_key: Option<&str>,
     ) -> ToolExecutionAuthorization {
+        let idempotency_key = idempotency_key.map(str::to_string);
         ToolExecutionAuthorization {
             request_id: "request".to_string(),
             tool_id: descriptor.tool_id.clone(),
             descriptor_hash: descriptor.descriptor_hash.clone(),
             scope: descriptor.scopes[0].clone(),
-            permission_lease: "permission-lease".to_string(),
+            authorization_lease: harness_contract::policy::AuthorizationLease {
+                lease_id: "permission-lease".to_string(),
+                principal_id: "test".to_string(),
+                parent_lease_id: None,
+                capability: descriptor.tool_id.clone(),
+                scopes: descriptor.scopes.clone(),
+                ceiling: descriptor.required_permission,
+                issued_at_ms: 0,
+                expires_at_ms: u64::MAX,
+                max_uses: 1,
+                remaining_uses: 1,
+                idempotency_key: idempotency_key.clone().unwrap_or_default(),
+                signature: "test-signature".to_string(),
+                status: harness_contract::policy::AuthorizationLeaseStatus::Active,
+            },
             timeout_lease: "timeout-lease".to_string(),
-            idempotency_key: idempotency_key.map(str::to_string),
+            idempotency_key,
         }
     }
 

@@ -37,7 +37,7 @@ fn definition() -> ManagedAgentDefinition {
         session_id: "managed-session".to_string(),
         objective: "process accepted source event".to_string(),
         acceptance: vec!["event evidence".to_string()],
-        permission_lease: "read_only".to_string(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         model_lease: "default".to_string(),
         granted_capabilities: vec![AgentCapability::Read],
         allowed_tool_contract_refs: Vec::new(),

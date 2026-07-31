@@ -249,7 +249,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
             resource_scopes: self.request.resource_scopes.clone(),
             allowed_tools,
             allowed_skills: self.request.allowed_skills.clone(),
-            permission_lease: self.request.permission_lease.clone(),
+            permission_ceiling: self.request.permission_ceiling.clone(),
             model_lease: self.request.model_lease.clone(),
             budget_lease: ContextBudgetLeaseRef::new(
                 format!("{}:{node_id}", self.request.budget_lease_id),

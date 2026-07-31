@@ -36,7 +36,7 @@ fn definition(trigger: ManagedAgentTrigger) -> ManagedAgentDefinition {
         session_id: "managed-session".to_string(),
         objective: "collect a bounded evidence update".to_string(),
         acceptance: vec!["evidence".to_string()],
-        permission_lease: "read_only".to_string(),
+        permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         model_lease: "default".to_string(),
         granted_capabilities: vec![AgentCapability::Read],
         allowed_tool_contract_refs: Vec::new(),

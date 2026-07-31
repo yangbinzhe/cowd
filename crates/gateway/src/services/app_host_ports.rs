@@ -24,7 +24,7 @@ use harness_contract::{
 };
 use runtime::{
     ApprovalApplicationSource, ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy,
-    CrossPlaneAction, CrossPlaneDispatchTarget, IdentityTrust, PolicyDecisionKind,
+    CrossPlaneAction, CrossPlaneDecisionKind, CrossPlaneDispatchTarget, IdentityTrust,
     SubmitGlobalApprovalRequest, VerifiedPrincipal,
 };
 use serde::Deserialize;
@@ -1639,7 +1639,7 @@ impl CrossPlanePort for GatewayAppHostBinding {
                 ));
             }
             (existing, true)
-        } else if decision.decision == PolicyDecisionKind::Allow {
+        } else if decision.decision == CrossPlaneDecisionKind::Allow {
             let target =
                 CrossPlaneDispatchTarget::from_action(&action, Some(&platform), Some(&operation))
                     .ok_or_else(|| {

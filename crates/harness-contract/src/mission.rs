@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::policy::PermissionMode;
 use crate::reality::EvidenceRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +104,7 @@ pub struct MissionSchedule {
     pub objective: String,
     pub trigger: ScheduleTrigger,
     pub autonomy_profile: String,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub priority: u8,
     pub next_at_ms: u64,
     pub status: MissionScheduleStatus,
@@ -118,7 +119,7 @@ pub struct MissionScheduleFire {
     pub correlation_id: String,
     pub target_session_id: String,
     pub objective: String,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub priority: u8,
     pub status: String,
     pub graph_id: Option<String>,
@@ -447,7 +448,7 @@ mod tests {
             objective: "inspect nightly evidence".to_string(),
             trigger: ScheduleTrigger::Interval { every_ms: 60_000 },
             autonomy_profile: "assisted".to_string(),
-            permission_lease: "read_only".to_string(),
+            permission_ceiling: PermissionMode::ReadOnly,
             priority: 64,
             next_at_ms: 123,
             status: MissionScheduleStatus::Scheduled,

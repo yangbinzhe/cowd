@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::agent::definition::validate_reference;
 use crate::agent::ValidationError;
+use crate::policy::PermissionMode;
 use crate::reality::EvidenceRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,7 +198,7 @@ pub struct EvaluationScenarioSpec {
     /// whole-workspace fallback.
     #[serde(default)]
     pub resource_scopes: Vec<String>,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub model_lease: String,
 }
 
@@ -223,10 +224,6 @@ impl EvaluationScenarioSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
         validate_reference("evaluation.scenario.scenario_ref", &self.scenario_ref)?;
         validate_reference("evaluation.scenario.objective", &self.objective)?;
-        validate_reference(
-            "evaluation.scenario.permission_lease",
-            &self.permission_lease,
-        )?;
         validate_reference("evaluation.scenario.model_lease", &self.model_lease)?;
         if self.acceptance.is_empty() {
             return Err(ValidationError::MissingField {

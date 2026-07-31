@@ -480,6 +480,11 @@ impl ExecutionLiveStore {
                     false
                 }
             }
+            CowdEvent::CapabilityAssessed { .. }
+            | CowdEvent::AuthorizationLeaseTransition { .. } => {
+                record.touch();
+                true
+            }
             CowdEvent::ContextWindow(window_tokens) => {
                 let mut usage = record.live.context_usage.clone().unwrap_or_default();
                 usage.window_tokens = Some(*window_tokens);

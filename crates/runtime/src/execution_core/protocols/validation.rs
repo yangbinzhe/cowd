@@ -187,7 +187,7 @@ pub fn validate_protocol_request(
         ("graph_id", request.graph_id.as_str()),
         ("session_id", request.session_id.as_str()),
         ("objective", request.objective.as_str()),
-        ("permission_lease", request.permission_lease.as_str()),
+        ("permission_ceiling", request.permission_ceiling.as_str()),
         ("model_lease", request.model_lease.as_str()),
         ("budget_lease_id", request.budget_lease_id.as_str()),
     ] {
@@ -492,7 +492,7 @@ fn validate_intent_node(
         || intent.expected_graph_revision != 0
         || intent.attempt != 1
         || intent.idempotency_key != node.idempotency_key
-        || intent.permission_lease != request.permission_lease
+        || intent.permission_ceiling != request.permission_ceiling
         || intent.model_lease != request.model_lease
         || intent.context_refs != request.context_refs
         || intent.evidence_refs != request.evidence_refs

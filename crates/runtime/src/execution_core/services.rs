@@ -2848,7 +2848,7 @@ impl RuntimeServices {
             resource_scopes: Vec::new(),
             allowed_tools: scenario.allowed_tools.clone(),
             allowed_skills: scenario.allowed_skills.clone(),
-            permission_lease: scenario.permission_lease.clone(),
+            permission_ceiling: scenario.permission_ceiling.clone(),
             model_lease: scenario.model_lease.clone(),
             budget_lease: ContextBudgetLeaseRef::new(
                 format!("evolution-eval-budget:{run_id}"),
@@ -3298,7 +3298,7 @@ impl RuntimeServices {
                     format!("schedule-fire:{}", fire.fire_id),
                 )],
                 context_budget_lease: None,
-                permission_lease: fire.permission_lease.clone(),
+                permission_ceiling: fire.permission_ceiling.clone(),
                 deadline_at_ms: None,
                 priority: fire.priority,
                 correlation_id: fire.correlation_id.clone(),
@@ -3842,7 +3842,7 @@ impl RuntimeServices {
                     resource_scopes: definition.resource_scopes.clone(),
                     allowed_tools: definition.allowed_tool_contract_refs.clone(),
                     allowed_skills: definition.allowed_skill_refs.clone(),
-                    permission_lease: definition.permission_lease.clone(),
+                    permission_ceiling: definition.permission_ceiling.clone(),
                     model_lease: definition.model_lease.clone(),
                     budget_lease: ContextBudgetLeaseRef::new(
                         format!("managed-budget:{run_id}"),
@@ -3982,7 +3982,7 @@ impl RuntimeServices {
                     role_binding_overrides: Vec::new(),
                     cardinality_overrides: Vec::new(),
                     focus_partition_plans: Vec::new(),
-                    permission_lease: definition.permission_lease.clone(),
+                    permission_ceiling: definition.permission_ceiling.clone(),
                     model_lease: definition.model_lease.clone(),
                     budget_lease: None,
                     managed_invocation: Some(
@@ -4534,7 +4534,7 @@ fn evolution_team_request(
         role_binding_overrides: Vec::new(),
         cardinality_overrides: Vec::new(),
         focus_partition_plans: Vec::new(),
-        permission_lease: scenario.permission_lease.clone(),
+        permission_ceiling: scenario.permission_ceiling.clone(),
         model_lease: scenario.model_lease.clone(),
         budget_lease: Some(ContextBudgetLeaseRef::new(
             format!("evolution-eval-budget:{identity}"),
@@ -5957,7 +5957,7 @@ mod tests {
                     objective: "check the durable schedule path".to_string(),
                     trigger: ScheduleTrigger::At { at_ms: due_at_ms },
                     autonomy_profile: "assisted".to_string(),
-                    permission_lease: "read_only".to_string(),
+                    permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
                     priority: 64,
                 },
                 due_at_ms,
@@ -6301,7 +6301,7 @@ mod tests {
             resource_scopes: Vec::new(),
             allowed_tools: Vec::new(),
             allowed_skills: Vec::new(),
-            permission_lease: "read_only".into(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "fast".into(),
             budget_lease: ContextBudgetLeaseRef::new(
                 "agent-runtime-budget",
@@ -6437,7 +6437,7 @@ mod tests {
                 resource_scopes: vec![format!("read:binding-domain-{index}")],
                 allowed_tools: vec!["read_file".to_string()],
                 allowed_skills: Vec::new(),
-                permission_lease: "read_only".to_string(),
+                permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
                 model_lease: "fast".to_string(),
                 budget_lease: ContextBudgetLeaseRef::new(
                     format!("binding-budget-{index}"),
@@ -6732,10 +6732,10 @@ mod tests {
             role_binding_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
-            permission_lease: if template_id == "cowd/execute-review" {
-                "workspace-write".to_string()
+            permission_ceiling: if template_id == "cowd/execute-review" {
+                harness_contract::policy::PermissionMode::WorkspaceWrite
             } else {
-                "read_only".to_string()
+                harness_contract::policy::PermissionMode::ReadOnly
             },
             model_lease: model_lease.to_string(),
             budget_lease: None,

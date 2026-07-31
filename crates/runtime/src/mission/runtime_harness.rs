@@ -790,6 +790,7 @@ mod tests {
                     spawns_process: false,
                     mutates_packages: false,
                     mutates_system: false,
+                    assessment: harness_contract::policy::EffectAssessment::default(),
                 },
                 resource_demand: harness_contract::tool::ResourceDemand::default(),
                 explicit_dependencies: Vec::new(),

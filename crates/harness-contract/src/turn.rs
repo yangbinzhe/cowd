@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
+use crate::policy::PermissionMode;
 use crate::reality::EvidenceRef;
 
 /// Convert a non-content execution marker into a strongly typed handoff
@@ -210,11 +211,11 @@ pub struct SessionHandoff {
     #[serde(default)]
     pub evidence_refs: Vec<EvidenceAccessRef>,
     /// The budget lease that grants this handoff's context allocation. It is
-    /// separate from `permission_lease`, which remains the execution-policy
+    /// separate from `permission_ceiling`, which remains the execution-policy
     /// lease used to approve actions in the target Session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_budget_lease: Option<ContextBudgetLeaseRef>,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_at_ms: Option<u64>,
     pub priority: u8,

@@ -6710,11 +6710,30 @@ UU conflicted.rs",
             let descriptor = executor
                 .registered_tool_effect(tool_name, &value)
                 .expect("registered tool should describe its effect");
+            let request_id = format!("gateway-mcp-test:{tool_name}");
+            let negotiator = runtime::AuthorizationNegotiator::new();
+            let policy = runtime::PermissionPolicy::new(PermissionMode::DangerFullAccess);
+            let assessment = negotiator.assess(
+                &policy,
+                &runtime::AuthorizationRequest {
+                    principal_id: "test:gateway-mcp".to_string(),
+                    capability: descriptor.tool_id.clone(),
+                    input: value.to_string(),
+                    idempotency_key: request_id.clone(),
+                    effect: descriptor.clone(),
+                    parent_ceiling: PermissionMode::DangerFullAccess,
+                    parent_lease_id: None,
+                    approval_satisfied: true,
+                    recovery_scope: request_id.clone(),
+                    context: runtime::PermissionContext::default(),
+                    safe_alternatives: Vec::new(),
+                },
+            );
             let authorization = runtime::ToolPolicy
                 .authorize(
                     &descriptor,
-                    format!("gateway-mcp-test:{tool_name}"),
-                    PermissionMode::DangerFullAccess,
+                    request_id,
+                    assessment.lease.expect("test authorization lease"),
                     30,
                 )
                 .expect("test permission should authorize tool")

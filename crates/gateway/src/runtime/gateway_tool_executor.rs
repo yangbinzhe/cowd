@@ -1823,11 +1823,29 @@ mod tests {
             invocation.effect.required_permission,
             harness_contract::tool::ToolPermissionMode::ReadOnly
         );
+        let negotiator = runtime::AuthorizationNegotiator::new();
+        let policy = runtime::PermissionPolicy::new(runtime::PermissionMode::WorkspaceWrite);
+        let assessment = negotiator.assess(
+            &policy,
+            &runtime::AuthorizationRequest {
+                principal_id: "test:web-search".to_string(),
+                capability: invocation.effect.tool_id.clone(),
+                input: invocation.intent.normalized_input.to_string(),
+                idempotency_key: "web-search-request".to_string(),
+                effect: invocation.effect.clone(),
+                parent_ceiling: runtime::PermissionMode::WorkspaceWrite,
+                parent_lease_id: None,
+                approval_satisfied: false,
+                recovery_scope: "web-search-request".to_string(),
+                context: runtime::PermissionContext::default(),
+                safe_alternatives: Vec::new(),
+            },
+        );
         let decision = runtime::ToolPolicy
             .authorize(
                 &invocation.effect,
                 "web-search-request",
-                runtime::PermissionMode::WorkspaceWrite,
+                assessment.lease.expect("read-only web search lease"),
                 60,
             )
             .expect("read-only web search must receive a Runtime authorization");

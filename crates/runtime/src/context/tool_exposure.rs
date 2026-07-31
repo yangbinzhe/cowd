@@ -197,7 +197,9 @@ fn permission_rank(permission: ToolPermissionMode) -> u8 {
     match permission {
         ToolPermissionMode::ReadOnly => 0,
         ToolPermissionMode::WorkspaceWrite => 1,
-        ToolPermissionMode::DangerFullAccess => 2,
+        ToolPermissionMode::DangerFullAccess
+        | ToolPermissionMode::Prompt
+        | ToolPermissionMode::Allow => 2,
     }
 }
 

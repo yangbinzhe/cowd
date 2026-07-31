@@ -2,28 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum PermissionMode {
-    ReadOnly,
-    WorkspaceWrite,
-    DangerFullAccess,
-    Prompt,
-    Allow,
-}
-
-impl PermissionMode {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read-only",
-            Self::WorkspaceWrite => "workspace-write",
-            Self::DangerFullAccess => "danger-full-access",
-            Self::Prompt => "prompt",
-            Self::Allow => "allow",
-        }
-    }
-}
+pub use harness_contract::policy::PermissionMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionPolicy {

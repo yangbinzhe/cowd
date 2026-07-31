@@ -191,7 +191,7 @@ mod tests {
             resource_scopes: vec!["read:src".to_string()],
             allowed_tools: vec!["read_file".to_string()],
             allowed_skills: Vec::new(),
-            permission_lease: "read_only".to_string(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "model".to_string(),
             budget_lease: ContextBudgetLeaseRef::new("budget", "agent", "team", 100, 1),
             binding: None,

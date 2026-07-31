@@ -103,7 +103,7 @@ impl MissionCommandInterpreter {
                     context_lens: Vec::new(),
                     evidence_refs: Vec::new(),
                     context_budget_lease: None,
-                    permission_lease: "session-dispatch-default".to_string(),
+                    permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
                     deadline_at_ms: None,
                     priority: 128,
                     correlation_id: format!("correlation-{}", uuid::Uuid::new_v4()),

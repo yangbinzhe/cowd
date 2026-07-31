@@ -1,6 +1,6 @@
 //! Tool contracts for the Cowd AI harness.
 
-use crate::policy::PermissionScope;
+use crate::policy::{AuthorizationLease, EffectAssessment, PermissionMode, PermissionScope};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +119,8 @@ pub struct ToolEffectDescriptor {
     pub spawns_process: bool,
     pub mutates_packages: bool,
     pub mutates_system: bool,
+    #[serde(default)]
+    pub assessment: EffectAssessment,
 }
 
 /// Declarative resolver selected when a tool is registered.
@@ -221,29 +223,12 @@ pub struct ToolExecutionAuthorization {
     pub tool_id: String,
     pub descriptor_hash: String,
     pub scope: PermissionScope,
-    pub permission_lease: String,
+    pub authorization_lease: AuthorizationLease,
     pub timeout_lease: String,
     pub idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolPermissionMode {
-    ReadOnly,
-    WorkspaceWrite,
-    DangerFullAccess,
-}
-
-impl ToolPermissionMode {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "read_only",
-            Self::WorkspaceWrite => "workspace_write",
-            Self::DangerFullAccess => "danger_full_access",
-        }
-    }
-}
+pub type ToolPermissionMode = PermissionMode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -354,7 +339,10 @@ impl ToolExecutionReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{PermissionOperation, PermissionResource};
+    use crate::policy::{
+        AuthorizationLease, AuthorizationLeaseStatus, EffectAssessment, PermissionOperation,
+        PermissionResource,
+    };
 
     #[test]
     fn activation_receipt_exposes_only_accepted_canonical_ids() {
@@ -397,13 +385,28 @@ mod tests {
             spawns_process: false,
             mutates_packages: false,
             mutates_system: false,
+            assessment: EffectAssessment::default(),
         };
         let authorization = ToolExecutionAuthorization {
             request_id: "request-1".to_string(),
             tool_id: descriptor.tool_id.clone(),
             descriptor_hash: descriptor.descriptor_hash.clone(),
-            scope,
-            permission_lease: "permission-1".to_string(),
+            scope: scope.clone(),
+            authorization_lease: AuthorizationLease {
+                lease_id: "permission-1".to_string(),
+                principal_id: "test".to_string(),
+                parent_lease_id: None,
+                capability: descriptor.tool_id.clone(),
+                scopes: vec![scope.clone()],
+                ceiling: ToolPermissionMode::WorkspaceWrite,
+                issued_at_ms: 0,
+                expires_at_ms: u64::MAX,
+                max_uses: 1,
+                remaining_uses: 1,
+                idempotency_key: "write-1".to_string(),
+                signature: "test-signature".to_string(),
+                status: AuthorizationLeaseStatus::Active,
+            },
             timeout_lease: "timeout-1".to_string(),
             idempotency_key: Some("write-1".to_string()),
         };

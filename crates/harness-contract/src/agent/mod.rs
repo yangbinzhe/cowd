@@ -6,6 +6,7 @@
 use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
 use crate::core::{ExecutionPattern, TaskRisk};
 use crate::execution::{ExecutionIdentity, ExecutionIdentityKind};
+use crate::policy::PermissionMode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -75,7 +76,7 @@ pub struct AgentTaskIntent {
     pub resource_scopes: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub model_lease: String,
     pub budget_lease: ContextBudgetLeaseRef,
     /// Runtime-issued lifecycle fence for a Managed Agent invocation.  The
@@ -229,7 +230,7 @@ pub struct AgentTaskPacket {
     pub resource_scopes: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub allowed_skills: Vec<String>,
-    pub permission_lease: String,
+    pub permission_ceiling: PermissionMode,
     pub model_lease: String,
     pub budget_lease: ContextBudgetLeaseRef,
     /// The exact Runtime-compiled execution Binding. Runtime refuses to
