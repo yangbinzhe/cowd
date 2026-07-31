@@ -1,21 +1,9 @@
 #[must_use]
 pub fn runtime_orchestration_actions() -> Vec<&'static str> {
-    vec![
-        "plan_only",
-        "request_team",
-        "request_subagent",
-        "request_verification",
-        "request_parallel_tools",
-        "request_rewoo_evidence",
-        "request_deliberation",
-        "request_reflexion_retry",
-        "request_background_review",
-        "request_risk_gate",
-        "dispatch_session",
-    ]
+    vec!["inspect", "propose", "revise", "control"]
 }
 
 #[must_use]
 pub fn runtime_orchestration_action_guidance() -> &'static str {
-    "Use runtime_capabilities for read-only runtime planning. Use runtime_orchestrate only for controlled stateful runtime orchestration. Executable lifecycle actions create runtime-owned team/subagent/verification/background/session receipts; deliberation/reflexion return strategy packets for the model to continue; risk_gate returns an approval packet."
+    "Use runtime_orchestrate(operation=inspect) for a bounded state snapshot. For state changes, propose or revise only semantic recipes (agent, team, review, synthesis, session_dispatch) and dependencies; Runtime resolves executors, definitions, leases, approvals and physical graph identities. Use control with an exact graph revision for pause, resume, or scoped cancellation."
 }

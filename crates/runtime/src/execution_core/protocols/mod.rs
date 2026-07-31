@@ -136,6 +136,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
                     harness_contract::execution_graph::ExecutionServiceClass::Interactive
                 },
                 parent_execution: request.parent_execution.clone(),
+                orchestration: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 node_statuses: BTreeMap::new(),

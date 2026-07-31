@@ -70,6 +70,8 @@ fn request(template_id: &str, mission_id: &str) -> TeamInstantiationRequest {
             "read:crates/runtime".to_string(),
             "session:session-team-instantiation".to_string(),
         ],
+        upstream_evidence_refs: Vec::new(),
+        upstream_artifact_refs: Vec::new(),
     }
 }
 

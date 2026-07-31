@@ -248,8 +248,20 @@ impl SystemService {
                 let lease = host.pin_snapshot();
                 let effect = lease.describe_effect(tool_name, &input);
                 let request_id = format!("system-api:{tool_name}");
-                let permission_policy =
-                    runtime::PermissionPolicy::new(runtime::PermissionMode::ReadOnly);
+                let permission_ceiling = match effect.required_permission {
+                    harness_contract::tool::ToolPermissionMode::ReadOnly => {
+                        runtime::PermissionMode::ReadOnly
+                    }
+                    harness_contract::tool::ToolPermissionMode::WorkspaceWrite => {
+                        runtime::PermissionMode::WorkspaceWrite
+                    }
+                    harness_contract::tool::ToolPermissionMode::DangerFullAccess
+                    | harness_contract::tool::ToolPermissionMode::Prompt
+                    | harness_contract::tool::ToolPermissionMode::Allow => {
+                        runtime::PermissionMode::DangerFullAccess
+                    }
+                };
+                let permission_policy = runtime::PermissionPolicy::new(permission_ceiling);
                 let assessment = self.authorization_negotiator.assess(
                     &permission_policy,
                     &runtime::AuthorizationRequest {
@@ -258,7 +270,7 @@ impl SystemService {
                         input: input.to_string(),
                         idempotency_key: request_id.clone(),
                         effect: effect.clone(),
-                        parent_ceiling: runtime::PermissionMode::ReadOnly,
+                        parent_ceiling: permission_ceiling,
                         parent_lease_id: Some("gateway:system-api".to_string()),
                         approval_satisfied: false,
                         recovery_scope: request_id.clone(),

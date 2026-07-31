@@ -134,7 +134,8 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         )
         .with_runtime_session_id(runtime_session_id)
         .with_runtime_memory_context(primary_memory_context)
-        .with_runtime_model_lease(model.clone()),
+        .with_runtime_model_lease(model.clone())
+        .with_runtime_permission_ceiling(permission_mode),
     );
     tool_executor
         .bind_runtime_services(Arc::clone(&runtime_services))

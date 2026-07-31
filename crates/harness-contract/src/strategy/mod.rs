@@ -2655,23 +2655,29 @@ fn estimate_collaboration_lift(
     understanding: &TaskUnderstanding,
     experience: Option<&StrategyExperienceSummary>,
 ) -> CollaborationLiftEstimate {
-    let independence = i16::from(understanding.independent_workstreams) * 1_500;
-    let verification = i16::from(matches!(
+    // A semantic Mission may legitimately propose up to 100 independent
+    // workstreams. Compute in a wider type and saturate only at the persisted
+    // contract boundary so debug builds cannot overflow on a valid graph.
+    let independence = i32::from(understanding.independent_workstreams) * 1_500;
+    let verification = i32::from(matches!(
         understanding.complexity,
         TaskComplexity::Complex | TaskComplexity::Strategic
     )) * 1_500;
-    let uncertainty = i16::from(understanding.uncertainty) * 100;
+    let uncertainty = i32::from(understanding.uncertainty) * 100;
     let historical = experience
         .filter(|summary| summary.multi_agent_lift_sample_count >= 3)
-        .map_or(0, |summary| summary.multi_agent_lift_rate_bp as i16 - 5_000);
+        .map_or(0, |summary| {
+            i32::from(summary.multi_agent_lift_rate_bp) - 5_000
+        });
     let coordination_cost_bp = match understanding.complexity {
         TaskComplexity::Trivial | TaskComplexity::Simple => 4_500,
         TaskComplexity::Moderate => 3_000,
         TaskComplexity::Complex => 2_000,
         TaskComplexity::Strategic => 1_500,
     };
-    let expected_lift_bp =
-        independence + verification + uncertainty + historical - coordination_cost_bp as i16;
+    let expected_lift_bp = (independence + verification + uncertainty + historical
+        - i32::from(coordination_cost_bp))
+    .clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
     CollaborationLiftEstimate {
         expected_lift_bp,
         coordination_cost_bp,

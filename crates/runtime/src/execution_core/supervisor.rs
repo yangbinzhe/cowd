@@ -741,6 +741,34 @@ impl RuntimeExecutionSupervisor {
         Ok((receipt, report))
     }
 
+    pub async fn revise_semantic_graph(
+        &self,
+        graph_id: &str,
+        expected_revision: u64,
+        nodes: Vec<harness_contract::execution_graph::ExecutionNodeSpec>,
+        edges: Vec<harness_contract::execution_graph::ExecutionEdge>,
+        reason: String,
+        mutation_id: String,
+        completion: harness_contract::execution_graph::ExecutionCompletionContract,
+    ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
+        let graph = self
+            .runner
+            .revise_semantic_graph(
+                graph_id,
+                expected_revision,
+                nodes,
+                edges,
+                reason,
+                mutation_id,
+                completion,
+            )
+            .await?;
+        let receipt = self.receipt(&graph, "semantic-mutation", now_ms());
+        let (slot, generation) = self.enqueue(graph_id).await?;
+        let report = self.await_slot(graph_id, slot, generation).await?;
+        Ok((receipt, report))
+    }
+
     pub async fn projection(
         &self,
         graph_id: &str,

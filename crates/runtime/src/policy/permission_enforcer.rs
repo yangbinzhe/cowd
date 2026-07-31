@@ -503,7 +503,9 @@ mod tests {
                 assert_eq!(tool, "write_file");
                 assert_eq!(active_mode, "read-only");
                 assert_eq!(required_mode, "workspace-write");
-                assert!(reason.contains("requires workspace-write permission"));
+                assert!(reason.contains("write_file"));
+                assert!(reason.contains("read-only"));
+                assert!(reason.contains("workspace-write"));
             }
             other => panic!("expected denied result, got {other:?}"),
         }

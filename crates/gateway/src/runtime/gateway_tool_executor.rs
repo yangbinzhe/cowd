@@ -55,6 +55,23 @@ struct RuntimeResourceCapabilitiesRequest {
     intent: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeamBoardToolRequest {
+    operation: String,
+    expected_revision: Option<u64>,
+    kind: Option<runtime::TeamWorkingStateKind>,
+    summary: Option<String>,
+    #[serde(default)]
+    refs: Vec<String>,
+    #[serde(default)]
+    artifact_refs: Vec<String>,
+    #[serde(default)]
+    visibility: runtime::TeamWorkingStateVisibility,
+    after_revision: Option<u64>,
+    exact_revision: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ContextRetrieveSource {
@@ -95,6 +112,7 @@ struct RuntimeToolExecutionBinding<'a> {
     memory_context: Option<&'a memory::MemoryTurnContext>,
     model_lease: Option<&'a str>,
     parent_execution: Option<&'a harness_contract::execution_graph::ExecutionParentBinding>,
+    permission_ceiling: harness_contract::policy::PermissionMode,
 }
 
 fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
@@ -124,6 +142,7 @@ pub(crate) struct GatewayToolExecutor {
     runtime_session_id: Option<String>,
     runtime_memory_context: Option<memory::MemoryTurnContext>,
     runtime_model_lease: Option<String>,
+    runtime_permission_ceiling: harness_contract::policy::PermissionMode,
     runtime_execution_decision: Arc<Mutex<Option<runtime::RuntimeExecutionDecision>>>,
     runtime_services: Arc<OnceLock<Arc<runtime::RuntimeServices>>>,
 }
@@ -154,6 +173,7 @@ impl GatewayToolExecutor {
             runtime_session_id: None,
             runtime_memory_context: None,
             runtime_model_lease: None,
+            runtime_permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
             runtime_services: Arc::new(OnceLock::new()),
         }
@@ -173,6 +193,7 @@ impl GatewayToolExecutor {
             runtime_session_id: None,
             runtime_memory_context: None,
             runtime_model_lease: None,
+            runtime_permission_ceiling: harness_contract::policy::PermissionMode::WorkspaceWrite,
             runtime_execution_decision: Arc::new(Mutex::new(None)),
             runtime_services: Arc::new(OnceLock::new()),
         }
@@ -207,6 +228,15 @@ impl GatewayToolExecutor {
         if !model.trim().is_empty() {
             self.runtime_model_lease = Some(model);
         }
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_runtime_permission_ceiling(
+        mut self,
+        permission_ceiling: harness_contract::policy::PermissionMode,
+    ) -> Self {
+        self.runtime_permission_ceiling = permission_ceiling;
         self
     }
 
@@ -292,6 +322,7 @@ impl GatewayToolExecutor {
                 memory_context: self.runtime_memory_context.as_ref(),
                 model_lease: self.runtime_model_lease.as_deref(),
                 parent_execution: None,
+                permission_ceiling: self.runtime_permission_ceiling,
             },
         )
         .await
@@ -335,6 +366,53 @@ impl GatewayToolExecutor {
             let input: ContextRetrieveRequest = serde_json::from_value(value)
                 .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
             return self.execute_context_retrieve(input, binding).await;
+        }
+        if tool_name == "team_board" {
+            let input: TeamBoardToolRequest = serde_json::from_value(value)
+                .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+            let parent = binding.parent_execution.ok_or_else(|| {
+                ToolError::new("team_board requires an immutable Team Agent execution binding")
+            })?;
+            let services = self.runtime_services.get().cloned().ok_or_else(|| {
+                ToolError::new("team_board requires the workspace RuntimeServices")
+            })?;
+            let state = match input.operation.as_str() {
+                "publish" => {
+                    services
+                        .team_runtime()
+                        .publish_working_state(runtime::TeamWorkingStatePublishRequest {
+                            graph_id: parent.execution_id.clone(),
+                            node_id: parent.node_id.clone(),
+                            expected_revision: input.expected_revision.ok_or_else(|| {
+                                ToolError::new("team_board publish requires expected_revision")
+                            })?,
+                            kind: input.kind.ok_or_else(|| {
+                                ToolError::new("team_board publish requires kind")
+                            })?,
+                            summary: input.summary.ok_or_else(|| {
+                                ToolError::new("team_board publish requires summary")
+                            })?,
+                            refs: input.refs,
+                            artifact_refs: input.artifact_refs,
+                            visibility: input.visibility,
+                        })
+                        .await
+                }
+                "read_after" | "read_exact" => services.team_runtime().read_working_state(
+                    runtime::TeamWorkingStateReadRequest {
+                        graph_id: parent.execution_id.clone(),
+                        node_id: parent.node_id.clone(),
+                        after_revision: input.after_revision,
+                        exact_revision: input.exact_revision,
+                    },
+                ),
+                _ => Err(
+                    "team_board operation must be publish, read_after, or read_exact".to_string(),
+                ),
+            }
+            .map_err(ToolError::new)?;
+            return serde_json::to_string_pretty(&state)
+                .map_err(|error| ToolError::new(error.to_string()));
         }
         if tool_name == "runtime_capabilities" {
             let input: RuntimeCapabilitiesRequest = serde_json::from_value(value)
@@ -388,7 +466,7 @@ impl GatewayToolExecutor {
                 .map_err(|error| {
                     ToolError::new(format!("invalid runtime_orchestrate input: {error}"))
                 })?;
-            sanitize_model_orchestration_request(&mut request);
+            sanitize_model_orchestration_request(&mut request, binding.permission_ceiling);
             self.bind_delegated_capabilities(&mut request);
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
                 ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
@@ -1143,16 +1221,20 @@ impl GatewayToolExecutor {
 /// ceilings. It cannot construct runtime topology. Focus plans remain a
 /// deliberate human/API authoring capability, while model-originated team
 /// requests always let Runtime resolve the template's versioned role contract.
-fn sanitize_model_orchestration_request(request: &mut runtime::RuntimeOrchestrationRequest) {
+fn sanitize_model_orchestration_request(
+    request: &mut runtime::RuntimeOrchestrationRequest,
+    permission_ceiling: harness_contract::policy::PermissionMode,
+) {
     request.selection_mode = None;
     request.strategy_binding = None;
-    if !request.focus_partition_plans.is_empty() {
-        tracing::info!(
-            discarded_focus_plan_count = request.focus_partition_plans.len(),
-            action = %request.action.as_str(),
-            "discarded model-supplied Team focus partitions; Runtime owns template topology"
-        );
-        request.focus_partition_plans.clear();
+    request.constraints.permission_ceiling = permission_ceiling;
+    if let Some(proposal) = request.proposal.as_mut() {
+        for node in &mut proposal.nodes {
+            node.resource_scopes.clear();
+            for focus in &mut node.focuses {
+                focus.resource_scopes.clear();
+            }
+        }
     }
     let resource_capability_count = request
         .capabilities
@@ -1162,7 +1244,7 @@ fn sanitize_model_orchestration_request(request: &mut runtime::RuntimeOrchestrat
     if resource_capability_count > 0 {
         tracing::info!(
             discarded_resource_capability_count = resource_capability_count,
-            action = %request.action.as_str(),
+            operation = %request.operation.as_str(),
             "discarded model-supplied resource leases; Runtime owns Team resource authority"
         );
         request
@@ -1689,6 +1771,12 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     memory_context: request.memory_context.as_ref(),
                     model_lease: request.model_lease.as_deref(),
                     parent_execution: request.parent_execution.as_ref(),
+                    permission_ceiling: request
+                        .authorization
+                        .as_ref()
+                        .map_or(self.runtime_permission_ceiling, |authorization| {
+                            authorization.authorization_lease.ceiling
+                        }),
                 },
             )
             .await
@@ -2463,7 +2551,7 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "intent": { "type": "string" },
-                        "action": { "type": "string" }
+                        "operation": { "type": "string" }
                     },
                     "required": ["intent"],
                     "additionalProperties": true
@@ -2482,13 +2570,13 @@ mod tests {
         let output = executor
             .execute(
                 "runtime_orchestrate",
-                r#"{"intent":"检查 README 是否反映最新架构","action":"plan_only"}"#,
+                r#"{"intent":"检查 Runtime 状态","operation":"inspect"}"#,
             )
             .await
             .expect("runtime orchestrate should execute without MCP");
 
         assert!(output.contains("runtime-orch-"));
-        assert!(output.contains("plan_only"));
+        assert!(output.contains("inspected"));
     }
 
     #[test]
@@ -2528,7 +2616,7 @@ mod tests {
                 RuntimeToolDefinition {
                     name: "runtime_orchestrate".to_string(),
                     description: Some("runtime orchestration".to_string()),
-                    input_schema: json!({"type":"object","properties":{"intent":{"type":"string"},"action":{"type":"string"}},"required":["intent"]}),
+                    input_schema: json!({"type":"object","properties":{"intent":{"type":"string"},"operation":{"type":"string"}},"required":["intent"]}),
                     required_permission: ToolPermissionMode::WorkspaceWrite,
                     effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
                         "runtime.state_write",
@@ -2561,7 +2649,7 @@ mod tests {
             &executor
                 .execute(
                     "runtime_orchestrate",
-                    r#"{"intent":"换一个描述也必须复用当前 turn 决策","action":"plan_only"}"#,
+                    r#"{"intent":"换一个描述也必须复用当前 turn 决策","operation":"inspect"}"#,
                 )
                 .await
                 .expect("orchestration"),
@@ -2606,15 +2694,13 @@ mod tests {
         let error = executor
             .execute(
                 "runtime_orchestrate",
-                r#"{"intent":"需要多 Agent 协同审查架构","action":"request_team"}"#,
+                r#"{"intent":"需要多 Agent 协同审查架构","operation":"propose","proposal":{"mutation_id":"missing-runtime-team","reason":"test","nodes":[{"node_id":"team","recipe":"team","objective":"审查架构"}]}}"#,
             )
             .await
             .expect_err("unavailable team orchestration must not be reported as a successful tool");
 
         assert!(
-            error
-                .to_string()
-                .contains("runtime orchestration unavailable"),
+            error.to_string().contains("runtime orchestration"),
             "{error}"
         );
         assert!(!error
@@ -2623,7 +2709,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_orchestrate_parallel_tools_injects_gateway_tool_host() {
+    async fn runtime_orchestrate_inspect_uses_gateway_runtime_services() {
         let registry = GatewayToolRegistry::builtin()
             .with_runtime_tools(vec![RuntimeToolDefinition {
                 name: "runtime_orchestrate".to_string(),
@@ -2632,7 +2718,7 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "intent": { "type": "string" },
-                        "action": { "type": "string" }
+                        "operation": { "type": "string" }
                     },
                     "required": ["intent"],
                     "additionalProperties": true
@@ -2652,17 +2738,18 @@ mod tests {
         let output = executor
             .execute(
                 "runtime_orchestrate",
-                r#"{"intent":"检查 README 是否反映最新架构","action":"request_parallel_tools"}"#,
+                r#"{"intent":"检查 Runtime 状态","operation":"inspect"}"#,
             )
             .await
             .expect("gateway-bound runtime orchestrate should inject a tool host");
 
         let response: serde_json::Value = serde_json::from_str(&output).expect("typed response");
-        assert_eq!(response["status"], "compiled");
-        assert_eq!(response["execution"]["type"], "execution_graph_compilation");
-        assert_eq!(response["evidence"]["compiled"], true);
-        assert_eq!(response["evidence"]["accepted"], false);
-        assert!(response["execution"].get("receipt").is_none());
+        assert_eq!(response["status"], "inspected");
+        assert_eq!(
+            response["runtime_snapshot"]["capability_recipes"][0],
+            "direct"
+        );
+        assert_eq!(response["evidence"]["operation"], "inspect");
     }
 
     #[test]
@@ -2672,13 +2759,12 @@ mod tests {
             intent: "review the workspace with a delegated team".to_string(),
             model_lease: None,
             session_id: Some("session".to_string()),
-            target_session_id: None,
-            action: runtime::RuntimeOrchestrationAction::RequestTeam,
+            operation: runtime::RuntimeOrchestrationOperation::Inspect,
+            inspect_execution_id: None,
+            proposal: None,
+            control: None,
             selection_mode: None,
             strategy_binding: None,
-            reason: None,
-            template_hint: None,
-            focus_partition_plans: Vec::new(),
             capabilities: vec![
                 "tool:runtime_orchestrate".to_string(),
                 "tool:unknown_tool".to_string(),
@@ -2710,23 +2796,40 @@ mod tests {
     }
 
     #[test]
-    fn model_orchestration_cannot_supply_template_role_topology() {
+    fn model_orchestration_cannot_supply_resource_authority() {
         let mut request: runtime::RuntimeOrchestrationRequest = serde_json::from_value(json!({
             "intent": "parallel architecture review",
-            "action": "request_team",
-            "focus_partition_plans": [{
-                "role_id": "invented_role",
-                "slots": [{
-                    "focus_id": "runtime",
-                    "boundary": "runtime only",
-                    "evidence_responsibility": "source evidence"
+            "operation": "propose",
+            "proposal": {
+                "mutation_id": "model-authority",
+                "reason": "test",
+                "nodes": [{
+                    "node_id": "team",
+                    "recipe": "team",
+                    "objective": "review",
+                    "resource_scopes": ["write:secret"],
+                    "focuses": [{
+                        "focus_id": "runtime",
+                        "role_id": "researcher",
+                        "objective": "runtime",
+                        "resource_scopes": ["write:secret"]
+                    }]
                 }]
-            }]
+            }
         }))
         .expect("model request parses before Gateway normalization");
 
-        sanitize_model_orchestration_request(&mut request);
+        sanitize_model_orchestration_request(
+            &mut request,
+            harness_contract::policy::PermissionMode::ReadOnly,
+        );
 
-        assert!(request.focus_partition_plans.is_empty());
+        let node = &request.proposal.as_ref().unwrap().nodes[0];
+        assert!(node.resource_scopes.is_empty());
+        assert!(node.focuses[0].resource_scopes.is_empty());
+        assert_eq!(
+            request.constraints.permission_ceiling,
+            harness_contract::policy::PermissionMode::ReadOnly
+        );
     }
 }

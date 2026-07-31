@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(
     clippy::unneeded_struct_pattern,
     clippy::unnecessary_wraps,

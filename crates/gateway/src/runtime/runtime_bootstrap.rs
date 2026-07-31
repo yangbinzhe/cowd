@@ -729,7 +729,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Submit a controlled stateful runtime orchestration request. Executable lifecycle actions create runtime-owned graph receipts; dispatch_session creates a typed cross-session handoff graph. Deliberation/reflexion return strategy packets; request_risk_gate submits a durable human approval and returns its approval_id. Use runtime_capabilities for read-only planning first.".to_string(),
+                "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
@@ -739,31 +739,80 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                         "type": "string",
                         "description": "Optional in gateway/API sessions because Cowd auto-binds the active session_id. Required only for detached/offline runtime_orchestrate calls."
                     },
-                    "target_session_id": {
+                    "operation": {
                         "type": "string",
-                        "description": "Required only for dispatch_session; the source is session_id."
+                        "enum": ["inspect", "propose", "revise", "control"],
+                        "default": "inspect"
                     },
-                    "action": {
-                        "type": "string",
-                        "description": "executable_lifecycle: request_team, request_subagent, request_verification, request_background_review, dispatch_session; executable_tool_dag: request_parallel_tools, request_rewoo_evidence; strategy_packet: request_deliberation, request_reflexion_retry; approval_packet: request_risk_gate",
-                        "enum": [
-                            "plan_only",
-                            "request_team",
-                            "request_subagent",
-                            "request_verification",
-                            "request_parallel_tools",
-                            "request_rewoo_evidence",
-                            "request_deliberation",
-                            "request_reflexion_retry",
-                            "request_background_review",
-                            "request_risk_gate",
-                            "dispatch_session"
-                        ]
+                    "inspect_execution_id": { "type": "string" },
+                    "proposal": {
+                        "type": "object",
+                        "properties": {
+                            "mutation_id": { "type": "string" },
+                            "target_execution_id": { "type": "string" },
+                            "expected_revision": { "type": "integer", "minimum": 0 },
+                            "reason": { "type": "string" },
+                            "nodes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "node_id": { "type": "string" },
+                                        "recipe": {
+                                            "type": "string",
+                                            "enum": ["direct", "agent", "team", "review", "synthesis", "session_dispatch"]
+                                        },
+                                        "objective": { "type": "string" },
+                                        "depends_on": { "type": "array", "items": { "type": "string" } },
+                                        "multiplicity": { "type": "integer", "minimum": 1, "maximum": 100 },
+                                        "template": { "type": "string" },
+                                        "input_refs": { "type": "array", "items": { "type": "string" } },
+                                        "output_artifacts": { "type": "array", "items": { "type": "string" } },
+                                        "evidence_contract": { "type": "array", "items": { "type": "string" } },
+                                        "focuses": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "focus_id": { "type": "string" },
+                                                    "role_id": { "type": "string" },
+                                                    "objective": { "type": "string" },
+                                                    "evidence_responsibilities": { "type": "array", "items": { "type": "string" } }
+                                                },
+                                                "required": ["focus_id", "role_id", "objective"],
+                                                "additionalProperties": false
+                                            }
+                                        }
+                                    },
+                                    "required": ["node_id", "recipe", "objective"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "completion": {
+                                "type": "object",
+                                "properties": {
+                                    "required_node_ids": { "type": "array", "items": { "type": "string" } },
+                                    "required_artifact_kinds": { "type": "array", "items": { "type": "string" } },
+                                    "allow_unresolved_conflicts": { "type": "boolean" }
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["mutation_id", "nodes", "reason"],
+                        "additionalProperties": false
                     },
-                    "reason": { "type": "string" },
-                    "template_hint": {
-                        "type": "string",
-                        "description": "Optional published builtin Team template path such as cowd/parallel-research-synthesis. Choose only the high-level template; Runtime resolves its immutable roles, cardinalities, dependencies, and focus partitions. Do not attempt to provide role ids or a graph in this tool call."
+                    "control": {
+                        "type": "object",
+                        "properties": {
+                            "target_execution_id": { "type": "string" },
+                            "expected_revision": { "type": "integer", "minimum": 0 },
+                            "scope": { "type": "string", "enum": ["mission", "graph", "agent", "team", "subgraph"] },
+                            "target_node_id": { "type": "string" },
+                            "action": { "type": "string", "enum": ["pause", "resume", "cancel"] },
+                            "reason": { "type": "string" }
+                        },
+                        "required": ["target_execution_id", "expected_revision", "action", "reason"],
+                        "additionalProperties": false
                     },
                     "capabilities": { "type": "array", "items": { "type": "string" } },
                     "evidence_refs": { "type": "array", "items": { "type": "string" } },
@@ -778,7 +827,11 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                                 "description": "Runtime-issued approval id. Supply only when resuming request_risk_gate after the human decision."
                             },
                             "requires_write": { "type": "boolean" },
-                            "surface_latency_sensitive": { "type": "boolean" }
+                            "surface_latency_sensitive": { "type": "boolean" },
+                            "permission_ceiling": {
+                                "type": "string",
+                                "enum": ["read-only", "workspace-write", "danger-full-access"]
+                            }
                         },
                         "additionalProperties": false
                     }
@@ -786,8 +839,38 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                 "required": ["intent"],
                 "additionalProperties": false
             }),
-            required_permission: ToolPermissionMode::WorkspaceWrite,
-            effect_resolver: runtime_effect_resolver("runtime.state_write"),
+            required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.orchestration"),
+        },
+        RuntimeToolDefinition {
+            name: "team_board".to_string(),
+            description: Some(
+                "Publish or retrieve bounded semantic Team working-state checkpoints. Runtime binds the caller's Team, role, Agent instance and graph; raw private reasoning and arbitrary topology are rejected.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string", "enum": ["publish", "read_after", "read_exact"] },
+                    "expected_revision": { "type": "integer", "minimum": 0 },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["finding", "evidence", "decision", "conflict", "unresolved", "blocker", "user_intervention", "artifact"]
+                    },
+                    "summary": { "type": "string" },
+                    "refs": { "type": "array", "items": { "type": "string" } },
+                    "artifact_refs": { "type": "array", "items": { "type": "string" } },
+                    "visibility": { "type": "string", "enum": ["team", "role", "private"] },
+                    "after_revision": { "type": "integer", "minimum": 0 },
+                    "exact_revision": { "type": "integer", "minimum": 1 }
+                },
+                "required": ["operation"],
+                "additionalProperties": false
+            }),
+            // Team board writes are internal bounded collaboration state, not
+            // workspace or external side effects. Immutable Agent binding is
+            // enforced by Runtime at execution.
+            required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
         RuntimeToolDefinition {
             name: "evidence_retrieve".to_string(),

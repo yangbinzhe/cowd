@@ -306,10 +306,15 @@ impl TeamInstantiationService {
                         ]
                     }))
                     .collect(),
-                    context_refs: focus_partition.capability_cropped_refs.clone(),
+                    context_refs: focus_partition
+                        .capability_cropped_refs
+                        .iter()
+                        .cloned()
+                        .chain(request.upstream_artifact_refs.iter().cloned())
+                        .collect(),
                     // A resource lease authorizes discovery but is not itself
                     // evidence. Durable tool audits populate result evidence.
-                    evidence_refs: Vec::new(),
+                    evidence_refs: request.upstream_evidence_refs.clone(),
                     resource_scopes,
                     // Runtime derives normal role tools from the immutable
                     // capability grant. Evaluation may only narrow that set;

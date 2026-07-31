@@ -10,11 +10,33 @@ pub enum ExecutionNodeKind {
     InlineModel,
     ToolBatch,
     AgentTask,
+    Subgraph,
     Verify,
     Synthesize,
     Approval,
     SessionDispatch,
     Timer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+pub struct ExecutionCompletionContract {
+    #[serde(default)]
+    pub required_node_ids: Vec<String>,
+    #[serde(default)]
+    pub required_artifact_kinds: Vec<String>,
+    #[serde(default)]
+    pub allow_unresolved_conflicts: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionOrchestrationMetadata {
+    pub mutation_id: String,
+    #[serde(default)]
+    pub applied_mutation_ids: Vec<String>,
+    pub semantic_revision: u64,
+    #[serde(default)]
+    pub source_generation: u64,
+    pub completion: ExecutionCompletionContract,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -234,6 +256,8 @@ pub struct ExecutionGraph {
     pub service_class: ExecutionServiceClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<ExecutionOrchestrationMetadata>,
     pub nodes: Vec<ExecutionNodeSpec>,
     pub edges: Vec<ExecutionEdge>,
     pub node_statuses: BTreeMap<String, ExecutionNodeStatus>,
@@ -250,6 +274,7 @@ impl ExecutionGraph {
             objective: objective.into(),
             service_class: ExecutionServiceClass::Interactive,
             parent_execution: None,
+            orchestration: None,
             nodes: Vec::new(),
             edges: Vec::new(),
             node_statuses: BTreeMap::new(),
@@ -277,6 +302,11 @@ pub enum ExecutionGraphCommand {
     },
     Cancel {
         expected_revision: u64,
+        reason: String,
+    },
+    CancelNode {
+        expected_revision: u64,
+        node_id: String,
         reason: String,
     },
     SubmitApproval {

@@ -40,6 +40,9 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
     // entry point. The tool itself enforces the exact Agent/Session/Project/
     // Team Binding, so this does not grant broad Memory or Session access.
     allowed_tools.insert("context_retrieve".to_string());
+    // The board is an internal, binding-scoped semantic exchange. Runtime
+    // rejects callers that are not Team Agent nodes.
+    allowed_tools.insert("team_board".to_string());
     let mut permission_policy = PermissionPolicy::new(permission_mode);
     for tool in &allowed_tools {
         permission_policy =

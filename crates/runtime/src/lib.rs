@@ -597,9 +597,11 @@ pub use module_map::{
 pub use orchestration::{
     handle_runtime_orchestration_request, handle_runtime_orchestration_request_with_decision,
     runtime_orchestration_response, runtime_orchestration_response_with_decision,
-    submit_runtime_orchestration_request, CompiledOrchestration, RuntimeOrchestrationAction,
-    RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision, RuntimeOrchestrationRequest,
-    RuntimeOrchestrationResult,
+    submit_runtime_orchestration_request, CapabilityRecipeId, CompiledOrchestration,
+    GraphMutationProposal, GraphSemanticNode, RuntimeControlKind, RuntimeControlRequest,
+    RuntimeControlScope, RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision,
+    RuntimeOrchestrationOperation, RuntimeOrchestrationRequest, RuntimeOrchestrationResult,
+    RuntimeStateSnapshot, SemanticFocus,
 };
 pub use outcome_projector::{
     OutcomeProjectionCheckpoint, OutcomeProjectionDlqEntry, OutcomeProjectionHealth,
@@ -751,6 +753,7 @@ pub use team_result_reducer::TeamResultReducer;
 pub use team_runtime::TeamRuntime;
 pub use team_working_state::{
     FocusOverlapAssessment, TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStateKind,
+    TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest, TeamWorkingStateVisibility,
 };
 pub use tool_execution_plane::{
     ToolExecutionAdmission, ToolExecutionPlane, ToolExecutionPlaneError, ToolExecutionPlaneStats,

@@ -251,6 +251,44 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // refs below remain the capability ceiling; this worker never scans
         // package directories or falls back to an empty production profile.
         let skill_catalog = services.skill_catalog();
+        let external_context_items = if binding.data_lease.team_working_state_visible {
+            services
+                .team_runtime()
+                .read_working_state(crate::TeamWorkingStateReadRequest {
+                    graph_id: packet.graph_id().to_string(),
+                    node_id: packet.node_id().to_string(),
+                    after_revision: None,
+                    exact_revision: None,
+                })
+                .ok()
+                .filter(|state| !state.entries.is_empty())
+                .map(|state| {
+                    let team_id = state.team_id.clone();
+                    let board_revision = state.board_revision;
+                    let summary = serde_json::to_string(&serde_json::json!({
+                        "board_revision": board_revision,
+                        "entries": state.entries.into_iter().rev().take(32).collect::<Vec<_>>(),
+                        "instruction": "Use committed semantic entries only. Call team_board read_after at safe checkpoints before synthesis; publish findings, conflicts, unresolved work, or artifacts without private reasoning."
+                    }))
+                    .unwrap_or_else(|_| "{}".to_string());
+                    let mut item = crate::ContextItem::new(
+                        format!("team-board:{team_id}"),
+                        crate::ContextSourceKind::AgentPeer,
+                        crate::ContextRole::Evidence,
+                        summary,
+                    );
+                    item.authority = crate::ContextAuthority::Tool;
+                    item.evidence = vec![format!(
+                        "team-working-state:{}:{}",
+                        team_id, board_revision
+                    )];
+                    item
+                })
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let host = StandardRuntimeHost::new(StandardRuntimeHostConfig {
             runtime_services: Arc::clone(&services),
             session: child_session,
@@ -266,7 +304,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             tool_callback: None,
             model_context_window: None,
             hook_progress_reporter: None,
-            external_context_items: Vec::new(),
+            external_context_items,
             skill_profiles: skill_catalog.profiles(),
             agent_skill_profile: harness_contract::skill::AgentSkillProfile {
                 baseline_skill_refs: Vec::new(),

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::agent::{AgentCapability, AgentDefinitionRevisionRef, ValidationError};
-use crate::context::ContextBudgetLeaseRef;
+use crate::context::{ContextBudgetLeaseRef, EvidenceAccessRef};
 use crate::core::TaskRisk;
 use crate::execution_graph::ExecutionParentBinding;
 use crate::policy::PermissionMode;
@@ -240,6 +240,12 @@ pub struct TeamInstantiationRequest {
     pub managed_invocation: Option<crate::managed_agent::ManagedAgentInvocationFence>,
     #[serde(default)]
     pub resource_scopes: Vec<String>,
+    /// Runtime-verified evidence committed by predecessor root-graph nodes.
+    #[serde(default)]
+    pub upstream_evidence_refs: Vec<EvidenceAccessRef>,
+    /// Durable artifact locators committed by predecessor root-graph nodes.
+    #[serde(default)]
+    pub upstream_artifact_refs: Vec<String>,
 }
 
 impl TeamInstantiationRequest {
@@ -325,6 +331,25 @@ impl TeamInstantiationRequest {
         }
         if let Some(managed_invocation) = &self.managed_invocation {
             managed_invocation.validate()?;
+        }
+        if (!self.upstream_evidence_refs.is_empty() || !self.upstream_artifact_refs.is_empty())
+            && self.parent_execution.is_none()
+        {
+            return Err(ValidationError::InvalidContract {
+                message: "Team upstream evidence requires a Runtime-owned parent execution"
+                    .to_string(),
+            });
+        }
+        if self.upstream_evidence_refs.len() > 256
+            || self.upstream_artifact_refs.len() > 256
+            || self
+                .upstream_artifact_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty() || reference.len() > 4_096)
+        {
+            return Err(ValidationError::InvalidContract {
+                message: "Team upstream evidence exceeds the bounded artifact contract".to_string(),
+            });
         }
         if self.resource_scopes.iter().any(|scope| {
             matches!(
@@ -600,6 +625,8 @@ mod tests {
             budget_lease: None,
             managed_invocation: None,
             resource_scopes: vec!["read:crates/runtime".to_string()],
+            upstream_evidence_refs: Vec::new(),
+            upstream_artifact_refs: Vec::new(),
         }
     }
 

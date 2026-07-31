@@ -795,7 +795,8 @@ impl ExecutionGraphRunner {
         node: &harness_contract::execution_graph::ExecutionNodeSpec,
     ) -> Result<NodeResourceGuards, ExecutionRunnerError> {
         let resource_kind = match node.kind {
-            harness_contract::execution_graph::ExecutionNodeKind::AgentTask => {
+            harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+            | harness_contract::execution_graph::ExecutionNodeKind::Subgraph => {
                 Some(ExecutionResourceKind::Agent)
             }
             harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => {
@@ -1013,7 +1014,9 @@ impl ExecutionGraphRunner {
         self.ensure_mutation_allowed()?;
         if matches!(
             command,
-            ExecutionGraphCommand::Pause { .. } | ExecutionGraphCommand::Cancel { .. }
+            ExecutionGraphCommand::Pause { .. }
+                | ExecutionGraphCommand::Cancel { .. }
+                | ExecutionGraphCommand::CancelNode { .. }
         ) {
             let coordination = self.graph_coordination(graph_id).await;
             let graph = self.state_store.load_async(graph_id).await?;
@@ -1025,7 +1028,15 @@ impl ExecutionGraphRunner {
                 .lock()
                 .await
                 .iter()
-                .filter(|((active_graph_id, _), _)| active_graph_id == graph_id)
+                .filter(|((active_graph_id, node_id), _)| {
+                    active_graph_id == graph_id
+                        && match &command {
+                            ExecutionGraphCommand::CancelNode {
+                                node_id: target, ..
+                            } => node_id == target,
+                            _ => true,
+                        }
+                })
                 .map(|((_, node_id), node)| {
                     (
                         node_id.clone(),
@@ -1054,7 +1065,9 @@ impl ExecutionGraphRunner {
             let mut cancellation_errors = Vec::new();
             if matches!(
                 command,
-                ExecutionGraphCommand::Pause { .. } | ExecutionGraphCommand::Cancel { .. }
+                ExecutionGraphCommand::Pause { .. }
+                    | ExecutionGraphCommand::Cancel { .. }
+                    | ExecutionGraphCommand::CancelNode { .. }
             ) {
                 for (node_id, executor, ticket) in cancellation_finalizer.active() {
                     if let Err(error) = executor.cancel(ticket).await {
@@ -1102,6 +1115,37 @@ impl ExecutionGraphRunner {
         let graph = self
             .commit_service
             .apply_command_async(graph, command.clone())
+            .await?
+            .graph;
+        drop(coordination);
+        Ok(graph)
+    }
+
+    pub(crate) async fn revise_semantic_graph(
+        &self,
+        graph_id: &str,
+        expected_revision: u64,
+        nodes: Vec<harness_contract::execution_graph::ExecutionNodeSpec>,
+        edges: Vec<harness_contract::execution_graph::ExecutionEdge>,
+        reason: String,
+        mutation_id: String,
+        completion: harness_contract::execution_graph::ExecutionCompletionContract,
+    ) -> Result<ExecutionGraph, ExecutionRunnerError> {
+        self.ensure_mutation_allowed()?;
+        let coordination = self.graph_coordination_without_command(graph_id).await;
+        let graph = self.state_store.load_async(graph_id).await?;
+        if graph.revision != expected_revision {
+            return Err(ExecutionCommitError::StaleRevision {
+                graph_id: graph_id.to_string(),
+                expected: expected_revision,
+                actual: graph.revision,
+            }
+            .into());
+        }
+        self.registry.validate_nodes(&nodes)?;
+        let graph = self
+            .commit_service
+            .replan_semantic_async(graph, nodes, edges, reason, mutation_id, completion)
             .await?
             .graph;
         drop(coordination);

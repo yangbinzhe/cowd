@@ -1,13 +1,19 @@
-use harness_contract::core::{ExecutionPattern, ExecutionPolicyGate};
+use std::collections::{BTreeMap, BTreeSet};
+
+use harness_contract::core::ExecutionPolicyGate;
+use harness_contract::policy::PermissionMode;
+use harness_contract::strategy::StrategyProposal;
 use serde_json::json;
 
 use crate::execution_core::RuntimeExecutionDecision;
-use crate::orchestration::request::{RuntimeOrchestrationAction, RuntimeOrchestrationRequest};
+use crate::orchestration::request::{
+    CapabilityRecipeId, GraphMutationProposal, RuntimeControlScope, RuntimeOrchestrationOperation,
+    RuntimeOrchestrationRequest,
+};
 use crate::orchestration::result::{
     RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
 };
 use crate::{ApprovalQueue, GlobalApprovalStatus};
-use harness_contract::strategy::StrategyProposal;
 
 #[must_use]
 pub fn validate_request(
@@ -18,47 +24,35 @@ pub fn validate_request(
 ) -> RuntimeOrchestrationDecision {
     let mut policy_gates = execution.gates().to_vec();
     let mut findings = Vec::new();
-    let dispatch_status = match request.action {
-        RuntimeOrchestrationAction::RequestTeam
-        | RuntimeOrchestrationAction::RequestSubagent
-        | RuntimeOrchestrationAction::RequestVerification
-        | RuntimeOrchestrationAction::RequestBackgroundReview
-        | RuntimeOrchestrationAction::DispatchSession => "accepted",
-        RuntimeOrchestrationAction::RequestRiskGate => "planned",
-        _ => "planned",
-    };
-    let mut status = dispatch_status.to_string();
+    let mut status = match request.operation {
+        RuntimeOrchestrationOperation::Inspect => "planned",
+        RuntimeOrchestrationOperation::Propose
+        | RuntimeOrchestrationOperation::Revise
+        | RuntimeOrchestrationOperation::Control => "accepted",
+    }
+    .to_string();
 
-    if !execution.executable {
-        status = "rejected".to_string();
-        findings.push("strategy_resources_unavailable".to_string());
+    if !execution.executable && request.operation != RuntimeOrchestrationOperation::Inspect {
+        reject(&mut status, &mut findings, "strategy_resources_unavailable");
         findings.extend(execution.blocked_reasons.iter().cloned());
     }
-    if !strategy_authorizes(request, execution) {
-        status = "rejected".to_string();
-        findings.push("action_not_authorized_by_strategy".to_string());
+    validate_operation_shape(request, &mut status, &mut findings);
+    if let Some(proposal) = request.proposal.as_ref() {
+        validate_proposal(request, proposal, &mut status, &mut findings);
     }
-    if model_proposal.is_some_and(|proposal| {
-        proposal.pattern != execution.pattern()
-            && !team_candidate_carries_semantic_pattern(request, execution)
-    }) {
-        status = "rejected".to_string();
-        findings.push("model_proposal_conflicts_with_strategy_lease".to_string());
+    if model_proposal.is_some_and(|proposal| proposal.pattern != execution.pattern()) {
+        reject(
+            &mut status,
+            &mut findings,
+            "model_proposal_conflicts_with_strategy_lease",
+        );
     }
-    if request.action == RuntimeOrchestrationAction::RequestRiskGate {
-        push_gate(&mut policy_gates, ExecutionPolicyGate::Risk);
-        push_gate(&mut policy_gates, ExecutionPolicyGate::Approval);
-        findings.push("risk_gate_requested".to_string());
-    }
+
     let requested_risk = request.constraints.risk.as_deref();
     if requested_risk.is_some_and(|risk| matches!(risk, "high" | "critical")) {
         push_gate(&mut policy_gates, ExecutionPolicyGate::Risk);
         findings.push("risk_gate_required".to_string());
     }
-    // 与 ExecutionPolicyGate::is_required_for 保持同一事实：High 需要
-    // 风险复核，但只有 Critical 才需要人工批准。此前把只读深度审计的
-    // High 也升级为 needs_approval，会让策略正确选中的自动 Team 在
-    // 创建任何子图之前被错误拦截。
     if requested_risk == Some("critical") {
         if status != "rejected" {
             status = "needs_approval".to_string();
@@ -67,86 +61,40 @@ pub fn validate_request(
         findings.push("risk_requires_approval".to_string());
     }
     if request.constraints.requires_write.unwrap_or(false)
-        && !execution.gates().contains(&ExecutionPolicyGate::Permission)
-    {
-        status = "rejected".to_string();
-        push_gate(&mut policy_gates, ExecutionPolicyGate::Permission);
-        findings.push("write_scope_not_present_in_strategy_lease".to_string());
-    }
-    if request.action == RuntimeOrchestrationAction::RequestTeam
-        && request.constraints.requires_write == Some(true)
         && !request
-            .capabilities
-            .iter()
-            .any(|capability| capability.starts_with("resource:"))
+            .constraints
+            .permission_ceiling
+            .permits(PermissionMode::WorkspaceWrite)
     {
-        status = "rejected".to_string();
-        findings.push("team_write_requires_explicit_cropped_resource_scope".to_string());
+        reject(
+            &mut status,
+            &mut findings,
+            "write_request_exceeds_permission_ceiling",
+        );
+        push_gate(&mut policy_gates, ExecutionPolicyGate::Permission);
     }
     if request
         .constraints
         .max_parallel_agents
         .is_some_and(|count| count == 0)
     {
-        status = "rejected".to_string();
-        findings.push("max_parallel_agents_must_be_positive".to_string());
-    }
-    if request.action == RuntimeOrchestrationAction::RequestTeam
-        && request.session_id.as_deref().is_none_or(str::is_empty)
-    {
-        status = "rejected".to_string();
-        findings.push("missing_session_id_for_team_runtime".to_string());
-    }
-    if request.action == RuntimeOrchestrationAction::RequestTeam {
-        if let Some(binding) = request.strategy_binding.as_ref() {
-            if binding.decision_id != execution.decision_id
-                || binding.decision_lease != execution.lease.lease_id
-                || binding.decision_revision != execution.decision_revision
-                || execution
-                    .turn_ref
-                    .as_deref()
-                    .is_some_and(|turn_ref| turn_ref != binding.turn_ref)
-            {
-                status = "rejected".to_string();
-                findings.push("team_strategy_binding_mismatch".to_string());
-            } else {
-                findings.push("team_collaboration_lease_bound".to_string());
-            }
-        }
-        if request.selection_mode == Some(harness_contract::team::TeamSelectionMode::Automatic)
-            && execution.strategy.selected_candidate
-                != harness_contract::strategy::ExecutionCandidateKind::Team
-        {
-            status = "rejected".to_string();
-            findings.push("automatic_team_not_selected_by_strategy".to_string());
-        }
+        reject(
+            &mut status,
+            &mut findings,
+            "max_parallel_agents_must_be_positive",
+        );
     }
     if request.intent.trim().is_empty()
-        && !matches!(request.action, RuntimeOrchestrationAction::PlanOnly)
+        && request.operation != RuntimeOrchestrationOperation::Control
     {
-        status = "rejected".to_string();
-        findings.push("empty_intent_rejected".to_string());
+        reject(&mut status, &mut findings, "empty_intent_rejected");
     }
-    if request.action == RuntimeOrchestrationAction::DispatchSession
-        && request.session_id.as_deref().is_none_or(str::is_empty)
-    {
-        status = "rejected".to_string();
-        findings.push("missing_source_session_id_for_dispatch".to_string());
-    }
-    if request.action == RuntimeOrchestrationAction::DispatchSession
-        && request
-            .target_session_id
-            .as_deref()
-            .is_none_or(str::is_empty)
-    {
-        status = "rejected".to_string();
-        findings.push("missing_target_session_id_for_dispatch".to_string());
-    }
+
     let required_approval = approval_requirement(request, execution);
     if let Some(requirement) = required_approval.as_ref() {
         validate_global_approval(
             requirement,
-            dispatch_status,
+            "accepted",
             &mut status,
             &mut findings,
             approval_queue,
@@ -157,47 +105,258 @@ pub fn validate_request(
 
     RuntimeOrchestrationDecision {
         selected_pattern: execution.pattern(),
-        selected_template: request.template_hint.clone().or_else(|| {
-            execution
-                .recommended_template
-                .map(|template| template.as_str().to_string())
-        }),
-        reason: request.reason.clone().unwrap_or_else(|| {
-            "runtime compiled model intent through the leased strategy decision".to_string()
-        }),
+        selected_template: request
+            .proposal
+            .as_ref()
+            .and_then(|proposal| proposal.nodes.iter().find_map(|node| node.template.clone()))
+            .or_else(|| {
+                execution
+                    .recommended_template
+                    .map(|template| template.as_str().to_string())
+            }),
+        reason: request
+            .proposal
+            .as_ref()
+            .map(|proposal| proposal.reason.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "runtime validated semantic operation `{}` against the active strategy lease",
+                    request.operation.as_str()
+                )
+            }),
         policy_gates,
         validation_findings: findings,
         required_approval,
         budget: json!({
             "requested_max_parallel_agents": request.constraints.max_parallel_agents,
-            "parallelism_owner": "runtime_team_instantiation_resource_policy",
-            "plan_only": request.action == RuntimeOrchestrationAction::PlanOnly,
+            "parallelism_owner": "runtime_execution_resource_manager",
             "strategy_lease_id": execution.lease.lease_id,
             "strategy_decision_id": execution.decision_id,
             "strategy_decision_revision": execution.decision_revision,
-            "collaboration_lease": request.strategy_binding.as_ref().map(|binding| binding.decision_lease.as_str()),
+            "mutation_id": request.proposal.as_ref().map(|proposal| proposal.mutation_id.as_str()),
+            "expected_graph_revision": request.proposal.as_ref().and_then(|proposal| proposal.expected_revision),
         }),
         permission: json!({
             "requires_write": request.constraints.requires_write.unwrap_or(false),
+            "permission_ceiling": request.constraints.permission_ceiling,
             "risk": request.constraints.risk.clone().unwrap_or_else(|| "low".to_string())
         }),
         status,
     }
 }
 
+fn validate_operation_shape(
+    request: &RuntimeOrchestrationRequest,
+    status: &mut String,
+    findings: &mut Vec<String>,
+) {
+    match request.operation {
+        RuntimeOrchestrationOperation::Inspect => {
+            if request.proposal.is_some() || request.control.is_some() {
+                reject(status, findings, "inspect_rejects_mutation_payload");
+            }
+        }
+        RuntimeOrchestrationOperation::Propose => {
+            if request.proposal.is_none() || request.control.is_some() {
+                reject(status, findings, "propose_requires_only_graph_proposal");
+            }
+            if request
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.target_execution_id.is_some())
+            {
+                reject(status, findings, "propose_rejects_existing_graph_target");
+            }
+        }
+        RuntimeOrchestrationOperation::Revise => {
+            if request.proposal.as_ref().is_none_or(|proposal| {
+                proposal
+                    .target_execution_id
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                    || proposal.expected_revision.is_none()
+            }) || request.control.is_some()
+            {
+                reject(
+                    status,
+                    findings,
+                    "revise_requires_target_and_expected_revision",
+                );
+            }
+        }
+        RuntimeOrchestrationOperation::Control => {
+            if request.control.is_none() || request.proposal.is_some() {
+                reject(status, findings, "control_requires_only_control_payload");
+            }
+            if let Some(control) = request.control.as_ref() {
+                let scoped = matches!(
+                    control.scope,
+                    RuntimeControlScope::Agent
+                        | RuntimeControlScope::Team
+                        | RuntimeControlScope::Subgraph
+                );
+                if scoped && control.target_node_id.as_deref().is_none_or(str::is_empty) {
+                    reject(status, findings, "scoped_control_requires_target_node");
+                }
+                if scoped
+                    && !matches!(
+                        control.action,
+                        crate::orchestration::request::RuntimeControlKind::Cancel
+                    )
+                {
+                    reject(
+                        status,
+                        findings,
+                        "scoped_control_currently_supports_cancel_only",
+                    );
+                }
+                if matches!(
+                    control.scope,
+                    RuntimeControlScope::Mission | RuntimeControlScope::Graph
+                ) && control.target_node_id.is_some()
+                {
+                    reject(status, findings, "graph_control_rejects_target_node");
+                }
+            }
+        }
+    }
+}
+
+fn validate_proposal(
+    request: &RuntimeOrchestrationRequest,
+    proposal: &GraphMutationProposal,
+    status: &mut String,
+    findings: &mut Vec<String>,
+) {
+    if proposal.mutation_id.trim().is_empty() {
+        reject(status, findings, "missing_mutation_id");
+    }
+    if proposal.nodes.is_empty() {
+        reject(status, findings, "empty_graph_mutation");
+        return;
+    }
+    let mut ids = BTreeSet::new();
+    let mut indegree = BTreeMap::<String, usize>::new();
+    let mut outgoing = BTreeMap::<String, Vec<String>>::new();
+    let allowed_resource_scopes = request
+        .capabilities
+        .iter()
+        .filter_map(|capability| capability.strip_prefix("resource:"))
+        .collect::<Vec<_>>();
+    let mut total_instances = 0usize;
+    for node in &proposal.nodes {
+        if node.node_id.trim().is_empty()
+            || !node.node_id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
+        {
+            reject(status, findings, "semantic_node_id_is_not_portable");
+        }
+        if !ids.insert(node.node_id.clone()) {
+            reject(status, findings, "duplicate_semantic_node_id");
+        }
+        indegree.insert(node.node_id.clone(), 0);
+        if node.objective.trim().is_empty() {
+            reject(status, findings, "semantic_node_objective_is_empty");
+        }
+        if node.multiplicity == 0 || node.multiplicity > 100 {
+            reject(status, findings, "semantic_node_multiplicity_out_of_range");
+        }
+        total_instances = total_instances.saturating_add(usize::from(node.multiplicity));
+        if node.recipe == CapabilityRecipeId::Direct {
+            reject(
+                status,
+                findings,
+                "direct_recipe_must_continue_in_the_current_turn",
+            );
+        }
+        if node
+            .output_artifacts
+            .iter()
+            .any(|artifact| artifact.trim().is_empty())
+        {
+            reject(status, findings, "empty_output_artifact_contract");
+        }
+        for scope in &node.resource_scopes {
+            if !valid_relative_scope(scope)
+                || !allowed_resource_scopes
+                    .iter()
+                    .any(|allowed| scope_within(scope, allowed))
+            {
+                reject(status, findings, "semantic_node_resource_scope_not_leased");
+            }
+        }
+    }
+    if request
+        .constraints
+        .max_parallel_agents
+        .is_some_and(|maximum| total_instances > maximum)
+    {
+        reject(status, findings, "proposal_exceeds_parallel_agent_ceiling");
+    }
+    for node in &proposal.nodes {
+        for dependency in &node.depends_on {
+            if ids.contains(dependency) {
+                *indegree.entry(node.node_id.clone()).or_default() += 1;
+                outgoing
+                    .entry(dependency.clone())
+                    .or_default()
+                    .push(node.node_id.clone());
+            } else if request.operation == RuntimeOrchestrationOperation::Propose {
+                reject(status, findings, "proposal_dependency_is_missing");
+            }
+        }
+    }
+    let mut frontier = indegree
+        .iter()
+        .filter_map(|(id, count)| (*count == 0).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    let mut visited = 0usize;
+    while let Some(id) = frontier.pop() {
+        visited += 1;
+        for target in outgoing.get(&id).into_iter().flatten() {
+            let count = indegree.get_mut(target).expect("validated semantic node");
+            *count -= 1;
+            if *count == 0 {
+                frontier.push(target.clone());
+            }
+        }
+    }
+    if visited != ids.len() {
+        reject(status, findings, "proposal_dependency_cycle");
+    }
+}
+
+fn valid_relative_scope(scope: &str) -> bool {
+    let (_, value) = scope.split_once(':').unwrap_or(("", scope));
+    !value.trim().is_empty()
+        && !value.starts_with('/')
+        && !value.split(['/', '\\']).any(|part| part == "..")
+        && !value.contains(':')
+}
+
+fn scope_within(requested: &str, allowed: &str) -> bool {
+    let requested = requested
+        .split_once(':')
+        .map_or(requested, |(_, value)| value);
+    let allowed = allowed.split_once(':').map_or(allowed, |(_, value)| value);
+    requested == allowed
+        || requested
+            .strip_prefix(allowed)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn approval_requirement(
     request: &RuntimeOrchestrationRequest,
     execution: &RuntimeExecutionDecision,
 ) -> Option<RuntimeOrchestrationApprovalRequirement> {
-    let explicit_risk_gate = request.action == RuntimeOrchestrationAction::RequestRiskGate;
-    if (!explicit_risk_gate && !execution.gates().contains(&ExecutionPolicyGate::Approval))
-        || request.action == RuntimeOrchestrationAction::PlanOnly
+    if request.operation == RuntimeOrchestrationOperation::Inspect
+        || !execution.gates().contains(&ExecutionPolicyGate::Approval)
     {
         return None;
     }
-
     Some(RuntimeOrchestrationApprovalRequirement {
-        action: format!("runtime_orchestrate:{}", request.action.as_str()),
+        action: format!("runtime_orchestrate:{}", request.operation.as_str()),
         session_id: request.session_id.clone(),
         approval_id: request
             .constraints
@@ -211,7 +370,7 @@ fn approval_requirement(
 
 fn validate_global_approval(
     requirement: &RuntimeOrchestrationApprovalRequirement,
-    dispatch_status: &str,
+    accepted_status: &str,
     status: &mut String,
     findings: &mut Vec<String>,
     approval_queue: Option<&ApprovalQueue>,
@@ -226,102 +385,36 @@ fn validate_global_approval(
         findings.push("global_approval_receipt_not_found".to_string());
         return;
     };
-
-    let mut mismatched = false;
-    if receipt.source.session_id != requirement.session_id {
-        findings.push("global_approval_session_mismatch".to_string());
-        mismatched = true;
-    }
-    if receipt.action != requirement.action {
-        findings.push("global_approval_action_mismatch".to_string());
-        mismatched = true;
-    }
-    if mismatched {
-        *status = "rejected".to_string();
+    if receipt.source.session_id != requirement.session_id || receipt.action != requirement.action {
+        reject(status, findings, "global_approval_binding_mismatch");
         return;
     }
-
     match receipt.status {
         GlobalApprovalStatus::Approved => {
             findings.push("global_approval_receipt_validated".to_string());
             if status == "needs_approval" {
-                *status = dispatch_status.to_string();
+                *status = accepted_status.to_string();
             }
         }
         GlobalApprovalStatus::Pending => {
             require_approval(status);
             findings.push("global_approval_pending".to_string());
         }
-        GlobalApprovalStatus::Denied => {
-            *status = "rejected".to_string();
-            findings.push("global_approval_denied".to_string());
-        }
-        GlobalApprovalStatus::TimedOut => {
-            *status = "rejected".to_string();
-            findings.push("global_approval_timed_out".to_string());
+        GlobalApprovalStatus::Denied | GlobalApprovalStatus::TimedOut => {
+            reject(status, findings, "global_approval_not_approved");
         }
     }
+}
+
+fn reject(status: &mut String, findings: &mut Vec<String>, finding: &str) {
+    *status = "rejected".to_string();
+    findings.push(finding.to_string());
 }
 
 fn require_approval(status: &mut String) {
     if status != "rejected" {
         *status = "needs_approval".to_string();
     }
-}
-
-fn strategy_authorizes(
-    request: &RuntimeOrchestrationRequest,
-    execution: &RuntimeExecutionDecision,
-) -> bool {
-    use RuntimeOrchestrationAction as Action;
-
-    match request.action {
-        Action::PlanOnly | Action::RequestRiskGate => true,
-        Action::RequestParallelTools => {
-            execution.pattern() == ExecutionPattern::Explore
-                && execution
-                    .modifiers()
-                    .contains(&harness_contract::core::ExecutionModifier::Parallel)
-        }
-        Action::RequestRewooEvidence => execution.pattern() == ExecutionPattern::Explore,
-        Action::RequestSubagent => execution.pattern() == ExecutionPattern::Execute,
-        Action::RequestVerification | Action::RequestReflexionRetry => {
-            execution.pattern() != ExecutionPattern::Direct
-        }
-        Action::RequestDeliberation => execution.pattern() == ExecutionPattern::Deliberate,
-        // Team is an execution carrier selected by the cost/resource model,
-        // while Explore/Execute/Deliberate describes the semantic work. An
-        // external-research Team therefore legitimately carries Explore and
-        // must not be rejected merely because its transport is collaborative.
-        Action::RequestTeam => {
-            let selected = execution.strategy.selected_candidate
-                == harness_contract::strategy::ExecutionCandidateKind::Team;
-            match request.selection_mode {
-                Some(harness_contract::team::TeamSelectionMode::Automatic) => selected,
-                Some(harness_contract::team::TeamSelectionMode::Explicit)
-                | Some(harness_contract::team::TeamSelectionMode::ModelAssisted)
-                | None => {
-                    selected
-                        || (execution.strategy.understanding.requests_multi_agent
-                            && !execution.strategy.understanding.forbids_team)
-                }
-            }
-        }
-        Action::RequestBackgroundReview | Action::DispatchSession => {
-            execution.pattern() == ExecutionPattern::Supervise
-        }
-    }
-}
-
-fn team_candidate_carries_semantic_pattern(
-    request: &RuntimeOrchestrationRequest,
-    execution: &RuntimeExecutionDecision,
-) -> bool {
-    request.action == RuntimeOrchestrationAction::RequestTeam
-        && (execution.strategy.selected_candidate
-            == harness_contract::strategy::ExecutionCandidateKind::Team
-            || (execution.strategy.understanding.requests_multi_agent
-                && !execution.strategy.understanding.forbids_team))
 }
 
 fn push_gate(gates: &mut Vec<ExecutionPolicyGate>, gate: ExecutionPolicyGate) {

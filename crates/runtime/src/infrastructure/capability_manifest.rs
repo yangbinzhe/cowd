@@ -224,63 +224,63 @@ impl RuntimeCapabilityCatalog {
             action_contracts: vec![
                 action_contract(
                     "run_deliberation_protocol",
-                    "request_deliberation",
-                    "Conflicting options, evidence quality, or material tradeoffs need the versioned debate Team template rather than a string consensus.",
-                    &["intent", "session_id", "template_hint optional"],
+                    "propose",
+                    "Conflicting options or material tradeoffs need semantic review and synthesis nodes or a versioned Team template.",
+                    &["intent", "operation=propose", "proposal.nodes"],
                     &["execution_graph", "graph_projection", "terminal_result_ref"],
                 ),
                 action_contract(
                     "run_review_fix_protocol",
-                    "request_reflexion_retry",
-                    "A bounded implementation or answer needs independent review and exactly one explicit remediation pass.",
-                    &["intent", "session_id", "reason optional"],
+                    "revise",
+                    "A running graph needs an evidence-backed review or remediation node without restarting committed work.",
+                    &["intent", "operation=revise", "proposal.target_execution_id", "proposal.expected_revision"],
                     &["execution_graph", "graph_projection", "terminal_result_ref"],
                 ),
                 action_contract(
                     "use_team_template",
-                    "request_team",
+                    "propose",
                     "Complex implementation, audit, research, debate, incident, or long-running work benefits from role split.",
-                    &["intent", "template_hint optional", "focus_partition_plans optional", "reason optional"],
+                    &["intent", "operation=propose", "proposal.nodes[].recipe=team"],
                     &["team_projection", "agent_projection", "execution_graph"],
                 ),
                 action_contract(
                     "build_execution_graph",
-                    "request_team",
+                    "propose",
                     "The model wants explicit dependencies, parallel lanes, review, and synthesis for a team.",
-                    &["intent", "template_hint optional", "focus_partition_plans optional"],
+                    &["intent", "operation=propose", "proposal.nodes", "proposal.completion"],
                     &["execution_graph", "execution_graph_quality", "ready_node_ids"],
                 ),
                 action_contract(
                     "dispatch_session",
-                    "dispatch_session",
+                    "propose",
                     "A background or related session should run or receive work from the current mission.",
-                    &["intent", "session_id", "target_session_id"],
+                    &["intent", "operation=propose", "proposal.nodes[].recipe=session_dispatch"],
                     &["session_handoff", "execution_graph", "correlation_result"],
                 ),
                 action_contract(
                     "request_arbiter",
-                    "request_risk_gate",
+                    "control",
                     "Evidence conflicts, graph blocks, or policy disagreement require explicit resolution.",
-                    &["intent", "risk optional", "evidence_refs optional"],
+                    &["intent", "operation=control", "control", "evidence_refs optional"],
                     &["conflict_projection", "approval_projection"],
                 ),
                 action_contract(
                     "parallel_tool_batch",
-                    "request_parallel_tools",
-                    "Independent read-only evidence can be gathered faster as a scheduler batch.",
-                    &["intent", "capabilities optional"],
-                    &["tool_intents", "schedule"],
+                    "propose",
+                    "Independent semantic Agent nodes can be admitted in parallel; ordinary tools remain owned by the Tool DAG.",
+                    &["intent", "operation=propose", "proposal.nodes with independent dependencies"],
+                    &["execution_graph", "runtime.evidence_refs"],
                 ),
                 action_contract(
                     "ask_approval",
-                    "request_risk_gate",
+                    "control",
                     "The next action is high-risk, destructive, external, or requires human authority.",
-                    &["intent", "risk", "reason optional"],
+                    &["intent", "constraints.risk=critical", "constraints.approval_id optional"],
                     &["approval_projection", "policy_gates"],
                 ),
                 action_contract(
                     "continue_single",
-                    "plan_only",
+                    "inspect",
                     "The task is simple enough that team/session overhead would reduce efficiency.",
                     &["intent"],
                     &["execution_decision"],
@@ -340,11 +340,11 @@ impl RuntimeCapabilityManifest {
                 ),
                 capability(
                     "runtime_orchestration",
-                    "Model-visible runtime control-plane for plan_only, teams, subagents, verification, ReWOO, Tool DAG, deliberation, reflexion, risk gates, and session links.",
+                    "Model-visible semantic control plane for inspect, propose, revise, and control over Agent, Team, review, synthesis, and session-dispatch graph recipes.",
                     &["runtime_capabilities", "runtime_orchestrate"],
                     &[
-                        "Use plan_only before complex implementation, architecture, or multi-agent work.",
-                        "Use request_team/request_parallel_tools/request_rewoo_evidence/request_deliberation/request_reflexion_retry when the task clearly benefits from higher-order runtime execution.",
+                        "Inspect current Runtime state before changing an existing graph.",
+                        "Propose semantic nodes and dependencies; revise by exact graph revision; never provide executors or leases.",
                     ],
                 ),
                 capability(
@@ -399,11 +399,11 @@ pub fn runtime_capability_primer() -> String {
     lines.extend([
         String::new(),
         "Runtime action contract:".to_string(),
-        "When higher-order execution is useful, inspect options through read-only `runtime_capabilities`; use `runtime_orchestrate` only when it is an active native schema and a stateful runtime operation may create teams, session commands, approvals, or evidence records.".to_string(),
+        "When higher-order execution is useful, inspect options through `runtime_capabilities`; use `runtime_orchestrate` only through inspect/propose/revise/control when its native schema is active.".to_string(),
     ]);
     for action in &catalog.action_contracts {
         lines.push(format!(
-            "- runtime_action=`{}` -> runtime_orchestrate action=`{}`: {}",
+            "- runtime_action=`{}` -> runtime_orchestrate operation=`{}`: {}",
             action.runtime_action, action.tool_action, action.when_to_use
         ));
     }
@@ -620,7 +620,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
             "use_or_request_subagents_for_independent_domains": true,
             "avoid_repeated_overlapping_reads": true,
             "current_turn_overrides_conflicting_memory": true,
-            "fallback_when_stalled": "switch execution pattern by querying runtime_capabilities first, then use runtime_orchestrate(request_reflexion_retry/request_parallel_tools) only when stateful runtime orchestration is intended, or answer with checked evidence, current judgment, remaining risks, and next best step"
+            "fallback_when_stalled": "inspect the current graph, then propose or revise a bounded semantic review/evidence path; do not repeat unchanged work"
         },
         "advanced_execution": {
             "available_on_detail": "orchestration_options",
@@ -822,7 +822,7 @@ fn runtime_action_plane<T: Serialize>(
         },
         "required_args": {
             "runtime_capabilities": ["intent"],
-            "runtime_orchestrate": ["intent", "action"],
+            "runtime_orchestrate": ["intent", "operation"],
         },
         "expected_events": [
             "RuntimeRun",
@@ -837,29 +837,28 @@ fn runtime_action_plane<T: Serialize>(
                 "when": "complex work has independent domains, reviewers, or parallel evidence needs",
                 "steps": [
                     {"tool": "runtime_capabilities", "args": {"detail": "team_templates"}},
-                    {"tool": "runtime_orchestrate", "args": {"action": "request_team"}, "session_id": "auto_bound_by_gateway"}
+                    {"tool": "runtime_orchestrate", "args": {"operation": "propose", "proposal": {"nodes": [{"recipe": "team"}]}}, "session_id": "auto_bound_by_gateway"}
                 ]
             },
             {
                 "name": "parallel_readonly_evidence",
                 "when": "several read-only facts can be gathered independently",
                 "steps": [
-                    {"tool": "runtime_orchestrate", "args": {"action": "request_parallel_tools"}},
-                    {"tool": "tool_batch_readonly", "args": "execute returned independent reads when available"}
+                    {"tool": "runtime_orchestrate", "args": {"operation": "propose", "proposal": {"nodes": [{"recipe": "agent"}, {"recipe": "agent"}]}}}
                 ]
             },
             {
                 "name": "rewoo_evidence_plan",
                 "when": "the task needs explicit evidence variables before synthesis",
                 "steps": [
-                    {"tool": "runtime_orchestrate", "args": {"action": "request_rewoo_evidence"}}
+                    {"tool": "runtime_orchestrate", "args": {"operation": "propose", "proposal": {"nodes": [{"recipe": "agent"}, {"recipe": "synthesis"}]}}}
                 ]
             },
             {
                 "name": "reflexion_on_stall",
                 "when": "tool path repeats, evidence novelty drops, or answer quality is blocked",
                 "steps": [
-                    {"tool": "runtime_orchestrate", "args": {"action": "request_reflexion_retry"}}
+                    {"tool": "runtime_orchestrate", "args": {"operation": "revise", "proposal": {"nodes": [{"recipe": "review"}]}}}
                 ]
             }
         ]) } else { json!([]) },
@@ -1476,11 +1475,10 @@ mod tests {
             .iter()
             .any(|group| group.operations.iter().any(|op| op.id == "request_arbiter")));
         assert!(catalog.action_contracts.iter().any(|contract| {
-            contract.runtime_action == "use_team_template" && contract.tool_action == "request_team"
+            contract.runtime_action == "use_team_template" && contract.tool_action == "propose"
         }));
         assert!(catalog.action_contracts.iter().any(|contract| {
-            contract.runtime_action == "dispatch_session"
-                && contract.tool_action == "dispatch_session"
+            contract.runtime_action == "dispatch_session" && contract.tool_action == "propose"
         }));
     }
 }

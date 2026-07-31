@@ -611,13 +611,17 @@ fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
     }
     serde_json::from_str::<serde_json::Value>(&call.input)
         .ok()
-        .and_then(|input| {
-            input
-                .get("action")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
+        .is_some_and(|input| {
+            input.get("operation").and_then(serde_json::Value::as_str) == Some("propose")
+                && input
+                    .pointer("/proposal/nodes")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            node.get("recipe").and_then(serde_json::Value::as_str) == Some("team")
+                        })
+                    })
         })
-        .is_some_and(|action| action == "request_team")
 }
 
 fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
@@ -646,9 +650,24 @@ fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
         name: "runtime_orchestrate".to_string(),
         input: serde_json::json!({
             "intent": objective,
-            "action": "request_team",
-            "reason": "the user explicitly requires an actually started collaboration team",
-            "template_hint": template,
+            "operation": "propose",
+            "proposal": {
+                "mutation_id": format!("explicit-team-{}", uuid::Uuid::new_v4()),
+                "reason": "the user explicitly requires an actually started collaboration team",
+                "nodes": [{
+                    "node_id": "explicit-team",
+                    "recipe": "team",
+                    "objective": objective,
+                    "template": template,
+                    "output_artifacts": ["terminal_synthesis"],
+                    "evidence_contract": ["summary", "evidence", "unresolved"]
+                }],
+                "completion": {
+                    "required_node_ids": ["explicit-team"],
+                    "required_artifact_kinds": ["terminal_synthesis"],
+                    "allow_unresolved_conflicts": false
+                }
+            },
             "constraints": {
                 "max_parallel_agents": 3,
                 "risk": "low",
@@ -11778,7 +11797,8 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "runtime_orchestrate");
         let input: serde_json::Value = serde_json::from_str(&calls[0].input).unwrap();
-        assert_eq!(input["action"], "request_team");
+        assert_eq!(input["operation"], "propose");
+        assert_eq!(input["proposal"]["nodes"][0]["recipe"], "team");
     }
 
     #[test]
@@ -11973,7 +11993,7 @@ mod tests {
         let input = serde_json::from_str::<serde_json::Value>(&call.input)
             .expect("runtime orchestration input is JSON");
         assert_eq!(
-            input["template_hint"],
+            input["proposal"]["nodes"][0]["template"],
             serde_json::json!("cowd/parallel-research-synthesis")
         );
     }
@@ -14680,7 +14700,7 @@ mod tests {
                         "display_name": "custom_reader",
                         "source": "test",
                         "schema_hash": "read-v1",
-                        "required_permission": "read_only",
+                        "required_permission": "read-only",
                         "permission_source": "test",
                         "health": "healthy"
                     }],
@@ -14912,11 +14932,33 @@ mod tests {
         let ModelStepIntent::ToolCalls { calls } = first.intent else {
             panic!("first request must invoke ToolSearch");
         };
+        {
+            let exposure = runtime
+                .tool_exposure_state
+                .lock()
+                .expect("tool exposure state");
+            let exposure = exposure
+                .as_ref()
+                .expect("first provider request must persist its exposure state");
+            assert!(
+                exposure.deferred.contains("custom_reader"),
+                "custom_reader must be discoverable before ToolSearch activation: {exposure:?}"
+            );
+        }
         let discovery_output = runtime
             .tool_executor
             .execute_output("ToolSearch", &calls[0].input)
             .await
             .expect("governed ToolSearch execution");
+        let parsed_discovery =
+            serde_json::from_str::<harness_contract::tool::ToolDiscoveryReceipt>(
+                discovery_output.model_text(),
+            )
+            .expect("ToolSearch must return a canonical discovery receipt");
+        assert_eq!(
+            parsed_discovery.activation_candidates,
+            vec!["custom_reader".to_string()]
+        );
         let discovery_result = runtime
             .prepare_governed_tool_result(
                 &calls[0].id,

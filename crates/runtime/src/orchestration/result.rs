@@ -1,6 +1,23 @@
 use harness_contract::core::{ExecutionPattern, ExecutionPolicyGate};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeStateSnapshot {
+    pub snapshot_generation: u64,
+    pub target_execution_id: Option<String>,
+    pub graph: Option<harness_contract::execution_graph::ExecutionGraphProjection>,
+    pub child_graphs: Vec<harness_contract::execution_graph::ExecutionGraphProjection>,
+    pub capability_recipes: Vec<String>,
+    pub team_templates: Vec<String>,
+    pub permission_ceiling: harness_contract::policy::PermissionMode,
+    pub pending_approvals: usize,
+    pub execution_health: Value,
+    pub team_board_revisions: BTreeMap<String, u64>,
+    pub unresolved_conflicts: Vec<String>,
+    pub artifact_refs: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationApprovalRequirement {
@@ -42,6 +59,22 @@ impl RuntimeOrchestrationResult {
     #[must_use]
     pub fn model_receipt(&self) -> Value {
         let execution = &self.execution;
+        let runtime_snapshot = (self.status == "inspected").then(|| {
+            json!({
+                "snapshot_generation": execution.get("snapshot_generation"),
+                "target_execution_id": execution.get("target_execution_id"),
+                "graph": execution.get("graph"),
+                "child_graphs": execution.get("child_graphs"),
+                "capability_recipes": execution.get("capability_recipes"),
+                "team_templates": execution.get("team_templates"),
+                "permission_ceiling": execution.get("permission_ceiling"),
+                "pending_approvals": execution.get("pending_approvals"),
+                "execution_health": execution.get("execution_health"),
+                "team_board_revisions": execution.get("team_board_revisions"),
+                "unresolved_conflicts": execution.get("unresolved_conflicts"),
+                "artifact_refs": execution.get("artifact_refs"),
+            })
+        });
         let terminal_result_ref = execution
             .get("terminal_result_ref")
             .and_then(Value::as_str)
@@ -88,15 +121,14 @@ impl RuntimeOrchestrationResult {
                 "focus_overlap_assessment": execution.get("focus_overlap_assessment"),
             },
             "team_id": self.evidence.get("team_id"),
+            "runtime_snapshot": runtime_snapshot,
             "working_state_verified": self.evidence.get("working_state_verified"),
             "focus_overlap_verified": self.evidence.get("focus_overlap_verified"),
             "focus_overlap_exceeded": self.evidence.get("focus_overlap_exceeded"),
             "evidence": {
-                "action": self.evidence.get("action"),
+                "operation": self.evidence.get("operation"),
                 "compiled": self.evidence.get("compiled"),
-                "strategy_lease_id": self
-                    .evidence
-                    .pointer("/strategy_lease/lease_id"),
+                "strategy_lease_id": self.evidence.get("strategy_lease_id"),
                 "accepted": self.evidence.get("accepted"),
                 "executed": self.evidence.get("executed"),
                 "reused": self.evidence.get("reused"),

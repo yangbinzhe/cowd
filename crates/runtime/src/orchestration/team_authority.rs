@@ -3,127 +3,105 @@
 //! Callers may request collaboration and suggest a published template, but
 //! only Runtime derives filesystem, network, and session evidence leases.
 
-use std::path::{Component, Path};
+use std::path::Path;
 
 use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
 
 use crate::execution_core::RuntimeExecutionDecision;
+use crate::orchestration::{CapabilityRecipeId, RuntimeOrchestrationRequest, SemanticFocus};
 
-use super::{RuntimeOrchestrationAction, RuntimeOrchestrationRequest};
-
-pub(crate) fn bind_team_resource_authority(
+pub(crate) fn bind_semantic_resource_authority(
     request: &mut RuntimeOrchestrationRequest,
     leased_decision: Option<&RuntimeExecutionDecision>,
     workspace_root: &Path,
 ) {
-    if request.action != RuntimeOrchestrationAction::RequestTeam {
+    let Some(proposal) = request.proposal.as_mut() else {
         return;
-    }
-
-    // A provider may suggest a narrow scope, but resource authority is never
-    // accepted from model JSON. Preserve the suggestion only long enough for
-    // Runtime to validate and crop it against the active workspace.
-    let proposed_resource_scopes = request
-        .capabilities
-        .iter()
-        .filter_map(|capability| capability.strip_prefix("resource:"))
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    request
-        .capabilities
-        .retain(|capability| !capability.starts_with("resource:"));
-
+    };
     let inferred = harness_contract::strategy::decide_strategy(
         &harness_contract::strategy::StrategyInput::from_prompt(&request.intent),
     );
     let understanding = leased_decision
         .map(|decision| &decision.strategy.understanding)
         .unwrap_or(&inferred.understanding);
-    // `requires_write` is authority, not a model preference. The admitted
-    // Runtime decision is the only source allowed to grant mutation scope.
-    // Overwrite the provider field so validation and compilation consume the
-    // same authoritative fact.
-    let requires_write = understanding.requires_write;
+    let requires_write = understanding.requires_write
+        && request
+            .constraints
+            .permission_ceiling
+            .permits(harness_contract::policy::PermissionMode::WorkspaceWrite);
     request.constraints.requires_write = Some(requires_write);
-    let external_research = understanding.requires_external_facts;
-    let explicit_team = understanding.requests_multi_agent
-        || request.selection_mode == Some(harness_contract::team::TeamSelectionMode::Explicit);
     let requested_count = request
         .constraints
         .max_parallel_agents
         .unwrap_or_else(|| usize::from(understanding.independent_workstreams.max(2)))
         .clamp(2, 6);
-
-    if external_research {
-        request.template_hint = Some("cowd/external-research-synthesis".to_string());
-    }
-    let mut proposed_scopes = request
-        .focus_partition_plans
-        .iter()
-        .flat_map(|plan| &plan.slots)
-        .flat_map(|slot| &slot.capability_cropped_refs)
-        .map(String::as_str)
-        .chain(proposed_resource_scopes.iter().map(String::as_str))
-        .filter_map(|scope| {
-            recrop_proposed_scope(scope, workspace_root, requires_write, external_research)
-        })
-        .collect::<Vec<_>>();
-    proposed_scopes.sort();
-    proposed_scopes.dedup();
-    request.focus_partition_plans = derive_team_focus_partition_plans(
+    let explicit_team = understanding.requests_multi_agent
+        || proposal
+            .nodes
+            .iter()
+            .any(|node| node.recipe == CapabilityRecipeId::Team);
+    let plans = derive_team_focus_partition_plans(
         &request.intent,
         workspace_root,
-        &proposed_scopes,
+        &[],
         requested_count,
         requires_write,
         explicit_team,
-        external_research,
+        understanding.requires_external_facts,
     );
-
-    request.capabilities.extend(
-        request
-            .focus_partition_plans
-            .iter()
-            .flat_map(|plan| &plan.slots)
-            .flat_map(|slot| &slot.capability_cropped_refs)
-            .map(|scope| format!("resource:{scope}")),
-    );
+    let mut scopes = plans
+        .iter()
+        .flat_map(|plan| &plan.slots)
+        .flat_map(|slot| &slot.capability_cropped_refs)
+        .cloned()
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    let authorized_focuses = plans
+        .iter()
+        .flat_map(|plan| {
+            plan.slots.iter().map(|slot| SemanticFocus {
+                focus_id: slot.focus_id.clone(),
+                role_id: plan.role_id.clone(),
+                objective: slot.boundary.clone(),
+                resource_scopes: slot.capability_cropped_refs.clone(),
+                evidence_responsibilities: vec![slot.evidence_responsibility.clone()],
+            })
+        })
+        .collect::<Vec<_>>();
+    for node in &mut proposal.nodes {
+        if matches!(
+            node.recipe,
+            CapabilityRecipeId::Agent
+                | CapabilityRecipeId::Team
+                | CapabilityRecipeId::Review
+                | CapabilityRecipeId::Synthesis
+        ) {
+            node.resource_scopes = scopes.clone();
+        }
+        if node.recipe == CapabilityRecipeId::Team {
+            // Team partitions are an authority-bearing contract. Preserve the
+            // model's semantic request at the node level, but always replace
+            // role/focus resource assignments with Runtime-derived partitions.
+            node.focuses.clone_from(&authorized_focuses);
+        } else if !node.focuses.is_empty() && !authorized_focuses.is_empty() {
+            // Model-defined Agent focus text remains useful, but each instance
+            // receives one bounded Runtime-derived scope instead of the union.
+            for (index, focus) in node.focuses.iter_mut().enumerate() {
+                focus.resource_scopes.clone_from(
+                    &authorized_focuses[index % authorized_focuses.len()].resource_scopes,
+                );
+            }
+        }
+    }
+    request
+        .capabilities
+        .retain(|value| !value.starts_with("resource:"));
+    request
+        .capabilities
+        .extend(scopes.into_iter().map(|scope| format!("resource:{scope}")));
     request.capabilities.sort();
     request.capabilities.dedup();
-}
-
-fn recrop_proposed_scope(
-    scope: &str,
-    workspace_root: &Path,
-    requires_write: bool,
-    external_research: bool,
-) -> Option<String> {
-    if scope == "network:*" {
-        return external_research.then(|| scope.to_string());
-    }
-    if external_research {
-        return None;
-    }
-    let (access, relative) = scope.split_once(':')?;
-    if access != "read" && access != "write" {
-        return None;
-    }
-    if requires_write != (access == "write") {
-        return None;
-    }
-    let relative = Path::new(relative);
-    if relative.as_os_str().is_empty()
-        || relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return None;
-    }
-    workspace_root
-        .join(relative)
-        .exists()
-        .then(|| format!("{access}:{}", relative.to_string_lossy().replace('\\', "/")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -568,163 +546,87 @@ fn workspace_focus_score(objective: &str, path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::{
+        GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationConstraints,
+        RuntimeOrchestrationOperation,
+    };
+    use harness_contract::execution_graph::ExecutionCompletionContract;
 
     #[test]
-    fn external_research_uses_network_leases_without_workspace_guessing() {
-        let root = tempfile::tempdir().expect("workspace");
-        std::fs::create_dir_all(root.path().join("apps/mfg")).expect("fixture");
-        let plans = derive_team_focus_partition_plans(
-            "Research current WAIC developments",
-            root.path(),
-            &[],
-            3,
-            false,
-            true,
-            true,
-        );
-        let scopes = plans
-            .iter()
-            .flat_map(|plan| &plan.slots)
-            .flat_map(|slot| &slot.capability_cropped_refs)
-            .collect::<Vec<_>>();
-        assert!(!scopes.is_empty());
-        assert!(scopes.iter().all(|scope| scope.as_str() == "network:*"));
-    }
-
-    #[test]
-    fn model_supplied_resource_scopes_are_replaced_by_runtime_authority() {
-        let root = tempfile::tempdir().expect("workspace");
-        std::fs::create_dir_all(root.path().join("apps/mfg")).expect("fixture");
-        let mut request: RuntimeOrchestrationRequest = serde_json::from_value(serde_json::json!({
-            "intent": "Research the latest current WAIC developments using a team",
-            "action": "request_team",
-            "selection_mode": "explicit",
-            "capabilities": [
-                "resource:write:.",
-                "resource:read:apps/mfg",
-                "tool:WebSearch"
-            ],
-            "focus_partition_plans": [{
-                "role_id": "researcher",
-                "shared_baseline": [],
-                "slots": [{
-                    "focus_id": "wrong-local-focus",
-                    "scope_hash": "model-supplied",
-                    "boundary": "inspect apps/mfg",
-                    "evidence_responsibility": "local files",
-                    "capability_cropped_refs": ["read:apps/mfg"],
-                    "overlap_budget_bp": 0,
-                    "novelty_target_bp": 0,
-                    "output_contract": ["findings"],
-                    "output_acceptance": ["evidence_scope:apps/mfg"]
-                }]
-            }],
-            "constraints": {"max_parallel_agents": 3, "requires_write": false}
-        }))
-        .expect("request");
-
-        bind_team_resource_authority(&mut request, None, root.path());
-
-        assert_eq!(
-            request.template_hint.as_deref(),
-            Some("cowd/external-research-synthesis")
-        );
-        assert!(request.capabilities.contains(&"tool:WebSearch".to_string()));
-        assert!(!request
-            .capabilities
-            .iter()
-            .any(|capability| capability == "resource:write:."));
-        assert!(request
-            .capabilities
-            .iter()
-            .any(|capability| capability == "resource:network:*"));
-        assert!(request
-            .focus_partition_plans
-            .iter()
-            .flat_map(|plan| &plan.slots)
-            .flat_map(|slot| &slot.capability_cropped_refs)
-            .all(|scope| scope == "network:*"));
-        assert!(request
-            .focus_partition_plans
-            .iter()
-            .flat_map(|plan| &plan.slots)
-            .flat_map(|slot| &slot.output_acceptance)
-            .all(|criterion| !criterion.contains("apps/mfg")));
-    }
-
-    #[test]
-    fn model_cannot_promote_research_request_to_workspace_write() {
-        let root = tempfile::tempdir().expect("workspace");
-        let objective = "Form a team to research current WAIC developments and synthesize evidence";
-        let decision = crate::execution_core::build_runtime_execution_decision(objective, None);
-        assert!(!decision.strategy.understanding.requires_write);
-        assert!(decision.strategy.understanding.requires_external_facts);
-        let mut request: RuntimeOrchestrationRequest = serde_json::from_value(serde_json::json!({
-            "intent": objective,
-            "action": "request_team",
-            "capabilities": ["WebSearch", "WebFetch", "write_file"],
-            "constraints": {"max_parallel_agents": 3, "requires_write": true}
-        }))
-        .expect("request");
-
-        bind_team_resource_authority(&mut request, Some(&decision), root.path());
-
-        assert_eq!(request.constraints.requires_write, Some(false));
-        assert_eq!(
-            request.template_hint.as_deref(),
-            Some("cowd/external-research-synthesis")
-        );
-        assert!(request
-            .capabilities
-            .iter()
-            .any(|capability| capability == "resource:network:*"));
-        assert!(!request
-            .capabilities
-            .iter()
-            .any(|capability| capability.starts_with("resource:write:")));
-    }
-
-    #[test]
-    fn local_webui_review_keeps_runtime_cropped_workspace_leases() {
-        let root = tempfile::tempdir().expect("workspace");
+    fn runtime_replaces_model_team_scopes_with_disjoint_authoritative_partitions() {
+        let workspace = tempfile::tempdir().expect("workspace");
         for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
-            std::fs::create_dir_all(root.path().join(relative)).expect("fixture");
+            std::fs::create_dir_all(workspace.path().join(relative)).expect("workspace partition");
         }
-        let objective = "这是复杂架构审查，必须实际启动一个多 Agent 协作团队，分别审视 crates/runtime、crates/gateway、surfaces/webui 的策略事件接线、权限边界和用户可见状态，再交叉验证并综合证据。";
-        let decision = crate::execution_core::build_runtime_execution_decision(objective, None);
-        assert!(
-            !decision.strategy.understanding.requires_external_facts,
-            "{:?}",
-            decision.strategy.understanding
-        );
-        let mut request: RuntimeOrchestrationRequest = serde_json::from_value(serde_json::json!({
-            "intent": objective,
-            "action": "request_team",
-            "selection_mode": "automatic",
-            "capabilities": [
-                "resource:read:crates/runtime",
-                "resource:read:crates/gateway",
-                "resource:read:surfaces/webui"
-            ],
-            "constraints": {"max_parallel_agents": 3, "requires_write": false}
-        }))
-        .expect("request");
+        let mut request = RuntimeOrchestrationRequest {
+            intent: "必须启动 Team 审查 runtime gateway webui 架构".to_string(),
+            model_lease: None,
+            session_id: Some("session-1".to_string()),
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "mutation-1".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: vec![GraphSemanticNode {
+                    node_id: "team".to_string(),
+                    recipe: CapabilityRecipeId::Team,
+                    objective: "审查三个边界".to_string(),
+                    depends_on: Vec::new(),
+                    multiplicity: 1,
+                    focuses: vec![
+                        SemanticFocus {
+                            focus_id: "model-a".to_string(),
+                            role_id: "researcher".to_string(),
+                            objective: "model scope a".to_string(),
+                            resource_scopes: vec!["write:../../outside".to_string()],
+                            evidence_responsibilities: Vec::new(),
+                        },
+                        SemanticFocus {
+                            focus_id: "model-b".to_string(),
+                            role_id: "researcher".to_string(),
+                            objective: "model scope b".to_string(),
+                            resource_scopes: vec!["write:../../outside".to_string()],
+                            evidence_responsibilities: Vec::new(),
+                        },
+                    ],
+                    template: None,
+                    input_refs: Vec::new(),
+                    output_artifacts: vec!["terminal_synthesis".to_string()],
+                    evidence_contract: vec!["summary".to_string()],
+                    resource_scopes: vec!["write:../../outside".to_string()],
+                }],
+                completion: ExecutionCompletionContract::default(),
+                reason: "independent review".to_string(),
+            }),
+            control: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: vec!["resource:write:../../outside".to_string()],
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints {
+                max_parallel_agents: Some(3),
+                permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+                ..RuntimeOrchestrationConstraints::default()
+            },
+            surface: None,
+        };
 
-        bind_team_resource_authority(&mut request, Some(&decision), root.path());
+        bind_semantic_resource_authority(&mut request, None, workspace.path());
 
-        assert_eq!(
-            request
-                .capabilities
-                .iter()
-                .filter(|capability| capability.starts_with("resource:"))
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![
-                "resource:read:crates/gateway".to_string(),
-                "resource:read:crates/runtime".to_string(),
-                "resource:read:surfaces/webui".to_string(),
-            ]
-        );
-        assert_eq!(request.focus_partition_plans[0].role_id, "researcher");
+        let node = &request.proposal.as_ref().expect("proposal").nodes[0];
+        assert!(node
+            .resource_scopes
+            .iter()
+            .all(|scope| scope.starts_with("read:") && !scope.contains("..")));
+        let researcher_scopes = node
+            .focuses
+            .iter()
+            .filter(|focus| focus.role_id == "researcher")
+            .map(|focus| focus.resource_scopes.clone())
+            .collect::<Vec<_>>();
+        assert!(researcher_scopes.len() >= 2);
+        assert!(researcher_scopes.iter().all(|scopes| scopes.len() == 1));
+        assert_ne!(researcher_scopes[0], researcher_scopes[1]);
     }
 }

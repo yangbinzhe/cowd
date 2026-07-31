@@ -211,6 +211,7 @@ impl ExecutionGraphStateStore {
             objective: graph.objective.clone(),
             service_class: graph.service_class,
             parent_execution: graph.parent_execution.clone(),
+            orchestration: graph.orchestration.clone(),
             nodes: graph
                 .nodes
                 .iter()

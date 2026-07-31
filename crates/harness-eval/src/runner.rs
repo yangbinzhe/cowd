@@ -766,6 +766,8 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             budget_lease: None,
             managed_invocation: None,
             resource_scopes: vec!["read:crates/runtime".to_string()],
+            upstream_evidence_refs: Vec::new(),
+            upstream_artifact_refs: Vec::new(),
         },
     ) {
         Ok(team_plan) => team_plan,

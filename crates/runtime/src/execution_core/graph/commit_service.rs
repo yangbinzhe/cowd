@@ -701,6 +701,101 @@ impl ExecutionCommitService {
             .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
     }
 
+    pub fn replan_semantic(
+        &self,
+        graph: &ExecutionGraph,
+        nodes: Vec<ExecutionNodeSpec>,
+        edges: Vec<ExecutionEdge>,
+        reason: String,
+        mutation_id: String,
+        completion: harness_contract::execution_graph::ExecutionCompletionContract,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        if mutation_id.trim().is_empty() {
+            return Err(ExecutionCommitError::InvalidReplan(
+                "semantic mutation id is empty".to_string(),
+            ));
+        }
+        validate_replan(graph, &nodes)?;
+        let added_node_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+        let mut next = graph.clone();
+        for node in &nodes {
+            next.node_statuses
+                .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        }
+        next.nodes.extend(nodes);
+        next.edges.extend(edges);
+        next.revision = next.revision.saturating_add(1);
+        let orchestration = next.orchestration.get_or_insert_with(|| {
+            harness_contract::execution_graph::ExecutionOrchestrationMetadata {
+                mutation_id: String::new(),
+                applied_mutation_ids: Vec::new(),
+                semantic_revision: 0,
+                source_generation: 0,
+                completion: Default::default(),
+            }
+        });
+        if orchestration
+            .applied_mutation_ids
+            .iter()
+            .any(|applied| applied == &mutation_id)
+        {
+            return Err(ExecutionCommitError::InvalidReplan(format!(
+                "semantic mutation `{mutation_id}` is already applied"
+            )));
+        }
+        orchestration.mutation_id = mutation_id.clone();
+        orchestration.applied_mutation_ids.push(mutation_id.clone());
+        orchestration.applied_mutation_ids.sort();
+        orchestration.applied_mutation_ids.dedup();
+        orchestration.semantic_revision = orchestration.semantic_revision.saturating_add(1);
+        orchestration.source_generation = orchestration.source_generation.saturating_add(1);
+        if !completion.required_node_ids.is_empty() {
+            orchestration
+                .completion
+                .required_node_ids
+                .extend(completion.required_node_ids);
+        }
+        orchestration
+            .completion
+            .required_artifact_kinds
+            .extend(completion.required_artifact_kinds);
+        orchestration.completion.allow_unresolved_conflicts = completion.allow_unresolved_conflicts;
+        orchestration.completion.required_node_ids.sort();
+        orchestration.completion.required_node_ids.dedup();
+        orchestration.completion.required_artifact_kinds.sort();
+        orchestration.completion.required_artifact_kinds.dedup();
+        validate_execution_graph(&next)
+            .map_err(|error| ExecutionCommitError::InvalidReplan(error.to_string()))?;
+        self.append_graph_event(
+            &next,
+            graph.revision,
+            format!("{}:semantic-mutation:{mutation_id}", graph.id),
+            ExecutionGraphEvent::Replanned {
+                reason,
+                added_node_ids,
+                graph: next.clone(),
+            },
+            Vec::new(),
+        )
+    }
+
+    pub async fn replan_semantic_async(
+        &self,
+        graph: ExecutionGraph,
+        nodes: Vec<ExecutionNodeSpec>,
+        edges: Vec<ExecutionEdge>,
+        reason: String,
+        mutation_id: String,
+        completion: harness_contract::execution_graph::ExecutionCompletionContract,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.replan_semantic(&graph, nodes, edges, reason, mutation_id, completion)
+        })
+        .await
+        .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
+    }
+
     /// Replace an admitted graph topology before any node starts.
     ///
     /// Strategy downgrade uses this boundary when the initially selected Team
@@ -810,6 +905,16 @@ impl ExecutionCommitService {
                     if !status.is_terminal() {
                         *status = ExecutionNodeStatus::Cancelled;
                     }
+                }
+            }
+            ExecutionGraphCommand::CancelNode { node_id, .. } => {
+                let status = next.node_statuses.get_mut(node_id).ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "cancel target node `{node_id}` does not exist"
+                    ))
+                })?;
+                if !status.is_terminal() {
+                    *status = ExecutionNodeStatus::Cancelled;
                 }
             }
             ExecutionGraphCommand::Start { .. } => {}
@@ -1409,6 +1514,9 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::Cancel {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::CancelNode {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::SubmitApproval {
             expected_revision, ..
         }
@@ -1428,6 +1536,7 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         ExecutionGraphCommand::Pause { reason, .. } => ("pause", Some(reason)),
         ExecutionGraphCommand::Resume { .. } => ("resume", None),
         ExecutionGraphCommand::Cancel { reason, .. } => ("cancel", Some(reason)),
+        ExecutionGraphCommand::CancelNode { reason, .. } => ("cancel_node", Some(reason)),
         ExecutionGraphCommand::SubmitApproval { .. } => ("submit_approval", None),
         ExecutionGraphCommand::ResolveExternal { .. } => ("resolve_external", None),
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
@@ -1713,6 +1822,110 @@ mod tests {
                 .begin_tool_effect(&idempotent_request, &idempotent)
                 .unwrap(),
             ToolEffectState::Fresh
+        );
+    }
+
+    #[test]
+    fn semantic_replan_is_revision_checked_idempotent_and_atomic() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = ExecutionCommitService::new(store);
+        let mut graph = agent_task_graph();
+        graph.orchestration = Some(
+            harness_contract::execution_graph::ExecutionOrchestrationMetadata {
+                mutation_id: "initial-mutation".to_string(),
+                applied_mutation_ids: vec!["initial-mutation".to_string()],
+                semantic_revision: 1,
+                source_generation: 1,
+                completion: Default::default(),
+            },
+        );
+        let registered = service.register_graph(graph).expect("register graph").graph;
+        let mut added =
+            ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "bounded-payload");
+        added.id = "agent-node-2".to_string();
+        added.idempotency_key = "agent-node-2-idempotency".to_string();
+        let first = service
+            .replan_semantic(
+                &registered,
+                vec![added.clone()],
+                Vec::new(),
+                "add bounded reviewer".to_string(),
+                "revision-2".to_string(),
+                Default::default(),
+            )
+            .expect("semantic revision commits");
+        assert_eq!(first.graph.revision, registered.revision + 1);
+        assert_eq!(first.graph.nodes.len(), registered.nodes.len() + 1);
+        assert_eq!(
+            first
+                .graph
+                .orchestration
+                .as_ref()
+                .expect("orchestration")
+                .applied_mutation_ids,
+            vec!["initial-mutation", "revision-2"]
+        );
+
+        let duplicate = match service.replan_semantic(
+            &first.graph,
+            vec![added.clone()],
+            Vec::new(),
+            "duplicate".to_string(),
+            "revision-2".to_string(),
+            Default::default(),
+        ) {
+            Ok(_) => panic!("same mutation id cannot commit twice"),
+            Err(error) => error,
+        };
+        assert!(matches!(duplicate, ExecutionCommitError::InvalidReplan(_)));
+
+        let mut stale_added =
+            ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "stale-payload");
+        stale_added.id = "stale-agent-node".to_string();
+        stale_added.idempotency_key = "stale-agent-node-idempotency".to_string();
+        let stale = match service.replan_semantic(
+            &registered,
+            vec![stale_added],
+            Vec::new(),
+            "stale proposal".to_string(),
+            "revision-stale".to_string(),
+            Default::default(),
+        ) {
+            Ok(_) => panic!("stale graph revision cannot partially commit"),
+            Err(error) => error,
+        };
+        assert!(matches!(stale, ExecutionCommitError::EventStore(_)));
+    }
+
+    #[test]
+    fn scoped_cancel_changes_only_the_authorized_node() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = ExecutionCommitService::new(store);
+        let mut graph = agent_task_graph();
+        let mut peer =
+            ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "peer-payload");
+        peer.id = "peer-agent-node".to_string();
+        peer.idempotency_key = "peer-agent-node-idempotency".to_string();
+        graph.nodes.push(peer);
+        let registered = service.register_graph(graph).expect("register graph").graph;
+        let cancelled = service
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::CancelNode {
+                    expected_revision: registered.revision,
+                    node_id: "agent-node".to_string(),
+                    reason: "cancel one Team lane".to_string(),
+                },
+            )
+            .expect("scoped cancel commits")
+            .graph;
+        assert_eq!(
+            cancelled.node_statuses["agent-node"],
+            ExecutionNodeStatus::Cancelled
+        );
+        assert_eq!(
+            cancelled.node_statuses["peer-agent-node"],
+            ExecutionNodeStatus::Planned
         );
     }
 }

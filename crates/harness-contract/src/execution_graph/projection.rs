@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ExecutionAcceptance, ExecutionEdgeKind, ExecutionFailure, ExecutionGraph, ExecutionNodeKind,
-    ExecutionNodeStatus, ExecutionParentBinding, ExecutionServiceClass, ExecutionUsage,
+    ExecutionNodeStatus, ExecutionOrchestrationMetadata, ExecutionParentBinding,
+    ExecutionServiceClass, ExecutionUsage,
 };
 use crate::context::EvidenceAccessRef;
 
@@ -54,6 +55,8 @@ pub struct ExecutionGraphProjection {
     pub service_class: ExecutionServiceClass,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<ExecutionOrchestrationMetadata>,
     pub nodes: Vec<ExecutionNodeProjection>,
     pub edges: Vec<ExecutionEdgeProjection>,
     pub commit_cursor: u64,
@@ -68,6 +71,7 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
         objective: graph.objective.clone(),
         service_class: graph.service_class,
         parent_execution: graph.parent_execution.clone(),
+        orchestration: graph.orchestration.clone(),
         nodes: graph
             .nodes
             .iter()

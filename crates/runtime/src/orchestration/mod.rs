@@ -1,8 +1,7 @@
-//! Runtime orchestration is a pure intent-to-graph compiler.
+//! Model-visible semantic orchestration over Runtime-owned execution graphs.
 //!
-//! Stateful execution is owned exclusively by `RuntimeExecutionSupervisor`
-//! through `RuntimeServices`. This module must never dispatch tools, agents, teams,
-//! sessions, missions, or approvals directly.
+//! The model may inspect state and propose semantic topology. Runtime alone
+//! resolves definitions, executors, leases, physical identities and commands.
 
 pub mod compiler;
 pub mod planner;
@@ -11,51 +10,62 @@ pub mod result;
 pub(crate) mod team_authority;
 pub mod validator;
 
-use crate::execution_core::{graph::ExecutionRunReport, RuntimeExecutionDecision};
+use std::collections::BTreeSet;
+
+use crate::execution_core::{
+    graph::ExecutionRunReport, ExecutionStateStoreError, RuntimeExecutionDecision,
+};
 use crate::{
     ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, ExecutionGraphHost, RuntimeServices,
     SubmitGlobalApprovalRequest,
 };
-use harness_contract::agent::{AgentTaskIntent, AgentTaskPacket};
 use harness_contract::core::TaskRisk;
 use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeKind,
-    ExecutionNodeStatus,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeStatus,
+    ExecutionParentBinding,
 };
 use serde_json::{json, Value};
 
 pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
 pub use request::{
-    RuntimeOrchestrationAction, RuntimeOrchestrationConstraints, RuntimeOrchestrationRequest,
+    CapabilityRecipeId, GraphMutationProposal, GraphSemanticNode, RuntimeControlKind,
+    RuntimeControlRequest, RuntimeControlScope, RuntimeOrchestrationConstraints,
+    RuntimeOrchestrationOperation, RuntimeOrchestrationRequest, SemanticFocus,
 };
 pub use result::{
     RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
-    RuntimeOrchestrationResult,
+    RuntimeOrchestrationResult, RuntimeStateSnapshot,
 };
 
 #[must_use]
 pub fn handle_runtime_orchestration_request(
     request: RuntimeOrchestrationRequest,
 ) -> RuntimeOrchestrationResult {
-    compile_runtime_orchestration_request(request, None, None, None)
+    handle_runtime_orchestration_request_with_decision(request, None)
 }
 
 #[must_use]
 pub fn handle_runtime_orchestration_request_with_decision(
-    request: RuntimeOrchestrationRequest,
+    mut request: RuntimeOrchestrationRequest,
     leased_decision: Option<&RuntimeExecutionDecision>,
 ) -> RuntimeOrchestrationResult {
-    compile_runtime_orchestration_request(request, leased_decision, None, None)
+    bind_strategy(&mut request, leased_decision, None);
+    let plan = planner::plan_runtime_orchestration_with_decision(&request, leased_decision);
+    let decision = validator::validate_request(
+        &request,
+        &plan.execution_decision,
+        plan.model_proposal.as_ref(),
+        None,
+    );
+    result_without_runtime(&request, decision)
 }
 
-/// Compile against workspace policy. Execution is owned by the active session
-/// runtime, which binds provider, tool, agent, and session backends to its graph.
 pub async fn submit_runtime_orchestration_request(
     request: RuntimeOrchestrationRequest,
     leased_decision: Option<&RuntimeExecutionDecision>,
     services: &RuntimeServices,
-    parent_execution: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+    parent_execution: Option<ExecutionParentBinding>,
 ) -> RuntimeOrchestrationResult {
     submit_runtime_orchestration_request_controlled(
         request,
@@ -71,367 +81,679 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
     mut request: RuntimeOrchestrationRequest,
     leased_decision: Option<&RuntimeExecutionDecision>,
     services: &RuntimeServices,
-    parent_execution: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+    parent_execution: Option<ExecutionParentBinding>,
     cancellation: Option<crate::CancellationToken>,
 ) -> RuntimeOrchestrationResult {
-    // Canonicalize the request before taking the reuse/locking snapshot.
-    // Model-originated calls deliberately arrive without a self-reported
-    // binding; the active Runtime decision supplies the only authoritative
-    // collaboration lease.
-    bind_team_request_to_strategy(&mut request, leased_decision, parent_execution.as_ref());
-    team_authority::bind_team_resource_authority(
+    bind_strategy(&mut request, leased_decision, parent_execution.as_ref());
+    team_authority::bind_semantic_resource_authority(
         &mut request,
         leased_decision,
         services.workspace_root(),
     );
-    let approval_submission_error = if request.action == RuntimeOrchestrationAction::RequestRiskGate
-        && request
-            .constraints
-            .approval_id
-            .as_deref()
-            .is_none_or(str::is_empty)
+    if request.constraints.risk.as_deref() == Some("critical")
+        && request.constraints.approval_id.is_none()
     {
-        submit_orchestration_risk_approval(&mut request, services).err()
-    } else {
-        None
-    };
-    let reuse_request = request.clone();
-    let reuse_parent = parent_execution.clone();
-    let (mut result, compiled) = match compile_runtime_orchestration(
-        request,
+        if let Err(error) = submit_approval(&mut request, services) {
+            return unavailable_result(&request, format!("approval_submission_failed:{error}"));
+        }
+    }
+    let plan = planner::plan_runtime_orchestration_with_decision_and_resources(
+        &request,
         leased_decision,
-        Some(services),
-        parent_execution,
-    ) {
-        Ok(compiled) => compiled,
-        Err(result) => return result,
-    };
-    if let Some(error) = approval_submission_error {
-        result.status = "unavailable".to_string();
-        result.decision.status = result.status.clone();
-        result
-            .decision
-            .validation_findings
-            .push(format!("global_approval_submission_failed:{error}"));
-        result.next_model_guidance =
-            "The approval queue could not persist the request. Preserve the failure and do not retry speculatively."
-                .to_string();
-        return result;
-    }
-    if result.status == "needs_approval" {
-        result.next_model_guidance = format!(
-            "A durable human approval is pending. Do not repeat the protected action while it is pending. After approval, repeat request_risk_gate with constraints.approval_id set to `{}`; then continue only from the validated receipt.",
-            reuse_request
-                .constraints
-                .approval_id
-                .as_deref()
-                .unwrap_or("missing")
-        );
-    }
-    let _collaboration_lease_guard =
-        if reuse_request.action == RuntimeOrchestrationAction::RequestTeam {
-            match (
-                reuse_request.strategy_binding.as_ref(),
-                reuse_parent.as_ref(),
-            ) {
-                (Some(binding), Some(parent)) => {
-                    let scope = match crate::execution_core::graph::ScopedResource::resource(
-                        "team-collaboration-lease",
-                        format!(
-                            "{}:{}:{}",
-                            services.workspace_key(),
-                            parent.execution_id,
-                            binding.decision_lease
-                        ),
-                    ) {
-                        Ok(scope) => scope,
-                        Err(error) => {
-                            result.status = "blocked".to_string();
-                            result.decision.status = result.status.clone();
-                            result
-                                .decision
-                                .validation_findings
-                                .push(format!("collaboration_lease_scope_invalid:{error}"));
-                            return result;
-                        }
-                    };
-                    match services
-                        .scope_locks()
-                        .acquire(
-                            [crate::execution_core::graph::ScopeLockRequest {
-                                scope,
-                                mode: crate::execution_core::graph::ScopeLockMode::Write,
-                            }],
-                            None,
-                        )
-                        .await
-                    {
-                        Ok(lease) => Some(lease),
-                        Err(error) => {
-                            result.status = "blocked".to_string();
-                            result.decision.status = result.status.clone();
-                            result
-                                .decision
-                                .validation_findings
-                                .push(format!("collaboration_lease_claim_failed:{error}"));
-                            return result;
-                        }
-                    }
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-    // A model can legitimately inspect the completed receipt and mention the
-    // same team request again in a later model step. A second protocol graph
-    // would repeat the work and spend another provider budget. Graph lineage
-    // is the durable source of truth, so reuse is decided here rather than in
-    // a Gateway adapter or an in-memory conversation cache.
-    if let Some(reused) =
-        find_reusable_team_execution(&reuse_request, services, reuse_parent.as_ref()).await
-    {
-        return apply_reused_team_execution(result, reused, services);
-    }
-    let Some(compiled) = compiled else {
-        return result;
-    };
-    if !should_execute(&result, &compiled) {
-        return result;
-    }
-
-    let team_request = compiled.team_request.clone();
-    let graph = if team_request.is_some() {
-        // TeamInstantiationService already compiled exact Agent Bindings while
-        // producing the dry-run graph. The actual start below deliberately
-        // re-enters TeamRuntime::instantiate with the same immutable request.
-        compiled.graph
-    } else {
-        match services.compile_graph_agent_intents(compiled.graph) {
-            Ok(graph) => graph,
-            Err(error) => {
-                result.status = "blocked".to_string();
-                result.decision.status = result.status.clone();
-                result
-                    .decision
-                    .validation_findings
-                    .push(format!("agent_binding_compilation_failed:{error}"));
-                return result;
-            }
-        }
-    };
-    let graph_id = graph.id.clone();
-    let compiled_team = declares_team(&graph);
-    let compiled_team_id = team_id(&graph);
-    let automatic_team =
-        reuse_request.selection_mode == Some(harness_contract::team::TeamSelectionMode::Automatic);
-    if automatic_team
-        && graph
-            .nodes
-            .iter()
-            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-            .count()
-            < 2
-    {
-        result.status = "blocked".to_string();
-        result.decision.status = result.status.clone();
-        result
-            .decision
-            .validation_findings
-            .push("automatic_team_requires_at_least_two_bounded_agent_slots".to_string());
-        return result;
-    }
-    let run_future = async {
-        if let Some(team_request) = team_request {
-            services
-                .team_runtime()
-                .instantiate(team_request)
-                .await
-                .map(|_| ())
-        } else {
-            services
-                .execution_supervisor()
-                .submit_and_wait(
-                    graph,
-                    ExecutionGraphCommand::Start {
-                        expected_revision: 0,
-                    },
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        }
-    };
-    tokio::pin!(run_future);
-    let run = if let Some(cancellation) = cancellation {
-        tokio::select! {
-            run = &mut run_future => run,
-            () = cancellation.cancelled() => {
-                match cancel_orchestration_execution(services, &graph_id).await {
-                    Ok(()) => Err("parent conversation cancelled automatic Team execution; child graph and Agents reached terminal cancellation".to_string()),
-                    Err(error) => Err(format!(
-                        "parent conversation cancellation propagation failed: {error}"
-                    )),
-                }
-            }
-        }
-    } else {
-        run_future.await
-    };
-    match run {
-        Ok(()) => match services.execution_supervisor().projection(&graph_id).await {
-            Ok(projection) => {
-                let report = report_from_projection(&projection);
-                let terminal = projection.terminal_result_ref.clone();
-                result.status = if report.failed > 0 || report.blocked > 0 {
-                    "blocked".to_string()
-                } else if report.waiting > 0 {
-                    "waiting".to_string()
-                } else if terminal.is_none() {
-                    result
-                        .decision
-                        .validation_findings
-                        .push("execution_graph_quiesced_without_terminal_result".to_string());
-                    "blocked".to_string()
-                } else {
-                    "completed".to_string()
-                };
-                result.decision.status = result.status.clone();
-                result.execution = json!({
-                    "type": "execution_graph_run",
-                    "status": result.status,
-                    "report": report,
-                    "projection": projection,
-                    "terminal_result_ref": terminal,
-                });
-                result.evidence["accepted"] = Value::Bool(result.status == "completed");
-                result.evidence["executed"] = Value::Bool(true);
-                result.evidence["graph_id"] = Value::String(graph_id.clone());
-                if compiled_team && result.status == "completed" {
-                    match compiled_team_id.as_deref().map(|team_id| {
-                        services
-                            .team_runtime()
-                            .working_state_for_graph(team_id, &graph_id)
-                            .map(|state| (team_id.to_string(), state))
-                    }) {
-                        Some(Ok((team_id, working_state))) if !working_state.entries.is_empty() => {
-                            let overlap = working_state.focus_overlap_assessment();
-                            result.execution["team_working_state"] =
-                                serde_json::to_value(&working_state).unwrap_or(Value::Null);
-                            result.execution["focus_overlap_assessment"] =
-                                serde_json::to_value(&overlap).unwrap_or(Value::Null);
-                            result.evidence["team_id"] = Value::String(team_id);
-                            let materialization = services
-                                .graph_state_store()
-                                .load(&graph_id)
-                                .map_err(|error| error.to_string())
-                                .and_then(|graph| working_state.verify_completed_graph(&graph));
-                            result.evidence["working_state_verified"] =
-                                Value::Bool(materialization.is_ok());
-                            result.evidence["focus_overlap_verified"] =
-                                Value::Bool(overlap.observed);
-                            result.evidence["focus_overlap_exceeded"] =
-                                Value::Bool(overlap.exceeded);
-                            if let Err(error) = materialization {
-                                result.status = "blocked".to_string();
-                                result.decision.status = result.status.clone();
-                                result
-                                    .decision
-                                    .validation_findings
-                                    .push(format!("team_working_state_not_materialized:{error}"));
-                                result.evidence["accepted"] = Value::Bool(false);
-                            } else if overlap.exceeded {
-                                result.status = "blocked".to_string();
-                                result.decision.status = result.status.clone();
-                                result.decision.validation_findings.push(format!(
-                                    "team_focus_overlap_budget_exceeded:{}bp>{}bp",
-                                    overlap.maximum_overlap_bp, overlap.allowed_overlap_bp
-                                ));
-                                result.evidence["accepted"] = Value::Bool(false);
-                            }
-                        }
-                        Some(Ok(_)) | None => {
-                            result.status = "blocked".to_string();
-                            result.decision.status = result.status.clone();
-                            result
-                                .decision
-                                .validation_findings
-                                .push("team_terminal_missing_committed_working_state".to_string());
-                            result.evidence["accepted"] = Value::Bool(false);
-                        }
-                        Some(Err(error)) => {
-                            result.status = "blocked".to_string();
-                            result.decision.status = result.status.clone();
-                            result
-                                .decision
-                                .validation_findings
-                                .push(format!("team_working_state_unavailable:{error}"));
-                            result.evidence["accepted"] = Value::Bool(false);
-                        }
-                    }
-                    result.next_model_guidance = if result.status == "completed" {
-                        "The requested team completed in this turn. Treat the terminal summary and durable graph evidence as the canonical result; do not create another overlapping team or deliberation graph unless the user introduces a genuinely independent objective."
-                            .to_string()
-                    } else {
-                        "The Team executed but failed a Runtime collaboration contract. Preserve its durable evidence, surface the validation finding, and use the governed fallback without creating a duplicate Team."
-                            .to_string()
-                    };
-                }
-            }
-            Err(error) => {
-                result.status = "blocked".to_string();
-                result.decision.status = result.status.clone();
-                result
-                    .decision
-                    .validation_findings
-                    .push(format!("execution_projection_unavailable:{error}"));
-            }
+        crate::execution_core::StrategyResourceHealth {
+            provider_available: true,
+            tools_available: true,
+            collaboration_available: true,
+            mission_available: true,
+            observed: true,
         },
+    );
+    let mut decision = validator::validate_request(
+        &request,
+        &plan.execution_decision,
+        plan.model_proposal.as_ref(),
+        Some(services.approval_queue().as_ref()),
+    );
+    if matches!(decision.status.as_str(), "rejected" | "needs_approval") {
+        return result_without_runtime(&request, decision);
+    }
+
+    let request_id = request_id(&request);
+    let operation = request.operation;
+    let outcome = match operation {
+        RuntimeOrchestrationOperation::Inspect => inspect(&request, services).await,
+        RuntimeOrchestrationOperation::Propose => {
+            propose(
+                &request_id,
+                &request,
+                &plan,
+                services,
+                parent_execution,
+                cancellation,
+            )
+            .await
+        }
+        RuntimeOrchestrationOperation::Revise => {
+            revise(&request_id, &request, &plan, services, cancellation).await
+        }
+        RuntimeOrchestrationOperation::Control => control(&request, services).await,
+    };
+    match outcome {
+        Ok(outcome) => {
+            decision.status = outcome.status.clone();
+            result_from_outcome(&request_id, decision, outcome)
+        }
         Err(error) => {
-            result.status = "blocked".to_string();
-            result.decision.status = result.status.clone();
-            result
-                .decision
-                .validation_findings
-                .push(format!("execution_graph_run_failed:{error}"));
-            if error.starts_with("parent conversation cancelled automatic Team execution") {
-                result.evidence["executed"] = Value::Bool(true);
-                result.evidence["accepted"] = Value::Bool(false);
-                result.evidence["graph_id"] = Value::String(graph_id);
-            }
+            decision.status = "blocked".to_string();
+            decision.validation_findings.push(error);
+            result_without_runtime_with_id(&request_id, &request, decision)
         }
     }
-    result
 }
 
-fn submit_orchestration_risk_approval(
+#[derive(Debug)]
+struct OperationOutcome {
+    status: String,
+    execution: Value,
+    evidence: Value,
+    guidance: String,
+}
+
+async fn inspect(
+    request: &RuntimeOrchestrationRequest,
+    services: &RuntimeServices,
+) -> Result<OperationOutcome, String> {
+    let target = request.inspect_execution_id.as_deref();
+    let graph = match target {
+        Some(graph_id) => Some(
+            services
+                .execution_supervisor()
+                .projection(graph_id)
+                .await
+                .map_err(|error| format!("inspect_projection_failed:{error}"))?,
+        ),
+        None => None,
+    };
+    let mut child_graphs = Vec::new();
+    let mut inspected_graph_ids = target.into_iter().map(str::to_string).collect::<Vec<_>>();
+    if let Some(graph_id) = target {
+        for link in services
+            .graph_state_store()
+            .child_links_async(graph_id.to_string())
+            .await
+            .map_err(|error| format!("inspect_lineage_failed:{error}"))?
+        {
+            inspected_graph_ids.push(link.child_execution_id.clone());
+            child_graphs.push(
+                services
+                    .execution_supervisor()
+                    .projection(&link.child_execution_id)
+                    .await
+                    .map_err(|error| format!("inspect_child_projection_failed:{error}"))?,
+            );
+        }
+    }
+    let mut unresolved_conflicts = Vec::new();
+    let mut artifact_refs = Vec::new();
+    let mut team_board_revisions = std::collections::BTreeMap::new();
+    for graph_id in inspected_graph_ids {
+        if let Ok(team) = services.team_runtime().project(&graph_id) {
+            if let Ok(state) = services
+                .team_runtime()
+                .working_state_for_graph(&team.team_id, &graph_id)
+            {
+                team_board_revisions.insert(team.team_id.clone(), state.board_revision);
+                unresolved_conflicts.extend(
+                    state
+                        .entries
+                        .iter()
+                        .filter(|entry| {
+                            matches!(
+                                entry.kind,
+                                crate::TeamWorkingStateKind::Conflict
+                                    | crate::TeamWorkingStateKind::Unresolved
+                            )
+                        })
+                        .map(|entry| format!("{}:{}", entry.entry_id, entry.summary)),
+                );
+                artifact_refs.extend(
+                    state
+                        .entries
+                        .into_iter()
+                        .flat_map(|entry| entry.artifact_refs),
+                );
+            }
+        }
+    }
+    unresolved_conflicts.sort();
+    unresolved_conflicts.dedup();
+    artifact_refs.sort();
+    artifact_refs.dedup();
+    let team_templates = services
+        .definition_registry()
+        .runnable_team_catalog()
+        .map_err(|error| format!("team_catalog_failed:{error}"))?
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "{}@{}",
+                entry.revision_ref.template_id.as_str(),
+                entry.revision_ref.revision
+            )
+        })
+        .collect::<Vec<_>>();
+    let pending_approvals = services.approval_queue().pending().len();
+    let snapshot_generation = graph.as_ref().map_or(0, |projection| projection.revision);
+    let snapshot = RuntimeStateSnapshot {
+        snapshot_generation,
+        target_execution_id: target.map(str::to_string),
+        graph,
+        child_graphs,
+        capability_recipes: recipe_catalog(),
+        team_templates,
+        permission_ceiling: request.constraints.permission_ceiling,
+        pending_approvals,
+        execution_health: serde_json::to_value(services.execution_health())
+            .map_err(|error| format!("execution_health_encode_failed:{error}"))?,
+        team_board_revisions,
+        unresolved_conflicts,
+        artifact_refs,
+    };
+    Ok(OperationOutcome {
+        status: "inspected".to_string(),
+        execution: serde_json::to_value(snapshot)
+            .map_err(|error| format!("runtime_snapshot_encode_failed:{error}"))?,
+        evidence: json!({"accepted": true, "executed": false, "operation": "inspect"}),
+        guidance:
+            "Use the current snapshot generation and graph revision when proposing a mutation."
+                .to_string(),
+    })
+}
+
+async fn propose(
+    request_id: &str,
+    request: &RuntimeOrchestrationRequest,
+    plan: &RuntimeOrchestrationPlan,
+    services: &RuntimeServices,
+    parent_execution: Option<ExecutionParentBinding>,
+    cancellation: Option<crate::CancellationToken>,
+) -> Result<OperationOutcome, String> {
+    let compiled = compiler::compile_orchestration(
+        request_id,
+        request,
+        plan,
+        parent_execution,
+        Some(services.team_runtime().as_ref()),
+    )
+    .map_err(|error| format!("semantic_compile_failed:{error}"))?;
+    let graph_id = compiled.graph.id.clone();
+    match services.graph_state_store().load_async(&graph_id).await {
+        Ok(existing) => {
+            if mutation_applied(&existing, mutation_id(request)?) {
+                return completed_projection(
+                    request.operation,
+                    services
+                        .execution_supervisor()
+                        .projection(&graph_id)
+                        .await
+                        .map_err(|error| format!("idempotent_projection_failed:{error}"))?,
+                    None,
+                    true,
+                    services,
+                );
+            }
+            return Err("mutation_identity_collision".to_string());
+        }
+        Err(ExecutionStateStoreError::NotFound(_)) => {}
+        Err(error) => return Err(format!("proposal_identity_lookup_failed:{error}")),
+    }
+    let graph = services
+        .compile_graph_agent_intents(compiled.graph)
+        .map_err(|error| format!("agent_binding_compilation_failed:{error}"))?;
+    let run = services
+        .execution_supervisor()
+        .submit_and_wait(graph, compiled.command);
+    let (_, report) = await_with_cancellation(run, cancellation, services, &graph_id).await?;
+    let projection = services
+        .execution_supervisor()
+        .projection(&graph_id)
+        .await
+        .map_err(|error| format!("execution_projection_failed:{error}"))?;
+    completed_projection(request.operation, projection, Some(report), false, services)
+}
+
+async fn revise(
+    request_id: &str,
+    request: &RuntimeOrchestrationRequest,
+    plan: &RuntimeOrchestrationPlan,
+    services: &RuntimeServices,
+    cancellation: Option<crate::CancellationToken>,
+) -> Result<OperationOutcome, String> {
+    let proposal = request
+        .proposal
+        .as_ref()
+        .ok_or_else(|| "revise_missing_proposal".to_string())?;
+    let graph_id = proposal
+        .target_execution_id
+        .as_deref()
+        .ok_or_else(|| "revise_missing_target".to_string())?;
+    let graph = services
+        .graph_state_store()
+        .load_async(graph_id)
+        .await
+        .map_err(|error| format!("revise_target_load_failed:{error}"))?;
+    if mutation_applied(&graph, &proposal.mutation_id) {
+        return completed_projection(
+            request.operation,
+            services
+                .execution_supervisor()
+                .projection(graph_id)
+                .await
+                .map_err(|error| format!("idempotent_projection_failed:{error}"))?,
+            None,
+            true,
+            services,
+        );
+    }
+    let existing_ids = graph
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut mutation = compiler::compile_graph_mutation(
+        request_id,
+        request,
+        plan,
+        proposal,
+        graph_id,
+        graph.parent_execution.as_ref(),
+        services.team_runtime().as_ref(),
+        &existing_ids,
+    )
+    .map_err(|error| format!("semantic_revision_compile_failed:{error}"))?;
+    services
+        .compile_agent_task_nodes(&mut mutation.nodes)
+        .map_err(|error| format!("agent_binding_compilation_failed:{error}"))?;
+    let completion =
+        compiler::materialize_completion(&proposal.completion, &mutation.semantic_node_instances);
+    let expected_revision = proposal
+        .expected_revision
+        .ok_or_else(|| "revise_missing_expected_revision".to_string())?;
+    let run = services.execution_supervisor().revise_semantic_graph(
+        graph_id,
+        expected_revision,
+        mutation.nodes,
+        mutation.edges,
+        proposal.reason.clone(),
+        proposal.mutation_id.clone(),
+        completion,
+    );
+    let (_, report) = await_with_cancellation(run, cancellation, services, graph_id).await?;
+    let projection = services
+        .execution_supervisor()
+        .projection(graph_id)
+        .await
+        .map_err(|error| format!("revision_projection_failed:{error}"))?;
+    completed_projection(request.operation, projection, Some(report), false, services)
+}
+
+async fn control(
+    request: &RuntimeOrchestrationRequest,
+    services: &RuntimeServices,
+) -> Result<OperationOutcome, String> {
+    let control = request
+        .control
+        .as_ref()
+        .ok_or_else(|| "control_payload_missing".to_string())?;
+    let command = match control.action {
+        RuntimeControlKind::Pause => ExecutionGraphCommand::Pause {
+            expected_revision: control.expected_revision,
+            reason: control.reason.clone(),
+        },
+        RuntimeControlKind::Resume => ExecutionGraphCommand::Resume {
+            expected_revision: control.expected_revision,
+        },
+        RuntimeControlKind::Cancel => {
+            if let Some(node_id) = control.target_node_id.clone() {
+                ExecutionGraphCommand::CancelNode {
+                    expected_revision: control.expected_revision,
+                    node_id,
+                    reason: control.reason.clone(),
+                }
+            } else {
+                ExecutionGraphCommand::Cancel {
+                    expected_revision: control.expected_revision,
+                    reason: control.reason.clone(),
+                }
+            }
+        }
+    };
+    services
+        .execution_supervisor()
+        .command_graph(&control.target_execution_id, command)
+        .await
+        .map_err(|error| format!("runtime_control_failed:{error}"))?;
+    let projection = services
+        .execution_supervisor()
+        .projection(&control.target_execution_id)
+        .await
+        .map_err(|error| format!("control_projection_failed:{error}"))?;
+    completed_projection(request.operation, projection, None, false, services)
+}
+
+async fn await_with_cancellation<F>(
+    future: F,
+    cancellation: Option<crate::CancellationToken>,
+    services: &RuntimeServices,
+    graph_id: &str,
+) -> Result<(crate::ExecutionGraphHostReceipt, ExecutionRunReport), String>
+where
+    F: std::future::Future<
+        Output = Result<
+            (crate::ExecutionGraphHostReceipt, ExecutionRunReport),
+            crate::execution_core::ExecutionRunnerError,
+        >,
+    >,
+{
+    let Some(cancellation) = cancellation else {
+        return future
+            .await
+            .map_err(|error| format!("execution_failed:{error}"));
+    };
+    tokio::select! {
+        outcome = future => outcome.map_err(|error| format!("execution_failed:{error}")),
+        () = cancellation.cancelled() => {
+            cancel_graph(services, graph_id).await?;
+            Err("parent_execution_cancelled".to_string())
+        }
+    }
+}
+
+async fn cancel_graph(services: &RuntimeServices, graph_id: &str) -> Result<(), String> {
+    let graph = services
+        .graph_state_store()
+        .load_async(graph_id)
+        .await
+        .map_err(|error| format!("cancel_target_load_failed:{error}"))?;
+    if graph
+        .node_statuses
+        .values()
+        .all(|status| status.is_terminal())
+    {
+        return Ok(());
+    }
+    services
+        .execution_supervisor()
+        .command_graph(
+            graph_id,
+            ExecutionGraphCommand::Cancel {
+                expected_revision: graph.revision,
+                reason: "parent execution cancellation propagated to semantic graph".to_string(),
+            },
+        )
+        .await
+        .map_err(|error| format!("cancel_graph_failed:{error}"))?;
+    Ok(())
+}
+
+fn completed_projection(
+    operation: RuntimeOrchestrationOperation,
+    projection: ExecutionGraphProjection,
+    report: Option<ExecutionRunReport>,
+    reused: bool,
+    services: &RuntimeServices,
+) -> Result<OperationOutcome, String> {
+    let mut completion_findings = completion_findings(&projection);
+    let team_assessment = assess_team_subgraphs(&projection, services);
+    completion_findings.extend(team_assessment.findings.iter().cloned());
+    let status = if graph_status(&projection) == "completed" && !completion_findings.is_empty() {
+        "blocked"
+    } else {
+        graph_status(&projection)
+    };
+    let graph_id = projection.graph_id.clone();
+    let terminal_result_ref = projection
+        .nodes
+        .iter()
+        .rev()
+        .find_map(|node| node.result_ref.clone());
+    Ok(OperationOutcome {
+        status: status.to_string(),
+        execution: json!({
+            "type": "execution_graph_run",
+            "status": status,
+            "projection": projection,
+            "report": report,
+            "terminal_result_ref": terminal_result_ref,
+            "team_subgraphs": team_assessment.teams,
+            "completion_findings": completion_findings,
+        }),
+        evidence: json!({
+            "accepted": status == "completed",
+            "executed": operation != RuntimeOrchestrationOperation::Inspect,
+            "operation": operation.as_str(),
+            "graph_id": graph_id,
+            "reused": reused,
+            "completion_findings": completion_findings,
+            "team_ids": team_assessment.team_ids,
+            "working_state_verified": team_assessment.has_teams.then_some(team_assessment.working_state_verified),
+            "focus_overlap_verified": team_assessment.has_teams.then_some(team_assessment.focus_overlap_verified),
+            "focus_overlap_exceeded": team_assessment.has_teams.then_some(team_assessment.focus_overlap_exceeded),
+        }),
+        guidance: if status == "completed" {
+            "Continue from the checked terminal synthesis and durable evidence.".to_string()
+        } else {
+            "Inspect the graph revision and unresolved nodes before proposing a bounded revision."
+                .to_string()
+        },
+    })
+}
+
+#[derive(Debug, Default)]
+struct TeamSubgraphAssessment {
+    has_teams: bool,
+    working_state_verified: bool,
+    focus_overlap_verified: bool,
+    focus_overlap_exceeded: bool,
+    team_ids: Vec<String>,
+    teams: Vec<Value>,
+    findings: Vec<String>,
+}
+
+fn assess_team_subgraphs(
+    projection: &ExecutionGraphProjection,
+    services: &RuntimeServices,
+) -> TeamSubgraphAssessment {
+    let mut assessment = TeamSubgraphAssessment {
+        working_state_verified: true,
+        focus_overlap_verified: true,
+        ..TeamSubgraphAssessment::default()
+    };
+    for node in projection.nodes.iter().filter(|node| {
+        node.executor_kind == compiler::TEAM_SUBGRAPH_EXECUTOR
+            && node.status == ExecutionNodeStatus::Completed
+    }) {
+        assessment.has_teams = true;
+        let request = match serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+            &node.payload_ref,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                assessment.working_state_verified = false;
+                assessment.findings.push(format!(
+                    "team_subgraph_payload_invalid:{}:{error}",
+                    node.node_id
+                ));
+                continue;
+            }
+        };
+        let team_id = request.team_id;
+        let child_graph_id = format!("team-graph:{team_id}");
+        assessment.team_ids.push(team_id.clone());
+        let working_state = match services
+            .team_runtime()
+            .working_state_for_graph(&team_id, &child_graph_id)
+        {
+            Ok(state) if !state.entries.is_empty() => state,
+            Ok(_) => {
+                assessment.working_state_verified = false;
+                assessment.findings.push(format!(
+                    "team_terminal_missing_committed_working_state:{team_id}"
+                ));
+                continue;
+            }
+            Err(error) => {
+                assessment.working_state_verified = false;
+                assessment
+                    .findings
+                    .push(format!("team_working_state_unavailable:{team_id}:{error}"));
+                continue;
+            }
+        };
+        let overlap = working_state.focus_overlap_assessment();
+        assessment.focus_overlap_verified &= overlap.observed;
+        assessment.focus_overlap_exceeded |= overlap.exceeded;
+        let materialization = services
+            .graph_state_store()
+            .load(&child_graph_id)
+            .map_err(|error| error.to_string())
+            .and_then(|graph| working_state.verify_completed_graph(&graph));
+        if let Err(error) = &materialization {
+            assessment.working_state_verified = false;
+            assessment.findings.push(format!(
+                "team_working_state_not_materialized:{team_id}:{error}"
+            ));
+        }
+        if overlap.exceeded {
+            assessment.findings.push(format!(
+                "team_focus_overlap_budget_exceeded:{team_id}:{}bp>{}bp",
+                overlap.maximum_overlap_bp, overlap.allowed_overlap_bp
+            ));
+        }
+        assessment.teams.push(json!({
+            "team_id": team_id,
+            "graph_id": child_graph_id,
+            "board_revision": working_state.board_revision,
+            "entry_count": working_state.entries.len(),
+            "working_state_verified": materialization.is_ok(),
+            "focus_overlap_assessment": overlap,
+        }));
+    }
+    assessment.team_ids.sort();
+    assessment.team_ids.dedup();
+    assessment
+}
+
+fn completion_findings(projection: &ExecutionGraphProjection) -> Vec<String> {
+    let Some(metadata) = projection.orchestration.as_ref() else {
+        return Vec::new();
+    };
+    let mut findings = Vec::new();
+    for required in &metadata.completion.required_node_ids {
+        if projection
+            .nodes
+            .iter()
+            .find(|node| node.node_id == *required)
+            .is_none_or(|node| node.status != ExecutionNodeStatus::Completed)
+        {
+            findings.push(format!("required_node_not_completed:{required}"));
+        }
+    }
+    for artifact in &metadata.completion.required_artifact_kinds {
+        let materialized = projection.nodes.iter().any(|node| {
+            node.status == ExecutionNodeStatus::Completed
+                && node
+                    .acceptance
+                    .required_evidence
+                    .iter()
+                    .any(|required| required == artifact)
+                && (node.result_ref.is_some() || !node.evidence_refs.is_empty())
+        });
+        if !materialized {
+            findings.push(format!("required_artifact_not_materialized:{artifact}"));
+        }
+    }
+    if !metadata.completion.allow_unresolved_conflicts
+        && projection.nodes.iter().any(|node| {
+            node.result_ref
+                .as_deref()
+                .is_some_and(|reference| reference.ends_with(":unresolved"))
+        })
+    {
+        findings.push("unresolved_conflict_rejected".to_string());
+    }
+    findings
+}
+
+fn graph_status(projection: &ExecutionGraphProjection) -> &'static str {
+    if projection
+        .nodes
+        .iter()
+        .all(|node| node.status == ExecutionNodeStatus::Completed)
+    {
+        "completed"
+    } else if projection
+        .nodes
+        .iter()
+        .any(|node| node.status == ExecutionNodeStatus::Failed)
+    {
+        "failed"
+    } else if projection
+        .nodes
+        .iter()
+        .any(|node| node.status == ExecutionNodeStatus::Blocked)
+    {
+        "blocked"
+    } else {
+        "running"
+    }
+}
+
+fn bind_strategy(
+    request: &mut RuntimeOrchestrationRequest,
+    leased_decision: Option<&RuntimeExecutionDecision>,
+    parent: Option<&ExecutionParentBinding>,
+) {
+    let team_requested = request.proposal.as_ref().is_some_and(|proposal| {
+        proposal
+            .nodes
+            .iter()
+            .any(|node| node.recipe == CapabilityRecipeId::Team)
+    });
+    if !team_requested {
+        return;
+    }
+    request.selection_mode = Some(harness_contract::team::TeamSelectionMode::ModelAssisted);
+    if request.strategy_binding.is_none() {
+        if let Some(decision) = leased_decision {
+            request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
+                decision_id: decision.decision_id.clone(),
+                decision_revision: decision.decision_revision,
+                decision_lease: decision.lease.lease_id.clone(),
+                turn_ref: decision
+                    .turn_ref
+                    .clone()
+                    .or_else(|| parent.map(|binding| binding.execution_id.clone()))
+                    .unwrap_or_else(|| "detached-orchestration".to_string()),
+            });
+        }
+    }
+}
+
+fn submit_approval(
     request: &mut RuntimeOrchestrationRequest,
     services: &RuntimeServices,
 ) -> Result<(), String> {
-    let session_id = request
-        .session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
+    let session_id = request.session_id.clone();
     let identity = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
         services.workspace_key(),
         session_id.as_deref().unwrap_or_default(),
         request.intent.trim(),
-        request.constraints.risk.as_deref().unwrap_or("high"),
-        serde_json::to_string(&request.capabilities).unwrap_or_default(),
-        serde_json::to_string(&request.evidence_refs).unwrap_or_default(),
+        request.operation.as_str(),
     );
     let digest = model_protocol::fingerprint::stable_hash_bytes(identity.as_bytes());
-    let approval_id = format!("runtime-risk-gate-{digest:016x}");
-    let risk = match request.constraints.risk.as_deref() {
-        Some("critical") => TaskRisk::Critical,
-        Some("medium") => TaskRisk::Medium,
-        Some("low") => TaskRisk::Low,
-        _ => TaskRisk::High,
-    };
+    let approval_id = format!("runtime-orchestration-{digest:016x}");
     services.approval_queue().submit_scoped(
         approval_id.clone(),
         SubmitGlobalApprovalRequest {
@@ -445,12 +767,9 @@ fn submit_orchestration_risk_approval(
                 review_ref: None,
                 application: None,
             },
-            action: format!(
-                "runtime_orchestrate:{}",
-                RuntimeOrchestrationAction::RequestRiskGate.as_str()
-            ),
-            summary: request.intent.trim().chars().take(512).collect(),
-            risk,
+            action: format!("runtime_orchestrate:{}", request.operation.as_str()),
+            summary: request.intent.chars().take(512).collect(),
+            risk: TaskRisk::Critical,
             evidence_refs: request.evidence_refs.iter().take(64).cloned().collect(),
             timeout_policy: ApprovalTimeoutPolicy::Pending,
         },
@@ -459,506 +778,128 @@ fn submit_orchestration_risk_approval(
     Ok(())
 }
 
-async fn cancel_orchestration_execution(
-    services: &RuntimeServices,
-    graph_id: &str,
-) -> Result<(), String> {
-    // Registration and cancellation can race by one scheduler yield. Retry
-    // only the durable lookup; once the graph exists, Runner cancellation
-    // invokes active node executor cancellation before atomically marking all
-    // remaining nodes terminal.
-    let mut last_error = None;
-    for _ in 0..100 {
-        match services.graph_state_store().load_async(graph_id).await {
-            Ok(graph) => {
-                if graph
-                    .node_statuses
-                    .values()
-                    .all(|status| status.is_terminal())
-                {
-                    return Ok(());
-                }
-                match services
-                    .execution_supervisor()
-                    .command_graph(
-                        graph_id,
-                        harness_contract::execution_graph::ExecutionGraphCommand::Cancel {
-                            expected_revision: graph.revision,
-                            reason:
-                                "parent conversation cancellation propagated to child execution"
-                                    .to_string(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => match services.graph_state_store().load_async(graph_id).await {
-                        Ok(cancelled)
-                            if cancelled
-                                .node_statuses
-                                .values()
-                                .all(|status| status.is_terminal()) =>
-                        {
-                            return Ok(());
-                        }
-                        Ok(_) => {
-                            last_error = Some(
-                                "execution supervisor cancel returned a non-terminal child graph"
-                                    .to_string(),
-                            );
-                        }
-                        Err(error) => last_error = Some(error.to_string()),
-                    },
-                    Err(error) => last_error = Some(error.to_string()),
-                }
-            }
-            Err(error) => last_error = Some(error.to_string()),
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    Err(format!(
-        "child graph `{graph_id}` cancellation did not commit terminal lineage: {}",
-        last_error.unwrap_or_else(|| "graph registration unavailable".to_string())
-    ))
-}
-
-#[derive(Debug)]
-struct ReusedTeamExecution {
-    request_id: String,
-    graph_id: String,
-    projection: ExecutionGraphProjection,
-    team_id: Option<String>,
-}
-
-async fn find_reusable_team_execution(
-    request: &RuntimeOrchestrationRequest,
-    services: &RuntimeServices,
-    parent: Option<&harness_contract::execution_graph::ExecutionParentBinding>,
-) -> Option<ReusedTeamExecution> {
-    if request.action != RuntimeOrchestrationAction::RequestTeam {
-        return None;
-    }
-    let parent = parent?;
-    let links = services
-        .graph_state_store()
-        .child_links_async(parent.execution_id.clone())
-        .await
-        .ok()?;
-    let requested_lease = request
-        .strategy_binding
-        .as_ref()
-        .map(|binding| binding.decision_lease.as_str());
-    for link in links {
-        if requested_lease.is_none() && !same_team_objective(&link.child_objective, &request.intent)
-        {
-            continue;
-        }
-        let graph = services
-            .graph_state_store()
-            .load_async(link.child_execution_id.clone())
-            .await
-            .ok()?;
-        if !declares_team(&graph)
-            || requested_lease
-                .is_some_and(|lease| team_collaboration_lease(&graph).as_deref() != Some(lease))
-            || (requested_lease.is_none()
-                && !same_team_objective(&graph.objective, &request.intent))
-        {
-            continue;
-        }
-        let projection = services
-            .graph_state_store()
-            .projection_async(link.child_execution_id.clone())
-            .await
-            .ok()?;
-        let team_id = team_id(&graph);
-        let request_id = team_id
-            .as_deref()
-            .and_then(|team_id| team_id.strip_prefix("runtime-team:"))
-            .filter(|request_id| !request_id.trim().is_empty())?
-            .to_string();
-        return Some(ReusedTeamExecution {
-            request_id,
-            graph_id: link.child_execution_id,
-            projection,
-            team_id,
-        });
-    }
-    None
-}
-
-fn team_collaboration_lease(graph: &ExecutionGraph) -> Option<String> {
-    graph
-        .nodes
-        .iter()
-        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-        .filter_map(|node| task_packet_or_intent(&node.payload_ref))
-        .flat_map(|(constraints, _)| constraints)
-        .find_map(|constraint| {
-            constraint
-                .strip_prefix("collaboration_lease:")
-                .map(str::to_string)
-        })
-}
-
-fn apply_reused_team_execution(
-    mut result: RuntimeOrchestrationResult,
-    reused: ReusedTeamExecution,
-    services: &RuntimeServices,
-) -> RuntimeOrchestrationResult {
-    // A replay is the original collaboration receipt, not a new request that
-    // happens to point at the old graph. Preserve its canonical request
-    // identity so all surfaces converge on the same idempotent receipt.
-    result.request_id = reused.request_id.clone();
-    result.evidence["request_id"] = Value::String(reused.request_id.clone());
-    let report = report_from_projection(&reused.projection);
-    let terminal = reused.projection.terminal_result_ref.clone();
-    result.status = if report.failed > 0 || report.blocked > 0 {
-        "blocked".to_string()
-    } else if report.waiting > 0 || terminal.is_none() {
-        "waiting".to_string()
-    } else {
-        "completed".to_string()
-    };
-    result.decision.status = result.status.clone();
-    result.execution = json!({
-        "type": "execution_graph_reused",
-        "status": result.status,
-        "report": report,
-        "projection": reused.projection,
-        "terminal_result_ref": terminal,
-        "reused_from_graph_id": reused.graph_id.clone(),
-        "original_request_id": reused.request_id.clone(),
-    });
-    result.evidence["accepted"] = Value::Bool(result.status == "completed");
-    result.evidence["executed"] = Value::Bool(true);
-    result.evidence["reused"] = Value::Bool(true);
-    result.evidence["graph_id"] = Value::String(reused.graph_id.clone());
-    if result.status == "completed" {
-        match reused.team_id.as_deref().map(|team_id| {
-            services
-                .team_runtime()
-                .working_state_for_graph(team_id, &reused.graph_id)
-                .map(|state| (team_id.to_string(), state))
-        }) {
-            Some(Ok((team_id, working_state))) if !working_state.entries.is_empty() => {
-                let overlap = working_state.focus_overlap_assessment();
-                result.execution["team_working_state"] =
-                    serde_json::to_value(&working_state).unwrap_or(Value::Null);
-                result.execution["focus_overlap_assessment"] =
-                    serde_json::to_value(&overlap).unwrap_or(Value::Null);
-                result.evidence["team_id"] = Value::String(team_id);
-                let materialization = services
-                    .graph_state_store()
-                    .load(&reused.graph_id)
-                    .map_err(|error| error.to_string())
-                    .and_then(|graph| working_state.verify_completed_graph(&graph));
-                result.evidence["working_state_verified"] = Value::Bool(materialization.is_ok());
-                result.evidence["focus_overlap_verified"] = Value::Bool(overlap.observed);
-                result.evidence["focus_overlap_exceeded"] = Value::Bool(overlap.exceeded);
-                if let Err(error) = materialization {
-                    result.status = "blocked".to_string();
-                    result.decision.status = result.status.clone();
-                    result.decision.validation_findings.push(format!(
-                        "replayed_team_working_state_not_materialized:{error}"
-                    ));
-                    result.evidence["accepted"] = Value::Bool(false);
-                } else if overlap.exceeded {
-                    result.status = "blocked".to_string();
-                    result.decision.status = result.status.clone();
-                    result.decision.validation_findings.push(format!(
-                        "replayed_team_focus_overlap_budget_exceeded:{}bp>{}bp",
-                        overlap.maximum_overlap_bp, overlap.allowed_overlap_bp
-                    ));
-                    result.evidence["accepted"] = Value::Bool(false);
-                }
-            }
-            Some(Ok(_)) | None => {
-                result.status = "blocked".to_string();
-                result.decision.status = result.status.clone();
-                result
-                    .decision
-                    .validation_findings
-                    .push("replayed_team_missing_committed_working_state".to_string());
-                result.evidence["accepted"] = Value::Bool(false);
-            }
-            Some(Err(error)) => {
-                result.status = "blocked".to_string();
-                result.decision.status = result.status.clone();
-                result
-                    .decision
-                    .validation_findings
-                    .push(format!("replayed_team_working_state_unavailable:{error}"));
-                result.evidence["accepted"] = Value::Bool(false);
-            }
-        }
-    }
-    result.next_model_guidance = if result.status == "completed" {
-        "The requested team already completed in this turn. Use its terminal receipt as evidence; do not request the same team again unless the user changes the objective."
-            .to_string()
-    } else {
-        "The requested team is already active in this turn. Inspect its durable execution projection and wait for or advance that work; do not create a duplicate team."
-            .to_string()
-    };
-    result
-}
-
-fn declares_team(graph: &ExecutionGraph) -> bool {
-    graph.nodes.iter().any(|node| {
-        node.kind == ExecutionNodeKind::AgentTask
-            && task_packet_or_intent(&node.payload_ref)
-                .and_then(|(_, team_id)| team_id)
-                .is_some_and(|team_id| !team_id.trim().is_empty())
+fn mutation_applied(graph: &ExecutionGraph, mutation_id: &str) -> bool {
+    graph.orchestration.as_ref().is_some_and(|metadata| {
+        metadata.mutation_id == mutation_id
+            || metadata
+                .applied_mutation_ids
+                .iter()
+                .any(|applied| applied == mutation_id)
     })
 }
 
-fn team_id(graph: &ExecutionGraph) -> Option<String> {
-    graph
-        .nodes
-        .iter()
-        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-        .filter_map(|node| task_packet_or_intent(&node.payload_ref))
-        .find_map(|(_, team_id)| team_id)
-        .filter(|team_id| !team_id.trim().is_empty())
+fn mutation_id(request: &RuntimeOrchestrationRequest) -> Result<&str, String> {
+    request
+        .proposal
+        .as_ref()
+        .map(|proposal| proposal.mutation_id.as_str())
+        .ok_or_else(|| "missing_mutation_id".to_string())
 }
 
-fn task_packet_or_intent(payload: &str) -> Option<(Vec<String>, Option<String>)> {
-    if let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(payload) {
-        let team_id = packet.team_id().map(str::to_owned);
-        return Some((packet.constraints, team_id));
-    }
-    serde_json::from_str::<AgentTaskIntent>(payload)
-        .ok()
-        .map(|intent| (intent.constraints, intent.team_id))
+fn recipe_catalog() -> Vec<String> {
+    [
+        CapabilityRecipeId::Direct,
+        CapabilityRecipeId::Agent,
+        CapabilityRecipeId::Team,
+        CapabilityRecipeId::Review,
+        CapabilityRecipeId::Synthesis,
+        CapabilityRecipeId::SessionDispatch,
+    ]
+    .into_iter()
+    .map(|recipe| recipe.as_str().to_string())
+    .collect()
 }
 
-fn same_objective(left: &str, right: &str) -> bool {
-    normalize_objective(left) == normalize_objective(right)
+fn request_id(request: &RuntimeOrchestrationRequest) -> String {
+    request.proposal.as_ref().map_or_else(
+        || format!("runtime-orch-{}", uuid::Uuid::new_v4()),
+        |proposal| format!("runtime-orch-{}", proposal.mutation_id),
+    )
 }
 
-/// Team graphs are scoped to one parent execution. A model often rephrases
-/// the same cross-domain objective after receiving a team receipt, sometimes
-/// even switching `request_team` to `request_deliberation`. The durable
-/// parent graph is still the same user turn, so reuse a materially
-/// overlapping team rather than spending another fan-out. New, independent
-/// work remains possible because it will not share enough objective terms.
-fn same_team_objective(left: &str, right: &str) -> bool {
-    if same_objective(left, right) {
-        return true;
-    }
-    let left_terms = objective_terms(left);
-    let right_terms = objective_terms(right);
-    if left_terms.is_empty() || right_terms.is_empty() {
-        return false;
-    }
-    let overlap = left_terms.intersection(&right_terms).count();
-    let smallest = left_terms.len().min(right_terms.len());
-    overlap >= 3 && overlap.saturating_mul(100) >= smallest.saturating_mul(40)
-}
-
-fn objective_terms(value: &str) -> std::collections::BTreeSet<String> {
-    let normalized = value.to_lowercase();
-    let mut terms = std::collections::BTreeSet::new();
-    let mut ascii = String::new();
-    let mut cjk = Vec::new();
-    let flush_ascii = |ascii: &mut String, terms: &mut std::collections::BTreeSet<String>| {
-        if ascii.len() >= 2 {
-            terms.insert(format!("word:{ascii}"));
-        }
-        ascii.clear();
-    };
-    for character in normalized.chars() {
-        if character.is_ascii_alphanumeric() {
-            ascii.push(character);
-            continue;
-        }
-        flush_ascii(&mut ascii, &mut terms);
-        if is_cjk(character) {
-            cjk.push(character);
-        } else {
-            cjk.push(' ');
-        }
-    }
-    flush_ascii(&mut ascii, &mut terms);
-    for pair in cjk.windows(2) {
-        if pair.iter().all(|character| is_cjk(*character)) {
-            terms.insert(format!("cjk:{}{}", pair[0], pair[1]));
-        }
-    }
-    terms
-}
-
-const fn is_cjk(character: char) -> bool {
-    matches!(character as u32, 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff)
-}
-
-fn normalize_objective(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn report_from_projection(projection: &ExecutionGraphProjection) -> ExecutionRunReport {
-    let mut report = ExecutionRunReport {
-        graph_id: projection.graph_id.clone(),
-        revision: projection.revision,
-        completed: 0,
-        failed: 0,
-        blocked: 0,
-        cancelled: 0,
-        waiting: 0,
-    };
-    for node in &projection.nodes {
-        match node.status {
-            ExecutionNodeStatus::Completed => report.completed += 1,
-            ExecutionNodeStatus::Failed => report.failed += 1,
-            ExecutionNodeStatus::Blocked => report.blocked += 1,
-            ExecutionNodeStatus::Cancelled => report.cancelled += 1,
-            ExecutionNodeStatus::Planned
-            | ExecutionNodeStatus::Ready
-            | ExecutionNodeStatus::Running
-            | ExecutionNodeStatus::WaitingInput
-            | ExecutionNodeStatus::WaitingApproval
-            | ExecutionNodeStatus::WaitingExternal
-            | ExecutionNodeStatus::Paused => report.waiting += 1,
-        }
-    }
-    report
-}
-
-fn should_execute(result: &RuntimeOrchestrationResult, compiled: &CompiledOrchestration) -> bool {
-    result.status == "compiled"
-        && compiled.execute_without_protocol
-        && result.decision.status == "compiled"
-}
-
-fn compile_runtime_orchestration_request(
-    request: RuntimeOrchestrationRequest,
-    leased_decision: Option<&RuntimeExecutionDecision>,
-    services: Option<&RuntimeServices>,
-    parent_execution: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+fn result_from_outcome(
+    request_id: &str,
+    mut decision: RuntimeOrchestrationDecision,
+    outcome: OperationOutcome,
 ) -> RuntimeOrchestrationResult {
-    compile_runtime_orchestration(request, leased_decision, services, parent_execution)
-        .map(|(result, _)| result)
-        .unwrap_or_else(|result| result)
+    if let Some(findings) = outcome
+        .execution
+        .get("completion_findings")
+        .and_then(Value::as_array)
+    {
+        decision.validation_findings.extend(
+            findings
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+        decision.validation_findings.sort();
+        decision.validation_findings.dedup();
+    }
+    let mut evidence = outcome.evidence;
+    if let Some(lease_id) = decision
+        .budget
+        .get("strategy_lease_id")
+        .and_then(Value::as_str)
+    {
+        evidence["strategy_lease_id"] = Value::String(lease_id.to_string());
+    }
+    RuntimeOrchestrationResult {
+        request_id: request_id.to_string(),
+        status: outcome.status,
+        decision,
+        execution: outcome.execution,
+        evidence,
+        next_model_guidance: outcome.guidance,
+    }
 }
 
-fn compile_runtime_orchestration(
-    mut request: RuntimeOrchestrationRequest,
-    leased_decision: Option<&RuntimeExecutionDecision>,
-    services: Option<&RuntimeServices>,
-    parent_execution: Option<harness_contract::execution_graph::ExecutionParentBinding>,
-) -> Result<(RuntimeOrchestrationResult, Option<CompiledOrchestration>), RuntimeOrchestrationResult>
-{
-    bind_team_request_to_strategy(&mut request, leased_decision, parent_execution.as_ref());
-    let resource_health = crate::execution_core::StrategyResourceHealth {
-        provider_available: true,
-        // Compilation describes required capabilities. Executor availability is
-        // validated by the Runner registry before any state transition.
-        tools_available: true,
-        collaboration_available: true,
-        mission_available: true,
-        observed: true,
-    };
-    let plan = planner::plan_runtime_orchestration_with_decision_and_resources(
-        &request,
-        leased_decision,
-        resource_health,
-    );
+fn result_without_runtime(
+    request: &RuntimeOrchestrationRequest,
+    decision: RuntimeOrchestrationDecision,
+) -> RuntimeOrchestrationResult {
+    result_without_runtime_with_id(&request_id(request), request, decision)
+}
+
+fn result_without_runtime_with_id(
+    request_id: &str,
+    request: &RuntimeOrchestrationRequest,
+    decision: RuntimeOrchestrationDecision,
+) -> RuntimeOrchestrationResult {
+    let status = decision.status.clone();
+    RuntimeOrchestrationResult {
+        request_id: request_id.to_string(),
+        status: status.clone(),
+        decision,
+        execution: json!({"type":"orchestration_not_submitted","status":status}),
+        evidence: json!({
+            "accepted": false,
+            "executed": false,
+            "operation": request.operation.as_str(),
+        }),
+        next_model_guidance: if status == "needs_approval" {
+            "Wait for the bound durable approval, then retry once with its approval_id.".to_string()
+        } else {
+            "Correct the semantic proposal from the validation findings; do not retry unchanged."
+                .to_string()
+        },
+    }
+}
+
+fn unavailable_result(
+    request: &RuntimeOrchestrationRequest,
+    finding: String,
+) -> RuntimeOrchestrationResult {
+    let plan = planner::plan_runtime_orchestration(request);
     let mut decision = validator::validate_request(
-        &request,
+        request,
         &plan.execution_decision,
         plan.model_proposal.as_ref(),
-        services.map(|services| services.approval_queue().as_ref()),
+        None,
     );
-    let request_id = format!("runtime-orch-{}", uuid::Uuid::new_v4());
-    let compiled = if decision.status == "rejected" || decision.status == "needs_approval" {
-        None
-    } else {
-        match compiler::compile_orchestration(
-            &request_id,
-            &request,
-            &plan,
-            parent_execution,
-            services.map(|services| services.team_runtime().as_ref()),
-        ) {
-            Ok(compiled) => Some(compiled),
-            Err(error) => {
-                decision.status = "unavailable".to_string();
-                decision
-                    .validation_findings
-                    .push(format!("execution_capability_unavailable:{error}"));
-                None
-            }
-        }
-    };
-    let compiled_ok = compiled.is_some();
-    let status = if decision.status == "rejected" || decision.status == "needs_approval" {
-        decision.status.clone()
-    } else if compiled_ok {
-        "compiled".to_string()
-    } else {
-        "unavailable".to_string()
-    };
-    decision.status = status.clone();
-    let execution = compiled.as_ref().map_or_else(
-        || {
-            json!({
-                "type": "orchestration_not_submitted",
-                "status": status,
-                "findings": decision.validation_findings,
-            })
-        },
-        |compiled| {
-            json!({
-                "type": "execution_graph_compilation",
-                "status": "compiled",
-                "graph": compiled.graph,
-                "command": compiled.command,
-            })
-        },
-    );
-    let evidence = orchestration_evidence(&request_id, &request, &plan, &decision, compiled_ok);
-    Ok((
-        RuntimeOrchestrationResult {
-            request_id,
-            status,
-            decision,
-            execution,
-            evidence,
-            next_model_guidance: compiler::guidance_for_compile_result(compiled_ok),
-        },
-        compiled,
-    ))
-}
-
-fn bind_team_request_to_strategy(
-    request: &mut RuntimeOrchestrationRequest,
-    leased_decision: Option<&RuntimeExecutionDecision>,
-    parent_execution: Option<&harness_contract::execution_graph::ExecutionParentBinding>,
-) {
-    if request.action != RuntimeOrchestrationAction::RequestTeam {
-        return;
-    }
-    let Some(decision) = leased_decision else {
-        return;
-    };
-    if request.selection_mode.is_none() {
-        request.selection_mode = Some(if decision.strategy.understanding.requests_multi_agent {
-            harness_contract::team::TeamSelectionMode::Explicit
-        } else {
-            harness_contract::team::TeamSelectionMode::ModelAssisted
-        });
-    }
-    if request.strategy_binding.is_none() {
-        request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
-            decision_id: decision.decision_id.clone(),
-            decision_revision: decision.decision_revision,
-            decision_lease: decision.lease.lease_id.clone(),
-            turn_ref: decision
-                .turn_ref
-                .clone()
-                .or_else(|| parent_execution.map(|parent| parent.execution_id.clone()))
-                .unwrap_or_else(|| "detached-orchestration".to_string()),
-        });
-    }
+    decision.status = "unavailable".to_string();
+    decision.validation_findings.push(finding);
+    result_without_runtime(request, decision)
 }
 
 #[must_use]
@@ -983,795 +924,474 @@ pub fn runtime_orchestration_response_with_decision(
     }
 }
 
-fn orchestration_evidence(
-    request_id: &str,
-    request: &RuntimeOrchestrationRequest,
-    plan: &RuntimeOrchestrationPlan,
-    decision: &RuntimeOrchestrationDecision,
-    compiled: bool,
-) -> Value {
-    json!({
-        "type": "runtime_orchestration_evidence",
-        "request_id": request_id,
-        "action": request.action,
-        "status": decision.status,
-        "model_intent": request.intent,
-        "selected_pattern": decision.selected_pattern.as_str(),
-        "compile_target": plan.execution_decision.compile_target,
-        "strategy_lease": plan.execution_decision.lease,
-        "policy_gates": decision.policy_gates,
-        "validation_findings": decision.validation_findings,
-        "accepted": false,
-        "compiled": compiled,
-        "runtime_owner": "runtime.execution_graph_compiler",
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    use async_trait::async_trait;
-    use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
-    use session::SessionRecord;
-
     use super::*;
+    use harness_contract::execution_graph::ExecutionCompletionContract;
+    use harness_contract::policy::PermissionMode;
 
-    struct CompletedProtocolBackend {
-        objectives: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[async_trait]
-    impl crate::AgentRuntimeBackend for CompletedProtocolBackend {
-        fn kind(&self) -> crate::AgentBackendKind {
-            crate::AgentBackendKind::InProcess
-        }
-
-        fn capabilities(&self) -> crate::AgentBackendCapabilities {
-            crate::AgentBackendCapabilities::in_process()
-        }
-
-        async fn execute(
-            &self,
-            packet: AgentTaskPacket,
-            selection: crate::AgentModelSelection,
-        ) -> Result<AgentReturnPacket, String> {
-            self.objectives
-                .lock()
-                .expect("objectives")
-                .push(packet.objective.clone());
-            let evidence_id = format!("materialized:{}", packet.node_id());
-            let evidence = harness_contract::context::EvidenceAccessRef::durable(
-                harness_contract::context::EvidenceRef::observed("tool", evidence_id),
-                "a".repeat(64),
-                1,
-                "application/json",
-                "artifact://art_orchestration_packet",
-                format!("session:{}", packet.session_id()),
-            );
-            let mut evidence_refs = packet.evidence_refs.clone();
-            evidence_refs.push(evidence);
-            let runtime_change_receipts = packet
-                .acceptance
-                .iter()
-                .any(|criterion| matches!(criterion.as_str(), "implementation" | "mitigation"))
-                .then(|| {
-                    vec![harness_contract::agent::AgentChangeReceipt {
-                        path: packet
-                            .resource_scopes
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "fixture.txt".to_string()),
-                        before_sha256: Some("b".repeat(64)),
-                        after_sha256: "c".repeat(64),
-                        write_sequence: 1,
-                    }]
-                })
-                .unwrap_or_default();
-            let changes = runtime_change_receipts
-                .iter()
-                .map(|receipt| receipt.path.clone())
-                .collect();
-            Ok(AgentReturnPacket {
-                run_id: packet.run_id().to_string(),
-                agent_id: packet.agent_id().to_string(),
-                task_id: packet.task_id().to_string(),
-                session_id: packet.session_id().to_string(),
-                mission_id: packet.mission_id().to_string(),
-                team_id: packet.team_id().map(ToString::to_string),
-                graph_id: packet.graph_id().to_string(),
-                node_id: packet.node_id().to_string(),
-                attempt: packet.attempt,
-                expected_graph_revision: packet.expected_graph_revision,
-                status: AgentTerminalStatus::Completed,
-                outcome: serde_json::json!({
-                    "summary": "protocol agent completed",
-                    "findings": ["fixture finding"],
-                    "plan": "fixture plan",
-                    "implementation": "fixture change",
-                    "source_verification": "fixture source inspection",
-                    "review": "fixture upstream review",
-                    "risks": ["fixture risk"],
-                    "unresolved": ["fixture gap"],
-                    "proposal": "fixture proposal",
-                    "critique": "fixture critique",
-                    "mitigation": "fixture mitigation",
-                    "checkpoint": "fixture checkpoint"
-                })
-                .to_string(),
-                acceptance: packet.acceptance,
-                evidence_refs,
-                changes,
-                runtime_change_receipts,
-                conflicts: Vec::new(),
-                unresolved: Vec::new(),
-                input_tokens: 11,
-                output_tokens: 7,
-                cached_tokens: 0,
-                model: selection.model,
-                provider: selection.provider,
-                tool_calls: 1,
-                duplicate_tool_calls: 0,
-                runtime_write_attempt_paths: Vec::new(),
-                runtime_observed_resource_scopes: Vec::new(),
-                failure: None,
-            })
-        }
-    }
-
-    fn request(action: RuntimeOrchestrationAction) -> RuntimeOrchestrationRequest {
+    fn proposal(nodes: Vec<GraphSemanticNode>) -> RuntimeOrchestrationRequest {
         RuntimeOrchestrationRequest {
-            intent: "inspect the workspace".to_string(),
-            model_lease: None,
-            session_id: Some("session-1".to_string()),
-            target_session_id: None,
-            action,
+            intent: "analyze independent domains and synthesize checked evidence".to_string(),
+            model_lease: Some("test-model".to_string()),
+            session_id: Some("session-v621".to_string()),
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "mutation-v621".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes,
+                completion: Default::default(),
+                reason: "parallel evidence lanes".to_string(),
+            }),
+            control: None,
             selection_mode: None,
             strategy_binding: None,
-            reason: None,
-            template_hint: None,
-            focus_partition_plans: Vec::new(),
-            capabilities: vec!["resource:read:crates/runtime".to_string()],
+            capabilities: Vec::new(),
             evidence_refs: Vec::new(),
-            constraints: Default::default(),
-            surface: None,
-        }
-    }
-
-    #[test]
-    fn sync_orchestration_compiles_without_side_effects() {
-        let result =
-            handle_runtime_orchestration_request(request(RuntimeOrchestrationAction::PlanOnly));
-        assert_eq!(
-            result.status, "compiled",
-            "findings={:?}",
-            result.decision.validation_findings
-        );
-        assert_eq!(result.execution["type"], "execution_graph_compilation");
-        assert_eq!(result.evidence["accepted"], false);
-    }
-
-    #[test]
-    fn rephrased_cross_domain_team_objectives_share_one_parent_execution() {
-        assert!(same_team_objective(
-            "复杂架构审查：启动团队分析 runtime、memory、gateway 的职责边界、事件真相和源码路径证据",
-            "继续架构审查：基于已收集证据分析 gateway、runtime、memory 的 canonical state、风险和实际源码路径",
-        ));
-        assert!(!same_team_objective(
-            "审查 runtime、memory、gateway 的架构边界",
-            "为市场部门起草一份下季度招聘计划",
-        ));
-    }
-
-    #[test]
-    fn future_capability_is_typed_unavailable_not_fake_running() {
-        let result =
-            handle_runtime_orchestration_request(request(RuntimeOrchestrationAction::RequestTeam));
-        assert_ne!(result.status, "running");
-        assert_eq!(result.evidence["accepted"], false);
-    }
-
-    #[tokio::test]
-    async fn async_orchestration_does_not_install_placeholder_executors() {
-        let services = RuntimeServices::in_memory().expect("runtime services");
-        let result = submit_runtime_orchestration_request(
-            request(RuntimeOrchestrationAction::PlanOnly),
-            None,
-            services.as_ref(),
-            None,
-        )
-        .await;
-
-        assert_eq!(result.status, "compiled", "{result:?}");
-        assert_eq!(result.evidence["accepted"], false);
-        assert!(!services
-            .event_store()
-            .all_events(100)
-            .expect("runtime events")
-            .iter()
-            .any(|event| event.kind == "execution_graph.planned"));
-    }
-
-    #[tokio::test]
-    async fn risk_gate_submits_one_durable_global_approval() {
-        let services = RuntimeServices::in_memory().expect("runtime services");
-        let mut risk_gate = request(RuntimeOrchestrationAction::RequestRiskGate);
-        risk_gate.intent = "allow checked external research for the current task".to_string();
-        risk_gate.constraints.risk = Some("high".to_string());
-
-        let result =
-            submit_runtime_orchestration_request(risk_gate, None, services.as_ref(), None).await;
-
-        assert_eq!(result.status, "needs_approval", "{result:?}");
-        let requirement = result
-            .decision
-            .required_approval
-            .as_ref()
-            .expect("approval requirement");
-        let approval_id = requirement
-            .approval_id
-            .as_deref()
-            .expect("durable approval id");
-        let approval = services
-            .approval_queue()
-            .get(approval_id)
-            .expect("approval queue entry");
-        assert_eq!(approval.status, crate::GlobalApprovalStatus::Pending);
-        assert_eq!(approval.source.session_id.as_deref(), Some("session-1"));
-        assert_eq!(approval.action, "runtime_orchestrate:request_risk_gate");
-        assert_eq!(
-            result.model_receipt()["decision"]["required_approval"]["approval_id"],
-            approval_id
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_session_compiles_and_starts_the_canonical_handoff_graph() {
-        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        for session_id in ["session-1", "session-2"] {
-            store
-                .create_session(&SessionRecord {
-                    session_id: session_id.to_string(),
-                    platform: "test".to_string(),
-                    chat_id: format!("chat-{session_id}"),
-                    user_id: None,
-                    model: None,
-                    created_at: timestamp.clone(),
-                    last_activity: timestamp.clone(),
-                    message_count: 0,
-                    reset_policy: "manual".to_string(),
-                    metadata_json: None,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    estimated_cost_usd: 0.0,
-                    status: "active".to_string(),
-                })
-                .await
-                .unwrap();
-        }
-        let services = RuntimeServices::in_memory().expect("runtime services");
-        services
-            .install_test_session_store(Arc::clone(&store))
-            .unwrap();
-        let mut request = request(RuntimeOrchestrationAction::DispatchSession);
-        request.target_session_id = Some("session-2".to_string());
-        request.evidence_refs = vec!["evidence:source".to_string()];
-
-        let result =
-            submit_runtime_orchestration_request(request, None, services.as_ref(), None).await;
-
-        assert_eq!(result.status, "waiting", "{result:?}");
-        assert_eq!(result.execution["type"], "execution_graph_run");
-        let target = store
-            .claim_session_runtime_outbox(
-                "orchestration-test",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64
-                    + 1_000,
-                1_000,
-                8,
-            )
-            .await
-            .unwrap();
-        assert_eq!(target.len(), 1);
-        assert_eq!(target[0].session_id, "session-2");
-    }
-
-    #[tokio::test]
-    async fn deliberation_instantiates_the_template_graph_and_returns_one_terminal_result() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
-            std::fs::create_dir_all(workspace.join(relative)).expect("bounded workspace scope");
-        }
-        let providers = crate::config::ProvidersConfig {
-            providers: HashMap::from([(
-                "test".to_string(),
-                crate::config::ProviderConfig {
-                    name: "test".to_string(),
-                    base_url: "https://example.test/v1".to_string(),
-                    api_key: "test".to_string(),
-                    models: vec!["fast".to_string()],
-                    protocol: Some("responses".to_string()),
-                    parallel_tool_calls: Default::default(),
-                    early_tool_start: Default::default(),
-                },
-            )]),
-        };
-        let services = RuntimeServices::builder(temp.path(), &workspace)
-            .provider_registry(Arc::new(
-                crate::ProviderRegistry::new(providers).expect("provider registry"),
-            ))
-            .build()
-            .expect("runtime services");
-        let objectives = Arc::new(Mutex::new(Vec::new()));
-        services
-            .agent_runtime()
-            .register_backend(Arc::new(CompletedProtocolBackend {
-                objectives: Arc::clone(&objectives),
-            }));
-
-        let result = submit_runtime_orchestration_request(
-            request(RuntimeOrchestrationAction::RequestDeliberation),
-            None,
-            services.as_ref(),
-            None,
-        )
-        .await;
-
-        assert_eq!(result.status, "completed", "{result:?}");
-        assert!(result.execution.get("protocol").is_none());
-        assert_eq!(result.execution["type"], "execution_graph_run");
-        assert!(result.execution["terminal_result_ref"]
-            .as_str()
-            .is_some_and(|value| value.starts_with("assistant_json:")));
-        assert_eq!(result.evidence["accepted"], true);
-        assert!(services
-            .event_store()
-            .all_events(200)
-            .expect("runtime events")
-            .iter()
-            .any(|event| event.kind == "agent.terminal"));
-        assert!(objectives
-            .lock()
-            .expect("objectives")
-            .iter()
-            .any(|objective| {
-                objective.contains("## Canonical upstream results")
-                    && objective.contains("### Upstream proposer")
-            }));
-    }
-
-    #[tokio::test]
-    async fn same_parent_team_request_reuses_the_durable_protocol_graph() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(workspace.join("crates/runtime")).expect("workspace");
-        let providers = crate::config::ProvidersConfig {
-            providers: HashMap::from([(
-                "test".to_string(),
-                crate::config::ProviderConfig {
-                    name: "test".to_string(),
-                    base_url: "https://example.test/v1".to_string(),
-                    api_key: "test".to_string(),
-                    models: vec!["fast".to_string()],
-                    protocol: Some("responses".to_string()),
-                    parallel_tool_calls: Default::default(),
-                    early_tool_start: Default::default(),
-                },
-            )]),
-        };
-        let services = RuntimeServices::builder(temp.path(), &workspace)
-            .provider_registry(Arc::new(
-                crate::ProviderRegistry::new(providers).expect("provider registry"),
-            ))
-            .build()
-            .expect("runtime services");
-        let objectives = Arc::new(Mutex::new(Vec::new()));
-        services
-            .agent_runtime()
-            .register_backend(Arc::new(CompletedProtocolBackend {
-                objectives: Arc::clone(&objectives),
-            }));
-        let parent = harness_contract::execution_graph::ExecutionParentBinding {
-            execution_id: "turn-graph-1".to_string(),
-            node_id: "model-step-1".to_string(),
-        };
-
-        let first = submit_runtime_orchestration_request(
-            request(RuntimeOrchestrationAction::RequestTeam),
-            None,
-            services.as_ref(),
-            Some(parent.clone()),
-        )
-        .await;
-        let executed_objectives = objectives.lock().expect("objectives").len();
-        let second = submit_runtime_orchestration_request(
-            request(RuntimeOrchestrationAction::RequestTeam),
-            None,
-            services.as_ref(),
-            Some(parent),
-        )
-        .await;
-
-        assert_eq!(first.status, "completed", "{first:?}");
-        assert_eq!(second.status, "completed", "{second:?}");
-        assert_eq!(second.execution["type"], "execution_graph_reused");
-        assert_eq!(second.evidence["reused"], true);
-        assert_eq!(
-            first.evidence["graph_id"], second.evidence["graph_id"],
-            "the repeated request must point at the same durable graph"
-        );
-        assert_eq!(
-            objectives.lock().expect("objectives").len(),
-            executed_objectives,
-            "the duplicate model request must not execute protocol agents again"
-        );
-    }
-
-    #[tokio::test]
-    async fn automatic_team_executes_bounded_graph_and_replays_by_collaboration_lease() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
-            std::fs::create_dir_all(workspace.join(relative)).expect("workspace scope");
-        }
-        let providers = crate::config::ProvidersConfig {
-            providers: HashMap::from([(
-                "test".to_string(),
-                crate::config::ProviderConfig {
-                    name: "test".to_string(),
-                    base_url: "https://example.test/v1".to_string(),
-                    api_key: "test".to_string(),
-                    models: vec!["fast".to_string()],
-                    protocol: Some("responses".to_string()),
-                    parallel_tool_calls: Default::default(),
-                    early_tool_start: Default::default(),
-                },
-            )]),
-        };
-        let services = RuntimeServices::builder(temp.path(), &workspace)
-            .provider_registry(Arc::new(
-                crate::ProviderRegistry::new(providers).expect("provider registry"),
-            ))
-            .build()
-            .expect("runtime services");
-        let objectives = Arc::new(Mutex::new(Vec::new()));
-        services
-            .agent_runtime()
-            .register_backend(Arc::new(CompletedProtocolBackend {
-                objectives: Arc::clone(&objectives),
-            }));
-        let objective = "这是复杂架构审查，必须实际启动一个多 Agent 协作团队，分别审视 crates/runtime、crates/gateway、surfaces/webui 的策略事件接线、权限边界和用户可见状态，再交叉验证并综合证据。";
-        let mut decision = crate::execution_core::build_runtime_execution_decision(objective, None);
-        assert_eq!(
-            decision.strategy.selected_candidate,
-            harness_contract::strategy::ExecutionCandidateKind::Team
-        );
-        decision.session_ref = Some("session-1".to_string());
-        decision.turn_ref = Some("turn-auto-team".to_string());
-        let binding = harness_contract::team::TeamStrategyBinding {
-            decision_id: decision.decision_id.clone(),
-            decision_revision: decision.decision_revision,
-            decision_lease: decision.lease.lease_id.clone(),
-            turn_ref: "turn-auto-team".to_string(),
-        };
-        let parent = harness_contract::execution_graph::ExecutionParentBinding {
-            execution_id: "turn-graph-auto".to_string(),
-            node_id: "turn-graph-auto:model".to_string(),
-        };
-        let mut automatic = request(RuntimeOrchestrationAction::RequestTeam);
-        automatic.intent = objective.to_string();
-        automatic.model_lease = Some("fast".to_string());
-        automatic.selection_mode = Some(harness_contract::team::TeamSelectionMode::Automatic);
-        automatic.strategy_binding = Some(binding.clone());
-        automatic.constraints.max_parallel_agents = Some(3);
-        automatic.constraints.risk =
-            Some(format!("{:?}", decision.strategy.understanding.risk).to_ascii_lowercase());
-        let scopes = [
-            "read:crates/runtime",
-            "read:crates/gateway",
-            "read:surfaces/webui",
-        ];
-        automatic.capabilities = scopes
-            .iter()
-            .map(|scope| format!("resource:{scope}"))
-            .collect();
-        automatic.focus_partition_plans = vec![
-            harness_contract::team::FocusPartitionPlan {
-                role_id: "researcher".to_string(),
-                shared_baseline: vec!["same parent objective".to_string()],
-                slots: scopes
-                    .iter()
-                    .enumerate()
-                    .map(
-                        |(index, scope)| harness_contract::team::FocusPartitionSlot {
-                            focus_id: format!("focus-{index}"),
-                            boundary: format!("inspect only {scope}"),
-                            evidence_responsibility: format!("evidence from {scope}"),
-                            capability_cropped_refs: vec![(*scope).to_string()],
-                            scope_hash: harness_contract::team::focus_scope_hash(
-                                "researcher",
-                                &format!("inspect only {scope}"),
-                                &[(*scope).to_string()],
-                            ),
-                            overlap_budget_bp: 0,
-                            novelty_target_bp: 2_500,
-                            output_contract: vec!["findings".to_string(), "evidence".to_string()],
-                            output_acceptance: vec![format!(
-                                "evidence_scope:{}",
-                                scope.trim_start_matches("read:")
-                            )],
-                        },
-                    )
-                    .collect(),
+            constraints: RuntimeOrchestrationConstraints {
+                max_parallel_agents: Some(8),
+                permission_ceiling: PermissionMode::ReadOnly,
+                ..Default::default()
             },
-            harness_contract::team::FocusPartitionPlan {
-                role_id: "synthesizer".to_string(),
-                shared_baseline: vec!["bounded researcher outputs only".to_string()],
-                slots: vec![harness_contract::team::FocusPartitionSlot {
-                    focus_id: "bounded-synthesis".to_string(),
-                    boundary: "synthesize only bounded researcher evidence".to_string(),
-                    evidence_responsibility: "preserve evidence scope and unresolved gaps"
-                        .to_string(),
-                    capability_cropped_refs: scopes
-                        .iter()
-                        .map(|scope| (*scope).to_string())
-                        .collect(),
-                    scope_hash: harness_contract::team::focus_scope_hash(
-                        "synthesizer",
-                        "synthesize only bounded researcher evidence",
-                        &scopes
-                            .iter()
-                            .map(|scope| (*scope).to_string())
-                            .collect::<Vec<_>>(),
-                    ),
-                    overlap_budget_bp: 0,
-                    novelty_target_bp: 1_000,
-                    output_contract: vec![
-                        "summary".to_string(),
-                        "evidence".to_string(),
-                        "unresolved".to_string(),
-                    ],
-                    output_acceptance: vec!["evidence".to_string(), "unresolved".to_string()],
-                }],
-            },
-        ];
+            surface: Some("test".to_string()),
+        }
+    }
 
-        let (left, right) = tokio::join!(
-            submit_runtime_orchestration_request(
-                automatic.clone(),
-                Some(&decision),
-                services.as_ref(),
-                Some(parent.clone()),
-            ),
-            submit_runtime_orchestration_request(
-                automatic.clone(),
-                Some(&decision),
-                services.as_ref(),
-                Some(parent.clone()),
-            ),
-        );
-        let (first, concurrent_replay) = if left.execution["type"] == "execution_graph_run" {
-            (left, right)
-        } else {
-            (right, left)
+    fn node(id: &str, recipe: CapabilityRecipeId, depends_on: Vec<String>) -> GraphSemanticNode {
+        GraphSemanticNode {
+            node_id: id.to_string(),
+            recipe,
+            objective: format!("complete {id}"),
+            depends_on,
+            multiplicity: 1,
+            focuses: Vec::new(),
+            template: None,
+            input_refs: Vec::new(),
+            output_artifacts: Vec::new(),
+            evidence_contract: Vec::new(),
+            resource_scopes: Vec::new(),
+        }
+    }
+
+    fn ensure_test_team_resource(request: &mut RuntimeOrchestrationRequest) {
+        let Some(proposal) = request.proposal.as_mut() else {
+            return;
         };
-        assert_eq!(first.status, "completed", "{first:?}");
-        assert_eq!(
-            concurrent_replay.status, "completed",
-            "{concurrent_replay:?}"
-        );
-        assert_eq!(
-            concurrent_replay.execution["type"],
-            "execution_graph_reused"
-        );
-        assert_eq!(
-            concurrent_replay.evidence["graph_id"],
-            first.evidence["graph_id"]
-        );
-        assert_eq!(first.evidence["executed"], true);
-        assert_eq!(first.evidence["working_state_verified"], true);
-        let graph_id = first.evidence["graph_id"].as_str().expect("graph id");
-        let graph = services
-            .graph_state_store()
-            .load(graph_id)
-            .expect("automatic Team graph");
-        let agent_packets = graph
+        if proposal
             .nodes
             .iter()
-            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-            .map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).unwrap())
-            .collect::<Vec<_>>();
-        assert!(agent_packets.len() >= 2);
-        assert!(agent_packets.iter().all(|packet| {
-            packet.budget_lease.max_tokens <= 24_000
-                && packet
-                    .constraints
-                    .contains(&format!("collaboration_lease:{}", binding.decision_lease))
-                && packet
-                    .constraints
-                    .contains(&"nested_team:forbidden".to_string())
-                && packet
-                    .constraints
-                    .contains(&"parent_merge:exactly_once".to_string())
-        }));
-        let executed_agents = objectives.lock().expect("objectives").len();
-
-        automatic.intent = "same leased turn, rephrased after terminal receipt".to_string();
-        // Match the Gateway's model-origin sanitization: the provider cannot
-        // self-report a binding or selection mode. Runtime must inject the
-        // active lease before reuse lookup.
-        automatic.strategy_binding = None;
-        automatic.selection_mode = None;
-        automatic.focus_partition_plans.clear();
-        let replay = submit_runtime_orchestration_request(
-            automatic,
-            Some(&decision),
-            services.as_ref(),
-            Some(parent),
-        )
-        .await;
-        assert_eq!(replay.status, "completed", "{replay:?}");
-        assert_eq!(replay.execution["type"], "execution_graph_reused");
-        assert_eq!(replay.request_id, first.request_id);
-        assert_eq!(replay.evidence["request_id"], first.evidence["request_id"]);
-        assert_eq!(replay.evidence["graph_id"], first.evidence["graph_id"]);
-        assert_eq!(
-            objectives.lock().expect("objectives").len(),
-            executed_agents
-        );
-    }
-
-    #[tokio::test]
-    async fn explicit_external_research_team_is_runtime_scoped_and_executes() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(workspace.join("apps/mfg")).expect("workspace");
-        let providers = crate::config::ProvidersConfig {
-            providers: HashMap::from([(
-                "test".to_string(),
-                crate::config::ProviderConfig {
-                    name: "test".to_string(),
-                    base_url: "https://example.test/v1".to_string(),
-                    api_key: "test".to_string(),
-                    models: vec!["fast".to_string()],
-                    protocol: Some("responses".to_string()),
-                    parallel_tool_calls: Default::default(),
-                    early_tool_start: Default::default(),
-                },
-            )]),
-        };
-        let services = RuntimeServices::builder(temp.path(), &workspace)
-            .provider_registry(Arc::new(
-                crate::ProviderRegistry::new(providers).expect("provider registry"),
-            ))
-            .build()
-            .expect("runtime services");
-        let objectives = Arc::new(Mutex::new(Vec::new()));
-        services
-            .agent_runtime()
-            .register_backend(Arc::new(CompletedProtocolBackend {
-                objectives: Arc::clone(&objectives),
-            }));
-
-        let objective =
-            "发起一个团队并行完成 WAIC 2026 事实核验简报，必须实际调用网络工具并引用真实来源。";
-        let mut decision = crate::execution_core::build_runtime_execution_decision(objective, None);
-        decision.session_ref = Some("session-external".to_string());
-        decision.turn_ref = Some("turn-external".to_string());
-        assert!(decision.strategy.understanding.requires_external_facts);
-        assert!(decision.strategy.understanding.requests_multi_agent);
-
-        let parent = harness_contract::execution_graph::ExecutionParentBinding {
-            execution_id: "turn-graph-external".to_string(),
-            node_id: "turn-graph-external:model".to_string(),
-        };
-        let mut external = request(RuntimeOrchestrationAction::RequestTeam);
-        external.intent = objective.to_string();
-        external.model_lease = Some("fast".to_string());
-        external.template_hint = Some("cowd/parallel-research-synthesis".to_string());
-        external.constraints.max_parallel_agents = Some(3);
-        // Model claims are deliberately adversarial. Runtime must replace
-        // write authority and resource scope from the admitted strategy.
-        external.constraints.requires_write = Some(true);
-        external.capabilities = vec![
-            "WebSearch".to_string(),
-            "WebFetch".to_string(),
-            "write_file".to_string(),
-            "resource:write:reports".to_string(),
-            "resource:read:apps/mfg".to_string(),
-        ];
-        external.focus_partition_plans = vec![team_authority::automatic_focus_partition_plan(
-            objective,
-            vec!["read:apps/mfg".to_string()],
-        )];
-
-        let result = submit_runtime_orchestration_request(
-            external,
-            Some(&decision),
-            services.as_ref(),
-            Some(parent),
-        )
-        .await;
-        assert_eq!(result.status, "completed", "{result:?}");
-        assert_eq!(result.evidence["executed"], true);
-        assert!(objectives.lock().expect("objectives").len() >= 3);
-
-        let graph_id = result.evidence["graph_id"].as_str().expect("graph id");
-        let graph = services
-            .graph_state_store()
-            .load(graph_id)
-            .expect("external Team graph");
-        let packets = graph
-            .nodes
-            .iter()
-            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-            .map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).unwrap())
-            .collect::<Vec<_>>();
-        assert!(packets.len() >= 3);
-        let researchers = packets
-            .iter()
-            .filter(|packet| {
-                packet
-                    .constraints
-                    .iter()
-                    .any(|constraint| constraint == "team_role:researcher")
-            })
-            .collect::<Vec<_>>();
-        assert!(researchers.len() >= 3);
-        assert!(
-            researchers.iter().all(|packet| {
-                !packet.allowed_tools.contains(&"write_file".to_string())
-                    && packet.allowed_tools.contains(&"WebSearch".to_string())
-                    && packet.allowed_tools.contains(&"WebFetch".to_string())
-                    && packet
-                        .resource_scopes
-                        .iter()
-                        .all(|scope| scope == "network:*" || scope == "session:session-1")
-                    && packet
-                        .resource_scopes
-                        .iter()
-                        .any(|scope| scope == "network:*")
-            }),
-            "packets={:?}",
-            researchers
-                .iter()
-                .map(|packet| (&packet.allowed_tools, &packet.resource_scopes))
-                .collect::<Vec<_>>()
-        );
-        assert!(packets.iter().all(|packet| {
-            packet
-                .constraints
-                .iter()
-                .all(|constraint| !constraint.contains("apps/mfg"))
-        }));
+            .filter(|node| node.recipe == CapabilityRecipeId::Team)
+            .all(|node| node.resource_scopes.is_empty())
+        {
+            request.capabilities.push("resource:network:*".to_string());
+            for node in proposal
+                .nodes
+                .iter_mut()
+                .filter(|node| node.recipe == CapabilityRecipeId::Team)
+            {
+                node.resource_scopes.push("network:*".to_string());
+            }
+        }
     }
 
     #[test]
-    fn critical_risk_still_requires_global_approval() {
-        let execution = crate::execution_core::build_runtime_execution_decision(
-            "force push 并 reset --hard 清理所有内容",
+    fn semantic_contract_rejects_physical_executor_injection() {
+        let parsed = serde_json::from_value::<RuntimeOrchestrationRequest>(json!({
+            "intent": "inject executor",
+            "operation": "propose",
+            "proposal": {
+                "mutation_id": "bad",
+                "reason": "bad",
+                "nodes": [{
+                    "node_id": "bad",
+                    "recipe": "agent",
+                    "objective": "bad",
+                    "executor_kind": "shell"
+                }]
+            }
+        }));
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn semantic_validator_rejects_dependency_cycle() {
+        let request = proposal(vec![
+            node("a", CapabilityRecipeId::Agent, vec!["b".to_string()]),
+            node("b", CapabilityRecipeId::Review, vec!["a".to_string()]),
+        ]);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let decision = validator::validate_request(
+            &request,
+            &plan.execution_decision,
+            plan.model_proposal.as_ref(),
             None,
         );
-        let mut critical = request(RuntimeOrchestrationAction::PlanOnly);
-        critical.constraints.risk = Some("critical".to_string());
-
-        let decision = validator::validate_request(&critical, &execution, None, None);
-
-        assert_eq!(decision.status, "needs_approval");
-        assert!(decision
-            .policy_gates
-            .contains(&harness_contract::core::ExecutionPolicyGate::Risk));
-        assert!(decision
-            .policy_gates
-            .contains(&harness_contract::core::ExecutionPolicyGate::Approval));
+        assert_eq!(decision.status, "rejected");
         assert!(decision
             .validation_findings
-            .contains(&"risk_requires_approval".to_string()));
+            .contains(&"proposal_dependency_cycle".to_string()));
+    }
+
+    #[test]
+    fn semantic_compiler_materializes_parallel_agents_and_synthesis() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut agents = node("research", CapabilityRecipeId::Agent, Vec::new());
+        agents.multiplicity = 2;
+        agents.output_artifacts = vec!["research_finding".to_string()];
+        let mut synthesis = node(
+            "synthesis",
+            CapabilityRecipeId::Synthesis,
+            vec!["research".to_string()],
+        );
+        synthesis.output_artifacts = vec!["report".to_string()];
+        let mut request = proposal(vec![agents, synthesis]);
+        request.proposal.as_mut().unwrap().completion = ExecutionCompletionContract {
+            required_node_ids: vec!["synthesis".to_string()],
+            required_artifact_kinds: vec!["report".to_string()],
+            allow_unresolved_conflicts: false,
+        };
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut request);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "compile-v621",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("semantic graph compiles");
+        assert_eq!(compiled.graph.nodes.len(), 3);
+        assert_eq!(compiled.graph.edges.len(), 4);
+        assert_eq!(
+            compiled
+                .graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::Produces
+                })
+                .count(),
+            2
+        );
+        let completion = &compiled.graph.orchestration.as_ref().unwrap().completion;
+        assert_eq!(completion.required_node_ids.len(), 1);
+        assert!(completion.required_node_ids[0].contains("synthesis"));
+        assert_eq!(completion.required_artifact_kinds, vec!["report"]);
+    }
+
+    #[test]
+    fn semantic_compiler_materializes_three_teams_and_a_review_team() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut teams = ["domain-a", "domain-b", "domain-c"]
+            .into_iter()
+            .map(|id| {
+                let mut team = node(id, CapabilityRecipeId::Team, Vec::new());
+                team.template = Some("cowd/direct-executor".to_string());
+                team.output_artifacts = vec![format!("{id}-finding")];
+                team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
+                team
+            })
+            .collect::<Vec<_>>();
+        let mut review = node(
+            "review-team",
+            CapabilityRecipeId::Team,
+            vec![
+                "domain-a".to_string(),
+                "domain-b".to_string(),
+                "domain-c".to_string(),
+            ],
+        );
+        review.template = Some("cowd/parallel-research-synthesis".to_string());
+        review.output_artifacts = vec!["reviewed-report".to_string()];
+        review.evidence_contract = vec![
+            "summary".to_string(),
+            "evidence".to_string(),
+            "unresolved".to_string(),
+        ];
+        teams.push(review);
+        let mut request = proposal(teams);
+        request.constraints.max_parallel_agents = Some(4);
+        request.proposal.as_mut().unwrap().completion = ExecutionCompletionContract {
+            required_node_ids: vec!["review-team".to_string()],
+            required_artifact_kinds: vec!["reviewed-report".to_string()],
+            allow_unresolved_conflicts: false,
+        };
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut request);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "multi-team-v621",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("multi-Team root compiles");
+        assert_eq!(compiled.graph.nodes.len(), 4);
+        assert!(compiled.graph.nodes.iter().all(|node| {
+            node.kind == harness_contract::execution_graph::ExecutionNodeKind::Subgraph
+                && node.executor_kind == compiler::TEAM_SUBGRAPH_EXECUTOR
+        }));
+        assert_eq!(
+            compiled
+                .graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::DependsOn
+                })
+                .count(),
+            3
+        );
+        assert_eq!(
+            compiled
+                .graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::Produces
+                })
+                .count(),
+            3
+        );
+        let completion = &compiled.graph.orchestration.as_ref().unwrap().completion;
+        assert_eq!(completion.required_node_ids.len(), 1);
+        assert!(completion.required_node_ids[0].contains("review-team"));
+    }
+
+    #[test]
+    fn hundred_teams_remain_bounded_root_subgraphs() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let nodes = (0..100)
+            .map(|index| {
+                let mut team = node(
+                    &format!("team-{index:03}"),
+                    CapabilityRecipeId::Team,
+                    Vec::new(),
+                );
+                team.template = Some("cowd/direct-executor".to_string());
+                team
+            })
+            .collect::<Vec<_>>();
+        let mut request = proposal(nodes);
+        request.constraints.max_parallel_agents = Some(100);
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut request);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "hundred-team-v621",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("bounded root compiles");
+        assert_eq!(compiled.graph.nodes.len(), 100);
+        assert!(compiled.graph.nodes.iter().all(|node| {
+            node.kind == harness_contract::execution_graph::ExecutionNodeKind::Subgraph
+                && serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+                    &node.payload_ref,
+                )
+                .is_ok()
+        }));
+        assert!(compiled.graph.nodes.iter().all(|node| {
+            node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+        }));
+    }
+
+    #[test]
+    fn completion_contract_blocks_missing_artifacts_and_unresolved_conflicts() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut synthesis = node("synthesis", CapabilityRecipeId::Synthesis, Vec::new());
+        synthesis.output_artifacts = vec!["verified-report".to_string()];
+        let mut request = proposal(vec![synthesis]);
+        request.proposal.as_mut().unwrap().completion = ExecutionCompletionContract {
+            required_node_ids: vec!["synthesis".to_string()],
+            required_artifact_kinds: vec!["verified-report".to_string()],
+            allow_unresolved_conflicts: false,
+        };
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        let plan = planner::plan_runtime_orchestration(&request);
+        let mut graph = compiler::compile_orchestration(
+            "completion-v621",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("completion graph compiles")
+        .graph;
+        let node_id = graph.nodes[0].id.clone();
+        graph.node_statuses.insert(
+            node_id.clone(),
+            harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+        );
+        let projection = harness_contract::execution_graph::project_execution_graph(&graph);
+        assert_eq!(
+            completion_findings(&projection),
+            vec!["required_artifact_not_materialized:verified-report"]
+        );
+
+        graph.node_results.insert(
+            node_id,
+            harness_contract::execution_graph::ExecutionNodeResult {
+                status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                result_ref: Some("artifact:verified-report:unresolved".to_string()),
+                summary: Some("conflicting evidence retained".to_string()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 1,
+            },
+        );
+        let findings = completion_findings(
+            &harness_contract::execution_graph::project_execution_graph(&graph),
+        );
+        assert_eq!(findings, vec!["unresolved_conflict_rejected"]);
+    }
+
+    #[tokio::test]
+    async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut team = node("team", CapabilityRecipeId::Team, Vec::new());
+        team.template = Some("cowd/parallel-research-synthesis".to_string());
+        let mut request = proposal(vec![team]);
+        request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
+            decision_id: "decision-v621".to_string(),
+            decision_revision: 1,
+            decision_lease: "lease-v621".to_string(),
+            turn_ref: "turn-v621".to_string(),
+        });
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        if request.proposal.as_ref().unwrap().nodes[0]
+            .resource_scopes
+            .is_empty()
+        {
+            request.capabilities.push("resource:network:*".to_string());
+            request.proposal.as_mut().unwrap().nodes[0]
+                .resource_scopes
+                .push("network:*".to_string());
+        }
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "team-board-v621",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("team root compiles");
+        let team_request: harness_contract::team::TeamInstantiationRequest =
+            serde_json::from_str(&compiled.graph.nodes[0].payload_ref).expect("typed team request");
+        let child = services
+            .team_runtime()
+            .plan(team_request)
+            .expect("team child plan");
+        let registered = services
+            .execution_supervisor()
+            .register_graph(child.graph)
+            .await
+            .expect("register team child");
+        let agent_nodes = registered
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+            })
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        assert!(agent_nodes.len() >= 2);
+        let publish = crate::TeamWorkingStatePublishRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[0].clone(),
+            expected_revision: 0,
+            kind: crate::TeamWorkingStateKind::Finding,
+            summary: "checked semantic finding".to_string(),
+            refs: vec!["evidence:test:v621".to_string()],
+            artifact_refs: vec!["artifact:test:v621".to_string()],
+            visibility: crate::TeamWorkingStateVisibility::Team,
+        };
+        let committed = services
+            .team_runtime()
+            .publish_working_state(publish.clone())
+            .await
+            .expect("publish board entry");
+        assert_eq!(committed.board_revision, 1);
+        let duplicate = services
+            .team_runtime()
+            .publish_working_state(publish)
+            .await
+            .expect("idempotent retry");
+        assert_eq!(duplicate.entries.len(), 1);
+        let visible = services
+            .team_runtime()
+            .read_working_state(crate::TeamWorkingStateReadRequest {
+                graph_id: registered.id.clone(),
+                node_id: agent_nodes[1].clone(),
+                after_revision: Some(0),
+                exact_revision: None,
+            })
+            .expect("peer read");
+        assert_eq!(visible.entries.len(), 1);
+        assert_eq!(visible.entries[0].source_generation, 1);
+        let exact = services
+            .team_runtime()
+            .read_working_state(crate::TeamWorkingStateReadRequest {
+                graph_id: registered.id.clone(),
+                node_id: agent_nodes[1].clone(),
+                after_revision: None,
+                exact_revision: Some(1),
+            })
+            .expect("exact revision read");
+        assert_eq!(exact.entries.len(), 1);
+        let after = services
+            .team_runtime()
+            .read_working_state(crate::TeamWorkingStateReadRequest {
+                graph_id: registered.id.clone(),
+                node_id: agent_nodes[1].clone(),
+                after_revision: Some(1),
+                exact_revision: None,
+            })
+            .expect("read after committed revision");
+        assert!(after.entries.is_empty());
+
+        let private_reasoning = services
+            .team_runtime()
+            .publish_working_state(crate::TeamWorkingStatePublishRequest {
+                graph_id: registered.id,
+                node_id: agent_nodes[0].clone(),
+                expected_revision: 1,
+                kind: crate::TeamWorkingStateKind::Finding,
+                summary: "raw chain-of-thought must remain private".to_string(),
+                refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                visibility: crate::TeamWorkingStateVisibility::Private,
+            })
+            .await
+            .expect_err("private reasoning trace must be rejected");
+        assert!(private_reasoning.contains("not private reasoning traces"));
     }
 }

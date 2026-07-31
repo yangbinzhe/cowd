@@ -13,7 +13,9 @@ use crate::execution_core::strategy_decision::{
     RuntimeExecutionDecision, StrategyDecisionEngine, StrategyResourceHealth,
 };
 use crate::execution_core::tool_intents::{tool_intents_from_rewoo, ToolIntentGraph};
-use crate::orchestration::request::RuntimeOrchestrationRequest;
+use crate::orchestration::request::{
+    CapabilityRecipeId, RuntimeOrchestrationOperation, RuntimeOrchestrationRequest,
+};
 use crate::{CollaborationDecision, CollaborationTemplateMatcher};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,8 +76,7 @@ pub(crate) fn plan_runtime_orchestration_with_decision_and_resources(
     if let Some(proposal) = model_proposal.clone() {
         strategy_input = strategy_input.with_proposal(proposal);
     }
-    let understanding =
-        understanding_with_action_signal(understand(&strategy_input), request.action);
+    let understanding = understanding_with_proposal_signal(understand(&strategy_input), request);
     strategy_input = strategy_input.with_understanding(understanding);
     let execution_decision = leased_decision.cloned().unwrap_or_else(|| {
         StrategyDecisionEngine.decide_with_input(strategy_input, None, resource_health)
@@ -99,40 +100,48 @@ pub(crate) fn plan_runtime_orchestration_with_decision_and_resources(
     }
 }
 
-fn understanding_with_action_signal(
+fn understanding_with_proposal_signal(
     mut understanding: TaskUnderstanding,
-    action: crate::orchestration::request::RuntimeOrchestrationAction,
+    request: &RuntimeOrchestrationRequest,
 ) -> TaskUnderstanding {
-    use crate::orchestration::request::RuntimeOrchestrationAction as Action;
-
-    match action {
-        Action::RequestParallelTools | Action::RequestRewooEvidence => {
-            understanding.requests_parallelism = true;
-            promote_complexity(&mut understanding, TaskComplexity::Moderate);
-        }
-        Action::RequestTeam => {
-            if !understanding.forbids_team {
-                understanding.requests_multi_agent = true;
-                understanding.requests_parallelism = true;
-                understanding.independent_workstreams =
-                    understanding.independent_workstreams.max(2);
-                promote_complexity(&mut understanding, TaskComplexity::Complex);
-            }
-        }
-        Action::RequestDeliberation => {
-            understanding.requests_deliberation = true;
-            understanding.uncertainty = understanding.uncertainty.max(6);
-            promote_complexity(&mut understanding, TaskComplexity::Complex);
-        }
-        Action::RequestBackgroundReview | Action::DispatchSession => {
-            understanding.requests_background = true;
-            understanding.estimated_duration = TaskDuration::LongRunning;
-            promote_complexity(&mut understanding, TaskComplexity::Complex);
-        }
-        Action::RequestSubagent | Action::RequestVerification | Action::RequestReflexionRetry => {
-            promote_complexity(&mut understanding, TaskComplexity::Moderate);
-        }
-        Action::PlanOnly | Action::RequestRiskGate => {}
+    let Some(proposal) = request.proposal.as_ref() else {
+        return understanding;
+    };
+    let team_count = proposal
+        .nodes
+        .iter()
+        .filter(|node| node.recipe == CapabilityRecipeId::Team)
+        .count();
+    let total_instances = proposal
+        .nodes
+        .iter()
+        .map(|node| usize::from(node.multiplicity))
+        .sum::<usize>();
+    if team_count > 0 && !understanding.forbids_team {
+        understanding.requests_multi_agent = true;
+        understanding.requests_parallelism |= team_count > 1 || total_instances > 1;
+        understanding.independent_workstreams = understanding
+            .independent_workstreams
+            .max(u8::try_from(total_instances.max(team_count)).unwrap_or(u8::MAX));
+        promote_complexity(&mut understanding, TaskComplexity::Complex);
+    } else if proposal.nodes.iter().any(|node| {
+        matches!(
+            node.recipe,
+            CapabilityRecipeId::Agent | CapabilityRecipeId::Review
+        )
+    }) {
+        promote_complexity(&mut understanding, TaskComplexity::Moderate);
+    }
+    if proposal
+        .nodes
+        .iter()
+        .any(|node| node.recipe == CapabilityRecipeId::Review)
+    {
+        understanding.requests_deliberation = true;
+        understanding.uncertainty = understanding.uncertainty.max(4);
+    }
+    if request.operation == RuntimeOrchestrationOperation::Revise {
+        understanding.estimated_duration = TaskDuration::LongRunning;
     }
     understanding
 }
@@ -163,39 +172,46 @@ fn parse_task_risk(value: &str) -> Option<TaskRisk> {
 fn strategy_proposal_from_request(
     request: &RuntimeOrchestrationRequest,
 ) -> Option<StrategyProposal> {
-    use crate::orchestration::request::RuntimeOrchestrationAction as Action;
-
-    let pattern = match request.action {
-        Action::PlanOnly => return None,
-        Action::RequestParallelTools | Action::RequestRewooEvidence => ExecutionPattern::Explore,
-        Action::RequestSubagent | Action::RequestVerification | Action::RequestReflexionRetry => {
-            ExecutionPattern::Execute
-        }
-        Action::RequestDeliberation => ExecutionPattern::Deliberate,
-        Action::RequestTeam => ExecutionPattern::Collaborate,
-        Action::RequestBackgroundReview | Action::DispatchSession => ExecutionPattern::Supervise,
-        Action::RequestRiskGate => ExecutionPattern::Execute,
+    if matches!(
+        request.operation,
+        RuntimeOrchestrationOperation::Inspect | RuntimeOrchestrationOperation::Control
+    ) {
+        return None;
+    }
+    let proposal = request.proposal.as_ref()?;
+    let pattern = if proposal
+        .nodes
+        .iter()
+        .any(|node| node.recipe == CapabilityRecipeId::Team)
+    {
+        ExecutionPattern::Collaborate
+    } else if proposal
+        .nodes
+        .iter()
+        .any(|node| node.recipe == CapabilityRecipeId::Review)
+    {
+        ExecutionPattern::Deliberate
+    } else if proposal
+        .nodes
+        .iter()
+        .any(|node| node.recipe == CapabilityRecipeId::SessionDispatch)
+    {
+        ExecutionPattern::Supervise
+    } else {
+        ExecutionPattern::Execute
     };
     let mut modifiers = Vec::new();
-    if matches!(
-        request.action,
-        Action::RequestParallelTools | Action::RequestTeam | Action::RequestDeliberation
-    ) {
+    if proposal.nodes.len() > 1 || proposal.nodes.iter().any(|node| node.multiplicity > 1) {
         modifiers.push(ExecutionModifier::Parallel);
     }
-    if request.action == Action::RequestBackgroundReview {
+    if pattern == ExecutionPattern::Supervise {
         modifiers.push(ExecutionModifier::Background);
     }
     Some(StrategyProposal {
         pattern,
         modifiers,
-        template: request.template_hint.clone(),
+        template: proposal.nodes.iter().find_map(|node| node.template.clone()),
         confidence: 85,
-        rationale: request.reason.clone().unwrap_or_else(|| {
-            format!(
-                "model selected runtime action `{}`",
-                request.action.as_str()
-            )
-        }),
+        rationale: proposal.reason.clone(),
     })
 }

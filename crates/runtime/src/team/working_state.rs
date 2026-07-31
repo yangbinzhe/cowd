@@ -27,6 +27,15 @@ pub enum TeamWorkingStateKind {
     Artifact,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamWorkingStateVisibility {
+    #[default]
+    Team,
+    Role,
+    Private,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamWorkingStateEntry {
     pub entry_id: String,
@@ -53,9 +62,17 @@ pub struct TeamWorkingStateEntry {
     pub kind: TeamWorkingStateKind,
     pub summary: String,
     pub refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
     pub boundary: String,
     pub confidence_milli: u16,
     pub graph_revision: u64,
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub source_generation: u64,
+    #[serde(default)]
+    pub visibility: TeamWorkingStateVisibility,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +80,35 @@ pub struct TeamWorkingState {
     pub team_id: String,
     pub graph_id: String,
     pub graph_revision: u64,
+    pub board_revision: u64,
     pub entries: Vec<TeamWorkingStateEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamWorkingStatePublishRequest {
+    pub graph_id: String,
+    pub node_id: String,
+    pub expected_revision: u64,
+    pub kind: TeamWorkingStateKind,
+    pub summary: String,
+    #[serde(default)]
+    pub refs: Vec<String>,
+    #[serde(default)]
+    pub artifact_refs: Vec<String>,
+    #[serde(default)]
+    pub visibility: TeamWorkingStateVisibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamWorkingStateReadRequest {
+    pub graph_id: String,
+    pub node_id: String,
+    #[serde(default)]
+    pub after_revision: Option<u64>,
+    #[serde(default)]
+    pub exact_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +136,7 @@ impl TeamWorkingState {
             team_id,
             graph_id,
             graph_revision: 0,
+            board_revision: 0,
             entries: Vec::new(),
         };
         for event in events {
@@ -99,13 +145,16 @@ impl TeamWorkingState {
             {
                 continue;
             }
-            let Ok(entry) = serde_json::from_value::<TeamWorkingStateEntry>(event.payload) else {
+            let Ok(mut entry) = serde_json::from_value::<TeamWorkingStateEntry>(event.payload)
+            else {
                 continue;
             };
             if entry.team_id != state.team_id || entry.graph_id != state.graph_id {
                 continue;
             }
             state.graph_revision = state.graph_revision.max(entry.graph_revision);
+            state.board_revision = state.board_revision.max(event.sequence);
+            entry.revision = event.sequence;
             if !state
                 .entries
                 .iter()
@@ -202,23 +251,32 @@ impl TeamWorkingState {
                 .iter()
                 .filter(|entry| entry.node_id == node.id)
                 .collect::<Vec<_>>();
-            if entries.len() != 1 {
+            if entries.is_empty() {
                 return Err(format!(
-                    "Team role slot `{}` has {} committed working-state entries",
-                    node.id,
-                    entries.len()
+                    "Team role slot `{}` has no committed working-state entries",
+                    node.id
                 ));
             }
-            let entry = entries[0];
-            if entry.role_id.as_deref().is_none_or(str::is_empty)
-                || entry.focus_id.as_deref().is_none_or(str::is_empty)
-                || entry.focus_scope_hash.as_deref().is_none_or(str::is_empty)
-                || !entry.refs.iter().any(|reference| {
-                    reference
-                        .strip_prefix("evidence:")
-                        .is_some_and(|reference| !reference.trim().is_empty())
-                })
-            {
+            let materialized = entries.iter().any(|entry| {
+                entry
+                    .role_id
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty())
+                    && entry
+                        .focus_id
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    && entry
+                        .focus_scope_hash
+                        .as_deref()
+                        .is_some_and(|value| !value.is_empty())
+                    && (entry.refs.iter().any(|reference| {
+                        reference
+                            .strip_prefix("evidence:")
+                            .is_some_and(|reference| !reference.trim().is_empty())
+                    }) || !entry.artifact_refs.is_empty())
+            });
+            if !materialized {
                 return Err(format!(
                     "Team role slot `{}` lacks role/focus/materialized evidence",
                     node.id
@@ -352,11 +410,18 @@ pub(crate) fn terminal_working_state_event(
         kind,
         summary,
         refs,
+        artifact_refs: Vec::new(),
         boundary: format!(
             "{focus_boundary}; runtime-terminal-projection; no raw chain-of-thought or raw tool output"
         ),
         confidence_milli,
         graph_revision: graph.revision,
+        revision: 0,
+        source_generation: graph
+            .orchestration
+            .as_ref()
+            .map_or(graph.revision, |metadata| metadata.source_generation),
+        visibility: TeamWorkingStateVisibility::Team,
     };
     let identity = &packet.assignment.execution_identity;
     let mut event_refs = vec![

@@ -31,7 +31,7 @@ use super::goal::GoalStore;
 use super::graph::{
     executors::{
         AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
-        SynthesizeNodeExecutor, VerifyNodeExecutor,
+        SynthesizeNodeExecutor, TeamSubgraphExecutor, VerifyNodeExecutor,
     },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError,
@@ -1291,6 +1291,10 @@ impl RuntimeServices {
             task_runtime_port,
             Arc::clone(&mission_runtime),
         ));
+        executor_registry.register(Arc::new(TeamSubgraphExecutor::new(
+            Arc::downgrade(&team_runtime),
+            Arc::downgrade(&execution_supervisor),
+        )))?;
         let l4_promotion_service = Arc::new(crate::L4PromotionService::new(
             Arc::clone(&event_store),
             Arc::clone(&approval_queue),
@@ -1837,7 +1841,17 @@ impl RuntimeServices {
         &self,
         mut graph: ExecutionGraph,
     ) -> Result<ExecutionGraph, RuntimeServicesError> {
-        for node in &mut graph.nodes {
+        self.compile_agent_task_nodes(&mut graph.nodes)?;
+        Ok(graph)
+    }
+
+    /// Resolve only newly-added semantic Agent nodes during a graph revision.
+    /// Existing immutable packets are deliberately not rebound.
+    pub fn compile_agent_task_nodes(
+        &self,
+        nodes: &mut [harness_contract::execution_graph::ExecutionNodeSpec],
+    ) -> Result<(), RuntimeServicesError> {
+        for node in nodes {
             if node.kind != ExecutionNodeKind::AgentTask {
                 continue;
             }
@@ -1861,7 +1875,7 @@ impl RuntimeServices {
                 ))
             })?;
         }
-        Ok(graph)
+        Ok(())
     }
     pub(crate) fn event_store(&self) -> &Arc<RuntimeEventStore> {
         &self.event_store
@@ -3996,6 +4010,8 @@ impl RuntimeServices {
                         },
                     ),
                     resource_scopes: definition.resource_scopes.clone(),
+                    upstream_evidence_refs: Vec::new(),
+                    upstream_artifact_refs: Vec::new(),
                 };
                 let mission_id = request.mission_id.clone();
                 let team_id = request.team_id.clone();
@@ -4545,6 +4561,8 @@ fn evolution_team_request(
         )),
         managed_invocation: None,
         resource_scopes: scenario.resource_scopes.clone(),
+        upstream_evidence_refs: Vec::new(),
+        upstream_artifact_refs: Vec::new(),
     }
 }
 
@@ -6745,6 +6763,8 @@ mod tests {
             } else {
                 "read:crates/runtime".to_string()
             }],
+            upstream_evidence_refs: Vec::new(),
+            upstream_artifact_refs: Vec::new(),
         }
     }
 

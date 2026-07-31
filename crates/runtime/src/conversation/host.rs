@@ -1891,12 +1891,76 @@ where
     } else {
         harness_contract::team::TeamSelectionMode::Automatic
     };
+    let semantic_focuses = focus_partition_plans
+        .iter()
+        .flat_map(|plan| {
+            plan.slots.iter().map(|slot| crate::SemanticFocus {
+                focus_id: slot.focus_id.clone(),
+                role_id: plan.role_id.clone(),
+                objective: slot.boundary.clone(),
+                resource_scopes: slot.capability_cropped_refs.clone(),
+                evidence_responsibilities: vec![slot.evidence_responsibility.clone()],
+            })
+        })
+        .collect::<Vec<_>>();
+    let template = if strategy
+        .decision
+        .strategy
+        .understanding
+        .requires_external_facts
+        && !requires_write
+    {
+        Some("cowd/external-research-synthesis".to_string())
+    } else if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
+        Some(if requires_write {
+            "cowd/execute-review".to_string()
+        } else {
+            "cowd/parallel-research-synthesis".to_string()
+        })
+    } else {
+        None
+    };
     let request = crate::RuntimeOrchestrationRequest {
         intent: objective.to_string(),
         model_lease: Some(model_lease),
         session_id: Some(strategy.session_ref.clone()),
-        target_session_id: None,
-        action: crate::RuntimeOrchestrationAction::RequestTeam,
+        operation: crate::RuntimeOrchestrationOperation::Propose,
+        inspect_execution_id: None,
+        proposal: Some(crate::GraphMutationProposal {
+            mutation_id: format!("strategy-{}", strategy.decision_id),
+            target_execution_id: None,
+            expected_revision: None,
+            nodes: vec![crate::GraphSemanticNode {
+                node_id: "selected-team".to_string(),
+                recipe: crate::CapabilityRecipeId::Team,
+                objective: objective.to_string(),
+                depends_on: Vec::new(),
+                multiplicity: 1,
+                focuses: semantic_focuses,
+                template,
+                input_refs: Vec::new(),
+                output_artifacts: vec!["terminal_synthesis".to_string()],
+                evidence_contract: vec![
+                    "summary".to_string(),
+                    "evidence".to_string(),
+                    "unresolved".to_string(),
+                ],
+                resource_scopes: capabilities
+                    .iter()
+                    .filter_map(|capability| capability.strip_prefix("resource:"))
+                    .map(str::to_string)
+                    .collect(),
+            }],
+            completion: harness_contract::execution_graph::ExecutionCompletionContract {
+                required_node_ids: vec!["selected-team".to_string()],
+                required_artifact_kinds: vec!["terminal_synthesis".to_string()],
+                allow_unresolved_conflicts: false,
+            },
+            reason: format!(
+                "runtime cost model selected Team at conversation admission ({selection_mode:?})"
+            ),
+        }),
+        control: None,
         selection_mode: Some(selection_mode),
         strategy_binding: Some(harness_contract::team::TeamStrategyBinding {
             decision_id: strategy.decision_id.clone(),
@@ -1904,27 +1968,6 @@ where
             decision_lease: strategy.decision_lease.clone(),
             turn_ref: strategy.turn_ref.clone(),
         }),
-        reason: Some(format!(
-            "runtime integer cost model selected Team at conversation admission ({selection_mode:?})"
-        )),
-        template_hint: if strategy
-            .decision
-            .strategy
-            .understanding
-            .requires_external_facts
-            && !requires_write
-        {
-            Some("cowd/external-research-synthesis".to_string())
-        } else if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
-            Some(if requires_write {
-                "cowd/execute-review".to_string()
-            } else {
-                "cowd/parallel-research-synthesis".to_string()
-            })
-        } else {
-            None
-        },
-        focus_partition_plans,
         capabilities,
         evidence_refs: Vec::new(),
         constraints: crate::RuntimeOrchestrationConstraints {
@@ -1935,6 +1978,15 @@ where
             approval_id: None,
             requires_write: Some(requires_write),
             surface_latency_sensitive: Some(false),
+            permission_ceiling: match permission_mode {
+                crate::PermissionMode::WorkspaceWrite => {
+                    harness_contract::policy::PermissionMode::WorkspaceWrite
+                }
+                crate::PermissionMode::DangerFullAccess | crate::PermissionMode::Allow => {
+                    harness_contract::policy::PermissionMode::DangerFullAccess
+                }
+                _ => harness_contract::policy::PermissionMode::ReadOnly,
+            },
         },
         surface: Some("conversation_runtime_host".to_string()),
     };
@@ -5064,13 +5116,18 @@ fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
         }
         serde_json::from_str::<serde_json::Value>(&call.input)
             .ok()
-            .and_then(|input| {
-                input
-                    .get("action")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|action| action.eq_ignore_ascii_case("request_team"))
+            .is_some_and(|input| {
+                input.get("operation").and_then(serde_json::Value::as_str) == Some("propose")
+                    && input
+                        .pointer("/proposal/nodes")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|nodes| {
+                            nodes.iter().any(|node| {
+                                node.get("recipe").and_then(serde_json::Value::as_str)
+                                    == Some("team")
+                            })
+                        })
             })
-            .unwrap_or(false)
     })
 }
 
@@ -9336,7 +9393,7 @@ fn upstream_verification_completion_instruction(
 
 /// Keep stateful runtime orchestration outside a workspace-tool batch.
 ///
-/// A `runtime_orchestrate(request_team)` call may synchronously drive a child
+/// A `runtime_orchestrate(propose:team)` call may synchronously drive a child
 /// graph whose agents read or write the workspace. If it shares one parent
 /// ToolBatch with a file mutation, the graph-level lease would be retained
 /// across the entire child execution. We compile two ordered durable batches:
@@ -10309,8 +10366,7 @@ mod tests {
                 Ok(AssistantEvent::ToolUse {
                     id: "team-1".to_string(),
                     name: "runtime_orchestrate".to_string(),
-                    input: r#"{"action":"request_team","intent":"review architecture"}"#
-                        .to_string(),
+                    input: r#"{"intent":"review architecture","operation":"propose","proposal":{"mutation_id":"review-architecture","nodes":[{"node_id":"review-team","recipe":"team","objective":"review architecture"}],"reason":"independent review is required"}}"#.to_string(),
                 }),
                 Ok(AssistantEvent::MessageStop),
             ]))
@@ -10842,7 +10898,7 @@ mod tests {
                             "display_name": "read_file",
                             "source": "test",
                             "schema_hash": "read-v1",
-                            "required_permission": "read_only",
+                            "required_permission": "read-only",
                             "permission_source": "test",
                             "health": "healthy"
                         },
@@ -10851,7 +10907,7 @@ mod tests {
                             "display_name": "write_file",
                             "source": "test",
                             "schema_hash": "write-v1",
-                            "required_permission": "workspace_write",
+                            "required_permission": "workspace-write",
                             "permission_source": "test",
                             "health": "healthy"
                         }
@@ -11527,14 +11583,19 @@ mod tests {
         let root_graph_id = outcome.payload["execution_graph_ref"]
             .as_str()
             .expect("root graph id");
-        let child_links = services
+        let mission_links = services
             .graph_state_store()
             .child_links(root_graph_id)
-            .expect("child links");
-        assert_eq!(child_links.len(), 1);
+            .expect("Mission graph link");
+        assert_eq!(mission_links.len(), 1);
+        let team_links = services
+            .graph_state_store()
+            .child_links(&mission_links[0].child_execution_id)
+            .expect("Team subgraph link");
+        assert_eq!(team_links.len(), 1);
         let team_graph = services
             .graph_state_store()
-            .load(&child_links[0].child_execution_id)
+            .load(&team_links[0].child_execution_id)
             .expect("Team graph");
         assert!(
             team_graph
@@ -12508,7 +12569,7 @@ mod tests {
             ModelToolCall {
                 id: "team".into(),
                 name: "runtime_orchestrate".into(),
-                input: r#"{"action":"request_team","intent":"review"}"#.into(),
+                input: r#"{"intent":"review","operation":"propose","proposal":{"mutation_id":"review","nodes":[{"node_id":"review-team","recipe":"team","objective":"review"}],"reason":"review as a team"}}"#.into(),
                 depends_on: Vec::new(),
             },
         ]);
@@ -12597,7 +12658,7 @@ mod tests {
             ModelToolCall {
                 id: "team".into(),
                 name: "runtime_orchestrate".into(),
-                input: r#"{"action":"request_team"}"#.into(),
+                input: r#"{"intent":"review","operation":"propose","proposal":{"mutation_id":"review","nodes":[{"node_id":"review-team","recipe":"team","objective":"review"}],"reason":"review as a team"}}"#.into(),
                 depends_on: Vec::new(),
             },
         ];
@@ -12614,17 +12675,18 @@ mod tests {
     }
 
     #[test]
-    fn only_request_team_consumes_the_turn_collaboration_lease() {
+    fn only_semantic_team_proposal_consumes_the_turn_collaboration_lease() {
         let request_team = ModelToolCall {
             id: "team".into(),
             name: "runtime_orchestrate".into(),
-            input: r#"{"action":"request_team","intent":"review"}"#.into(),
+            input: r#"{"intent":"review","operation":"propose","proposal":{"mutation_id":"review","nodes":[{"node_id":"review-team","recipe":"team","objective":"review"}],"reason":"review as a team"}}"#.into(),
             depends_on: Vec::new(),
         };
-        let parallel_tools = ModelToolCall {
-            id: "parallel".into(),
-            input: r#"{"action":"request_parallel_tools","intent":"read files"}"#.into(),
-            ..request_team.clone()
+        let inspect = ModelToolCall {
+            id: "inspect".into(),
+            name: "runtime_orchestrate".into(),
+            input: r#"{"intent":"inspect current runtime","operation":"inspect"}"#.into(),
+            depends_on: Vec::new(),
         };
         let ordinary = ModelToolCall {
             id: "read".into(),
@@ -12634,7 +12696,7 @@ mod tests {
         };
 
         assert!(requests_team_orchestration(&[request_team]));
-        assert!(!requests_team_orchestration(&[parallel_tools]));
+        assert!(!requests_team_orchestration(&[inspect]));
         assert!(!requests_team_orchestration(&[ordinary]));
     }
 
@@ -12644,7 +12706,7 @@ mod tests {
             ModelToolCall {
                 id: "team".into(),
                 name: "runtime_orchestrate".into(),
-                input: r#"{"action":"request_team"}"#.into(),
+                input: r#"{"intent":"review","operation":"propose","proposal":{"mutation_id":"review","nodes":[{"node_id":"review-team","recipe":"team","objective":"review"}],"reason":"review as a team"}}"#.into(),
                 depends_on: Vec::new(),
             },
             ModelToolCall {

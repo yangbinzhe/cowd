@@ -1098,6 +1098,7 @@ impl AgentRuntime {
             // standalone packets. They have no graph peer context to attach.
             return Ok(packet);
         };
+        let mut predecessor_ids = BTreeSet::new();
         let predecessors = graph
             .edges
             .iter()
@@ -1116,6 +1117,7 @@ impl AgentRuntime {
                     .iter()
                     .find(|node| node.id == edge.from && node.kind == ExecutionNodeKind::AgentTask)
             })
+            .filter(|node| predecessor_ids.insert(node.id.clone()))
             .collect::<Vec<_>>();
         if predecessors.is_empty() {
             return Ok(packet);

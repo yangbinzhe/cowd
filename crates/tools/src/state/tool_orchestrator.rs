@@ -205,6 +205,37 @@ fn resolve_effect_properties(
             mutates_packages: false,
             mutates_system: false,
         },
+        "runtime.orchestration" => {
+            let operation = input
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or("inspect");
+            if operation == "inspect" {
+                EffectProperties {
+                    effect_kind: ToolEffectKind::Read,
+                    idempotency: ToolIdempotency::Idempotent,
+                    scopes: vec![read_scope()],
+                    required_permission: ToolPermissionMode::ReadOnly,
+                    approval_class: ToolApprovalClass::None,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }
+            } else {
+                EffectProperties {
+                    effect_kind: ToolEffectKind::Write,
+                    idempotency: ToolIdempotency::IdempotentWithKey,
+                    scopes: vec![write_scope()],
+                    required_permission: ToolPermissionMode::WorkspaceWrite,
+                    approval_class: ToolApprovalClass::Policy,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }
+            }
+        }
         "builtin.network" => EffectProperties {
             effect_kind: ToolEffectKind::Network,
             idempotency: ToolIdempotency::Unknown,
@@ -696,6 +727,35 @@ mod tests {
         );
         assert!(descriptor.uses_network);
         assert!(descriptor.spawns_process);
+    }
+
+    #[test]
+    fn runtime_orchestration_effect_depends_on_typed_operation() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "runtime.orchestration".to_string(),
+            resolver_version: 1,
+        };
+        let inspect = resolve_registered_tool_effect(
+            &resolver,
+            "runtime_orchestrate",
+            &json!({"intent": "inspect", "operation": "inspect"}),
+            ToolPermissionMode::ReadOnly,
+        );
+        let propose = resolve_registered_tool_effect(
+            &resolver,
+            "runtime_orchestrate",
+            &json!({"intent": "propose", "operation": "propose"}),
+            ToolPermissionMode::ReadOnly,
+        );
+
+        assert_eq!(inspect.effect_kind, ToolEffectKind::Read);
+        assert_eq!(inspect.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(propose.effect_kind, ToolEffectKind::Write);
+        assert_eq!(
+            propose.required_permission,
+            ToolPermissionMode::WorkspaceWrite
+        );
+        assert_eq!(propose.idempotency, ToolIdempotency::IdempotentWithKey);
     }
 
     #[test]

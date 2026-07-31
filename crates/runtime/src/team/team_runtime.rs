@@ -6,21 +6,28 @@
 use std::sync::Arc;
 
 use harness_contract::{
+    agent::{AgentCommand, AgentCommandRequest, AgentInput, AgentStatus, AgentTaskPacket},
     reality::EvidenceRef,
     team::{TeamInstantiationRequest, TeamTemplateRevisionRef},
 };
 
+use crate::execution_core::ExecutionStateStoreError;
 use crate::{
-    AgentRuntime, EvolutionGovernanceService, ExecutionGraphHostReceipt, ExecutionGraphStateStore,
-    LegacyTeamImportReport, LegacyTeamProfileMigrationReport, MissionRuntime,
-    RuntimeDefinitionRegistry, RuntimeEventStore, RuntimeExecutionSupervisor, TaskRuntimePort,
-    TeamProjection, TeamProjectionReader,
+    AgentRuntime, AppendTransactionRequest, EvolutionGovernanceService, ExecutionGraphHostReceipt,
+    ExecutionGraphStateStore, ExpectedStreamRevision, LegacyTeamImportReport,
+    LegacyTeamProfileMigrationReport, MissionRuntime, RuntimeDefinitionRegistry, RuntimeEventInput,
+    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeExecutionSupervisor,
+    RuntimeTransactionEventInput, TaskRuntimePort, TeamProjection, TeamProjectionReader,
+    TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStatePublishRequest,
+    TeamWorkingStateReadRequest, TeamWorkingStateVisibility,
 };
 
 pub struct TeamRuntime {
     execution: Arc<RuntimeExecutionSupervisor>,
     instantiation: crate::TeamInstantiationService,
     projection: TeamProjectionReader,
+    graphs: ExecutionGraphStateStore,
+    agents: Arc<AgentRuntime>,
     event_store: Arc<RuntimeEventStore>,
     tasks: TaskRuntimePort,
     missions: Arc<MissionRuntime>,
@@ -53,7 +60,9 @@ impl TeamRuntime {
                 evolution_governance,
                 workspace_id,
             ),
-            projection: TeamProjectionReader::new(graphs, agents),
+            projection: TeamProjectionReader::new(graphs.clone(), Arc::clone(&agents)),
+            graphs,
+            agents,
             event_store,
             tasks,
             missions,
@@ -111,6 +120,28 @@ impl TeamRuntime {
             .await
             .map_err(|error| error.to_string())?;
         self.projection.project(&graph_id)
+    }
+
+    /// Idempotent child-graph entry used by a root Mission graph. Recovery
+    /// resumes the exact deterministic Team graph instead of registering a
+    /// second child or rebuilding topology from model prose.
+    pub async fn instantiate_or_resume(
+        &self,
+        request: TeamInstantiationRequest,
+    ) -> Result<TeamProjection, String> {
+        let graph_id = format!("team-graph:{}", request.team_id);
+        match self.graphs.load(&graph_id) {
+            Ok(_) => {
+                self.execution
+                    .drive_registered(&graph_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return self.projection.project(&graph_id);
+            }
+            Err(ExecutionStateStoreError::NotFound(_)) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        self.instantiate(request).await
     }
 
     /// Admit a Team graph and return after durable submission. The supervisor
@@ -267,6 +298,279 @@ impl TeamRuntime {
         ))
     }
 
+    /// Append a bounded semantic update from an immutable Team Agent binding.
+    /// The caller cannot choose its team, role, producer or authority scope.
+    pub async fn publish_working_state(
+        &self,
+        request: TeamWorkingStatePublishRequest,
+    ) -> Result<TeamWorkingState, String> {
+        let (graph, packet) = self.bound_team_packet(&request.graph_id, &request.node_id)?;
+        let team_id = packet
+            .team_id()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "team board publish requires a Team-bound Agent".to_string())?;
+        let binding = packet
+            .binding
+            .as_ref()
+            .ok_or_else(|| "team board publish requires an immutable Agent Binding".to_string())?;
+        let summary = request.summary.trim();
+        if summary.is_empty() || summary.chars().count() > 16_000 {
+            return Err("team board summary must contain 1..16000 characters".to_string());
+        }
+        let normalized = summary.to_ascii_lowercase();
+        if normalized.contains("<thinking")
+            || normalized.contains("chain-of-thought")
+            || normalized.contains("internal reasoning trace")
+        {
+            return Err(
+                "team board accepts semantic findings, not private reasoning traces".to_string(),
+            );
+        }
+        let stream_id = format!("team-working-state:{team_id}");
+        let entry_id = format!(
+            "{}:{}:{:016x}",
+            request.graph_id,
+            request.node_id,
+            model_protocol::fingerprint::stable_hash_bytes(
+                serde_json::to_string(&request)
+                    .map_err(|error| error.to_string())?
+                    .as_bytes(),
+            )
+        );
+        let current_revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        if current_revision != request.expected_revision {
+            let existing = self.working_state_for_graph(team_id, &request.graph_id)?;
+            if existing
+                .entries
+                .iter()
+                .any(|entry| entry.entry_id == entry_id)
+            {
+                return Ok(existing);
+            }
+            return Err(format!(
+                "team board revision mismatch: expected {}, actual {current_revision}",
+                request.expected_revision
+            ));
+        }
+        let mut refs = request
+            .refs
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .take(64)
+            .collect::<Vec<_>>();
+        refs.sort();
+        refs.dedup();
+        let mut artifact_refs = request
+            .artifact_refs
+            .into_iter()
+            .filter(|value| !value.trim().is_empty())
+            .take(64)
+            .collect::<Vec<_>>();
+        artifact_refs.sort();
+        artifact_refs.dedup();
+        let entry = TeamWorkingStateEntry {
+            entry_id: entry_id.clone(),
+            team_id: team_id.to_string(),
+            graph_id: graph.id.clone(),
+            node_id: request.node_id.clone(),
+            producer_instance_id: binding.instance.instance_id.clone(),
+            role_id: packet_constraint(&packet, "team_role:"),
+            focus_id: packet_constraint(&packet, "focus_partition:"),
+            focus_scope_hash: packet_constraint(&packet, "focus_scope_hash:"),
+            overlap_budget_bp: packet_constraint(&packet, "focus_overlap_budget_bp:")
+                .and_then(|value| value.parse().ok()),
+            novelty_target_bp: packet_constraint(&packet, "focus_novelty_target_bp:")
+                .and_then(|value| value.parse().ok()),
+            focus_resource_scopes: packet.resource_scopes.clone(),
+            observed_resource_scopes: Vec::new(),
+            kind: request.kind,
+            summary: summary.to_string(),
+            refs,
+            artifact_refs,
+            boundary: "runtime semantic checkpoint; no raw chain-of-thought or raw tool output"
+                .to_string(),
+            confidence_milli: 1_000,
+            graph_revision: graph.revision,
+            revision: current_revision.saturating_add(1),
+            source_generation: graph
+                .orchestration
+                .as_ref()
+                .map_or(graph.revision, |metadata| metadata.source_generation),
+            visibility: request.visibility,
+        };
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("team-board:{entry_id}"),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: current_revision,
+                }],
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::Team,
+                        kind: "team.working_state.appended.v1".to_string(),
+                        status: Some("committed".to_string()),
+                        actor: Some(binding.instance.instance_id.clone()),
+                        refs: vec![
+                            RuntimeEventRef {
+                                kind: "team_run".to_string(),
+                                id: team_id.to_string(),
+                            },
+                            RuntimeEventRef {
+                                kind: "execution_graph".to_string(),
+                                id: graph.id.clone(),
+                            },
+                            RuntimeEventRef {
+                                kind: "execution_node".to_string(),
+                                id: request.node_id,
+                            },
+                        ],
+                        payload: serde_json::to_value(entry).map_err(|error| error.to_string())?,
+                    },
+                    idempotency_key: Some(entry_id),
+                    schema_version: 1,
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        let committed = self.working_state_for_graph(team_id, &graph.id)?;
+        self.notify_team_board_revision(
+            &graph,
+            &packet,
+            team_id,
+            committed.board_revision,
+            summary,
+        )
+        .await;
+        Ok(committed)
+    }
+
+    /// Read only entries visible to the immutable caller binding.
+    pub fn read_working_state(
+        &self,
+        request: TeamWorkingStateReadRequest,
+    ) -> Result<TeamWorkingState, String> {
+        if request.after_revision.is_some() && request.exact_revision.is_some() {
+            return Err(
+                "team board read accepts after_revision or exact_revision, not both".to_string(),
+            );
+        }
+        let (_, packet) = self.bound_team_packet(&request.graph_id, &request.node_id)?;
+        let team_id = packet
+            .team_id()
+            .ok_or_else(|| "team board read requires a Team-bound Agent".to_string())?;
+        let binding = packet
+            .binding
+            .as_ref()
+            .ok_or_else(|| "team board read requires an immutable Agent Binding".to_string())?;
+        let role_id = packet_constraint(&packet, "team_role:");
+        let mut state = self.working_state_for_graph(team_id, &request.graph_id)?;
+        state.entries.retain(|entry| {
+            let visible = match entry.visibility {
+                TeamWorkingStateVisibility::Team => true,
+                TeamWorkingStateVisibility::Role => entry.role_id == role_id,
+                TeamWorkingStateVisibility::Private => {
+                    entry.producer_instance_id == binding.instance.instance_id
+                }
+            };
+            visible
+                && request
+                    .after_revision
+                    .is_none_or(|revision| entry.revision > revision)
+                && request
+                    .exact_revision
+                    .is_none_or(|revision| entry.revision == revision)
+        });
+        Ok(state)
+    }
+
+    fn bound_team_packet(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Result<
+        (
+            harness_contract::execution_graph::ExecutionGraph,
+            AgentTaskPacket,
+        ),
+        String,
+    > {
+        let graph = self
+            .graphs
+            .load(graph_id)
+            .map_err(|error| error.to_string())?;
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .ok_or_else(|| format!("team graph node not found: {node_id}"))?;
+        if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
+            return Err("team board caller must be an AgentTask node".to_string());
+        }
+        let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+            .map_err(|error| format!("team board caller packet is invalid: {error}"))?;
+        Ok((graph, packet))
+    }
+
+    async fn notify_team_board_revision(
+        &self,
+        graph: &harness_contract::execution_graph::ExecutionGraph,
+        source: &AgentTaskPacket,
+        team_id: &str,
+        revision: u64,
+        summary: &str,
+    ) {
+        let source_agent_id = source.agent_id();
+        for node in &graph.nodes {
+            if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
+                continue;
+            }
+            let Ok(peer) = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref) else {
+                continue;
+            };
+            if peer.agent_id() == source_agent_id || peer.team_id() != Some(team_id) {
+                continue;
+            }
+            let Some(snapshot) = self.agents.get(peer.agent_id()) else {
+                continue;
+            };
+            if snapshot.status != AgentStatus::Running {
+                continue;
+            }
+            let receipt = self
+                .agents
+                .command(AgentCommandRequest {
+                    command_id: format!(
+                        "team-board-notify:{team_id}:{revision}:{}",
+                        peer.agent_id()
+                    ),
+                    agent_id: peer.agent_id().to_string(),
+                    expected_revision: snapshot.revision,
+                    command: AgentCommand::SendInput,
+                    input: Some(AgentInput::PeerMessage {
+                        from_agent_id: source_agent_id.to_string(),
+                        message: format!(
+                            "Team board revision {revision} is available. At the next safe checkpoint call `team_board` with `read_after` using your last consumed revision. Semantic preview: {}",
+                            summary.chars().take(512).collect::<String>()
+                        ),
+                    }),
+                })
+                .await;
+            if !receipt.accepted {
+                tracing::debug!(
+                    team_id,
+                    revision,
+                    peer_agent_id = %peer.agent_id(),
+                    reason = ?receipt.reject_reason,
+                    "Team board revision notification was not accepted by the peer Agent"
+                );
+            }
+        }
+    }
+
     /// Import and retire the removed pre-V5 Team state file. Unbound active
     /// records are kept as durable blocked audit events rather than resumed.
     pub fn import_legacy_state_file(
@@ -319,4 +623,11 @@ impl TeamRuntime {
             })).collect::<Vec<_>>(),
         })
     }
+}
+
+fn packet_constraint(packet: &AgentTaskPacket, prefix: &str) -> Option<String> {
+    packet
+        .constraints
+        .iter()
+        .find_map(|constraint| constraint.strip_prefix(prefix).map(str::to_string))
 }

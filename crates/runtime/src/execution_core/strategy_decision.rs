@@ -619,44 +619,38 @@ pub fn action_selection_report_for_decision(
 
 fn fallback_action_for(action: &str) -> &'static str {
     match action {
-        "request_team" | "request_deliberation" | "request_background_review" => {
-            "request_rewoo_evidence"
-        }
-        "request_parallel_tools" | "request_rewoo_evidence" => "direct",
-        "request_risk_gate" => "direct",
+        "propose:team" | "propose:review" | "propose:session_dispatch" => "propose:agent",
+        "propose:agent" => "direct",
+        "control:approval" => "direct",
         _ => "direct",
     }
 }
 
 fn expected_projection_for(action: &str) -> &'static [&'static str] {
     match action {
-        "request_team" => &[
+        "propose:team" => &[
             "mission.team_projection",
             "mission.agent_projection",
             "mission.execution_graph_projection",
             "mission.evidence_projection",
         ],
-        "request_parallel_tools" | "request_rewoo_evidence" => &[
-            "runtime.tool_intents",
-            "runtime.tool_schedule",
-            "runtime.evidence_refs",
-        ],
-        "request_deliberation" => &["runtime.deliberation_graph", "mission.evidence_projection"],
-        "request_background_review" => &["mission.steward_projection", "runtime.execution_graph"],
-        "request_risk_gate" => &["mission.conflict_projection", "mission.approval_projection"],
+        "propose:agent" => &["runtime.execution_graph", "runtime.evidence_refs"],
+        "propose:review" => &["runtime.review_graph", "mission.evidence_projection"],
+        "propose:session_dispatch" => &["mission.session_projection", "runtime.execution_graph"],
+        "control:approval" => &["mission.conflict_projection", "mission.approval_projection"],
         _ => &["runtime.execution_decision"],
     }
 }
 
 fn action_hints(
     pattern: ExecutionPattern,
-    modifiers: &[ExecutionModifier],
+    _modifiers: &[ExecutionModifier],
     gates: &[ExecutionPolicyGate],
     template_hint: &CollaborationTemplateId,
 ) -> Vec<RuntimeExecutionActionHint> {
     if gates.contains(&ExecutionPolicyGate::Approval) {
         return vec![RuntimeExecutionActionHint {
-            action: "request_risk_gate".to_string(),
+            action: "control:approval".to_string(),
             template_hint: None,
             reason: "critical execution requires approval before graph dispatch".to_string(),
         }];
@@ -665,31 +659,27 @@ fn action_hints(
     match pattern {
         ExecutionPattern::Direct => Vec::new(),
         ExecutionPattern::Explore => vec![RuntimeExecutionActionHint {
-            action: if modifiers.contains(&ExecutionModifier::Parallel) {
-                "request_parallel_tools".to_string()
-            } else {
-                "request_rewoo_evidence".to_string()
-            },
+            action: "propose:agent".to_string(),
             template_hint: template,
             reason: "acquire checked evidence before synthesis".to_string(),
         }],
         ExecutionPattern::Execute => vec![RuntimeExecutionActionHint {
-            action: "request_subagent".to_string(),
+            action: "propose:agent".to_string(),
             template_hint: template,
             reason: "compile a bounded execution and verification graph".to_string(),
         }],
         ExecutionPattern::Deliberate => vec![RuntimeExecutionActionHint {
-            action: "request_deliberation".to_string(),
+            action: "propose:review".to_string(),
             template_hint: Some("cowd/debate-critic-arbiter".to_string()),
             reason: "resolve competing options with evidence-backed arbitration".to_string(),
         }],
         ExecutionPattern::Collaborate => vec![RuntimeExecutionActionHint {
-            action: "request_team".to_string(),
+            action: "propose:team".to_string(),
             template_hint: template,
             reason: "positive collaboration lift supports a governed team graph".to_string(),
         }],
         ExecutionPattern::Supervise => vec![RuntimeExecutionActionHint {
-            action: "request_background_review".to_string(),
+            action: "propose:session_dispatch".to_string(),
             template_hint: template,
             reason: "long-running work belongs to a supervised mission graph".to_string(),
         }],
@@ -707,7 +697,7 @@ mod tests {
             Some(ContextProfile::DeepInvestigation),
         );
         assert_eq!(decision.pattern(), ExecutionPattern::Collaborate);
-        assert_eq!(decision.recommended_actions[0].action, "request_team");
+        assert_eq!(decision.recommended_actions[0].action, "propose:team");
     }
 
     #[test]

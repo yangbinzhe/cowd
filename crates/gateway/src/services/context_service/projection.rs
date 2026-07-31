@@ -38,6 +38,18 @@ impl ContextService {
         let mut dynamic_items = Vec::new();
         let mut omitted_items = Vec::new();
         let mut degraded = Vec::new();
+        if !query.trim().is_empty() {
+            let mut task = ContextItem::new(
+                format!("synthetic-task:{session_id}"),
+                ContextSourceKind::Task,
+                ContextRole::TaskState,
+                query.clone(),
+            );
+            task.authority = ContextAuthority::User;
+            task.visibility = ContextVisibility::Private;
+            task.score = 1.0;
+            dynamic_items.push(task);
+        }
 
         match memory
             .context_packet_preview(session_id.clone(), "api", query.clone(), 12, 2_000)

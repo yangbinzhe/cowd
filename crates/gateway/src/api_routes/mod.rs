@@ -15564,7 +15564,8 @@ providers:
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["envelope"]["profile"], "YoloGoal");
         assert_eq!(json["envelope"]["identity"]["mode"], "YoloGoal");
-        assert_eq!(json["envelope"]["budget"]["leases"][0]["source"], "Task");
+        assert_eq!(json["envelope"]["selected"][0]["source"], "Task");
+        assert_eq!(json["envelope"]["selected"][0]["role"], "TaskState");
         assert!(json["envelope"]["assembled"]["runtime_header"][0]
             .as_str()
             .unwrap()
